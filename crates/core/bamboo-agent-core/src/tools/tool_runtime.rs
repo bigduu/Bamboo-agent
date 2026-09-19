@@ -175,6 +175,8 @@ pub struct RunningHandle {
 pub struct ToolCtx {
     /// Bamboo session id executing the tool.
     pub session_id: Option<Arc<str>>,
+    /// Lifetime captured by real dispatch; never refreshed from configuration.
+    pub executing_supervisor: Option<super::ExecutingSupervisorObservation>,
     /// The model's tool call id.
     pub tool_call_id: Arc<str>,
     /// Streaming progress channel (owned clone of the former `&mpsc::Sender`).
@@ -204,6 +206,7 @@ impl ToolCtx {
     pub fn none(tool_call_id: impl Into<Arc<str>>) -> Self {
         Self {
             session_id: None,
+            executing_supervisor: None,
             tool_call_id: tool_call_id.into(),
             event_tx: None,
             available_tool_schemas: Arc::from(Vec::new()),
@@ -224,6 +227,19 @@ impl ToolCtx {
     /// The session id as `&str`, if present.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Preserve the original observation for same-caller nested dispatch only.
+    /// The caller ID is an identity check, not a source of new authority.
+    pub fn executing_supervisor_for(
+        &self,
+        session_id: &str,
+    ) -> Option<super::ExecutingSupervisorObservation> {
+        if self.session_id() != Some(session_id) {
+            return None;
+        }
+        self.executing_supervisor
+            .and_then(|observation| observation.for_caller(Some(session_id)))
     }
 
     /// Clone the event sender for a spawned task (peer of the former

@@ -1,7 +1,7 @@
 //! WebSocket transport (design §6): full-duplex parent↔child link.
 //!
 //! - Child side: [`WsServer`] accepts a connection and drives a [`ChildExecutor`] — `Run` starts a
-//!   task whose events stream out as `ChildFrame::Event`, then a `ChildFrame::Terminal`; `Cancel`
+//!   task whose events stream out as `ChildFrame::EventBatch`, then a `ChildFrame::Terminal`; `Cancel`
 //!   trips the run's token (out-of-band, never queued behind events).
 //! - Parent side: [`ChildClient`] sends [`ParentFrame`]s and reads [`ChildFrame`]s.
 
@@ -30,12 +30,100 @@ use crate::executor::{
     SteerMessage,
 };
 use crate::poison::PoisonRecover;
-use crate::proto::{ChildFrame, ParentFrame, RunSpec};
+use crate::proto::{
+    ActorEventBatch, ActorEventBatcher, ActorEventQos, ChildFrame, ParentFrame, RunSpec,
+};
+
+/// Direct actor links use separate bounded data/control queues. A slow parent
+/// can lose lossy batches (visible as a sequence gap), but it cannot grow the
+/// worker heap without bound or strand approvals behind token traffic.
+const DIRECT_EVENT_QUEUE_CAPACITY: usize = 64;
+const DIRECT_CONTROL_QUEUE_CAPACITY: usize = 32;
+const ACTOR_EVENT_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(20);
+const DIRECT_RUN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Every connection/run owns its spawned helpers. A cancelled owner must not
+/// detach children merely because Tokio's plain JoinHandle was dropped.
+struct OwnedTask<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> OwnedTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self.0.as_mut().expect("owned task present").await;
+        self.0.take();
+        result
+    }
+
+    fn abort(&self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl<T> Drop for OwnedTask<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+struct ActiveRun {
+    cancel: CancellationToken,
+    task: OwnedTask<()>,
+}
+
+impl ActiveRun {
+    async fn stop(mut self, terminal_tx: Option<&mpsc::Sender<ChildFrame>>) {
+        self.cancel.cancel();
+        if tokio::time::timeout(DIRECT_RUN_DRAIN_TIMEOUT, self.task.join())
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = tokio::time::timeout(DIRECT_RUN_DRAIN_TIMEOUT, self.task.join()).await;
+            if let Some(terminal_tx) = terminal_tx {
+                let _ = tokio::time::timeout(
+                    DIRECT_RUN_DRAIN_TIMEOUT,
+                    terminal_tx.send(ChildFrame::Terminal {
+                        status: crate::proto::TerminalStatus::Cancelled,
+                        result: None,
+                        error: None,
+                        transcript: Vec::new(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
 
 /// Pending host-callback replies, keyed by request id, shared between the
 /// per-run pump (which inserts) and the connection read loop (which resolves
 /// them on [`ParentFrame::ApprovalReply`]).
 type PendingReplies = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
+
+struct PendingReplyOwner {
+    pending: PendingReplies,
+    ids: Vec<String>,
+}
+
+impl Drop for PendingReplyOwner {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock().recover_poison();
+        for id in &self.ids {
+            pending.remove(id);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -239,8 +327,15 @@ impl WsServer {
 
     /// Serve connections forever (long-running service agent).
     pub async fn serve<E: ChildExecutor + ?Sized>(self, executor: Arc<E>) -> TransportResult<()> {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let (stream, _) = tokio::select! {
+                connection = connections.join_next(), if !connections.is_empty() => {
+                    let _ = connection;
+                    continue;
+                }
+                accepted = self.listener.accept() => accepted?,
+            };
             let exec = executor.clone();
             // The TLS handshake + auth callback run inside the spawned task (not
             // on the accept loop) so a slow/hostile client cannot stall the
@@ -248,7 +343,7 @@ impl WsServer {
             // `TlsAcceptor` is `Arc`-backed, the token is a short `String`.
             let tls = self.tls.clone();
             let token = self.expected_token.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _ = accept_and_handle(stream, &tls, &token, exec).await;
             });
         }
@@ -457,18 +552,29 @@ where
     E: ChildExecutor + ?Sized,
 {
     let (ws_tx, mut ws_rx) = ws.split();
-    // One writer task owns the sink; runs push frames through this channel (decouples read/write).
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<ChildFrame>();
-    let writer = tokio::spawn(writer_task(ws_tx, out_rx));
+    // One writer task owns the sink. Event traffic is bounded and independent
+    // from control traffic, so 200 active actors cannot create an unbounded
+    // per-connection token queue or starve an approval/cancellation response.
+    let (control_tx, control_rx) = mpsc::channel::<ChildFrame>(DIRECT_CONTROL_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel::<ChildFrame>(DIRECT_EVENT_QUEUE_CAPACITY);
+    let mut writer = OwnedTask::new(tokio::spawn(writer_task(ws_tx, control_rx, event_rx)));
 
     // Host-callback replies for gated-tool approvals the active run proxies back
     // to the host over this WS. Shared with each run's pump.
     let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut active_cancel: Option<CancellationToken> = None;
+    let mut active_run: Option<ActiveRun> = None;
     let mut active_steer: Option<mpsc::UnboundedSender<SteerMessage>> = None;
-    while let Some(msg) = ws_rx.next().await {
-        match msg? {
+    let result = loop {
+        let msg = tokio::select! {
+            _ = writer.join() => break Ok(()),
+            message = ws_rx.next() => match message {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => break Err(TransportError::from(error)),
+                None => break Ok(()),
+            },
+        };
+        match msg {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
                 // Phase 2: the host's decision on a proxied gated-tool approval.
                 // Routed through the `pending` correlation map (body =
@@ -486,26 +592,27 @@ where
                     // old task is orphaned and its output interleaves with the
                     // new run's. (The old steer sender is dropped implicitly by
                     // the reassignment of `active_steer` below.)
-                    if let Some(prev) = active_cancel.take() {
-                        prev.cancel();
+                    if let Some(prev) = active_run.take() {
+                        prev.stop(Some(&event_tx)).await;
                     }
                     let cancel = CancellationToken::new();
                     let (steer_tx, steer_rx) = SteerInbox::channel();
-                    active_cancel = Some(cancel.clone());
                     active_steer = Some(steer_tx);
-                    start_run(
+                    active_run = Some(start_run(
                         executor.clone(),
                         spec,
                         steer_rx,
                         cancel,
-                        out_tx.clone(),
+                        control_tx.clone(),
+                        event_tx.clone(),
                         pending.clone(),
-                    );
+                    ));
                 }
                 Ok(ParentFrame::Cancel) => {
-                    if let Some(c) = &active_cancel {
-                        c.cancel();
+                    if let Some(run) = active_run.take() {
+                        run.stop(Some(&event_tx)).await;
                     }
+                    active_steer = None;
                 }
                 Ok(ParentFrame::Message { text }) => {
                     // In-band steering: hand to the active run's inbox; the
@@ -521,29 +628,57 @@ where
                 }
                 Err(_) => { /* ignore malformed frame */ }
             },
-            Message::Close(_) => break,
+            Message::Close(_) => break Ok(()),
             _ => {}
         }
-    }
+    };
 
     // Parent disconnected / closed: cancel any still-active run so its spawned
     // task ends and stops feeding the writer. Without this `writer.await` blocks
     // until the orphaned run finishes on its own.
-    if let Some(c) = active_cancel {
-        c.cancel();
+    if let Some(run) = active_run {
+        run.stop(None).await;
     }
-    drop(out_tx);
-    let _ = writer.await;
-    Ok(())
+    drop(active_steer);
+    pending.lock().recover_poison().clear();
+    drop(control_tx);
+    drop(event_tx);
+    if writer.0.is_some() {
+        let _ = tokio::time::timeout(DIRECT_RUN_DRAIN_TIMEOUT, writer.join()).await;
+    }
+    result
 }
 
 async fn writer_task<S>(
     mut ws_tx: SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
-    mut out_rx: mpsc::UnboundedReceiver<ChildFrame>,
+    mut control_rx: mpsc::Receiver<ChildFrame>,
+    mut event_rx: mpsc::Receiver<ChildFrame>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    while let Some(frame) = out_rx.recv().await {
+    let mut control_open = true;
+    let mut events_open = true;
+    while control_open || events_open {
+        let frame = tokio::select! {
+            biased;
+            frame = control_rx.recv(), if control_open => match frame {
+                Some(frame) => Some(frame),
+                None => {
+                    control_open = false;
+                    None
+                }
+            },
+            frame = event_rx.recv(), if events_open => match frame {
+                Some(frame) => Some(frame),
+                None => {
+                    events_open = false;
+                    None
+                }
+            },
+        };
+        let Some(frame) = frame else {
+            continue;
+        };
         if ws_tx.send(Message::text(frame.to_text())).await.is_err() {
             break;
         }
@@ -556,32 +691,68 @@ fn start_run<E: ChildExecutor + ?Sized>(
     spec: RunSpec,
     steer: SteerInbox,
     cancel: CancellationToken,
-    out_tx: mpsc::UnboundedSender<ChildFrame>,
+    control_tx: mpsc::Sender<ChildFrame>,
+    event_tx: mpsc::Sender<ChildFrame>,
     pending: PendingReplies,
-) {
+) -> ActiveRun {
     let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
-    let out_fwd = out_tx.clone();
-    // forward executor events -> wire, ends when the executor drops the sink
-    let fwd = tokio::spawn(async move {
-        while let Some(e) = ev_rx.recv().await {
-            if out_fwd.send(ChildFrame::Event { event: e }).is_err() {
-                break;
+    let legacy_event_wire = spec.execution_epoch == 0;
+    let mut batcher = ActorEventBatcher::for_run(&spec, None, None);
+    let event_fwd = event_tx.clone();
+    // All event batches share one ordered data lane. Durable batches wait for
+    // capacity; lossy data uses `try_send`, making overload observable as a
+    // sequence gap. Approval/admission controls remain independent.
+    let mut fwd = OwnedTask::new(tokio::spawn(async move {
+        let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        flush.tick().await;
+        let mut open = true;
+        while open {
+            tokio::select! {
+                event = ev_rx.recv() => match event {
+                    Some(event) => {
+                        if legacy_event_wire {
+                            if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        for batch in batcher.push(event) {
+                            if !send_direct_event_batch(&event_fwd, batch).await {
+                                return;
+                            }
+                        }
+                    }
+                    None => open = false,
+                },
+                _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
+                    if let Some(batch) = batcher.flush() {
+                        if !send_direct_event_batch(&event_fwd, batch).await {
+                            return;
+                        }
+                    }
+                }
             }
         }
-    });
-    let out_control = out_tx.clone();
-    let control = tokio::spawn(async move {
+        if !legacy_event_wire {
+            if let Some(batch) = batcher.flush() {
+                let _ = send_direct_event_batch(&event_fwd, batch).await;
+            }
+        }
+    }));
+    let out_control = control_tx.clone();
+    let mut control = OwnedTask::new(tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
             let frame = match control {
                 ExecutorControl::SessionMessageAdmitted(confirmation) => {
                     ChildFrame::SessionMessageAdmitted { confirmation }
                 }
             };
-            if out_control.send(frame).is_err() {
+            if out_control.send(frame).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     // Host-callback pump: each gated-tool approval the executor proxies back
     // becomes an `ApprovalRequest` on the wire; its reply (an `ApprovalReply`
@@ -589,9 +760,13 @@ fn start_run<E: ChildExecutor + ?Sized>(
     // `pending`.
     let (bridge, mut req_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(bridge);
-    let out_req = out_tx.clone();
+    let out_req = control_tx.clone();
     let pending_for_pump = pending.clone();
-    let pump = tokio::spawn(async move {
+    let pump = OwnedTask::new(tokio::spawn(async move {
+        let mut registrations = PendingReplyOwner {
+            pending: pending_for_pump.clone(),
+            ids: Vec::new(),
+        };
         while let Some(req) = req_rx.recv().await {
             // Random + unguessable: the worker's pending map and the host-side
             // pending-approval registry both key on this exact string, so a
@@ -602,27 +777,60 @@ fn start_run<E: ChildExecutor + ?Sized>(
                 .lock()
                 .recover_poison()
                 .insert(id.clone(), req.reply);
+            registrations.ids.push(id.clone());
             let frame = match req.kind {
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
             };
-            if out_req.send(frame).is_err() {
+            if out_req.send(frame).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
-    tokio::spawn(async move {
-        let outcome = executor.run(spec, sink, steer, cancel).await;
-        let _ = fwd.await; // flush all events before the terminal frame
-        let _ = control.await; // flush durable-admission confirmations first
+    let run_cancel = cancel.clone();
+    let task = OwnedTask::new(tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let outcome = std::panic::AssertUnwindSafe(executor.run(spec, sink, steer, run_cancel))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| crate::executor::ChildOutcome::error("actor executor panicked"));
+        let _ = fwd.join().await; // flush all events before the terminal frame
+        let _ = control.join().await; // flush durable-admission confirmations first
         pump.abort(); // no more host callbacks after the run ends
-        let _ = out_tx.send(ChildFrame::Terminal {
-            status: outcome.status,
-            result: outcome.result,
-            error: outcome.error,
-            transcript: outcome.transcript,
-        });
-    });
+                      // Terminal follows every accepted event batch on the bounded event
+                      // lane. Approval/admission control remains independently prioritized.
+        let _ = event_tx
+            .send(ChildFrame::Terminal {
+                status: outcome.status,
+                result: outcome.result,
+                error: outcome.error,
+                transcript: outcome.transcript,
+            })
+            .await;
+    }));
+    ActiveRun { cancel, task }
+}
+
+async fn send_direct_event_batch(
+    event_tx: &mpsc::Sender<ChildFrame>,
+    batch: ActorEventBatch,
+) -> bool {
+    let frame = ChildFrame::EventBatch { batch };
+    if matches!(
+        &frame,
+        ChildFrame::EventBatch {
+            batch: ActorEventBatch {
+                qos: ActorEventQos::Durable,
+                ..
+            }
+        }
+    ) {
+        return event_tx.send(frame).await.is_ok();
+    }
+    match event_tx.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 // ---- parent side -------------------------------------------------------------
@@ -744,6 +952,153 @@ mod tests {
     use crate::executor::EchoExecutor;
     use crate::proto::{ChildFrame, TerminalStatus};
 
+    struct RunDropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for RunDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct UncooperativeExecutor(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl ChildExecutor for UncooperativeExecutor {
+        async fn run(
+            &self,
+            _spec: RunSpec,
+            events: EventSink,
+            _steer: SteerInbox,
+            _cancel: CancellationToken,
+        ) -> crate::ChildOutcome {
+            let _dropped = RunDropFlag(self.0.clone());
+            events.emit(serde_json::json!({"type":"ready"})).await;
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_server_abort_reclaim_uncooperative_execution() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        for abort_server in [false, true] {
+            let server = WsServer::bind_loopback().await.unwrap();
+            let endpoint = server.ws_endpoint();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let executor = Arc::new(UncooperativeExecutor(dropped.clone()));
+            let task = tokio::spawn(async move { server.serve(executor).await });
+            let mut client = ChildClient::connect(&endpoint).await.unwrap();
+            let spec = serde_json::from_value(serde_json::json!({"assignment":"hang"})).unwrap();
+            client.send(ParentFrame::Run(spec)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), client.next_frame())
+                .await
+                .unwrap()
+                .unwrap();
+            if abort_server {
+                task.abort();
+                let _ = task.await;
+            } else {
+                client.close().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    while !dropped.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("disconnect must abort an executor that ignores cancellation");
+                task.abort();
+                let _ = task.await;
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("server cancellation must own and release connection/run tasks");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_bounds_uncooperative_execution_and_emits_terminal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(UncooperativeExecutor(dropped.clone()));
+        let task = tokio::spawn(async move { server.serve_one(executor).await });
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(
+                serde_json::from_value(serde_json::json!({"assignment":"hang"})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        client.next_frame().await.unwrap();
+        client.send(ParentFrame::Cancel).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(8), client.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            frame,
+            ChildFrame::Terminal {
+                status: TerminalStatus::Cancelled,
+                ..
+            }
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+        client.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_panic_becomes_terminal_error() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl ChildExecutor for Panics {
+            async fn run(
+                &self,
+                _spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> crate::ChildOutcome {
+                panic!("intentional executor failure");
+            }
+        }
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let task = tokio::spawn(async move { server.serve_one(Arc::new(Panics)).await });
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(
+                serde_json::from_value(serde_json::json!({"assignment":"panic"})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            frame,
+            ChildFrame::Terminal {
+                status: TerminalStatus::Error,
+                ..
+            }
+        ));
+        client.close().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn transport_error_conversions_preserve_diagnostics_and_sources() {
         let io_source = std::io::Error::other("socket unavailable");
@@ -820,6 +1175,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 1,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -827,10 +1183,15 @@ mod tests {
             .unwrap();
 
         let mut events = Vec::new();
+        let mut saw_batch = false;
         let mut terminal = None;
         while let Some(frame) = client.next_frame().await.unwrap() {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
+                ChildFrame::EventBatch { batch } => {
+                    saw_batch = true;
+                    events.extend(batch.events);
+                }
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
@@ -848,6 +1209,10 @@ mod tests {
         assert_eq!(status, TerminalStatus::Completed);
         assert_eq!(result.as_deref(), Some("echo: one two"));
         assert!(events.iter().any(|e| e["content"] == "one "));
+        assert!(
+            saw_batch,
+            "a non-zero execution epoch must select event batches"
+        );
 
         let _ = client.close().await;
         let _ = srv.await;
@@ -881,6 +1246,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -946,6 +1312,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1050,7 +1417,9 @@ mod tests {
                 _cancel: CancellationToken,
             ) -> ChildOutcome {
                 let steered = steer.recv().await.unwrap_or_default();
-                events.emit(serde_json::json!({"type": "token", "content": steered.clone()}));
+                events
+                    .emit(serde_json::json!({"type": "token", "content": steered.clone()}))
+                    .await;
                 ChildOutcome::completed(format!("steered: {steered}"))
             }
         }
@@ -1069,6 +1438,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1126,12 +1496,14 @@ mod tests {
                 else {
                     panic!("expected typed SessionInbox delivery");
                 };
-                events.confirm_session_message(SessionMessageAdmissionConfirmation {
-                    target_session_id: delivery.target_session_id,
-                    envelope_id: delivery.envelope.id.as_str().to_string(),
-                    canonical_claim_generation: delivery.canonical_claim_generation,
-                    activation_run_id: delivery.activation_run_id,
-                });
+                events
+                    .confirm_session_message(SessionMessageAdmissionConfirmation {
+                        target_session_id: delivery.target_session_id,
+                        envelope_id: delivery.envelope.id.as_str().to_string(),
+                        canonical_claim_generation: delivery.canonical_claim_generation,
+                        activation_run_id: delivery.activation_run_id,
+                    })
+                    .await;
                 ChildOutcome::completed("confirmed")
             }
         }
@@ -1153,6 +1525,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1245,6 +1618,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1302,6 +1676,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
@@ -1323,6 +1698,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
@@ -1359,6 +1735,14 @@ mod tests {
                     if let Some(t) = event["content"].as_str() {
                         tokens.push(t.to_string());
                     }
+                }
+                ChildFrame::EventBatch { batch } => {
+                    tokens.extend(
+                        batch
+                            .events
+                            .into_iter()
+                            .filter_map(|event| event["content"].as_str().map(ToString::to_string)),
+                    );
                 }
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
@@ -1413,7 +1797,9 @@ mod tests {
                 _steer: SteerInbox,
                 cancel: CancellationToken,
             ) -> ChildOutcome {
-                events.emit(serde_json::json!({"type": "token", "content": "go"}));
+                events
+                    .emit(serde_json::json!({"type": "token", "content": "go"}))
+                    .await;
                 cancel.cancelled().await;
                 ChildOutcome::cancelled()
             }
@@ -1435,6 +1821,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1443,6 +1830,11 @@ mod tests {
         loop {
             match client.next_frame().await.unwrap() {
                 Some(ChildFrame::Event { event }) if event["content"] == "go" => break,
+                Some(ChildFrame::EventBatch { batch })
+                    if batch.events.iter().any(|event| event["content"] == "go") =>
+                {
+                    break;
+                }
                 Some(_) => continue,
                 None => panic!("connection closed before first token"),
             }
@@ -1458,6 +1850,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))

@@ -71,46 +71,56 @@ pub async fn set_bamboo_config(
     let effects = config_manager::effects_for_root_patch(&patch_obj);
     let provider_credential_intents = api_key_intents.providers.clone();
     let provider_instance_credential_intents = api_key_intents.provider_instances.clone();
+    let provider_metadata_only = provider_credential_intents.is_empty()
+        && provider_instance_credential_intents.is_empty()
+        && is_provider_only_patch(&patch_obj);
     // Apply the patch under the config write lock to avoid clobbering concurrent updates.
-    let new_config = app_state
-        .update_config_with_provider_credentials(
-            move |config| {
-                let current = config.clone();
-                let mut patch_obj = patch_obj;
-                remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
-                config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
-                config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
-                config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);
-                let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
-                // Compatibility serialization intentionally omits access
-                // verifier material. This path rejects all access-control
-                // mutations, so carry the hydrated runtime verifier records
-                // from the lock-time authority instead of losing them in the
-                // JSON merge round-trip.
-                new_config.access_control = current.access_control.clone();
-                new_config.cluster_fabric.prune_orphaned_credential_refs();
-                new_config.extra.remove("model_limits");
-                config_manager::sync_provider_api_keys_encrypted_for_patch(
-                    &mut new_config,
-                    &api_key_intents,
-                )?;
-                *config = new_config;
-                Ok(())
-            },
-            provider_credential_intents,
-            provider_instance_credential_intents,
-            ConfigUpdateEffects {
-                // Best-effort: setup/UX flows must be able to persist partial config even when
-                // provider init isn't possible yet.
-                reload_provider: effects.reload_provider,
-                reconcile_mcp: if effects.reconcile_mcp {
-                    bamboo_config::patch::ReloadMode::BestEffort
-                } else {
-                    bamboo_config::patch::ReloadMode::None
-                },
-            },
-        )
-        .await?;
+    let update = move |config: &mut bamboo_config::Config| {
+        let current = config.clone();
+        let mut patch_obj = patch_obj;
+        remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
+        config_manager::preserve_masked_provider_api_keys(&mut patch_obj, &current);
+        config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
+        config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);
+        let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
+        // Compatibility serialization intentionally omits access verifier
+        // material. This path rejects all access-control mutations, so carry
+        // the hydrated runtime verifier records from the lock-time authority
+        // instead of losing them in the JSON merge round-trip.
+        new_config.access_control = current.access_control.clone();
+        new_config.cluster_fabric.prune_orphaned_credential_refs();
+        new_config.extra.remove("model_limits");
+        config_manager::sync_provider_api_keys_encrypted_for_patch(
+            &mut new_config,
+            &api_key_intents,
+        )?;
+        *config = new_config;
+        Ok(())
+    };
+    let update_effects = ConfigUpdateEffects {
+        // Best-effort: setup/UX flows must be able to persist partial config even when
+        // provider init isn't possible yet.
+        reload_provider: effects.reload_provider,
+        reconcile_mcp: if effects.reconcile_mcp {
+            bamboo_config::patch::ReloadMode::BestEffort
+        } else {
+            bamboo_config::patch::ReloadMode::None
+        },
+    };
+    let new_config = if provider_metadata_only {
+        app_state
+            .update_provider_metadata(update, update_effects)
+            .await?
+    } else {
+        app_state
+            .update_config_with_provider_credentials(
+                update,
+                provider_credential_intents,
+                provider_instance_credential_intents,
+                update_effects,
+            )
+            .await?
+    };
 
     // Omission means "leave this independently owned section unchanged"; only
     // an explicit model_limits field may replace or clear it. Persist under the
@@ -134,6 +144,25 @@ pub async fn set_bamboo_config(
     response_config.sanitize_cluster_fabric_for_disk();
     Ok(HttpResponse::Ok()
         .json(redacted_config_json(&response_config, &app_state.app_data_dir).await?))
+}
+
+/// A credential-free compatibility patch may use the exact Providers
+/// transaction only when every remaining root field belongs to Providers.
+/// Mixed and unknown fields stay on the generic writer, whose section fence
+/// rejects multi-domain persistence.
+pub(super) fn is_provider_only_patch(patch_obj: &Map<String, Value>) -> bool {
+    !patch_obj.is_empty()
+        && patch_obj.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "provider"
+                    | "providers"
+                    | "defaults"
+                    | "provider_instances"
+                    | "default_provider_instance"
+                    | "features"
+            )
+        })
 }
 
 pub(super) fn remove_unchanged_access_control_echo(

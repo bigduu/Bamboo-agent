@@ -37,12 +37,14 @@ pub use mailbox::{
     ReplyBody, ADMITTED_SET_CAPACITY,
 };
 pub use proto::{
-    AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame, RunSpec,
-    SessionMessageAdmissionConfirmation, SessionMessageDelivery, TerminalStatus,
+    ActorEventBatch, ActorEventBatcher, ActorEventQos, AgentRecord, ChildFrame,
+    LogicalSessionIdentity, ParentFrame, RunSpec, SessionMessageAdmissionConfirmation,
+    SessionMessageDelivery, TerminalStatus, MAX_ACTOR_EVENT_BATCH_EVENTS,
 };
 pub use provision::{
     BusEndpoint, Capabilities, ChildIdentity, ExecutorSpec, Limits, McpProxyConfig, ModelRefSpec,
-    Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, WorkerOwner, PROVISION_VERSION,
+    Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, WorkerCapabilityReport,
+    WorkerOwner, PROVISION_VERSION, TYPED_READ_ONLY_WORKER_CAPABILITY,
 };
 pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,

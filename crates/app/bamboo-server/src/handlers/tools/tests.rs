@@ -6,7 +6,7 @@ use super::{
     models::{ToolExecutionRequest, ToolParameter},
     request::{
         build_tool_call, canonical_tool_name_or_error, parse_arguments, trimmed_session_id,
-        validate_session_context_requirement,
+        validate_direct_dispatch_support, validate_session_context_requirement,
     },
     response::build_execution_response,
 };
@@ -182,6 +182,35 @@ fn validate_session_context_requirement_rejects_missing_session_for_session_hist
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn validate_session_context_requirement_rejects_missing_session_for_current_history() {
+    let error = validate_session_context_requirement("session_history_current", None)
+        .expect_err("expected missing-session validation error");
+
+    match error {
+        AppError::BadRequest(message) => {
+            assert!(message.contains("requires session_id"));
+            assert!(message.contains("session_history_current"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn direct_http_rejects_lifecycle_only_archive_context() {
+    let error = validate_direct_dispatch_support("archive_context")
+        .expect_err("direct dispatch cannot complete the agent archive lifecycle");
+
+    match error {
+        AppError::BadRequest(message) => {
+            assert!(message.contains("lifecycle-only"));
+            assert!(message.contains("active agent run"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    validate_direct_dispatch_support("Read").expect("ordinary direct tools remain available");
 }
 
 #[test]

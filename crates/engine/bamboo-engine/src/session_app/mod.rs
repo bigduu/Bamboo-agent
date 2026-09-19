@@ -14,6 +14,7 @@ pub mod resolution;
 pub mod respond;
 pub mod resume;
 pub mod session_create;
+pub mod supervisor;
 pub mod system_prompt;
 pub mod truncation;
 pub mod types;

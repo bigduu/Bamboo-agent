@@ -423,8 +423,10 @@ impl SessionRunRegistration {
             .router
             .finish_finalization(&self.target_session_id, &self.run_id, admitted_generation)
             .await;
-        self.armed = false;
-        self.abort_cleanup = None;
+        if result.is_ok() {
+            self.armed = false;
+            self.abort_cleanup = None;
+        }
         result
     }
 }
@@ -460,6 +462,15 @@ impl SessionActivationRouter {
     /// graph has been assembled.
     pub async fn set_spawner(&self, spawner: Arc<dyn SessionActivationSpawner>) {
         *self.spawner.write().await = Some(spawner);
+    }
+
+    /// Snapshot the current logical run, including its terminal handoff.
+    pub async fn current_run_id(&self, target_session_id: &str) -> Option<String> {
+        self.states
+            .lock()
+            .await
+            .get(target_session_id)
+            .and_then(|state| state.owner.as_ref().map(|owner| owner.run_id.clone()))
     }
 
     /// Bind the durable inbox used by abandoned-run reconciliation.
@@ -735,6 +746,22 @@ impl SessionActivationRouter {
         run_id: &str,
         admitted_generation: u64,
     ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        // Deferred guidance may precede a later admitted message. A maximum
+        // transcript cursor alone cannot prove that this authorized queue is empty.
+        let inbox = self
+            .inbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let durable_pending = match inbox {
+            Some(inbox) => Some(
+                inbox
+                    .inspect(target_session_id)
+                    .await
+                    .map_err(|error| SessionActivationError::Internal(error.to_string()))?,
+            ),
+            None => None,
+        };
         let reservation_to_dispatch = {
             let mut states = self.states.lock().await;
             let state = states.entry(target_session_id.to_string()).or_default();
@@ -746,7 +773,14 @@ impl SessionActivationRouter {
                 return Ok(None);
             }
             state.owner = None;
-            if state.latest_generation > admitted_generation
+            let pending = durable_pending
+                .as_ref()
+                .is_some_and(|backlog| backlog.activation_pending());
+            if let Some(backlog) = durable_pending.as_ref() {
+                state.latest_generation =
+                    state.latest_generation.max(backlog.activation_generation);
+            }
+            if (pending || state.latest_generation > admitted_generation)
                 && state.latest_generation > state.last_dispatched_generation
                 && !state.activation_reserved
             {
@@ -759,6 +793,7 @@ impl SessionActivationRouter {
                 // caught up and no reservation exists, this target carries no
                 // live routing state and must not remain in AppState forever.
                 if state.latest_generation <= admitted_generation
+                    && !pending
                     && state.owner.is_none()
                     && !state.activation_reserved
                     && state.notify.receiver_count() == 0
@@ -1077,6 +1112,8 @@ mod tests {
     struct BlockingInspectInbox {
         entered: Arc<Notify>,
         release: Arc<Notify>,
+        drained: Arc<std::sync::atomic::AtomicBool>,
+        fail_once: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     #[async_trait]
@@ -1126,6 +1163,22 @@ mod tests {
             &self,
             _target_session_id: &str,
         ) -> Result<bamboo_domain::SessionInboxBacklog, bamboo_domain::SessionInboxError> {
+            if self
+                .fail_once
+                .as_ref()
+                .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+            {
+                return Err(bamboo_domain::SessionInboxError::Storage(
+                    "injected inspect failure".into(),
+                ));
+            }
+            if self.drained.load(Ordering::SeqCst) {
+                return Ok(bamboo_domain::SessionInboxBacklog {
+                    generation: 1,
+                    activation_generation: 1,
+                    ..Default::default()
+                });
+            }
             self.entered.notify_one();
             self.release.notified().await;
             Ok(bamboo_domain::SessionInboxBacklog {
@@ -1569,9 +1622,12 @@ mod tests {
         router.set_spawner(spawner.clone()).await;
         let inspect_entered = Arc::new(Notify::new());
         let inspect_release = Arc::new(Notify::new());
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
         router.set_inbox(Arc::new(BlockingInspectInbox {
             entered: inspect_entered.clone(),
             release: inspect_release.clone(),
+            drained: drained.clone(),
+            fail_once: None,
         }));
 
         let registration = router
@@ -1606,6 +1662,7 @@ mod tests {
         assert!(!router.owns_run("session", "run-abandoned").await);
 
         let mut successor = router.register_run("session", "run-1").await.unwrap();
+        drained.store(true, Ordering::SeqCst);
         successor.begin_finalization().await;
         assert_eq!(successor.finish(1).await.unwrap(), None);
     }
@@ -2023,10 +2080,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_terminal_inspection_keeps_the_exact_owner_cleanup_armed() {
+        let router = SessionActivationRouter::new();
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let inspect_release = Arc::new(Notify::new());
+        inspect_release.notify_one();
+        router.set_inbox(Arc::new(BlockingInspectInbox {
+            entered: Arc::new(Notify::new()),
+            release: inspect_release,
+            drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_once: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        }));
+        let mut registration = router
+            .register_run("session", "failed-inspect-run")
+            .await
+            .unwrap();
+        router.request_activation("session", 1).await.unwrap();
+        registration.begin_finalization().await;
+        assert!(registration.finish(1).await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while spawner.launches.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed inspection must not leave the old run owning the inbox");
+        assert!(!router.owns_run("session", "failed-inspect-run").await);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn poison_generation_launches_only_one_successor_until_new_work_arrives() {
         let router = SessionActivationRouter::new();
         let spawner = spawner();
         router.set_spawner(spawner.clone()).await;
+        let inspect_release = Arc::new(Notify::new());
+        router.set_inbox(Arc::new(BlockingInspectInbox {
+            entered: Arc::new(Notify::new()),
+            release: inspect_release.clone(),
+            drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_once: None,
+        }));
         let mut registration = router
             .register_run("session", "run-original")
             .await
@@ -2036,6 +2131,7 @@ mod tests {
             SessionActivationDisposition::ActiveNotified
         );
         registration.begin_finalization().await;
+        inspect_release.notify_one();
         assert_eq!(
             registration.finish(0).await.unwrap(),
             Some(SessionActivationDisposition::ActivationReserved)
@@ -2047,6 +2143,7 @@ mod tests {
         // cannot recursively launch provider loops.
         let mut successor_registration = router.register_run("session", "run-1").await.unwrap();
         successor_registration.begin_finalization().await;
+        inspect_release.notify_one();
         assert_eq!(successor_registration.finish(0).await.unwrap(), None);
         assert_eq!(
             router.request_activation("session", 7).await.unwrap(),

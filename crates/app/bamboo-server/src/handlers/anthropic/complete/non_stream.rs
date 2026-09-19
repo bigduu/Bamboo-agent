@@ -93,6 +93,7 @@ pub(super) async fn handle_non_streaming_complete(
             Ok(bamboo_llm::types::LLMChunk::Done) => break,
             Ok(bamboo_llm::types::LLMChunk::TransportActivity)
             | Ok(bamboo_llm::types::LLMChunk::ResponsesEvent { .. })
+            | Ok(bamboo_llm::types::LLMChunk::ProviderTranscriptItem(_))
             | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::ProviderUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })

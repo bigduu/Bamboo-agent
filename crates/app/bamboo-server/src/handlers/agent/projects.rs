@@ -12,7 +12,6 @@ use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
     LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding,
 };
-use bamboo_memory::memory_store::project_key_from_path;
 use bamboo_projects::{
     canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
 };
@@ -69,16 +68,6 @@ pub struct LegacyDryRunRequest {
     pub sessions: Vec<LegacySessionProjectInput>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct LegacyMemoryMigrationRequest {
-    pub legacy_project_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LegacyMemoryMigrationStatusQuery {
-    pub legacy_project_key: String,
-}
-
 fn missing_legacy_evidence(input: &LegacySessionProjectInput) -> Vec<&'static str> {
     let mut fields = Vec::new();
     if input.canonical_path.is_none() {
@@ -86,9 +75,6 @@ fn missing_legacy_evidence(input: &LegacySessionProjectInput) -> Vec<&'static st
     }
     if input.git_common_dir.is_none() {
         fields.push("git_common_dir");
-    }
-    if input.legacy_project_keys.is_empty() {
-        fields.push("legacy_project_keys");
     }
     fields
 }
@@ -167,11 +153,6 @@ fn enrich_legacy_dry_run_sessions(
                         input.session_id
                     )),
                 }
-            }
-            if input.legacy_project_keys.is_empty() {
-                input
-                    .legacy_project_keys
-                    .push(project_key_from_path(Path::new(&canonical_workspace)));
             }
             input
         })
@@ -554,111 +535,6 @@ pub async fn legacy_dry_run(
     Ok(HttpResponse::Ok().json(report))
 }
 
-pub async fn migrate_legacy_memory(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-    http_request: HttpRequest,
-    request: web::Json<LegacyMemoryMigrationRequest>,
-) -> Result<HttpResponse> {
-    let id = match parse_id(&path) {
-        Ok(id) => id,
-        Err(response) => return Ok(response),
-    };
-    let expected = match parse_if_match(&http_request) {
-        Ok(revision) => revision,
-        Err(response) => return Ok(response),
-    };
-    let current = match state.project_store.get(&id) {
-        Ok(project) => project,
-        Err(error) => return Ok(project_error(error)),
-    };
-    if current.revision != expected {
-        return Ok(project_error(ProjectStoreError::Conflict {
-            expected,
-            actual: current.revision,
-        }));
-    }
-    let project = if current
-        .legacy_project_keys
-        .iter()
-        .any(|key| key == &request.legacy_project_key)
-    {
-        current
-    } else {
-        match state.project_store.update(&id, expected, |project| {
-            project
-                .legacy_project_keys
-                .push(request.legacy_project_key.clone());
-            Ok(())
-        }) {
-            Ok(project) => {
-                state.account_sink.record(
-                    None,
-                    &AgentEvent::ProjectUpdated {
-                        project_id: project.id.to_string(),
-                        revision: project.revision,
-                    },
-                );
-                project
-            }
-            Err(error) => return Ok(project_error(error)),
-        }
-    };
-    match state
-        .project_store
-        .migrate_legacy_memory(&id, &request.legacy_project_key)
-    {
-        Ok(report) => {
-            let authoritative = match state.project_store.get(&id) {
-                Ok(project) => project,
-                Err(error) => return Ok(project_error(error)),
-            };
-            if authoritative.revision != project.revision {
-                state.account_sink.record(
-                    None,
-                    &AgentEvent::ProjectUpdated {
-                        project_id: authoritative.id.to_string(),
-                        revision: authoritative.revision,
-                    },
-                );
-            }
-            Ok(HttpResponse::Ok()
-                .insert_header((
-                    actix_web::http::header::ETAG,
-                    format!("\"{}\"", authoritative.revision),
-                ))
-                .json(serde_json::json!({
-                    "project_id": id,
-                    "project_revision": authoritative.revision,
-                    "migration": report,
-                })))
-        }
-        Err(error) => Ok(project_error(error)),
-    }
-}
-
-pub async fn legacy_memory_migration_status(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-    query: web::Query<LegacyMemoryMigrationStatusQuery>,
-) -> Result<HttpResponse> {
-    let id = match parse_id(&path) {
-        Ok(id) => id,
-        Err(response) => return Ok(response),
-    };
-    match state
-        .project_store
-        .legacy_memory_migration_status(&id, &query.legacy_project_key)
-    {
-        Ok(status) => Ok(HttpResponse::Ok().json(serde_json::json!({
-            "project_id": id,
-            "legacy_project_key": query.legacy_project_key,
-            "migration": status,
-        }))),
-        Err(error) => Ok(project_error(error)),
-    }
-}
-
 pub fn is_active(project: &ProjectManifest) -> bool {
     project.status == ProjectStatus::Active
 }
@@ -733,14 +609,6 @@ mod tests {
                 .route(
                     "/projects/migrations/legacy/dry-run",
                     web::post().to(legacy_dry_run),
-                )
-                .route(
-                    "/projects/{id}/migrations/legacy-memory",
-                    web::post().to(migrate_legacy_memory),
-                )
-                .route(
-                    "/projects/{id}/migrations/legacy-memory",
-                    web::get().to(legacy_memory_migration_status),
                 )
         };
     }
@@ -950,66 +818,6 @@ mod tests {
         assert!(!body.contains("TOP-SECRET-VALUE"));
         assert!(body.contains("resource_revision"));
 
-        let legacy_key = "legacy-key";
-        let legacy_root = dir
-            .path()
-            .join("memory/v1/scopes/projects")
-            .join(legacy_key);
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        std::fs::write(legacy_root.join("index.json"), r#"{"legacy":true}"#).unwrap();
-        let migration_revision = state.project_store.get(&renamed.id).unwrap().revision;
-        let migration = test::call_service(
-            &app,
-            test::TestRequest::post()
-                .uri(&format!(
-                    "/projects/{}/migrations/legacy-memory",
-                    renamed.id
-                ))
-                .insert_header((header::IF_MATCH, format!("\"{migration_revision}\"")))
-                .set_json(serde_json::json!({"legacy_project_key": legacy_key}))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(migration.status(), StatusCode::OK);
-        let migration_etag = migration
-            .headers()
-            .get(header::ETAG)
-            .expect("migration ETag")
-            .to_str()
-            .unwrap()
-            .to_string();
-        let migration_body: Value = test::read_body_json(migration).await;
-        assert_eq!(migration_body["migration"]["phase"], "committed");
-        let response_revision = migration_body["project_revision"]
-            .as_u64()
-            .expect("project revision");
-        assert_eq!(migration_etag, format!("\"{response_revision}\""));
-        assert_eq!(
-            state.project_store.get(&renamed.id).unwrap().revision,
-            response_revision,
-            "endpoint must return the authoritative post-migration CAS revision"
-        );
-        let mut observed_final_event = false;
-        for _ in 0..8 {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if matches!(
-                &event.event,
-                AgentEvent::ProjectUpdated {
-                    project_id,
-                    revision,
-                } if project_id == renamed.id.as_str() && *revision == response_revision
-            ) {
-                observed_final_event = true;
-                break;
-            }
-        }
-        assert!(
-            observed_final_event,
-            "post-migration revision must be published to the Project change feed"
-        );
         let before_external_write = state.project_store.get(&renamed.id).unwrap().revision;
         std::fs::write(
             commands.join("independent.md"),
@@ -1024,26 +832,10 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "an external resource write interleaved after migration must advance revision"
+                "an external resource write must advance revision"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(legacy_root.join("index.json").is_file());
-        assert!(home.join("memory/v1/index.json").is_file());
-
-        let migration_status = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri(&format!(
-                    "/projects/{}/migrations/legacy-memory?legacy_project_key={legacy_key}",
-                    renamed.id
-                ))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(migration_status.status(), StatusCode::OK);
-        let status_body: Value = test::read_body_json(migration_status).await;
-        assert_eq!(status_body["migration"]["phase"], "committed");
 
         let archive_revision = state.project_store.get(&renamed.id).unwrap().revision;
         let archive = test::call_service(
@@ -1174,7 +966,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn legacy_dry_run_groups_git_worktrees_with_derived_memory_keys() {
+    async fn legacy_dry_run_groups_git_worktrees_by_derived_git_common_dir() {
         let (dir, state) = app_state().await;
         let repository = dir.path().join("group-repository");
         let linked_worktree = dir.path().join("group-worktree");
@@ -1184,12 +976,6 @@ mod tests {
             &repository,
             &["worktree", "add", "-q", "-b", "linked-group", &linked_arg],
         );
-        let expected_keys = [
-            project_key_from_path(&repository),
-            project_key_from_path(&linked_worktree),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
         let app = test::init_service(project_app!(state)).await;
 
         let response = test::call_service(
@@ -1229,14 +1015,6 @@ mod tests {
                 .into_iter()
                 .collect()
         );
-        assert_eq!(
-            report.suggestions[0]
-                .legacy_project_keys
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            expected_keys
-        );
         assert!(report.unassigned.is_empty());
     }
 
@@ -1258,15 +1036,13 @@ mod tests {
                             "session_id": "explicit-a",
                             "workspace_path": &workspace,
                             "canonical_path": "/caller/canonical-a",
-                            "git_common_dir": "/caller/shared/.git",
-                            "legacy_project_keys": ["caller-key-a"]
+                            "git_common_dir": "/caller/shared/.git"
                         },
                         {
                             "session_id": "explicit-b",
                             "workspace_path": &workspace,
                             "canonical_path": "/caller/canonical-b",
-                            "git_common_dir": "/caller/shared/.git",
-                            "legacy_project_keys": ["caller-key-b"]
+                            "git_common_dir": "/caller/shared/.git"
                         }
                     ]
                 }))
@@ -1281,10 +1057,6 @@ mod tests {
             report.suggestions[0].basis,
             LegacyProjectMatchBasis::GitCommonDir
         );
-        assert_eq!(
-            report.suggestions[0].legacy_project_keys,
-            vec!["caller-key-a".to_string(), "caller-key-b".to_string()]
-        );
         assert!(report.unassigned.is_empty());
         assert!(report.diagnostics.is_empty());
     }
@@ -1298,15 +1070,12 @@ mod tests {
             workspace_path: Some(missing.to_string_lossy().into_owned()),
             canonical_path: None,
             git_common_dir: None,
-            legacy_project_keys: Vec::new(),
         }];
         let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
         assert!(enriched[0].canonical_path.is_none());
         assert!(enriched[0].git_common_dir.is_none());
-        assert!(enriched[0].legacy_project_keys.is_empty());
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("missing-session")
-                && diagnostic.contains("legacy_project_keys")
                 && diagnostic.contains("could not be canonicalized")
         }));
         let app = test::init_service(project_app!(state)).await;
@@ -1367,14 +1136,12 @@ mod tests {
             workspace_path: Some(workspace.to_string_lossy().into_owned()),
             canonical_path: None,
             git_common_dir: None,
-            legacy_project_keys: Vec::new(),
         }];
         let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
         std::fs::set_permissions(&guarded, original_permissions).unwrap();
 
         assert!(enriched[0].canonical_path.is_none());
         assert!(enriched[0].git_common_dir.is_none());
-        assert!(enriched[0].legacy_project_keys.is_empty());
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("unreadable-session") && diagnostic.contains("could not enrich")
         }));
@@ -1401,15 +1168,6 @@ mod tests {
                     git_common_dir: None,
                 }],
             )
-            .unwrap();
-        let project = state
-            .project_store
-            .update(&project.id, project.revision, |manifest| {
-                manifest
-                    .legacy_project_keys
-                    .push("legacy-zenith".to_string());
-                Ok(())
-            })
             .unwrap();
         let archived = state
             .project_store
@@ -1468,7 +1226,6 @@ mod tests {
         assert_eq!(restored.project_path, archived.project_path);
         assert_eq!(restored.project_path_status, archived.project_path_status);
         assert_eq!(restored.workspace_bindings, archived.workspace_bindings);
-        assert_eq!(restored.legacy_project_keys, archived.legacy_project_keys);
         assert_eq!(restored.resource_revision, archived.resource_revision);
         assert_eq!(restored.created_at, archived.created_at);
 

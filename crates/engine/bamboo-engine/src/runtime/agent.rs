@@ -37,6 +37,16 @@ pub struct DirectExecutionLease {
     registration: Option<crate::session_activation::SessionRunRegistration>,
 }
 
+impl DirectExecutionLease {
+    /// Release ownership before returning a handled pre-execution stop to an
+    /// SDK caller, so its next resume does not race the asynchronous Drop path.
+    pub async fn abandon(mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.abandon().await;
+        }
+    }
+}
+
 impl Agent {
     /// Wrap an existing [`AgentRuntime`] in an `Agent`.
     pub fn from_runtime(runtime: Arc<AgentRuntime>) -> Self {
@@ -73,7 +83,49 @@ impl Agent {
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
         let lease = self.begin_direct_execution(&session.id).await?;
+        self.prepare_external_session_for_execution(session).await?;
         self.execute_direct_registered(session, req, lease).await
+    }
+
+    /// Validate and publish Project/Workspace context for a caller-owned
+    /// session before any external pre-execution side effect.
+    ///
+    /// SDK facades that acquire a direct lease themselves call this before
+    /// approved-tool replay. [`execute_direct`](Self::execute_direct) also calls
+    /// it, so the lower-level escape hatch cannot bypass legacy migration,
+    /// Project validation, or runtime workspace publication.
+    pub async fn prepare_external_session_for_execution(
+        &self,
+        session: &mut Session,
+    ) -> crate::runtime::runner::Result<()> {
+        crate::session_app::execution_prep::prepare_external_session_for_execution(
+            session,
+            self.runtime.project_context_resolver.as_deref(),
+        )
+        .await
+    }
+
+    /// Resolve a proposed SDK Project assignment without publishing a runtime
+    /// workspace. The caller must persist the validated candidate before the
+    /// ordinary execution handoff publishes it or replays an approved tool.
+    pub async fn prepare_external_project_assignment_read_only(
+        &self,
+        session: &mut Session,
+    ) -> crate::runtime::runner::Result<()> {
+        let resolver = self
+            .runtime
+            .project_context_resolver
+            .as_deref()
+            .ok_or_else(|| {
+                bamboo_agent_core::AgentError::ProjectContext(
+                    "Project assignment requires a ProjectContextResolver".to_string(),
+                )
+            })?;
+        resolver
+            .refresh_session_prompt_read_only(session)
+            .await
+            .map(|_| ())
+            .map_err(|error| bamboo_agent_core::AgentError::ProjectContext(error.to_string()))
     }
 
     /// Acquire direct logical-session ownership before an SDK facade performs
@@ -350,6 +402,11 @@ impl AgentBuilder {
 
     pub fn provider(mut self, v: Arc<dyn bamboo_llm::LLMProvider>) -> Self {
         self.inner = self.inner.provider(v);
+        self
+    }
+
+    pub fn memory_store(mut self, v: bamboo_memory::memory_store::MemoryStore) -> Self {
+        self.inner = self.inner.memory_store(v);
         self
     }
 

@@ -95,6 +95,7 @@ pub mod agentic;
 pub mod bash_completion;
 pub mod context;
 pub mod executor;
+pub mod input_guard;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
@@ -110,7 +111,9 @@ pub use agentic::{
     AgenticToolExecutor, AgenticToolResult, Interaction, InteractionRole, ToolGoal,
 };
 pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
-pub use context::{ToolExecutionContext, ToolExecutionSessionFlags};
+pub use context::{
+    ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
+};
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
@@ -148,8 +151,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "session_note",
     "memory_note",
     "session_history",
+    "session_history_current",
     "recall",
     "session_inspector",
+    "archive_context",
     "compact_context",
     "Sleep",
     // The goal self-report tool records a status only; the durable goal-state
@@ -190,6 +195,7 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "ExitPlanMode",
             "request_permissions",
             "conclusion_with_options",
+            "archive_context",
             "compact_context",
         ]
         .iter()
@@ -203,6 +209,12 @@ mod tests {
     #[test]
     fn classify_compact_context_as_read_only() {
         assert_eq!(classify_tool("compact_context"), ToolMutability::ReadOnly);
+    }
+
+    #[test]
+    fn classify_archive_context_as_read_only() {
+        assert_eq!(classify_tool("archive_context"), ToolMutability::ReadOnly);
+        assert!(plan_mode_allows_tool("ARCHIVE_CONTEXT"));
     }
 
     #[test]

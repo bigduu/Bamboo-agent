@@ -403,9 +403,24 @@ pub fn check_permissions(
                 _ => Ok(None), // list / list_sessions → read-only
             }
         }
-        // Read-only: session_inspector (list / get_meta / read_messages) and the
-        // session_history viewer never mutate or spin up compute. #395.
-        "session_inspector" | "session_history" => Ok(None),
+        "session_control" => {
+            let action = required_string_arg(args, "action")?;
+            if action != "followup" {
+                return Err(PermissionError::CheckFailed(
+                    "unsupported session_control action".into(),
+                ));
+            }
+            let target = required_string_arg(args, "target_session_id")?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                format!("session_control followup {target}"),
+                "session_control followup: continue an existing independent Root",
+            )]))
+        }
+        // Read-only: session_inspector (list / get_meta / read_messages), the
+        // legacy session_history viewer, and exact self-only current history
+        // never mutate or spin up compute. #395.
+        "session_inspector" | "session_history" | "session_history_current" => Ok(None),
         // `notify` fires an outbound OS popup / push notification but mutates
         // nothing in the session or workspace, so it is explicitly ungated
         // (auto-approved) by design: a reminder/alert tool that itself
@@ -578,6 +593,10 @@ mod tests {
             ("SubAgent", json!({"action": "create", "prompt": "x"})),
             ("SubAgent", json!({"action": "run", "session_id": "c1"})),
             (
+                "session_control",
+                json!({"action": "followup", "target_session_id": "root-a", "operation_id": "op-a", "message": "continue"}),
+            ),
+            (
                 "SubAgent",
                 json!({"action": "send_message", "session_id": "c1"}),
             ),
@@ -663,6 +682,10 @@ mod tests {
             (
                 "session_inspector",
                 json!({"action": "read_messages", "session_id": "x"}),
+            ),
+            (
+                "session_history_current",
+                json!({"action": "read_current", "limit": 5}),
             ),
         ] {
             assert!(

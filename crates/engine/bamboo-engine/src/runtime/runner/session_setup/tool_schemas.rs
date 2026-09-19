@@ -1,14 +1,76 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
+use bamboo_domain::{
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet,
+};
 use bamboo_skills::runtime_metadata::{
     LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
     SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
-use bamboo_tools::exposure::{
-    activated_discoverable_tools, canonical_tool_name, discoverable_tool_short_description,
-    is_core_tool,
-};
+use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
+
+const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
+const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
+
+pub(crate) fn effective_guide_activation(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> std::collections::BTreeSet<String> {
+    if config.freeze_tool_exposure_for_cache {
+        if let Some(frozen) = session
+            .metadata
+            .get(EXPOSURE_ACTIVATED)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+        {
+            return frozen;
+        }
+    }
+    activated_discoverable_tools(session)
+}
+
+/// Capture presentation only; the catalog and execution authority are rebuilt live.
+pub(crate) fn resolve_tool_schemas_for_round(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &mut Session,
+) -> Vec<ToolSchema> {
+    if config.freeze_tool_exposure_for_cache {
+        use sha2::{Digest, Sha256};
+        let catalog = resolve_catalog_with_activation(
+            config,
+            tools,
+            session,
+            &std::collections::BTreeSet::new(),
+        );
+        let schemas = catalog
+            .iter()
+            .map(|entry| entry.schema())
+            .collect::<Vec<_>>();
+        let value = serde_json::to_value(schemas).expect("tool schemas serialize");
+        let bytes =
+            bamboo_llm::providers::common::tool_schema::canonicalize_json_value(&value).to_string();
+        let signature = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if session.metadata.get(EXPOSURE_SIGNATURE) != Some(&signature) {
+            session
+                .metadata
+                .insert(EXPOSURE_SIGNATURE.into(), signature);
+            session.metadata.insert(
+                EXPOSURE_ACTIVATED.into(),
+                serde_json::to_string(&activated_discoverable_tools(session))
+                    .expect("activation names serialize"),
+            );
+        }
+    } else {
+        session.metadata.remove(EXPOSURE_SIGNATURE);
+        session.metadata.remove(EXPOSURE_ACTIVATED);
+    }
+    resolve_available_tool_schemas_for_session(config, tools, session)
+}
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
@@ -36,11 +98,73 @@ fn apply_session_tool_schema_overrides(session: &Session, tool_schemas: &mut [To
     }
 }
 
+/// Prefer delegated planning only when the live, post-disable catalog actually
+/// contains `Plan`. A persisted session already inside the legacy PlanMode
+/// state machine keeps `ExitPlanMode` as its recovery path.
+fn prefer_delegated_plan_tool(
+    session: &Session,
+    catalog: &mut std::collections::BTreeMap<String, ClassifiedToolSchema>,
+) {
+    if !catalog.contains_key("Plan") {
+        return;
+    }
+
+    catalog.remove("EnterPlanMode");
+    let legacy_plan_active = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    if legacy_plan_active {
+        catalog.remove("Plan");
+    } else {
+        catalog.remove("ExitPlanMode");
+    }
+}
+
 pub(crate) fn resolve_available_tool_schemas_for_session(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
     session: &Session,
 ) -> Vec<ToolSchema> {
+    let catalog = resolve_classified_tool_catalog_for_session(config, tools, session);
+    let effective = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        std::iter::empty::<&str>(),
+    );
+    catalog
+        .into_iter()
+        .filter(|entry| effective.contains_execution_name(entry.execution_name()))
+        .map(ClassifiedToolSchema::into_schema)
+        .collect()
+}
+
+/// Resolve the provider-neutral logical catalog for one round.
+///
+/// Legacy providers project every model-visible Deferred entry from this
+/// catalog. Native/fallback progressive-loading adapters later consume the same
+/// classification and may project only initially visible entries. HostOnly
+/// entries remain represented for host compatibility but never cross the model
+/// catalog projection above.
+pub(crate) fn resolve_classified_tool_catalog_for_session(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+) -> Vec<ClassifiedToolSchema> {
+    resolve_catalog_with_activation(
+        config,
+        tools,
+        session,
+        &effective_guide_activation(config, session),
+    )
+}
+
+fn resolve_catalog_with_activation(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+    activated: &std::collections::BTreeSet<String>,
+) -> Vec<ClassifiedToolSchema> {
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
@@ -54,10 +178,6 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     // round, because this list is rebuilt unfiltered every round; with no resolver
     // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
     let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
-    if !disabled_tools.is_empty() {
-        tool_schemas.retain(|schema| !disabled_tools.contains(&schema.function.name));
-    }
-
     // The `update_goal` self-report tool is only meaningful while the autonomous
     // goal loop is active; hide it from every ordinary session so it never
     // tempts the model when no goal is set.
@@ -98,15 +218,17 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
         tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
 
-    let activated = activated_discoverable_tools(session);
-
-    // Replace descriptions for inactive discoverable tools with short summaries.
-    // All tools remain available to the LLM; activation only controls the
-    // depth of guidance (short vs full) shown in the tool guide.
+    // Legacy providers keep Deferred schemas visible during migration;
+    // activation only controls the depth of the existing tool-guide summaries.
     for schema in &mut tool_schemas {
-        let canonical = canonical_tool_name(&schema.function.name);
-        if !is_core_tool(&canonical) && !activated.contains(&canonical) {
-            if let Some(short) = discoverable_tool_short_description(&canonical) {
+        let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
+            continue;
+        };
+        let guide_name = identity.alias_fallback_name();
+        if identity.loading_class() == CapabilityLoadingClass::Deferred
+            && !activated.contains(guide_name)
+        {
+            if let Some(short) = expandable_tool_short_description(guide_name) {
                 schema.function.description =
                     format!("[Discoverable — not fully activated] {}", short);
             }
@@ -115,7 +237,37 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
 
     apply_session_tool_schema_overrides(session, &mut tool_schemas);
 
-    tool_schemas
+    let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
+    for entry in tool_schemas
+        .into_iter()
+        .filter_map(ClassifiedToolSchema::new)
+    {
+        let key = entry.execution_name().to_string();
+        match by_execution_name.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let disabled_execution_names = disabled_tools
+        .iter()
+        .filter_map(|reference| {
+            resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
+    prefer_delegated_plan_tool(session, &mut by_execution_name);
+
+    let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
+    catalog.sort_by(|left, right| {
+        left.schema()
+            .function
+            .name
+            .cmp(&right.schema().function.name)
+    });
+
+    catalog
 }
 
 #[cfg(test)]
@@ -127,6 +279,73 @@ mod live_disabled_tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        }
+    }
+
+    fn plan_catalog() -> std::collections::BTreeMap<String, ClassifiedToolSchema> {
+        ["Plan", "EnterPlanMode", "ExitPlanMode", "Read"]
+            .into_iter()
+            .map(schema)
+            .filter_map(ClassifiedToolSchema::new)
+            .map(|entry| (entry.execution_name().to_string(), entry))
+            .collect()
+    }
+
+    #[test]
+    fn delegated_plan_replaces_legacy_mode_tools_for_inactive_sessions() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["Plan", "Read"]
+        );
+    }
+
+    #[test]
+    fn delegated_plan_preserves_exit_for_an_active_legacy_session() {
+        let mut session = Session::new("s", "m");
+        let runtime = session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: bamboo_domain::PlanModeStatus::Exploring,
+        });
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["ExitPlanMode", "Read"]
+        );
+    }
+
+    #[test]
+    fn legacy_plan_mode_tools_remain_when_plan_is_not_available() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+        catalog.remove("Plan");
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert!(catalog.contains_key("EnterPlanMode"));
+        assert!(catalog.contains_key("ExitPlanMode"));
+    }
 
     struct TwoTools;
     #[async_trait::async_trait]
@@ -144,14 +363,7 @@ mod live_disabled_tests {
         fn list_tools(&self) -> Vec<ToolSchema> {
             ["alpha_tool", "beta_tool", "load_skill"]
                 .into_iter()
-                .map(|name| ToolSchema {
-                    schema_type: "function".into(),
-                    function: FunctionSchema {
-                        name: name.into(),
-                        description: String::new(),
-                        parameters: serde_json::json!({ "type": "object" }),
-                    },
-                })
+                .map(schema)
                 .collect()
         }
     }

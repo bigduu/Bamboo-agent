@@ -22,6 +22,7 @@ use crate::runtime::config::{
     GuardianConfig, GuardianSpawner, ImageFallbackConfig,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
+use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
     finalize_rejected_runner_if_distinct, finalize_runner, finalize_runner_exact,
     reserve_runner_core, ReserveOutcome, RunnerReservation,
@@ -34,16 +35,7 @@ use crate::session_activation::{
     SessionActivationRouter, SessionRunRegistration, SessionRunRegistrationError,
 };
 
-/// Shared, per-session-locked session cache.
-///
-/// A `DashMap` gives each session id its own shard-level lock (so unrelated
-/// sessions never contend), and the inner `parking_lot::RwLock` is a *sync*
-/// lock held only to briefly clone-out or mutate-and-write-back a single
-/// `Session` — never across an `.await`. Using a sync lock makes "no guard
-/// across await" a compile-time guarantee in Send futures.
-pub type SessionCache = std::sync::Arc<
-    dashmap::DashMap<String, std::sync::Arc<parking_lot::RwLock<bamboo_agent_core::Session>>>,
->;
+pub use crate::session_cache::SessionCache;
 
 enum SessionExecutionActivationOwnership {
     /// This runtime was built without a SessionInbox activation router.
@@ -373,7 +365,7 @@ async fn remove_runner_exact(
         .get(session_id)
         .is_some_and(|runner| runner.run_id == run_id)
     {
-        runners.remove(session_id);
+        super::runner_lifecycle::remove_runner_entry(&mut runners, session_id).await;
         true
     } else {
         false
@@ -434,8 +426,8 @@ pub async fn reserve_session_execution(
     SessionExecutionReserveOutcome::Reserved(execution_reservation)
 }
 
-/// Read a session out of the in-memory cache, cloning it out from under the
-/// brief sync read-lock. Returns `None` on a cache miss.
+/// Read a consistent session snapshot without acquiring a session or index
+/// lock. Returns `None` on a cache miss.
 ///
 /// This is the single canonical cache-read used everywhere a caller holds a
 /// `SessionCache` (HTTP handlers, server tools, the app-state loader). It
@@ -536,6 +528,9 @@ pub struct SessionExecutionArgs {
     pub selected_skill_ids: Option<Vec<String>>,
     pub selected_skill_mode: Option<String>,
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
+    /// Acknowledges that the forwarder actually published the terminal durable
+    /// history barrier before this runner becomes replaceable.
+    pub history_commit_barrier: HistoryCommitBarrier,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub gold_config: Option<GoldConfig>,
     /// Optional guardian adversarial-review gate configuration.
@@ -717,6 +712,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 selected_skill_ids,
                 selected_skill_mode,
                 mpsc_tx,
+                mut history_commit_barrier,
                 image_fallback,
                 gold_config,
                 guardian_config,
@@ -788,7 +784,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 Some(&model),
             );
 
-            let system_prompt = system_prompt_for_session(&session);
+            let system_prompt = system_prompt_for_debug_log(&mut session);
             if let Some(prompt) = system_prompt.as_ref() {
                 log_base_system_prompt_snapshot(&session_id, prompt);
             }
@@ -978,8 +974,31 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            if let Err(error) = agent.persistence().save_runtime_session(&mut session).await {
+            let saved = agent.persistence().save_runtime_session(&mut session).await;
+            let history_committed = saved.is_ok();
+            let authority_conflict = saved.as_ref().err().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+            });
+            if let Err(error) = saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
+            }
+
+            // `Complete` intentionally closes the low-latency token stream as
+            // soon as generation ends. Publish a separate durable barrier only
+            // after the final runtime snapshot has been saved, while this run's
+            // publication fence still owns event ordering. Account-feed clients
+            // can now reconcile `/history` without racing the checkpoint.
+            if history_committed
+                && !history_commit_barrier
+                    .send_and_wait(&mpsc_tx, session_id.clone())
+                    .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "history commit barrier could not be published before runner finalization"
+                );
             }
 
             // Flip the runner registry to a terminal status (which makes session
@@ -1021,11 +1040,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let child_status = session.last_run_status();
             let child_error = session.last_run_error();
 
-            // Update memory cache.
-            sessions_cache.insert(
-                session_id.clone(),
-                Arc::new(parking_lot::RwLock::new(session)),
-            );
+            // Preserve normal I/O failure behavior, but never overwrite a
+            // current Root's cache with a rejected authority/incarnation.
+            if !authority_conflict {
+                sessions_cache.insert(
+                    session_id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(session)),
+                );
+            }
 
             if let (Some(handler), Some(parent_session_id), Some(status)) =
                 (child_completion, parent_session_id, child_status)
@@ -1105,6 +1127,14 @@ fn system_prompt_for_session(session: &Session) -> Option<String> {
         .map(|message| message.content.clone())
 }
 
+/// Normalize legacy host-owned prompt sections before the debug logger can
+/// observe persisted System text. The runner repeats this migration
+/// idempotently before workspace-scoped setup.
+fn system_prompt_for_debug_log(session: &mut Session) -> Option<String> {
+    crate::runtime::runner::session_setup::migrate_legacy_workspace_prompt(session);
+    system_prompt_for_session(session)
+}
+
 fn initial_user_message_for_session(session: &Session) -> String {
     session
         .messages
@@ -1138,6 +1168,46 @@ fn selected_skill_mode_for_session(session: &Session) -> Option<String> {
 mod reservation_tests {
     use super::*;
     use crate::runtime::execution::runner_state::AgentStatus;
+
+    #[test]
+    fn debug_prompt_snapshot_migrates_legacy_host_paths_before_logging() {
+        let legacy_project = format!(
+            "{}\nProject ID: legacy-project\nProject path: /private/legacy-project\nProject home: /private/legacy-home\n{}",
+            crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+            crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+        );
+        let legacy_workspace =
+            crate::runtime::context::build_workspace_prompt_context("/private/legacy-workspace")
+                .expect("legacy workspace context");
+        let legacy_instruction = format!(
+            "{}\nSource: /private/legacy-workspace/AGENTS.md\nlegacy policy\n{}",
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_END_MARKER,
+        );
+        let mut session = Session::new("legacy-debug-log", "model");
+        session.add_message(bamboo_agent_core::Message::system(format!(
+            "Base prompt\n\n{legacy_project}\n\n{legacy_workspace}\n\n{legacy_instruction}"
+        )));
+
+        let prompt = system_prompt_for_debug_log(&mut session).expect("normalized System");
+
+        assert_eq!(prompt, "Base prompt");
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some("/private/legacy-workspace")
+        );
+        for private_path in [
+            "/private/legacy-project",
+            "/private/legacy-home",
+            "/private/legacy-workspace",
+        ] {
+            assert!(!prompt.contains(private_path));
+        }
+        assert!(!prompt.contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+        assert!(!prompt
+            .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+    }
 
     #[test]
     fn reservation_target_requires_domain_id_and_exact_runner_registry() {

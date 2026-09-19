@@ -33,8 +33,7 @@ impl SessionNoteTool {
         }
     }
 
-    #[cfg(test)]
-    fn with_memory_store(memory_store: MemoryStore) -> Self {
+    pub fn with_memory_store(memory_store: MemoryStore) -> Self {
         Self { memory_store }
     }
 }
@@ -169,6 +168,7 @@ mod tests {
             .invoke(
                 json!({"action": "unknown"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_unknown"),
                     event_tx: None,
@@ -191,6 +191,7 @@ mod tests {
             .invoke(
                 json!({"action": "replace"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_replace"),
                     event_tx: None,
@@ -219,6 +220,7 @@ mod tests {
             .invoke(
                 json!({"action": "append", "topic": "backend", "content": "API finalized"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_append"),
                     event_tx: None,
@@ -244,6 +246,7 @@ mod tests {
             .invoke(
                 json!({"action": "read", "topic": "backend"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_read"),
                     event_tx: None,
@@ -271,6 +274,7 @@ mod tests {
             .invoke(
                 json!({"action": "list_topics"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_list"),
                     event_tx: None,
@@ -296,6 +300,7 @@ mod tests {
             .invoke(
                 json!({"action": "clear", "topic": "backend"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_clear"),
                     event_tx: None,
@@ -327,6 +332,7 @@ mod tests {
         tool.invoke(
             json!({"action": "replace", "topic": "default", "content": long_content}),
             ToolCtx {
+                executing_supervisor: None,
                 session_id: Some(std::sync::Arc::from("session-2")),
                 tool_call_id: std::sync::Arc::from("tool_call_replace_long"),
                 event_tx: None,
@@ -346,6 +352,7 @@ mod tests {
             .invoke(
                 json!({"action": "read", "topic": "default"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-2")),
                     tool_call_id: std::sync::Arc::from("tool_call_read_long"),
                     event_tx: None,
@@ -370,6 +377,7 @@ mod tests {
         tool.invoke(
             json!({"action": "replace", "topic": "limit", "content": "x".repeat(crate::tools::session_memory::MAX_SESSION_NOTE_CHARS - 1)}),
             ToolCtx {
+                executing_supervisor: None,
                 session_id: Some(std::sync::Arc::from("session-3")),
                 tool_call_id: std::sync::Arc::from("tool_call_replace_limit"),
                 event_tx: None,
@@ -389,6 +397,7 @@ mod tests {
             .invoke(
                 json!({"action": "append", "topic": "limit", "content": "y"}),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-3")),
                     tool_call_id: std::sync::Arc::from("tool_call_append_limit"),
                     event_tx: None,

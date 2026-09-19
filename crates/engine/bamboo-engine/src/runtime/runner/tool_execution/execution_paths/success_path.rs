@@ -101,6 +101,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
 
     if clarification::maybe_handle_user_question_tool(clarification::UserQuestionToolContext {
         tool_call: ctx.tool_call,
+        permission_replay_origin: ctx.permission_replay_origin,
         result: ctx.result,
         session: ctx.session,
         event_tx: ctx.event_tx,

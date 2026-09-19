@@ -447,6 +447,16 @@ pub async fn patch_session(
                             bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
                         )));
         if membership_changed || workspace_changed {
+            let Some(next_version) = session.metadata_version.checked_add(1) else {
+                return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "session_metadata_revision_exhausted",
+                        "message": "Session metadata revision cannot advance"
+                    },
+                    "session_id": session_id,
+                })));
+            };
             match target.as_ref() {
                 Some(project_id) if membership_changed => {
                     session.set_project_id_meta(project_id.to_string())
@@ -472,7 +482,7 @@ pub async fn patch_session(
                     );
                 }
             }
-            session.metadata_version = session.metadata_version.saturating_add(1);
+            session.metadata_version = next_version;
             session.updated_at = chrono::Utc::now();
 
             // Resolve and replace the stable Project/Workspace markers through
@@ -486,19 +496,33 @@ pub async fn patch_session(
                 return Ok(project_context_error_response(error));
             }
 
-            state
-                .persistence
-                .storage()
-                .save_session(&session)
-                .await
-                .map_err(|error| {
-                    crate::error::json_internal_server_error(format!(
-                        "Failed to save Project/Workspace update: {error}"
-                    ))
-                })?;
+            #[cfg(test)]
+            patch_test_hooks::pause_after_authoritative_fields(&format!(
+                "project-save:{session_id}"
+            ))
+            .await;
+
+            if let Err(error) = state.persistence.storage().save_session(&session).await {
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                {
+                    return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "session_authority_conflict",
+                            "message": "Session context changed; reload before updating Project or Workspace"
+                        },
+                        "session_id": session_id,
+                    })));
+                }
+                return Err(crate::error::json_internal_server_error(format!(
+                    "Failed to save Project/Workspace update: {error}"
+                )));
+            }
             state.sessions.insert(
                 session_id.clone(),
-                std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+                std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
             );
             if let Some(workspace) = session
                 .workspace_path_meta()
@@ -755,7 +779,7 @@ pub async fn patch_session(
             })?;
         state.sessions.insert(
             session_id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
         drop(guard);
 
@@ -854,6 +878,47 @@ mod tests {
             label: None,
             git_common_dir: None,
         }
+    }
+
+    #[actix_web::test]
+    async fn ordinary_create_and_real_title_patch_cannot_forge_supervisor_identity() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let forged = serde_json::json!({"kind":"supervisor","incarnation_id":uuid::Uuid::new_v4()});
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({"title":"Ordinary", "authority_identity":forged}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(response).await;
+        let id = body["session"]["id"].as_str().unwrap();
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before.authority_identity.is_ordinary());
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", before.metadata_version)))
+                .set_json(
+                    serde_json::json!({"title":"Really patched", "authority_identity":forged}),
+                )
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(persisted.title, "Really patched");
+        assert!(persisted.metadata_version > before.metadata_version);
+        assert!(persisted.authority_identity.is_ordinary());
     }
 
     #[actix_web::test]
@@ -1352,6 +1417,12 @@ mod tests {
         )
         .await;
         let id = create_session!(app);
+        let before = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load initial session")
+            .expect("initial session");
 
         let response = test::call_service(
             &app,
@@ -1372,7 +1443,8 @@ mod tests {
             .await
             .expect("load")
             .expect("session");
-        assert!(persisted.agent_runtime_state.is_none());
+        assert_eq!(persisted.metadata_version, before.metadata_version);
+        assert_eq!(persisted.agent_runtime_state, before.agent_runtime_state);
     }
 
     async fn seed_session(
@@ -1402,7 +1474,153 @@ mod tests {
             .expect("seed session");
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+        );
+    }
+
+    #[actix_web::test]
+    async fn root_context_fence_project_patch_rejects_final_store_race_without_publication() {
+        let state = new_state().await;
+        let workspace = tempdir().unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Requested Project",
+                None,
+                workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let winner_project = state
+            .project_store
+            .create("Competing Project", None)
+            .unwrap();
+        let id = "http-root-context-race";
+        seed_session(&state, id, None, None).await;
+        let cached_before = state.sessions.get(id).unwrap().value().clone();
+        let workspace_before = bamboo_agent_core::workspace_state::peek_workspace(id);
+        let second = bamboo_storage::SessionStoreV2::new(state.app_data_dir.clone())
+            .await
+            .unwrap();
+        let mut winner = second.load_session(id).await.unwrap().unwrap();
+        winner.set_project_id_meta(winner_project.id.to_string());
+        winner.metadata_version += 1;
+        let path = state
+            .app_data_dir
+            .join("sessions")
+            .join(id)
+            .join("session.json");
+        let history_before = std::fs::read(&path).unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let hook = super::patch_test_hooks::install(&format!("project-save:{id}"));
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let patch = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({"project_id":project.id, "title":"Must not publish"}))
+                .to_request(),
+        );
+        let compete = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+                .await
+                .unwrap();
+            second.save_runtime_state(&winner).await.unwrap();
+            hook.resume.notify_one();
+        };
+        let (response, ()) = tokio::join!(patch, compete);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_conflict");
+        assert!(std::sync::Arc::ptr_eq(
+            &cached_before,
+            state.sessions.get(id).unwrap().value()
+        ));
+        assert_eq!(
+            bamboo_agent_core::workspace_state::peek_workspace(id),
+            workspace_before
+        );
+        assert_eq!(std::fs::read(path).unwrap(), history_before);
+        let persisted = second.load_root_authority(id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(winner_project.id.as_str())
+        );
+        assert_eq!(persisted.metadata_version, 1);
+        assert_eq!(persisted.title, "Original title");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), feed.recv())
+                .await
+                .is_err(),
+            "rejected Project/Title mutation must not publish an account event"
+        );
+    }
+
+    #[actix_web::test]
+    async fn root_context_fence_project_and_workspace_patch_overflow_preserves_state() {
+        let state = new_state().await;
+        let project_path = tempdir().unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Overflow Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let workspace = tempdir().unwrap();
+        let id = "http-root-context-overflow";
+        let mut session = bamboo_agent_core::Session::new(id, "model");
+        session.metadata_version = u64::MAX;
+        state.storage.save_session(&session).await.unwrap();
+        let cached = std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone()));
+        state.sessions.insert(id.to_string(), cached.clone());
+        let before = serde_json::to_vec(&session).unwrap();
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for request in [
+            serde_json::json!({"project_id":project.id}),
+            serde_json::json!({"workspace_path":workspace.path().to_string_lossy()}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .insert_header((header::IF_MATCH, format!("\"{}\"", u64::MAX)))
+                    .set_json(request)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "session_metadata_revision_exhausted");
+            let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&persisted).unwrap(),
+                serde_json::from_slice::<Value>(&before).unwrap()
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &cached,
+                state.sessions.get(id).unwrap().value()
+            ));
+        }
+        assert!(bamboo_agent_core::workspace_state::peek_workspace(id).is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), feed.recv())
+                .await
+                .is_err()
         );
     }
 
@@ -1510,6 +1728,8 @@ mod tests {
             .expect("load session")
             .expect("session exists");
         session.set_project_id_meta("../malformed");
+        session.metadata_version = session.metadata_version.checked_add(1).unwrap();
+        let malformed_version = session.metadata_version;
         state
             .storage
             .save_session(&session)
@@ -1520,7 +1740,7 @@ mod tests {
             &app,
             test::TestRequest::patch()
                 .uri(&format!("/api/v1/sessions/{id}"))
-                .insert_header((header::IF_MATCH, "\"0\""))
+                .insert_header((header::IF_MATCH, format!("\"{malformed_version}\"")))
                 .set_json(serde_json::json!({ "project_id": null }))
                 .to_request(),
         )
@@ -1537,7 +1757,7 @@ mod tests {
             reloaded.project_id_meta().is_none(),
             "explicit null must clear even a malformed legacy value"
         );
-        assert_eq!(reloaded.metadata_version, 1);
+        assert_eq!(reloaded.metadata_version, malformed_version + 1);
     }
 
     #[actix_web::test]
@@ -1577,7 +1797,7 @@ mod tests {
             .expect("persist session");
         state.sessions.insert(
             session.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
         let app = test::init_service(
             App::new()

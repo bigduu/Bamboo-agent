@@ -47,6 +47,7 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
     let mut session = Session::new("session-1", "model");
 
     let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        permission_replay_origin: None,
         tool_call: &tool_call,
         result: &result,
         session: &mut session,
@@ -148,6 +149,7 @@ async fn legacy_pending_question_persistence_failure_never_publishes_clarificati
 
     assert!(
         maybe_handle_user_question_tool(UserQuestionToolContext {
+            permission_replay_origin: None,
             tool_call: &tool_call,
             result: &result,
             session: &mut session,
@@ -198,6 +200,7 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
     let mut session = Session::new("session-perm", "model");
 
     let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        permission_replay_origin: None,
         tool_call: &tool_call,
         result: &result,
         session: &mut session,
@@ -343,6 +346,7 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
     });
 
     let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        permission_replay_origin: None,
         tool_call: &tool_call,
         result: &result,
         session: &mut session,
@@ -454,6 +458,7 @@ async fn maybe_handle_user_question_tool_ignores_unrelated_tool_calls() {
     let mut session = Session::new("session-1", "model");
 
     let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        permission_replay_origin: None,
         tool_call: &tool_call,
         result: &result,
         session: &mut session,

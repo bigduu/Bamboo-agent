@@ -23,6 +23,10 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Ok(LLMChunk::ResponsesEvent { .. }) => Ok(()),
+        Ok(LLMChunk::ProviderTranscriptItem(item)) => {
+            state.push_provider_transcript_item(item);
+            Ok(())
+        }
         Ok(LLMChunk::Token(token)) => {
             state.append_token(&token);
             if let Some(event_tx) = event_tx {

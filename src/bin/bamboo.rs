@@ -311,7 +311,13 @@ enum Commands {
     /// closes the pipe), self-registers into the discovery fabric, and serves
     /// one run over a loopback WebSocket. Not intended for interactive use.
     #[command(name = "subagent-worker", hide = true)]
-    SubagentWorker,
+    SubagentWorker {
+        /// Print the non-secret worker capability document and exit without
+        /// reading a provision spec. Used by a parent before authority-bearing
+        /// typed read-only provisioning.
+        #[arg(long, hide = true)]
+        print_capabilities: bool,
+    },
 
     /// Internal Codex command-auth helper. The token stays in a Bamboo-owned
     /// 0600 file so a long-lived app-server can refresh per-run credentials.
@@ -977,7 +983,8 @@ enum BrokerCommands {
 
         /// Max concurrent WebSocket connections (#53 DoS defense). Beyond
         /// this, new connections are dropped immediately. Default is
-        /// generous — sized well above a normal multi-worker fabric.
+        /// sized with headroom for 200 concurrent actor activations and their
+        /// split control/event/MCP connections.
         #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().max_connections)]
         max_connections: usize,
 
@@ -1055,6 +1062,11 @@ enum BrokerAgentCommands {
         /// are ignored (the spec is authoritative).
         #[arg(long = "spec-stdin")]
         spec_stdin: bool,
+
+        /// Print the non-secret worker capability document and exit before
+        /// reading a provision spec or connecting to the broker.
+        #[arg(long, hide = true)]
+        print_capabilities: bool,
 
         /// Like --spec-stdin, but read the spec from this FILE (a remote deployer
         /// uploads it next to the binary). Takes precedence over --spec-stdin.
@@ -1315,7 +1327,7 @@ async fn run() {
             // display. Matches the standalone `bamboo-tui` binary, which
             // installs none.
         }
-        Some(Commands::SubagentWorker)
+        Some(Commands::SubagentWorker { .. })
         | Some(Commands::CodexProviderToken { .. })
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
@@ -1564,7 +1576,16 @@ async fn run() {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Commands::SubagentWorker => {
+        Commands::SubagentWorker { print_capabilities } => {
+            if print_capabilities {
+                let report = bamboo_subagent::WorkerCapabilityReport::current();
+                println!(
+                    "{}",
+                    serde_json::to_string(&report)
+                        .expect("worker capability report must serialize")
+                );
+                return;
+            }
             let result = bamboo_agent::subagent_worker::run().await;
             if let Err(e) = &result {
                 eprintln!("subagent-worker failed: {e}");
@@ -1751,9 +1772,25 @@ async fn run() {
                 echo,
                 mcp_proxy,
                 spec_stdin,
+                print_capabilities,
                 spec_file,
                 tls_ca_cert,
             } = command;
+            if print_capabilities {
+                if !spec_stdin || spec_file.is_some() {
+                    eprintln!(
+                        "broker-agent capability probe requires --spec-stdin and forbids --spec-file"
+                    );
+                    std::process::exit(2);
+                }
+                let report = bamboo_subagent::WorkerCapabilityReport::current();
+                println!(
+                    "{}",
+                    serde_json::to_string(&report)
+                        .expect("worker capability report must serialize")
+                );
+                return;
+            }
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
                 .filter(|t| !t.is_empty())
@@ -2266,7 +2303,11 @@ mod tests {
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "****...****"
         );
-        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+        assert_eq!(
+            value["tools"]["disabled"],
+            json!(["bash", "read_file"]),
+            "CLI serialization must preserve exact references for catalog-aware resolution"
+        );
     }
 
     #[test]
@@ -2283,7 +2324,11 @@ mod tests {
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "super-secret"
         );
-        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+        assert_eq!(
+            value["tools"]["disabled"],
+            json!(["bash", "read_file"]),
+            "including secrets must not change exact disabled-tool references"
+        );
     }
 
     #[test]

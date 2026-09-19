@@ -1,19 +1,22 @@
-//! Minimal round prelude — provides `prepare_round` for lifecycle adapter
-//! and `refresh_round_prompt_context` for the pipeline.
+//! Shared round prelude for the lifecycle adapter and main pipeline.
+//! Durable input admission and cancellation checks happen before prompt context.
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
+use bamboo_domain::AgentRuntimeState;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    refresh_external_memory_context, PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    refresh_external_memory_context, PromptMemoryExposureProvenance, PromptMemoryRuntimeContext,
+    PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -24,7 +27,8 @@ use bamboo_agent_core::PromptSnapshot;
 pub(crate) struct RoundPreludeFrame<'a> {
     pub execution_id: &'a str,
     pub round: usize,
-    pub max_rounds: usize,
+    /// Round cap; `None` = unlimited. Logging surfaces it as `null`.
+    pub max_rounds: Option<usize>,
     pub debug_enabled: bool,
     pub cancel_token: &'a CancellationToken,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -40,16 +44,20 @@ const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
 
 pub(crate) async fn refresh_round_prompt_context(
     session: &mut Session,
+    memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
-) -> Result<(), AgentError> {
+    app_data_dir: Option<&std::path::Path>,
+) -> Result<PromptMemoryExposureProvenance, AgentError> {
     refresh_project_context(session, project_context_resolver).await?;
-    refresh_external_memory_context(
+    let prompt_memory_exposure = refresh_external_memory_context(
         session,
+        memory,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
+        app_data_dir,
     )
     .await;
     // Task list, goal, plan-mode, and plan-runtime context are NOT injected into
@@ -67,7 +75,7 @@ pub(crate) async fn refresh_round_prompt_context(
         persist_round_prompt_metadata(session, &prompt);
         log_round_prompt_refresh_summary(session_id.as_str(), &prompt);
     }
-    Ok(())
+    Ok(prompt_memory_exposure)
 }
 
 async fn refresh_project_context(
@@ -84,16 +92,111 @@ async fn refresh_project_context(
         .map_err(|error| AgentError::ProjectContext(error.to_string()))
 }
 
+/// Refresh the durable turn boundary before deriving any prompt context.
+///
+/// Both the main pipeline and the lifecycle adapter use this exact sequence so
+/// external-memory recall always sees messages admitted for the current round,
+/// while a cancelled run never starts Project or memory context work.
+pub(crate) async fn refresh_round_boundary_and_prompt_context(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    cancel_token: &CancellationToken,
+    metrics_collector: Option<&MetricsCollector>,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) -> Result<PromptMemoryExposureProvenance, AgentError> {
+    if let Some(notifications) = config.session_activation_notifications.as_ref() {
+        let mut receiver = notifications.lock();
+        if receiver.has_changed().unwrap_or(false) {
+            let generation = *receiver.borrow_and_update();
+            tracing::debug!(
+                session_id = %session.id,
+                generation,
+                "active loop consumed SessionInbox wake notification at safe boundary"
+            );
+        }
+    }
+
+    let turn_refresh = super::state_bridge::refresh_turn_boundary_with_inbox_for_run(
+        session,
+        config.storage.as_ref(),
+        config.persistence.as_ref(),
+        config.session_inbox.as_ref(),
+        config.guidance_active_run_id.as_deref(),
+    )
+    .await;
+    if turn_refresh.merged > 0 {
+        tracing::debug!(
+            session_id = %session.id,
+            admitted_messages = turn_refresh.merged,
+            "turn boundary admitted durable SessionInbox work"
+        );
+    }
+    // A queued user message is already part of the durable transcript here,
+    // and the current tool result is already complete. Publish the append now
+    // so clients can render it before the next provider response begins.
+    if let Some(event_tx) = event_tx {
+        for message in &turn_refresh.committed_messages {
+            let _ = event_tx
+                .send(AgentEvent::MessageAppended {
+                    session_id: session.id.clone(),
+                    message_id: message.id.clone(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    created_at: message.created_at,
+                })
+                .await;
+        }
+    }
+    if let Some(disk_mode) = turn_refresh.disk_permission_mode {
+        runtime_state.set_permission_mode(disk_mode);
+        session
+            .agent_runtime_state
+            .get_or_insert_with(AgentRuntimeState::default)
+            .set_permission_mode(disk_mode);
+    }
+
+    ensure_not_cancelled(
+        cancel_token,
+        metrics_collector,
+        &session.id,
+        session.messages.len(),
+    )?;
+
+    let prompt_memory_exposure = refresh_round_prompt_context(
+        session,
+        &config.memory_store,
+        config.prompt_memory_flags,
+        runtime_context,
+        config.project_context_resolver.as_deref(),
+        config.app_data_dir.as_deref(),
+    )
+    .await?;
+
+    // Preserve the existing post-refresh observation point as well: a cancel
+    // that arrives while context I/O is in flight must still stop before the
+    // provider request. The check above is what prevents already-cancelled runs
+    // from starting context work in the first place.
+    ensure_not_cancelled(
+        cancel_token,
+        metrics_collector,
+        &session.id,
+        session.messages.len(),
+    )?;
+    Ok(prompt_memory_exposure)
+}
+
 // ---- round_state functions ----
 
 pub(super) fn update_task_round_state(
     task_context: &mut Option<TaskLoopContext>,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
 ) {
     if let Some(ctx) = task_context.as_mut() {
         ctx.current_round = round as u32;
-        ctx.max_rounds = max_rounds as u32;
+        ctx.max_rounds = max_rounds.map(|value| value as u32);
     }
 }
 
@@ -126,7 +229,7 @@ pub(super) fn log_round_start(
     debug_enabled: bool,
     session_id: &str,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
     message_count: usize,
 ) {
     if debug_enabled {
@@ -135,7 +238,7 @@ pub(super) fn log_round_start(
             session_id,
             serde_json::json!({
                 "round": round + 1,
-                "total_rounds": max_rounds,
+                "round_cap": max_rounds,
                 "message_count": message_count,
             })
         );
@@ -197,17 +300,20 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
                 .cloned()
                 .unwrap_or_default(),
             enhancement_prompt: session.enhance_prompt(),
-            project_context: super::session_setup::prompt_setup::extract_project_context(prompt),
-            workspace_context: session.workspace_path_meta().and_then(|workspace_path| {
-                crate::runtime::context::build_workspace_prompt_context(&workspace_path)
-            }),
+            project_context: session
+                .metadata
+                .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+                .cloned(),
+            workspace_context: super::session_setup::prompt_setup::workspace_context_from_session(
+                session,
+            ),
             instruction_context: session.workspace_path_meta().and_then(|workspace_path| {
                 crate::runtime::context::instruction::build_instruction_prompt_context(
                     &workspace_path,
                 )
             }),
-            env_context: None,
-            skill_context: None,
+            env_context: crate::runtime::context::build_env_prompt_context(),
+            skill_context: session.metadata.get("skill.context").cloned(),
             tool_guide_context: None,
             dream_notebook: None,
             session_memory_note: None,
@@ -277,6 +383,7 @@ fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {
 pub(crate) async fn prepare_round(
     session: &mut Session,
     task_context: &mut Option<TaskLoopContext>,
+    runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
     llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
@@ -295,11 +402,14 @@ pub(crate) async fn prepare_round(
         llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),
     };
-    refresh_round_prompt_context(
+    refresh_round_boundary_and_prompt_context(
         session,
-        config.prompt_memory_flags,
+        runtime_state,
+        config,
+        None,
+        cancel_token,
+        metrics_collector,
         Some(&runtime_context),
-        config.project_context_resolver.as_deref(),
     )
     .await?;
     update_task_round_state(task_context, round, max_rounds);
@@ -312,12 +422,6 @@ pub(crate) async fn prepare_round(
         max_rounds,
         session.messages.len(),
     );
-    ensure_not_cancelled(
-        cancel_token,
-        metrics_collector,
-        session_id,
-        session.messages.len(),
-    )?;
 
     super::metrics_lifecycle::record_round_started(
         metrics_collector,
@@ -334,6 +438,7 @@ mod project_prompt_tests {
     use async_trait::async_trait;
     use bamboo_agent_core::{Message, Session};
     use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
+    use bamboo_memory::memory_store::MemoryStore;
 
     use crate::project_context::{
         ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
@@ -374,12 +479,14 @@ mod project_prompt_tests {
     }
 
     #[tokio::test]
-    async fn per_round_resolution_injects_project_once_and_refreshes_only_workspace() {
+    async fn per_round_resolution_preserves_system_and_refreshes_workspace_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let first = directory.path().join("main");
         let second = directory.path().join("worktree");
         std::fs::create_dir_all(&first).expect("first");
         std::fs::create_dir_all(&second).expect("second");
+        let first = first.canonicalize().expect("canonical first workspace");
+        let second = second.canonicalize().expect("canonical second workspace");
         let project_id = ProjectId::parse("project-1").expect("project id");
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
@@ -403,55 +510,104 @@ mod project_prompt_tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/project-1/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("session-1", "model");
         session.set_project_id_meta(project_id.to_string());
         session.set_workspace_path_meta(first.to_string_lossy().to_string());
         session.add_message(Message::system("Base"));
+        let system_id = session.messages[0].id.clone();
+
+        let memory = MemoryStore::new(directory.path().join("jiandu"));
+        memory
+            .write_session_topic("session-1", "default", "memory refresh marker")
+            .await
+            .expect("write session memory note");
 
         super::refresh_project_context(&mut session, Some(&resolver))
             .await
             .expect("first Project refresh");
-        let first_prompt = session.messages[0].content.clone();
-        let project_block = first_prompt
-            .split(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-            .nth(1)
-            .and_then(|tail| {
-                tail.split(crate::runtime::context::PROJECT_CONTEXT_END_MARKER)
-                    .next()
-            })
-            .expect("project body")
-            .to_string();
+        assert_eq!(session.messages[0].id, system_id);
+        assert_eq!(session.messages[0].content, "Base");
+        let project_context = session
+            .metadata
+            .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+            .expect("path-free Project model context")
+            .clone();
+        assert!(project_context.contains("Project ID: project-1"));
+        assert!(!project_context.contains(directory.path().to_string_lossy().as_ref()));
 
         session.set_workspace_path_meta(second.to_string_lossy().to_string());
-        super::refresh_project_context(&mut session, Some(&resolver))
-            .await
-            .expect("second Project refresh");
-        let second_prompt = &session.messages[0].content;
-        assert_eq!(
-            second_prompt
-                .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-                .count(),
-            1
-        );
-        assert_eq!(
-            second_prompt
-                .matches(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
-                .count(),
-            1
-        );
-        assert!(second_prompt.contains(&project_block));
-        let second = bamboo_config::paths::path_to_display_string(
+        super::refresh_round_prompt_context(
+            &mut session,
+            &memory,
+            crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            None,
+            Some(&resolver),
+            Some(directory.path()),
+        )
+        .await
+        .expect("second full prompt refresh");
+        let second_workspace = bamboo_config::paths::path_to_display_string(
             &second.canonicalize().expect("canonical second workspace"),
         );
-        assert!(
-            second_prompt.contains(&format!("Workspace path: {second}")),
-            "second workspace was not refreshed in prompt: {second_prompt}"
+        assert_eq!(session.messages[0].id, system_id);
+        assert_eq!(session.messages[0].content.as_bytes(), b"Base");
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY),
+            Some(&project_context)
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(second_workspace.as_str())
+        );
+        assert!(session
+            .prompt_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace_context.as_deref())
+            .is_some_and(|context| context.contains(&second_workspace)));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("full prompt snapshot after round refresh");
+        assert_eq!(
+            snapshot.project_context.as_deref(),
+            Some(project_context.as_str())
+        );
+        assert!(snapshot
+            .session_memory_note
+            .as_deref()
+            .is_some_and(|note| note.contains("memory refresh marker")));
+        assert!(snapshot
+            .external_memory
+            .as_deref()
+            .is_some_and(|memory| memory.contains("memory refresh marker")));
+        assert_eq!(snapshot.effective_system_prompt.as_bytes(), b"Base");
+        assert!(session.messages.iter().all(|message| {
+            !message
+                .content
+                .contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+                && !message
+                    .content
+                    .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
+                && !message.content.contains(&second_workspace)
+                && !message.content.contains("memory refresh marker")
+                && !message.content.contains("External memory")
+        }));
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::project_context::WorkspaceBindingStatus::Registered.as_str())
         );
     }
 
@@ -471,10 +627,6 @@ mod project_prompt_tests {
                 project_id: project_id.clone(),
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/round-project/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver =
@@ -537,12 +689,6 @@ mod project_prompt_tests {
                 project_id,
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/unrelated-project/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));

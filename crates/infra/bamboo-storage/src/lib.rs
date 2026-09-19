@@ -6,11 +6,13 @@
 //! - **SessionSearchIndex**: Full-text search for session content
 //! - **merge_save_session**: Merge-aware session save with concurrent edit protection
 
+pub mod context_view;
 pub mod jsonl;
 pub mod search_index;
 pub mod session_inbox;
 pub mod session_merge;
 pub mod v2;
+pub mod v3;
 
 pub use jsonl::JsonlStorage;
 pub use search_index::{SessionSearchIndex, SessionSearchMatch};

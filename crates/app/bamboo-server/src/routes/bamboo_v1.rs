@@ -238,6 +238,14 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::update_permission_ask_rules),
         )
         .route(
+            "/bamboo/permission/default-session-mode",
+            web::get().to(settings::get_default_session_permission_mode),
+        )
+        .route(
+            "/bamboo/permission/default-session-mode",
+            web::put().to(settings::update_default_session_permission_mode),
+        )
+        .route(
             "/bamboo/permission/policy",
             web::get().to(settings::get_permission_policy),
         )

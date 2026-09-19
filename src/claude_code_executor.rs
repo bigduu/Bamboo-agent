@@ -18,7 +18,7 @@
 //! in four steps — see its doc comment for the full state-machine and
 //! `docs/claude-code-executor.md` §4 for the on-disk state file shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, HostBridge, SteerInbox};
@@ -40,6 +40,8 @@ use bamboo_subagent::executor_util::{
     render_history_preamble, spawn_with_etxtbsy_retry, write_json_atomic,
 };
 use bamboo_subagent::proto::RunSpec;
+
+use crate::codex_cli_executor::ProcessTreeChild;
 
 /// Upper bound on a single stdout NDJSON line. Tool results can be huge (the
 /// protocol doc specifies a 10 MB scanner buffer at `docs/claude-code-executor.md`
@@ -80,6 +82,29 @@ const APPROVAL_RELAY_TIMEOUT: Duration = Duration::from_secs(300);
 /// listed here.
 const ENV_ALLOWLIST: &[&str] = &[
     "HOME", "PATH", "SHELL", "TERM", "LANG", "TMPDIR", "USER", "LOGNAME",
+];
+
+/// Claude's native workspace-inspection tools retained for a Bamboo typed
+/// read-only activation. `--tools` is a positive built-in surface restriction;
+/// MCP tools are denied separately because Claude documents that `--tools`
+/// does not affect them.
+const READ_ONLY_CLAUDE_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+/// Defense-in-depth denies for every Claude execution/mutation/delegation
+/// surface known to overlap Bamboo's typed read-only policy. The positive
+/// [`READ_ONLY_CLAUDE_TOOLS`] surface remains authoritative for built-ins; the
+/// MCP wildcard closes the separate external-tool namespace.
+const READ_ONLY_CLAUDE_DENY_RULES: &[&str] = &[
+    "Agent",
+    "Bash",
+    "Edit",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "mcp__*",
 ];
 
 /// Resolve this actor's stable per-child storage dir, exactly like
@@ -150,11 +175,18 @@ pub struct ClaudeCodeExecutor {
     /// Issue #443: `false` (the default) adds `--strict-mcp-config` and
     /// `--setting-sources project` so the child does NOT load the invoking
     /// user's `~/.claude` MCP servers/skills/settings. `true` omits both
-    /// flags (the old inherit-everything behavior).
+    /// flags (the old inherit-everything behavior). A read-only `plan`
+    /// activation always overrides this with an empty setting-source list so
+    /// repository-controlled hooks cannot execute outside Bamboo's tool gate.
     inherit_user_config: bool,
     /// Issue #443: extra env var NAMES forwarded verbatim from the parent
     /// process env, on top of the fixed [`ENV_ALLOWLIST`].
     forward_env: Vec<String>,
+    /// Parent-provisioned exact tool denies translated to Claude's bare-rule
+    /// CLI form. For typed read-only children this is paired with a positive
+    /// `--tools Read,Glob,Grep` surface and an `mcp__*` deny.
+    disallowed_tools: Vec<String>,
+    read_only_tool_surface: bool,
     /// Issue #443: bound on [`HostBridge::approval_call`] in
     /// [`decide_and_respond`]. Always [`APPROVAL_RELAY_TIMEOUT`] outside
     /// tests; overridable via [`Self::with_relay_timeout_for_test`] so a unit
@@ -185,8 +217,59 @@ impl ClaudeCodeExecutor {
             state_dir,
             inherit_user_config,
             forward_env,
+            disallowed_tools: Vec::new(),
+            read_only_tool_surface: false,
             relay_timeout: APPROVAL_RELAY_TIMEOUT,
         }
+    }
+
+    /// Apply the host-provisioned tool policy to Claude Code's own tool
+    /// surface. `ProvisionSpec.disabled_tools` contains exact schema names,
+    /// not arbitrary Claude permission expressions, so only bare rules are
+    /// forwarded. Typed read-only additionally uses a positive built-in
+    /// allow-surface and denies every MCP tool.
+    pub fn with_provisioned_tool_policy(
+        mut self,
+        disabled_tools: impl IntoIterator<Item = String>,
+        read_only: bool,
+    ) -> Self {
+        let mut rules = disabled_tools
+            .into_iter()
+            .filter_map(|name| {
+                let name = name.trim();
+                if name.is_empty()
+                    || name.starts_with('-')
+                    || name
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || matches!(ch, '(' | ')' | ','))
+                {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        // Bamboo's native names predate Claude's Agent/Skill names. Preserve
+        // exact caller denies while adding the corresponding Claude built-ins.
+        if rules.contains("SubAgent") || rules.contains("Task") {
+            rules.insert("Agent".to_string());
+            rules.insert("Task".to_string());
+        }
+        if rules.contains("SlashCommand") || rules.contains("load_skill") {
+            rules.insert("Skill".to_string());
+        }
+        if read_only {
+            rules.extend(
+                READ_ONLY_CLAUDE_DENY_RULES
+                    .iter()
+                    .map(|rule| rule.to_string()),
+            );
+        }
+
+        self.disallowed_tools = rules.into_iter().collect();
+        self.read_only_tool_surface = read_only;
+        self
     }
 
     pub fn with_provisioned_permission_context(
@@ -361,11 +444,10 @@ impl ClaudeCodeExecutor {
         // engages the local-decide policy in `decide_and_respond` below
         // ("no host bridge -> deny unless bypassPermissions") instead of
         // that policy being unreachable dead code.
-        cmd.arg("--permission-mode").arg(
-            permission_mode_override
-                .or(self.permission_mode.as_deref())
-                .unwrap_or("default"),
-        );
+        let effective_permission_mode = permission_mode_override
+            .or(self.permission_mode.as_deref())
+            .unwrap_or("default");
+        cmd.arg("--permission-mode").arg(effective_permission_mode);
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -378,9 +460,31 @@ impl ClaudeCodeExecutor {
         // from global config for a single `touch`. `inherit_user_config:
         // true` opts back into the CLI's normal (inherit-everything)
         // behavior.
-        if !self.inherit_user_config {
+        let read_only_plan = effective_permission_mode.eq_ignore_ascii_case("plan");
+        if read_only_plan {
+            // An empty setting-source list is the CLI representation of the
+            // Agent SDK's `settingSources: []`: no user/project/local settings,
+            // CLAUDE.md, skills, or hooks. This is authority-bearing for Plan;
+            // `--permission-mode plan` alone does not sandbox hook processes.
+            cmd.arg("--strict-mcp-config");
+            cmd.arg("--setting-sources").arg("");
+        } else if !self.inherit_user_config {
             cmd.arg("--strict-mcp-config");
             cmd.arg("--setting-sources").arg("project");
+        }
+        if self.read_only_tool_surface {
+            // A positive built-in surface avoids depending on Claude's current
+            // inventory: newly-added execution tools remain unavailable until
+            // Bamboo explicitly admits them. Claude's CLI takes this list as a
+            // comma-separated value.
+            cmd.arg("--tools").arg(READ_ONLY_CLAUDE_TOOLS.join(","));
+        }
+        if !self.disallowed_tools.is_empty() {
+            // Keep the variadic deny list last in argv, matching Claude's
+            // documented `--disallowedTools "Bash" "Edit"` shape and avoiding
+            // ambiguity about where its values stop.
+            cmd.arg("--disallowedTools");
+            cmd.args(&self.disallowed_tools);
         }
         // Issue #443: env allowlist. `env_clear()` plus an explicit forward
         // list supersedes the old single `env_remove("CLAUDECODE")`
@@ -431,7 +535,7 @@ impl ClaudeCodeExecutor {
         value: Value,
         events: &EventSink,
         write_tx: &mpsc::UnboundedSender<Value>,
-        pending: &mut HashMap<String, JoinHandle<()>>,
+        pending: &mut HashMap<String, AbortOnDropHandle<()>>,
         last_text: &mut String,
         permission: bamboo_domain::PermissionModeResolution,
     ) -> Option<ChildOutcome> {
@@ -452,7 +556,7 @@ impl ClaudeCodeExecutor {
             "assistant" => {
                 if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) {
                     for block in blocks {
-                        emit_assistant_block(block, events, last_text);
+                        emit_assistant_block(block, events, last_text).await;
                     }
                 }
                 None
@@ -460,7 +564,7 @@ impl ClaudeCodeExecutor {
             "user" => {
                 if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) {
                     for block in blocks {
-                        emit_tool_result_block(block, events);
+                        emit_tool_result_block(block, events).await;
                     }
                 }
                 None
@@ -499,7 +603,9 @@ impl ClaudeCodeExecutor {
                         }
                     })
                     .unwrap_or_default();
-                events.emit(event_json(AgentEvent::Complete { usage }));
+                events
+                    .emit(event_json(AgentEvent::Complete { usage }))
+                    .await;
                 Some(ChildOutcome::completed(final_text))
             }
             "control_request" => {
@@ -533,7 +639,7 @@ impl ClaudeCodeExecutor {
         value: Value,
         events: &EventSink,
         write_tx: &mpsc::UnboundedSender<Value>,
-        pending: &mut HashMap<String, JoinHandle<()>>,
+        pending: &mut HashMap<String, AbortOnDropHandle<()>>,
         permission: bamboo_domain::PermissionModeResolution,
     ) {
         let request_id = value
@@ -584,7 +690,7 @@ impl ClaudeCodeExecutor {
         let relay_timeout = self.relay_timeout;
         let write_tx = write_tx.clone();
         let task_request_id = request_id.clone();
-        let handle = tokio::spawn(async move {
+        let handle = AbortOnDropHandle::new(tokio::spawn(async move {
             decide_and_respond(
                 host,
                 permission_mode,
@@ -595,7 +701,7 @@ impl ClaudeCodeExecutor {
                 &write_tx,
             )
             .await;
-        });
+        }));
         pending.insert(request_id, handle);
     }
 
@@ -650,7 +756,7 @@ impl ClaudeCodeExecutor {
         })
         .await
         {
-            Ok(c) => c,
+            Ok(c) => ProcessTreeChild::new(c),
             Err(e) => {
                 return (
                     ChildOutcome::error(format!("spawn '{}': {e}", self.binary)),
@@ -675,7 +781,9 @@ impl ClaudeCodeExecutor {
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let stderr_task = stderr.map(|stderr| {
             let tail = stderr_tail.clone();
-            tokio::spawn(async move { drain_stderr_tail(stderr, tail).await })
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                drain_stderr_tail(stderr, tail).await
+            }))
         });
 
         let (write_tx, writer_handle) = spawn_stdin_writer(stdin);
@@ -694,7 +802,7 @@ impl ClaudeCodeExecutor {
         }
 
         let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, stdout);
-        let mut pending: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let mut pending: HashMap<String, AbortOnDropHandle<()>> = HashMap::new();
         let mut last_text = String::new();
 
         let (outcome, exited_without_result) = loop {
@@ -815,9 +923,11 @@ impl ChildExecutor for ClaudeCodeExecutor {
         let (permission, policy_revision) = match self.activation_permission(&spec) {
             Ok(permission) => permission,
             Err(ClaudePermissionActivationError::Invalid(message)) => {
-                events.emit(event_json(AgentEvent::Error {
-                    message: message.clone(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Error {
+                        message: message.clone(),
+                    }))
+                    .await;
                 return ChildOutcome::error(message);
             }
             Err(ClaudePermissionActivationError::ExplicitDeny {
@@ -825,34 +935,42 @@ impl ChildExecutor for ClaudeCodeExecutor {
                 resolution,
                 policy_revision,
             }) => {
-                events.emit(event_json(AgentEvent::PermissionPostureActivated {
-                    session_id: logical_session_id,
-                    policy_revision,
-                    requested_mode: resolution.requested.as_str().to_string(),
-                    effective_mode: resolution.effective.as_str().to_string(),
-                    executor_mapping: "claude_code:blocked_explicit_deny".to_string(),
-                }));
-                events.emit(event_json(AgentEvent::Error {
-                    message: message.clone(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::PermissionPostureActivated {
+                        session_id: logical_session_id,
+                        policy_revision,
+                        requested_mode: resolution.requested.as_str().to_string(),
+                        effective_mode: resolution.effective.as_str().to_string(),
+                        executor_mapping: "claude_code:blocked_explicit_deny".to_string(),
+                    }))
+                    .await;
+                events
+                    .emit(event_json(AgentEvent::Error {
+                        message: message.clone(),
+                    }))
+                    .await;
                 return ChildOutcome::error(message);
             }
         };
         let mapped_permission_mode = self.mapped_permission_mode(permission);
         let executor_mapping = format!("claude_code:permission_mode={mapped_permission_mode}");
-        events.emit(event_json(AgentEvent::PermissionPostureActivated {
-            session_id: logical_session_id.clone(),
-            policy_revision,
-            requested_mode: permission.requested.as_str().to_string(),
-            effective_mode: permission.effective.as_str().to_string(),
-            executor_mapping: executor_mapping.clone(),
-        }));
+        events
+            .emit(event_json(AgentEvent::PermissionPostureActivated {
+                session_id: logical_session_id.clone(),
+                policy_revision,
+                requested_mode: permission.requested.as_str().to_string(),
+                effective_mode: permission.effective.as_str().to_string(),
+                executor_mapping: executor_mapping.clone(),
+            }))
+            .await;
 
         // Ignore steer messages (see doc comment on `steer` above) but keep
         // draining so the sender never sees an unbounded backlog. Spans BOTH
         // possible spawn attempts below — the inbox belongs to the whole
         // activation, not to one child process.
-        let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
+        let steer_drain = AbortOnDropHandle::new(tokio::spawn(async move {
+            while steer.recv().await.is_some() {}
+        }));
 
         // Step 1: a fresh activation must never resume stale context.
         if spec.messages.is_empty() {
@@ -868,16 +986,18 @@ impl ChildExecutor for ClaudeCodeExecutor {
 
         // Step 3: fallback body when there's history but no usable id.
         let body = build_turn_body(&spec, resume_id.as_deref());
-        events.emit(json!({
-            "type": "runner_progress",
-            "session_id": logical_session_id,
-            "round_count": 0,
-            "executor": "claude_code",
-            "phase": "bootstrap",
-            "requested_mode": permission.requested.as_str(),
-            "effective_mode": permission.effective.as_str(),
-            "executor_mapping": executor_mapping,
-        }));
+        events
+            .emit(json!({
+                "type": "runner_progress",
+                "session_id": logical_session_id,
+                "round_count": 0,
+                "executor": "claude_code",
+                "phase": "bootstrap",
+                "requested_mode": permission.requested.as_str(),
+                "effective_mode": permission.effective.as_str(),
+                "executor_mapping": executor_mapping,
+            }))
+            .await;
 
         let used_resume = resume_id.is_some();
         let (outcome, exited_without_result) = self
@@ -941,9 +1061,9 @@ fn signal_process_group(_child: &Child, _signal: ProcessSignal) {}
 /// "dropped silently if the peer is gone" convention).
 fn spawn_stdin_writer(
     mut stdin: tokio::process::ChildStdin,
-) -> (mpsc::UnboundedSender<Value>, JoinHandle<()>) {
+) -> (mpsc::UnboundedSender<Value>, AbortOnDropHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let handle = tokio::spawn(async move {
+    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
         while let Some(value) = rx.recv().await {
             let Ok(mut line) = serde_json::to_vec(&value) else {
                 continue;
@@ -958,7 +1078,7 @@ fn spawn_stdin_writer(
         }
         // `stdin` drops here (once every sender clone is gone and the channel
         // drains), closing the write half — the EOF the CLI's Stop hooks see.
-    });
+    }));
     (tx, handle)
 }
 
@@ -1028,23 +1148,27 @@ async fn drain_stderr_tail(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<
 
 /// Emit the `AgentEvent` for one `assistant` message content block (`text` /
 /// `thinking` / `tool_use`); unrecognized block types are ignored.
-fn emit_assistant_block(block: &Value, events: &EventSink, last_text: &mut String) {
+async fn emit_assistant_block(block: &Value, events: &EventSink, last_text: &mut String) {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => {
             let text = block.get("text").and_then(Value::as_str).unwrap_or("");
             if !text.is_empty() {
                 last_text.push_str(text);
-                events.emit(event_json(AgentEvent::Token {
-                    content: text.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Token {
+                        content: text.to_string(),
+                    }))
+                    .await;
             }
         }
         Some("thinking") => {
             let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
             if !text.is_empty() {
-                events.emit(event_json(AgentEvent::ReasoningToken {
-                    content: text.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::ReasoningToken {
+                        content: text.to_string(),
+                    }))
+                    .await;
             }
         }
         Some("tool_use") => {
@@ -1059,11 +1183,13 @@ fn emit_assistant_block(block: &Value, events: &EventSink, last_text: &mut Strin
                 .unwrap_or("")
                 .to_string();
             let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
-            events.emit(event_json(AgentEvent::ToolStart {
-                tool_call_id,
-                tool_name,
-                arguments,
-            }));
+            events
+                .emit(event_json(AgentEvent::ToolStart {
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                }))
+                .await;
         }
         _ => {}
     }
@@ -1071,7 +1197,7 @@ fn emit_assistant_block(block: &Value, events: &EventSink, last_text: &mut Strin
 
 /// Emit the `AgentEvent` for one `user` message content block, when it is a
 /// `tool_result` (other block types in an echoed user message are ignored).
-fn emit_tool_result_block(block: &Value, events: &EventSink) {
+async fn emit_tool_result_block(block: &Value, events: &EventSink) {
     if block.get("type").and_then(Value::as_str) != Some("tool_result") {
         return;
     }
@@ -1099,7 +1225,7 @@ fn emit_tool_result_block(block: &Value, events: &EventSink) {
             result: ToolResult::text(true, text),
         }
     };
-    events.emit(event_json(event));
+    events.emit(event_json(event)).await;
 }
 
 /// A `tool_result` block's `content` is either a plain string or an array of
@@ -1312,6 +1438,7 @@ mod tests {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
@@ -1326,6 +1453,7 @@ mod tests {
             permission_policy: None,
             messages,
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
@@ -1348,6 +1476,138 @@ mod tests {
             args.get(mode_index + 1).map(String::as_str),
             Some("bypassPermissions")
         );
+    }
+
+    #[test]
+    fn typed_read_only_plan_disables_settings_hooks_shell_and_mutation_tools() {
+        for inherit_user_config in [false, true] {
+            let executor = ClaudeCodeExecutor::new(
+                Some("claude".to_string()),
+                None,
+                None,
+                None,
+                None,
+                inherit_user_config,
+                Vec::new(),
+            )
+            .with_provisioned_tool_policy(
+                bamboo_engine::runtime::guardian_state::read_only_child_disabled_tools(),
+                true,
+            );
+            let command = executor.build_command(None, Some("plan"));
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+
+            let sources_index = args
+                .iter()
+                .position(|arg| arg == "--setting-sources")
+                .expect("Plan must set an explicit empty source list");
+            assert_eq!(args.get(sources_index + 1).map(String::as_str), Some(""));
+            assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+            assert!(
+                !args.iter().any(|arg| arg == "project"),
+                "Plan must not load repository-controlled settings or hooks"
+            );
+
+            let tools_index = args
+                .iter()
+                .position(|arg| arg == "--tools")
+                .expect("typed read-only Plan must restrict Claude built-ins");
+            assert_eq!(
+                args.get(tools_index + 1).map(String::as_str),
+                Some("Read,Glob,Grep")
+            );
+
+            let denies_index = args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .expect("typed read-only Plan must pass host-owned deny rules");
+            let denied = &args[denies_index + 1..];
+            for rule in [
+                "Agent",
+                "Bash",
+                "Edit",
+                "NotebookEdit",
+                "Skill",
+                "Task",
+                "WebFetch",
+                "WebSearch",
+                "Write",
+                "mcp__*",
+            ] {
+                assert!(
+                    denied.iter().any(|candidate| candidate == rule),
+                    "typed read-only Plan must deny Claude rule {rule}"
+                );
+            }
+        }
+
+        let normal = ClaudeCodeExecutor::new(
+            Some("claude".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
+        );
+        let args = normal
+            .build_command(None, Some("default"))
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sources_index = args
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .expect("ordinary isolated activations must retain project settings");
+        assert_eq!(
+            args.get(sources_index + 1).map(String::as_str),
+            Some("project")
+        );
+        assert!(!args.iter().any(|arg| arg == "--tools"));
+        assert!(!args.iter().any(|arg| arg == "--disallowedTools"));
+    }
+
+    #[test]
+    fn provisioned_tool_policy_forwards_only_bare_deny_rules() {
+        let executor = ClaudeCodeExecutor::new(
+            Some("claude".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .with_provisioned_tool_policy(
+            [
+                "Write".to_string(),
+                "mcp__server__tool".to_string(),
+                "--model".to_string(),
+                "Bash(rm *)".to_string(),
+                "  ".to_string(),
+            ],
+            false,
+        );
+        let args = executor
+            .build_command(None, Some("default"))
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let denies_index = args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .expect("valid provisioned denies must reach Claude");
+        assert_eq!(
+            &args[denies_index + 1..],
+            &["Write".to_string(), "mcp__server__tool".to_string()]
+        );
+        assert!(!args.iter().any(|arg| arg == "--tools"));
     }
 
     fn msg(role: &str, content: &str) -> Value {
@@ -1717,6 +1977,35 @@ echo '{"type":"result","subtype":"success","result":"wrote file"}'
     }
 
     #[tokio::test]
+    async fn dropping_approval_owner_releases_pending_host_reply() {
+        let (host, mut host_rx) = HostBridge::channel();
+        let (events, receiver) = EventSink::channel();
+        drop(receiver);
+        let events = events.with_host_bridge(host);
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let mut pending = HashMap::new();
+        executor(PathBuf::from("unused")).handle_control_request(
+            json!({"type": "control_request", "request_id": "pending", "request": {
+                "subtype": "can_use_tool", "tool_name": "Write", "input": {"file_path": "/tmp/x"}
+            }}),
+            &events,
+            &write_tx,
+            &mut pending,
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                bamboo_domain::PermissionMode::Default,
+            ),
+        );
+        let mut request = host_rx.recv().await.unwrap();
+        drop(pending);
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(1), request.reply.closed())
+            .await
+            .unwrap();
+        assert!(host_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn control_request_approval_relay_times_out_and_denies() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_stub(
@@ -1819,6 +2108,32 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
         // the stub couldn't have run `env`/`cat`-family commands at all, and
         // this test would be vacuously passing.
         assert!(dump.contains("PATH="), "PATH missing from the child env");
+    }
+
+    #[tokio::test]
+    async fn websocket_cancel_and_owner_abort_reap_claude_process_tree() {
+        for abort_owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+read -r assignment
+trap '' TERM
+(trap '' TERM; sleep 60) &
+printf '%s %s\n' "$$" "$!" > "$DIR/pids"
+echo '{"type":"control_request","request_id":"pending","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"sleep 60"}}}'
+wait
+"#,
+            );
+            crate::codex_cli_executor::process_lifecycle_tests::interrupt_over_websocket(
+                Arc::new(executor(bin)),
+                run_spec("wait"),
+                &dir.path().join("pids"),
+                abort_owner,
+            )
+            .await;
+        }
     }
 
     #[tokio::test]

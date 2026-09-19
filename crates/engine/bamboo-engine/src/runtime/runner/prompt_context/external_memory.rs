@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::project_context::{ProjectContextResolver, ProjectMemoryScope};
+use crate::project_context::ProjectContextResolver;
 use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{PromptMemoryObservability, Session};
 use bamboo_domain::ledger::LedgerScope;
@@ -8,12 +10,16 @@ use bamboo_llm::LLMProvider;
 use bamboo_memory::budget::{segment_by_granularity_budget, GranularityBudgetItem};
 use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
-    render_memory_freshness_note, select_relevant_memories,
-    truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
-    MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
-    TemporalGranularity,
+    render_memory_freshness_note, truncate_chars as memory_truncate_chars, FreshnessKind,
+    MemoryRecallCandidate, MemoryRecallOptions, MemoryScope, MemoryStore, TemporalGranularity,
+};
+use bamboo_metrics::types::{
+    PromptMemoryExposureItem, PromptMemoryExposureObservation, PromptMemoryRecallOutcome,
 };
 
+use super::memory_rerank::{
+    select_relevant_memories, MemoryRecallRerankContext, MemoryRecallStrategy,
+};
 use super::system_sections::strip_existing_prompt_block;
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
@@ -34,7 +40,7 @@ const PROJECT_MEMORY_INDEX_PROMPT_MAX_CHARS: usize = 1_800;
 const RELEVANT_MEMORY_RESULT_LIMIT: usize = 3;
 /// Max chars used by the full relevant-memory section.
 const RELEVANT_MEMORY_TOTAL_MAX_CHARS: usize = 1_600;
-/// Max chars used by each relevant-memory summary snippet.
+/// Max chars used by each fully rendered relevant-memory item.
 const RELEVANT_MEMORY_PER_ITEM_MAX_CHARS: usize = 220;
 /// Max chars injected from the global Dream notebook fallback.
 const GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
@@ -89,7 +95,6 @@ struct RelevantMemorySnippet {
     title: String,
     scope: MemoryScope,
     status: String,
-    score: f64,
     summary: String,
     freshness_note: Option<String>,
     /// Temporal granularity of the source memory, carried through so the render
@@ -103,6 +108,7 @@ struct RelevantMemorySnippet {
 struct RelevantMemoryLoadResult {
     snippets: Vec<RelevantMemorySnippet>,
     strategy: MemoryRecallStrategy,
+    outcome: PromptMemoryRecallOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -117,12 +123,75 @@ pub(crate) struct PromptMemoryRuntimeContext {
     pub background_model_name: Option<String>,
 }
 
+/// Engine-private, execution-local provenance for the final compact memories
+/// selected during this round's trusted prompt refresh.
+///
+/// This value is returned directly to the runner and never stored in Session
+/// metadata, so an HTTP metadata patch cannot forge the metrics observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptMemoryExposureProvenance {
+    project_id: Option<String>,
+    recall_enabled: bool,
+    query_present: bool,
+    recall_outcome: PromptMemoryRecallOutcome,
+    all_compact_exposed_count: u32,
+    project_exposed_count: u32,
+    out_of_project_only: bool,
+    compact_section_chars: u32,
+    project_items: Vec<PromptMemoryExposureItem>,
+}
+
+impl PromptMemoryExposureProvenance {
+    pub(crate) fn observation(
+        &self,
+        round_id: &str,
+        session_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> PromptMemoryExposureObservation {
+        PromptMemoryExposureObservation {
+            schema_version: 1,
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            project_id: self.project_id.clone(),
+            observed_at,
+            recall_enabled: self.recall_enabled,
+            query_present: self.query_present,
+            recall_outcome: self.recall_outcome,
+            all_compact_exposed_count: self.all_compact_exposed_count,
+            project_exposed_count: self.project_exposed_count,
+            out_of_project_only: self.out_of_project_only,
+            compact_section_chars: self.compact_section_chars,
+            project_items: self.project_items.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn supported_empty_for_test(project_id: Option<&str>) -> Self {
+        Self {
+            project_id: project_id.map(str::to_string),
+            recall_enabled: false,
+            query_present: false,
+            recall_outcome: PromptMemoryRecallOutcome::Disabled,
+            all_compact_exposed_count: 0,
+            project_exposed_count: 0,
+            out_of_project_only: false,
+            compact_section_chars: 0,
+            project_items: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExternalMemoryRenderParts {
     session_note_section: String,
     #[allow(dead_code)]
     ledger_agenda_section: String,
     relevant_memory_section: String,
+    /// Typed records that survived the final granularity reorder and render
+    /// budget, in their provider-visible order. This is deliberately separate
+    /// from the rendered markdown so exposure telemetry never reparses prompt
+    /// text (including older compact text retained in the context ledger).
+    rendered_relevant_memories: Vec<RelevantMemorySnippet>,
     project_memory_index_section: String,
     project_dream_section: String,
     global_dream_fallback_section: String,
@@ -174,19 +243,21 @@ fn count_chars(value: &str) -> usize {
 
 pub(super) async fn refresh_external_memory_context(
     session: &mut Session,
+    memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
-) {
-    let memory = MemoryStore::with_defaults();
-    refresh_external_memory_context_with_store_and_resolver(
+    app_data_dir: Option<&Path>,
+) -> PromptMemoryExposureProvenance {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
-        &memory,
+        memory,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
+        app_data_dir,
     )
-    .await;
+    .await
 }
 
 #[cfg(test)]
@@ -195,24 +266,64 @@ pub(super) async fn refresh_external_memory_context_with_store(
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
-) {
-    refresh_external_memory_context_with_store_and_resolver(
+) -> PromptMemoryExposureProvenance {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
         prompt_memory_flags,
         runtime_context,
         None,
+        None,
     )
-    .await;
+    .await
 }
 
+#[cfg(test)]
+pub(super) async fn refresh_external_memory_context_with_stores(
+    session: &mut Session,
+    memory: &MemoryStore,
+    ledger_data_dir: &Path,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) -> PromptMemoryExposureProvenance {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        None,
+        Some(ledger_data_dir),
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
     session: &mut Session,
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
-) {
+) -> PromptMemoryExposureProvenance {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        project_context_resolver,
+        None,
+    )
+    .await
+}
+
+async fn refresh_external_memory_context_with_store_resolver_and_ledger(
+    session: &mut Session,
+    memory: &MemoryStore,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&ProjectContextResolver>,
+    ledger_data_dir: Option<&Path>,
+) -> PromptMemoryExposureProvenance {
     // Computed each round and cached in a session field (NOT injected into the
     // system message), so a per-round memory change never invalidates the cached
     // system prefix; the request assembler reads the field to build a volatile
@@ -228,25 +339,24 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
             Err(error) => {
                 tracing::warn!(
                     session_id = %session.id,
-                    "failed to resolve Project memory read roots: {error}"
+                    "failed to resolve Project memory identity: {error}"
                 );
                 None
             }
         }
     } else {
-        resolve_prompt_project_scope(session)
+        ProjectContextResolver::memory_read_identity_for_session(session)
     };
     let scoped_memory = resolved_project_scope
         .as_ref()
-        .map(|scope| scope.scoped_store(memory))
+        .map(|project_id| memory.for_project(project_id))
         .unwrap_or_else(|| memory.clone());
     let memory = &scoped_memory;
-    let resolved_project_key = resolved_project_scope
-        .as_ref()
-        .map(|scope| scope.key().to_string());
+    let resolved_project_key = resolved_project_scope.as_ref().map(ToString::to_string);
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
     let ledger_agenda = if prompt_memory_flags.ledger_agenda {
-        load_ledger_agenda_snippet(memory, resolved_project_key.as_deref()).await
+        let data_dir = resolve_ledger_data_dir(ledger_data_dir);
+        load_ledger_agenda_snippet(&data_dir, resolved_project_key.as_deref()).await
     } else {
         None
     };
@@ -274,6 +384,7 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
         RelevantMemoryLoadResult {
             snippets: Vec::new(),
             strategy: MemoryRecallStrategy::Lexical,
+            outcome: PromptMemoryRecallOutcome::Disabled,
         }
     };
     let relevant_memory_snippets = relevant_memory_result.snippets.clone();
@@ -303,6 +414,34 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
         project_dream.as_ref(),
         global_dream_fallback.as_ref(),
     );
+    let all_compact_exposed_count = render_parts.rendered_relevant_memories.len() as u32;
+    let project_items = render_parts
+        .rendered_relevant_memories
+        .iter()
+        .enumerate()
+        .filter(|(_, snippet)| {
+            resolved_project_scope.is_some() && snippet.scope.as_str() == "project"
+        })
+        .map(|(index, snippet)| PromptMemoryExposureItem {
+            memory_id: snippet.id.clone(),
+            scope: "project".to_string(),
+            status_at_observation: snippet.status.clone(),
+            rank: index as u32 + 1,
+            rendered_chars: count_chars(&render_relevant_memory_item(snippet)) as u32,
+        })
+        .collect::<Vec<_>>();
+    let project_exposed_count = project_items.len() as u32;
+    let prompt_memory_exposure = PromptMemoryExposureProvenance {
+        project_id: resolved_project_key.clone(),
+        recall_enabled: prompt_memory_flags.relevant_recall,
+        query_present: latest_user_query_present,
+        recall_outcome: relevant_memory_result.outcome,
+        all_compact_exposed_count,
+        project_exposed_count,
+        out_of_project_only: all_compact_exposed_count > 0 && project_exposed_count == 0,
+        compact_section_chars: count_chars(&render_parts.relevant_memory_section) as u32,
+        project_items,
+    };
     if let Some(agenda) = &ledger_agenda {
         tracing::debug!(
             "[{}] Ledger agenda injected: items={}, chars={}",
@@ -367,16 +506,22 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
         observability.dream_source,
         observability.external_memory_section_chars,
     );
+    prompt_memory_exposure
 }
 
-/// Load the agenda from the ledger store colocated with the memory store's
-/// data dir (global scope + the resolved project scope). Pure index/file
-/// reads — no LLM cost. `None` when the ledger has nothing open.
+/// Load the agenda from Bamboo's ledger store. Jiandu memory owns a separate
+/// data root and is deliberately not used to locate prospective records.
+fn resolve_ledger_data_dir(explicit: Option<&Path>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .unwrap_or_else(bamboo_config::paths::bamboo_dir)
+}
+
 async fn load_ledger_agenda_snippet(
-    memory: &MemoryStore,
+    ledger_data_dir: &Path,
     project_key: Option<&str>,
 ) -> Option<LedgerAgendaSnippet> {
-    let store = LedgerStore::new(memory.resolver().data_dir());
+    let store = LedgerStore::new(ledger_data_dir);
     let mut scopes: Vec<(LedgerScope, Option<String>)> = vec![(LedgerScope::Global, None)];
     if let Some(project_key) = project_key {
         scopes.push((LedgerScope::Project, Some(project_key.to_string())));
@@ -444,19 +589,16 @@ fn render_ledger_agenda_section(snippet: &LedgerAgendaSnippet) -> String {
     section
 }
 
-fn resolve_prompt_project_scope(session: &Session) -> Option<ProjectMemoryScope> {
-    ProjectContextResolver::memory_read_identity_for_session(session)
-}
-
-fn latest_user_query_text(session: &Session) -> Option<String> {
-    session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
-        .map(|message| message.content.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+pub(super) fn latest_user_query_text(session: &Session) -> Option<String> {
+    session.messages.iter().rev().find_map(|message| {
+        if !matches!(message.role, bamboo_agent_core::Role::User)
+            || bamboo_domain::is_system_resume_message(message)
+        {
+            return None;
+        }
+        let content = message.content.trim();
+        (!content.is_empty()).then(|| content.to_string())
+    })
 }
 
 async fn load_session_note_snippets(memory: &MemoryStore, session_id: &str) -> Vec<TopicSnippet> {
@@ -566,6 +708,7 @@ async fn load_relevant_memory_snippets(
         return RelevantMemoryLoadResult {
             snippets: Vec::new(),
             strategy: MemoryRecallStrategy::Lexical,
+            outcome: PromptMemoryRecallOutcome::NoQuery,
         };
     };
 
@@ -608,8 +751,16 @@ async fn load_relevant_memory_snippets(
             return RelevantMemoryLoadResult {
                 snippets: Vec::new(),
                 strategy: MemoryRecallStrategy::Lexical,
+                outcome: PromptMemoryRecallOutcome::LookupError,
             };
         }
+    };
+
+    let outcome = match (selection.strategy, selection.candidates.is_empty()) {
+        (MemoryRecallStrategy::Lexical, true) => PromptMemoryRecallOutcome::NoMatch,
+        (MemoryRecallStrategy::Lexical, false) => PromptMemoryRecallOutcome::Lexical,
+        (MemoryRecallStrategy::Reranked, _) => PromptMemoryRecallOutcome::Reranked,
+        (MemoryRecallStrategy::RerankFallback, _) => PromptMemoryRecallOutcome::RerankFallback,
     };
 
     let mut rendered = Vec::new();
@@ -622,14 +773,7 @@ async fn load_relevant_memory_snippets(
             continue;
         };
 
-        let estimated_len = count_chars(&snippet.summary)
-            + snippet
-                .freshness_note
-                .as_deref()
-                .map(count_chars)
-                .unwrap_or(0)
-            + count_chars(&snippet.title)
-            + 48;
+        let estimated_len = count_chars(&render_relevant_memory_item(&snippet));
         if total_chars + estimated_len > RELEVANT_MEMORY_TOTAL_MAX_CHARS && !rendered.is_empty() {
             break;
         }
@@ -640,6 +784,7 @@ async fn load_relevant_memory_snippets(
     RelevantMemoryLoadResult {
         snippets: rendered,
         strategy: selection.strategy,
+        outcome,
     }
 }
 
@@ -662,7 +807,6 @@ fn build_relevant_memory_snippet(
         title: candidate.title,
         scope: candidate.scope,
         status: candidate.status.as_str().to_string(),
-        score: candidate.score,
         summary,
         freshness_note: render_memory_freshness_note(
             &candidate.updated_at,
@@ -682,9 +826,11 @@ async fn load_project_dream_snippet(
         return None;
     }
 
-    let content = match memory.read_project_dream_view(project_key).await {
-        Ok(Some(content)) => content,
-        Ok(None) => return None,
+    let read = match memory
+        .read_dream_snapshot(MemoryScope::Project, Some(project_key))
+        .await
+    {
+        Ok(read) => read,
         Err(error) => {
             tracing::warn!(
                 "[{}] Failed to read project Dream notebook for '{}': {}",
@@ -695,6 +841,14 @@ async fn load_project_dream_snippet(
             return None;
         }
     };
+    if read.stale {
+        tracing::debug!(
+            "[{}] Using stale project Dream snapshot for orientation; project='{}'",
+            session_id,
+            project_key
+        );
+    }
+    let content = read.snapshot?.content;
 
     let full_len = count_chars(&content);
     let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
@@ -710,14 +864,20 @@ async fn load_global_dream_fallback_snippet(
     memory: &MemoryStore,
     session_id: &str,
 ) -> Option<LoadedSnippet> {
-    let content = match memory.read_dream_view().await {
-        Ok(Some(content)) => content,
-        Ok(None) => return None,
+    let read = match memory.read_dream_snapshot(MemoryScope::Global, None).await {
+        Ok(read) => read,
         Err(error) => {
             tracing::warn!("[{}] Failed to read Dream notebook: {}", session_id, error);
             return None;
         }
     };
+    if read.stale {
+        tracing::debug!(
+            "[{}] Using stale global Dream snapshot for orientation",
+            session_id
+        );
+    }
+    let content = read.snapshot?.content;
 
     let full_len = count_chars(&content);
     let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
@@ -753,11 +913,15 @@ fn build_external_memory_render_parts(
     let ledger_agenda_section = ledger_agenda
         .map(render_ledger_agenda_section)
         .unwrap_or_default();
-    let relevant_memory_section = if relevant_memory_snippets.is_empty() {
-        String::new()
+    let relevant_memory_render = if relevant_memory_snippets.is_empty() {
+        RelevantMemoryRender::default()
     } else {
-        render_relevant_memory_section(relevant_memory_snippets)
+        render_relevant_memory_section_with_budget(
+            relevant_memory_snippets,
+            RELEVANT_MEMORY_TOTAL_MAX_CHARS,
+        )
     };
+    let relevant_memory_section = relevant_memory_render.section;
     let project_memory_index_section = project_memory_index
         .map(render_project_memory_index_section)
         .unwrap_or_default();
@@ -804,12 +968,12 @@ fn build_external_memory_render_parts(
     );
     section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
     section.push_str("- When the user states a commitment, deadline, appointment, or recurring routine, record it with the `ledger` tool (action=upsert; set due_at/remind_at so reminders actually fire) instead of keeping it only in the session task list. Mark records done/cancelled with action=transition, and answer \"what's on my plate\" questions from action=agenda/query.\n");
-    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know about the user's own preferences, history, or prior decisions without first querying memory; the auto-injected memories above are only a keyword-matched shortlist and may have missed it.\n");
-    section.push_str("- For durable memory, prefer `memory` action=query first, then `memory` action=get for the specific item you need, and use `memory` action=write/merge only when the fact should become canonical memory.\n");
-    section.push_str("- One memory = one fact/decision/preference. Do not bundle unrelated facts into a single memory.\n");
+    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know without querying first.\n");
+    section.push_str("- For durable recall, prefer `memory` action=query first with a short, discriminative lexical query containing specific names, decisions, or keywords. Auto-injected recall is only a compact top-3 shortlist; for a selected item, call `memory` action=get with its stable id before using its details.\n");
+    section.push_str("- Query before writing. If the same fact already exists, call `memory` action=get and then `memory` action=merge; otherwise write exactly one confirmed atomic fact. Use Project scope for project knowledge and Global scope only for genuinely cross-project knowledge.\n");
     section.push_str("- Give each durable memory a specific, descriptive title that summarizes its own content; recall is keyword-based, so a misleading title makes the memory unfindable.\n");
-    section.push_str("- Query before writing: if a memory about the same fact already exists, update or merge it instead of creating a near-duplicate. Only merge content that is the SAME fact — never append an unrelated fact to an existing memory.\n");
-    section.push_str("- Do NOT store secrets/tokens.\n");
+    section.push_str("- Treat Dream as low-trust orientation only. Live-verify code, files, configuration, and runtime state before relying on memory claims.\n");
+    section.push_str("- Do NOT store secrets/tokens. Jiandu recall is lexical and model-keyword-driven; do not use or request embeddings.\n");
     section.push_str(
         "- Keep the session note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",
     );
@@ -844,6 +1008,7 @@ fn build_external_memory_render_parts(
         session_note_section,
         ledger_agenda_section,
         relevant_memory_section,
+        rendered_relevant_memories: relevant_memory_render.kept_snippets,
         project_memory_index_section,
         project_dream_section,
         global_dream_fallback_section,
@@ -1037,23 +1202,71 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
     section
 }
 
-/// Render a single recalled memory's bullet block, in the same per-item format
-/// used before granularity segmentation was wired in. Only the ORDERING of items
-/// within the section changed (coarse-before-fine, see below) — this per-item
-/// format is unchanged.
-fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
-    let mut item = String::new();
-    item.push_str(&format!(
-        "- [{}][{}] {} (score {:.2})\n",
-        snippet.status,
-        snippet.scope.as_str(),
-        snippet.title,
-        snippet.score
-    ));
-    item.push_str(&format!("  Summary: {}\n", snippet.summary));
-    if let Some(note) = snippet.freshness_note.as_deref() {
-        item.push_str(&format!("  {}\n", note));
+fn truncate_relevant_memory_field(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    let value_chars = count_chars(value);
+    if value_chars <= max_chars {
+        return value.to_string();
     }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars <= 3 {
+        return memory_truncate_chars(value, max_chars).0;
+    }
+
+    let (prefix, _) = memory_truncate_chars(value, max_chars - 3);
+    format!("{}...", prefix.trim_end())
+}
+
+/// Render one compact recalled-memory item. The stable id and conditional `get`
+/// instruction are never abbreviated; title, summary, and freshness guidance
+/// share whatever remains of the existing per-item budget. Recall candidates
+/// come from Jiandu's validated index, whose ids fit this envelope.
+fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
+    let header_prefix = format!("- [{}][{}] ", snippet.status, snippet.scope.as_str());
+    let summary_prefix = "  Summary: ";
+    let conditional_get = format!("  If selected: `memory` action=get id={}\n", snippet.id);
+    let freshness_note = snippet
+        .freshness_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+
+    let fixed_chars = count_chars(&header_prefix)
+        + 1
+        + count_chars(summary_prefix)
+        + 1
+        + count_chars(&conditional_get)
+        + freshness_note.map_or(0, |_| 3);
+    let content_budget = RELEVANT_MEMORY_PER_ITEM_MAX_CHARS.saturating_sub(fixed_chars);
+    let freshness_budget = freshness_note
+        .map(|note| count_chars(note).min(64).min(content_budget / 3))
+        .unwrap_or(0);
+    let title_and_summary_budget = content_budget.saturating_sub(freshness_budget);
+    let summary_reserve = (title_and_summary_budget / 2).min(48);
+    let title_budget = count_chars(snippet.title.trim())
+        .min(64)
+        .min(title_and_summary_budget.saturating_sub(summary_reserve));
+    let title = truncate_relevant_memory_field(&snippet.title, title_budget);
+    let summary_budget = title_and_summary_budget.saturating_sub(count_chars(&title));
+    let summary = truncate_relevant_memory_field(&snippet.summary, summary_budget);
+
+    let mut item = String::new();
+    item.push_str(&header_prefix);
+    item.push_str(&title);
+    item.push('\n');
+    item.push_str(summary_prefix);
+    item.push_str(&summary);
+    item.push('\n');
+    if let Some(note) = freshness_note {
+        item.push_str("  ");
+        item.push_str(&truncate_relevant_memory_field(note, freshness_budget));
+        item.push('\n');
+    }
+    item.push_str(&conditional_get);
+
+    debug_assert!(count_chars(&item) <= RELEVANT_MEMORY_PER_ITEM_MAX_CHARS);
     item
 }
 
@@ -1071,7 +1284,16 @@ fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
 /// `TemporalGranularity::is_high_churn`), the suffix segment is empty and
 /// `segments.combined()` degenerates to exactly the old flat concatenation in the
 /// same relative order, with no separator inserted.
-fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+#[derive(Debug, Clone, Default)]
+struct RelevantMemoryRender {
+    section: String,
+    kept_snippets: Vec<RelevantMemorySnippet>,
+}
+
+fn render_relevant_memory_section_with_budget(
+    snippets: &[RelevantMemorySnippet],
+    total_budget_chars: usize,
+) -> RelevantMemoryRender {
     let mut section = String::new();
     section.push_str("### Relevant Durable Memories\n");
     section.push_str(
@@ -1088,13 +1310,38 @@ fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String 
             )
         })
         .collect();
-    let segments = segment_by_granularity_budget(&items, RELEVANT_MEMORY_TOTAL_MAX_CHARS);
+    let segments = segment_by_granularity_budget(&items, total_budget_chars);
+    let dropped_ids = segments
+        .prefix_dropped_ids
+        .iter()
+        .chain(segments.suffix_dropped_ids.iter())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let kept_snippets = snippets
+        .iter()
+        .filter(|snippet| !TemporalGranularity::is_high_churn(snippet.granularity))
+        .chain(
+            snippets
+                .iter()
+                .filter(|snippet| TemporalGranularity::is_high_churn(snippet.granularity)),
+        )
+        .filter(|snippet| !dropped_ids.contains(snippet.id.as_str()))
+        .cloned()
+        .collect();
     // `combined()` is prefix followed by suffix with no separator — for the
     // all-coarse case the suffix is empty and this is byte-identical to the old
     // flat per-snippet loop.
     section.push_str(&segments.combined());
     section.push('\n');
-    section
+    RelevantMemoryRender {
+        section,
+        kept_snippets,
+    }
+}
+
+#[cfg(test)]
+fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+    render_relevant_memory_section_with_budget(snippets, RELEVANT_MEMORY_TOTAL_MAX_CHARS).section
 }
 
 fn render_project_memory_index_section(snippet: &ProjectMemoryIndexSnippet) -> String {
@@ -1192,6 +1439,16 @@ fn render_context_pressure_warning(session: &Session) -> Option<String> {
 mod granularity_prompt_wiring_tests {
     use super::*;
 
+    #[test]
+    fn ledger_root_defaults_to_bamboo_and_preserves_explicit_override() {
+        let explicit = PathBuf::from("explicit-bamboo-root");
+        assert_eq!(resolve_ledger_data_dir(Some(explicit.as_path())), explicit);
+        assert_eq!(
+            resolve_ledger_data_dir(None),
+            bamboo_config::paths::bamboo_dir()
+        );
+    }
+
     fn snippet(
         id: &str,
         granularity: Option<TemporalGranularity>,
@@ -1203,17 +1460,15 @@ mod granularity_prompt_wiring_tests {
             title: title.to_string(),
             scope: MemoryScope::Project,
             status: "active".to_string(),
-            score: 0.5,
             summary: summary.to_string(),
             freshness_note: None,
             granularity,
         }
     }
 
-    /// Faithful copy of `render_relevant_memory_section`'s pre-#497 body (flat,
-    /// unsegmented render loop) — kept only in this test to pin the exact
-    /// byte-for-byte output the all-coarse case must still produce.
-    fn old_style_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+    /// Flat, unsegmented copy of the compact #1029 item format. This pins the
+    /// byte contract that granularity routing must preserve for all-coarse input.
+    fn flat_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
         let mut section = String::new();
         section.push_str("### Relevant Durable Memories\n");
         section.push_str(
@@ -1221,23 +1476,26 @@ mod granularity_prompt_wiring_tests {
         );
         for snippet in snippets {
             section.push_str(&format!(
-                "- [{}][{}] {} (score {:.2})\n",
+                "- [{}][{}] {}\n",
                 snippet.status,
                 snippet.scope.as_str(),
-                snippet.title,
-                snippet.score
+                snippet.title
             ));
             section.push_str(&format!("  Summary: {}\n", snippet.summary));
             if let Some(note) = snippet.freshness_note.as_deref() {
                 section.push_str(&format!("  {}\n", note));
             }
+            section.push_str(&format!(
+                "  If selected: `memory` action=get id={}\n",
+                snippet.id
+            ));
         }
         section.push('\n');
         section
     }
 
     #[test]
-    fn all_untagged_memories_render_identically_to_pre_segmentation_format() {
+    fn all_untagged_memories_preserve_compact_flat_bytes() {
         let snippets = vec![
             snippet("a", None, "Alpha decision", "alpha summary"),
             snippet("b", None, "Beta preference", "beta summary"),
@@ -1246,9 +1504,51 @@ mod granularity_prompt_wiring_tests {
 
         assert_eq!(
             render_relevant_memory_section(&snippets),
-            old_style_relevant_memory_section(&snippets),
-            "an all-coarse (untagged) config must render byte-identical to the pre-#497 flat format"
+            flat_relevant_memory_section(&snippets),
+            "an all-coarse (untagged) config must preserve compact flat-render bytes"
         );
+    }
+
+    #[test]
+    fn compact_item_keeps_full_conditional_get_id_within_per_item_budget() {
+        let id = "m".repeat(128);
+        let mut memory = snippet(&id, None, &"title".repeat(40), &"summary".repeat(80));
+        memory.freshness_note = Some("Historical memory; verify against current state.".repeat(4));
+
+        let rendered = render_relevant_memory_item(&memory);
+
+        assert!(rendered.contains(&format!("If selected: `memory` action=get id={id}")));
+        assert!(rendered.contains("Summary:"));
+        assert!(count_chars(&rendered) <= RELEVANT_MEMORY_PER_ITEM_MAX_CHARS);
+    }
+
+    #[test]
+    fn compact_items_remain_within_existing_total_budget() {
+        let snippets = (0..20)
+            .map(|index| {
+                snippet(
+                    &format!("mem_{index:038}"),
+                    None,
+                    &"title".repeat(40),
+                    &"summary".repeat(80),
+                )
+            })
+            .collect::<Vec<_>>();
+        let items = snippets
+            .iter()
+            .map(|snippet| {
+                GranularityBudgetItem::new(
+                    snippet.id.clone(),
+                    snippet.granularity,
+                    render_relevant_memory_item(snippet),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let rendered =
+            segment_by_granularity_budget(&items, RELEVANT_MEMORY_TOTAL_MAX_CHARS).combined();
+
+        assert!(count_chars(&rendered) <= RELEVANT_MEMORY_TOTAL_MAX_CHARS);
     }
 
     #[test]
@@ -1268,7 +1568,11 @@ mod granularity_prompt_wiring_tests {
             "year summary",
         );
 
-        let section = render_relevant_memory_section(&[day, year]);
+        let rendered = render_relevant_memory_section_with_budget(
+            &[day, year],
+            RELEVANT_MEMORY_TOTAL_MAX_CHARS,
+        );
+        let section = rendered.section;
 
         let day_pos = section
             .find("Day Title Marker")
@@ -1280,6 +1584,53 @@ mod granularity_prompt_wiring_tests {
             year_pos < day_pos,
             "coarse (year) memory must render before fine (day) memory"
         );
+        assert_eq!(
+            rendered
+                .kept_snippets
+                .iter()
+                .map(|snippet| snippet.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["year-1", "day-1"],
+            "typed provenance order must match final provider-visible render order"
+        );
+    }
+
+    #[test]
+    fn typed_provenance_excludes_items_dropped_by_the_final_render_budget() {
+        let day = snippet(
+            "day-dropped",
+            Some(TemporalGranularity::Day),
+            "Day Dropped Marker",
+            "day summary",
+        );
+        let year = snippet(
+            "year-kept",
+            Some(TemporalGranularity::Year),
+            "Year Kept Marker",
+            "year summary",
+        );
+        let quarter = snippet(
+            "quarter-dropped",
+            Some(TemporalGranularity::Quarter),
+            "Quarter Dropped Marker",
+            "quarter summary",
+        );
+        let year_chars = count_chars(&render_relevant_memory_item(&year));
+
+        let rendered =
+            render_relevant_memory_section_with_budget(&[day, year, quarter], year_chars);
+
+        assert_eq!(
+            rendered
+                .kept_snippets
+                .iter()
+                .map(|snippet| snippet.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["year-kept"],
+        );
+        assert!(rendered.section.contains("Year Kept Marker"));
+        assert!(!rendered.section.contains("Quarter Dropped Marker"));
+        assert!(!rendered.section.contains("Day Dropped Marker"));
     }
 
     #[test]

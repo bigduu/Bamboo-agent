@@ -104,7 +104,7 @@ impl TaskLoopContext {
                     .map(|item| item.id.clone()),
                 items,
                 current_round: 0,
-                max_rounds: 200,
+                max_rounds: None,
                 created_at: task_list.created_at,
                 updated_at: task_list.updated_at,
                 version: existing_version,

@@ -45,10 +45,10 @@ claude \
   --replay-user-messages \
   --verbose \
   --permission-mode <acceptEdits|plan|bypassPermissions|default>  # ALWAYS explicit — see below
-  [--strict-mcp-config] [--setting-sources project]               # isolation — see below
+  [--strict-mcp-config] [--setting-sources project|""]            # isolation — see below
   [--resume <session_id>]                                    # omit for a fresh session
   [--model <model>]
-  [--allowedTools a,b] [--disallowedTools a,b]
+  [--tools Read,Glob,Grep] [--disallowedTools Bash Edit ...]
   [--system-prompt <s>] [--append-system-prompt-file <path>]
 ```
 
@@ -72,7 +72,11 @@ memory paths — ~8k cache-creation tokens and a large ambient-authority surface
 for a single `touch`. Unless `inherit_user_config: true` is set on the
 `ClaudeCode` executor spec, `build_command` adds `--strict-mcp-config` and
 `--setting-sources project`, so the child sees only project-scoped config, not
-the user's global one.
+the user's global one. A typed read-only activation additionally passes an
+empty `--setting-sources` value even if inheritance was requested. That keeps
+repository-controlled settings, CLAUDE.md, skills, and especially hooks out of
+the process: Claude's `plan` permission mode controls built-in tools but does
+not sandbox hook subprocesses.
 
 Environment (issue #443 — env allowlist supersedes the earlier
 strip-one-var approach):
@@ -87,6 +91,19 @@ strip-one-var approach):
 - `CLAUDECODE` is still explicitly `env_remove`d after the allowlist pass —
   redundant now that `env_clear()` means it can't leak in from the parent at
   all, kept as executable documentation of the nested-session hazard below.
+- The worker forwards host-provisioned `disabled_tools` as bare
+  `--disallowedTools` rules. A typed read-only activation also sets the
+  positive built-in surface to `--tools Read,Glob,Grep` and denies `mcp__*`.
+  This keeps Bash, mutation, delegation, web, and newly-added built-in tools
+  outside the child even though Claude's native `plan` mode remains enabled as
+  another layer.
+- Before a parent sends any typed read-only provision to a local worker, it
+  runs `subagent-worker --print-capabilities` and requires the explicit
+  `typed_read_only_tool_policy_v1` acknowledgement. This happens before the
+  assignment or provision document is delivered. A pre-change Bamboo worker
+  rejects the unknown flag, and a custom worker without the acknowledgement is
+  refused, so forward-compatible JSON field skipping cannot silently erase the
+  read-only boundary.
 - Put the child in its own **process group** so shutdown can kill the whole tree
   (claude → its MCP servers) (`session.go:369`).
 
@@ -283,7 +300,7 @@ pub struct ClaudeCodeExecutor {
     /// `None` disables resume persistence (every activation is fresh).
     state_dir: Option<PathBuf>,
     /// Issue #443: `false` (default) adds `--strict-mcp-config` +
-    /// `--setting-sources project` — see §1.
+    /// `--setting-sources project`; read-only Plan uses an empty source list.
     inherit_user_config: bool,
     /// Issue #443: extra env var NAMES forwarded on top of the fixed
     /// allowlist — see §1/§6.

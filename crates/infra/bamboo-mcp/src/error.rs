@@ -1,5 +1,47 @@
 use thiserror::Error;
 
+/// Typed failures produced while validating or publishing one MCP tool catalog.
+///
+/// These diagnostics deliberately identify positions, bounded counts, and
+/// provider-visible hashed aliases instead of echoing remote server/tool labels,
+/// which may contain sensitive or attacker-controlled text.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ToolRegistrationError {
+    #[error("MCP tool catalog has an empty server identity")]
+    EmptyServerIdentity,
+
+    #[error("MCP tool catalog has an empty tool identity at position {position}")]
+    EmptyToolIdentity { position: usize },
+
+    #[error(
+        "MCP tool catalog has a duplicate tool identity at positions {first_position} and {duplicate_position}"
+    )]
+    DuplicateToolIdentity {
+        first_position: usize,
+        duplicate_position: usize,
+    },
+
+    #[error("MCP catalog update contains duplicate plans for one server")]
+    DuplicateServerPlan,
+
+    #[error("MCP catalog update both replaces and removes one server")]
+    ConflictingServerChange,
+
+    #[error("MCP canonical tool alias collision for '{alias}'")]
+    AliasCollision { alias: String },
+
+    #[error(
+        "MCP ownership ledger capacity exceeded: attempted {attempted} relationships with limit {limit}"
+    )]
+    OwnershipLedgerCapacityExceeded { limit: usize, attempted: usize },
+
+    #[error("MCP publication revision exhausted")]
+    PublicationRevisionExhausted,
+
+    #[error("MCP provider schema is unavailable for a published catalog entry")]
+    ProviderSchemaUnavailable,
+}
+
 #[derive(Error, Debug, Clone)]
 pub enum McpError {
     #[error("Transport error: {0}")]
@@ -47,6 +89,9 @@ pub enum McpError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    #[error(transparent)]
+    ToolRegistration(#[from] ToolRegistrationError),
+
     #[error("Server disconnected")]
     Disconnected,
 
@@ -55,6 +100,21 @@ pub enum McpError {
 
     #[error("Server not running: {0}")]
     NotRunning(String),
+
+    #[error("MCP publication is stale (publication_id={publication_id}, runtime_id={runtime_id})")]
+    StalePublication {
+        publication_id: u64,
+        runtime_id: u64,
+    },
+
+    #[error("MCP resolved call belongs to a different runtime authority")]
+    ForeignRuntimeAuthority,
+
+    #[error("MCP publication identity space exhausted")]
+    PublicationIdentityExhausted,
+
+    #[error("MCP runtime identity space exhausted")]
+    RuntimeIdentityExhausted,
 }
 
 impl From<serde_json::Error> for McpError {

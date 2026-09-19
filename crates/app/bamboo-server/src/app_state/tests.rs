@@ -1,14 +1,17 @@
-use super::{AppState, DEFAULT_BASE_PROMPT};
+use super::{AppState, UnconfiguredProvider, DEFAULT_BASE_PROMPT};
 use crate::tools::ToolSurface;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError};
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{Session, ToolExecutionContext};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+use bamboo_llm::{Config, LLMProvider};
 use bamboo_metrics::{MetricsStorage, SessionStatus, SqliteMetricsStorage};
+use bamboo_plugin_protocol::InMemoryToolEventRecorder;
 use bamboo_storage::SessionStoreV2;
 use bamboo_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
 use bamboo_tools::permission::storage::PermissionStorage;
 use serde_json::json;
+use std::sync::Arc;
 
 fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall {
@@ -65,6 +68,100 @@ async fn test_app_state_creation() {
     assert!(state.sessions.is_empty());
     assert!(state.config_facade.is_some());
     assert!(bamboo_config::section_layout_is_active(temp_dir.path()).unwrap());
+}
+
+#[tokio::test]
+async fn injected_tool_event_publishers_are_isolated_between_app_states() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let recorder_a = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+    let recorder_b = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+    let provider: Arc<dyn LLMProvider> = Arc::new(UnconfiguredProvider {
+        message: "test provider is intentionally unconfigured".to_string(),
+    });
+    let state_a = AppState::new_with_provider_and_tool_event_publisher(
+        dir_a.path().to_path_buf(),
+        Config::default(),
+        provider.clone(),
+        recorder_a.clone(),
+    )
+    .await
+    .unwrap();
+    let state_b = AppState::new_with_provider_and_tool_event_publisher(
+        dir_b.path().to_path_buf(),
+        Config::default(),
+        provider,
+        recorder_b.clone(),
+    )
+    .await
+    .unwrap();
+
+    let file_a = dir_a.path().join("state-a.txt");
+    let call_a = make_tool_call("Write", json!({"file_path": file_a, "content": "state-a"}));
+    let result_a = state_a
+        .tools_for(ToolSurface::Base)
+        .execute_with_context(
+            &call_a,
+            ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("state-a-session"),
+                root_session_id: Some("state-a-root-session"),
+                tool_call_id: &call_a.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result_a.success);
+    assert_eq!(tokio::fs::read_to_string(file_a).await.unwrap(), "state-a");
+    assert_eq!(recorder_a.try_snapshot().unwrap().len(), 1);
+    assert!(recorder_b.try_snapshot().unwrap().is_empty());
+
+    let file_b = dir_b.path().join("state-b.txt");
+    let call_b = make_tool_call("Write", json!({"file_path": file_b, "content": "state-b"}));
+    let result_b = state_b
+        .tools_for(ToolSurface::Base)
+        .execute_with_context(
+            &call_b,
+            ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("state-b-session"),
+                root_session_id: Some("state-b-root-session"),
+                tool_call_id: &call_b.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result_b.success);
+    assert_eq!(tokio::fs::read_to_string(file_b).await.unwrap(), "state-b");
+
+    let events_a = recorder_a.try_snapshot().unwrap();
+    let events_b = recorder_b.try_snapshot().unwrap();
+    assert_eq!(events_a.len(), 1, "state B must not publish into state A");
+    assert_eq!(
+        events_b.len(),
+        1,
+        "state B must publish into its own recorder"
+    );
+    assert_eq!(events_a[0].context.session_id, "state-a-session");
+    assert_eq!(events_a[0].context.root_session_id, "state-a-root-session");
+    assert_eq!(events_b[0].context.session_id, "state-b-session");
+    assert_eq!(events_b[0].context.root_session_id, "state-b-root-session");
 }
 
 #[tokio::test]
@@ -138,68 +235,301 @@ async fn root_tools_include_server_overlays_and_session_note() {
 
     assert!(names.contains("Task"));
     assert!(names.contains("SubAgent"));
+    assert!(names.contains("archive_context"));
     assert!(names.contains("scheduler"));
     assert!(names.contains("session_history"));
+    assert!(names.contains("session_history_current"));
+    assert!(names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("session_note"));
+
+    let history = state
+        .tools_for(ToolSurface::Root)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Root history schema");
+    let actions = history.function.parameters["properties"]["action"]["enum"]
+        .as_array()
+        .expect("Root history actions");
+    assert!(actions.contains(&json!("search_current")));
+    assert!(actions.contains(&json!("read_current")));
+    assert!(actions.contains(&json!("read_around")));
+    assert!(actions.contains(&json!("list")));
+    assert!(actions.contains(&json!("read_messages")));
+
+    let current_history = state
+        .tools_for(ToolSurface::Root)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Root current-history schema");
+    assert_eq!(
+        current_history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current", "read_current", "read_around"])
+    );
+    assert!(current_history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
 }
 
 #[tokio::test]
-async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog() {
+async fn root_catalog_keeps_only_current_history_in_the_six_core_functions() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
     let full = state.get_all_tool_schemas();
-    let visible: Vec<_> = full
+    let core_names = full
         .iter()
-        .filter(|schema| bamboo_tools::exposure::is_core_tool(&schema.function.name))
-        .collect();
-    let visible_names: std::collections::HashSet<&str> = visible
-        .iter()
-        .map(|schema| schema.function.name.as_str())
-        .collect();
-    eprintln!(
-        "tool_surface_metrics: full={}, visible={}, hidden={}",
-        full.len(),
-        visible.len(),
-        full.len().saturating_sub(visible.len())
-    );
+        .filter_map(|schema| {
+            bamboo_domain::ClassifiedToolIdentity::from_schema_name(&schema.function.name)
+        })
+        .filter(|identity| identity.loading_class() == bamboo_domain::CapabilityLoadingClass::Core)
+        .map(|identity| identity.execution_name().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    assert!(
-        visible.len() < full.len(),
-        "expected reduced first-round surface: visible={}, full={}",
-        visible.len(),
-        full.len()
+    assert_eq!(
+        core_names,
+        std::collections::BTreeSet::from([
+            "Bash".to_string(),
+            "Edit".to_string(),
+            "Grep".to_string(),
+            "Read".to_string(),
+            "Write".to_string(),
+            "session_history_current".to_string(),
+        ])
     );
-    assert!(!visible_names.contains("scheduler"));
-    assert!(!visible_names.contains("sub_session_manager"));
-    assert!(!visible_names.contains("session_history"));
+    let broad_history = bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_history")
+        .expect("broad history identity");
+    assert_eq!(
+        broad_history.loading_class(),
+        bamboo_domain::CapabilityLoadingClass::Deferred
+    );
+    assert_eq!(
+        bamboo_domain::DISCOVERY_CONTROL_GATEWAY.logical_name(),
+        "discover"
+    );
+    assert!(bamboo_domain::DISCOVERY_CONTROL_GATEWAY.is_initially_visible());
 }
 
 #[tokio::test]
-async fn child_tools_exclude_scheduler_and_session_history() {
+async fn child_tools_include_only_self_scoped_session_history() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
-    let names: std::collections::HashSet<String> = state
-        .tools_for(ToolSurface::Child)
-        .list_tools()
-        .into_iter()
-        .map(|schema| schema.function.name)
-        .collect();
+    let tools = state.tools_for(ToolSurface::Child).list_tools();
+    let names = tools
+        .iter()
+        .map(|schema| schema.function.name.clone())
+        .collect::<std::collections::HashSet<_>>();
 
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
-    assert!(!names.contains("session_history"));
+    assert!(names.contains("archive_context"));
+    assert!(names.contains("session_history"));
+    assert!(names.contains("session_history_current"));
+    assert!(!names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("session_note"));
+
+    let history = tools
+        .iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Child history schema");
+    assert_eq!(
+        history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current", "read_current", "read_around"])
+    );
+    assert!(history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
+    let base_history = state
+        .tools_for(ToolSurface::Base)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Base history schema");
+    assert_eq!(
+        base_history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current", "read_current", "read_around"])
+    );
+    assert!(base_history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
+    let child_current_history = tools
+        .iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Child current-history schema");
+    assert_eq!(
+        child_current_history.function.parameters, history.function.parameters,
+        "the exact Core identity must expose only the same least-privilege schema"
+    );
+    let base_current_history = state
+        .tools_for(ToolSurface::Base)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Base current-history schema");
+    assert_eq!(
+        base_current_history.function.parameters,
+        base_history.function.parameters
+    );
+    let mut child_session = Session::new("child-history-surface", "test-model");
+    child_session.add_message(bamboo_agent_core::Message::user(
+        "CHILD-SELF-HISTORY-SENTINEL",
+    ));
+    child_session.add_message(bamboo_agent_core::Message::assistant(
+        "Stored answer from the prior turn",
+        None,
+    ));
+    child_session.add_message(bamboo_agent_core::Message::user(
+        "Search the prior turn now",
+    ));
+    state
+        .session_store
+        .save_session(&child_session)
+        .await
+        .unwrap();
+    let search_call = make_tool_call(
+        "session_history_current",
+        json!({"action": "search_current", "query": "CHILD-SELF-HISTORY-SENTINEL"}),
+    );
+    let mut context = ToolExecutionContext::none(&search_call.id);
+    context.session_id = Some(&child_session.id);
+    let result = state
+        .tools_for(ToolSurface::Child)
+        .execute_with_context(&search_call, context)
+        .await
+        .expect("Child self-history search succeeds");
+    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result["session_id"], child_session.id);
+    assert_eq!(result["match_count"], 1);
+
+    let list_call = make_tool_call("session_history_current", json!({"action": "list"}));
+    let mut context = ToolExecutionContext::none(&list_call.id);
+    context.session_id = Some(&child_session.id);
+    assert!(matches!(
+        state
+            .tools_for(ToolSurface::Child)
+            .execute_with_context(&list_call, context)
+            .await,
+        Err(ToolError::InvalidArguments(message)) if message.contains("only permits")
+    ));
+
+    let legacy_search_call = make_tool_call(
+        "session_history",
+        json!({"action": "search_current", "query": "CHILD-SELF-HISTORY-SENTINEL"}),
+    );
+    let mut context = ToolExecutionContext::none(&legacy_search_call.id);
+    context.session_id = Some(&child_session.id);
+    assert!(
+        state
+            .tools_for(ToolSurface::Child)
+            .execute_with_context(&legacy_search_call, context)
+            .await
+            .expect("legacy self-history name remains compatible")
+            .success
+    );
+}
+
+#[tokio::test]
+async fn current_history_survives_app_state_restart_with_archived_messages() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().to_path_buf();
+    let session_id = "restart-current-history";
+
+    {
+        let state = AppState::new(data_dir.clone())
+            .await
+            .expect("initial app state should initialize");
+        let mut session = Session::new(session_id, "test-model");
+        let mut archived_user = bamboo_agent_core::Message::user(
+            "ARCHIVED-CURRENT-HISTORY-SENTINEL exact prior decision",
+        );
+        archived_user.compressed = true;
+        let mut archived_assistant = bamboo_agent_core::Message::assistant(
+            "The exact archived decision remains authoritative",
+            None,
+        );
+        archived_assistant.compressed = true;
+        session.add_message(archived_user);
+        session.add_message(archived_assistant);
+        session.add_message(bamboo_agent_core::Message::user(
+            "Recover the earlier exact decision",
+        ));
+        state
+            .session_store
+            .save_session(&session)
+            .await
+            .expect("archived Session should persist");
+        state.session_store.flush_search_index().await;
+    }
+
+    let restarted = AppState::new(data_dir)
+        .await
+        .expect("restarted app state should initialize");
+    for surface in [ToolSurface::Base, ToolSurface::Child, ToolSurface::Root] {
+        let schema = restarted
+            .tools_for(surface)
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "session_history_current")
+            .unwrap_or_else(|| panic!("{surface:?} must retain current history after restart"));
+        let identity =
+            bamboo_domain::ClassifiedToolIdentity::from_schema_name(&schema.function.name)
+                .expect("registered current-history identity");
+        assert_eq!(
+            identity.loading_class(),
+            bamboo_domain::CapabilityLoadingClass::Core
+        );
+        assert_eq!(
+            schema.function.parameters["properties"]["action"]["enum"],
+            json!(["search_current", "read_current", "read_around"])
+        );
+    }
+
+    let search_call = make_tool_call(
+        "session_history_current",
+        json!({
+            "action": "search_current",
+            "query": "ARCHIVED-CURRENT-HISTORY-SENTINEL"
+        }),
+    );
+    let mut context = ToolExecutionContext::none(&search_call.id);
+    context.session_id = Some(session_id);
+    let result = restarted
+        .tools_for(ToolSurface::Root)
+        .execute_with_context(&search_call, context)
+        .await
+        .expect("restarted exact current-history search should succeed");
+    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result["match_count"], 1);
+    assert_eq!(result["matches"][0]["compressed"], true);
+
+    let override_call = make_tool_call(
+        "session_history_current",
+        json!({
+            "action": "search_current",
+            "query": "sentinel",
+            "session_id": "another-session"
+        }),
+    );
+    let mut context = ToolExecutionContext::none(&override_call.id);
+    context.session_id = Some(session_id);
+    assert!(matches!(
+        restarted
+            .tools_for(ToolSurface::Root)
+            .execute_with_context(&override_call, context)
+            .await,
+        Err(ToolError::InvalidArguments(message)) if message.contains("only accepts")
+    ));
 }
 
 #[tokio::test]
@@ -228,6 +558,18 @@ async fn overlay_tools_require_session_context() {
     assert!(matches!(
         inspector_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
+    ));
+
+    let current_history_result = state
+        .tools_for(ToolSurface::Root)
+        .execute(&make_tool_call(
+            "session_history_current",
+            json!({ "action": "read_current" }),
+        ))
+        .await;
+    assert!(matches!(
+        current_history_result,
+        Err(ToolError::Execution(msg)) if msg.contains("session_history_current") && msg.contains("session_id")
     ));
 
     let memory_result = state
@@ -282,7 +624,9 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &write_target,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-target",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -315,7 +659,9 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &write_source,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-source",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -347,7 +693,9 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &merge_call,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -400,7 +748,9 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-original",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -433,7 +783,9 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -462,7 +814,9 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-inspect-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -508,7 +862,9 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-target",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -539,7 +895,9 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-source",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -571,7 +929,9 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-contradict",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -624,7 +984,9 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-stale",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -654,7 +1016,9 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-mark-stale",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -683,7 +1047,9 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-active",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -715,7 +1081,9 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-batch-purge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -732,6 +1100,53 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
     let batch_json: serde_json::Value = serde_json::from_str(&batch_result.result).unwrap();
     assert_eq!(batch_json["action"], "purge");
     assert_eq!(batch_json["data"]["matched_count"], 1);
+}
+
+#[tokio::test]
+async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    state
+        .tools_for(ToolSurface::Root)
+        .execute_with_context(
+            &make_tool_call(
+                "session_note",
+                json!({
+                    "action": "replace",
+                    "content": "Shared AppState Jiandu note"
+                }),
+            ),
+            bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("session-note-injected-store"),
+                root_session_id: None,
+                tool_call_id: "tool-call-session-note-injected-store",
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .expect("session_note replace should succeed");
+
+    assert_eq!(
+        state
+            .memory_store
+            .read_session_topic("session-note-injected-store", "default")
+            .await
+            .expect("read note from AppState store")
+            .as_deref(),
+        Some("Shared AppState Jiandu note")
+    );
 }
 
 #[tokio::test]
@@ -762,7 +1177,9 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -788,7 +1205,9 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -808,7 +1227,10 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     assert!(inspect_json["data"]["state_files"].is_array());
     assert!(inspect_json["data"]["stale_candidate_count"].is_number());
     assert!(inspect_json["data"]["last_reindex_at"].is_string());
-    assert!(inspect_json["data"]["last_dream_at"].is_string());
+    assert!(
+        inspect_json["data"]["last_dream_at"].is_null(),
+        "a cold Jiandu scope has no Dream snapshot until one is explicitly published"
+    );
 
     let rebuild_result = state
         .tools_for(ToolSurface::Root)
@@ -821,7 +1243,9 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-rebuild",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -841,7 +1265,10 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     assert!(rebuild_json["data"]["state_files"].is_array());
     assert!(rebuild_json["data"]["stale_candidate_count"].is_number());
     assert!(rebuild_json["data"]["last_reindex_at"].is_string());
-    assert!(rebuild_json["data"]["last_dream_at"].is_string());
+    assert!(
+        rebuild_json["data"]["last_dream_at"].is_null(),
+        "rebuilding canonical indexes must not synthesize a Dream snapshot"
+    );
 }
 
 #[tokio::test]
@@ -1009,3 +1436,6 @@ mod config_recovery_gate {
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 }
+
+#[path = "session_control_tests.rs"]
+mod session_control_tests;

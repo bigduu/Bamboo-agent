@@ -2,8 +2,10 @@ name: CI
 
 on:
   workflow_dispatch:
+  # Pull requests are the required dev gate; do not repeat the same suite after
+  # that tested head merges. Main promotions still validate their merge result.
   push:
-    branches: [ dev, main ]
+    branches: [ main ]
   pull_request:
     branches: [ dev, main ]
 
@@ -39,15 +41,22 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Node.js
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
 
+      - name: Test frontend artifact and release policies
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        run: node --test scripts/ci-policy.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+
       - name: Stage frontend package
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        shell: bash
         run: |
+          set -euo pipefail
           node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
+          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,24 +67,48 @@ jobs:
           shared-key: bamboo-ci-test-${{ runner.os }}
           cache-on-failure: true
 
-      - name: Run tests
-        run: cargo test --all-features --lib --tests
+      - name: Verify published server crate owns the frontend package
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_FILES="$(cargo package --locked -p bamboo-server --allow-dirty --list)"
+          for required in \
+            build.rs \
+            frontend_build.rs \
+            frontend_package/frontend-manifest.json \
+            frontend_package/lotus-frontend.zip; do
+            if ! grep -Fxq "${required}" <<< "${PACKAGE_FILES}"; then
+              echo "::error::bamboo-server package is missing ${required}"
+              exit 1
+            fi
+          done
 
-      - name: Run integration tests
-        run: cargo test --tests
+      - name: Build locked Rust workspace
+        run: cargo build --locked
 
-      - name: Run real SSH/SFTP transport test
-        timeout-minutes: 10
-        run: scripts/run-russh-live.sh
+      - name: Test locked Rust workspace
+        run: cargo test --locked
+
+      - name: Run all-feature Rust tests
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        run: cargo test --locked --all-features --lib --tests
 
       - name: Build examples
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
         # Compile-only (no network/config needed): guards `examples/*.rs` —
         # and the README SDK snippet each one's doc comment mirrors — against
         # drifting from the real API (bamboo-agent#255).
-        run: cargo build --examples
+        run: cargo build --locked --examples
+
+      - name: Run real SSH/SFTP transport test
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        timeout-minutes: 10
+        run: scripts/run-russh-live.sh
 
   msrv:
     name: MSRV (Rust 1.95)
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,6 +135,7 @@ jobs:
 
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     # Keep the test-only certificate generator portable across the OpenSSL and
     # LibreSSL variants on every supported host. The release build matrix below
     # does not compile or execute #[cfg(test)] code.
@@ -133,8 +167,32 @@ jobs:
         if: runner.os != 'macOS'
         run: cargo test --locked -p bamboo-server --lib server::tls::tests -- --nocapture
 
+  tool-event-recorder-e2e:
+    name: ToolEvent Recorder E2E (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Run native recorder contract and lifecycle tests
+        run: cargo test --locked -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
+
   e2e-test:
     name: E2E Tests
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -153,6 +211,7 @@ jobs:
 
   lint:
     name: Lint
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -208,11 +267,15 @@ jobs:
         with:
           node-version: lts/*
 
+      - name: Test frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+
       - name: Stage frontend package
+        shell: bash
         run: |
+          set -euo pipefail
           node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
+          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -226,8 +289,12 @@ jobs:
       - name: Build
         run: cargo build --release --verbose
 
+      - name: Verify portable frontend package contract
+        run: cargo test --locked -p bamboo-server --test frontend_build_contract
+
   docs:
     name: Documentation
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -246,6 +313,7 @@ jobs:
 
   security:
     name: Security Audit
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -280,6 +348,7 @@ jobs:
 
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

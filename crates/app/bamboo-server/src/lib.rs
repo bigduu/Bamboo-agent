@@ -127,6 +127,11 @@ pub mod server;
 pub mod service_manager;
 pub mod services;
 pub mod session_app;
+pub mod tool_event_policy;
+pub mod tool_event_router;
+
+#[cfg(test)]
+mod tool_event_recorder_example_tests;
 
 // Re-export shims: these modules were relocated to bamboo-engine; keep the
 // historical bamboo_server::… paths working for external/integration-test refs.

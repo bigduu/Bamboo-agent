@@ -438,95 +438,59 @@ impl PermissionChecker for DenyDangerousPermissionChecker {
     }
 }
 
-/// A permission checker for a READ-ONLY Guardian reviewer's Bash.
+/// A permission checker for a runtime-enforced read-only child.
 ///
-/// The Guardian reviewer is given a tool DENYLIST (`guardian_read_only_disabled_tools`)
-/// that strips every mutating tool but keeps `Bash` so the reviewer can fetch the
-/// diff and run tests. That left `Bash` unrestricted — a "read-only" reviewer
-/// could still `rm -rf`, `git push --force`, `curl … | sh`, or `> file`. This
-/// checker closes that gap: it wraps an inner checker (the worker's High-threshold
-/// [`ConfigPermissionChecker`]) and, for `ExecuteCommand`, allows ONLY commands in
-/// the read-only allowlist ([`is_read_only_command`]) — without gating them (so
-/// `cargo test` runs freely) — and DENIES everything else, failing closed (the
-/// reviewer has no human to approve). Every other permission type delegates to the
-/// inner checker; the reviewer's other mutating tools are already removed by the
-/// denylist, so they never reach here.
-pub struct GuardianReadOnlyChecker {
+/// A shell command cannot be made a hard read-only authority boundary by
+/// inspecting its source string: the shell still resolves executables through
+/// ambient environment and repository-controlled state. Therefore every
+/// `ExecuteCommand` is denied before the shell starts. More generally, every
+/// permission-bearing operation is a side effect and is hard-denied; read-only
+/// children use the ungated, dedicated Read/Glob/Grep/GetFileInfo surfaces.
+/// The host-owned denylist removes those tools from the advertised schema too.
+pub struct ReadOnlyCommandChecker {
     inner: Arc<dyn PermissionChecker>,
 }
 
-impl std::fmt::Debug for GuardianReadOnlyChecker {
+impl std::fmt::Debug for ReadOnlyCommandChecker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GuardianReadOnlyChecker").finish()
+        f.debug_struct("ReadOnlyCommandChecker").finish()
     }
 }
 
-impl GuardianReadOnlyChecker {
-    /// Wrap `inner`, enforcing the read-only Bash allowlist on top of it.
+impl ReadOnlyCommandChecker {
+    /// Wrap `inner`, enforcing the no-shell read-only boundary on top of it.
     pub fn new(inner: Arc<dyn PermissionChecker>) -> Self {
         Self { inner }
     }
 }
 
 #[async_trait]
-impl PermissionChecker for GuardianReadOnlyChecker {
-    async fn needs_confirmation(&self, perm_type: PermissionType, resource: &str) -> bool {
-        if perm_type == PermissionType::ExecuteCommand {
-            // A read-only command runs WITHOUT a gate (so `cargo test` is free);
-            // anything else "needs confirmation" — which, with no human, denies.
-            return !is_read_only_command(resource);
-        }
-        // Other tools are removed by the reviewer's denylist; delegate safely.
-        self.inner.needs_confirmation(perm_type, resource).await
+impl PermissionChecker for ReadOnlyCommandChecker {
+    async fn needs_confirmation(&self, _perm_type: PermissionType, _resource: &str) -> bool {
+        // Every permission-bearing operation is a hard deny. Returning true
+        // keeps older confirmation-oriented callers fail-closed as well.
+        true
     }
 
     async fn request_confirmation(&self, ctx: PermissionContext) -> Result<bool, PermissionError> {
-        // Fail closed: a non-read-only command is DENIED outright (not routed to
-        // an approver / model-reviewer), so the read-only guarantee is hard — a
-        // reviewer's Bash can NEVER run a mutating command, period.
-        if ctx.permission_type == PermissionType::ExecuteCommand
-            && !is_read_only_command(&ctx.resource)
-        {
-            return Err(PermissionError::Denied(format!(
-                "Guardian reviewer is read-only: command not allowed: {}",
-                ctx.resource
-            )));
-        }
-        self.inner.request_confirmation(ctx).await
+        // Fail closed before any approver/model-review path can widen the
+        // runtime boundary.
+        Err(PermissionError::Denied(format!(
+            "Read-only child: {} is disabled: {}",
+            ctx.permission_type.description(),
+            ctx.resource
+        )))
     }
 
     async fn check_or_request(&self, ctx: PermissionContext) -> Result<bool, PermissionError> {
-        // Read-only commands are auto-allowed; non-read-only ones are hard-denied.
-        if ctx.permission_type == PermissionType::ExecuteCommand {
-            return if is_read_only_command(&ctx.resource) {
-                Ok(true)
-            } else {
-                Err(PermissionError::Denied(format!(
-                    "Guardian reviewer is read-only: command not allowed: {}",
-                    ctx.resource
-                )))
-            };
-        }
-        self.inner.check_or_request(ctx).await
+        self.request_confirmation(ctx).await
     }
 
     async fn check_or_request_forced(
         &self,
         ctx: PermissionContext,
     ) -> Result<bool, PermissionError> {
-        // A forced (always-ask) ExecuteCommand is held to the SAME hard rule, so a
-        // dangerous-command pattern can't slip past the read-only guarantee.
-        if ctx.permission_type == PermissionType::ExecuteCommand {
-            return if is_read_only_command(&ctx.resource) {
-                Ok(true)
-            } else {
-                Err(PermissionError::Denied(format!(
-                    "Guardian reviewer is read-only: command not allowed: {}",
-                    ctx.resource
-                )))
-            };
-        }
-        self.inner.check_or_request_forced(ctx).await
+        self.request_confirmation(ctx).await
     }
 
     fn grant_session_permission(&self, perm_type: PermissionType, resource: String) {
@@ -546,18 +510,17 @@ impl PermissionChecker for GuardianReadOnlyChecker {
     }
 
     fn hard_deny_reason(&self, ctx: &PermissionContext) -> Option<String> {
-        if ctx.permission_type == PermissionType::ExecuteCommand
-            && !is_read_only_command(&ctx.resource)
-        {
-            Some(format!(
-                "Guardian reviewer is read-only: command not allowed: {}",
-                ctx.resource
-            ))
-        } else {
-            self.inner.hard_deny_reason(ctx)
-        }
+        Some(format!(
+            "Read-only child: {} is disabled: {}",
+            ctx.permission_type.description(),
+            ctx.resource
+        ))
     }
 }
+
+/// Compatibility alias for downstream users of the original Guardian-specific
+/// type name. The enforcement itself is generic for every read-only child.
+pub type GuardianReadOnlyChecker = ReadOnlyCommandChecker;
 
 /// Shell commands that are considered safe for auto-approval in AcceptEdits mode.
 const SAFE_EDIT_COMMANDS: &[&str] = &[
@@ -677,12 +640,15 @@ fn command_can_chain_or_inject(analysis: &crate::bash_security::BashSecurityAnal
     })
 }
 
-/// Read-only `git` subcommands the Guardian reviewer may run (inspection only —
-/// NO add/commit/push/pull/checkout/reset/rebase/merge/stash/clean/rm/mv/tag).
+/// Inspection-only `git` subcommands recognized by the lexical classifier —
+/// NO status, add/commit/push/pull/checkout/reset/rebase/merge/stash/clean/rm/
+/// mv/tag). Porcelain diff commands additionally require explicit helper-
+/// disabling flags checked by [`git_subcommand_is_read_only`]. `log` and `show`
+/// also require a safe explicit pretty format so repository config cannot turn
+/// an ordinary history read into signature-helper execution.
 const GUARDIAN_GIT_SUBCOMMANDS: &[&str] = &[
-    // Read-only inspection only. NOT `branch` (its -d/-D/-m mutate refs), and NOT
-    // add/commit/push/pull/checkout/reset/rebase/merge/stash/clean/rm/mv/tag.
-    "status",
+    // Read-only inspection only. NOT `status` (it may refresh/write the index),
+    // `branch` (its -d/-D/-m mutate refs), or any explicit ref/worktree mutation.
     "diff",
     "log",
     "show",
@@ -691,18 +657,32 @@ const GUARDIAN_GIT_SUBCOMMANDS: &[&str] = &[
     "ls-files",
     "diff-tree",
     "cat-file",
-    "describe",
 ];
 
-/// Read-only / test / build `cargo` subcommands the Guardian reviewer may run
-/// (NO run/publish/install/clean — those execute or mutate; NO `fmt` — it
-/// rewrites source files in place unless `--check`, which an allowlist can't
-/// require cheaply).
-const GUARDIAN_CARGO_SUBCOMMANDS: &[&str] = &[
-    "check", "build", "test", "clippy", "tree", "metadata", "nextest",
+/// Built-in pretty formats whose meaning cannot be replaced by a repository's
+/// `format.pretty` or `pretty.<name>` configuration. Arbitrary format strings
+/// are excluded because `%G*` (including modifier forms) invokes a configured
+/// signature verifier.
+const GUARDIAN_GIT_PRETTY_FORMATS: &[&str] = &[
+    "oneline",
+    "short",
+    "medium",
+    "full",
+    "fuller",
+    "reference",
+    "email",
+    "mboxrd",
+    "raw",
 ];
 
-/// Plain read-only/inspection tools the Guardian reviewer may run directly. These
+fn git_pretty_arg_is_safe(arg: &str) -> bool {
+    arg == "--oneline"
+        || arg
+            .strip_prefix("--pretty=")
+            .is_some_and(|format| GUARDIAN_GIT_PRETTY_FORMATS.contains(&format))
+}
+
+/// Plain read-only/inspection tools recognized by the lexical classifier. These
 /// neither mutate the filesystem nor reach the network. (`echo`/`true` are inert;
 /// they only matter as the tail of a pipe.) Deliberately EXCLUDES tools whose
 /// flags can write/exec: `sort`/`tree` (`-o` writes), `uniq` (positional output
@@ -720,34 +700,133 @@ const GUARDIAN_READ_ONLY_COMMANDS: &[&str] = &[
 /// through on the base-command name alone.
 fn segment_has_dangerous_flag(base: &str, args: &[&str]) -> bool {
     match base {
-        "find" => args.iter().any(|a| {
+        // Several otherwise-inspection-only git commands share options that
+        // either write an output file or invoke repository-configured programs.
+        // Signature pretty placeholders also execute the configured GPG helper.
+        // Reject them independently of the allowed subcommand name. Keep the
+        // output match exact so harmless flags such as
+        // `--output-indicator-new` remain available.
+        "git" => args.iter().any(|raw| {
+            let arg = crate::bash_security::shell_unquote(raw);
+            arg == "--output"
+                || arg.starts_with("--output=")
+                || arg == "--ext-diff"
+                || arg == "--textconv"
+                || arg == "--filters"
+                || arg.starts_with("--filters=")
+                || arg == "--show-signature"
+                || arg.starts_with("--show-signature=")
+                || arg.contains("%G")
+                || arg == "--format"
+                || arg.starts_with("--format=")
+                || (arg.starts_with("--pretty") && !git_pretty_arg_is_safe(&arg))
+        }),
+        "find" => args.iter().any(|raw| {
+            let arg = crate::bash_security::shell_unquote(raw);
             matches!(
-                *a,
+                arg.as_str(),
                 "-exec"
                     | "-execdir"
                     | "-ok"
                     | "-okdir"
                     | "-delete"
                     | "-fprint"
+                    | "-fprint0"
                     | "-fprintf"
                     | "-fls"
             )
         }),
-        "fd" => args
-            .iter()
-            .any(|a| *a == "-x" || *a == "-X" || a.starts_with("--exec")),
-        "rg" => args
-            .iter()
-            .any(|a| a.starts_with("--pre") || *a == "--hostname-bin"),
+        "fd" => args.iter().any(|raw| {
+            let arg = crate::bash_security::shell_unquote(raw);
+            // `fd` accepts the command directly after either short flag
+            // (`-xrm` / `-Xrm`) as well as in the next argv slot. Reject the
+            // whole short-option prefix so attached values cannot bypass the
+            // read-only boundary.
+            arg.starts_with("-x") || arg.starts_with("-X") || arg.starts_with("--exec")
+        }),
+        "rg" => args.iter().any(|raw| {
+            let arg = crate::bash_security::shell_unquote(raw);
+            arg.starts_with("--pre")
+                || arg == "--hostname-bin"
+                || arg.starts_with("--hostname-bin=")
+        }),
+        // `file -C/--compile` writes a compiled magic database, while
+        // `--preserve-date` calls utime/utimes after reading the input.
+        "file" => args.iter().any(|raw| {
+            matches!(
+                crate::bash_security::shell_unquote(raw).as_str(),
+                "-C" | "--compile" | "-p" | "--preserve-date"
+            )
+        }),
+        // Bare hostname and its inspection switches are read-only, but a
+        // positional name (or implementation-specific switch such as `-F`)
+        // changes host state. Fail closed on every argument we do not know.
+        "hostname" => args.iter().any(|raw| {
+            !matches!(
+                crate::bash_security::shell_unquote(raw).as_str(),
+                "-f" | "--fqdn"
+                    | "-s"
+                    | "--short"
+                    | "-d"
+                    | "--domain"
+                    | "-i"
+                    | "--ip-address"
+                    | "-I"
+                    | "--all-ip-addresses"
+                    | "--help"
+                    | "--version"
+            )
+        }),
         _ => false,
     }
 }
 
-/// Whether a single (already wrapper-stripped) command segment's base command is
-/// in the strict read-only allowlist. `git`/`cargo` additionally require their
-/// subcommand (token 1) to be in the respective read-only subcommand list.
+fn git_has_safe_explicit_pretty_format(flags: &[String]) -> bool {
+    flags.iter().any(|arg| git_pretty_arg_is_safe(arg))
+}
+
+/// Git's porcelain diff commands enable repository-configured external diff,
+/// text-conversion, or signature helpers. Require explicit negative flags so an
+/// inspected repository cannot turn a nominal read into arbitrary execution.
+/// `format.pretty` can itself contain a `%G*` signature placeholder, so `log`
+/// and `show` must also override it with a known built-in safe format.
+fn git_subcommand_is_read_only(tokens: &[&str]) -> bool {
+    let Some(raw_subcommand) = tokens.get(1) else {
+        return false;
+    };
+    let subcommand = crate::bash_security::shell_unquote(raw_subcommand);
+    if !GUARDIAN_GIT_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        return false;
+    }
+    if !matches!(subcommand.as_str(), "diff" | "log" | "show" | "blame") {
+        return true;
+    }
+
+    let flags: Vec<String> = tokens[2..]
+        .iter()
+        .map(|raw| crate::bash_security::shell_unquote(raw))
+        .collect();
+    let diff_helpers_disabled = flags.iter().any(|arg| arg == "--no-ext-diff")
+        && flags.iter().any(|arg| arg == "--no-textconv");
+    if !diff_helpers_disabled {
+        return false;
+    }
+
+    if matches!(subcommand.as_str(), "log" | "show") {
+        flags.iter().any(|arg| arg == "--no-show-signature")
+            && git_has_safe_explicit_pretty_format(&flags)
+    } else {
+        true
+    }
+}
+
+/// Whether a command segment's base command is in the strict read-only
+/// allowlist. `git` additionally requires its subcommand (token 1) and, for
+/// porcelain diff commands, helper-disabling flags to pass a second check.
+/// Wrappers are denied: `env` can inject executable helpers and `time`/`nohup`
+/// can write output files.
 fn segment_is_read_only(segment: &str) -> bool {
-    let tokens: Vec<&str> = strip_command_wrappers(segment);
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
     let Some(&base) = tokens.first() else {
         return false;
     };
@@ -757,38 +836,112 @@ fn segment_is_read_only(segment: &str) -> bool {
         return false;
     }
     match base {
-        "git" => tokens
-            .get(1)
-            .is_some_and(|sub| GUARDIAN_GIT_SUBCOMMANDS.contains(sub)),
-        "cargo" => tokens
-            .get(1)
-            .is_some_and(|sub| GUARDIAN_CARGO_SUBCOMMANDS.contains(sub)),
+        "git" => git_subcommand_is_read_only(&tokens),
         other => GUARDIAN_READ_ONLY_COMMANDS.contains(&other),
     }
 }
 
-/// Whether `command` is a read-only command the Guardian reviewer may run.
+/// Whether a nominally static read-only command contains shell expansion that
+/// can change the argv Bamboo validated. An untrusted workspace can, for
+/// example, make `find victim -de*` expand a committed `-delete` filename, and
+/// Bash ANSI-C quoting turns `$'-de'lete` into the same mutating action.
 ///
-/// The Guardian reviewer keeps an unrestricted-looking `Bash` so it can fetch the
-/// diff and run tests, but a true read-only guarantee means its shell must NOT be
-/// able to mutate the workspace, push, exfiltrate, or run arbitrary interpreters.
-/// This is the allowlist that closes that gap (see `guardian_read_only_disabled_tools`).
+/// Quoted glob characters remain ordinary arguments (`find -name '*.rs'`).
+/// Backslash-escaped characters are also static. Simple `$VAR` expansion is
+/// detected lexically because the general analyzer deliberately treats it as a
+/// safe leaf when it is not the command name; the stricter read-only boundary
+/// cannot make that assumption for option-bearing argv.
+fn read_only_command_has_dynamic_expansion(command: &str) -> bool {
+    use crate::bash_security::BashWarningKind;
+
+    let analysis = crate::bash_security::analyze_command(command);
+    if command_can_chain_or_inject(&analysis)
+        || analysis.warnings.iter().any(|warning| {
+            matches!(
+                warning.kind,
+                BashWarningKind::ParameterExpansion | BashWarningKind::BraceExpansion
+            )
+        })
+    {
+        return true;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::Unquoted;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::Unquoted => match ch {
+                '\\' => {
+                    // An escaped metacharacter is passed literally.
+                    let _ = chars.next();
+                }
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                // `$` covers simple variables, ANSI-C/locale strings, command
+                // substitution, and arithmetic expansion. Unquoted glob
+                // metacharacters can be replaced by adversarial filenames.
+                '$' | '*' | '?' | '[' | '{' => return true,
+                _ => {}
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::Unquoted;
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::Unquoted,
+                '\\' => {
+                    // Inside double quotes Bash only consumes the backslash for
+                    // these characters; otherwise the next character must still
+                    // be inspected normally.
+                    if matches!(chars.peek(), Some('$' | '`' | '"' | '\\' | '\n')) {
+                        let _ = chars.next();
+                    }
+                }
+                '$' | '`' => return true,
+                _ => {}
+            },
+        }
+    }
+
+    // An unterminated quote is not a statically verified argv.
+    quote != Quote::Unquoted
+}
+
+/// Whether `command` is a lexically static, inspection-only candidate.
+///
+/// This classifier deliberately does not claim to be an execution authority:
+/// shell startup, `PATH` resolution, and repository configuration can still
+/// replace a benign command name with executable code. Runtime-enforced
+/// read-only children deny every shell command in [`ReadOnlyCommandChecker`].
+/// Keep this helper only for compatibility and non-authoritative diagnostics.
 ///
 /// Rules:
 /// 1. Reject any command containing shell chaining/redirection that could hide a
 ///    mutation: `;`, `&&`, `||`, `&`, `>`, `<`, backtick, `$(`, `${`, or a
 ///    newline. The ONE exception is `|` pipes — allowed, but then EVERY pipe
 ///    segment's base command must independently be in the allowlist.
-/// 2. After stripping wrappers (time/nohup/timeout/nice/env), the base command
-///    (token 0; for `git`/`cargo` also the subcommand) must be in the strict
-///    read-only allowlist ([`GUARDIAN_GIT_SUBCOMMANDS`] /
-///    [`GUARDIAN_CARGO_SUBCOMMANDS`] / [`GUARDIAN_READ_ONLY_COMMANDS`]).
+/// 2. Wrappers (time/nohup/timeout/nice/env) are denied. The base command (token
+///    0; for `git` also the subcommand and safe-helper flags) must be in the
+///    strict read-only allowlist ([`GUARDIAN_GIT_SUBCOMMANDS`] /
+///    [`GUARDIAN_READ_ONLY_COMMANDS`]).
 ///
 /// Everything else (rm/mv/cp/mkdir/touch/chmod/chown/ln/dd/tee/sed/awk/curl/wget/
 /// ssh/nc/python/node/sh/bash/zsh/eval/npm/pip/make/…) returns `false`.
 pub fn is_read_only_command(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+
+    if read_only_command_has_dynamic_expansion(trimmed) {
         return false;
     }
 
@@ -823,8 +976,8 @@ pub fn is_read_only_command(command: &str) -> bool {
 }
 
 /// Split a command into tokens with leading wrappers (time/nohup/timeout/nice/env)
-/// stripped, returning the remaining tokens (base command first). Shared by
-/// [`is_safe_edit_command`] and [`is_read_only_command`].
+/// stripped, returning the remaining tokens (base command first). Used only by
+/// [`is_safe_edit_command`]; the stricter read-only checker denies wrappers.
 fn strip_command_wrappers(command: &str) -> Vec<&str> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut idx = 0;
@@ -1168,7 +1321,7 @@ mod tests {
     // --- is_read_only_command tests ---
 
     #[test]
-    fn read_only_command_allows_read_test_build() {
+    fn read_only_command_allows_inspection() {
         // Plain read tools.
         assert!(is_read_only_command("ls"));
         assert!(is_read_only_command("ls -la src/"));
@@ -1178,25 +1331,24 @@ mod tests {
         assert!(is_read_only_command("find . -name '*.rs'"));
         assert!(is_read_only_command("pwd"));
         // git read-only subcommands.
-        assert!(is_read_only_command("git status"));
-        assert!(is_read_only_command("git diff"));
-        assert!(is_read_only_command("git diff HEAD~1"));
-        assert!(is_read_only_command("git log --oneline -20"));
-        assert!(is_read_only_command("git show HEAD"));
-        // cargo read-only / test / build subcommands.
-        assert!(is_read_only_command("cargo test"));
-        assert!(is_read_only_command("cargo test --workspace"));
-        assert!(is_read_only_command("cargo check"));
-        assert!(is_read_only_command("cargo clippy --all"));
-        assert!(is_read_only_command("cargo nextest run"));
-        // Allowed wrappers stripped before the base command is checked. (NOTE:
-        // the shared `timeout`/`nice`/`env` stripping consumes ONE following token
-        // as the wrapper's own argument — `timeout 60 cmd`, `env A=1 cmd` — so a
-        // separating arg must be present; `nohup` consumes none.)
-        assert!(is_read_only_command("timeout 60 cargo test"));
-        assert!(is_read_only_command("nohup cargo build"));
+        assert!(is_read_only_command(
+            "git diff --no-ext-diff --no-textconv HEAD~1"
+        ));
+        assert!(is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature --oneline -20"
+        ));
+        assert!(is_read_only_command(
+            "git show --no-ext-diff --no-textconv --no-show-signature --pretty=medium HEAD"
+        ));
+        assert!(is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature --pretty=fuller -20"
+        ));
+        assert!(is_read_only_command("git rev-parse HEAD"));
+        assert!(is_read_only_command("git ls-files"));
         // Pipe: allowed when EVERY segment is read-only.
-        assert!(is_read_only_command("git diff | head -50"));
+        assert!(is_read_only_command(
+            "git diff --no-ext-diff --no-textconv | head -50"
+        ));
         assert!(is_read_only_command("cat f.txt | grep foo | wc -l"));
         assert!(is_read_only_command("rg foo src/ | head -20"));
         // Read-only find usage (no exec/delete) is still allowed.
@@ -1224,13 +1376,28 @@ mod tests {
         assert!(!is_read_only_command("git checkout main"));
         assert!(!is_read_only_command("git reset --hard"));
         assert!(!is_read_only_command("git")); // bare git, no subcommand
-                                               // cargo mutating / executing subcommands.
-        assert!(!is_read_only_command("cargo run"));
-        assert!(!is_read_only_command("cargo publish"));
-        assert!(!is_read_only_command("cargo install foo"));
-        assert!(!is_read_only_command("cargo clean"));
-        assert!(!is_read_only_command("cargo")); // bare cargo, no subcommand
-                                                 // Interpreters / package managers / network.
+                                               // Cargo commands can execute repository-controlled build scripts, test
+                                               // binaries, compiler wrappers, and plugins. None are read-only here.
+        for command in [
+            "cargo check",
+            "cargo build",
+            "cargo test",
+            "cargo test --offline --no-run",
+            "cargo clippy --all",
+            "cargo nextest run",
+            "cargo tree",
+            "cargo metadata",
+            "cargo run",
+            "cargo publish",
+            "cargo install foo",
+            "cargo clean",
+            "cargo",
+            "timeout 60 cargo test",
+            "nohup cargo build",
+        ] {
+            assert!(!is_read_only_command(command), "must deny {command}");
+        }
+        // Interpreters / package managers / network.
         assert!(!is_read_only_command("python -c 'print(1)'"));
         assert!(!is_read_only_command("node -e 'x'"));
         assert!(!is_read_only_command("sh -c ls"));
@@ -1264,55 +1431,138 @@ mod tests {
         assert!(!is_read_only_command("git branch -D main")); // mutates refs
         assert!(!is_read_only_command("find . -exec rm {} +")); // -exec runs rm (no `;`)
         assert!(!is_read_only_command("find . -delete"));
+        assert!(!is_read_only_command("find victim $'-de'lete"));
+        assert!(!is_read_only_command("find victim $ACTION"));
+        assert!(!is_read_only_command("find victim -{dele,}te"));
+        assert!(!is_read_only_command("find victim -de*"));
+        assert!(!is_read_only_command("rg foo [ab]*"));
         assert!(!is_read_only_command("fd -x rm")); // fd exec
+        assert!(!is_read_only_command("fd -xrm")); // attached short-option value
+        assert!(!is_read_only_command("fd -Xrm"));
+        assert!(!is_read_only_command("fd '-x'rm")); // quote-spliced token
         assert!(!is_read_only_command("fd --exec rm"));
         assert!(!is_read_only_command("rg --pre sh foo")); // rg preprocessor exec
+        assert!(!is_read_only_command("rg --hostname-bin make foo"));
+        assert!(!is_read_only_command("rg --hostname-bin=make foo"));
+        assert!(!is_read_only_command("rg '--hostname-bin'=make foo"));
         assert!(!is_read_only_command("sort -o out.txt f")); // sort write (removed)
         assert!(!is_read_only_command("tree -o out.txt")); // tree write (removed)
+        assert!(!is_read_only_command("git diff --output=planner-owned"));
+        assert!(!is_read_only_command("git diff --output planner-owned"));
+        assert!(!is_read_only_command("git diff '--out'put=planner-owned"));
+        assert!(!is_read_only_command("git log --output=planner-owned"));
+        assert!(!is_read_only_command("git show --ext-diff HEAD"));
+        assert!(!is_read_only_command("git diff --textconv"));
+        assert!(!is_read_only_command("git cat-file --filters HEAD:file"));
+        assert!(!is_read_only_command("git cat-file --filters=HEAD:file"));
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --show-signature -1"
+        ));
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature --format=%G? -1"
+        ));
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature --format=%+G? -1"
+        ));
+        assert!(!is_read_only_command(
+            "git show --no-ext-diff --no-textconv --no-show-signature --pretty=format:%GG HEAD"
+        ));
+        // A repository may set log.showSignature=true or put `%G*` in
+        // format.pretty/pretty.<name>. Both settings are neutralized only when
+        // the command supplies the explicit disable and its own safe format.
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --oneline -20"
+        ));
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature -20"
+        ));
+        assert!(!is_read_only_command(
+            "git show --no-ext-diff --no-textconv --no-show-signature HEAD"
+        ));
+        assert!(!is_read_only_command(
+            "git log --no-ext-diff --no-textconv --no-show-signature --pretty=repository-owned -20"
+        ));
+        assert!(!is_read_only_command("find . '-delete'"));
+        assert!(!is_read_only_command("find . -fprint0 planner-owned"));
+        assert!(!is_read_only_command("find . '-fprint'0 planner-owned"));
+        // Wrappers and nominally-inspection commands with mutating modes are
+        // denied rather than relying on fragile wrapper/flag parsing.
+        assert!(!is_read_only_command(
+            "env GIT_EXTERNAL_DIFF=make git diff --no-ext-diff --no-textconv"
+        ));
+        assert!(!is_read_only_command("time --output=planner-owned pwd"));
+        assert!(!is_read_only_command("file -C -m magic"));
+        assert!(!is_read_only_command("file --preserve-date Cargo.toml"));
+        assert!(!is_read_only_command("hostname planner-owned"));
+        assert!(is_read_only_command("hostname"));
+        assert!(is_read_only_command("hostname -s"));
+        assert!(is_read_only_command("rg 'foo [ab]*' src"));
+        assert!(is_read_only_command("rg 'literal $VALUE' src"));
+        // Porcelain diff commands are denied unless both helper-disabling flags
+        // are explicit, even when no dangerous positive flag is present.
+        assert!(!is_read_only_command("git status"));
+        assert!(!is_read_only_command("git diff"));
+        assert!(!is_read_only_command("git log --oneline -20"));
+        assert!(!is_read_only_command("git show HEAD"));
+        assert!(is_read_only_command(
+            "git diff --no-ext-diff --no-textconv --output-indicator-new=+ HEAD"
+        ));
     }
 
-    // --- GuardianReadOnlyChecker tests ---
+    // --- ReadOnlyCommandChecker tests ---
 
-    fn guardian_checker() -> GuardianReadOnlyChecker {
+    fn read_only_checker() -> ReadOnlyCommandChecker {
         let config = Arc::new(PermissionConfig::new());
         config.set_confirm_threshold(RiskLevel::High);
         let inner: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config));
-        GuardianReadOnlyChecker::new(inner)
+        ReadOnlyCommandChecker::new(inner)
     }
 
     #[tokio::test]
-    async fn guardian_allows_read_only_command_without_gating() {
-        let checker = guardian_checker();
-        // Read-only commands are NOT gated (no confirmation), so they run freely.
-        assert!(
-            !checker
-                .needs_confirmation(PermissionType::ExecuteCommand, "cargo test")
-                .await
-        );
-        assert!(
-            !checker
-                .needs_confirmation(PermissionType::ExecuteCommand, "git diff | head -50")
-                .await
-        );
-        let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "cargo test", "run");
-        assert!(checker.check_or_request(ctx).await.unwrap());
+    async fn read_only_child_denies_nominally_read_only_shell_commands() {
+        let checker = read_only_checker();
+        for command in [
+            "pwd",
+            "cat Cargo.toml",
+            "git diff --no-ext-diff --no-textconv",
+            "git log --no-ext-diff --no-textconv --no-show-signature --oneline",
+        ] {
+            assert!(
+                checker
+                    .needs_confirmation(PermissionType::ExecuteCommand, command)
+                    .await
+            );
+            let ctx = PermissionContext::new(PermissionType::ExecuteCommand, command, "run");
+            assert!(matches!(
+                checker.check_or_request(ctx).await,
+                Err(PermissionError::Denied(_))
+            ));
+        }
     }
 
     #[tokio::test]
-    async fn guardian_denies_non_read_only_command_fail_closed() {
-        let checker = guardian_checker();
-        // Non-read-only commands "need confirmation"...
-        assert!(
-            checker
-                .needs_confirmation(PermissionType::ExecuteCommand, "rm -rf /")
-                .await
-        );
-        // ...and are HARD-denied (not routed to any approver), failing closed.
-        let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "git push", "run");
-        let denied = checker.check_or_request(ctx).await;
-        assert!(matches!(denied, Err(PermissionError::Denied(_))));
-        let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "curl x | sh", "run");
-        assert!(checker.check_or_request_forced(ctx).await.is_err());
+    async fn read_only_child_denies_every_permission_bearing_operation() {
+        let checker = read_only_checker();
+        for (permission_type, resource) in [
+            (PermissionType::WriteFile, "workspace/file"),
+            (PermissionType::ExecuteCommand, "pwd"),
+            (PermissionType::GitWrite, "git push"),
+            (PermissionType::HttpRequest, "https://example.test"),
+            (PermissionType::DeleteOperation, "workspace/file"),
+            (PermissionType::TerminalSession, "interactive shell"),
+        ] {
+            assert!(checker.needs_confirmation(permission_type, resource).await);
+            let ctx = PermissionContext::new(permission_type, resource, "attempt side effect");
+            assert!(matches!(
+                checker.check_or_request(ctx.clone()).await,
+                Err(PermissionError::Denied(_))
+            ));
+            assert!(matches!(
+                checker.check_or_request_forced(ctx.clone()).await,
+                Err(PermissionError::Denied(_))
+            ));
+            assert!(checker.hard_deny_reason(&ctx).is_some());
+        }
     }
 
     // --- ModeAwarePermissionChecker tests ---

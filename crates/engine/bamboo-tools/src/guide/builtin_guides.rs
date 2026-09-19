@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 24] = [
     "conclusion_with_options",
     "Bash",
     "BashInput",
@@ -21,6 +21,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
     "KillShell",
     "session_note",
     "NotebookEdit",
+    "Plan",
     "Read",
     "request_permissions",
     "Sleep",
@@ -258,19 +259,31 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Create or update the shared task list for the current root session tree (root + child sessions share the same task list).",
             "Do not use for trivial one-step requests.",
-            &["ExitPlanMode"],
+            &["Plan"],
             vec![example(
                 "Update shared task statuses",
                 json!({"tasks":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]}),
                 "Keep exactly one item in_progress whenever possible.",
             )],
         )),
+        "Plan" => Some(guide(
+            "Plan",
+            ToolCategory::TaskManagement,
+            "Delegate a complex planning request to one runtime-enforced read-only planner child. The root remains the normal orchestrator and resumes automatically with the planner result.",
+            "Do not use for a trivial lookup or as a substitute for implementation after the approach is already clear; do not call legacy EnterPlanMode when Plan is available.",
+            &["Task", "SubAgent"],
+            vec![example(
+                "Delegate an implementation plan",
+                json!({"task":"Inspect the current authentication flow and return an ordered migration plan with affected files, tests, risks, and explicit non-goals.","title":"Plan authentication migration","fork_last_messages":2}),
+                "The planner runs read-only; the parent waits internally and resumes without a mode-switch question.",
+            )],
+        )),
         "EnterPlanMode" => Some(guide(
             "EnterPlanMode",
             ToolCategory::UserInteraction,
-            "Switch to plan mode for complex tasks requiring exploration and design before implementation.",
-            "Do not use for simple tasks that can be implemented directly.",
-            &["Task", "ExitPlanMode"],
+            "Legacy compatibility tool for hosts where delegated Plan is unavailable.",
+            "Do not call when Plan is available; ordinary server sessions should delegate planning without switching the root mode.",
+            &["Plan", "Task", "ExitPlanMode"],
             vec![example(
                 "Start planning a complex refactor",
                 json!({"reason":"This refactor touches multiple crates and needs careful design"}),
@@ -368,7 +381,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
             "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
-            &["Task", "session_history"],
+            &["Task", "session_history_current"],
             vec![
                 example(
                     "Persist a durable session constraint",
@@ -385,9 +398,9 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory" => Some(guide(
             "memory",
             ToolCategory::TaskManagement,
-            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project or global memories backed by canonical topic files. Proactively query before answering when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — recall first instead of replying that you don't know.",
-            "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging. One memory = one atomic fact: do not bundle unrelated facts into a single memory. Only merge/append content that is the SAME fact as the target — if it's a different topic, write a new memory instead of appending.",
-            &["session_note", "session_history", "Task"],
+            "Use Session memory for current-session continuity, Project memory for durable project facts and decisions, and Global memory for cross-project user context. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing; store one confirmed atomic fact with a few useful keywords, entities, and tags.",
+            "Do not store secrets, unverified claims, live state that you can inspect directly, embeddings, or unrelated facts in one memory. Treat canonical Project memory as trusted durable project authority but verify live state before acting; treat Dream as a low-trust derived orientation snapshot. Do not increase the query limit or get every hit by default, and merge or consolidate only the same confirmed fact.",
+            &["session_note", "session_history_current", "Task"],
             vec![
                 example(
                     "Read the current session note topic",
@@ -396,47 +409,47 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
                 example(
                     "Shortlist durable memories before reading full content",
-                    json!({"action":"query","scope":"project","query":"release freeze mobile","options":{"limit":5,"max_chars":3000}}),
-                    "Prefer query first so the model gets a shortlist summary under budget; call get(id) only for the durable item that needs full context.",
+                    json!({"action":"query","scope":"project","query":"mobile release freeze"}),
+                    "Use Jiandu's compact default top three ID/summary results, then select only the item that needs full context.",
                 ),
                 example(
-                    "Read one durable memory in full after query",
+                    "Get the selected durable memory",
                     json!({"action":"get","id":"mem_20260403_001","options":{"max_chars":5000}}),
-                    "Use after query when you need the full body/frontmatter of a single durable memory item.",
+                    "Use after query for the one selected ID whose full body or frontmatter is needed.",
                 ),
                 example(
                     "Recall before answering about the user's own context",
-                    json!({"action":"query","scope":"global","query":"preferred testing framework","options":{"limit":5}}),
+                    json!({"action":"query","scope":"global","query":"preferred testing framework"}),
                     "When the user refers to their own preferences, opinions, or past decisions you don't already know — especially first-person questions ('what do I...', 'did I...', '我...?') — query memory BEFORE answering; do not say you don't know without checking.",
                 ),
                 example(
                     "Recall a past project decision before acting",
-                    json!({"action":"query","scope":"project","query":"why we chose HTTP over Tauri IPC","options":{"limit":5}}),
-                    "When continuing prior work, query project memory for past decisions and constraints before re-deciding or claiming none exist.",
+                    json!({"action":"query","scope":"project","query":"HTTP Tauri IPC decision"}),
+                    "Treat a matching canonical Project memory as trusted durable project authority, then verify any live implementation state before acting.",
                 ),
                 example(
-                    "Check for an existing duplicate before writing",
-                    json!({"action":"find_duplicates","scope":"project","type":"project","title":"Release freeze begins next week","content":"Mobile release freeze begins Tuesday."}),
-                    "Before write, check whether the same fact already exists; if a high-scoring candidate is the same fact, merge into it instead of creating a near-duplicate.",
+                    "Query before writing a durable fact",
+                    json!({"action":"query","scope":"project","query":"mobile release freeze Tuesday"}),
+                    "Check whether the same fact already exists before write; merge only when the selected existing item is the same confirmed fact.",
                 ),
                 example(
                     "Write a durable project memory",
-                    json!({"action":"write","scope":"project","type":"project","title":"Release freeze begins next week","content":"Merge freeze begins on Tuesday for the mobile release cut.","tags":["release","freeze"]}),
-                    "Use when the fact should persist across sessions as canonical project memory. Give it a specific title that summarizes this fact — recall is keyword-based, so a vague or mismatched title makes it unfindable.",
+                    json!({"action":"write","scope":"project","type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["mobile","release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
+                    "Write one confirmed atomic fact with a specific title and only a few lexical retrieval hints.",
                 ),
                 example(
                     "Merge follow-up details into an existing durable memory",
-                    json!({"action":"merge","id":"mem_20260403_001","content":"Additional confirmation from a later session.","tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
+                    json!({"action":"merge","id":"mem_20260403_001","content":"The release manager confirmed the Tuesday freeze.","keywords":["release freeze","Tuesday"],"entities":["release manager"],"tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
                     "Use ONLY when the new evidence is the same fact as the target memory and older overlapping items should be superseded. Do not merge unrelated facts together — create a separate memory instead.",
                 ),
                 example(
                     "Split a multi-topic memory into atomic memories",
-                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm and strict TypeScript.","tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","tags":["release"]}]}),
+                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm.","keywords":["pnpm","package manager"],"entities":["pnpm"],"tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}]}),
                     "Use when one memory has accreted several unrelated facts (a 'blob'): split archives the original and creates one atomic memory per fact, preserving lineage via supersedes.",
                 ),
                 example(
                     "Consolidate near-duplicate memories into one",
-                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday for the release cut.","tags":["release","freeze"]}),
+                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
                     "Use ONLY when two or more memories are the SAME fact: consolidate archives them all and creates one canonical atomic memory, preserving lineage via supersedes. Confirm sameness (e.g. via scan_duplicates / find_duplicates) before consolidating — never merge distinct facts.",
                 ),
             ],
@@ -547,26 +560,32 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when the loaded instructions point to additional files.",
             )],
         )),
-        "session_history" | "recall" | "session_inspector" => Some(guide(
+        "session_history_current" | "session_history" | "recall" | "session_inspector" => Some(guide(
             match tool_name {
                 "session_inspector" => "session_inspector",
                 "recall" => "recall",
+                "session_history_current" => "session_history_current",
                 _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Inspect prior Bamboo session history from local SQLite storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed conversation cache, or search results to recover previous discussion context. Distinct from `memory` (durable cross-session knowledge).",
-            "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
+            "Use the always-resident session_history_current identity to search your current Bamboo Session with search_current, then recover the hit's complete turn and nearby context with read_around or page exact bounded evidence with read_current, including history already compressed out of the model window. The host preserves complete logical turns and tool-call/result chains. The legacy session_history name remains compatible; Root schemas may additionally offer list/get_meta, privileged bounded reads, global search, and same-tree export_context only under that separate legacy identity. When export_context is present, Read its returned status/brief paths with bounded offset/limit and keep the returned revision fixed across continuation reads; exports are last persisted observations, not verified live progress. Raw Session history is transcript authority; memory is selective durable knowledge and may be stale.",
+            "Do not pass a Session ID, boundary, or compressed-state mutation to current-Session actions: the host derives identity and the current-call boundary. Treat cursors only as opaque continuations and reuse them unchanged. Do not use history as a broad substitute for code search. Privileged cross-session actions exist only when the supplied schema lists them, and export quota/corruption errors do not authorize deleting snapshots.",
             &["session_note", "Read", "Task"],
             vec![
                 example(
-                    "Search prior discussion history",
-                    json!({"action":"search","query":"release checklist","mode":"tail_messages","max_sessions":10,"tail_messages":6}),
-                    "Use when you need to recover what was discussed previously before asking the user to repeat it.",
+                    "Search this Session's stored history",
+                    json!({"action":"search_current","query":"release checklist","limit":20}),
+                    "Locate exact details omitted from the active model window. Returned excerpts are read-only; archived messages stay archived.",
                 ),
                 example(
-                    "Inspect a specific session with bounded reads",
-                    json!({"action":"read_messages","session_id":"session-123","from_end":true,"limit":20,"include_system":false,"truncate_chars":200}),
-                    "Prefer bounded slices rather than dumping an entire session at once.",
+                    "Page older exact turns",
+                    json!({"action":"read_current","direction":"backward","limit":10,"max_chars":12000,"archived_only":true}),
+                    "Follow next_cursor unchanged when more bounded turns remain.",
+                ),
+                example(
+                    "Recover a search hit in context",
+                    json!({"action":"read_around","message_id":"message-id-from-search","before_turns":1,"after_turns":1,"max_chars":12000}),
+                    "The anchor and returned neighbors are complete logical turns; unavailable anchors do not reveal why they were excluded.",
                 ),
             ],
         )),
@@ -597,7 +616,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "SubAgent",
             ToolCategory::TaskManagement,
             "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. Use action=create to spawn a new child; use list/get to inspect existing children before creating duplicates; use update/run/send_message/cancel/delete to manage existing children.",
-            "Do not use proactively for simple one-step tasks; do not spawn children from child sessions; do not create multiple overlapping children with unclear responsibilities.",
+            "Do not use proactively for simple one-step tasks; from a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
@@ -742,6 +761,88 @@ mod tests {
                 .and_then(|value| value.as_str())
                 == Some("merge")
         }));
+    }
+
+    #[test]
+    fn current_history_guide_teaches_exact_retrieval_and_authority_boundaries() {
+        let guide = builtin_guide_spec("session_history_current")
+            .expect("current-history guide should exist");
+        assert_eq!(guide.tool_name, "session_history_current");
+        for action in ["search_current", "read_current", "read_around"] {
+            assert!(guide.examples.iter().any(|example| {
+                example
+                    .parameters
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    == Some(action)
+            }));
+        }
+        assert!(guide.when_to_use.contains("always-resident"));
+        assert!(guide.when_to_use.contains("transcript authority"));
+        assert!(guide.when_to_use.contains("memory is selective"));
+        assert!(guide.when_not_to_use.contains("Session ID"));
+    }
+
+    #[test]
+    fn memory_guide_teaches_compact_recall_and_small_lexical_hints() {
+        let guide = builtin_guide_spec("memory").expect("memory guide should exist");
+        let examples_for = |action: &str| {
+            guide
+                .examples
+                .iter()
+                .filter(|example| {
+                    example
+                        .parameters
+                        .get("action")
+                        .and_then(|value| value.as_str())
+                        == Some(action)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let queries = examples_for("query");
+        assert!(!queries.is_empty());
+        assert!(queries
+            .iter()
+            .all(|example| example.parameters.pointer("/options/limit").is_none()));
+        assert_eq!(examples_for("get").len(), 1);
+
+        for action in ["write", "merge", "consolidate"] {
+            let examples = examples_for(action);
+            assert_eq!(examples.len(), 1, "missing {action} example");
+            for field in ["keywords", "entities", "tags"] {
+                let hints = examples[0].parameters[field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{action} example is missing {field}"));
+                assert!(!hints.is_empty() && hints.len() <= 3);
+            }
+        }
+
+        let split = examples_for("split");
+        let pieces = split[0].parameters["pieces"]
+            .as_array()
+            .expect("split example should contain pieces");
+        for piece in pieces {
+            for field in ["keywords", "entities", "tags"] {
+                let hints = piece[field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("split piece is missing {field}"));
+                assert!(!hints.is_empty() && hints.len() <= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_guide_makes_nested_delegation_explicit_and_necessary() {
+        let guide = builtin_guide_spec("SubAgent").expect("SubAgent guide should exist");
+        assert!(guide.when_not_to_use.contains("child session"));
+        assert!(guide
+            .when_not_to_use
+            .contains("explicitly authorizes nested delegation"));
+        assert!(guide.when_not_to_use.contains("it is necessary"));
+        assert!(!guide
+            .when_not_to_use
+            .contains("do not spawn children from child sessions"));
     }
 
     #[test]

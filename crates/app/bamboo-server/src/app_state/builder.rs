@@ -5,8 +5,43 @@ use super::init::{
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
+use crate::tool_event_router::{CombinedToolEventPublisher, ToolEventRouter};
 use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
+#[cfg(not(test))]
+use bamboo_memory::memory_store::{resolve_jiandu_data_root, BAMBOO_JIANDU_DATA_DIR_ENV};
+use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
+
+fn default_app_state_memory_store(
+    bamboo_home_dir: &std::path::Path,
+) -> Result<bamboo_memory::memory_store::MemoryStore, AppError> {
+    #[cfg(test)]
+    {
+        let root = bamboo_home_dir.join("jiandu");
+        tracing::info!(
+            target: "bamboo.memory",
+            mode = "test-isolated",
+            root = %root.display(),
+            "selected Jiandu data root"
+        );
+        Ok(bamboo_memory::memory_store::MemoryStore::new(root))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bamboo_home_dir;
+        let selection = resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))
+            .map_err(|message| AppError::InternalError(anyhow::anyhow!(message)))?;
+        let mode = selection.mode();
+        let root = selection.into_path();
+        tracing::info!(
+            target: "bamboo.memory",
+            mode,
+            root = %root.display(),
+            "selected Jiandu data root"
+        );
+        Ok(bamboo_memory::memory_store::MemoryStore::new(root))
+    }
+}
 
 impl AppState {
     /// Create unified app state with direct provider access
@@ -51,6 +86,16 @@ impl AppState {
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_memory_store(bamboo_home_dir, memory_store).await
+    }
+
+    /// Create a server state with one explicit Jiandu store shared by the tool,
+    /// prompt, Dream, gardener, metrics, and maintenance paths.
+    pub async fn new_with_memory_store(
+        bamboo_home_dir: PathBuf,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
@@ -138,7 +183,15 @@ impl AppState {
             Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
         });
 
-        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, config_facade).await
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            config_facade,
+            Arc::new(NoopToolEventPublisher),
+            memory_store,
+        )
+        .await
     }
 
     /// Create unified app state with a specific provider
@@ -160,7 +213,36 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
-        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, None).await
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            None,
+            Arc::new(NoopToolEventPublisher),
+            memory_store,
+        )
+        .await
+    }
+
+    /// Create a server state with an instance-local tool-event publisher.
+    /// Existing constructors retain the no-op publisher and unchanged behavior.
+    pub async fn new_with_provider_and_tool_event_publisher(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        tool_event_publisher: Arc<dyn ToolEventPublisher>,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            None,
+            tool_event_publisher,
+            memory_store,
+        )
+        .await
     }
 
     async fn new_with_provider_and_facade(
@@ -168,6 +250,8 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+        tool_event_publisher: Arc<dyn ToolEventPublisher>,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -214,7 +298,7 @@ impl AppState {
         ));
 
         // In-memory session cache (shared across handlers and background jobs).
-        let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        let sessions: bamboo_engine::SessionCache = Arc::default();
 
         // Embed the mailbox bus (broker) in-process unless an external one is
         // configured. Mutates `config.subagents.broker` to point at the loopback
@@ -300,6 +384,16 @@ impl AppState {
             init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
+
+        // Service input and ToolEvent routing share one AppState-owned
+        // lifecycle. The router is built before the tool surfaces so every
+        // executor receives the production publisher from its first call;
+        // it remains inert until install/boot reconciliation declares sinks.
+        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
+        let tool_event_router = ToolEventRouter::new(service_manager.clone());
+        let tool_event_publisher: Arc<dyn ToolEventPublisher> = Arc::new(
+            CombinedToolEventPublisher::new(tool_event_router.clone(), tool_event_publisher),
+        );
 
         let startup_sessions = {
             let entries = session_store.list_index_entries().await;
@@ -422,6 +516,8 @@ impl AppState {
             mcp_manager.clone(),
             skill_manager.clone(),
             session_repo.clone(),
+            session_store.clone(),
+            storage.clone(),
             bamboo_home_dir.clone(),
             notification_service.clone(),
             session_event_senders.clone(),
@@ -430,6 +526,8 @@ impl AppState {
             project_store.clone(),
             account_sink.clone(),
             workspace_resolver.clone(),
+            tool_event_publisher.clone(),
+            memory_store.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -448,7 +546,13 @@ impl AppState {
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
         // owns handles to both maps.
-        spawn_session_map_cleanup_task(agent_runners.clone(), session_event_senders.clone(), None);
+        spawn_session_map_cleanup_task(
+            agent_runners.clone(),
+            session_event_senders.clone(),
+            session_watchers.clone(),
+            sessions.clone(),
+            None,
+        );
 
         // Bridge both instruction and orchestration catalog transitions onto
         // the same durable account feed used by SSE and v2 WebSocket clients.
@@ -535,6 +639,7 @@ impl AppState {
             .metrics_collector(metrics_service.collector())
             .config(config.clone())
             .provider(provider_handle.clone())
+            .memory_store(memory_store.clone())
             .default_tools(base_tools.clone())
             .project_context_resolver(project_context_resolver.clone());
         if let Some(permission_config) = permission_checker.permission_config() {
@@ -726,6 +831,7 @@ impl AppState {
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
+                memory: memory_store.clone(),
                 provider: provider_handle.clone(),
                 config: config.clone(),
                 provider_registry: provider_registry.clone(),
@@ -740,6 +846,7 @@ impl AppState {
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
+                memory: memory_store.clone(),
                 provider: provider_handle.clone(),
                 config: config.clone(),
                 provider_registry: provider_registry.clone(),
@@ -755,6 +862,7 @@ impl AppState {
                 dream: bamboo_engine::auto_dream::AutoDreamContext {
                     session_store: session_store.clone(),
                     storage: storage.clone(),
+                    memory: memory_store.clone(),
                     provider: provider_handle.clone(),
                     config: config.clone(),
                     provider_registry: provider_registry.clone(),
@@ -971,7 +1079,6 @@ impl AppState {
         // until a plugin install or the boot-time reconcile below starts
         // something — mirrors `mcp_manager`/`connect_manager`'s
         // always-alive lifecycle.
-        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
         // Backgrounded (mirrors `init_mcp_manager`'s background MCP
         // bootstrap): a service that `installed.json` says should be
         // running but isn't (the previous `bamboo serve` process, if
@@ -979,16 +1086,22 @@ impl AppState {
         //
         // The `JoinHandle` is kept (not discarded) purely so tests can
         // deterministically wait it out via
-        // `AppState::wait_for_boot_reconcile_services` instead of racing
-        // this unsynchronized pass — see that method's doc comment and issue
-        // #486. Production code never awaits it; server startup is never
-        // blocked on plugin service spawns.
+        // `AppState::wait_for_boot_reconcile_services`. The pass shares the
+        // plugin operation lock with install/update/uninstall, so its
+        // manifest/provenance generation cannot race a newer mutation; see
+        // that method's doc comment and issue #486. Production code never
+        // awaits it; server startup is never blocked on plugin service spawns.
         let boot_reconcile_services_handle = {
             let service_manager = service_manager.clone();
+            let tool_event_router = tool_event_router.clone();
             let app_data_dir = bamboo_home_dir.clone();
             tokio::spawn(async move {
-                crate::plugin_installer::boot_reconcile_services(&app_data_dir, &service_manager)
-                    .await;
+                crate::plugin_installer::boot_reconcile_services(
+                    &app_data_dir,
+                    &service_manager,
+                    &tool_event_router,
+                )
+                .await;
             })
         };
 
@@ -1005,6 +1118,9 @@ impl AppState {
             );
         Ok(Self {
             app_data_dir: bamboo_home_dir,
+            memory_store,
+            tool_event_publisher,
+            tool_event_router,
             config,
             config_facade,
             config_io_lock,

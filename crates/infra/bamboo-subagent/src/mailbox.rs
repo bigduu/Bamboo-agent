@@ -69,15 +69,15 @@ pub enum InboxKind {
     /// bus instead of a direct WS connection). The unification target — a local
     /// child is driven over the bus exactly like a deployed one.
     Run,
-    /// Child→parent: one streamed agent event during a [`InboxKind::Run`]. `body`
-    /// is the verbatim event JSON (the actor `ChildFrame::Event`). `reply_to`
-    /// correlates it to the `Run` it belongs to.
+    /// Child→parent: a durable sequenced event batch during an
+    /// [`InboxKind::Run`]. Snapshot/ephemeral batches use the broker's bounded
+    /// live lane instead. `correlation_id` identifies the owning Run.
     Event,
     /// Child→parent: durable worker admission confirmation for a typed
     /// SessionInbox delivery forwarded during a running actor activation.
     SessionMessageAdmitted,
     /// Child→parent: the terminal result of a [`InboxKind::Run`]. `body` is a
-    /// serialized [`crate::executor::ChildOutcome`]. `reply_to` correlates it to
+    /// serialized [`crate::executor::ChildOutcome`]. `correlation_id` correlates it to
     /// the `Run`.
     Outcome,
     /// Parent→child: an in-band steering message for a running [`InboxKind::Run`]

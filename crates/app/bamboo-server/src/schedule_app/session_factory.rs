@@ -2,7 +2,10 @@
 
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::{Message, Session, SessionPermissionMode};
-use bamboo_engine::runner;
+use bamboo_engine::session_app::execution_prep::{
+    prepare_session_for_execution, publish_resolved_workspace_for_execution,
+    ResolvedExecutionWorkspace,
+};
 
 use super::manager::ScheduleRunJob;
 
@@ -26,7 +29,7 @@ pub fn create_schedule_session(
     model: &str,
     system_prompt: &str,
     base_system_prompt: &str,
-    workspace_path: Option<&str>,
+    workspace: Option<ResolvedExecutionWorkspace<'_>>,
     reasoning_effort: Option<ReasoningEffort>,
     workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Session {
@@ -59,36 +62,18 @@ pub fn create_schedule_session(
     if let Some(project_id) = job.run_config.project_id.as_ref() {
         session.set_project_id_meta(project_id.to_string());
     }
-    if let Some(path) = workspace_path {
-        let final_workspace = workspace_resolver.publish_resolved_workspace(
-            &session_id,
-            std::path::PathBuf::from(path),
+    if let Some(workspace) = workspace {
+        publish_resolved_workspace_for_execution(
+            &mut session,
+            workspace,
+            workspace_resolver,
             "schedule",
         );
-        let final_workspace = bamboo_config::paths::path_to_display_string(&final_workspace);
-        session.set_workspace_path_meta(final_workspace);
-        if job.run_config.project_id.is_some() {
-            let source = if job
-                .run_config
-                .workspace_path
-                .as_deref()
-                .is_some_and(|workspace| !workspace.trim().is_empty())
-            {
-                bamboo_engine::project_context::WorkspaceSource::Explicit
-            } else {
-                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
-            };
-            session.metadata.insert(
-                bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
-                source.as_str().to_string(),
-            );
-        }
     }
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
     }
-    session.add_message(Message::system(system_prompt.to_string()));
-    runner::refresh_prompt_snapshot(&mut session);
+    prepare_session_for_execution(&mut session, Some(system_prompt), None);
 
     if let Some(task) = job
         .run_config
@@ -109,6 +94,7 @@ mod tests {
     use bamboo_agent_core::tools::ToolExecutionSessionFlags;
     use bamboo_agent_core::workspace_state::{WorkspaceResolver, WorkspaceRootConfig};
     use bamboo_domain::{PermissionAuditSnapshot, PermissionMode, ScheduleRunConfig};
+    use bamboo_engine::project_context::{WorkspaceBindingStatus, WorkspaceSource};
     use bamboo_tools::permission::{
         EffectivePermissionPolicy, PermissionConfig, PermissionDecisionKind,
         PermissionDecisionSource, PermissionEvaluation, PermissionOutcome, PermissionReasonCode,
@@ -241,19 +227,24 @@ mod tests {
                 confine: true,
             }
         });
-        let job = ScheduleRunJob {
+        let mut job = ScheduleRunJob {
             run_id: "run-instance-root".to_string(),
             schedule_id: "schedule-instance-root".to_string(),
             schedule_name: "instance root".to_string(),
             ..test_job()
         };
+        job.run_config.workspace_path = Some(relocated.to_string_lossy().into_owned());
 
         let session = create_schedule_session(
             &job,
             "model",
             "system",
             "base",
-            Some(relocated.to_string_lossy().as_ref()),
+            Some(ResolvedExecutionWorkspace {
+                path: &relocated,
+                source: WorkspaceSource::Explicit,
+                binding_status: WorkspaceBindingStatus::Unregistered,
+            }),
             None,
             &resolver,
         );
@@ -266,5 +257,45 @@ mod tests {
             relocated.is_dir(),
             "the AppState resolver must materialize its own validated target"
         );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(WorkspaceSource::Explicit.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            Some(relocated.clone())
+        );
+        let system = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("clean Schedule System");
+        assert_eq!(system.content, "system");
+        assert!(!system
+            .content
+            .contains(relocated.to_string_lossy().as_ref()));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("first prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "system");
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context in first snapshot");
+        assert!(workspace_context.contains(relocated.to_string_lossy().as_ref()));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: unregistered"));
     }
 }

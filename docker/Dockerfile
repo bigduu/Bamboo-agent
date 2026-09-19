@@ -39,10 +39,9 @@ WORKDIR /app
 # Builds ONLY the dependency graph (crates.io deps) described by recipe.json.
 # This layer is invalidated by a Cargo.toml/Cargo.lock change, NOT by a
 # source-only change, so it's reused across builds where just application
-# code changed. bamboo-skills' and bamboo-server's build.rs scripts probe for
-# builtin_skills/ and frontend_package/ and degrade gracefully (empty
-# skill list / no embedded frontend) when those directories aren't present
-# yet at this stage — real content lands in the COPY below.
+# code changed. cargo-chef replaces workspace build scripts with recipe
+# placeholders in this dependency-only layer; the real bamboo-server build
+# script and its required frontend package run only after the full COPY below.
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --bin bamboo --recipe-path recipe.json
 
@@ -95,7 +94,10 @@ EXPOSE 9562
 USER bamboo
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:9562/api/v1/health || exit 1
+  CMD curl -fsS http://127.0.0.1:9562/api/v1/health >/dev/null \
+    && curl -fsS http://127.0.0.1:9562/ >/dev/null \
+    && test -s /data/frontend/.frontend-manifest.json \
+    || exit 1
 
 ENTRYPOINT ["bamboo"]
 CMD ["serve", "--port", "9562", "--bind", "0.0.0.0", "--data-dir", "/data"]

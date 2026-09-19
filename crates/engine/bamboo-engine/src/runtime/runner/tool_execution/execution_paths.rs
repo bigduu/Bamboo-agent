@@ -16,6 +16,8 @@ mod success_path;
 mod workspace;
 
 pub(super) struct SuccessPathContext<'a> {
+    pub permission_replay_origin:
+        Option<&'a crate::session_app::approval_replay::PermissionReplayOrigin>,
     pub tool_call: &'a ToolCall,
     pub result: &'a ToolResult,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,

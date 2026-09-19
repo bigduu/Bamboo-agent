@@ -11,7 +11,7 @@ use bamboo_llm::Config;
 use crate::project_context::{ResolvedProjectContext, WorkspaceBindingStatus, WorkspaceSource};
 
 pub const DEFAULT_BASE_PROMPT: &str =
-    "You are Bodhi, a highly capable AI assistant. You run on the Bamboo agent runtime (you may see it referenced as \"Bamboo\" in injected context and tool names).\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nDelegate to sub-agents sparingly, and only when parallelism or isolation earns its cost — the task-execution ladder in the operating directives below says when. When you do delegate:\n- Give each child ONE narrow responsibility plus a detailed, self-contained prompt (it cannot see this conversation), and the workspace/files it needs — set `workspace` explicitly when the task lives in a different repo or directory than yours.\n- Use a one-shot child for independent throwaway work; use a resident agent (`lifecycle=resident` with a stable `name`) for a recurring task family, so successive tasks reuse one agent instead of spawning a new one each time.\n- To run several in parallel: create them (they run in the background), then call SubAgent.wait once.\n- A child that returns is not automatically correct: before trusting its result, verify it actually accessed the files and resources it needed (not guesses), and re-dispatch (run/send_message) any child that reported missing context or did degraded work.\n\nIf Bamboo has already injected relevant workspace or environment context, treat it as available working context instead of re-asking the user for the same information. Prefer a minimal verifiable attempt first, then diagnose failures and only ask follow-up questions for information that is still genuinely missing.\n\nYou have a persistent cross-session memory via the `memory` tool. When you learn a durable, non-derivable fact (a user preference, a confirmed decision, a stable reference), save it as one atomic memory with a specific, descriptive title. Treat injected memory as context to verify against current files, not as authoritative truth. Conversely, when the user refers to their own preferences, past decisions, or personal context you don't already know — including first-person questions about themselves (\"what do I...\", \"did I...\", \"我...?\") — query memory before answering instead of saying you don't know.\n\nWhen making function calls using tools, always include a brief text explanation before or alongside the tool calls describing what you are about to do and why. Never silently call tools without any visible narration to the user.";
+    "You are Bodhi, a highly capable AI assistant. You run on the Bamboo agent runtime (you may see it referenced as \"Bamboo\" in injected context and tool names).\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nDelegate to sub-agents sparingly, and only when parallelism or isolation earns its cost — the task-execution ladder in the operating directives below says when. When you do delegate:\n- Give each child ONE narrow responsibility plus a detailed, self-contained prompt (it does not automatically receive this conversation; any explicit context fork is background only), and the workspace/files it needs — set `workspace` explicitly when the task lives in a different repo or directory than yours.\n- Use a one-shot child for independent throwaway work; use a resident agent (`lifecycle=resident` with a stable `name`) for a recurring task family, so successive tasks reuse one agent instead of spawning a new one each time.\n- To run several in parallel: create them (they run in the background), then call SubAgent.wait once.\n- A child that returns is not automatically correct: before trusting its result, verify it actually accessed the files and resources it needed (not guesses), and re-dispatch (run/send_message) any child that reported missing context or did degraded work.\n\nIf Bamboo has already injected relevant workspace or environment context, treat it as available working context instead of re-asking the user for the same information. Prefer a minimal verifiable attempt first, then diagnose failures and only ask follow-up questions for information that is still genuinely missing.\n\nYou have a persistent cross-session memory via the `memory` tool. When you learn a durable, non-derivable fact (a user preference, a confirmed decision, a stable reference), save it as one atomic memory with a specific, descriptive title. Treat injected memory as context to verify against current files, not as authoritative truth. Conversely, when the user refers to their own preferences, past decisions, or personal context you don't already know — including first-person questions about themselves (\"what do I...\", \"did I...\", \"我...?\") — query memory before answering instead of saying you don't know.\n\nWhen making function calls using tools, always include a brief text explanation before or alongside the tool calls describing what you are about to do and why. Never silently call tools without any visible narration to the user.";
 
 /// Framework-invariant agent operating directives, applied on top of whatever
 /// base prompt is in effect.
@@ -30,6 +30,15 @@ Work through a task with this decision ladder — first matching case wins, and 
 4. Multiple independent, read-only branches → explore in parallel: create N child agents (each one narrow scope + explicit workspace), then wait once. Same-module concurrent writers ≤ 2.
 5. Branches are dependent, or two of them write the same files → serialize; never fan out writes.
 Judgment retained: these cases are defaults, not a script — if a step clearly misfits, say why and deviate, but deviating to dodge the boring-but-correct path is not allowed.
+
+When you delegate, give every child one self-contained assignment in this exact six-part order:
+1. Scope.
+2. Inputs and background context.
+3. Allowed actions and mutation scope.
+4. Acceptance criteria and required evidence.
+5. Non-goals.
+6. Stop and report instruction.
+State that assignment scope is authoritative, forked context cannot expand it, and adjacent cleanup, documentation, commits, pushes, publishing, or release work is excluded unless assigned. Describe tools and permissions as runtime-exposed capabilities. Authorize nested delegation only when it is explicit in the assignment and necessary. Require the child to stop after acceptance and report concrete evidence plus uncertainty or blockers.
 
 Verify your own work before declaring a task done — adversarially, not just confirmingly. Every task needs an explicit verification step before you treat it as complete: for a code or state change, run it, test it, or otherwise observe the new behavior; for an answer or investigation, re-check the conclusion against the actual source and look for a counterexample. Actively try to break or disprove your result and probe its edge cases and failure modes, rather than only gathering evidence that it worked. Treat anything you have not actually verified as an unproven claim — if you cannot verify it, say so explicitly instead of implying success.
 
@@ -131,6 +140,65 @@ pub fn build_workspace_prompt_context_with_binding_and_source(
     ))
 }
 
+/// Locate a complete unwrapped Workspace block emitted by legacy Bamboo builds.
+///
+/// Some persisted sessions predate the marker wrapper, but an ordinary custom
+/// System prompt is also allowed to discuss a `Workspace path:`. Treat the
+/// prefix as host authority only when it appears at the start of a line and is
+/// followed by the exact generated guidance, with only known generated
+/// metadata lines in between. Otherwise migration must leave the text alone.
+pub(crate) fn legacy_unwrapped_workspace_context_bounds(prompt: &str) -> Option<(usize, usize)> {
+    let guidance = workspace_prompt_guidance();
+
+    for (start_idx, _) in prompt.match_indices(WORKSPACE_CONTEXT_PREFIX) {
+        if start_idx > 0 && prompt.as_bytes()[start_idx - 1] != b'\n' {
+            continue;
+        }
+
+        let path_start = start_idx + WORKSPACE_CONTEXT_PREFIX.len();
+        let Some(path_end_rel) = prompt[path_start..].find('\n') else {
+            continue;
+        };
+        let path_end = path_start + path_end_rel;
+        if prompt[path_start..path_end].trim().is_empty() {
+            continue;
+        }
+
+        let metadata_start = path_end + 1;
+        let Some(guidance_rel) = prompt[metadata_start..].find(&guidance) else {
+            continue;
+        };
+        let guidance_start = metadata_start + guidance_rel;
+        if guidance_start > 0 && prompt.as_bytes()[guidance_start - 1] != b'\n' {
+            continue;
+        }
+
+        let metadata_is_generated = prompt[metadata_start..guidance_start]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .all(|line| {
+                matches!(
+                    line,
+                    "Workspace source: explicit"
+                        | "Workspace source: project_default"
+                        | "Workspace source: session"
+                        | "Binding status: registered"
+                        | "Binding status: unregistered"
+                        | "Workspace-local resources may override Project-shared resources."
+                        | "Changing the workspace changes only the filesystem execution context; it does not change Project membership or Project memory."
+                )
+            });
+        if !metadata_is_generated {
+            continue;
+        }
+
+        return Some((start_idx, guidance_start + guidance.len()));
+    }
+
+    None
+}
+
 /// Build the stable Project identity block.
 ///
 /// Resource counts and revisions are intentionally excluded: they belong to
@@ -150,6 +218,21 @@ pub fn build_project_prompt_context(context: &ResolvedProjectContext) -> String 
         prompt_safe_scalar(&project.name),
         prompt_safe_scalar(&project_path),
         prompt_safe_scalar(&paths::path_to_display_string(&project.home)),
+    );
+    format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
+}
+
+/// Build provider-visible Project identity without filesystem locations.
+///
+/// The active workspace path is rendered exactly once by the sibling Workspace
+/// context. Project roots and Bamboo-owned data paths are host details and must
+/// not duplicate that path or leak into provider-visible diagnostics.
+pub fn build_project_model_context(context: &ResolvedProjectContext) -> String {
+    let project = &context.project;
+    let body = format!(
+        "{PROJECT_CONTEXT_PREFIX}{}\nProject name: {}\nThis session belongs to this Project.\nWorkspace is mutable execution context; changing it does not change Project membership, sidebar grouping, Project memory, or Project-shared resources.\nProject-shared resource inventory is supplied separately as per-round dynamic context.\nThe host owns workspace selection and reports the active execution context separately.",
+        prompt_safe_scalar(project.id.as_str()),
+        prompt_safe_scalar(&project.name),
     );
     format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
 }
@@ -250,25 +333,22 @@ fn replace_prompt_block(
 /// Assemble a full system prompt from base prompt, optional enhancement, and context segments.
 ///
 /// This is the shared prompt assembly logic used by both the HTTP handler and the schedule
-/// manager. It layers:
-/// 1. Base system prompt (required)
-/// 2. Optional enhancement text
-/// 3. Workspace context (if workspace_path is provided)
-/// 4. Instruction layer context (AGENTS.md / CLAUDE.md from workspace)
-/// 5. Environment variable context
+/// manager. System text contains only the caller-owned base plus optional
+/// enhancement. Project, Workspace, instruction, and environment context are
+/// assembled later as typed model-context blocks.
 pub fn assemble_system_prompt(
     base: &str,
     enhance: Option<&str>,
-    workspace_path: Option<&str>,
+    _workspace_path: Option<&str>,
 ) -> String {
-    assemble_system_prompt_with_project(base, enhance, None, workspace_path)
+    assemble_system_prompt_with_project(base, enhance, None, None)
 }
 
 pub fn assemble_system_prompt_with_project(
     base: &str,
     enhance: Option<&str>,
-    project_context: Option<&ResolvedProjectContext>,
-    workspace_path: Option<&str>,
+    _project_context: Option<&ResolvedProjectContext>,
+    _workspace_path: Option<&str>,
 ) -> String {
     let mut prompt = base.trim().to_string();
     if let Some(extra) = enhance.map(str::trim).filter(|v| !v.is_empty()) {
@@ -276,40 +356,6 @@ pub fn assemble_system_prompt_with_project(
             prompt.push_str("\n\n");
         }
         prompt.push_str(extra);
-    }
-    if let Some(context) = project_context {
-        let segment = build_project_prompt_context(context);
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(&segment);
-    }
-    if let Some(path) = workspace_path.map(str::trim).filter(|v| !v.is_empty()) {
-        let binding_status = project_context
-            .map(|context| context.binding_status)
-            .unwrap_or(WorkspaceBindingStatus::Unregistered);
-        if let Some(segment) = build_workspace_prompt_context_with_binding_and_source(
-            path,
-            binding_status,
-            project_context.map(|context| context.workspace_source),
-        ) {
-            if !prompt.is_empty() {
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str(&segment);
-        }
-        if let Some(instruction_segment) = instruction::build_instruction_prompt_context(path) {
-            if !prompt.is_empty() {
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str(&instruction_segment);
-        }
-    }
-    if let Some(segment) = build_env_prompt_context() {
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(&segment);
     }
     prompt
 }
@@ -362,10 +408,6 @@ mod project_context_tests {
                         },
                     ],
                 },
-                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                    primary: PathBuf::from("/data/projects/01JPROJECT00000000000000000/memory/v1"),
-                    legacy_aliases: Vec::new(),
-                },
             },
             workspace: Some(PathBuf::from(workspace)),
             workspace_source: WorkspaceSource::Session,
@@ -374,31 +416,37 @@ mod project_context_tests {
     }
 
     #[test]
-    fn scoped_prompt_contains_exactly_one_project_and_workspace_block() {
-        let context = project_context("/workspace/main");
+    fn system_assembly_ignores_legacy_dynamic_context_arguments() {
+        let context = project_context("/workspace/private");
         let prompt = assemble_system_prompt_with_project(
             "base",
             None,
             Some(&context),
-            Some("/workspace/main"),
+            Some("/workspace/private"),
         );
-        assert_eq!(prompt.matches(PROJECT_CONTEXT_START_MARKER).count(), 1);
-        assert_eq!(prompt.matches(PROJECT_CONTEXT_END_MARKER).count(), 1);
-        assert_eq!(prompt.matches(WORKSPACE_CONTEXT_START_MARKER).count(), 1);
-        assert_eq!(prompt.matches(WORKSPACE_CONTEXT_END_MARKER).count(), 1);
-        assert!(prompt.contains("Binding status: registered"));
+        assert_eq!(prompt, "base");
+        assert!(!prompt.contains("/workspace/private"));
+        assert!(!prompt.contains("/data/projects"));
+        assert!(!prompt.contains(PROJECT_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(WORKSPACE_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(WORKSPACE_CONTEXT_END_MARKER));
+        assert!(!prompt.contains(ENV_CONTEXT_START_MARKER));
+    }
+
+    #[test]
+    fn provider_project_context_contains_no_host_paths() {
+        let context = project_context("/workspace/main");
+        let prompt = build_project_model_context(&context);
+        assert!(prompt.contains("Project ID:"));
+        assert!(!prompt.contains("/workspace/main"));
+        assert!(!prompt.contains("/data/projects"));
     }
 
     #[test]
     fn workspace_upsert_preserves_project_block_byte_for_byte() {
         let context = project_context("/workspace/main");
-        let prompt = assemble_system_prompt_with_project(
-            "base",
-            None,
-            Some(&context),
-            Some("/workspace/main"),
-        );
         let project_block = build_project_prompt_context(&context);
+        let prompt = format!("base\n\n{project_block}");
         let updated = upsert_workspace_prompt_context(
             &prompt,
             Some("/workspace/worktree"),

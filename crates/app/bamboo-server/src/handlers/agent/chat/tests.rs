@@ -74,6 +74,7 @@ fn chat_request_blank_model_trims_to_empty() {
         provider: None,
         model_ref: None,
         reasoning_effort: None,
+        permission_mode: None,
     };
     // A whitespace-only model is treated the same as an absent one by the
     // handler's `request::resolve_model` (falls back to the server default).

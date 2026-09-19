@@ -77,8 +77,9 @@
 //! # Thread Safety
 //!
 //! All storage operations are thread-safe and can be called from multiple
-//! async tasks concurrently. SQLite connections are opened per-operation
-//! to avoid blocking the async runtime.
+//! async tasks concurrently. Each standalone operation or bounded batch segment
+//! opens a connection on the blocking pool. Commands retain their individual
+//! transaction boundaries; a segment does not create an outer transaction.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -91,9 +92,20 @@ use thiserror::Error;
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
-    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, PromptMemoryExposureItem,
+    PromptMemoryExposureObservation, PromptMemoryRecallOutcome, RoundMetrics, RoundStatus,
+    SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus, TokenUsage,
+    ToolCallMetrics,
 };
+
+pub use super::mutations::{MetricsMutation, MAX_METRICS_BATCH_SIZE};
+
+mod batch;
+#[cfg(test)]
+mod batch_probe;
+#[cfg(test)]
+mod batch_tests;
+mod writes;
 
 /// Result type for metrics storage operations.
 ///
@@ -230,6 +242,25 @@ pub struct ToolCallCompletion {
 /// ```
 #[async_trait]
 pub trait MetricsStorage: Send + Sync {
+    /// Apply ordinary writes in input order, preserving one result per item.
+    ///
+    /// The default calls the existing single-item API and continues after an
+    /// error. SQLite segments at 32 items and retains each command's original
+    /// commit boundary. An outer error means the blocking task failed outside
+    /// item isolation: a prefix may have committed, so do not replay the batch.
+    /// Runtime teardown is not a successful drain. Custom backend panics keep
+    /// their existing behavior; this default adds no new unwind boundary.
+    async fn apply_batch(
+        &self,
+        mutations: Vec<MetricsMutation>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        let mut results = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            results.push(mutation.apply(self).await);
+        }
+        Ok(results)
+    }
+
     /// Initializes the storage backend.
     ///
     /// This must be called before any other storage operations.
@@ -313,6 +344,23 @@ pub trait MetricsStorage: Send + Sync {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
+
+    /// Persists the first successfully bootstrapped prompt-memory observation
+    /// for one logical round.
+    ///
+    /// Storage implementations that do not support this additive metric fail
+    /// explicitly instead of treating an unobserved path as an observed empty
+    /// round. The live collector logs that best-effort failure without blocking
+    /// agent execution.
+    async fn record_prompt_memory_exposure(
+        &self,
+        _observation: &PromptMemoryExposureObservation,
+    ) -> MetricsResult<()> {
+        Err(MetricsError::InvalidData(
+            "prompt-memory exposure observations are not supported by this metrics storage"
+                .to_string(),
+        ))
+    }
 
     /// Completes a round with final metrics and status.
     ///
@@ -909,8 +957,9 @@ pub trait MetricsStorage: Send + Sync {
 ///
 /// # Thread Safety
 ///
-/// The storage can be safely cloned and shared across threads. Each operation
-/// opens its own database connection to avoid blocking and ensure thread safety.
+/// The storage can be safely cloned and shared across threads. Each standalone
+/// operation or bounded batch segment opens its own connection on the blocking
+/// pool. Each command retains its original transaction boundary.
 #[derive(Debug, Clone)]
 pub struct SqliteMetricsStorage {
     /// Path to the SQLite database file
@@ -939,6 +988,26 @@ impl SqliteMetricsStorage {
         Self {
             db_path: db_path.as_ref().to_path_buf(),
         }
+    }
+
+    /// Loads one persisted prompt-memory observation by logical round.
+    ///
+    /// This is a narrow storage primitive used by producer verification. Public
+    /// Project-authoritative aggregation remains a separate API slice.
+    pub async fn prompt_memory_exposure(
+        &self,
+        round_id: &str,
+    ) -> MetricsResult<Option<PromptMemoryExposureObservation>> {
+        let round_id = round_id.to_string();
+        self.with_connection(move |connection| load_prompt_memory_exposure(connection, &round_id))
+            .await
+    }
+
+    async fn write_one(&self, mutation: MetricsMutation) -> MetricsResult<()> {
+        self.with_connection(move |connection| {
+            writes::apply_mutation_on_connection(connection, mutation)
+        })
+        .await
     }
 
     /// Executes a function with a database connection in a blocking context.
@@ -970,6 +1039,8 @@ impl SqliteMetricsStorage {
     {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            batch_probe::task_started(&db_path);
             let connection = open_connection(&db_path)?;
             func(&connection)
         })
@@ -980,6 +1051,13 @@ impl SqliteMetricsStorage {
 
 #[async_trait]
 impl MetricsStorage for SqliteMetricsStorage {
+    async fn apply_batch(
+        &self,
+        mutations: Vec<MetricsMutation>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        self.apply_mutations(mutations).await
+    }
+
     async fn init(&self) -> MetricsResult<()> {
         self.with_connection(|connection| {
             connection.execute_batch(
@@ -1021,6 +1099,47 @@ impl MetricsStorage for SqliteMetricsStorage {
                     FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS prompt_memory_round_observations (
+                    round_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT,
+                    observed_at TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    recall_enabled INTEGER NOT NULL,
+                    query_present INTEGER NOT NULL,
+                    recall_outcome TEXT NOT NULL,
+                    all_compact_exposed_count INTEGER NOT NULL,
+                    project_exposed_count INTEGER NOT NULL,
+                    out_of_project_only INTEGER NOT NULL,
+                    compact_section_chars INTEGER NOT NULL,
+                    FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
+                    FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE,
+                    CHECK(schema_version = 1),
+                    CHECK(recall_enabled IN (0, 1)),
+                    CHECK(query_present IN (0, 1)),
+                    CHECK(recall_outcome IN ('disabled', 'no_query', 'no_match', 'lookup_error', 'lexical', 'reranked', 'rerank_fallback')),
+                    CHECK(all_compact_exposed_count >= 0),
+                    CHECK(project_exposed_count >= 0),
+                    CHECK(project_exposed_count <= all_compact_exposed_count),
+                    CHECK(out_of_project_only IN (0, 1)),
+                    CHECK(compact_section_chars >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS prompt_memory_project_exposures (
+                    round_id TEXT NOT NULL,
+                    memory_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    status_at_observation TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    rendered_chars INTEGER NOT NULL,
+                    PRIMARY KEY(round_id, memory_id),
+                    FOREIGN KEY(round_id) REFERENCES prompt_memory_round_observations(round_id) ON DELETE CASCADE,
+                    CHECK(scope = 'project'),
+                    CHECK(status_at_observation IN ('active', 'stale', 'superseded', 'contradicted', 'archived')),
+                    CHECK(rank > 0),
+                    CHECK(rendered_chars > 0)
+                );
+
                 CREATE TABLE IF NOT EXISTS tool_call_metrics (
                     tool_call_id TEXT PRIMARY KEY,
                     round_id TEXT NOT NULL,
@@ -1036,9 +1155,15 @@ impl MetricsStorage for SqliteMetricsStorage {
 
                 CREATE INDEX IF NOT EXISTS idx_session_started_at ON session_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_session_model ON session_metrics(model);
-                CREATE INDEX IF NOT EXISTS idx_round_session ON round_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_round_session_started_at ON round_metrics(session_id, started_at);
+                -- Install the replacement before dropping our redundant prefix index.
+                -- Repeated or interrupted initialization always retains a session lookup.
+                DROP INDEX IF EXISTS idx_round_session;
                 CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
+                CREATE INDEX IF NOT EXISTS idx_prompt_memory_project_observed_at ON prompt_memory_round_observations(project_id, observed_at, round_id);
+                CREATE INDEX IF NOT EXISTS idx_prompt_memory_item_memory_round ON prompt_memory_project_exposures(memory_id, round_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_tool_round_started_at ON tool_call_metrics(round_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name);
 
@@ -1125,29 +1250,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let model = model.to_string();
-        let started_at = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO session_metrics (
-                    session_id, model, started_at, status, updated_at
-                ) VALUES (?1, ?2, ?3, 'running', ?3)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    model = excluded.model,
-                    started_at = CASE
-                        WHEN session_metrics.started_at <= excluded.started_at THEN session_metrics.started_at
-                        ELSE excluded.started_at
-                    END,
-                    completed_at = NULL,
-                    status = 'running',
-                    updated_at = excluded.updated_at
-                "#,
-                params![session_id, model, started_at],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::SessionStarted {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            started_at,
         })
         .await
     }
@@ -1158,15 +1264,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         message_count: u32,
         updated_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let updated_at = format_timestamp(updated_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                "UPDATE session_metrics SET message_count = ?1, updated_at = ?2 WHERE session_id = ?3",
-                params![i64::from(message_count), updated_at, session_id],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::SessionMessageCount {
+            session_id: session_id.to_string(),
+            message_count,
+            updated_at,
         })
         .await
     }
@@ -1177,18 +1278,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         status: SessionStatus,
         completed_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                refresh_session_aggregates(connection, &session_id, completed_at)?;
-                connection.execute(
-                    "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
-                    params![status.as_str(), completed_at_str, session_id],
-                )?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::SessionCompleted {
+            session_id: session_id.to_string(),
+            status,
+            completed_at,
         })
         .await
     }
@@ -1200,23 +1293,105 @@ impl MetricsStorage for SqliteMetricsStorage {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let round_id = round_id.to_string();
-        let session_id = session_id.to_string();
-        let model = model.to_string();
-        let started_at_str = format_timestamp(started_at);
+        self.write_one(MetricsMutation::RoundStarted {
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            started_at,
+        })
+        .await
+    }
 
+    async fn record_prompt_memory_exposure(
+        &self,
+        observation: &PromptMemoryExposureObservation,
+    ) -> MetricsResult<()> {
+        let observation = observation.clone();
         self.with_connection(move |connection| {
             with_immediate_transaction(connection, || {
+                validate_prompt_memory_exposure(&observation)?;
+
+                let round_session_id = connection
+                    .query_row(
+                        "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                        params![observation.round_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        MetricsError::InvalidData(format!(
+                            "prompt-memory observation references unknown round '{}'",
+                            observation.round_id
+                        ))
+                    })?;
+                if round_session_id != observation.session_id {
+                    return Err(MetricsError::InvalidData(format!(
+                        "prompt-memory observation session '{}' does not own round '{}'",
+                        observation.session_id, observation.round_id
+                    )));
+                }
+
+                if let Some(existing) =
+                    load_prompt_memory_exposure(connection, &observation.round_id)?
+                {
+                    // First successful bootstrap owns the logical round. Later
+                    // retries by that same Session/Project are harmless no-ops,
+                    // even if request membership changed after recovery.
+                    if existing.session_id == observation.session_id
+                        && existing.project_id == observation.project_id
+                    {
+                        return Ok(());
+                    }
+                    return Err(MetricsError::InvalidData(format!(
+                        "prompt-memory observation ownership conflict for round '{}'",
+                        observation.round_id
+                    )));
+                }
+
                 connection.execute(
                     r#"
-                    INSERT INTO round_metrics (
-                        round_id, session_id, model, started_at, status
-                    ) VALUES (?1, ?2, ?3, ?4, 'running')
-                    ON CONFLICT(round_id) DO NOTHING
+                    INSERT INTO prompt_memory_round_observations (
+                        round_id, session_id, project_id, observed_at,
+                        schema_version, recall_enabled, query_present,
+                        recall_outcome, all_compact_exposed_count,
+                        project_exposed_count, out_of_project_only,
+                        compact_section_chars
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                     "#,
-                    params![round_id, session_id, model, started_at_str],
+                    params![
+                        observation.round_id,
+                        observation.session_id,
+                        observation.project_id,
+                        format_timestamp(observation.observed_at),
+                        i64::from(observation.schema_version),
+                        i64::from(observation.recall_enabled),
+                        i64::from(observation.query_present),
+                        observation.recall_outcome.as_str(),
+                        i64::from(observation.all_compact_exposed_count),
+                        i64::from(observation.project_exposed_count),
+                        i64::from(observation.out_of_project_only),
+                        i64::from(observation.compact_section_chars),
+                    ],
                 )?;
-                refresh_session_aggregates(connection, &session_id, started_at)?;
+
+                for item in &observation.project_items {
+                    connection.execute(
+                        r#"
+                        INSERT INTO prompt_memory_project_exposures (
+                            round_id, memory_id, scope, status_at_observation,
+                            rank, rendered_chars
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        "#,
+                        params![
+                            observation.round_id,
+                            item.memory_id,
+                            item.scope,
+                            item.status_at_observation,
+                            i64::from(item.rank),
+                            i64::from(item.rendered_chars),
+                        ],
+                    )?;
+                }
                 Ok(())
             })
         })
@@ -1233,64 +1408,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     ) -> MetricsResult<()> {
-        let round_id = round_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-        // SQLite INTEGER is signed 64-bit. Normalize before conversion so
-        // extreme provider values saturate instead of wrapping negative.
-        let usage = usage.clamped_for_durable_metrics();
-        let prompt_tokens = durable_token_to_i64(usage.prompt_tokens);
-        let completion_tokens = durable_token_to_i64(usage.completion_tokens);
-        let total_tokens = durable_token_to_i64(usage.total_tokens);
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                #[cfg(test)]
-                signal_complete_round_transaction_entered(&round_id);
-
-                let session_id: String = connection.query_row(
-                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                    params![round_id],
-                    |row| row.get(0),
-                )?;
-
-                connection.execute(
-                    r#"
-                    UPDATE round_metrics
-                    SET completed_at = ?1,
-                        status = ?2,
-                        prompt_tokens = ?3,
-                        completion_tokens = ?4,
-                        total_tokens = ?5,
-                        prompt_cached_tool_outputs = ?6,
-                        prompt_cached_tool_tokens_saved = ?7,
-                        -- `RoundCompleted` may be replayed. Replace its prompt-
-                        -- cache contribution while preserving tokens recorded by
-                        -- separate compression events, rather than adding the
-                        -- same completion payload again.
-                        tokens_saved = MAX(
-                            COALESCE(tokens_saved, 0) - COALESCE(prompt_cached_tool_tokens_saved, 0),
-                            0
-                        ) + ?8,
-                        error = ?9
-                    WHERE round_id = ?10
-                    "#,
-                    params![
-                        completed_at_str,
-                        status.as_str(),
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens,
-                        i64::from(prompt_cached_tool_outputs),
-                        i64::from(prompt_cached_tool_tokens_saved),
-                        i64::from(prompt_cached_tool_tokens_saved),
-                        error,
-                        round_id,
-                    ],
-                )?;
-
-                refresh_session_aggregates(connection, &session_id, completed_at)?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::RoundCompleted {
+            round_id: round_id.to_string(),
+            completed_at,
+            status,
+            usage,
+            prompt_cached_tool_outputs,
+            prompt_cached_tool_tokens_saved,
+            error,
         })
         .await
     }
@@ -1336,33 +1461,12 @@ impl MetricsStorage for SqliteMetricsStorage {
         tool_name: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let tool_call_id = tool_call_id.to_string();
-        let round_id = round_id.to_string();
-        let session_id = session_id.to_string();
-        let tool_name = tool_name.to_string();
-        let started_at_str = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO tool_call_metrics (
-                    tool_call_id, round_id, session_id, tool_name, started_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(tool_call_id) DO UPDATE SET
-                    round_id = excluded.round_id,
-                    session_id = excluded.session_id,
-                    tool_name = excluded.tool_name,
-                    started_at = excluded.started_at
-                "#,
-                params![
-                    tool_call_id,
-                    round_id,
-                    session_id,
-                    tool_name,
-                    started_at_str
-                ],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ToolStarted {
+            tool_call_id: tool_call_id.to_string(),
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            started_at,
         })
         .await
     }
@@ -1372,27 +1476,9 @@ impl MetricsStorage for SqliteMetricsStorage {
         tool_call_id: &str,
         completion: ToolCallCompletion,
     ) -> MetricsResult<()> {
-        let tool_call_id = tool_call_id.to_string();
-        let completed_at = format_timestamp(completion.completed_at);
-        let success = if completion.success { 1_i64 } else { 0_i64 };
-        let error = completion.error;
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                let session_id: String = connection.query_row(
-                    "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
-                    params![tool_call_id],
-                    |row| row.get(0),
-                )?;
-
-                connection.execute(
-                    "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
-                    params![completed_at, success, error, tool_call_id],
-                )?;
-
-                refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::ToolCompleted {
+            tool_call_id: tool_call_id.to_string(),
+            completion,
         })
         .await
     }
@@ -1405,39 +1491,12 @@ impl MetricsStorage for SqliteMetricsStorage {
         is_stream: bool,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let forward_id = forward_id.to_string();
-        let endpoint = endpoint.to_string();
-        let model = model.to_string();
-        let is_stream_int = if is_stream { 1_i64 } else { 0_i64 };
-        let started_at_str = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO forward_request_metrics (
-                    forward_id, endpoint, model, is_stream, started_at, status, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?5)
-                ON CONFLICT(forward_id) DO UPDATE SET
-                    endpoint = excluded.endpoint,
-                    model = excluded.model,
-                    is_stream = excluded.is_stream,
-                    started_at = excluded.started_at,
-                    completed_at = NULL,
-                    status_code = NULL,
-                    status = 'pending',
-                    prompt_tokens = NULL,
-                    completion_tokens = NULL,
-                    total_tokens = NULL,
-                    cache_creation_input_tokens = NULL,
-                    cache_read_input_tokens = NULL,
-                    cache_write_input_tokens = NULL,
-                    reasoning_output_tokens = NULL,
-                    error = NULL,
-                    updated_at = excluded.updated_at
-                "#,
-                params![forward_id, endpoint, model, is_stream_int, started_at_str],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ForwardStarted {
+            forward_id: forward_id.to_string(),
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            is_stream,
+            started_at,
         })
         .await
     }
@@ -1452,65 +1511,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) -> MetricsResult<()> {
-        let forward_id = forward_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-        let status_code_int = status_code.map(|s| s as i64);
-        let (prompt, completion, total) = match usage {
-            Some(u) => (
-                Some(u.prompt_tokens as i64),
-                Some(u.completion_tokens as i64),
-                Some(u.total_tokens as i64),
-            ),
-            None => (None, None, None),
-        };
-        let token_details = token_details.unwrap_or_default();
-        let cache_creation = token_details
-            .cache_creation_input_tokens
-            .map(|value| value as i64);
-        let cache_read = token_details
-            .cache_read_input_tokens
-            .map(|value| value as i64);
-        let cache_write = token_details
-            .cache_write_input_tokens
-            .map(|value| value as i64);
-        let reasoning_output = token_details
-            .reasoning_output_tokens
-            .map(|value| value as i64);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                UPDATE forward_request_metrics
-                SET completed_at = ?1,
-                    status_code = ?2,
-                    status = ?3,
-                    prompt_tokens = ?4,
-                    completion_tokens = ?5,
-                    total_tokens = ?6,
-                    cache_creation_input_tokens = ?7,
-                    cache_read_input_tokens = ?8,
-                    cache_write_input_tokens = ?9,
-                    reasoning_output_tokens = ?10,
-                    error = ?11,
-                    updated_at = ?1
-                WHERE forward_id = ?12
-                "#,
-                params![
-                    completed_at_str,
-                    status_code_int,
-                    status.as_str(),
-                    prompt,
-                    completion,
-                    total,
-                    cache_creation,
-                    cache_read,
-                    cache_write,
-                    reasoning_output,
-                    error,
-                    forward_id,
-                ],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ForwardCompleted {
+            forward_id: forward_id.to_string(),
+            completed_at,
+            status_code,
+            status,
+            usage,
+            token_details,
+            error,
         })
         .await
     }
@@ -2256,22 +2264,9 @@ impl MetricsStorage for SqliteMetricsStorage {
         reason: &str,
         occurred_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let reason = reason.to_string();
-        let mismatch_date = occurred_at.date_naive().to_string();
-        let updated_at = format_timestamp(occurred_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO execute_sync_mismatch_metrics (reason, mismatch_date, count, updated_at)
-                VALUES (?1, ?2, 1, ?3)
-                ON CONFLICT(reason, mismatch_date) DO UPDATE SET
-                    count = count + 1,
-                    updated_at = excluded.updated_at
-                "#,
-                params![reason, mismatch_date, updated_at],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ExecuteSyncMismatch {
+            reason: reason.to_string(),
+            occurred_at,
         })
         .await
     }
@@ -2469,6 +2464,8 @@ impl MetricsStorage for SqliteMetricsStorage {
 /// - Database file cannot be opened
 /// - PRAGMA settings fail to apply
 fn open_connection(path: &Path) -> MetricsResult<Connection> {
+    #[cfg(test)]
+    batch_probe::before_open(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2485,6 +2482,9 @@ fn open_connection(path: &Path) -> MetricsResult<Connection> {
         PRAGMA busy_timeout = 5000;
         "#,
     )?;
+    connection.set_prepared_statement_cache_capacity(32);
+    #[cfg(test)]
+    batch_probe::opened(path);
     Ok(connection)
 }
 
@@ -2512,6 +2512,289 @@ fn format_timestamp(timestamp: DateTime<Utc>) -> String {
 /// Returns an error if the string doesn't conform to RFC3339 format.
 fn parse_timestamp(raw: String) -> MetricsResult<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&raw)?.with_timezone(&Utc))
+}
+
+fn validate_prompt_memory_exposure(
+    observation: &PromptMemoryExposureObservation,
+) -> MetricsResult<()> {
+    if observation.schema_version != 1 {
+        return Err(MetricsError::InvalidData(format!(
+            "unsupported prompt-memory observation schema version {}",
+            observation.schema_version
+        )));
+    }
+    if observation.round_id.trim().is_empty() || observation.session_id.trim().is_empty() {
+        return Err(MetricsError::InvalidData(
+            "prompt-memory observation requires non-empty round and session identities".to_string(),
+        ));
+    }
+    if observation
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id.trim().is_empty())
+    {
+        return Err(MetricsError::InvalidData(
+            "prompt-memory observation Project identity cannot be blank".to_string(),
+        ));
+    }
+    if observation.project_exposed_count > observation.all_compact_exposed_count {
+        return Err(MetricsError::InvalidData(
+            "Project prompt-memory exposure count exceeds the complete compact count".to_string(),
+        ));
+    }
+    let item_count = u32::try_from(observation.project_items.len()).map_err(|_| {
+        MetricsError::InvalidData("too many Project prompt-memory exposure items".to_string())
+    })?;
+    if observation.project_exposed_count != item_count {
+        return Err(MetricsError::InvalidData(format!(
+            "Project prompt-memory exposure count {} does not match {} items",
+            observation.project_exposed_count, item_count
+        )));
+    }
+    if item_count > 0 && observation.project_id.is_none() {
+        return Err(MetricsError::InvalidData(
+            "Project prompt-memory items require a server-resolved Project identity".to_string(),
+        ));
+    }
+    let expected_out_of_project_only =
+        observation.all_compact_exposed_count > 0 && observation.project_exposed_count == 0;
+    if observation.out_of_project_only != expected_out_of_project_only {
+        return Err(MetricsError::InvalidData(
+            "out-of-Project-only flag does not match prompt-memory exposure counts".to_string(),
+        ));
+    }
+
+    match observation.recall_outcome {
+        PromptMemoryRecallOutcome::Disabled if observation.recall_enabled => {
+            return Err(MetricsError::InvalidData(
+                "disabled recall outcome requires recall to be disabled".to_string(),
+            ));
+        }
+        PromptMemoryRecallOutcome::NoQuery
+            if !observation.recall_enabled || observation.query_present =>
+        {
+            return Err(MetricsError::InvalidData(
+                "no-query recall outcome requires enabled recall without a query".to_string(),
+            ));
+        }
+        PromptMemoryRecallOutcome::NoMatch
+        | PromptMemoryRecallOutcome::LookupError
+        | PromptMemoryRecallOutcome::Lexical
+        | PromptMemoryRecallOutcome::Reranked
+        | PromptMemoryRecallOutcome::RerankFallback
+            if !observation.recall_enabled || !observation.query_present =>
+        {
+            return Err(MetricsError::InvalidData(
+                "observed recall outcome requires enabled recall and a query".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    if matches!(
+        observation.recall_outcome,
+        PromptMemoryRecallOutcome::Disabled
+            | PromptMemoryRecallOutcome::NoQuery
+            | PromptMemoryRecallOutcome::NoMatch
+            | PromptMemoryRecallOutcome::LookupError
+    ) && observation.all_compact_exposed_count != 0
+    {
+        return Err(MetricsError::InvalidData(
+            "non-selection recall outcome cannot contain compact exposures".to_string(),
+        ));
+    }
+
+    let mut memory_ids = BTreeSet::new();
+    let mut ranks = BTreeSet::new();
+    let mut rendered_item_chars = 0_u64;
+    for item in &observation.project_items {
+        if item.memory_id.trim().is_empty() {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item identity cannot be blank".to_string(),
+            ));
+        }
+        if !matches!(
+            item.status_at_observation.as_str(),
+            "active" | "stale" | "superseded" | "contradicted" | "archived"
+        ) {
+            return Err(MetricsError::InvalidData(
+                "invalid prompt-memory lifecycle status".to_string(),
+            ));
+        }
+        if item.scope != "project" {
+            return Err(MetricsError::InvalidData(
+                "schema v1 persists only Project prompt-memory item identities".to_string(),
+            ));
+        }
+        if item.rank == 0 || item.rendered_chars == 0 {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item rank and rendered characters must be positive".to_string(),
+            ));
+        }
+        if item.rank > observation.all_compact_exposed_count {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item rank exceeds the complete compact exposure count".to_string(),
+            ));
+        }
+        rendered_item_chars = rendered_item_chars.saturating_add(u64::from(item.rendered_chars));
+        if !memory_ids.insert(item.memory_id.as_str()) || !ranks.insert(item.rank) {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item identities and ranks must be unique within a round".to_string(),
+            ));
+        }
+    }
+    if observation.all_compact_exposed_count > 0 && observation.compact_section_chars == 0 {
+        return Err(MetricsError::InvalidData(
+            "non-empty compact exposure requires a rendered section".to_string(),
+        ));
+    }
+    if u64::from(observation.compact_section_chars) < rendered_item_chars {
+        return Err(MetricsError::InvalidData(
+            "compact section characters cannot be smaller than its Project items".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_prompt_memory_exposure(
+    connection: &Connection,
+    round_id: &str,
+) -> MetricsResult<Option<PromptMemoryExposureObservation>> {
+    type HeaderRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+    let header: Option<HeaderRow> = connection
+        .query_row(
+            r#"
+            SELECT round_id, session_id, project_id, observed_at,
+                   schema_version, recall_enabled, query_present, recall_outcome,
+                   all_compact_exposed_count, project_exposed_count,
+                   out_of_project_only, compact_section_chars
+            FROM prompt_memory_round_observations
+            WHERE round_id = ?1
+            "#,
+            params![round_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        round_id,
+        session_id,
+        project_id,
+        observed_at,
+        schema_version,
+        recall_enabled,
+        query_present,
+        recall_outcome,
+        all_compact_exposed_count,
+        project_exposed_count,
+        out_of_project_only,
+        compact_section_chars,
+    )) = header
+    else {
+        return Ok(None);
+    };
+
+    let mut statement = connection.prepare(
+        r#"
+        SELECT memory_id, scope, status_at_observation, rank, rendered_chars
+        FROM prompt_memory_project_exposures
+        WHERE round_id = ?1
+        ORDER BY rank ASC, memory_id ASC
+        "#,
+    )?;
+    let project_items = statement
+        .query_map(params![round_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .map(|row| {
+            let (memory_id, scope, status_at_observation, rank, rendered_chars) = row?;
+            Ok(PromptMemoryExposureItem {
+                memory_id,
+                scope,
+                status_at_observation,
+                rank: metric_i64_to_u32(rank, "prompt-memory item rank")?,
+                rendered_chars: metric_i64_to_u32(
+                    rendered_chars,
+                    "prompt-memory item rendered characters",
+                )?,
+            })
+        })
+        .collect::<MetricsResult<Vec<_>>>()?;
+
+    let observation = PromptMemoryExposureObservation {
+        schema_version: metric_i64_to_u32(
+            schema_version,
+            "prompt-memory observation schema version",
+        )?,
+        round_id,
+        session_id,
+        project_id,
+        observed_at: parse_timestamp(observed_at)?,
+        recall_enabled: metric_i64_to_bool(recall_enabled, "recall-enabled flag")?,
+        query_present: metric_i64_to_bool(query_present, "query-present flag")?,
+        recall_outcome: PromptMemoryRecallOutcome::from_db(&recall_outcome).ok_or_else(|| {
+            MetricsError::InvalidData("unknown prompt-memory recall outcome".to_string())
+        })?,
+        all_compact_exposed_count: metric_i64_to_u32(
+            all_compact_exposed_count,
+            "all compact exposure count",
+        )?,
+        project_exposed_count: metric_i64_to_u32(project_exposed_count, "Project exposure count")?,
+        out_of_project_only: metric_i64_to_bool(out_of_project_only, "out-of-Project-only flag")?,
+        compact_section_chars: metric_i64_to_u32(
+            compact_section_chars,
+            "compact section characters",
+        )?,
+        project_items,
+    };
+    validate_prompt_memory_exposure(&observation)?;
+    Ok(Some(observation))
+}
+
+fn metric_i64_to_u32(value: i64, field: &str) -> MetricsResult<u32> {
+    u32::try_from(value).map_err(|_| MetricsError::InvalidData(format!("invalid {field}: {value}")))
+}
+
+fn metric_i64_to_bool(value: i64, field: &str) -> MetricsResult<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(MetricsError::InvalidData(format!(
+            "invalid {field}: {value}"
+        ))),
+    }
 }
 
 /// Parses an optional RFC3339 timestamp string.
@@ -2944,7 +3227,11 @@ fn with_immediate_transaction<T>(
     connection.execute_batch("BEGIN IMMEDIATE")?;
     match operation() {
         Ok(value) => match connection.execute_batch("COMMIT") {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                #[cfg(test)]
+                batch_probe::committed(connection);
+                Ok(value)
+            }
             Err(error) => {
                 let _ = connection.execute_batch("ROLLBACK");
                 Err(error.into())
@@ -2999,6 +3286,8 @@ fn refresh_session_aggregates_in_transaction(
     session_id: &str,
     updated_at: DateTime<Utc>,
 ) -> MetricsResult<()> {
+    #[cfg(test)]
+    batch_probe::aggregated(connection, session_id);
     // Do not use SQLite SUM for token counters: summing otherwise-valid i64
     // round rows can overflow before an outer MIN/CASE can clamp it. Fold in
     // Rust with the same signed-64 saturation policy used by the runtime.
@@ -3006,22 +3295,9 @@ fn refresh_session_aggregates_in_transaction(
     #[cfg(test)]
     pause_after_session_token_fold(session_id);
     let updated_at = format_timestamp(updated_at);
-    connection.execute(
-        r#"
-        UPDATE session_metrics
-        SET
-            total_rounds = COALESCE((SELECT COUNT(*) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_tokens = ?2,
-            completion_tokens = ?3,
-            total_tokens = ?4,
-            prompt_cached_tool_outputs = COALESCE((SELECT SUM(prompt_cached_tool_outputs) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_cached_tool_tokens_saved = COALESCE((SELECT SUM(prompt_cached_tool_tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
-            total_compression_events = COALESCE((SELECT SUM(compression_count) FROM round_metrics WHERE session_id = ?1), 0),
-            total_tokens_saved = COALESCE((SELECT SUM(tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
-            tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
-            updated_at = ?5
-        WHERE session_id = ?1
-        "#,
+    writes::execute_cached(
+        connection,
+        REFRESH_SESSION_AGGREGATES_SQL,
         params![
             session_id,
             durable_token_to_i64(token_usage.prompt_tokens),
@@ -3050,7 +3326,7 @@ fn load_session_token_aggregate(
     connection: &Connection,
     session_id: &str,
 ) -> MetricsResult<TokenUsage> {
-    let mut stmt = connection.prepare(
+    let mut stmt = connection.prepare_cached(
         "SELECT prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE session_id = ?1",
     )?;
     let mut rows = stmt.query(params![session_id])?;
@@ -3128,9 +3404,7 @@ fn load_tool_breakdown(
 /// - Timestamp parsing fails
 /// - Status values are invalid
 fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<RoundMetrics>> {
-    let mut stmt = connection.prepare(
-        "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC",
-    )?;
+    let mut stmt = connection.prepare(LOAD_ROUNDS_SQL)?;
     let mut rows = stmt.query(params![session_id])?;
     let mut rounds = Vec::new();
 
@@ -3182,9 +3456,7 @@ fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<R
 ///
 /// A vector of ToolCallMetrics ordered by started_at ascending.
 fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec<ToolCallMetrics>> {
-    let mut stmt = connection.prepare(
-        "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC",
-    )?;
+    let mut stmt = connection.prepare(LOAD_TOOL_CALLS_SQL)?;
     let mut rows = stmt.query(params![round_id])?;
     let mut tools = Vec::new();
 
@@ -3445,6 +3717,40 @@ fn load_execute_sync_mismatch_breakdown(
     Ok(breakdown)
 }
 
+const LOAD_ROUNDS_SQL: &str = "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC";
+
+const LOAD_TOOL_CALLS_SQL: &str = "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC";
+
+// Keep these aggregates in the parent UPDATE: SQLite retains SUM's dynamic
+// numeric types and overflow errors, and skips them when no parent matches.
+// Token validation and its saturated fold still run first, in Rust.
+const REFRESH_SESSION_AGGREGATES_SQL: &str = r#"
+    UPDATE session_metrics
+    SET (total_rounds, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved,
+         total_compression_events, total_tokens_saved) = (
+            SELECT COUNT(*),
+                   COALESCE(SUM(prompt_cached_tool_outputs), 0),
+                   COALESCE(SUM(prompt_cached_tool_tokens_saved), 0),
+                   COALESCE(SUM(compression_count), 0),
+                   COALESCE(SUM(tokens_saved), 0)
+            FROM round_metrics WHERE session_id = ?1
+        ),
+        prompt_tokens = ?2,
+        completion_tokens = ?3,
+        total_tokens = ?4,
+        tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
+        updated_at = ?5
+    WHERE session_id = ?1
+"#;
+
+#[cfg(test)]
+#[path = "storage/aggregate_tests.rs"]
+mod aggregate_tests;
+
+#[cfg(test)]
+#[path = "storage/prompt_memory_tests.rs"]
+mod prompt_memory_tests;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3457,6 +3763,307 @@ mod tests {
         ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter,
         ModelMetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
+
+    // The pre-#1075 layout is independent of init() so this exercises a real
+    // populated database migration rather than deriving the old schema from it.
+    const LEGACY_ROUND_SCHEMA: &str = r#"
+        CREATE TABLE session_metrics (
+            session_id TEXT PRIMARY KEY, model TEXT NOT NULL, started_at TEXT NOT NULL,
+            completed_at TEXT, status TEXT NOT NULL DEFAULT 'running',
+            total_rounds INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_tokens_saved INTEGER NOT NULL DEFAULT 0,
+            total_compression_events INTEGER NOT NULL DEFAULT 0,
+            total_tokens_saved INTEGER NOT NULL DEFAULT 0, tool_call_count INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE round_metrics (
+            round_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, model TEXT NOT NULL,
+            started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL DEFAULT 'running',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0, prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_tokens_saved INTEGER NOT NULL DEFAULT 0,
+            compression_count INTEGER NOT NULL DEFAULT 0, tokens_saved INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE tool_call_metrics (
+            tool_call_id TEXT PRIMARY KEY, round_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
+            success INTEGER, error TEXT,
+            FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_session_started_at ON session_metrics(started_at);
+        CREATE INDEX idx_session_model ON session_metrics(model);
+        CREATE INDEX idx_round_session ON round_metrics(session_id);
+        CREATE INDEX idx_round_started_at ON round_metrics(started_at);
+        CREATE INDEX idx_tool_session ON tool_call_metrics(session_id);
+        CREATE INDEX idx_tool_started_at ON tool_call_metrics(started_at);
+        CREATE INDEX idx_tool_name ON tool_call_metrics(tool_name);
+        CREATE INDEX custom_tool_success ON tool_call_metrics(success);
+    "#;
+
+    fn seed_round_index_fixture(connection: &rusqlite::Connection) {
+        let now = Utc.with_ymd_and_hms(2026, 2, 10, 12, 0, 0).unwrap();
+        super::with_immediate_transaction(connection, || {
+            // Target plus 64 unrelated sessions, 195 rounds and 585 tools.
+            // Reverse insertion order ensures detail ordering comes from SQL.
+            for session in 0..65 {
+                let sid = format!("index-session-{session}");
+                connection.execute(
+                    "INSERT INTO session_metrics(session_id,model,started_at,message_count,updated_at) VALUES (?1,'model',?2,7,?2)",
+                    rusqlite::params![sid, super::format_timestamp(now)],
+                )?;
+                for round in (0..3).rev() {
+                    let rid = format!("index-round-{session}-{round}");
+                    let started = if session == 0 && round == 0 {
+                        now - chrono::Duration::days(40)
+                    } else {
+                        now + chrono::Duration::minutes(round)
+                    };
+                    connection.execute(
+                        "INSERT INTO round_metrics(round_id,session_id,model,started_at,completed_at,status,prompt_tokens,completion_tokens,total_tokens,prompt_cached_tool_outputs,prompt_cached_tool_tokens_saved,tokens_saved) VALUES (?1,?2,'model',?3,?3,'success',10,2,12,1,3,3)",
+                        rusqlite::params![rid, sid, super::format_timestamp(started)],
+                    )?;
+                    for tool in (0..3).rev() {
+                        connection.execute(
+                            "INSERT INTO tool_call_metrics(tool_call_id,round_id,session_id,tool_name,started_at,completed_at,success) VALUES (?1,?2,?3,'fixture_tool',?4,?4,1)",
+                            rusqlite::params![format!("index-tool-{session}-{round}-{tool}"), rid, sid, super::format_timestamp(started + chrono::Duration::seconds(tool))],
+                        )?;
+                    }
+                }
+                super::refresh_session_aggregates(connection, &sid, now)?;
+            }
+            Ok(())
+        }).expect("seed populated metrics fixture");
+        connection
+            .execute_batch("ANALYZE")
+            .expect("analyze fixture");
+    }
+
+    fn assert_round_lookup_plans(connection: &rusqlite::Connection) {
+        for (query, key, table, column) in [
+            (
+                super::LOAD_TOOL_CALLS_SQL,
+                "index-round-0-1",
+                "tool_call_metrics",
+                "round_id",
+            ),
+            (
+                super::LOAD_ROUNDS_SQL,
+                "index-session-0",
+                "round_metrics",
+                "session_id",
+            ),
+            (
+                "DELETE FROM round_metrics WHERE round_id = ?1",
+                "index-round-0-1",
+                "tool_call_metrics",
+                "round_id",
+            ),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let plan = statement
+                .query_map([key], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| {
+                    step.starts_with(&format!("SEARCH {table} "))
+                        && step.contains(&format!("({column}=?"))
+                }),
+                "lookup must be keyed by {column}: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.starts_with(&format!("SCAN {table}"))),
+                "lookup must not scan unrelated {table} rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "ordered detail must not need a temporary sort: {plan:?}"
+            );
+        }
+    }
+
+    fn assert_round_indexes(connection: &rusqlite::Connection) {
+        for (name, expected) in [
+            ("idx_round_session_started_at", ["session_id", "started_at"]),
+            ("idx_tool_round_started_at", ["round_id", "started_at"]),
+        ] {
+            let columns = connection
+                .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                .unwrap()
+                .query_map([name], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(columns, expected, "index columns for {name}");
+        }
+        let old_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_round_session'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(old_count, 0, "owned redundant prefix index is replaced");
+    }
+
+    type MetricRows = Vec<Vec<rusqlite::types::Value>>;
+
+    fn snapshot_round_fixture(
+        connection: &rusqlite::Connection,
+        unrelated_only: bool,
+    ) -> Vec<MetricRows> {
+        ["session_metrics", "round_metrics", "tool_call_metrics"]
+            .iter()
+            .map(|table| {
+                let filter = if unrelated_only {
+                    "WHERE session_id != 'index-session-0'"
+                } else {
+                    ""
+                };
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table} {filter} ORDER BY 1"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_round_indexes_use_keyed_lookups_and_preserve_detail_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let storage = SqliteMetricsStorage::new(&path);
+        storage.init().await.unwrap();
+        storage
+            .init()
+            .await
+            .expect("fresh initialization is idempotent");
+        let connection = super::open_connection(&path).unwrap();
+        assert_round_indexes(&connection);
+        seed_round_index_fixture(&connection);
+        assert_round_lookup_plans(&connection);
+        drop(connection);
+
+        let detail = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail
+                .rounds
+                .iter()
+                .map(|round| round.round_id.as_str())
+                .collect::<Vec<_>>(),
+            ["index-round-0-0", "index-round-0-1", "index-round-0-2"]
+        );
+        for (round_index, round) in detail.rounds.iter().enumerate() {
+            assert_eq!(
+                round
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.tool_call_id.clone())
+                    .collect::<Vec<_>>(),
+                (0..3)
+                    .map(|tool| format!("index-tool-0-{round_index}-{tool}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn populated_legacy_round_indexes_migrate_without_loss_and_preserve_retention() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let connection = super::open_connection(&path).unwrap();
+        connection.execute_batch(LEGACY_ROUND_SCHEMA).unwrap();
+        seed_round_index_fixture(&connection);
+        let before = snapshot_round_fixture(&connection, false);
+        let unrelated_before = snapshot_round_fixture(&connection, true);
+        drop(connection);
+
+        let storage = SqliteMetricsStorage::new(&path);
+        let detail_before = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            storage
+                .init()
+                .await
+                .expect("migrate/reinitialize populated legacy database");
+            let connection = super::open_connection(&path).unwrap();
+            assert_round_indexes(&connection);
+            assert_round_lookup_plans(&connection);
+            assert_eq!(
+                snapshot_round_fixture(&connection, false),
+                before,
+                "migration preserves every existing row"
+            );
+            let unrelated_index: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='custom_tool_success'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(unrelated_index, 1, "unrelated indexes are preserved");
+        }
+        assert_eq!(
+            storage
+                .session_detail("index-session-0")
+                .await
+                .unwrap()
+                .unwrap(),
+            detail_before
+        );
+        let cutoff = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        assert_eq!(storage.prune_rounds_before(cutoff).await.unwrap(), 1);
+        assert_eq!(storage.prune_rounds_before(cutoff).await.unwrap(), 0);
+        let detail = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.rounds, detail_before.rounds[1..]);
+        assert_eq!(detail.session.total_rounds, 2);
+        assert_eq!(detail.session.total_token_usage.total_tokens, 24);
+        assert_eq!(detail.session.tool_call_count, 6);
+        assert_eq!(detail.session.prompt_cached_tool_outputs, 2);
+        assert_eq!(detail.session.prompt_cached_tool_tokens_saved, 6);
+        assert_eq!(detail.session.total_tokens_saved, 6);
+        assert_eq!(detail.session.message_count, 7);
+        let connection = super::open_connection(&path).unwrap();
+        assert_eq!(snapshot_round_fixture(&connection, true), unrelated_before);
+        let orphans: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call_metrics WHERE round_id='index-round-0-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "pruning cascades to the expired round's tools");
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
 
     #[test]
     fn open_connection_sets_busy_timeout() {

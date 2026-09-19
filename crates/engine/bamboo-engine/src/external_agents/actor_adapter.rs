@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::{spawn_worker_on_bus, SpawnedChild};
 use bamboo_subagent::proto::{
-    AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame, PermissionPolicyContext, RunSpec,
-    SessionMessageDelivery, TerminalStatus,
+    ActorEventBatch, AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame,
+    PermissionPolicyContext, RunSpec, SessionMessageDelivery, TerminalStatus,
 };
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
@@ -35,8 +35,10 @@ use bamboo_subagent::transport::{client_config_trusting_cert, ChildClient};
 
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
-/// Default cap on simultaneously running actor processes.
-pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 8;
+/// Default cap on simultaneously running actor activations. The event and
+/// broker transports are bounded independently, so 200 active sub-agents are a
+/// supported operating point rather than an opt-in escape hatch.
+pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 200;
 
 /// Max nesting depth for direct nested execution (Phase 6). A worker whose
 /// session `spawn_depth` is below this gets its own spawn stack + the real
@@ -51,7 +53,7 @@ const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
 /// Process-wide-per-runner cap across every reuse fingerprint. Without this,
 /// workloads that continually change role/model/workspace can leave one parked
 /// worker in an unbounded number of otherwise-small buckets.
-const DEFAULT_MAX_IDLE_TOTAL: usize = DEFAULT_MAX_CONCURRENT_ACTORS;
+const DEFAULT_MAX_IDLE_TOTAL: usize = 16;
 
 /// How long a pooled worker waits for its next assignment before reclaiming
 /// itself (must comfortably exceed the gap between sibling spawns).
@@ -490,6 +492,36 @@ enum PlacementKind {
     Schedulable,
 }
 
+/// A read-only activation needs an executor and worker whose tool surface and
+/// no-shell checker enforce the typed capability. Codex's read-only sandbox
+/// prevents writes but still permits command execution, so neither Codex mode
+/// can currently satisfy the no-shell contract. Local Bamboo/Claude workers are
+/// fingerprinted by their baked fields, while remote/schedulable placements
+/// connect to an already-provisioned resident and [`RunSpec`] currently carries
+/// no equivalent per-activation authority. Fail closed before provisioning or
+/// dispatch instead of treating either posture as read-only enforcement.
+fn ensure_read_only_activation_is_enforceable(spec: &ProvisionSpec) -> Result<(), AgentError> {
+    if !spec.capabilities.read_only_enforced() {
+        return Ok(());
+    }
+
+    if matches!(spec.executor, ExecutorSpec::Codex { .. }) {
+        return Err(AgentError::LLM(format!(
+            "read-only actor role '{}' cannot use the Codex executor because its read-only sandbox still permits command execution; use bamboo_runtime or claude_code",
+            spec.identity.role
+        )));
+    }
+
+    if !matches!(spec.placement, Placement::Local) {
+        return Err(AgentError::LLM(format!(
+            "read-only actor role '{}' requires local placement; remote and schedulable resident workers cannot verify this activation's read-only tool boundary",
+            spec.identity.role
+        )));
+    }
+
+    Ok(())
+}
+
 /// Spawns and drives a child session as an independent actor: a `bamboo-subagent` worker process.
 pub struct ActorChildRunner {
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
@@ -520,6 +552,10 @@ pub struct ActorChildRunner {
     max_idle_per_key: usize,
     max_idle_total: usize,
     pool_reaper_started: AtomicBool,
+    /// Monotonic fencing token for concrete worker attempts in this runtime.
+    /// `activation_run_id` fences across runtime restarts; this epoch also
+    /// fences a late first worker when an activation is retried in-place.
+    next_execution_epoch: AtomicU64,
     /// Host-side decision for a child's gated-tool approval request (Phase 2).
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
@@ -662,6 +698,7 @@ impl ActorChildRunner {
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             max_idle_total: DEFAULT_MAX_IDLE_TOTAL,
             pool_reaper_started: AtomicBool::new(false),
+            next_execution_epoch: AtomicU64::new(0),
             approval_decider: None,
             approval_reviewer: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
@@ -776,7 +813,7 @@ impl ActorChildRunner {
         // Codex exec and app-server workers are not interchangeable.
         let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}ro={}\u{1}gro={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
@@ -793,9 +830,11 @@ impl ActorChildRunner {
             // silently model-review instead of asking the human (and vice-versa,
             // reintroducing the 300s-deny). Split the bucket on it.
             caps.no_human_approver,
-            // #71: the read-only Bash checker is baked once at build() from this
-            // flag, so a guardian-reviewer worker must NOT be reused for an
-            // ordinary child (which expects unrestricted Bash), and vice-versa.
+            // The read-only no-shell checker is baked once at build(), so a planner
+            // or Guardian worker must NOT be reused for an ordinary child.
+            caps.read_only,
+            // Preserve the legacy Guardian bit as a distinct fingerprint axis
+            // during rolling upgrades even though both bits enforce read-only.
             caps.guardian_read_only,
         )
     }
@@ -1073,30 +1112,83 @@ impl ActorChildRunner {
             .agent_runtime_state
             .as_ref()
             .is_some_and(|s| s.no_human_approver);
-        // #71: mark a READ-ONLY Guardian reviewer so the worker installs the
-        // read-only Bash allowlist checker. The reviewer is spawned by
-        // `spawn_guardian_review` with `subagent_type == "guardian"` (the SAME
-        // marker the completion coordinator branches on to parse the verdict) AND
-        // the `guardian_read_only_disabled_tools` denylist. Keyed off that role
-        // marker (already read above to set `identity.role`), so it rides the same
-        // session-metadata path the denylist/subagent_type use — no new wire seam.
-        // Without this the worker keeps an UNRESTRICTED Bash, so the reviewer could
-        // still `rm -rf` / `git push` / `curl | sh`, defeating "read-only".
-        spec.capabilities.guardian_read_only =
-            session.metadata.get("subagent_type").map(String::as_str) == Some("guardian");
-        if spec.capabilities.guardian_read_only {
-            if let ExecutorSpec::Codex {
-                permission_profile, ..
-            } = &mut spec.executor
-            {
-                *permission_profile = Some("read-only".to_string());
+        // Read-only authority comes from the child's typed runtime state, never
+        // its cosmetic role label. The sole legacy recovery path additionally
+        // requires the old Guardian role AND its host-owned mutation denylist,
+        // preserving in-flight pre-upgrade reviewers without making a label an
+        // authority boundary.
+        let typed_read_only = session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.read_only);
+        let legacy_guardian_read_only = spec.identity.role == "guardian"
+            && spec.disabled_tools.as_ref().is_some_and(|disabled| {
+                ["Edit", "Write", "SubAgent", "WebFetch"]
+                    .iter()
+                    .all(|name| disabled.iter().any(|disabled_name| disabled_name == *name))
+            });
+        let read_only = typed_read_only || legacy_guardian_read_only;
+        spec.capabilities.read_only = read_only;
+        // Emit the old field for every read-only child. Older workers ignore
+        // `read_only` but understand this bit and will install the strict
+        // no-shell checker, which prevents a rolling upgrade from weakening Plan.
+        spec.capabilities.guardian_read_only = read_only;
+        if spec.capabilities.read_only_enforced() {
+            // Do not even construct nested delegation machinery for a read-only
+            // inspection child; the denylist below remains a second boundary.
+            spec.capabilities.nested_spawn = false;
+            // Treat the capability as the authority boundary, not as a hint
+            // that every caller must remember to pair with a schema filter.
+            // Preserve caller-specific disables while always removing Bamboo's
+            // shell, mutating, persistent, interactive, and delegation surfaces.
+            spec.disabled_tools
+                .get_or_insert_with(Default::default)
+                .extend(crate::runtime::guardian_state::read_only_child_disabled_tools());
+            match &mut spec.executor {
+                ExecutorSpec::ClaudeCode {
+                    permission_mode,
+                    inherit_user_config,
+                    ..
+                } => {
+                    *permission_mode = Some("plan".to_string());
+                    // User config may add MCP tools/hooks outside the provisioned
+                    // surface, so it is never inherited by a read-only child.
+                    *inherit_user_config = Some(false);
+                }
+                ExecutorSpec::Codex {
+                    mode,
+                    sandbox,
+                    inherit_user_config,
+                    approval_policy,
+                    network_access,
+                    allow_danger_bypass,
+                    permission_profile,
+                    ..
+                } => {
+                    *sandbox = Some("read-only".to_string());
+                    *inherit_user_config = Some(false);
+                    // app-server provisioning accepts `on-request`; the typed
+                    // Plan activation maps that to `approvalPolicy=never`.
+                    *approval_policy = Some(
+                        if mode.as_deref() == Some("app_server") {
+                            "on-request"
+                        } else {
+                            "never"
+                        }
+                        .to_string(),
+                    );
+                    *network_access = Some(false);
+                    *allow_danger_bypass = Some(false);
+                    *permission_profile = Some("read-only".to_string());
+                }
+                _ => {}
             }
         }
         let read_only_overlay = session
             .agent_runtime_state
             .as_ref()
             .is_some_and(|state| state.plan_mode.is_some())
-            || spec.capabilities.guardian_read_only
+            || spec.capabilities.read_only_enforced()
             || executor_has_read_only_permission_profile(&spec.executor);
         let permission_resolution = bamboo_domain::resolve_permission_mode_with_read_only(
             requested_permission_mode,
@@ -1268,6 +1360,7 @@ impl ExternalChildRunner for ActorChildRunner {
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
         }
+        ensure_read_only_activation_is_enforceable(&spec)?;
         let pool_key = Self::fingerprint(&spec);
 
         // The recommended provider URL is deliberately parent-loopback. A
@@ -1297,7 +1390,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 .agent_runtime_state
                 .as_ref()
                 .is_some_and(|state| state.plan_mode.is_some())
-                || spec.capabilities.guardian_read_only
+                || spec.capabilities.read_only_enforced()
                 || executor_has_read_only_permission_profile(&spec.executor);
             let resolution = bamboo_domain::resolve_permission_mode_with_read_only(
                 requested_permission_mode,
@@ -1418,6 +1511,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // no spawn fallback, so they never retry.
         let mut attempt = 0u8;
         let (result, actor) = loop {
+            let execution_epoch = self.next_execution_epoch.fetch_add(1, Ordering::Relaxed) + 1;
             let (actor, mut client) = match kind {
                 PlacementKind::Remote => {
                     // REMOTE branch: connect to a resident worker. No spawn, no pool
@@ -1628,6 +1722,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     permission_policy: permission_policy.clone(),
                     messages,
                     activation_run_id: bound_activation_run_id.clone(),
+                    execution_epoch,
                     initial_session_messages,
                     secrets: run_secrets.clone(),
                 }))
@@ -1676,6 +1771,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 expected_permission_posture: expected_permission_posture.clone(),
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
                 activation_run_id: bound_activation_run_id.as_deref(),
+                execution_epoch,
+                expected_source_actor_id: &actor.mailbox_id,
                 initial_inflight_claims,
                 // First-frame watchdog for EVERY placement: a wedged-but-connected
                 // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
@@ -2050,7 +2147,7 @@ async fn claim_canonical_deliveries(
 ) -> crate::runtime::runner::Result<Vec<(SessionInboxClaim, SessionMessageDelivery)>> {
     let claims = binding
         .inbox
-        .claim(&session.id, limit)
+        .claim_for_turn(&session.id, limit, Some(activation_run_id))
         .await
         .map_err(|error| {
             AgentError::LLM(format!(
@@ -2179,6 +2276,8 @@ struct ActorDriveContext<'a> {
     expected_permission_posture: Option<ExpectedPermissionPosture>,
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
     activation_run_id: Option<&'a str>,
+    execution_epoch: u64,
+    expected_source_actor_id: &'a str,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     first_frame_timeout: Option<Duration>,
 }
@@ -2267,6 +2366,160 @@ fn permission_posture_seed_from_event(
     )))
 }
 
+fn validate_actor_event_batch(
+    batch: &ActorEventBatch,
+    logical_session: &Session,
+    parent_session_id: &str,
+    activation_run_id: Option<&str>,
+    execution_epoch: u64,
+    expected_source_actor_id: &str,
+) -> Result<(), AgentError> {
+    batch
+        .validate()
+        .map_err(|error| AgentError::LLM(format!("actor emitted invalid event batch: {error}")))?;
+    let identity = batch.logical_session.as_ref().ok_or_else(|| {
+        AgentError::LLM("actor event batch omitted its logical session identity".to_string())
+    })?;
+    // Fence against the exact canonical identity used to build RunSpec. Some
+    // migrated/test sessions have not yet materialized parent ancestry on the
+    // in-memory Session, so comparing the batch directly with those raw fields
+    // can reject the identity the host itself just dispatched.
+    let expected_identity = LogicalSessionIdentity {
+        session_id: logical_session.id.clone(),
+        parent_session_id: logical_session
+            .parent_session_id
+            .clone()
+            .or_else(|| Some(parent_session_id.to_string())),
+        root_session_id: if logical_session.root_session_id.trim().is_empty() {
+            parent_session_id.to_string()
+        } else {
+            logical_session.root_session_id.clone()
+        },
+    };
+    if identity != &expected_identity {
+        return Err(AgentError::LLM(
+            "actor event batch targets a different logical session".to_string(),
+        ));
+    }
+    if batch.activation_id.as_deref() != activation_run_id {
+        return Err(AgentError::LLM(
+            "actor event batch belongs to a stale activation".to_string(),
+        ));
+    }
+    if batch.execution_epoch != execution_epoch {
+        return Err(AgentError::LLM(
+            "actor event batch belongs to a stale execution epoch".to_string(),
+        ));
+    }
+    if batch
+        .source_actor_id
+        .as_deref()
+        .is_some_and(|source| source != expected_source_actor_id)
+    {
+        return Err(AgentError::LLM(
+            "actor event batch declares a different physical actor".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_actor_event(
+    event: serde_json::Value,
+    strict_permission_events: bool,
+    permission_handshake: &mut PermissionPostureHandshake,
+    expected_permission_posture: Option<&ExpectedPermissionPosture>,
+    session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
+    logical_session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> crate::runtime::runner::Result<()> {
+    let event = match serde_json::from_value::<AgentEvent>(event) {
+        Ok(event) => event,
+        Err(error) if strict_permission_events => {
+            return Err(AgentError::LLM(format!(
+                "actor emitted malformed AgentEvent under a typed permission posture contract: {error}"
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+    if matches!(&event, AgentEvent::PermissionPostureActivated { .. }) {
+        if permission_handshake.posture_was_confirmed() {
+            return Err(AgentError::LLM(
+                "actor emitted a duplicate permission posture activation".to_string(),
+            ));
+        }
+        let seed = permission_posture_seed_from_event(logical_session, &event)
+            .map_err(AgentError::LLM)?
+            .ok_or_else(|| {
+                AgentError::LLM(
+                    "actor permission posture event did not decode as a posture".to_string(),
+                )
+            })?;
+        if let Some(expected) = expected_permission_posture {
+            if seed.policy_revision != expected.policy_revision
+                || seed.resolution != expected.resolution
+            {
+                return Err(AgentError::LLM(
+                    "permission posture event does not match the host-dispatched policy"
+                        .to_string(),
+                ));
+            }
+            if seed.executor_mapping() != expected.executor_mapping {
+                return Err(AgentError::LLM(
+                    "permission posture event does not match the host-dispatched executor mapping"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(binding) = session_inbox_runtime {
+            let saved = binding
+                .persistence
+                .record_permission_posture_activation(
+                    &logical_session.id,
+                    expected_permission_posture
+                        .and_then(|expected| expected.expected_audit_revision),
+                    &seed,
+                )
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "persist child permission posture bootstrap: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    AgentError::LLM(
+                        "persist child permission posture bootstrap: session not found".to_string(),
+                    )
+                })?;
+            let snapshot = bamboo_domain::PermissionAuditSnapshot::from_metadata(&saved.metadata)
+                .ok_or_else(|| {
+                AgentError::LLM(
+                    "persisted child permission posture audit is incomplete".to_string(),
+                )
+            })?;
+            snapshot.write_to(&mut logical_session.metadata);
+        } else {
+            // In-memory/custom actor embeddings still use a host-owned clock.
+            // Durable server paths always take the atomic branch.
+            bamboo_domain::record_permission_audit(&mut logical_session.metadata, &seed, None)
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "record in-memory child permission posture: {error}"
+                    ))
+                })?;
+        }
+        // Confirmation is deliberately last: matching alone is not enough.
+        // The host-owned audit write must succeed first.
+        *permission_handshake = PermissionPostureHandshake::Confirmed;
+    } else if permission_handshake.is_awaiting() {
+        return Err(AgentError::LLM(
+            "actor emitted an execution event before permission posture confirmation".to_string(),
+        ));
+    }
+    let _ = event_tx.send(event).await;
+    Ok(())
+}
+
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
@@ -2295,6 +2548,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         expected_permission_posture,
         session_inbox_runtime,
         activation_run_id,
+        execution_epoch,
+        expected_source_actor_id,
         initial_inflight_claims,
         first_frame_timeout,
     } = context;
@@ -2311,6 +2566,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
+    let mut next_actor_event_seq = 1u64;
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -2353,103 +2609,57 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
-                        // AgentEvent is serialized verbatim on the wire (zero mapping).
-                        let ev = match serde_json::from_value::<AgentEvent>(event) {
-                            Ok(ev) => ev,
-                            Err(error) if strict_permission_events => {
-                                return Err(AgentError::LLM(format!(
-                                    "actor emitted malformed AgentEvent under a typed permission posture contract: {error}"
-                                )));
-                            }
-                            Err(_) => continue,
-                        };
-                        if matches!(&ev, AgentEvent::PermissionPostureActivated { .. }) {
-                            if permission_handshake.posture_was_confirmed() {
-                                return Err(AgentError::LLM(
-                                    "actor emitted a duplicate permission posture activation"
-                                        .to_string(),
-                                ));
-                            }
-                            let seed = permission_posture_seed_from_event(logical_session, &ev)
-                                .map_err(AgentError::LLM)?
-                                .ok_or_else(|| {
-                                    AgentError::LLM(
-                                        "actor permission posture event did not decode as a posture"
-                                            .to_string(),
-                                    )
-                                })?;
-                            if let Some(expected) = expected_permission_posture.as_ref() {
-                                if seed.policy_revision != expected.policy_revision
-                                    || seed.resolution != expected.resolution
-                                {
-                                    return Err(AgentError::LLM(
-                                        "permission posture event does not match the host-dispatched policy"
-                                            .to_string(),
-                                    ));
-                                }
-                                if seed.executor_mapping() != expected.executor_mapping {
-                                    return Err(AgentError::LLM(
-                                        "permission posture event does not match the host-dispatched executor mapping"
-                                            .to_string(),
-                                    ));
-                                }
-                            }
-                            if let Some(binding) = session_inbox_runtime {
-                                let saved = binding
-                                    .persistence
-                                    .record_permission_posture_activation(
-                                        &logical_session.id,
-                                        expected_permission_posture
-                                            .as_ref()
-                                            .and_then(|expected| expected.expected_audit_revision),
-                                        &seed,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        AgentError::LLM(format!(
-                                            "persist child permission posture bootstrap: {error}"
-                                        ))
-                                    })?
-                                    .ok_or_else(|| {
-                                        AgentError::LLM(
-                                            "persist child permission posture bootstrap: session not found"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                let snapshot = bamboo_domain::PermissionAuditSnapshot::from_metadata(
-                                    &saved.metadata,
-                                )
-                                .ok_or_else(|| {
-                                    AgentError::LLM(
-                                        "persisted child permission posture audit is incomplete"
-                                            .to_string(),
-                                    )
-                                })?;
-                                snapshot.write_to(&mut logical_session.metadata);
-                            } else {
-                                // In-memory/custom actor embeddings still use a host-owned
-                                // clock. Durable server paths always take the atomic branch.
-                                bamboo_domain::record_permission_audit(
-                                    &mut logical_session.metadata,
-                                    &seed,
-                                    None,
-                                )
-                                .map_err(|error| {
-                                    AgentError::LLM(format!(
-                                        "record in-memory child permission posture: {error}"
-                                    ))
-                                })?;
-                            }
-                            // Confirmation is deliberately last: matching alone is not
-                            // enough. The host-owned audit write must succeed first.
-                            permission_handshake = PermissionPostureHandshake::Confirmed;
-                        } else if permission_handshake.is_awaiting() {
-                            return Err(AgentError::LLM(
-                                "actor emitted an execution event before permission posture confirmation"
-                                    .to_string(),
-                            ));
+                        // Rolling-upgrade compatibility: old actors have no
+                        // route/sequence metadata, but retain the same typed
+                        // permission handshake and event validation.
+                        process_actor_event(
+                            event,
+                            strict_permission_events,
+                            &mut permission_handshake,
+                            expected_permission_posture.as_ref(),
+                            session_inbox_runtime,
+                            logical_session,
+                            event_tx,
+                        )
+                        .await?;
+                    }
+                    Ok(Some(ChildFrame::EventBatch { batch })) => {
+                        validate_actor_event_batch(
+                            &batch,
+                            logical_session,
+                            parent_session_id,
+                            activation_run_id,
+                            execution_epoch,
+                            expected_source_actor_id,
+                        )?;
+                        if batch.last_seq < next_actor_event_seq {
+                            continue;
                         }
-                        let _ = event_tx.send(ev).await;
+                        if batch.first_seq > next_actor_event_seq {
+                            tracing::warn!(
+                                child_session_id,
+                                expected_seq = next_actor_event_seq,
+                                received_seq = batch.first_seq,
+                                "actor event sequence gap; authoritative session snapshot is required"
+                            );
+                        }
+                        let skip = next_actor_event_seq
+                            .saturating_sub(batch.first_seq)
+                            .min(batch.events.len() as u64) as usize;
+                        for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
+                            let seq = batch.first_seq + offset as u64;
+                            process_actor_event(
+                                event,
+                                strict_permission_events,
+                                &mut permission_handshake,
+                                expected_permission_posture.as_ref(),
+                                session_inbox_runtime,
+                                logical_session,
+                                event_tx,
+                            )
+                            .await?;
+                            next_actor_event_seq = seq.saturating_add(1);
+                        }
                     }
                     Ok(Some(ChildFrame::ApprovalRequest { id, body })) => {
                         if permission_handshake.is_awaiting() {
@@ -3289,6 +3499,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actor_event_batch_is_fenced_by_session_activation_and_epoch() {
+        let session = Session::new_child("logical-child", "logical-parent", "model", "child");
+        let mut batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session.id.clone(),
+                parent_session_id: session.parent_session_id.clone(),
+                root_session_id: session.root_session_id.clone(),
+            }),
+            activation_id: Some("activation-7".into()),
+            execution_epoch: 11,
+            source_node_id: Some("node-a".into()),
+            source_actor_id: Some("worker-a".into()),
+            first_seq: 1,
+            last_seq: 1,
+            qos: bamboo_subagent::ActorEventQos::Ephemeral,
+            events: vec![serde_json::json!({"type":"token","content":"ok"})],
+        };
+        validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap();
+
+        batch.execution_epoch = 10;
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("execution epoch"));
+        batch.execution_epoch = 11;
+        batch.activation_id = Some("replaced-activation".into());
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("stale activation"));
+        batch.activation_id = Some("activation-7".into());
+        batch
+            .logical_session
+            .as_mut()
+            .expect("logical identity")
+            .session_id = "foreign-child".into();
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different logical session"));
+        batch
+            .logical_session
+            .as_mut()
+            .expect("logical identity")
+            .session_id = session.id.clone();
+        batch.source_actor_id = Some("worker-b".into());
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different physical actor"));
+    }
+
     fn completed_actor_frame() -> ChildFrame {
         ChildFrame::Terminal {
             status: TerminalStatus::Completed,
@@ -3334,6 +3633,8 @@ mod tests {
             expected_permission_posture: Some(expected),
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: session_id,
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -3723,6 +4024,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: Some(&binding),
             activation_run_id: Some(run_id),
+            execution_epoch: 0,
+            expected_source_actor_id: session_id,
             initial_inflight_claims: claims,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -4427,8 +4730,17 @@ mod tests {
             "no_human_approver must split"
         );
 
-        // #71: the read-only Bash checker is baked once at build() from this flag,
-        // so a guardian reviewer worker must not be reused for an ordinary child.
+        // The generic read-only no-shell checker is baked once at build(), so a
+        // planner/Guardian worker must not be reused for an ordinary child.
+        let mut read_only = spec_with("explorer", "p", "m", Some("/ws"), None);
+        read_only.capabilities.read_only = true;
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&read_only),
+            "read_only must split"
+        );
+
+        // Preserve the legacy Guardian bit as its own rolling-upgrade axis.
         let mut gro = spec_with("explorer", "p", "m", Some("/ws"), None);
         gro.capabilities.guardian_read_only = true;
         assert_ne!(
@@ -4575,6 +4887,8 @@ mod tests {
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
+                execution_epoch: 0,
+                expected_source_actor_id: "child-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 first_frame_timeout: None,
             }),
@@ -4637,6 +4951,8 @@ mod tests {
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
+                execution_epoch: 0,
+                expected_source_actor_id: "child-no-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 first_frame_timeout: None,
             }),
@@ -4696,6 +5012,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: "child-x",
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_millis(100)),
         })
@@ -4733,6 +5051,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: "child-y",
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_millis(50)),
         })
@@ -4975,6 +5295,363 @@ mod tests {
         assert!(spec.secrets.worker_auth_token.is_none());
     }
 
+    #[test]
+    fn typed_child_state_is_the_read_only_authority_under_auto_and_bypass() {
+        for mode in [
+            bamboo_domain::SessionPermissionMode::Auto,
+            bamboo_domain::SessionPermissionMode::Bypass,
+        ] {
+            let runner = bogus_runner(HashMap::new());
+            let mut child = session_of_role("planner", "inspect and plan");
+            let runtime = child
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+            runtime.set_permission_mode(mode);
+            runtime.read_only = true;
+
+            let spec = runner.build_spec(&child, &job_for("read-only-child"));
+
+            assert!(spec.capabilities.read_only);
+            assert!(spec.capabilities.read_only_enforced());
+            assert!(
+                spec.capabilities.guardian_read_only,
+                "the compatibility alias must protect planners on older workers"
+            );
+            assert_eq!(spec.capabilities.permission_requested_mode, mode.as_str());
+            assert_eq!(spec.capabilities.permission_effective_mode, "plan");
+            assert!(
+                !spec.capabilities.bypass,
+                "read-only must win over requested {mode:?}"
+            );
+            assert_eq!(
+                spec.capabilities.auto_approve_permissions,
+                mode == bamboo_domain::SessionPermissionMode::Auto,
+                "Auto may suppress prompts but must not widen Plan authorization"
+            );
+            let disabled = spec
+                .disabled_tools
+                .as_ref()
+                .expect("read-only state must provision a host-owned denylist");
+            for tool_name in [
+                "Edit",
+                "Write",
+                "Plan",
+                "SubAgent",
+                "session_control",
+                "request_permissions",
+            ] {
+                assert!(
+                    disabled.iter().any(|name| name == tool_name),
+                    "read-only provisioning must disable {tool_name}"
+                );
+            }
+        }
+
+        let runner = bogus_runner(HashMap::new());
+        let cosmetic_planner = runner.build_spec(
+            &session_of_role("planner", "label only"),
+            &job_for("cosmetic"),
+        );
+        assert!(
+            !cosmetic_planner.capabilities.read_only_enforced(),
+            "a cosmetic role label must not change authority"
+        );
+        assert!(cosmetic_planner.disabled_tools.is_none());
+
+        let cosmetic_guardian = runner.build_spec(
+            &session_of_role("guardian", "label only"),
+            &job_for("cosmetic-guardian"),
+        );
+        assert!(
+            !cosmetic_guardian.capabilities.read_only_enforced(),
+            "a Guardian label without typed state or the legacy denylist is cosmetic"
+        );
+
+        let legacy_guardian = session_of_role("guardian", "pre-upgrade reviewer");
+        let mut legacy_job = job_for("legacy-guardian");
+        legacy_job.disabled_tools = Some(vec![
+            "Edit".to_string(),
+            "Write".to_string(),
+            "SubAgent".to_string(),
+            "WebFetch".to_string(),
+        ]);
+        let legacy_spec = runner.build_spec(&legacy_guardian, &legacy_job);
+        assert!(
+            legacy_spec.capabilities.read_only_enforced(),
+            "an in-flight pre-upgrade Guardian keeps its read-only authority"
+        );
+
+        let mut differently_named = session_of_role("explorer", "typed authority");
+        differently_named
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .read_only = true;
+        let typed = runner.build_spec(&differently_named, &job_for("typed"));
+        assert!(
+            typed.capabilities.read_only_enforced(),
+            "typed state must enforce read-only independently of role"
+        );
+    }
+
+    #[test]
+    fn typed_read_only_forces_native_external_executor_profiles() {
+        let mut planner = session_of_role("planner", "inspect and plan");
+        planner
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .read_only = true;
+
+        let claude_runner = ActorChildRunner::new(
+            "test-actor".into(),
+            PathBuf::from("/bin/false"),
+            vec![],
+            std::env::temp_dir().join("bamboo-test-plan-claude"),
+            ExecutorSpec::ClaudeCode {
+                binary: None,
+                model: None,
+                permission_mode: Some("bypassPermissions".to_string()),
+                inherit_user_config: Some(true),
+                forward_env: None,
+            },
+            vec![],
+            "anthropic".into(),
+            4,
+        );
+        let claude_spec = claude_runner.build_spec(&planner, &job_for("planner-claude"));
+        let disabled = claude_spec
+            .disabled_tools
+            .as_ref()
+            .expect("typed read-only child must receive a host-owned denylist");
+        for tool in ["Bash", "BashInput", "BashOutput", "KillShell"] {
+            assert!(
+                disabled.iter().any(|name| name == tool),
+                "typed read-only child must not advertise {tool}"
+            );
+        }
+        assert!(matches!(
+            claude_spec.executor,
+            ExecutorSpec::ClaudeCode {
+                permission_mode: Some(ref mode),
+                inherit_user_config: Some(false),
+                ..
+            } if mode == "plan"
+        ));
+        assert_eq!(claude_spec.capabilities.permission_effective_mode, "plan");
+
+        let mut codex_exec = codex_executor(Some("inherit"), Some(true));
+        if let ExecutorSpec::Codex {
+            sandbox,
+            approval_policy,
+            network_access,
+            allow_danger_bypass,
+            permission_profile,
+            ..
+        } = &mut codex_exec
+        {
+            *sandbox = Some("danger-full-access".to_string());
+            *approval_policy = Some("on-failure".to_string());
+            *network_access = Some(true);
+            *allow_danger_bypass = Some(true);
+            *permission_profile = Some("full-access".to_string());
+        }
+        let codex_runner = ActorChildRunner::new(
+            "test-actor".into(),
+            PathBuf::from("/bin/false"),
+            vec![],
+            std::env::temp_dir().join("bamboo-test-plan-codex"),
+            codex_exec,
+            vec![],
+            "openai".into(),
+            4,
+        );
+        let codex_spec = codex_runner.build_spec(&planner, &job_for("planner-codex"));
+        assert_eq!(
+            expected_permission_executor_mapping(
+                &codex_spec.executor,
+                codex_spec.capabilities.permission_resolution().unwrap(),
+                false,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("codex_exec:approval_policy=never")
+        );
+        assert!(matches!(
+            codex_spec.executor,
+            ExecutorSpec::Codex {
+                sandbox: Some(ref sandbox),
+                inherit_user_config: Some(false),
+                approval_policy: Some(ref approval_policy),
+                network_access: Some(false),
+                allow_danger_bypass: Some(false),
+                permission_profile: Some(ref profile),
+                ..
+            } if sandbox == "read-only"
+                && approval_policy == "never"
+                && profile == "read-only"
+        ));
+
+        let mut app_server = codex_executor(Some("inherit"), Some(true));
+        if let ExecutorSpec::Codex {
+            mode,
+            sandbox,
+            approval_policy,
+            network_access,
+            allow_danger_bypass,
+            permission_profile,
+            ..
+        } = &mut app_server
+        {
+            *mode = Some("app_server".to_string());
+            *sandbox = Some("danger-full-access".to_string());
+            *approval_policy = Some("on-request".to_string());
+            *network_access = Some(true);
+            *allow_danger_bypass = Some(true);
+            *permission_profile = Some("full-access".to_string());
+        }
+        let app_server_runner = ActorChildRunner::new(
+            "test-actor".into(),
+            PathBuf::from("/bin/false"),
+            vec![],
+            std::env::temp_dir().join("bamboo-test-plan-codex-app-server"),
+            app_server,
+            vec![],
+            "openai".into(),
+            4,
+        );
+        let app_server_spec =
+            app_server_runner.build_spec(&planner, &job_for("planner-codex-app-server"));
+        assert_eq!(
+            expected_permission_executor_mapping(
+                &app_server_spec.executor,
+                app_server_spec
+                    .capabilities
+                    .permission_resolution()
+                    .unwrap(),
+                false,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("codex_app_server:approvalPolicy=never")
+        );
+        assert!(matches!(
+            app_server_spec.executor,
+            ExecutorSpec::Codex {
+                mode: Some(ref mode),
+                sandbox: Some(ref sandbox),
+                inherit_user_config: Some(false),
+                approval_policy: Some(ref approval_policy),
+                network_access: Some(false),
+                allow_danger_bypass: Some(false),
+                permission_profile: Some(ref profile),
+                ..
+            } if mode == "app_server"
+                && sandbox == "read-only"
+                && approval_policy == "on-request"
+                && profile == "read-only"
+        ));
+    }
+
+    #[test]
+    fn typed_read_only_rejects_both_codex_executor_modes() {
+        let mut planner = session_of_role("planner", "inspect and plan");
+        planner
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .read_only = true;
+
+        for mode in ["exec", "app_server"] {
+            let mut executor = codex_executor(Some("inherit"), Some(true));
+            if let ExecutorSpec::Codex {
+                mode: configured_mode,
+                ..
+            } = &mut executor
+            {
+                *configured_mode = Some(mode.to_string());
+            }
+            let runner = ActorChildRunner::new(
+                "test-actor".into(),
+                PathBuf::from("/bin/false"),
+                vec![],
+                std::env::temp_dir().join(format!("bamboo-test-plan-codex-{mode}")),
+                executor,
+                vec![],
+                "openai".into(),
+                4,
+            );
+            let spec = runner.build_spec(&planner, &job_for(&format!("planner-codex-{mode}")));
+            let error = ensure_read_only_activation_is_enforceable(&spec)
+                .expect_err("Codex command execution must fail closed for read-only activations");
+            let message = error.to_string();
+            assert!(message.contains("Codex executor"), "{message}");
+            assert!(message.contains("command execution"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_read_only_codex_fails_before_worker_spawn_or_dispatch() {
+        let mut planner = session_of_role("planner", "inspect and plan");
+        planner
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .read_only = true;
+
+        let runner = ActorChildRunner::new(
+            "test-actor".into(),
+            PathBuf::from("/bin/false"),
+            vec![],
+            std::env::temp_dir().join("bamboo-test-plan-codex-no-spawn"),
+            codex_executor(Some("inherit"), Some(true)),
+            vec![],
+            "openai".into(),
+            4,
+        );
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+        let error = runner
+            .execute_external_child(
+                &mut planner,
+                &job_for("planner-codex-no-spawn"),
+                event_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("typed read-only Codex must fail before invoking /bin/false");
+        let message = error.to_string();
+        assert!(message.contains("Codex executor"), "{message}");
+        assert!(message.contains("command execution"), "{message}");
+    }
+
+    #[test]
+    fn typed_read_only_rejects_resident_actor_placements() {
+        let runner = bogus_runner(HashMap::new());
+        let mut planner = session_of_role("planner", "inspect and plan");
+        planner
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .read_only = true;
+
+        for placement in [
+            Placement::Remote {
+                endpoint: "wss://resident.example/actor".to_string(),
+            },
+            Placement::Schedulable {
+                pool: "resident-pool".to_string(),
+            },
+        ] {
+            let mut spec = runner.build_spec(&planner, &job_for("read-only-resident"));
+            spec.placement = placement;
+
+            let error = ensure_read_only_activation_is_enforceable(&spec)
+                .expect_err("resident placement must fail closed for read-only activation");
+            let message = error.to_string();
+            assert!(message.contains("requires local placement"), "{message}");
+            assert!(message.contains("read-only tool boundary"), "{message}");
+        }
+
+        let local = runner.build_spec(&planner, &job_for("read-only-local"));
+        ensure_read_only_activation_is_enforceable(&local)
+            .expect("a locally provisioned read-only worker is enforceable");
+    }
+
     #[tokio::test]
     async fn build_spec_preserves_exact_inherited_permission_mode_for_child_worker() {
         // Exercise the real creation path instead of pre-seeding the child by
@@ -5007,6 +5684,7 @@ mod tests {
                     model_override: None,
                     model_ref_override: None,
                     runtime_metadata: HashMap::new(),
+                    read_only: false,
                     auto_run: false,
                     reasoning_effort: None,
                     lifecycle: None,
@@ -5074,6 +5752,7 @@ mod tests {
                     model_override: None,
                     model_ref_override: None,
                     runtime_metadata: HashMap::new(),
+                    read_only: false,
                     auto_run: false,
                     reasoning_effort: None,
                     lifecycle: lifecycle.map(str::to_string),

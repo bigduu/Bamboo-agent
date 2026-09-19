@@ -104,6 +104,24 @@ pub trait ToolExecutor: Send + Sync {
             .map(ToolOutcome::Completed)
     }
 
+    /// Execute a call through an already-selected exact owner.
+    ///
+    /// `execution_name` is the complete, case-sensitive identity returned by
+    /// the shared reference resolver. The original `call` is retained so a
+    /// concrete executor can apply compatibility argument handling based on the
+    /// caller's spelling without re-running ownership selection. The default
+    /// rewrites only the function name and delegates to the outcome-aware path.
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome> {
+        let mut exact_call = call.clone();
+        exact_call.function.name = execution_name.to_string();
+        self.execute_with_context_outcome(&exact_call, ctx).await
+    }
+
     /// Permission gate for a tool call, exposed on the executor trait so the
     /// check is part of the executor *chain*.
     ///
@@ -137,10 +155,69 @@ pub trait ToolExecutor: Send + Sync {
         Ok(None)
     }
 
+    /// Permission gate for an already-selected exact owner identity.
+    ///
+    /// Routing wrappers must use this seam after ownership resolution instead
+    /// of handing the original reference back to
+    /// [`check_permissions_for`](Self::check_permissions_for), where a concrete
+    /// executor may resolve it differently. The default preserves compatibility
+    /// by pinning only the function name and delegating to the existing gate;
+    /// argument bytes and the caller's pre-parsed context remain unchanged.
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>> {
+        let mut exact_call = call.clone();
+        exact_call.function.name = execution_name.to_string();
+        self.check_permissions_for(&exact_call, ctx).await
+    }
+
+    /// Permission gate for a call whose exact execution identity and effective
+    /// arguments have already been resolved by a wrapping executor.
+    ///
+    /// Routing wrappers use this seam after selecting an exact owner so the
+    /// permission layer observes the same identity and arguments that the tool
+    /// will receive. The default rebuilds both the call and its pre-parsed-args
+    /// context before delegating to
+    /// [`check_permissions_for`](Self::check_permissions_for), preserving source
+    /// compatibility for executors without a specialized permission layer.
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>> {
+        let mut resolved_call = call.clone();
+        resolved_call.function.name = execution_name.to_string();
+        resolved_call.function.arguments = args.to_string();
+        let resolved_ctx = ToolExecutionContext {
+            pre_parsed_args: Some(args),
+            ..*ctx
+        };
+        self.check_permissions_for(&resolved_call, &resolved_ctx)
+            .await
+    }
+
     /// Lists all available tools and their schemas
     ///
     /// Returns schemas for all tools that can be executed via this executor
     fn list_tools(&self) -> Vec<ToolSchema>;
+
+    /// Returns whether this executor owns `tool_name` as a complete, exact,
+    /// case-sensitive execution identity.
+    ///
+    /// This deliberately performs no namespace stripping or alias resolution.
+    /// Wrappers use it to select an owner before applying compatibility
+    /// fallbacks. Registry/index-backed production executors should override the
+    /// source-compatible default to avoid cloning parameter schemas per query.
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        self.list_tools()
+            .iter()
+            .any(|schema| schema.function.name == tool_name)
+    }
 
     /// Server-level usage guidance to surface in the system prompt for whatever
     /// this executor currently exposes — e.g. the `instructions` an MCP server
@@ -430,5 +507,91 @@ mod tests {
             .expect("composition execution should succeed");
 
         assert_eq!(result.result, "from-composition");
+    }
+
+    struct PermissionArgsExecutor {
+        seen: Arc<std::sync::Mutex<Option<(String, serde_json::Value, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PermissionArgsExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult> {
+            Err(ToolError::NotFound(call.function.name.clone()))
+        }
+
+        async fn check_permissions_for(
+            &self,
+            call: &ToolCall,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>> {
+            let call_args = serde_json::from_str(&call.function.arguments).expect("call args JSON");
+            let pre_parsed_args = ctx
+                .pre_parsed_args
+                .cloned()
+                .expect("resolved args must be threaded through context");
+            *self.seen.lock().unwrap() =
+                Some((call.function.name.clone(), call_args, pre_parsed_args));
+            Ok(None)
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_resolved_permission_seam_replaces_call_and_pre_parsed_args() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(PermissionArgsExecutor { seen: seen.clone() });
+        let mut call = make_tool_call("default::apply_patch");
+        call.function.arguments = json!({"path": "original"}).to_string();
+        let original_args = json!({"path": "original"});
+        let effective_args = json!({"file_path": "effective"});
+        let ctx = ToolExecutionContext {
+            pre_parsed_args: Some(&original_args),
+            ..ToolExecutionContext::none(&call.id)
+        };
+
+        executor
+            .check_permissions_for_resolved(&call, "Edit", &effective_args, &ctx)
+            .await
+            .expect("resolved permission check");
+
+        let recorded = seen.lock().unwrap().clone().expect("permission record");
+        assert_eq!(recorded.0, "Edit");
+        assert_eq!(recorded.1, effective_args);
+        assert_eq!(recorded.2, effective_args);
+        assert_eq!(call.function.name, "default::apply_patch");
+        assert_eq!(call.function.arguments, original_args.to_string());
+    }
+
+    #[tokio::test]
+    async fn default_exact_permission_seam_pins_only_the_selected_identity() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(PermissionArgsExecutor { seen: seen.clone() });
+        let mut call = make_tool_call("default::custom_tool");
+        call.function.arguments = json!({"path": "original"}).to_string();
+        let original_args = json!({"path": "from-context"});
+        let ctx = ToolExecutionContext {
+            pre_parsed_args: Some(&original_args),
+            ..ToolExecutionContext::none(&call.id)
+        };
+
+        executor
+            .check_permissions_for_exact(&call, "custom_tool", &ctx)
+            .await
+            .expect("exact permission check");
+
+        let recorded = seen.lock().unwrap().clone().expect("permission record");
+        assert_eq!(recorded.0, "custom_tool");
+        assert_eq!(recorded.1, json!({"path": "original"}));
+        assert_eq!(recorded.2, original_args);
+        assert_eq!(call.function.name, "default::custom_tool");
+        assert_eq!(
+            call.function.arguments,
+            json!({"path": "original"}).to_string()
+        );
     }
 }

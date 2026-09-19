@@ -38,13 +38,14 @@ fn spec(assignment: &str, messages: Vec<serde_json::Value>) -> RunSpec {
         permission_policy: None,
         messages,
         activation_run_id: None,
+        execution_epoch: 0,
         initial_session_messages: Vec::new(),
         secrets: Default::default(),
     }
 }
 
 async fn drain_events(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
     let mut all = Vec::new();
     while let Some(ev) = rx.recv().await {

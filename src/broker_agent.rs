@@ -111,7 +111,7 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
 
     // #48: an explicit CA cert to trust for a self-signed `wss://` broker,
     // instead of the OS native root store. Built once and shared (as an `Arc`)
-    // across the worker's own connection and every per-Run reconnect.
+    // across the worker's inbound subscription and fixed control/event uplinks.
     let tls_config = match &args.tls_ca_cert {
         Some(path) => Some(Arc::new(
             bamboo_broker::client_config_trusting_cert(std::path::Path::new(path))
@@ -185,7 +185,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                     inherit_user_config.unwrap_or(false),
                     forward_env.clone().unwrap_or_default(),
                 )
-                .with_provisioned_permission_resolution(provisioned_permission),
+                .with_provisioned_permission_resolution(provisioned_permission)
+                .with_provisioned_tool_policy(
+                    spec.disabled_tools.clone().unwrap_or_default(),
+                    spec.capabilities.read_only_enforced(),
+                ),
             ),
             ExecutorSpec::Codex {
                 ref binary,

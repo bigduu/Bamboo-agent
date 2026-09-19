@@ -38,7 +38,7 @@ fn mcp_scope() -> impl HttpServiceFactory {
 /// registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
 /// the same `enforce_access_password_middleware` wrap as every other
 /// mutating route here — no new auth was added).
-fn plugin_scope() -> impl HttpServiceFactory {
+pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
@@ -84,6 +84,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .wrap(actix_web::middleware::from_fn(
             settings::enforce_access_password_middleware,
         ))
+        .route("/bootstrap", web::get().to(agent::bootstrap::handler))
         .route("/chat", web::post().to(agent::chat::handler))
         .route(
             "/prompt-presets",
@@ -110,6 +111,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/subagents/snapshot",
             web::get().to(agent::subagent_snapshot::handler),
         )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::get().to(agent::guidance::list),
+        )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::post().to(agent::guidance::send),
+        )
+        .route(
+            "/sessions/{session_id}/guidance/{message_id}",
+            web::delete().to(agent::guidance::cancel),
+        )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
         .route(
@@ -121,14 +134,6 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/projects/migrations/legacy/dry-run",
             web::post().to(agent::projects::legacy_dry_run),
-        )
-        .route(
-            "/projects/{project_id}/migrations/legacy-memory",
-            web::post().to(agent::projects::migrate_legacy_memory),
-        )
-        .route(
-            "/projects/{project_id}/migrations/legacy-memory",
-            web::get().to(agent::projects::legacy_memory_migration_status),
         )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))

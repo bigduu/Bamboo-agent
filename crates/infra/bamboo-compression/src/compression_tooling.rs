@@ -1248,6 +1248,17 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         .as_ref()
         .map(|u| u.max_context_tokens)
         .unwrap_or(0);
+    let previous_cache_read_input_tokens = previous_usage
+        .as_ref()
+        .map(|u| u.cache_read_input_tokens)
+        .unwrap_or(0);
+    let previous_provider_prompt_usage = previous_usage
+        .as_ref()
+        .and_then(|u| u.provider_prompt_usage)
+        .map(|mut usage| {
+            usage.retained_from_previous_call = true;
+            usage
+        });
     session.token_usage = Some(bamboo_domain::TokenBudgetUsage {
         system_tokens,
         summary_tokens: new_summary_tokens,
@@ -1260,7 +1271,8 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: previous_cache_read_input_tokens,
+        provider_prompt_usage: previous_provider_prompt_usage,
     });
 
     session.reset_model_context_epoch(ModelContextResetReason::Compression);
@@ -1378,8 +1390,12 @@ pub fn build_summary_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall};
-    use bamboo_domain::{ModelContextResetReason, ModelContextState, TokenBudgetUsage};
+    use bamboo_domain::{
+        CompressionEventKind, FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall,
+    };
+    use bamboo_domain::{
+        ModelContextResetReason, ModelContextState, ProviderPromptUsage, TokenBudgetUsage,
+    };
     use chrono::Utc;
 
     fn make_budget() -> TokenBudget {
@@ -1622,6 +1638,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 0,
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_prompt_usage: None,
         });
 
         let exposure = estimate_context_compression_exposure(
@@ -1842,7 +1859,7 @@ mod tests {
             },
         }]);
         session.add_message(call);
-        let mut result = Message::tool_result("tc-gen", &"search result payload ".repeat(20));
+        let mut result = Message::tool_result("tc-gen", "search result payload ".repeat(20));
         result.tool_success = Some(true);
         session.add_message(result);
 
@@ -2135,8 +2152,37 @@ mod tests {
 
         assert!(!plan.compressed_message_ids.is_empty());
 
+        session.token_usage = Some(TokenBudgetUsage {
+            system_tokens: 10,
+            summary_tokens: 0,
+            window_tokens: 90,
+            total_tokens: 100,
+            max_context_tokens: 1200,
+            budget_limit: 1100,
+            truncation_occurred: false,
+            segments_removed: 0,
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+            thinking_tokens: 0,
+            cache_read_input_tokens: 80,
+            provider_prompt_usage: Some(ProviderPromptUsage {
+                input_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 80,
+                retained_from_previous_call: false,
+            }),
+        });
+
         let compressed_count = apply_compression_plan(&mut session, plan);
         assert!(compressed_count > 0);
+        assert_eq!(
+            session
+                .compression_events
+                .last()
+                .expect("summary compression event")
+                .kind,
+            CompressionEventKind::Summary
+        );
 
         // Verify recovery message was injected
         let has_recovery = session.messages.iter().any(|m| {
@@ -2148,6 +2194,21 @@ mod tests {
             has_recovery,
             "session should contain a post-compaction recovery message with the file path"
         );
+        let retained_provider_usage = session
+            .token_usage
+            .as_ref()
+            .and_then(|usage| usage.provider_prompt_usage)
+            .expect("compression should retain the last provider usage");
+        assert_eq!(
+            session
+                .token_usage
+                .as_ref()
+                .unwrap()
+                .cache_read_input_tokens,
+            80
+        );
+        assert_eq!(retained_provider_usage.cache_read_input_tokens, 80);
+        assert!(retained_provider_usage.retained_from_previous_call);
         let state = session
             .model_context_state
             .as_ref()

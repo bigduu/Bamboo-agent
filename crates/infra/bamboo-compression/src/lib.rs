@@ -17,6 +17,7 @@ pub mod compression_tooling;
 pub mod counter;
 pub mod limits;
 pub mod preparation;
+pub mod retrieval_window;
 pub mod segmenter;
 pub mod summarizer;
 pub mod types;
@@ -32,11 +33,22 @@ pub use compression_tooling::{
     CompressionCandidatePlan, CompressionPlan, CompressionPlanError, ContextCompressionExposure,
     DEFAULT_SUMMARY_TARGET_RATIO,
 };
-pub use counter::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
+pub use counter::{
+    HeuristicTokenCounter, ProviderVisibleToolEstimate, TiktokenTokenCounter, TokenCounter,
+};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
 pub use preparation::{
     estimate_prompt_cache_savings, estimate_prompt_cache_savings_with_fixed_tokens,
     prepare_hybrid_context, prepare_hybrid_context_with_fixed_tokens,
+};
+pub use retrieval_window::{
+    apply_retrieval_window_plan, apply_retrieval_window_plan_with_trigger,
+    build_retrieval_window_candidate_plan, build_retrieval_window_candidate_plan_with_fixed_tokens,
+    build_retrieval_window_candidate_plan_with_token_accounting,
+    build_retrieval_window_critical_overflow_plan_with_token_accounting,
+    effective_retrieval_window_target_tokens, RetrievalWindowApplyError,
+    RetrievalWindowApplyResult, RetrievalWindowCandidatePlan, RetrievalWindowPlanError,
+    RetrievalWindowPolicy, RetrievalWindowTokenAccounting,
 };
 pub use segmenter::MessageSegmenter;
 pub use summarizer::{HeuristicSummarizer, Summarizer, SummaryManager, SummaryTrigger};

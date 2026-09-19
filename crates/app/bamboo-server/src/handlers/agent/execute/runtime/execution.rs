@@ -44,6 +44,7 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) disabled_tools: BTreeSet<String>,
     pub(crate) disabled_skill_ids: BTreeSet<String>,
     pub(crate) mpsc_tx: mpsc::Sender<bamboo_agent_core::AgentEvent>,
+    pub(crate) history_commit_barrier: bamboo_engine::execution::HistoryCommitBarrier,
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
     pub(crate) gold_config: Option<GoldConfig>,
     pub(crate) app_data_dir: Option<std::path::PathBuf>,
@@ -145,7 +146,10 @@ pub(crate) fn make_disabled_filter_resolver(
     Arc::new(move || {
         let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
         (
-            config_snapshot.disabled_tool_names().into_iter().collect(),
+            config_snapshot
+                .disabled_tool_references()
+                .into_iter()
+                .collect(),
             config_snapshot.disabled_skill_ids().into_iter().collect(),
         )
     })
@@ -210,6 +214,7 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
         selected_skill_ids,
         selected_skill_mode,
         mpsc_tx: args.mpsc_tx,
+        history_commit_barrier: args.history_commit_barrier,
         image_fallback: args.image_fallback,
         gold_config: args.gold_config,
         // The guardian reviewer spawner is always available; the terminal gate

@@ -32,8 +32,9 @@ pub struct TaskLoopContext {
     /// Current round number
     pub current_round: u32,
 
-    /// Maximum rounds allowed
-    pub max_rounds: u32,
+    /// Round cap for this run, `None` = unlimited. Mirrors
+    /// `RunBudgetConfig::max_rounds`.
+    pub max_rounds: Option<u32>,
 
     /// Creation timestamp
     pub created_at: DateTime<Utc>,

@@ -16,6 +16,7 @@
 pub mod agent_spawn;
 pub mod child_completion;
 pub mod event_forwarder;
+pub mod event_publication;
 pub mod runner_lifecycle;
 pub mod runner_state;
 pub mod session_events;
@@ -27,7 +28,10 @@ pub use agent_spawn::{
     SessionExecutionReservation, SessionExecutionReserveOutcome,
 };
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
-pub use event_forwarder::{create_event_forwarder, AccountFeedInbox};
+pub use event_forwarder::{
+    create_event_forwarder, create_event_forwarder_with_history_commit_barrier,
+    history_commit_barrier, AccountFeedInbox, HistoryCommitAcknowledger, HistoryCommitBarrier,
+};
 pub use runner_lifecycle::{
     finalize_runner, finalize_runner_exact, reserve_runner_core, status_from_execution_result,
     try_reserve_runner, ReserveOutcome, RunnerReservation,

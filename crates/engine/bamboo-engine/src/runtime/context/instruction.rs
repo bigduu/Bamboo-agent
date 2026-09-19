@@ -23,21 +23,24 @@ fn read_trimmed_file(path: &Path) -> Option<String> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            tracing::warn!("Failed to inspect instruction file {:?}: {}", path, error);
+            tracing::warn!(
+                error_kind = ?error.kind(),
+                "failed to inspect workspace instruction file"
+            );
             return None;
         }
     };
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        tracing::warn!(
-            "Ignoring non-regular or symlinked instruction file: {:?}",
-            path
-        );
+        tracing::warn!("ignoring non-regular or symlinked workspace instruction file");
         return None;
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            tracing::warn!("Failed to read instruction file {:?}: {}", path, error);
+            tracing::warn!(
+                error_kind = ?error.kind(),
+                "failed to read workspace instruction file"
+            );
             return None;
         }
     };
@@ -128,14 +131,33 @@ pub fn build_instruction_prompt_context(workspace_path: &str) -> Option<String> 
         "Repository instruction layer loaded from workspace policy files. Treat these as authoritative project guardrails and follow them in addition to the base system prompt. When a request in this conversation conflicts with them, the repository policy takes precedence: do not override it just because the user asks in passing — surface the conflict and keep following the policy unless the user explicitly and knowingly directs you to override a specific rule. Only the base system prompt and higher-priority system/developer/safety directives outrank these files.".to_string(),
     );
 
+    // Provider-visible source identities are workspace-relative. Absolute host
+    // paths belong only to the dedicated Workspace block and must not be
+    // duplicated by the instruction overlay.
+    let source_root = files
+        .first()
+        .and_then(|file| file.path.parent())
+        .map(Path::to_path_buf);
     for file in files {
+        let source = source_root
+            .as_deref()
+            .and_then(|root| file.path.strip_prefix(root).ok())
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .unwrap_or_else(|| {
+                Path::new(
+                    file.path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("INSTRUCTION.md"),
+                )
+            });
         sections.push(format!(
             "## {}\nSource: {}\n\n{}",
             file.path
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("INSTRUCTION.md"),
-            file.display_path,
+            paths::path_to_display_string(source),
             file.content
         ));
     }

@@ -17,7 +17,7 @@
 //! them through a shared helper, or one path silently drifts (see the locking
 //! tests, which fail loudly if the two positions are ever unified).
 
-use bamboo_domain::{Message, PromptBlock};
+use bamboo_domain::{Message, PromptBlock, ProviderProtocol, ProviderTranscriptGroup};
 
 use crate::cache::PromptCachePlan;
 
@@ -36,6 +36,10 @@ pub struct PromptIR {
     /// The lowering methods (not the Vec order) impose the canonical
     /// concatenation order per view.
     pub segments: Vec<Segment>,
+    /// Provider-owned discovery items kept separate from normalized messages.
+    /// Adapters must select only their protocol and insert each atomic group at
+    /// its ordinary-message anchor.
+    pub provider_transcript_groups: Vec<ProviderTranscriptGroup>,
     /// Cross-cutting cache plan — the SOLE authority for breakpoint placement.
     pub cache: PromptCachePlan,
     /// `Some` → stateful Responses continuation (send only the delta with
@@ -211,6 +215,12 @@ impl PromptIR {
     ) -> crate::provider::ResponsesRequestOptions {
         let mut options = base.cloned().unwrap_or_default();
         options.input_messages = Some(self.responses_input());
+        options.provider_transcript_groups = self
+            .provider_transcript_groups
+            .iter()
+            .filter(|group| group.protocol() == ProviderProtocol::OpenAiResponsesV1)
+            .cloned()
+            .collect();
         let system = self.system_field();
         let trimmed = system.trim();
         options.instructions = (!trimmed.is_empty()).then(|| trimmed.to_string());

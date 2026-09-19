@@ -17,7 +17,9 @@ where
 
     while let Some(chunk) = stream.next().await {
         match chunk? {
-            LLMChunk::ResponseId(_) | LLMChunk::ResponsesEvent { .. } => {}
+            LLMChunk::ResponseId(_)
+            | LLMChunk::ResponsesEvent { .. }
+            | LLMChunk::ProviderTranscriptItem(_) => {}
             LLMChunk::Token(token) => collected.full_content.push_str(&token),
             LLMChunk::ReasoningToken(_) => {}
             LLMChunk::Done => break,

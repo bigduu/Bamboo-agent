@@ -6,7 +6,7 @@
 
 ### The local-first AI agent runtime, in Rust.
 
-**Persistent memory, 22 built-in tools, skills, MCP, workflows & schedules — behind one HTTP + SSE API.**
+**Persistent memory, 22 built-in tools, skills, MCP, workflows & schedules — behind HTTP + WebSocket + SSE APIs.**
 Run it as a server, or embed the same agent loop as a Rust crate. Your data stays on your machine.
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
@@ -31,13 +31,13 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 
 | Capability | What it does |
 |---|---|
-| 🧠 **Memory system** | Session notes, Dream notebook, cross-session durable memory, with auto-dream and background gardener |
+| 🧠 **Memory system** | Session notes, Jiandu-owned derived Dream snapshots, and cross-session durable memory, with auto-dream and background gardener |
 | 🗜️ **Context compression** | Hybrid compression with rolling summary + recent-window retention, automatic trimming of oversized tool output, executed against the model's context-window budget |
 | 🛠️ **Built-in tools** | 22 built-in tools: files, search, Shell, Web, plan mode, tasks, permission requests, and more |
 | 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in docx / pdf / pptx / xlsx / skill-creator |
 | 🔌 **MCP** | Model Context Protocol client that hooks into external tool servers |
 | ⏰ **Workflows & schedules** | Declarative workflow loading + a cron-style schedule trigger engine |
-| 🌐 **HTTP / SSE** | Actix server, REST API, Server-Sent Events streaming, compatible with OpenAI / Anthropic / Gemini endpoints |
+| 🌐 **HTTP / WebSocket / SSE** | Actix server, REST API, shared `/v2/stream` WebSocket, legacy SSE feeds, and OpenAI / Anthropic / Gemini-compatible endpoints |
 | 🏗️ **Multi-provider** | anthropic (default), openai, gemini, copilot, bodhi routing |
 
 ---
@@ -48,7 +48,7 @@ Bamboo is a Cargo **workspace**: a thin root binary (`bamboo-agent`, which expos
 
 ```mermaid
 graph TD
-  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows]
+  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + WebSocket + SSE, routes, schedules, workflows]
   SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, metrics]
   ENG --> CORE[bamboo-agent-core<br/>core abstractions]
   CORE --> DOM[bamboo-domain<br/>pure domain types]
@@ -75,23 +75,50 @@ graph TD
 
 …plus the root `bamboo-agent` binary.
 
-**Place in the Zenith stack:** lotus (the React UI) and bamboo communicate over **HTTP**; bodhi (the Tauri shell) is just the container that hosts the interface. Bamboo is the execution engine, and bodhi-server (Go) handles accounts/persistence/billing and the LLM proxy.
+**Place in the Zenith stack:** Bodhi is the Tauri desktop shell that starts or reuses a local `bamboo serve`, waits for `GET /api/v1/health`, and manages the sidecar lifecycle. Bamboo now embeds the verified Lotus Next artifact by default; a shell may still provide an explicit external frontend package during the staged migration. Lotus Next sends requests over HTTP and receives live events through one shared `/v2/stream` WebSocket by default; the legacy account and session SSE feeds are fallbacks when the v2 transport is explicitly disabled or its initial WebSocket connection cannot be established. Bamboo remains the execution engine. `bodhi-server` is a separate, optional hosted account and provider path; the local Bodhi → Bamboo → Lotus Next path does not require it.
 
 ---
 
 ## Signature Deep-Dives
 
-### Memory System · `crates/infra/bamboo-memory`
+### Memory System · Jiandu through `crates/infra/bamboo-memory`
 
-Memory has three layers:
+Bamboo does not maintain a second memory implementation. Its narrow `bamboo-memory` facade delegates canonical storage, deterministic lexical retrieval, session notes, and Dream snapshots to the exact `jiandu-memory` release.
 
-- **Session notes** — written by the `session_note` tool (actions: `session_read` / `session_append` / `session_replace` / `session_clear` / `session_list_topics`); these are temporary drafts/facts within the current session.
-- **Dream notebook** — a background process "dreams" over a stretch of conversation, distilling it into structured candidate memories and consolidating them into the notebook (`auto_dream.rs`).
-- **Durable memory** — survives across sessions, with frontmatter (type, status, source, relations, retrieval metadata), scoped as `session` / `project` / `global` (`memory_store/types.rs`).
+Jiandu owns canonical persistence, derived indexes, lexical recall, and the persisted Dream snapshot bytes. Bamboo owns prompt selection and budget, may optionally rerank a recalled shortlist, and chooses the model and cadence used to refresh Dream; it does not duplicate Jiandu's memory engine.
 
-**Auto-dream** (`MemoryConfig.auto_dream_enabled`, **off by default** because it consumes model tokens) performs extraction, consolidation, and Dream generation as the conversation evolves; it supports three modes: `Incremental`, `Refine`, `Rebuild`.
+- **Session notes** — the `session_note` tool (`read` / `append` / `replace` / `clear` / `list_topics`) keeps compression-resistant context for one session.
+- **Durable memory** — atomic Global or first-class Project facts with type, status, source, relations, and lexical retrieval metadata. Jiandu is the source of truth; there is no embedding pipeline.
+- **Dream** — a Jiandu-owned derived Global or Project orientation snapshot, never a canonical memory record. Bamboo extracts facts and Ledger candidates first, captures the Jiandu generation, reads canonical `MEMORY.md`, synthesizes once, then asks Jiandu to publish with compare-and-swap so a stale run cannot overwrite newer facts.
 
-**Gardener** (`bamboo-engine/src/gardener.rs`, `gardener_enabled` off by default) specializes in splitting "multi-topic blob memories." It has cost guardrails: a hard per-run split cap, a slow cadence (daily by default), and **it calls no LLM when the deterministic pre-screen finds no candidates** — an idle gardener costs nothing. The split "work list" is produced for free by `MemoryStore::scan_blob_candidates`; only the split "decision" uses the model.
+Jiandu defaults to the independent `~/.jiandu` data root. Bamboo configuration, sessions, and the prospective-record Ledger remain under `~/.bamboo`; the two stores are not mixed. For an isolated managed-host or acceptance run, `BAMBOO_JIANDU_DATA_DIR` may select a non-empty absolute Jiandu root for the server process and every local Bamboo-runtime worker it spawns. Invalid values stop the server or worker before memory initialization. This is an isolation boundary, not a second persistence mode or a migration mechanism, and `--data-dir` continues to control Bamboo data only.
+
+**Prompt-memory observations.** The canonical native agent loop can record which
+compact relevant-memory records it supplied when a provider stream successfully
+bootstraps. Schema v1 keeps the first such observation for an execution-scoped
+logical round: retries do not increase its frequency or replace its membership,
+while a new execution/resume has a new round identity. This is host-side prompt
+exposure, not proof of provider processing, model adoption, or a full `memory get`.
+
+- Only trusted Project item IDs, lifecycle status, final rank and character
+  counts are retained. Headers also distinguish empty/disabled/failed recall and
+  count Global fallback without storing Global IDs. Jiandu v0.2.0 currently
+  chooses Project hits or Global fallback, not a mixed set; the observation
+  schema can represent mixed counts without assigning Global IDs to a Project.
+  Overall recall eligibility is not a Project lookup attempt or a Project
+  retrieval hit-rate denominator.
+- Records use the existing best-effort metrics collector and `metrics.db`, with
+  the existing 90-day round retention. Queued observations can be lost on a crash
+  or storage failure; this is not complete lifetime history or crash-exact delivery.
+- This captures the current round's fresh compact selection, not old memory text
+  retained in the append-only transcript. Management browsing and direct tool
+  execution do not emit observations; execution adapters without provenance are
+  unsupported coverage, not observed zeroes. There is no historical backfill.
+
+This producer does not add an aggregation endpoint or dashboard, alter Jiandu's
+canonical data, or store memory bodies, summaries, queries, prompts or outputs.
+
+**Gardener** (`bamboo-engine/src/gardener.rs`) specializes in splitting multi-topic blobs and consolidating duplicates. It has a hard per-run cap and **calls no LLM when the deterministic pre-screen finds no candidates**; only the model-reviewed maintenance decision has model cost.
 
 > Why it matters: the memory system lets the assistant understand your project better over long-term use, while keeping cost controlled and data local.
 
@@ -161,11 +188,79 @@ bamboo serve
 Arguments supported by `bamboo serve` (all override the config file):
 `--port`, `--bind`, `--data-dir`, `--static-dir`, `--workers` (plus `--parent-pid`, a sidecar orphan-guard: the process exits when that PID goes away).
 
+### Frontend build contract
+
+Normal Bamboo builds require the staged frontend package owned by
+`crates/app/bamboo-server/frontend_package`. The repository default is the exact
+`@bigduu/lotus-next` release recorded in `scripts/frontend-package-lock.json`.
+The build validates the sidecar manifest, the matching manifest inside the zip,
+portable archive paths and payload integrity, the `index.html` entry, and the
+manifest hash shape. The staging verifier additionally checks the upstream
+universal manifest, complete resource inventory, per-resource digests, clean
+source revision, and locked package identity. Missing, stale, or invalid assets
+stop the build instead of silently producing an API-only server.
+
+The normal command verifies and reuses those committed bytes without selecting
+an adjacent checkout:
+
+```bash
+node scripts/frontend-package.cjs stage
+```
+
+To refresh the lock deliberately, first update and review the lock file, install
+that exact public package, then stage it explicitly:
+
+```bash
+LOTUS_NEXT_VERSION="$(node -p "require('./scripts/frontend-package-lock.json').packageVersion")"
+npm install --no-save --no-package-lock "@bigduu/lotus-next@${LOTUS_NEXT_VERSION}"
+LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
+```
+
+`LOTUS_SOURCE=local` and `stage:prebuilt` remain explicit developer paths for a
+clean, self-identifying Lotus Next build. The crate and Docker release workflows
+use the same committed Lotus Next lock by default, including tag-triggered
+Docker builds; they never resolve a moving npm `latest` tag. Their
+`frontend_package` input is the single release-time rollback selector. Choosing
+legacy Lotus pins `@bigduu/lotus@2026.8.28`; an unsupported package, `latest`,
+or a version inconsistent with the selected fixed artifact fails before npm
+installation. Remove this transitional legacy choice only after the rollback
+window tracked by `bigduu/Zenith#187` is complete.
+
+Cargo never runs that staging command implicitly. This removes the previous
+ignored child-process status: explicit local and GitHub Actions callers receive
+the stager's nonzero exit status before `build.rs` validates the resulting
+crate-owned bytes.
+
+An intentionally frontend-free binary remains available for infrastructure
+that supplies only Bamboo APIs. Select it at build time (never as an implicit
+fallback):
+
+```bash
+BAMBOO_FRONTEND_BUILD_MODE=api-only cargo build --bin bamboo
+```
+
+PowerShell:
+
+```powershell
+$env:BAMBOO_FRONTEND_BUILD_MODE = "api-only"
+cargo build --bin bamboo
+```
+
+That setting disables only the compiled-in package. At runtime, `--static-dir`
+still has the highest-level static-directory behavior. An explicitly configured
+`BAMBOO_FRONTEND_PACKAGE` takes precedence over the compiled package and fails
+closed when the path, zip, or adjacent sidecar is missing or invalid. Treat that
+variable as the single artifact-level rollback input: it must name a complete,
+known-good Lotus Next zip accompanied by its byte-matching
+`frontend-manifest.json`. Legacy package candidates beside the working directory
+or executable are considered only when no compiled package and no explicit
+package configuration exists.
+
 **Other subcommands** (`bamboo --help` / `bamboo <cmd> --help` for the full list):
 
 | Command | What it does |
 |---|---|
-| `bamboo serve` | Start the HTTP/SSE server (above). |
+| `bamboo serve` | Start the HTTP/WebSocket/SSE server (above). |
 | `bamboo tui` | Full-screen terminal client (chat, sessions, MCP, schedules, skills, config) over a running server; offers to auto-start a local one when unreachable (`--auto-serve`/`--no-auto-serve`). |
 | `bamboo init` | First-run setup: write `config.json` with a provider + API key (interactive, or `--non-interactive` for CI). |
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
@@ -202,6 +297,8 @@ A global `--log-level <error|warn|info|debug|trace>` sets the default log level 
 - Health: `GET /api/v1/health`
 - Data dir: `BAMBOO_DATA_DIR` or `${HOME}/.bamboo`
 - Default provider: `anthropic`
+
+**Search-index upgrade:** Before upgrading `session_search.db` from schema 3 to 4, stop all older Bamboo servers, workers, and embedded writers that share the data directory. Startup migrates this derived search cache in one atomic transaction; a failed migration preserves the previous schema and cache contents. Running old and new writers together during a rolling upgrade is unsupported because older writers can reset the schema version and do not preserve the new search row identities. Canonical session data is unchanged; do not delete it to perform or recover this upgrade.
 
 ### Call the agent loop
 
@@ -307,7 +404,7 @@ dirs = "5"
 anyhow = "1"
 ```
 
-> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the HTTP API above — it drives the exact same loop. The full SDK type reference is the rustdoc at [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) (the published crate re-exports the facade as `bamboo_agent::agent`); [`docs/guides/API.md`](./docs/guides/API.md) covers the HTTP/SSE surface.
+> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the server APIs above — they drive the exact same loop. The full SDK type reference is the rustdoc at [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) (the published crate re-exports the facade as `bamboo_agent::agent`); [`docs/guides/API.md`](./docs/guides/API.md) covers the HTTP/WebSocket/SSE surface.
 
 ### Example configuration
 
@@ -345,6 +442,7 @@ curl http://localhost:9562/api/v1/health
 ### Selected API routes
 
 REST prefix `/api/v1`: `chat`, `execute/{session_id}`, `stream`, `sessions`, `skills`, `tools`, `tools/execute`, `models`, `commands`, `workflows`, `metrics/*`, `mcp`, `servers`, `stop/{session_id}`, `health`.
+The shared live transport is WebSocket `/v2/stream`; `/api/v1/stream` and `/api/v1/events/{session_id}` remain the legacy SSE feeds.
 There are also provider-compatible endpoints: `/openai/v1`, `/anthropic/v1`, `/gemini/v1beta`, `/v1/{chat/completions,responses,messages}`.
 
 ### Tests & quality
@@ -359,16 +457,19 @@ cargo build --release
 
 ## The Rest of the Stack
 
-Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
+[`Zenith`](https://github.com/bigduu/Zenith) is a thin monorepo, and Bamboo is its execution-engine submodule.
 
 | Module | Role |
 |---|---|
-| [**bodhi**](../bodhi) | Desktop AI product surface (Tauri shell) |
-| [**lotus**](../lotus) | React+Vite UI layer (talks to bamboo over HTTP) |
-| **bamboo** | Local-first Rust agent runtime (this repo) |
-| [**bodhi-server**](../bodhi-server) | Go backend: auth, persistence, billing+quota, LLM proxy |
-| [**pavilion**](../pavilion) | Official website & docs |
-| [**Zenith (root)**](../) | Monorepo entry, submodule pointers, release train |
+| [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri desktop shell: starts or reuses Bamboo, waits for health, manages the sidecar lifecycle, and displays the frontend served by Bamboo |
+| [**Lotus Next**](https://github.com/bigduu/lotus-next) | Canonical React + Vite UI and Bamboo's verified embedded default: HTTP requests, shared `/v2/stream` WebSocket by default, legacy SSE fallback |
+| [**Lotus**](https://github.com/bigduu/Lotus) | Legacy UI retained temporarily only as an explicit fixed-artifact rollback during the staged migration |
+| [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | Local-first Rust agent runtime and packaged Lotus Next host (this repo) |
+| [**bodhi-server**](https://github.com/bigduu/bodhi-server) | Optional hosted service for accounts, API keys, encrypted provider credentials, model routing, billing/quota, and provider proxy |
+| [**Pavilion**](https://github.com/bigduu/Pavilion) | Official website and documentation surface |
+| [**Jiandu**](https://github.com/bigduu/Jiandu) | Small filesystem-backed shared-memory boundary: Rust library plus stdio MCP server |
+| [**Nova**](https://github.com/bigduu/Nova) | Native computer-use capabilities exposed through MCP |
+| [**Magpie**](https://github.com/bigduu/Magpie) | IM connector for Bamboo, available standalone and as a Bamboo service plugin |
 
 **In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
 - Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)

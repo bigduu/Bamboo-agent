@@ -92,7 +92,9 @@ impl ToolExecutor for NoopTools {
 
 fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
     ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool_call",
         event_tx: None,
         available_tool_schemas: None,
@@ -198,7 +200,7 @@ fn build_manager(
         persistence: Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
         tools: Arc::new(NoopTools),
         permission_config: None,
-        sessions_cache: Arc::new(dashmap::DashMap::new()),
+        sessions_cache: Arc::default(),
         agent_runners: Arc::new(RwLock::new(HashMap::<String, AgentRunner>::new())),
         session_event_senders: Arc::new(RwLock::new(HashMap::<
             String,

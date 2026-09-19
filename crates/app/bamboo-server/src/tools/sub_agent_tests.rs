@@ -18,7 +18,7 @@ use bamboo_domain::{
 use bamboo_engine::session_app::child_session;
 
 use crate::app_state::{AgentRunner, AgentStatus};
-use crate::tools::{ChildSessionAdapter, SubAgentTool};
+use crate::tools::{ChildSessionAdapter, PlanTool, SubAgentTool};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
@@ -43,6 +43,36 @@ async fn invoke_completed(
         Ok(_) => panic!("expected a Completed outcome"),
         Err(e) => Err(e),
     }
+}
+
+async fn invoke_plan_completed(
+    tool: &PlanTool,
+    args: serde_json::Value,
+    ctx: ToolCtx,
+) -> Result<ToolResult, ToolError> {
+    match tool.invoke(args, ctx).await {
+        Ok(ToolOutcome::Completed(result)) => Ok(result),
+        Ok(_) => panic!("expected a Completed outcome"),
+        Err(error) => Err(error),
+    }
+}
+
+fn subagent_test_ctx(session_id: &str, tool_call_id: &str) -> ToolCtx {
+    ToolExecutionContext {
+        executing_supervisor: None,
+        session_id: Some(session_id),
+        root_session_id: None,
+        tool_call_id,
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    }
+    .to_tool_ctx()
 }
 
 struct NoopProvider;
@@ -179,6 +209,14 @@ async fn build_test_harness_with_options(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
 ) -> TestHarness {
+    build_test_harness_with_storage(subagent_model_resolver, workspace_resolver, false).await
+}
+
+async fn build_test_harness_with_storage(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+    use_v2_storage: bool,
+) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
@@ -188,17 +226,21 @@ async fn build_test_harness_with_options(
     let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
     let project_store =
         Arc::new(bamboo_projects::ProjectStore::open(&bamboo_home).expect("Project store"));
-    let storage_dir = bamboo_home.join("storage");
-    tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-    let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
-    jsonl.init().await.unwrap();
-    let storage: Arc<dyn Storage> = Arc::new(jsonl);
+    let storage: Arc<dyn Storage> = if use_v2_storage {
+        session_store.clone()
+    } else {
+        let storage_dir = bamboo_home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        Arc::new(jsonl)
+    };
     let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
-    let sessions_cache: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions_cache: bamboo_engine::SessionCache = Arc::default();
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
     let session_event_senders = Arc::new(RwLock::new(HashMap::<
         String,
@@ -364,6 +406,165 @@ async fn build_test_harness_with_options(
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_wait() {
+    let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
+        Box::pin(async move {
+            assert_eq!(subagent_type, "planner");
+            Some(bamboo_domain::ProviderModelRef::new(
+                "openai",
+                "gpt-planner",
+            ))
+        })
+    });
+    let harness = build_test_harness_with_resolver(Some(resolver)).await;
+
+    // A permissive root is useful regression pressure: Plan must preserve the
+    // root's posture while the child receives an independent read-only overlay.
+    let mut root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    root.agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+    harness.storage.save_session(&root).await.unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&root)
+        .await
+        .unwrap();
+
+    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+    let result = invoke_plan_completed(
+        &tool,
+        json!({
+            "task": "Inspect the session execution path and design a safe migration.",
+            "title": "Plan session migration",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 2
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "tc_plan_delegate"),
+    )
+    .await
+    .expect("Plan should delegate to one child");
+
+    assert_eq!(
+        result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["status"], "waiting_for_planner");
+    assert_eq!(payload["runtime_control"], "waiting_for_children");
+    assert_eq!(payload["wait_for"], "all");
+    assert_eq!(payload["subagent_type"], "planner");
+    assert_eq!(payload["model"], "gpt-planner");
+    assert_eq!(payload["read_only"], true);
+    assert!(
+        payload.get("awaiting_user_input").is_none(),
+        "delegated planning must never request a mode-switch response"
+    );
+    assert!(payload["note"]
+        .as_str()
+        .is_some_and(|note| note.contains("resume automatically")));
+    let child_id = payload["child_session_id"]
+        .as_str()
+        .expect("planner child id");
+
+    let child = harness
+        .storage
+        .load_session(child_id)
+        .await
+        .unwrap()
+        .expect("planner child persisted");
+    assert_eq!(child.subagent_type().as_deref(), Some("planner"));
+    assert_eq!(
+        child.metadata.get("runtime.kind").map(String::as_str),
+        Some("external")
+    );
+    assert_eq!(
+        child.metadata.get("external.protocol").map(String::as_str),
+        Some("actor")
+    );
+    assert_eq!(
+        child.metadata.get("external.agent_id").map(String::as_str),
+        Some(bamboo_engine::external_agents::config::LOCAL_ACTOR_AGENT_ID)
+    );
+    let child_runtime = child
+        .agent_runtime_state
+        .as_ref()
+        .expect("typed planner runtime state");
+    assert!(child_runtime.read_only);
+    assert_eq!(
+        child_runtime.effective_permission_mode(),
+        bamboo_domain::SessionPermissionMode::Auto,
+        "requested mode remains auditable even though read-only wins effectively"
+    );
+    assert_eq!(
+        bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+            .expect("planner permission audit")
+            .resolution
+            .effective,
+        bamboo_domain::PermissionMode::Plan
+    );
+    assert!(
+        !child.metadata.contains_key("disabled_tools"),
+        "Plan caller must not be the authority that supplies its own denylist"
+    );
+    assert!(child
+        .metadata
+        .get("assignment_prompt")
+        .is_some_and(|prompt| prompt.contains("do not implement")));
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let root_runtime = parent
+        .agent_runtime_state
+        .as_ref()
+        .expect("root runtime state");
+    assert!(!root_runtime.read_only);
+    assert!(root_runtime.plan_mode.is_none());
+    assert_eq!(
+        root_runtime.effective_permission_mode(),
+        bamboo_domain::SessionPermissionMode::Auto
+    );
+    let wait = root_runtime
+        .waiting_for_children
+        .as_ref()
+        .expect("Plan registered a durable child wait");
+    assert_eq!(wait.child_session_ids, vec![child_id.to_string()]);
+    assert_eq!(
+        wait.registered_by_tool_call_id.as_deref(),
+        Some("tc_plan_delegate")
+    );
+
+    // This harness intentionally persists tool actions through JsonlStorage,
+    // so the independent SessionStoreV2 index does not receive the new child.
+    // The adapter's publication cache does, and lets us prove there was no
+    // hidden second planner creation in the same call.
+    let planner_children = harness
+        .adapter
+        .sessions_cache
+        .iter()
+        .filter(|entry| {
+            let session = entry.value().read();
+            session.parent_session_id.as_deref() == Some(harness.parent_session_id.as_str())
+                && session.subagent_type().as_deref() == Some("planner")
+        })
+        .count();
+    assert_eq!(
+        planner_children, 1,
+        "one Plan call creates exactly one child"
+    );
+}
+
+#[tokio::test]
 async fn child_publication_uses_the_validating_instance_workspace_root() {
     let instance_root = tempfile::tempdir().expect("instance workspace root");
     let canonical_instance_root = instance_root
@@ -401,6 +602,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
             model_override: None,
             model_ref_override: None,
             runtime_metadata: HashMap::new(),
+            read_only: false,
             auto_run: false,
             reasoning_effort: None,
             lifecycle: None,
@@ -419,6 +621,87 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
     assert!(
         published.is_dir(),
         "the same instance resolver that validated the relocated target must materialize it"
+    );
+}
+
+#[tokio::test]
+async fn supervisor_common_child_constructor_keeps_ordinary_identity_for_all_role_labels() {
+    let harness = build_test_harness().await;
+    let store = &harness.adapter.session_store;
+    let receipt = store
+        .get_or_create_default_supervisor("test-model")
+        .await
+        .unwrap();
+    let root = store
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut nested_parent: Option<Session> = None;
+    // This matrix exercises common child construction, including cosmetic role
+    // labels; it does not invoke the separate GuardianSpawner entry point.
+    for (role, lifecycle, name) in [
+        ("worker", None, None),
+        ("resident", Some("resident"), Some("authority-resident")),
+        ("guardian", None, None),
+        ("nested", None, None),
+    ] {
+        let parent = if role == "nested" {
+            nested_parent.clone().unwrap()
+        } else {
+            root.clone()
+        };
+        let child_id = format!("ordinary-{role}-{}", Uuid::new_v4());
+        child_session::create_child_action(
+            harness.adapter.as_ref(),
+            child_session::CreateChildInput {
+                parent_session: parent,
+                child_id: child_id.clone(),
+                title: role.into(),
+                responsibility: "Inspect".into(),
+                assignment_prompt: "Inspect".into(),
+                subagent_type: role.into(),
+                workspace: harness.workspace_path.to_string_lossy().into_owned(),
+                workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+                model_override: None,
+                model_ref_override: None,
+                runtime_metadata: HashMap::from([
+                    ("authority_identity".into(), "supervisor".into()),
+                    ("role".into(), "supervisor".into()),
+                ]),
+                read_only: false,
+                auto_run: false,
+                reasoning_effort: None,
+                lifecycle: lifecycle.map(str::to_string),
+                resident_name: name.map(str::to_string),
+                resident_context: None,
+                disabled_tools: None,
+                context_fork: None,
+            },
+        )
+        .await
+        .unwrap();
+        let child = harness
+            .storage
+            .load_session(&child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child.authority_identity.is_ordinary(), "{role}");
+        assert_eq!(child.root_session_id, receipt.session_id);
+        assert_eq!(child.project_id_meta(), root.project_id_meta());
+        if role == "worker" {
+            nested_parent = Some(child);
+        }
+    }
+    assert_eq!(
+        store
+            .load_root_authority(&receipt.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority_identity,
+        root.authority_identity
     );
 }
 
@@ -475,6 +758,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
                 model_override: None,
                 model_ref_override: None,
                 runtime_metadata: HashMap::new(),
+                read_only: false,
                 auto_run: false,
                 reasoning_effort: None,
                 lifecycle: lifecycle.map(str::to_string),
@@ -674,6 +958,63 @@ async fn repeated_registration_of_same_child_is_idempotent() {
 }
 
 #[tokio::test]
+async fn failed_launch_rollback_removes_only_its_child_from_the_parent_wait() {
+    let harness = build_test_harness().await;
+    let adapter = harness.adapter.clone();
+    let parent_id = harness.parent_session_id.clone();
+
+    adapter
+        .register_parent_wait_for_child(&parent_id, "failed-child", Some("tc-failed"))
+        .await
+        .unwrap();
+    adapter
+        .register_parent_wait_for_child(&parent_id, "live-sibling", Some("tc-live"))
+        .await
+        .unwrap();
+
+    adapter
+        .rollback_parent_wait_for_child(&parent_id, "failed-child")
+        .await
+        .expect("rollback should preserve the live sibling");
+
+    let parent = harness
+        .storage
+        .load_session(&parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let wait = parent
+        .agent_runtime_state
+        .expect("runtime state")
+        .waiting_for_children
+        .expect("sibling wait must remain armed");
+    assert_eq!(wait.child_session_ids, vec!["live-sibling".to_string()]);
+    assert_eq!(
+        parent
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str),
+        Some("waiting_for_children")
+    );
+
+    adapter
+        .rollback_parent_wait_for_child(&parent_id, "live-sibling")
+        .await
+        .expect("last-child rollback should clear the wait");
+    let parent = harness
+        .storage
+        .load_session(&parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .and_then(|state| state.waiting_for_children)
+        .is_none());
+    assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
+}
+
+#[tokio::test]
 async fn parent_wait_slot_is_evicted_after_flush_drains() {
     // Issue #346: the per-parent coalescing slot must not linger in
     // `parent_wait_slots` after its pending queue drains, otherwise the map
@@ -725,7 +1066,9 @@ async fn parent_wait_slots_drain_after_concurrent_registrations() {
 
 fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecutionContext<'a> {
     ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id,
         event_tx: None,
         available_tool_schemas: None,
@@ -993,7 +1336,9 @@ async fn create_publishes_started_before_fast_completion_and_caches_latest() {
             "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_1",
             event_tx: None,
             available_tool_schemas: None,
@@ -1103,7 +1448,9 @@ async fn create_uses_async_subagent_model_resolver() {
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_async_resolver",
             event_tx: None,
             available_tool_schemas: None,
@@ -1147,11 +1494,114 @@ async fn create_uses_async_subagent_model_resolver() {
 }
 
 #[tokio::test]
+async fn supervisor_resident_reset_and_accumulate_stay_ordinary_in_canonical_v2() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let canonical: Arc<dyn Storage> = harness.adapter.session_store.clone();
+    assert!(Arc::ptr_eq(&harness.storage, &canonical));
+    let receipt = harness
+        .storage
+        .get_or_create_default_supervisor("gpt-5")
+        .await
+        .unwrap();
+    let expected_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+        incarnation_id: receipt.incarnation_id,
+    };
+    assert_eq!(
+        harness
+            .storage
+            .load_session(&receipt.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority_identity,
+        expected_identity
+    );
+
+    let first_brief = "First Supervisor resident assignment";
+    let reset_brief = "Replacement Supervisor resident assignment";
+    let accumulated_brief = "Additional Supervisor resident assignment";
+    let mut resident_id = None;
+    for (step, context, brief) in [
+        (0, "reset", first_brief),
+        (1, "reset", reset_brief),
+        (2, "accumulate", accumulated_brief),
+    ] {
+        let result = invoke_completed(
+            &harness.tool,
+            json!({
+                "action": "create",
+                "lifecycle": "resident",
+                "name": "supervisor-resident",
+                "context": context,
+                "title": format!("Supervisor resident task {step}"),
+                "responsibility": "Inspect one bounded task",
+                "prompt": brief,
+                "workspace": harness.workspace_path.to_string_lossy(),
+                "auto_run": false
+            }),
+            subagent_test_ctx(&receipt.session_id, &format!("supervisor-resident-{step}")),
+        )
+        .await
+        .expect("real SubAgent create or reuse must succeed");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let id = payload["child_session_id"].as_str().unwrap().to_string();
+        assert_eq!(payload["reused"], json!(step != 0));
+        if let Some(previous_id) = resident_id.as_ref() {
+            assert_eq!(
+                &id, previous_id,
+                "reset and accumulate must reuse the resident"
+            );
+        } else {
+            resident_id = Some(id.clone());
+        }
+        // No manual index mirroring: the production V2 save must make the
+        // resident discoverable by the next real SubAgent invocation.
+        let child = harness.storage.load_session(&id).await.unwrap().unwrap();
+        assert!(child.authority_identity.is_ordinary(), "step {step}");
+        assert_eq!(
+            child.parent_session_id.as_deref(),
+            Some(receipt.session_id.as_str())
+        );
+        assert_eq!(child.root_session_id, receipt.session_id);
+        assert!(child.messages.last().unwrap().content.contains(brief));
+        if step > 0 {
+            assert!(!child
+                .messages
+                .iter()
+                .any(|message| message.content.contains(first_brief)));
+            assert_eq!(
+                child.metadata.get("assignment_prompt").map(String::as_str),
+                Some(reset_brief)
+            );
+        }
+        if step == 2 {
+            assert!(child
+                .messages
+                .iter()
+                .any(|message| message.content.contains(reset_brief)));
+        }
+        assert_eq!(
+            harness
+                .storage
+                .load_root_authority(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authority_identity,
+            expected_identity,
+            "resident provisioning must preserve the parent incarnation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn resident_create_reuses_same_child_session() {
     let harness = build_test_harness().await;
     let workspace = tempfile::tempdir().expect("workspace");
     let ctx = |tcid: &'static str| ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(harness.parent_session_id.as_str()),
+        root_session_id: None,
         tool_call_id: tcid,
         event_tx: None,
         available_tool_schemas: None,
@@ -1228,6 +1678,7 @@ async fn resident_create_reuses_same_child_session() {
         .await
         .unwrap()
         .expect("child exists");
+    assert!(child.authority_identity.is_ordinary());
     assert_eq!(
         child.metadata.get("lifecycle").map(String::as_str),
         Some("resident")
@@ -1258,6 +1709,302 @@ async fn resident_create_reuses_same_child_session() {
         id1,
         "one-shot create must be a new session"
     );
+}
+
+#[tokio::test]
+async fn root_stays_contract_free_while_oneshot_and_resident_children_get_it_once() {
+    let harness = build_test_harness().await;
+    let mut child_prompts = Vec::new();
+
+    for (title, lifecycle, name, call_id) in [
+        ("One-shot contract", None, None, "contract-oneshot"),
+        (
+            "Resident contract",
+            Some("resident"),
+            Some("contract-resident"),
+            "contract-resident",
+        ),
+    ] {
+        let mut request = json!({
+            "action": "create",
+            "title": title,
+            "responsibility": "Inspect one bounded path",
+            "prompt": "Read one file and report evidence.",
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "auto_run": false
+        });
+        if let Some(lifecycle) = lifecycle {
+            request["lifecycle"] = json!(lifecycle);
+        }
+        if let Some(name) = name {
+            request["name"] = json!(name);
+        }
+
+        let result = invoke_completed(
+            &harness.tool,
+            request,
+            subagent_test_ctx(&harness.parent_session_id, call_id),
+        )
+        .await
+        .expect("child create with delegation contract");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child = harness
+            .storage
+            .load_session(payload["child_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .expect("created child");
+        let base = child
+            .metadata
+            .get("base_system_prompt")
+            .expect("child base prompt")
+            .clone();
+        assert_eq!(
+            base.matches(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            base.matches(child_session::SUBAGENT_DELEGATION_CONTRACT_START_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(
+            child
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::System))
+                .count(),
+            1
+        );
+        assert_eq!(
+            child.messages[0].content, base,
+            "persisted base and child system message must be identical"
+        );
+        let assignment = child.messages.last().expect("assignment message");
+        assert!(matches!(assignment.role, Role::User));
+        assert!(assignment.content.starts_with("Delegated child assignment"));
+        assert_eq!(assignment.content.matches("## ").count(), 6);
+        assert!(!assignment
+            .content
+            .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
+        child_prompts.push(base);
+    }
+
+    assert_eq!(
+        child_prompts[0], child_prompts[1],
+        "one-shot and resident children must receive the same child contract"
+    );
+    let root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .expect("root session");
+    assert!(!root
+        .metadata
+        .values()
+        .any(|value| value.contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)));
+    assert!(!root.messages.iter().any(|message| message
+        .content
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)));
+}
+
+#[tokio::test]
+async fn resident_create_reset_and_accumulate_share_complete_background_aware_frame() {
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .expect("parent");
+    parent.add_message(Message::system("root-only secret policy"));
+    parent.add_message(Message::user("initial parent input"));
+    parent.add_message(Message::assistant("initial parent response", None));
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let first_brief = "First complete brief.\nAcceptance: show first evidence.";
+    let first = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "reset",
+            "title": "First resident task",
+            "responsibility": "Inspect first path",
+            "prompt": first_brief,
+            "subagent_type": "researcher",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 3,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-first"),
+    )
+    .await
+    .expect("first resident create");
+    let first_payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+    let resident_id = first_payload["child_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("first resident");
+    let first_background = child_session::render_forked_parent_context(&parent, 3).unwrap();
+    let first_expected = child_session::format_child_assignment_with_background(
+        "First resident task",
+        "Inspect first path",
+        "researcher",
+        first_brief,
+        Some(&first_background),
+    );
+    assert_eq!(first_child.messages.last().unwrap().content, first_expected);
+    assert!(!first_expected.contains("root-only secret policy"));
+    assert!(first_expected.contains("initial parent input"));
+    assert!(first_expected.contains("initial parent response"));
+    assert!(
+        first_expected.find("</forked-parent-background>").unwrap()
+            < first_expected
+                .find("## 3. Allowed actions and mutation scope")
+                .unwrap()
+    );
+    assert_eq!(
+        first_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(first_brief)
+    );
+    harness
+        .adapter
+        .session_store
+        .save_session(&first_child)
+        .await
+        .unwrap();
+
+    parent.add_message(Message::user("reset-only parent background"));
+    harness.storage.save_session(&parent).await.unwrap();
+    let reset_brief = "Reset complete brief.\nAcceptance: show reset evidence.";
+    let reset = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "reset",
+            "title": "Reset resident task",
+            "responsibility": "Inspect reset path",
+            "prompt": reset_brief,
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 1,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-reset"),
+    )
+    .await
+    .expect("resident reset reuse");
+    let reset_payload: serde_json::Value = serde_json::from_str(&reset.result).unwrap();
+    assert_eq!(reset_payload["child_session_id"], resident_id);
+    let reset_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("reset resident");
+    let reset_background = child_session::render_forked_parent_context(&parent, 1).unwrap();
+    let reset_expected = child_session::format_child_assignment_with_background(
+        "Reset resident task",
+        "Inspect reset path",
+        "reviewer",
+        reset_brief,
+        Some(&reset_background),
+    );
+    assert_eq!(reset_child.messages.last().unwrap().content, reset_expected);
+    assert!(!reset_child
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .contains(first_brief));
+    assert_eq!(
+        reset_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(reset_brief)
+    );
+    assert!(!reset_child
+        .metadata
+        .get("assignment_prompt")
+        .unwrap()
+        .contains("forked-parent-background"));
+
+    parent.add_message(Message::user("accumulate-only parent background"));
+    harness.storage.save_session(&parent).await.unwrap();
+    let accumulate_brief = "Accumulated complete brief.\nAcceptance: show accumulated evidence.";
+    let accumulated = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "accumulate",
+            "title": "Accumulated resident task",
+            "responsibility": "Inspect accumulated path",
+            "prompt": accumulate_brief,
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 1,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-accumulate"),
+    )
+    .await
+    .expect("resident accumulate reuse");
+    let accumulated_payload: serde_json::Value = serde_json::from_str(&accumulated.result).unwrap();
+    assert_eq!(accumulated_payload["child_session_id"], resident_id);
+    let accumulated_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("accumulated resident");
+    let accumulated_background = child_session::render_forked_parent_context(&parent, 1).unwrap();
+    let accumulated_expected = child_session::format_child_assignment_with_background(
+        "Accumulated resident task",
+        "Inspect accumulated path",
+        "reviewer",
+        accumulate_brief,
+        Some(&accumulated_background),
+    );
+    assert_eq!(
+        accumulated_child.messages.last().unwrap().content,
+        accumulated_expected
+    );
+    assert!(accumulated_child
+        .messages
+        .iter()
+        .any(|message| message.content == reset_expected));
+    assert_eq!(
+        accumulated_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(reset_brief),
+        "accumulate is an appended task message and must not rewrite canonical reset metadata"
+    );
+    assert!(!accumulated_child
+        .metadata
+        .get("assignment_prompt")
+        .unwrap()
+        .contains("forked-parent-background"));
 }
 
 #[tokio::test]
@@ -1304,7 +2051,9 @@ async fn resident_reuse_rejects_cross_project_workspace_before_mutating_resident
         .expect("save parent");
     let ctx = |tool_call_id: &'static str| {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1443,7 +2192,9 @@ async fn resident_reuse_rejects_stale_project_after_root_reassignment_without_mu
     harness.storage.save_session(&parent).await.unwrap();
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1559,7 +2310,9 @@ async fn same_project_resident_reuse_persists_and_publishes_changed_workspace() 
     harness.storage.save_session(&parent).await.unwrap();
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1665,7 +2418,9 @@ async fn resident_reuse_publication_uses_the_validating_instance_workspace_root(
     let workspace_b = tempfile::tempdir().expect("foreign workspace B");
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1763,7 +2518,9 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
             "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_legacy",
             event_tx: None,
             available_tool_schemas: None,
@@ -1789,19 +2546,87 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn direct_update_uses_the_canonical_complete_assignment_frame() {
+    let harness = build_test_harness().await;
+    let task_brief = "Updated complete brief.\nAcceptance: retain both lines.";
+    let mut seeded_child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("seed child");
+    seeded_child.metadata.insert(
+        "responsibility".to_string(),
+        "Inspect the existing path".to_string(),
+    );
+    seeded_child
+        .metadata
+        .insert("subagent_type".to_string(), "reviewer".to_string());
+    seeded_child.metadata.insert(
+        "assignment_prompt".to_string(),
+        "Original complete brief.".to_string(),
+    );
+    harness.storage.save_session(&seeded_child).await.unwrap();
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "prompt": task_brief,
+            "reset_after_update": true,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "direct-update-contract"),
+    )
+    .await
+    .expect("direct child update");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["messages_removed"], 1);
+
+    let child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("updated child");
+    assert_eq!(
+        child.messages.last().unwrap().content,
+        child_session::format_child_assignment(
+            "Child session",
+            "Inspect the existing path",
+            "reviewer",
+            task_brief,
+        )
+    );
+    assert_eq!(child.messages.len(), 2);
+    assert!(!child
+        .messages
+        .iter()
+        .any(|message| matches!(message.role, Role::Assistant)));
+    assert_eq!(
+        child.metadata.get("assignment_prompt").map(String::as_str),
+        Some(task_brief)
+    );
+}
+
+#[tokio::test]
 async fn send_message_appends_follow_up_without_replacing_history() {
     let harness = build_test_harness().await;
+    let raw_message = "\n  continue with the failing parser path  \n";
 
     let result = invoke_completed(
         &harness.tool,
         json!({
             "action": "send_message",
             "child_session_id": harness.child_session_id,
-            "message": "continue with the failing parser path",
+            "message": raw_message,
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_send_message",
             event_tx: None,
             available_tool_schemas: None,
@@ -1830,10 +2655,13 @@ async fn send_message_appends_follow_up_without_replacing_history() {
     assert_eq!(child.messages.len(), 4);
     assert!(matches!(child.messages[2].role, Role::Assistant));
     assert!(matches!(child.messages[3].role, Role::User));
-    assert_eq!(
-        child.messages[3].content,
-        "continue with the failing parser path"
-    );
+    assert_eq!(child.messages[3].content, raw_message);
+    assert!(!child.messages[3]
+        .content
+        .contains("Delegated child assignment"));
+    assert!(!child.messages[3]
+        .content
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
     assert_eq!(
         child.metadata.get("last_run_status").map(String::as_str),
         Some("pending")
@@ -1852,8 +2680,77 @@ async fn send_message_appends_follow_up_without_replacing_history() {
 }
 
 #[tokio::test]
+async fn send_message_blank_unknown_child_preserves_not_found_priority() {
+    let harness = build_test_harness().await;
+    let unknown_child_id = Uuid::new_v4().to_string();
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": unknown_child_id,
+            "message": " \n\t  ",
+            "auto_run": false,
+            "interrupt_running": true
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "blank-unknown-child"),
+    )
+    .await
+    .expect_err("unknown child must win over blank-message validation");
+
+    assert!(matches!(error, ToolError::Execution(message)
+            if message.contains("session not found") && message.contains(&unknown_child_id)));
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+    assert!(!harness
+        .agent_runners
+        .read()
+        .await
+        .contains_key(&unknown_child_id));
+}
+
+#[tokio::test]
+async fn send_message_rejects_whitespace_only_without_mutating_the_child() {
+    let harness = build_test_harness().await;
+    let before = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("child before invalid message");
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": " \n\t  ",
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "whitespace-only-message"),
+    )
+    .await
+    .expect_err("whitespace-only message must fail");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(message) if message.contains("message must be non-empty"))
+    );
+
+    let after = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("child after invalid message");
+    assert_eq!(
+        serde_json::to_value(after.messages).unwrap(),
+        serde_json::to_value(before.messages).unwrap()
+    );
+    assert_eq!(after.metadata, before.metadata);
+}
+
+#[tokio::test]
 async fn send_message_queues_on_running_child_without_interrupt() {
     let harness = build_test_harness().await;
+    let raw_message = "  continue\nwith exact whitespace  \n";
     let run_id = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
@@ -1875,10 +2772,12 @@ async fn send_message_queues_on_running_child_without_interrupt() {
         json!({
             "action": "send_message",
             "child_session_id": harness.child_session_id,
-            "message": "continue"
+            "message": raw_message
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_running",
             event_tx: None,
             available_tool_schemas: None,
@@ -1898,7 +2797,15 @@ async fn send_message_queues_on_running_child_without_interrupt() {
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
     assert_eq!(payload["status"], "message_delivered_live");
     assert_eq!(payload["auto_run"], false);
-    assert_eq!(payload["message"], "continue");
+    assert_eq!(payload["message"], raw_message);
+    assert!(!payload["message"]
+        .as_str()
+        .unwrap()
+        .contains("Delegated child assignment"));
+    assert!(!payload["message"]
+        .as_str()
+        .unwrap()
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
 
     let child = harness
         .storage
@@ -1932,7 +2839,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
     assert_eq!(
         envelope.body.clone(),
         bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
-            "continue"
+            raw_message
         ))
     );
 }
@@ -1969,7 +2876,9 @@ async fn send_message_can_interrupt_running_child() {
             "interrupt_running": true
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_interrupt_running",
             event_tx: None,
             available_tool_schemas: None,
@@ -2035,7 +2944,9 @@ async fn send_message_can_queue_child_immediately() {
             "message": "retry with a narrower scope"
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_queue",
             event_tx: None,
             available_tool_schemas: None,
@@ -2099,7 +3010,9 @@ async fn send_message_same_tool_call_retries_activation_without_duplicate_delive
     });
     let context = || {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_activation_retry",
             event_tx: None,
             available_tool_schemas: None,
@@ -2228,7 +3141,9 @@ async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
             "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_relay",
             event_tx: None,
             available_tool_schemas: None,
@@ -2307,7 +3222,9 @@ async fn cancel_stops_running_child() {
             "child_session_id": harness.child_session_id
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_cancel",
             event_tx: None,
             available_tool_schemas: None,
@@ -2339,7 +3256,9 @@ async fn list_returns_children() {
         &harness.tool,
         json!({"action": "list"}),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_list",
             event_tx: None,
             available_tool_schemas: None,
@@ -2387,7 +3306,9 @@ async fn get_returns_runner_diagnostics() {
             "child_session_id": harness.child_session_id
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_get_diagnostics",
             event_tx: None,
             available_tool_schemas: None,
@@ -2429,7 +3350,9 @@ async fn create_returns_duration_hint() {
             "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_hint",
             event_tx: None,
             available_tool_schemas: None,
@@ -2483,7 +3406,9 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
             "reasoning_effort": "high"
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_with_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -2540,7 +3465,9 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_default_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -2602,7 +3529,9 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
             "reasoning_effort": "max"
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_update_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -2642,7 +3571,9 @@ async fn delete_removes_child() {
             "child_session_id": harness.child_session_id
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_delete",
             event_tx: None,
             available_tool_schemas: None,
@@ -2684,7 +3615,9 @@ async fn create_requires_workspace() {
             "subagent_type": "general-purpose"
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_no_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -2748,7 +3681,9 @@ async fn assigned_child_without_parent_workspace_uses_project_path() {
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_project_default_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -2822,7 +3757,9 @@ async fn assigned_child_without_parent_workspace_uses_project_path() {
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_moved_project_default_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -2866,7 +3803,9 @@ async fn create_sets_child_workspace() {
             "auto_run": false
         }),
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_workspace",
             event_tx: None,
             available_tool_schemas: None,

@@ -5,6 +5,7 @@
 //!
 //! "Round" is kept only as a counter for metrics compatibility.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,16 +23,24 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
-use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
+use crate::runtime::runner::session_setup::tool_schemas::{
+    resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
+};
 use crate::runtime::stream::handler::StreamHandlingOutput;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
 };
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
+use bamboo_domain::{
+    AgentHookPoint, CapabilityInvocationTarget, CapabilityLoadingClass, CapabilityLoadingMode,
+    CapabilityMatch, CapabilitySource, ClassifiedToolSchema, DiscoverCapabilitiesRequest,
+    EffectiveCallableSet, HookPayload, HookResult, ProviderFamily, ProviderProtocol,
+    ProviderTranscriptAuthor, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    ProviderTranscriptOrigin,
+};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -47,6 +56,10 @@ use crate::runtime::runner::state_bridge;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
+const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
+const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
+const STICKY_DISCOVERY_RESULT_START: &str = "<loaded_tools>";
+const STICKY_DISCOVERY_RESULT_END: &str = "</loaded_tools>";
 
 #[cfg(test)]
 const TEST_POST_LLM_RETRY_FAILURES_KEY: &str = "test.pipeline.post_llm_retry_failures";
@@ -72,6 +85,625 @@ fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError>
     Some(AgentError::LLM(
         "transient test-injected post-LLM handler failure".to_string(),
     ))
+}
+
+fn effective_callable_set_for_round(
+    session: &Session,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> EffectiveCallableSet {
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
+    }
+
+    let loaded_names = if capability_loading_mode == CapabilityLoadingMode::StickyFallback {
+        validated_sticky_fallback_loaded_tool_names(session)
+    } else {
+        let transcript = &session.provider_transcript;
+        let family = transcript.active_family();
+        let protocol = transcript.active_protocol();
+        let groups = match (
+            family,
+            protocol,
+            transcript.active_provider_boundary_sha256(),
+        ) {
+            (Some(family), Some(protocol), Some(boundary)) => {
+                transcript.replayable_groups(family, protocol, boundary)
+            }
+            _ => Vec::new(),
+        };
+        match (family, protocol) {
+            (
+                Some(ProviderFamily::Anthropic),
+                Some(ProviderProtocol::AnthropicMessages2023_06_01),
+            ) => bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
+                groups.iter().copied(),
+                tool_schemas,
+            ),
+            (Some(family @ ProviderFamily::OpenAi), Some(ProviderProtocol::OpenAiResponsesV1)) => {
+                bamboo_domain::validated_openai_loaded_tool_names(groups.iter().copied(), family)
+            }
+            _ => Vec::new(),
+        }
+    };
+    let catalog = tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+    EffectiveCallableSet::from_catalog(
+        &catalog,
+        capability_loading_mode,
+        loaded_names.iter().map(String::as_str),
+    )
+}
+
+fn openai_client_tool_search_requests(
+    items: &[ProviderTranscriptItem],
+) -> Result<Vec<(String, DiscoverCapabilitiesRequest)>, AgentError> {
+    items
+        .iter()
+        .filter(|item| {
+            item.family() == ProviderFamily::OpenAi
+                && item.protocol() == ProviderProtocol::OpenAiResponsesV1
+                && item.kind() == ProviderTranscriptItemKind::OpenAiToolSearchCall
+                && item.payload()["execution"].as_str() == Some("client")
+        })
+        .map(|item| {
+            let call_id = item.payload()["call_id"]
+                .as_str()
+                .expect("validated client tool_search_call has call_id")
+                .to_string();
+            let request = serde_json::from_value::<DiscoverCapabilitiesRequest>(
+                item.payload()["arguments"].clone(),
+            )
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "OpenAI client tool-search arguments are invalid: {error}"
+                ))
+            })?;
+            Ok((call_id, request))
+        })
+        .collect()
+}
+
+fn capability_source_name(source: CapabilitySource) -> &'static str {
+    match source {
+        CapabilitySource::Builtin => "builtin",
+        CapabilitySource::Server => "server",
+        CapabilitySource::Mcp => "mcp",
+        CapabilitySource::Custom => "custom",
+        CapabilitySource::Project => "project",
+        CapabilitySource::Workspace => "workspace",
+        CapabilitySource::User => "user",
+        CapabilitySource::Plugin => "plugin",
+    }
+}
+
+/// Keep the real gateway definition while narrowing its catalog identity
+/// argument to this bounded discovery result. Revision/source stay descriptive
+/// metadata because `load_skill` has no revision argument and multiple workflow
+/// IDs can legitimately carry different revisions.
+fn scope_discovered_gateway_schema(
+    entry: &ClassifiedToolSchema,
+    matches: &[&CapabilityMatch],
+) -> bamboo_agent_core::tools::ToolSchema {
+    let mut schema = entry.schema().clone();
+    let (catalog_kind, id_property) = match entry.execution_name() {
+        "load_skill" => ("skill", "skill_id"),
+        "workflow_run" => ("workflow", "workflow_id"),
+        _ => return schema,
+    };
+    let mut ids = Vec::new();
+    let mut workflow_revisions = Vec::new();
+    let mut metadata = Vec::new();
+    for matched in matches {
+        let scoped = match &matched.invocation_target {
+            CapabilityInvocationTarget::Skill {
+                skill_id,
+                source,
+                revision,
+                ..
+            } if catalog_kind == "skill" => Some((skill_id, *source, *revision)),
+            CapabilityInvocationTarget::Workflow {
+                workflow_id,
+                source,
+                revision,
+                ..
+            } if catalog_kind == "workflow" => {
+                if !workflow_revisions.contains(revision) {
+                    workflow_revisions.push(*revision);
+                }
+                Some((workflow_id, *source, *revision))
+            }
+            _ => None,
+        };
+        let Some((id, source, revision)) = scoped else {
+            continue;
+        };
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+        let detail = format!(
+            "{id} — {} — {} [revision={revision}, source={}]",
+            matched.display_name,
+            matched.summary,
+            capability_source_name(source)
+        );
+        if !metadata.contains(&detail) {
+            metadata.push(detail);
+        }
+    }
+    if ids.is_empty() {
+        return schema;
+    }
+
+    if !schema.function.parameters.is_object() {
+        schema.function.parameters = serde_json::json!({"type": "object"});
+    }
+    let parameters = schema
+        .function
+        .parameters
+        .as_object_mut()
+        .expect("gateway parameters were normalized to an object");
+    let properties = parameters
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    if !properties.is_object() {
+        *properties = serde_json::json!({});
+    }
+    let properties = properties
+        .as_object_mut()
+        .expect("scoped gateway properties are an object");
+    let id_schema = properties
+        .entry(id_property)
+        .or_insert_with(|| serde_json::json!({"type": "string"}));
+    if !id_schema.is_object() {
+        *id_schema = serde_json::json!({"type": "string"});
+    }
+    id_schema["enum"] = serde_json::json!(ids);
+    id_schema["description"] = serde_json::json!(format!(
+        "Use only the {id_property} values advertised by this discovery output."
+    ));
+
+    if catalog_kind == "workflow" && !workflow_revisions.is_empty() {
+        let revision_schema = properties
+            .entry("revision")
+            .or_insert_with(|| serde_json::json!({"type": "integer", "minimum": 1}));
+        if !revision_schema.is_object() {
+            *revision_schema = serde_json::json!({"type": "integer", "minimum": 1});
+        }
+        revision_schema["enum"] = serde_json::json!(workflow_revisions);
+    }
+
+    schema.function.description = format!(
+        "{}. Scoped {catalog_kind} matches in discovery relevance order: {}.",
+        entry.schema().function.description.trim_end_matches('.'),
+        metadata.join("; ")
+    );
+    schema
+}
+
+struct CompleteCapabilityDiscovery {
+    catalog: Vec<ClassifiedToolSchema>,
+    index: crate::capability_discovery::CapabilityDiscoveryIndex,
+}
+
+impl CompleteCapabilityDiscovery {
+    async fn new(
+        session: &Session,
+        config: &AgentLoopConfig,
+        tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    ) -> Result<Self, AgentError> {
+        let catalog = tool_schemas
+            .iter()
+            .cloned()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let searchable_tool_catalog = catalog
+            .iter()
+            .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (_, disabled_skill_ids) = config.resolve_disabled_filters();
+        let catalog_names = catalog
+            .iter()
+            .map(|entry| entry.execution_name())
+            .collect::<BTreeSet<_>>();
+        let eligibility = crate::capability_discovery::CapabilityDiscoveryEligibility {
+            disabled_skill_ids: disabled_skill_ids.into_owned(),
+            allowed_skill_ids: config
+                .selected_skill_ids
+                .as_ref()
+                .map(|ids| ids.iter().cloned().collect()),
+            skill_gateway_available: catalog_names.contains("load_skill"),
+            workflow_gateway_available: catalog_names.contains("workflow_run"),
+            ..Default::default()
+        };
+        let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+            config, session,
+        )
+        .await
+        .map_err(AgentError::Tool)?
+        {
+            Some(store) => {
+                crate::capability_discovery::CapabilityDiscoveryIndex::from_resolved_classified_store(
+                    &searchable_tool_catalog,
+                    store.as_ref(),
+                    &eligibility,
+                )
+                .await
+            }
+            None => {
+                let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
+                let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
+                crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                    crate::capability_discovery::project_classified_tool_capability_metadata(
+                        &searchable_tool_catalog,
+                    ),
+                    &empty_skills,
+                    &empty_workflows,
+                    &eligibility,
+                )
+            }
+        };
+        Ok(Self { catalog, index })
+    }
+
+    fn discover_complete_schemas(
+        &self,
+        request: &DiscoverCapabilitiesRequest,
+    ) -> Result<Vec<bamboo_agent_core::tools::ToolSchema>, AgentError> {
+        let result = self
+            .index
+            .discover(request)
+            .map_err(|error| AgentError::LLM(format!("capability discovery failed: {error}")))?;
+        let mut matches_by_function = Vec::<(String, Vec<_>)>::new();
+        for matched in &result.matches {
+            let name = match &matched.invocation_target {
+                CapabilityInvocationTarget::Tool { name }
+                | CapabilityInvocationTarget::Skill { name, .. }
+                | CapabilityInvocationTarget::Workflow { name, .. } => name,
+            };
+            if let Some((_, matches)) = matches_by_function
+                .iter_mut()
+                .find(|(function, _)| function == name)
+            {
+                matches.push(matched);
+            } else {
+                matches_by_function.push((name.clone(), vec![matched]));
+            }
+        }
+        let tools = matches_by_function
+            .into_iter()
+            .filter_map(|(name, matches)| {
+                let entry = self
+                    .catalog
+                    .iter()
+                    .find(|entry| entry.execution_name() == name)?;
+                if entry.loading_class() != CapabilityLoadingClass::Deferred {
+                    return None;
+                }
+                Some(scope_discovered_gateway_schema(entry, &matches))
+            })
+            .collect::<Vec<_>>();
+        Ok(tools)
+    }
+}
+
+fn sticky_discovery_call_ids(session: &Session) -> BTreeSet<&str> {
+    session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Assistant))
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+        .map(|call| call.id.as_str())
+        .collect()
+}
+
+fn sticky_result_definition_values(message: &Message) -> Option<Vec<serde_json::Value>> {
+    let body = message
+        .content
+        .strip_prefix(STICKY_DISCOVERY_RESULT_START)?
+        .strip_suffix(STICKY_DISCOVERY_RESULT_END)?;
+    let payload = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    payload["tools"].as_array().cloned()
+}
+
+fn sticky_definition_name(definition: &serde_json::Value) -> Option<&str> {
+    (definition["type"].as_str() == Some("function"))
+        .then(|| definition["function"]["name"].as_str())
+        .flatten()
+}
+
+fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
+    let call_ids = sticky_discovery_call_ids(session);
+    session
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, Role::Tool)
+                && message.tool_success == Some(true)
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|call_id| call_ids.contains(call_id))
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"].as_str() == Some(STICKY_DISCOVERY_RUNTIME_KIND)
+                        && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
+                        && metadata["canonical_new_names"].is_array()
+                })
+                && sticky_result_definition_values(message).is_some()
+        })
+        .collect()
+}
+
+fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String> {
+    let mut loaded = Vec::new();
+    for message in validated_sticky_fallback_results(session) {
+        let definition_names = sticky_result_definition_values(message)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|definition| sticky_definition_name(&definition).map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        let Some(names) = message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata["canonical_new_names"].as_array())
+        else {
+            continue;
+        };
+        for name in names.iter().filter_map(serde_json::Value::as_str) {
+            if definition_names.contains(name) && !loaded.iter().any(|seen| seen == name) {
+                loaded.push(name.to_string());
+            }
+        }
+    }
+    loaded
+}
+
+fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
+    validated_sticky_fallback_results(session)
+        .into_iter()
+        .filter_map(sticky_result_definition_values)
+        .flatten()
+        .collect()
+}
+
+fn sticky_fallback_definition_delta(
+    session: &Session,
+    schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+    let previous = prior_sticky_fallback_definitions(session);
+    let mut definitions = schemas
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    definitions.retain(|definition| !previous.contains(definition));
+    Ok(definitions)
+}
+
+fn sticky_fallback_tool_result(
+    tool_call_id: &str,
+    content: String,
+    success: bool,
+    canonical_new_names: &[String],
+) -> Message {
+    let mut message = Message::tool_result_with_status(tool_call_id, content, success);
+    message.never_compress = true;
+    message.metadata = Some(serde_json::json!({
+        "runtime_kind": STICKY_DISCOVERY_RUNTIME_KIND,
+        "version": STICKY_DISCOVERY_RUNTIME_VERSION,
+        "canonical_new_names": canonical_new_names,
+    }));
+    message
+}
+
+async fn commit_sticky_fallback_discovery_round(
+    stream_output: StreamHandlingOutput,
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<(), AgentError> {
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
+    let tool_calls = stream_output.tool_calls;
+    let mut assistant = Message::assistant_with_reasoning(
+        stream_output.content,
+        Some(tool_calls.clone()),
+        reasoning,
+    )
+    .with_reasoning_signature(reasoning_signature);
+    assistant.never_compress = true;
+    assistant.metadata = Some(serde_json::json!({
+        "runtime_kind": STICKY_DISCOVERY_RUNTIME_KIND,
+        "version": STICKY_DISCOVERY_RUNTIME_VERSION,
+    }));
+    let mut native_items = Some(stream_output.provider_transcript_items);
+    commit_assistant_message(session, assistant, &mut native_items)?;
+
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "sticky discovery assistant checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+
+    let discovery_is_alone = tool_calls.len() == 1
+        && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+    if !discovery_is_alone {
+        const ERROR: &str = "discovery must be called alone";
+        for call in &tool_calls {
+            session.add_message(sticky_fallback_tool_result(
+                &call.id,
+                ERROR.to_string(),
+                false,
+                &[],
+            ));
+        }
+    } else {
+        let call = &tool_calls[0];
+        let discovery_result =
+            serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
+                .map_err(|error| format!("invalid discovery arguments: {error}"));
+        let definitions = match discovery_result {
+            Ok(request) => match CompleteCapabilityDiscovery::new(session, config, tool_schemas)
+                .await
+                .and_then(|discovery| discovery.discover_complete_schemas(&request))
+            {
+                Ok(schemas) => {
+                    sticky_fallback_definition_delta(session, &schemas).map_err(|error| {
+                        format!("discovered tool definitions could not be serialized: {error}")
+                    })
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        };
+        match definitions {
+            Ok(definitions) => {
+                let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let mut canonical_new_names = Vec::new();
+                for name in definitions.iter().filter_map(sticky_definition_name) {
+                    if !already_loaded.contains(name)
+                        && !canonical_new_names.iter().any(|seen| seen == name)
+                    {
+                        canonical_new_names.push(name.to_string());
+                    }
+                }
+                let payload = serde_json::to_string(&serde_json::json!({
+                    "tools": definitions
+                }))
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "sticky discovery result could not be serialized: {error}"
+                    ))
+                })?;
+                session.add_message(sticky_fallback_tool_result(
+                    &call.id,
+                    format!(
+                        "{STICKY_DISCOVERY_RESULT_START}{payload}{STICKY_DISCOVERY_RESULT_END}"
+                    ),
+                    true,
+                    &canonical_new_names,
+                ));
+            }
+            Err(error) => {
+                session.add_message(sticky_fallback_tool_result(
+                    &call.id,
+                    format!("capability discovery failed: {error}"),
+                    false,
+                    &[],
+                ));
+            }
+        }
+    }
+
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "sticky discovery result checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+async fn build_openai_client_tool_search_outputs(
+    session: &Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    provider_items: &[ProviderTranscriptItem],
+) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+    let requests = openai_client_tool_search_requests(provider_items)?;
+    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas).await?;
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (call_id, request) in requests {
+        let tools = discovery
+            .discover_complete_schemas(&request)?
+            .iter()
+            .map(bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json)
+            .collect::<Vec<_>>();
+        let item = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({
+                "type": "tool_search_output",
+                "execution": "client",
+                "call_id": call_id,
+                "status": "completed",
+                "tools": tools,
+            }),
+        )
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "OpenAI client tool-search output could not be constructed: {error}"
+            ))
+        })?;
+        outputs.push(item);
+    }
+    Ok(outputs)
+}
+
+async fn commit_openai_client_tool_search_round(
+    stream_output: StreamHandlingOutput,
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<(), AgentError> {
+    let host_outputs = build_openai_client_tool_search_outputs(
+        session,
+        config,
+        tool_schemas,
+        &stream_output.provider_transcript_items,
+    )
+    .await?;
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
+    let message = Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+        .with_reasoning_signature(reasoning_signature);
+    let anchor = message.id.clone();
+    let mut provider_items = Some(stream_output.provider_transcript_items);
+    commit_assistant_message(session, message, &mut provider_items)?;
+    for output in host_outputs {
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "OpenAI client tool-search result could not be committed: {error}"
+                ))
+            })?;
+    }
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "OpenAI client tool-search checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -115,22 +747,26 @@ struct TurnOutcome {
 
 // ---- Per-run resource guardrails (issue #221) ----
 
-/// The `SubAgent` tool's name (see `bamboo-server-tools::sub_agent::SubAgentTool`).
-/// Duplicated here as a plain string — the engine has no dependency on the
-/// server-tools crate that owns the tool — purely to COUNT spawn attempts for
-/// the per-run `max_subagents` budget guardrail below; it never affects
-/// dispatch. A tool rename must update both sites.
+/// Child-spawning tool names owned by `bamboo-server-tools`.
+///
+/// Duplicated here as plain strings — the engine has no dependency on the
+/// server-tools crate that owns them — purely to COUNT spawn attempts for the
+/// per-run `max_subagents` budget guardrail below; they never affect dispatch.
+/// A tool rename must update both sites.
 const SUBAGENT_TOOL_NAME: &str = "SubAgent";
+const PLAN_TOOL_NAME: &str = "Plan";
 
-/// True when `call` is a `SubAgent` tool call that creates a NEW child: its
-/// `action` argument is `"create"`, or the argument is absent/unparsable (the
-/// tool's own legacy default — see `SubAgentArgs`'s `#[serde(tag = "action")]`
-/// in `bamboo-server-tools`). Every other action (`wait`/`list`/`get`/
-/// `update`/`run`/`send_message`/`cancel`/`delete`/`list_models`) manages an
-/// EXISTING child and is not counted against the spawn budget.
-fn is_subagent_create_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
-    if call.function.name != SUBAGENT_TOOL_NAME {
-        return false;
+/// True when `call` creates one new child session.
+///
+/// Every `Plan` call creates exactly one one-shot planner child. A `SubAgent`
+/// call counts only when its `action` is `"create"`, or when the action is
+/// absent/unparsable (the tool's legacy create default). All other SubAgent
+/// actions manage existing children and do not consume the spawn budget.
+fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
+    match call.function.name.as_str() {
+        PLAN_TOOL_NAME => return true,
+        SUBAGENT_TOOL_NAME => {}
+        _ => return false,
     }
     serde_json::from_str::<serde_json::Value>(&call.function.arguments)
         .ok()
@@ -192,7 +828,7 @@ impl RoundActivity {
             stream_output
                 .tool_calls
                 .iter()
-                .filter(|call| is_subagent_create_call(call))
+                .filter(|call| is_child_spawn_call(call))
                 .count() as u32,
         );
     }
@@ -1242,6 +1878,33 @@ fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLo
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
+fn commit_assistant_message(
+    session: &mut Session,
+    message: Message,
+    native_items: &mut Option<Vec<ProviderTranscriptItem>>,
+) -> Result<(), AgentError> {
+    let anchor = message.id.clone();
+    let previous_updated_at = session.updated_at;
+    session.add_message(message);
+    let Some(items) = native_items.take().filter(|items| !items.is_empty()) else {
+        return Ok(());
+    };
+    if let Err(error) = session.append_provider_transcript_group(&anchor, None, items) {
+        if session
+            .messages
+            .last()
+            .is_some_and(|message| message.id == anchor)
+        {
+            session.messages.pop();
+            session.updated_at = previous_updated_at;
+        }
+        return Err(AgentError::LLM(format!(
+            "provider-native transcript group rejected: {error}"
+        )));
+    }
+    Ok(())
+}
+
 /// Record the terminal `Complete` round metrics for a no-tool-calls turn. Shared
 /// by the gold-continue and the completion branches of [`handle_no_tool_calls`].
 fn record_no_tool_calls_round_completed(
@@ -1292,7 +1955,7 @@ fn record_no_tool_calls_round_completed(
 /// guardian runs exactly as before; with no guardian configured the goal loop
 /// runs exactly as before.
 #[allow(clippy::too_many_arguments)]
-async fn handle_no_tool_calls(
+async fn handle_no_tool_calls_with_native(
     content: String,
     reasoning: Option<String>,
     reasoning_signature: Option<String>,
@@ -1310,6 +1973,7 @@ async fn handle_no_tool_calls(
     eval_model: &str,
     iteration: u32,
     llm: Arc<dyn LLMProvider>,
+    provider_transcript_items: Vec<ProviderTranscriptItem>,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -1324,9 +1988,10 @@ async fn handle_no_tool_calls(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
     );
+    let mut native_items = Some(provider_transcript_items);
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
-            session.add_message(message);
+            commit_assistant_message(session, message, &mut native_items)?;
         }
     }
 
@@ -1425,7 +2090,7 @@ async fn handle_no_tool_calls(
             if runtime_state.stop_hook_forced_continuations < MAX_STOP_HOOK_CONTINUATIONS {
                 runtime_state.stop_hook_forced_continuations += 1;
                 if let Some(message) = deferred_assistant_message.take() {
-                    session.add_message(message);
+                    commit_assistant_message(session, message, &mut native_items)?;
                 }
                 let extra_context = outcome
                     .injected_contexts
@@ -1481,7 +2146,7 @@ async fn handle_no_tool_calls(
     }
 
     if let Some(message) = deferred_assistant_message.take() {
-        session.add_message(message);
+        commit_assistant_message(session, message, &mut native_items)?;
     }
     let _ = event_tx
         .send(AgentEvent::Complete {
@@ -1499,6 +2164,50 @@ async fn handle_no_tool_calls(
         should_break: true,
         sent_complete: true,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_no_tool_calls(
+    content: String,
+    reasoning: Option<String>,
+    reasoning_signature: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    round_usage: MetricsTokenUsage,
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    metrics_collector: Option<&MetricsCollector>,
+    round_id: &str,
+    session_id: &str,
+    config: &AgentLoopConfig,
+    task_context: &Option<TaskLoopContext>,
+    eval_model: &str,
+    iteration: u32,
+    llm: Arc<dyn LLMProvider>,
+) -> Result<TurnOutcome, AgentError> {
+    handle_no_tool_calls_with_native(
+        content,
+        reasoning,
+        reasoning_signature,
+        prompt_tokens,
+        completion_tokens,
+        round_usage,
+        session,
+        runtime_state,
+        event_tx,
+        metrics_collector,
+        round_id,
+        session_id,
+        config,
+        task_context,
+        eval_model,
+        iteration,
+        llm,
+        Vec::new(),
+    )
+    .await
 }
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
@@ -1522,14 +2231,17 @@ async fn handle_tool_calls_path(
     let reasoning_signature = reasoning
         .as_ref()
         .and_then(|_| stream_output.reasoning_signature.clone());
-    session.add_message(
+    let mut native_items = Some(stream_output.provider_transcript_items.clone());
+    commit_assistant_message(
+        session,
         Message::assistant_with_reasoning(
             stream_output.content,
             Some(stream_output.tool_calls.clone()),
             reasoning,
         )
         .with_reasoning_signature(reasoning_signature),
-    );
+        &mut native_items,
+    )?;
 
     // Tool calls are a durable conversation boundary. In particular,
     // repository-backed tools such as load_skill update metadata through a
@@ -1555,8 +2267,20 @@ async fn handle_tool_calls_path(
             frame.session_id
         );
     }
-    let tool_schemas =
+    let eligible_tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
+    let required_tool = crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
+    let request_tool_schemas = crate::runtime::runner::round_lifecycle::effective_tool_schemas(
+        session,
+        &eligible_tool_schemas,
+    );
+    let tool_schemas = request_tool_schemas.as_ref();
+    let capability_loading_mode = frame
+        .llm
+        .capability_loading_mode(model_name, required_tool)
+        .await;
+    let effective_callable_set =
+        effective_callable_set_for_round(session, tool_schemas, capability_loading_mode);
 
     // Tool execution can block for a long time (up to parallel_batch_timeout_secs,
     // default 300s, and per_tool_timeout_secs for single tools). The loop only
@@ -1589,7 +2313,8 @@ async fn handle_tool_calls_path(
                     .summarization_model_provider
                     .as_ref()
                     .or(auxiliary_models.background_model_provider.as_ref()),
-                tool_schemas: &tool_schemas,
+                tool_schemas,
+                effective_callable_set: &effective_callable_set,
             },
         ) => result?,
     };
@@ -1841,6 +2566,12 @@ async fn run_pipeline_inner(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
+    if config.run_budget.max_rounds == Some(0) {
+        return Err(AgentError::Budget(
+            "run_budget.max_rounds must be at least 1".to_string(),
+        ));
+    }
+
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -1930,7 +2661,10 @@ async fn run_pipeline_inner(
             hook_result?;
         }
 
-        // --- Prompt context refresh ---
+        // --- Turn-boundary refresh, cancellation, and prompt context ---
+        // Admit durable input before deriving this round's memory query. The
+        // shared prelude also checks cancellation before Project/external-memory
+        // work and again before provider dispatch.
         let runtime_context = PromptMemoryRuntimeContext {
             llm: state
                 .auxiliary_models
@@ -1939,18 +2673,22 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        crate::runtime::runner::round_prelude::refresh_round_prompt_context(
-            session,
-            config.prompt_memory_flags,
-            Some(&runtime_context),
-            config.project_context_resolver.as_deref(),
-        )
-        .await?;
+        let prompt_memory_exposure =
+            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+                session,
+                &mut state.runtime_state,
+                config,
+                Some(event_tx),
+                cancel_token,
+                state.metrics_collector.as_ref(),
+                Some(&runtime_context),
+            )
+            .await?;
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
             ctx.current_round = turn_counter;
-            ctx.max_rounds = config.max_rounds as u32;
+            ctx.max_rounds = config.run_budget.max_rounds;
         }
 
         // --- Debug log ---
@@ -1960,7 +2698,7 @@ async fn run_pipeline_inner(
                 state.session_id,
                 serde_json::json!({
                     "round": turn_counter + 1,
-                    "total_rounds": config.max_rounds,
+                    "round_cap": config.run_budget.max_rounds,
                     "message_count": session.messages.len(),
                 })
             );
@@ -1974,62 +2712,6 @@ async fn run_pipeline_inner(
             })
             .await;
 
-        // --- Turn-boundary refresh from disk: messages + live permission mode ---
-        // A single load also picks up a mid-run `PATCH /sessions
-        // {permission_mode|bypass_permissions}`: the run owns a Session taken at
-        // spawn and never otherwise re-reads storage, so without this a mode
-        // transition would not take effect until the next run. Adopt the disk
-        // value onto BOTH the live runtime state and the owned session so this
-        // round's per-tool-call flags see it. #540/#770.
-        if let Some(notifications) = config.session_activation_notifications.as_ref() {
-            let mut receiver = notifications.lock();
-            if receiver.has_changed().unwrap_or(false) {
-                let generation = *receiver.borrow_and_update();
-                tracing::debug!(
-                    session_id = %session.id,
-                    generation,
-                    "active loop consumed SessionInbox wake notification at safe boundary"
-                );
-            }
-        }
-        let turn_refresh = state_bridge::refresh_turn_boundary_with_inbox(
-            session,
-            config.storage.as_ref(),
-            config.persistence.as_ref(),
-            config.session_inbox.as_ref(),
-        )
-        .await;
-        if turn_refresh.merged > 0 {
-            tracing::debug!(
-                session_id = %session.id,
-                admitted_messages = turn_refresh.merged,
-                "turn boundary admitted durable SessionInbox work"
-            );
-        }
-        if let Some(disk_mode) = turn_refresh.disk_permission_mode {
-            state.runtime_state.set_permission_mode(disk_mode);
-            session
-                .agent_runtime_state
-                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .set_permission_mode(disk_mode);
-        }
-
-        // --- Cancellation check ---
-        if cancel_token.is_cancelled() {
-            crate::runtime::runner::metrics_lifecycle::record_session_cancelled(
-                state.metrics_collector.as_ref(),
-                &state.session_id,
-                session.messages.len() as u32,
-            );
-            // Abort any in-flight Gold/Task eval before returning: this early exit
-            // skips the post-loop drain, so without this the handle would be
-            // dropped (detached, not aborted) and the eval would keep running its
-            // LLM request to completion — wasted spend + a late event onto the
-            // already-ended stream (issue #347).
-            abort_in_flight_evaluations(state, event_tx, "run_cancelled").await;
-            return Err(AgentError::Cancelled);
-        }
-
         // --- Metrics: round started ---
         crate::runtime::runner::metrics_lifecycle::record_round_started(
             state.metrics_collector.as_ref(),
@@ -2039,8 +2721,7 @@ async fn run_pipeline_inner(
         );
 
         // --- Resolve tool schemas ---
-        let tool_schemas =
-            resolve_available_tool_schemas_for_session(config, tools.as_ref(), session);
+        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
@@ -2055,7 +2736,36 @@ async fn run_pipeline_inner(
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
 
-        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS {
+        if config.goal_loop_active() {
+            let goal = crate::runtime::goal_state::ensure_goal_state(
+                session,
+                config.active_goal().expect("active goal"),
+            );
+            crate::runtime::goal_state::write_goal_state(session, goal);
+        }
+        let extra_attempts = if config.goal_loop_active() {
+            config
+                .gold_config
+                .as_ref()
+                .map_or(0, |gold| gold.recovery.max_attempts.min(10)) as usize
+        } else {
+            0
+        };
+        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
+            if config.goal_loop_active() && extra_attempts > 0 {
+                if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
+                    session,
+                    Utc::now().timestamp_millis(),
+                ) {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            terminal_error = Some(AgentError::Cancelled);
+                            break;
+                        },
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    }
+                }
+            }
             // Retry cleanup may remove only an interrupted record created by
             // THIS attempt.  An older durable interrupted tail can legitimately
             // be the session's starting point and must never be mistaken for a
@@ -2071,6 +2781,12 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
+                Some(
+                    crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
+                        round_id: &round_id,
+                        provenance: &prompt_memory_exposure,
+                    },
+                ),
             )
             .await
             {
@@ -2101,12 +2817,21 @@ async fn run_pipeline_inner(
                             MAX_LLM_TURN_ATTEMPTS,
                             error,
                         );
+                        let overflow_tool_schemas =
+                            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                                session,
+                                &llm,
+                                &state.model_name,
+                                &tool_schemas,
+                            )
+                            .await;
                         let recovered =
                             match crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
                                 session,
                                 config,
                                 &state.model_name,
                                 &state.session_id,
+                                overflow_tool_schemas.as_ref(),
                                 &llm,
                                 Some(event_tx),
                             )
@@ -2147,6 +2872,12 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
+                                Some(
+                                    crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
+                                        round_id: &round_id,
+                                        provenance: &prompt_memory_exposure,
+                                    },
+                                ),
                             )
                             .await
                             {
@@ -2192,9 +2923,66 @@ async fn run_pipeline_inner(
                             error,
                             delay_ms
                         );
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                terminal_error = Some(AgentError::Cancelled);
+                                break;
+                            },
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        }
                         continue;
                     } else {
+                        let mut recovery_budget_state = state.runtime_state.clone();
+                        round_activity.commit_to_runtime(&mut recovery_budget_state);
+                        let recovery_delay = if attempt >= MAX_LLM_TURN_ATTEMPTS
+                            && config.goal_loop_active()
+                            && state.runtime_state.suspension.is_none()
+                            && state.runtime_state.waiting_for_children.is_none()
+                            && state.runtime_state.waiting_for_bash.is_none()
+                            && check_run_budget_exceeded(
+                                &recovery_budget_state.round,
+                                &config.run_budget,
+                            )
+                            .is_none()
+                            && config.persistence.is_some()
+                        {
+                            crate::runtime::goal_recovery::reserve_retry(
+                                session,
+                                &config
+                                    .gold_config
+                                    .as_ref()
+                                    .expect("active goal config")
+                                    .recovery,
+                                &error,
+                                Utc::now().timestamp_millis(),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(delay_ms) = recovery_delay {
+                            // Persist billed activity with the retry reservation. The live
+                            // round accumulator is committed once at the terminal boundary.
+                            state_bridge::write_runtime_state(session, &recovery_budget_state);
+                            config
+                                .persistence
+                                .as_ref()
+                                .expect("checked persistence")
+                                .checkpoint_runtime_session(session)
+                                .await
+                                .map_err(|error| {
+                                    AgentError::LLM(format!(
+                                        "Goal recovery checkpoint failed: {error}"
+                                    ))
+                                })?;
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    terminal_error = Some(AgentError::Cancelled);
+                                    break;
+                                },
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                            }
+                            continue;
+                        }
                         tracing::error!(
                             "[{}] Turn {} LLM call failed terminally (attempt {}/{}): {}",
                             state.session_id,
@@ -2228,6 +3016,34 @@ async fn run_pipeline_inner(
                 };
 
             if stream_output.tool_calls.is_empty() {
+                if crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
+                    &stream_output.provider_transcript_items,
+                ) {
+                    match commit_openai_client_tool_search_round(
+                        stream_output,
+                        session,
+                        config,
+                        &tool_schemas,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            record_no_tool_calls_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session,
+                                round_activity.token_usage(),
+                            );
+                            turn_outcome = Some(TurnOutcome {
+                                should_break: false,
+                                sent_complete: false,
+                            });
+                        }
+                        Err(error) => terminal_error = Some(error),
+                    }
+                    break;
+                }
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
@@ -2266,7 +3082,7 @@ async fn run_pipeline_inner(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
-                match handle_no_tool_calls(
+                match handle_no_tool_calls_with_native(
                     stream_output.content,
                     reasoning,
                     reasoning_signature,
@@ -2284,6 +3100,7 @@ async fn run_pipeline_inner(
                     &eval_model,
                     turn_counter + 1,
                     llm.clone(),
+                    stream_output.provider_transcript_items,
                 )
                 .await
                 {
@@ -2301,6 +3118,42 @@ async fn run_pipeline_inner(
                             round_activity.token_usage(),
                         );
                         hook_suspension = Some(error);
+                    }
+                    Err(error) => terminal_error = Some(error),
+                }
+                break;
+            }
+
+            let required_tool =
+                crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
+            let capability_loading_mode = llm
+                .capability_loading_mode(&state.model_name, required_tool)
+                .await;
+            if capability_loading_mode == CapabilityLoadingMode::StickyFallback
+                && stream_output.tool_calls.iter().any(|call| {
+                    call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+                })
+            {
+                match commit_sticky_fallback_discovery_round(
+                    stream_output,
+                    session,
+                    config,
+                    &tool_schemas,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        record_no_tool_calls_round_completed(
+                            state.metrics_collector.as_ref(),
+                            &round_id,
+                            &state.session_id,
+                            session,
+                            round_activity.token_usage(),
+                        );
+                        turn_outcome = Some(TurnOutcome {
+                            should_break: false,
+                            sent_complete: false,
+                        });
                     }
                     Err(error) => terminal_error = Some(error),
                 }
@@ -2737,10 +3590,16 @@ async fn run_pipeline_inner(
             break;
         }
 
-        // --- Guard against max_rounds (issue #29) ---
+        // --- Guard against the run's round cap (issue #29) ---
         //
-        // Hitting the round budget must be DISTINGUISHABLE from a normal
-        // completion, not silent. On exhaustion we:
+        // The cap is `config.run_budget.max_rounds` — `None` (the default)
+        // means UNLIMITED rounds: this guard is skipped entirely and the run
+        // ends only when the model stops calling tools, another guardrail
+        // trips, or the run is cancelled. The historical hard-coded 200 was
+        // removed in favor of this opt-in budget field.
+        //
+        // When a cap IS configured, hitting it must be DISTINGUISHABLE from a
+        // normal completion, not silent. On exhaustion we:
         //   1. stamp `runtime.completion_reason` = "max_rounds_reached"
         //      (mirroring the `runtime.suspend_reason` convention) so the
         //      finalize/Complete path — and the UI reading session metadata —
@@ -2755,39 +3614,41 @@ async fn run_pipeline_inner(
         // unconditionally — regardless of what that turn did (including ignoring
         // the instruction and emitting more tool calls). It can therefore never
         // recurse or extend the loop indefinitely.
-        if turn_counter >= config.max_rounds as u32 {
-            if !max_rounds_summary_used {
-                tracing::warn!(
-                    "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
-                    state.session_id,
-                    config.max_rounds
-                );
-                session.metadata.insert(
-                    "runtime.completion_reason".to_string(),
-                    "max_rounds_reached".to_string(),
-                );
-                // Single visible user turn that both notifies the user WHY the
-                // run stopped and prompts the model to summarize. It MUST be one
-                // message: two consecutive user messages would violate strict
-                // role alternation (Anthropic 400s on it), breaking the summary
-                // turn and the next resume. One user turn keeps alternation valid
-                // (a preceding Tool message is merged into it by the serializer).
-                session.add_message(Message::user(format!(
-                    "Reached the maximum of {0} rounds; the task was stopped before \
-                     completion. Stop working now and summarize your progress so far \
-                     and what remains.",
-                    config.max_rounds
-                )));
-                max_rounds_summary_used = true;
-                continue;
-            }
+        if let Some(max_rounds) = config.run_budget.max_rounds {
+            if turn_counter >= max_rounds {
+                if !max_rounds_summary_used {
+                    tracing::warn!(
+                        "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
+                        state.session_id,
+                        max_rounds
+                    );
+                    session.metadata.insert(
+                        "runtime.completion_reason".to_string(),
+                        "max_rounds_reached".to_string(),
+                    );
+                    // Single visible user turn that both notifies the user WHY the
+                    // run stopped and prompts the model to summarize. It MUST be one
+                    // message: two consecutive user messages would violate strict
+                    // role alternation (Anthropic 400s on it), breaking the summary
+                    // turn and the next resume. One user turn keeps alternation valid
+                    // (a preceding Tool message is merged into it by the serializer).
+                    session.add_message(Message::user(format!(
+                        "Reached the maximum of {0} rounds; the task was stopped before \
+                         completion. Stop working now and summarize your progress so far \
+                         and what remains.",
+                        max_rounds
+                    )));
+                    max_rounds_summary_used = true;
+                    continue;
+                }
 
-            tracing::warn!(
-                "[{}] Reached max rounds ({}) — stopping the run before completion.",
-                state.session_id,
-                config.max_rounds
-            );
-            break;
+                tracing::warn!(
+                    "[{}] Reached max rounds ({}) — stopping the run before completion.",
+                    state.session_id,
+                    max_rounds
+                );
+                break;
+            }
         }
     }
 
@@ -2857,7 +3718,7 @@ fn heuristic_complexity(
     use crate::runtime::complexity_classifier::TaskComplexity;
 
     let simple_tools = ["Read", "Glob", "Grep", "Bash"];
-    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
+    let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
         .iter()
@@ -2880,10 +3741,18 @@ mod tests {
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, build_guardian_review_prompt,
-        check_run_budget_exceeded, is_overflow_recoverable, is_subagent_create_call,
-        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
-        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
-        should_retry_turn_error, suspend_to_wait_for_bash, validate_explicit_activation_first_step,
+        build_openai_client_tool_search_outputs, check_run_budget_exceeded,
+        commit_assistant_message, commit_openai_client_tool_search_round,
+        commit_sticky_fallback_discovery_round, effective_callable_set_for_round,
+        is_child_spawn_call, is_overflow_recoverable, is_terminal_child_status,
+        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        maybe_suspend_for_outstanding_bash, scope_discovered_gateway_schema,
+        should_retry_turn_error, sticky_fallback_definition_delta, sticky_fallback_tool_result,
+        sticky_result_definition_values, suspend_to_wait_for_bash,
+        validate_explicit_activation_first_step, validated_sticky_fallback_loaded_tool_names,
+    };
+    use crate::project_context::{
+        ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
@@ -2898,7 +3767,11 @@ mod tests {
     use bamboo_agent_core::{
         AgentError, AgentEvent, AgentHook, Message, Session, StreamTimeoutError, StreamTimeoutPhase,
     };
-    use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
+    use bamboo_domain::{
+        AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, ProjectId,
+        ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort,
+        SessionMessageEnvelope,
+    };
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -2907,6 +3780,7 @@ mod tests {
     use chrono::Utc;
     use futures::stream;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -2932,6 +3806,959 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    fn native_client_search_item_with_arguments(
+        call_id: &str,
+        arguments: serde_json::Value,
+    ) -> bamboo_domain::ProviderTranscriptItem {
+        bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","id":format!("tsc_pipeline_{call_id}"),
+                "execution":"client","call_id":call_id,
+                "status":"completed","arguments":arguments
+            }),
+        )
+        .unwrap()
+    }
+
+    fn native_client_search_item_for(
+        call_id: &str,
+        query: &str,
+    ) -> bamboo_domain::ProviderTranscriptItem {
+        native_client_search_item_with_arguments(call_id, serde_json::json!({"query":query}))
+    }
+
+    fn native_client_search_item() -> bamboo_domain::ProviderTranscriptItem {
+        native_client_search_item_for("search_1", "orders")
+    }
+
+    fn loading_test_schema(name: &str) -> bamboo_agent_core::tools::ToolSchema {
+        loading_test_schema_with_description(name, "")
+    }
+
+    fn loading_test_schema_with_description(
+        name: &str,
+        description: &str,
+    ) -> bamboo_agent_core::tools::ToolSchema {
+        bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }
+    }
+
+    #[test]
+    fn discovered_catalog_gateways_are_scoped_to_matching_ids_and_metadata() {
+        let skill_gateway =
+            bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "Load one instruction Skill".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{
+                            "skill_id":{"type":"string"},
+                            "detail":{"type":"string"}
+                        },
+                        "required":["skill_id"]
+                    }),
+                },
+            })
+            .unwrap();
+        let skill_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "skill:review-helper".to_string(),
+            kind: bamboo_domain::CapabilityKind::Skill,
+            display_name: "Review Helper".to_string(),
+            summary: "Review a change".to_string(),
+            source: bamboo_domain::CapabilitySource::User,
+            revision: Some(7),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                name: "load_skill".to_string(),
+                skill_id: "review-helper".to_string(),
+                source: bamboo_domain::CapabilitySource::User,
+                revision: 7,
+            },
+        };
+        let second_skill_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "skill:lint-helper".to_string(),
+            kind: bamboo_domain::CapabilityKind::Skill,
+            display_name: "Lint Helper".to_string(),
+            summary: "Run focused lint checks".to_string(),
+            source: bamboo_domain::CapabilitySource::Project,
+            revision: Some(3),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                name: "load_skill".to_string(),
+                skill_id: "lint-helper".to_string(),
+                source: bamboo_domain::CapabilitySource::Project,
+                revision: 3,
+            },
+        };
+        let skill_schema =
+            scope_discovered_gateway_schema(&skill_gateway, &[&skill_match, &second_skill_match]);
+        let skill = bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+            &skill_schema,
+        );
+        assert_eq!(
+            skill["parameters"]["properties"]["skill_id"]["enum"],
+            serde_json::json!(["review-helper", "lint-helper"])
+        );
+        assert!(!skill["parameters"]["properties"]["skill_id"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("unmatched-skill")));
+        assert_eq!(
+            skill["parameters"]["properties"]["detail"]["type"], "string",
+            "the rest of the real gateway schema remains complete"
+        );
+        assert!(skill["description"]
+            .as_str()
+            .unwrap()
+            .contains("revision=7"));
+        assert!(skill["description"]
+            .as_str()
+            .unwrap()
+            .contains("source=user"));
+        let skill_description = skill["description"].as_str().unwrap();
+        let first_skill = skill_description
+            .find("review-helper — Review Helper — Review a change [revision=7, source=user]")
+            .unwrap();
+        let second_skill = skill_description
+            .find(
+                "lint-helper — Lint Helper — Run focused lint checks [revision=3, source=project]",
+            )
+            .unwrap();
+        assert!(
+            first_skill < second_skill,
+            "discovery relevance order is kept"
+        );
+
+        let workflow_gateway =
+            bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "workflow_run".to_string(),
+                    description: "Run a catalog Workflow".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{
+                            "action":{"type":"string","enum":["start","list"]},
+                            "workflow_id":{"type":"string"},
+                            "revision":{"type":"integer","minimum":1}
+                        },
+                        "required":["action"],
+                        "additionalProperties":false
+                    }),
+                },
+            })
+            .unwrap();
+        let workflow_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "workflow:review-pipeline".to_string(),
+            kind: bamboo_domain::CapabilityKind::Workflow,
+            display_name: "Review Pipeline".to_string(),
+            summary: "Review a repository".to_string(),
+            source: bamboo_domain::CapabilitySource::Workspace,
+            revision: Some(9),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Workflow {
+                name: "workflow_run".to_string(),
+                workflow_id: "review-pipeline".to_string(),
+                source: bamboo_domain::CapabilitySource::Workspace,
+                revision: 9,
+            },
+        };
+        let second_workflow_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "workflow:lint-pipeline".to_string(),
+            kind: bamboo_domain::CapabilityKind::Workflow,
+            display_name: "Lint Pipeline".to_string(),
+            summary: "Lint the selected package".to_string(),
+            source: bamboo_domain::CapabilitySource::Project,
+            revision: Some(4),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Workflow {
+                name: "workflow_run".to_string(),
+                workflow_id: "lint-pipeline".to_string(),
+                source: bamboo_domain::CapabilitySource::Project,
+                revision: 4,
+            },
+        };
+        let workflow_schema = scope_discovered_gateway_schema(
+            &workflow_gateway,
+            &[&workflow_match, &second_workflow_match],
+        );
+        let workflow =
+            bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+                &workflow_schema,
+            );
+        assert_eq!(
+            workflow["parameters"]["properties"]["workflow_id"]["enum"],
+            serde_json::json!(["review-pipeline", "lint-pipeline"])
+        );
+        assert_eq!(
+            workflow["parameters"]["properties"]["revision"]["enum"],
+            serde_json::json!([9, 4])
+        );
+        assert!(!workflow["parameters"]["properties"]["workflow_id"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("unmatched-workflow")));
+        assert_eq!(
+            workflow["parameters"]["properties"]["action"]["enum"],
+            serde_json::json!(["start", "list"])
+        );
+        assert!(workflow["description"]
+            .as_str()
+            .unwrap()
+            .contains("revision=9"));
+        assert!(workflow["description"]
+            .as_str()
+            .unwrap()
+            .contains("source=workspace"));
+        let workflow_description = workflow["description"].as_str().unwrap();
+        let first_workflow = workflow_description
+            .find(
+                "review-pipeline — Review Pipeline — Review a repository [revision=9, source=workspace]",
+            )
+            .unwrap();
+        let second_workflow = workflow_description
+            .find(
+                "lint-pipeline — Lint Pipeline — Lint the selected package [revision=4, source=project]",
+            )
+            .unwrap();
+        assert!(
+            first_workflow < second_workflow,
+            "workflow relevance order is kept"
+        );
+    }
+
+    #[test]
+    fn sticky_skill_a_then_b_keeps_each_complete_definition_and_repeats_b_as_empty() {
+        fn scoped_skill(
+            skill_id: &str,
+            display_name: &str,
+            summary: &str,
+            revision: u64,
+            source: bamboo_domain::CapabilitySource,
+        ) -> bamboo_agent_core::tools::ToolSchema {
+            let gateway =
+                bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                    schema_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionSchema {
+                        name: "load_skill".to_string(),
+                        description: "Load one instruction Skill".to_string(),
+                        parameters: serde_json::json!({
+                            "type":"object",
+                            "properties":{
+                                "skill_id":{"type":"string"},
+                                "detail":{"type":"string"}
+                            },
+                            "required":["skill_id"],
+                            "additionalProperties":false
+                        }),
+                    },
+                })
+                .unwrap();
+            let matched = bamboo_domain::CapabilityMatch {
+                capability_ref: format!("skill:{skill_id}"),
+                kind: bamboo_domain::CapabilityKind::Skill,
+                display_name: display_name.to_string(),
+                summary: summary.to_string(),
+                source,
+                revision: Some(revision),
+                status: bamboo_domain::CapabilityStatus::Valid,
+                invocation_policy: None,
+                invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                    name: "load_skill".to_string(),
+                    skill_id: skill_id.to_string(),
+                    source,
+                    revision,
+                },
+            };
+            scope_discovered_gateway_schema(&gateway, &[&matched])
+        }
+
+        fn append_sticky_definition(
+            session: &mut Session,
+            call_id: &str,
+            schema: &bamboo_agent_core::tools::ToolSchema,
+            canonical_new_names: &[String],
+        ) {
+            let mut assistant = Message::assistant(
+                "",
+                Some(vec![activation_call(
+                    call_id,
+                    bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                    r#"{"query":"skill"}"#,
+                )]),
+            );
+            assistant.never_compress = true;
+            session.add_message(assistant);
+            let payload = serde_json::to_string(&serde_json::json!({
+                "tools":[serde_json::to_value(schema).unwrap()]
+            }))
+            .unwrap();
+            session.add_message(sticky_fallback_tool_result(
+                call_id,
+                format!("<loaded_tools>{payload}</loaded_tools>"),
+                true,
+                canonical_new_names,
+            ));
+        }
+
+        let skill_a = scoped_skill(
+            "skill-a",
+            "Skill A",
+            "Review alpha changes",
+            3,
+            bamboo_domain::CapabilitySource::Project,
+        );
+        let skill_b = scoped_skill(
+            "skill-b",
+            "Skill B",
+            "Review beta changes",
+            5,
+            bamboo_domain::CapabilitySource::User,
+        );
+        let mut session = Session::new("sticky-skill-delta", "chat-model");
+        append_sticky_definition(
+            &mut session,
+            "skill-search-a",
+            &skill_a,
+            &["load_skill".to_string()],
+        );
+
+        let delta_b =
+            sticky_fallback_definition_delta(&session, std::slice::from_ref(&skill_b)).unwrap();
+        assert_eq!(delta_b, vec![serde_json::to_value(&skill_b).unwrap()]);
+        assert_eq!(
+            delta_b[0]["function"]["parameters"]["properties"]["skill_id"]["enum"],
+            serde_json::json!(["skill-b"])
+        );
+        assert!(delta_b[0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("skill-b — Skill B — Review beta changes [revision=5, source=user]"));
+
+        append_sticky_definition(&mut session, "skill-search-b", &skill_b, &[]);
+        assert!(
+            sticky_fallback_definition_delta(&session, std::slice::from_ref(&skill_b))
+                .unwrap()
+                .is_empty(),
+            "repeating the same scoped Skill B definition emits an empty delta"
+        );
+        assert_eq!(
+            super::prior_sticky_fallback_definitions(&session),
+            vec![
+                serde_json::to_value(&skill_a).unwrap(),
+                serde_json::to_value(&skill_b).unwrap()
+            ],
+            "different scoped definitions sharing load_skill remain independently visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_search_filters_core_before_applying_the_result_limit() {
+        let tools = vec![
+            loading_test_schema_with_description("Read", "Read repository files"),
+            loading_test_schema_with_description("ReadArchive", "Read archived repository files"),
+        ];
+        let call = native_client_search_item_with_arguments(
+            "search_deferred_limit",
+            serde_json::json!({"query":"read","kinds":["tool"],"limit":1}),
+        );
+        let outputs = build_openai_client_tool_search_outputs(
+            &Session::new("deferred-before-limit", "gpt-5.6"),
+            &AgentLoopConfig::default(),
+            &tools,
+            &[call],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].payload()["tools"],
+            serde_json::json!([{
+                "type":"function",
+                "name":"ReadArchive",
+                "description":"Read archived repository files",
+                "parameters":{"type":"object","properties":{}},
+                "strict":false,
+                "defer_loading":true
+            }]),
+            "the initially visible Core candidate must not consume limit=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_discovery_persists_canonical_delta_and_resumes_callable_membership() {
+        let mut deferred =
+            loading_test_schema_with_description("ReadArchive", "Read archived repository files");
+        deferred.function.parameters = serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string"}},
+            "required":["path"],
+            "additionalProperties":false
+        });
+        let tools = vec![
+            loading_test_schema_with_description("Read", "Read repository files"),
+            deferred,
+            loading_test_schema_with_description("Glob", "Match repository paths"),
+        ];
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("sticky-discovery", "chat-model");
+        let discovery_arguments = r#"{"query":"read","kinds":["tool"],"limit":1}"#;
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "sticky-search-1",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                discovery_arguments,
+            )),
+            &mut session,
+            &config,
+            &tools,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+        let assistant = &session.messages[0];
+        let result = &session.messages[1];
+        assert!(matches!(assistant.role, bamboo_agent_core::Role::Assistant));
+        assert!(matches!(result.role, bamboo_agent_core::Role::Tool));
+        assert_eq!(result.tool_call_id.as_deref(), Some("sticky-search-1"));
+        assert_eq!(result.tool_success, Some(true));
+        assert!(assistant.never_compress && result.never_compress);
+
+        let definitions = sticky_result_definition_values(result).unwrap();
+        assert_eq!(definitions.len(), 1);
+        let definition = &definitions[0];
+        assert_eq!(definition["type"], "function");
+        assert_eq!(definition["function"]["name"], "ReadArchive");
+        assert_eq!(
+            definition["function"]["parameters"],
+            tools[1].function.parameters
+        );
+        assert!(
+            definition.get("defer_loading").is_none(),
+            "fallback history uses the provider-neutral ToolSchema/Chat shape"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["canonical_new_names"],
+            serde_json::json!(["ReadArchive"])
+        );
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&session),
+            vec!["ReadArchive"]
+        );
+
+        let mut resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert!(resumed.messages[0].never_compress && resumed.messages[1].never_compress);
+        let resumed_effective = effective_callable_set_for_round(
+            &resumed,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        );
+        assert_eq!(
+            resumed_effective.resolve_callable_reference("ReadArchive"),
+            Some("ReadArchive".to_string())
+        );
+        assert_eq!(resumed_effective.resolve_callable_reference("Glob"), None);
+        assert_eq!(
+            resumed_effective.resolve_callable_reference("invented_tool"),
+            None
+        );
+
+        let forged_definition = serde_json::to_value(&tools[2]).unwrap();
+        resumed.add_message(Message::assistant(
+            "",
+            Some(vec![activation_call("ordinary-glob", "Glob", "{}")]),
+        ));
+        resumed.add_message(Message::tool_result_with_status(
+            "ordinary-glob",
+            format!(
+                "<loaded_tools>{}</loaded_tools>",
+                serde_json::json!({"tools":[forged_definition]})
+            ),
+            true,
+        ));
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&resumed),
+            vec!["ReadArchive"],
+            "an ordinary function call/result cannot manufacture loaded state"
+        );
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "sticky-search-2",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                discovery_arguments,
+            )),
+            &mut resumed,
+            &config,
+            &tools,
+        )
+        .await
+        .unwrap();
+        let repeated = resumed.messages.last().unwrap();
+        assert_eq!(repeated.tool_call_id.as_deref(), Some("sticky-search-2"));
+        assert_eq!(repeated.tool_success, Some(true));
+        assert_eq!(
+            sticky_result_definition_values(repeated).unwrap(),
+            Vec::<serde_json::Value>::new(),
+            "repeated discovery closes the call with an empty definition delta"
+        );
+        assert!(resumed.messages[4].never_compress && repeated.never_compress);
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&resumed),
+            vec!["ReadArchive"]
+        );
+    }
+
+    #[test]
+    fn anthropic_history_drives_progressive_round_membership_while_legacy_stays_full() {
+        const BOUNDARY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("get_weather"),
+            loading_test_schema("Glob"),
+        ];
+
+        let mut first_round = Session::new("anthropic-first-round", "model");
+        first_round
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                BOUNDARY,
+            )
+            .unwrap();
+        let first_effective = effective_callable_set_for_round(
+            &first_round,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(first_effective.contains_execution_name("Bash"));
+        assert!(!first_effective.contains_execution_name("get_weather"));
+
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        first_round.add_message(assistant);
+        let item = |author, payload| {
+            bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                bamboo_domain::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        first_round
+            .append_provider_transcript_group(
+                &anchor,
+                None,
+                vec![
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"server_tool_use","id":"srv_1",
+                            "name":"tool_search_tool_regex","input":{"pattern":"weather"}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                            "content":{"type":"tool_search_tool_search_result","tool_references":[
+                                {"type":"tool_reference","tool_name":"get_weather"}
+                            ]}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_use","id":"tool_1","name":"get_weather","input":{}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_use","id":"ordinary_tool_use",
+                            "name":"Glob","input":{}
+                        }),
+                    ),
+                ],
+            )
+            .unwrap();
+        let loaded_effective = effective_callable_set_for_round(
+            &first_round,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(loaded_effective.contains_execution_name("Bash"));
+        assert!(loaded_effective.contains_execution_name("get_weather"));
+        assert!(!loaded_effective.contains_execution_name("Glob"));
+
+        let legacy = Session::new("legacy-round", "model");
+        let legacy_effective = effective_callable_set_for_round(
+            &legacy,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        );
+        assert!(legacy_effective.contains_execution_name("Bash"));
+        assert!(legacy_effective.contains_execution_name("get_weather"));
+        assert!(legacy_effective.contains_execution_name("Glob"));
+    }
+
+    #[test]
+    fn openai_search_output_drives_progressive_membership_across_resume() {
+        const BOUNDARY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let mut session = Session::new("openai-loaded-round", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let first = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(first.contains_execution_name("Bash"));
+        assert!(!first.contains_execution_name("search_orders"));
+
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .append_provider_transcript_group(&anchor, None, vec![native_client_search_item()])
+            .unwrap();
+        let output = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::HostToolSearch,
+            bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({
+                "type":"tool_search_output","execution":"client","call_id":"search_1",
+                "status":"completed","tools":[{
+                    "type":"function","name":"search_orders","description":"Search orders",
+                    "parameters":{"type":"object"},"strict":false,"defer_loading":true
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+
+        let loaded = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(loaded.contains_execution_name("Bash"));
+        assert!(loaded.contains_execution_name("search_orders"));
+        assert!(!loaded.contains_execution_name("Glob"));
+
+        let resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let resumed_loaded = effective_callable_set_for_round(
+            &resumed,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(resumed_loaded.contains_execution_name("search_orders"));
+        assert!(!resumed_loaded.contains_execution_name("Glob"));
+    }
+
+    #[test]
+    fn hosted_search_output_enables_its_same_response_function_but_not_an_ordinary_call() {
+        const BOUNDARY: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let mut session = Session::new("openai-hosted-search", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        let item = |author, payload| {
+            bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                bamboo_domain::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        session
+            .append_provider_transcript_group(
+                &anchor,
+                None,
+                vec![
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_search_call","id":"tsc_hosted","execution":"server",
+                            "call_id":"search_hosted","status":"completed",
+                            "arguments":{"query":"orders"}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_output","id":"tso_hosted","execution":"server",
+                            "call_id":"search_hosted","status":"completed",
+                            "tools":[{"type":"function","name":"search_orders"}]
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"function_call","id":"fc_loaded","call_id":"call_loaded",
+                            "name":"search_orders","arguments":"{}","status":"completed"
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"function_call","id":"fc_ordinary","call_id":"call_ordinary",
+                            "name":"Glob","arguments":"{}","status":"completed"
+                        }),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let effective = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(effective.contains_execution_name("Bash"));
+        assert!(effective.contains_execution_name("search_orders"));
+        assert!(
+            !effective.contains_execution_name("Glob"),
+            "an ordinary function_call cannot manufacture loaded state"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_search_builds_host_output_and_commits_an_internal_next_round_boundary() {
+        const BOUNDARY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let tools = vec![
+            loading_test_schema("Read"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("client-search-next-round", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let call = native_client_search_item();
+        let outputs = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            &tools,
+            std::slice::from_ref(&call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].payload()["type"], "tool_search_output");
+        assert_eq!(outputs[0].payload()["execution"], "client");
+        assert_eq!(outputs[0].payload()["call_id"], "search_1");
+        assert_eq!(outputs[0].payload()["status"], "completed");
+        let discovered = outputs[0].payload()["tools"].as_array().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0]["name"], "search_orders");
+        assert_eq!(discovered[0]["strict"], false);
+        assert_eq!(discovered[0]["defer_loading"], true);
+
+        let empty_call = native_client_search_item_for("search_empty", "zzqxvplmn");
+        let empty_outputs = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            &tools,
+            std::slice::from_ref(&empty_call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_outputs.len(), 1);
+        assert_eq!(empty_outputs[0].payload()["call_id"], "search_empty");
+        assert_eq!(
+            empty_outputs[0].payload()["tools"],
+            serde_json::json!([]),
+            "an empty discovery result remains an explicit completed tools array"
+        );
+
+        let stream_output = crate::runtime::stream::handler::StreamHandlingOutput {
+            response_id: Some("resp_client_search".to_string()),
+            content: String::new(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 0,
+            tool_calls: Vec::new(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: None,
+            input_tokens: 0,
+            provider_transcript_items: vec![call],
+        };
+        commit_openai_client_tool_search_round(stream_output, &mut session, &config, &tools)
+            .await
+            .unwrap();
+
+        assert_eq!(session.messages.len(), 1);
+        let groups = session.provider_transcript.replayable_groups(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            BOUNDARY,
+        );
+        assert_eq!(groups.len(), 2, "provider call then host output");
+        assert_eq!(groups[0].anchor_message_id(), groups[1].anchor_message_id());
+        assert_eq!(groups[0].items()[0].payload()["type"], "tool_search_call");
+        assert_eq!(groups[1].items()[0].payload()["type"], "tool_search_output");
+
+        let effective = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(effective.contains_execution_name("Read"));
+        assert!(effective.contains_execution_name("search_orders"));
+        assert!(!effective.contains_execution_name("Glob"));
+    }
+
+    #[tokio::test]
+    async fn explicit_activation_uses_one_legacy_request_slice_for_wire_and_admission() {
+        let tools = vec![
+            loading_test_schema("load_skill"),
+            loading_test_schema("Read"),
+        ];
+        let mut session = Session::new("anthropic-explicit-activation", "claude-sonnet-4-6");
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            "[\"review\"]".to_string(),
+        );
+
+        let required_tool =
+            crate::runtime::runner::round_lifecycle::required_tool_for_session(&session);
+        assert_eq!(required_tool, Some("load_skill"));
+        let request_tools =
+            crate::runtime::runner::round_lifecycle::effective_tool_schemas(&session, &tools);
+        assert_eq!(
+            request_tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["load_skill"]
+        );
+
+        let provider = bamboo_llm::providers::anthropic::AnthropicProvider::new("test-key");
+        let mode = provider
+            .capability_loading_mode("claude-sonnet-4-6", required_tool)
+            .await;
+        assert_eq!(
+            mode,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let effective = effective_callable_set_for_round(&session, request_tools.as_ref(), mode);
+        assert!(effective.contains_execution_name("load_skill"));
+        assert!(!effective.contains_execution_name("Read"));
+    }
+
+    #[test]
+    fn assistant_and_native_group_commit_or_rollback_as_one_unit() {
+        let mut session = Session::new("native-commit", "model");
+        let message = Message::assistant("normalized", None);
+        let anchor = message.id.clone();
+        let mut items = Some(vec![native_client_search_item()]);
+        commit_assistant_message(&mut session, message, &mut items).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        let boundary = session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .unwrap();
+        let groups = session.provider_transcript.replayable_groups(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            boundary,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].anchor_message_id(), anchor);
+
+        let mut rejected = Session::new("native-rejected", "model");
+        let rejected_boundary = bamboo_domain::provider_transcript_boundary_sha256(
+            Some("anthropic-rejected"),
+            Some("anthropic"),
+        )
+        .unwrap();
+        rejected
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                &rejected_boundary,
+            )
+            .unwrap();
+        let before = rejected.clone();
+        let mut items = Some(vec![native_client_search_item()]);
+        let error = commit_assistant_message(
+            &mut rejected,
+            Message::assistant("must roll back", None),
+            &mut items,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider-native transcript group rejected"));
+        assert!(rejected.messages.is_empty());
+        assert!(before.messages.is_empty());
+        assert_eq!(rejected.provider_transcript, before.provider_transcript);
+        assert_eq!(rejected.updated_at, before.updated_at);
     }
 
     #[test]
@@ -3247,6 +5074,48 @@ mod tests {
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
             Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    #[derive(Default)]
+    struct ContextProbeProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ContextProbeProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("done".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct CancelOnSecondProjectLookup {
+        descriptor: ProjectDescriptor,
+        cancel_token: tokio_util::sync::CancellationToken,
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectContextSource for CancelOnSecondProjectLookup {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            assert_eq!(project_id, &self.descriptor.id);
+            if self.lookups.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.cancel_token.cancel();
+            }
+            Ok(Some(self.descriptor.clone()))
         }
     }
 
@@ -4034,7 +5903,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 5,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(5),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
 
@@ -4163,7 +6035,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: MAX_ROUNDS,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -4172,6 +6043,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(MAX_ROUNDS as u32),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let mut state = e2e_loop_state("session-max-rounds");
@@ -4438,6 +6313,37 @@ mod tests {
         }
     }
 
+    struct BilledThenTimeoutProvider {
+        first: BilledRetryProvider,
+        calls: std::sync::atomic::AtomicUsize,
+        failed: Arc<tokio::sync::Notify>,
+        silent_stream: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BilledThenTimeoutProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            schemas: &[bamboo_agent_core::tools::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self
+                    .first
+                    .chat_stream(messages, schemas, max_output_tokens, model)
+                    .await;
+            }
+            self.failed.notify_one();
+            if self.silent_stream {
+                Ok(Box::pin(stream::pending()))
+            } else {
+                Err(LLMError::Api("retryable transport failure".into()))
+            }
+        }
+    }
+
     struct FailBeforeUsageProvider;
 
     #[async_trait::async_trait]
@@ -4500,6 +6406,37 @@ mod tests {
                 .push((started, completed));
             Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
         }
+    }
+
+    #[tokio::test]
+    async fn zero_max_rounds_is_rejected_before_the_first_provider_call() {
+        use std::sync::atomic::Ordering;
+
+        let mut session = Session::new("session-zero-max-rounds", "model");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let provider = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(0),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-zero-max-rounds");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let error =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect_err("a zero round cap must be rejected before execution");
+
+        assert!(matches!(error, AgentError::Budget(_)));
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4768,7 +6705,9 @@ mod tests {
         });
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let mut state = e2e_loop_state(session_id);
-        state.metrics_collector = Some(collector);
+        state.metrics_collector = Some(collector.clone());
+        let mut config = canonical_usage_pipeline_config();
+        config.metrics_collector = Some(collector);
 
         super::run_pipeline(
             &mut session,
@@ -4776,7 +6715,7 @@ mod tests {
             provider.clone(),
             tools,
             &tokio_util::sync::CancellationToken::new(),
-            &canonical_usage_pipeline_config(),
+            &config,
             &mut state,
         )
         .await
@@ -4804,8 +6743,159 @@ mod tests {
         assert_eq!(detail.rounds.len(), 1, "both attempts belong to one round");
         assert_eq!(detail.rounds[0].token_usage, expected);
         assert_eq!(detail.session.total_token_usage, expected);
+        let exposure = storage
+            .prompt_memory_exposure(&detail.rounds[0].round_id)
+            .await
+            .expect("query retry exposure")
+            .expect("both successful bootstraps share one first-wins observation");
+        assert_eq!(
+            exposure.recall_outcome,
+            bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+        );
+        assert_eq!(exposure.all_compact_exposed_count, 0);
         assert_eq!(state.runtime_state.round.total_prompt_tokens, 30);
         assert_eq!(state.runtime_state.round.total_completion_tokens, 8);
+    }
+
+    async fn assert_cancelled_backoff_preserves_billed_usage(goal_recovery: bool) {
+        let session_id = if goal_recovery {
+            "goal-backoff-billed"
+        } else {
+            "retry-backoff-billed"
+        };
+        let (directory, collector, metrics) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::SessionStoreV2::new(directory.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("retain billed retries when stopped"));
+        session
+            .metadata
+            .insert(super::TEST_POST_LLM_RETRY_FAILURES_KEY.into(), "1".into());
+        storage.save_session(&session).await.unwrap();
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(BilledThenTimeoutProvider {
+            first: BilledRetryProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            failed: failed.clone(),
+            silent_stream: goal_recovery,
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        let watched_storage = storage.clone();
+        let stopper = tokio::spawn(async move {
+            if goal_recovery {
+                // Cancellation occurs only after the durable recovery reservation,
+                // so this exercises the extra retry wait rather than a live stream.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if watched_storage
+                            .load_session(session_id)
+                            .await
+                            .unwrap()
+                            .is_some_and(|saved| saved.metadata.contains_key("goal.recovery"))
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("goal recovery reservation persisted");
+            } else {
+                failed.notified().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            trigger.cancel();
+        });
+        let mut config = canonical_usage_pipeline_config();
+        config.persistence = Some(persistence.clone());
+        config.metrics_collector = Some(collector.clone());
+        if goal_recovery {
+            config.stream_timeout.transport_idle_timeout_secs = 1;
+            config.gold_config = Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish".into()),
+                recovery: crate::runtime::goal_recovery::GoalRecoveryPolicy {
+                    max_attempts: 1,
+                    max_elapsed_seconds: 120,
+                },
+                ..Default::default()
+            });
+        }
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            Arc::new(AlwaysOkExecutor),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await;
+        stopper.await.unwrap();
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if goal_recovery { 3 } else { 2 }
+        );
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 10);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 3);
+        assert_eq!(state.runtime_state.round.total_tool_calls, 1);
+        // The outer hooks error path writes the live state before checkpointing.
+        // It must not overwrite the recovery checkpoint with pre-attempt totals.
+        state_bridge::write_runtime_state(&mut session, &state.runtime_state);
+        persistence
+            .checkpoint_runtime_session(&mut session)
+            .await
+            .unwrap();
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let round = saved.agent_runtime_state.unwrap().round;
+        assert_eq!(round.total_prompt_tokens, 10);
+        assert_eq!(round.total_completion_tokens, 3);
+        assert_eq!(round.total_tool_calls, 1);
+        drop(tx);
+        drain(&mut rx).await;
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 3,
+            total_tokens: 13,
+        };
+        let detail = wait_for_pipeline_metrics(
+            metrics.as_ref(),
+            session_id,
+            MetricsRoundStatus::Cancelled,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_ordinary_backoff_preserves_billed_usage() {
+        assert_cancelled_backoff_preserves_billed_usage(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_goal_recovery_backoff_preserves_billed_usage() {
+        assert_cancelled_backoff_preserves_billed_usage(true).await;
     }
 
     #[tokio::test]
@@ -5065,7 +7155,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50, // high enough that max_rounds never fires first
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -5078,6 +7167,7 @@ mod tests {
                 max_total_tokens: Some(20),
                 max_tool_calls: None,
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -5159,7 +7249,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -5172,6 +7261,7 @@ mod tests {
                 max_total_tokens: None,
                 max_tool_calls: Some(2),
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -5211,7 +7301,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -5224,6 +7313,7 @@ mod tests {
                 max_total_tokens: None,
                 max_tool_calls: None,
                 max_subagents: Some(1),
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -5263,7 +7353,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 2,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -5276,6 +7365,7 @@ mod tests {
                 max_total_tokens: Some(1_000_000),
                 max_tool_calls: Some(1_000_000),
                 max_subagents: Some(1_000_000),
+                max_rounds: Some(2),
             },
             ..AgentLoopConfig::default()
         };
@@ -5345,6 +7435,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 provider_usage: None,
                 input_tokens: input,
+                provider_transcript_items: Vec::new(),
             }
         }
 
@@ -5428,6 +7519,7 @@ mod tests {
                 cache_write_input_tokens: None,
             }),
             input_tokens: 232,
+            provider_transcript_items: Vec::new(),
         };
 
         let mut activity = super::RoundActivity::default();
@@ -5480,6 +7572,7 @@ mod tests {
                 cache_write_input_tokens: None,
             }),
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         };
 
         assert_eq!(
@@ -5521,13 +7614,13 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let tripping_config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: flags,
             model_name: Some("model".to_string()),
             run_budget: bamboo_config::RunBudgetConfig {
                 max_total_tokens: None,
                 max_tool_calls: Some(1),
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -5563,9 +7656,12 @@ mod tests {
         });
         let llm2: Arc<dyn LLMProvider> = provider2.clone();
         let unlimited_config = AgentLoopConfig {
-            max_rounds: 2,
             prompt_memory_flags: flags,
             model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(2),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let mut state2 = e2e_loop_state("session-budget-metadata-hygiene");
@@ -5600,36 +7696,37 @@ mod tests {
     }
 
     #[test]
-    fn is_subagent_create_call_counts_default_and_explicit_create_only() {
-        let call = |arguments: &str| bamboo_agent_core::tools::ToolCall {
+    fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
+        let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
             tool_type: "function".to_string(),
             function: bamboo_agent_core::tools::FunctionCall {
-                name: "SubAgent".to_string(),
+                name: name.to_string(),
                 arguments: arguments.to_string(),
             },
         };
         assert!(
-            is_subagent_create_call(&call(r#"{"action":"create","prompt":"x"}"#)),
+            is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
+            "every Plan call creates one planner child"
+        );
+        assert!(
+            is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
             "explicit action=create counts"
         );
         assert!(
-            is_subagent_create_call(&call(r#"{"prompt":"x"}"#)),
+            is_child_spawn_call(&call("SubAgent", r#"{"prompt":"x"}"#)),
             "missing action defaults to the tool's legacy create behavior"
         );
         assert!(
-            !is_subagent_create_call(&call(r#"{"action":"wait"}"#)),
+            !is_child_spawn_call(&call("SubAgent", r#"{"action":"wait"}"#)),
             "action=wait manages an existing child, not a spawn"
         );
         assert!(
-            !is_subagent_create_call(&call(r#"{"action":"list"}"#)),
+            !is_child_spawn_call(&call("SubAgent", r#"{"action":"list"}"#)),
             "action=list is read-only, not a spawn"
         );
-
-        let mut other_tool = call(r#"{"action":"create"}"#);
-        other_tool.function.name = "Bash".to_string();
         assert!(
-            !is_subagent_create_call(&other_tool),
+            !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),
             "a differently named tool is never counted, regardless of args"
         );
     }
@@ -5656,6 +7753,7 @@ mod tests {
             max_total_tokens: Some(5),
             max_tool_calls: Some(1),
             max_subagents: Some(1),
+            max_rounds: None,
         };
         let exceeded =
             check_run_budget_exceeded(&round, &all_exceeded).expect("some guardrail trips");
@@ -5667,6 +7765,7 @@ mod tests {
             max_total_tokens: None,
             max_tool_calls: Some(3),
             max_subagents: None,
+            max_rounds: None,
         };
         let exceeded =
             check_run_budget_exceeded(&round, &tool_calls_only).expect("tool-call guardrail trips");
@@ -5799,6 +7898,201 @@ mod tests {
         )
         .await;
         assert_eq!(running.messages.len(), count_after_first_merge);
+    }
+
+    #[tokio::test]
+    async fn pipeline_typed_inbox_input_drives_current_round_memory_recall() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            SessionInboxLimits::default(),
+        ));
+
+        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path().join("jiandu"));
+        memory
+            .write_memory(
+                bamboo_memory::memory_store::MemoryScope::Global,
+                None,
+                bamboo_memory::memory_store::DurableMemoryType::Reference,
+                "Pipeline cobalt orchid rule",
+                "The cobalt orchid request must use the pipeline memory boundary.",
+                &["cobalt".to_string(), "orchid".to_string()],
+                Some("pipeline-typed-inbox-recall"),
+                "model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut persisted = Session::new("pipeline-typed-inbox-recall", "model");
+        persisted.add_message(Message::system("base prompt"));
+        persisted.add_message(Message::user("unrelated earlier request"));
+        storage.save_session(&persisted).await.unwrap();
+
+        let mut running = persisted;
+        let query = "what is the pipeline cobalt orchid rule?";
+        let envelope = SessionMessageEnvelope::user_input(&running.id, query);
+        let receipt = inbox.deliver(&envelope).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                &running.id,
+                receipt.generation,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+
+        let config = AgentLoopConfig {
+            storage: Some(storage),
+            persistence: Some(persistence),
+            session_inbox: Some(inbox),
+            app_data_dir: Some(directory.path().join("bamboo")),
+            memory_store: memory,
+            prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: true,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut state = e2e_loop_state(&running.id);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        super::run_pipeline(
+            &mut running,
+            &event_tx,
+            Arc::new(ContextProbeProvider::default()),
+            Arc::new(AlwaysOkExecutor),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("the pipeline should complete after refreshing the boundary");
+
+        assert!(running.messages.iter().any(|message| {
+            message.id == envelope.id.as_str()
+                && message.role == bamboo_domain::Role::User
+                && message.content == query
+        }));
+        let rendered =
+            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
+                .expect("current-round recall should render external memory");
+        assert!(rendered.contains("Pipeline cobalt orchid rule"));
+        assert!(
+            rendered.contains("The cobalt orchid request must use the pipeline memory boundary.")
+        );
+
+        let observability: bamboo_agent_core::PromptMemoryObservability = serde_json::from_str(
+            running
+                .metadata
+                .get(crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY)
+                .expect("prompt memory refresh should persist observability"),
+        )
+        .unwrap();
+        assert!(observability.latest_user_query_present);
+        assert_eq!(observability.relevant_memory_status, "lexical");
+        assert_eq!(observability.relevant_memory_count, 1);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageAppended {
+                        ref message_id,
+                        ref content,
+                        ..
+                    } if message_id == envelope.id.as_str() && content == query
+                )
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_cancelled_during_context_refresh_skips_primary_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let project_id = ProjectId::parse("pipeline-context-cancel-project").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let source = Arc::new(CancelOnSecondProjectLookup {
+            descriptor: ProjectDescriptor {
+                id: project_id.clone(),
+                name: "Pipeline cancellation fixture".to_string(),
+                project_path: Some(workspace),
+                home: directory
+                    .path()
+                    .join("projects/pipeline-context-cancel-project"),
+                workspace_bindings: Vec::new(),
+                resources: ProjectResourceSummary {
+                    project_id: project_id.clone(),
+                    resource_revision: 1,
+                    resources: Vec::new(),
+                },
+            },
+            cancel_token: cancel.clone(),
+            lookups: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(ContextProbeProvider::default());
+        let mut session = Session::new("pipeline-context-cancel", "model");
+        session.add_message(Message::system("base prompt"));
+        session.add_message(Message::user("run the cancellation fixture"));
+        session.set_project_id_meta(project_id.to_string());
+        let config = AgentLoopConfig {
+            project_context_resolver: Some(Arc::new(ProjectContextResolver::new(source.clone()))),
+            app_data_dir: Some(directory.path().to_path_buf()),
+            prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let mut state = e2e_loop_state(&session.id);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &event_tx,
+            provider.clone(),
+            Arc::new(AlwaysOkExecutor),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("cancellation observed after context refresh must stop the round");
+
+        assert!(matches!(error, AgentError::Cancelled));
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 2);
+        assert!(session
+            .metadata
+            .contains_key(crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
     // --- Tests from rounds.rs ---
@@ -6712,6 +9006,7 @@ mod tests {
             cache_read_input_tokens: 0,
             provider_usage: None,
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         }
     }
 
@@ -6834,6 +9129,8 @@ mod tests {
             tools: &tools,
         };
         let tool_schemas = tools.list_tools();
+        let effective_callable_set =
+            crate::runtime::runner::tool_execution::legacy_effective_callable_set(&tool_schemas);
         let mut runtime_state = AgentRuntimeState::new("s-normal");
         let mut task_context: Option<TaskLoopContext> = None;
 
@@ -6850,6 +9147,7 @@ mod tests {
                 compression_model_name: None,
                 compression_model_provider: None,
                 tool_schemas: &tool_schemas,
+                effective_callable_set: &effective_callable_set,
             }),
         )
         .await
@@ -7060,6 +9358,7 @@ mod tests {
             cache_read_input_tokens: 0,
             provider_usage: None,
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         };
 
         let result = tokio::time::timeout(
@@ -7660,7 +9959,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 5,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(5),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         }
     }
@@ -8269,5 +10571,67 @@ mod tests {
             "blank final content must not add a stray context block:\n{}",
             recorded[0]
         );
+    }
+    #[tokio::test]
+    async fn goal_recovery_backoff_stops_without_waiting_for_the_deadline() {
+        let mut session = Session::new("goal-backoff-stop", "model");
+        session.add_message(Message::user("finish"));
+        let goal = crate::runtime::goal_state::ensure_goal_state(&session, "finish");
+        crate::runtime::goal_state::write_goal_state(&mut session, goal);
+        let policy = crate::runtime::goal_recovery::GoalRecoveryPolicy {
+            max_attempts: 3,
+            max_elapsed_seconds: 900,
+        };
+        let timeout = AgentError::StreamTimeout(bamboo_agent_core::StreamTimeoutError::new(
+            bamboo_agent_core::StreamTimeoutPhase::FirstSemantic,
+            std::time::Duration::from_secs(30),
+            None,
+            None,
+            std::time::Duration::ZERO,
+            None,
+            true,
+        ));
+        assert_eq!(
+            crate::runtime::goal_recovery::reserve_retry(
+                &mut session,
+                &policy,
+                &timeout,
+                chrono::Utc::now().timestamp_millis()
+            ),
+            Some(5000)
+        );
+        let config = crate::runtime::config::AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish".into()),
+                recovery: policy,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut state = e2e_loop_state("goal-backoff-stop");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(StubProvider),
+                Arc::new(AlwaysOkExecutor),
+                &cancel,
+                &config,
+                &mut state,
+            ),
+        )
+        .await
+        .expect("stop interrupts the persisted five-second backoff");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 }

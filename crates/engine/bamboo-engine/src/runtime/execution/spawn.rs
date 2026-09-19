@@ -460,7 +460,7 @@ pub(crate) async fn watch_child_liveness(
                     return;
                 }
 
-                let last_activity_at = runner.last_event_at.unwrap_or(runner.started_at);
+                let last_activity_at = runner.last_activity_at().unwrap_or(runner.started_at);
                 let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
                 if idle_secs >= policy.max_idle_secs {
                     let reason = format!(

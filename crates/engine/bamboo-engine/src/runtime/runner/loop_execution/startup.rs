@@ -142,7 +142,7 @@ pub(super) async fn initialize_loop_state(
         "agent_loop_start",
         serde_json::json!({
             "message": initial_message,
-            "max_rounds": config.max_rounds,
+            "round_cap": config.run_budget.max_rounds,
             "initial_message_count": session.messages.len(),
         }),
     );
@@ -184,7 +184,7 @@ pub(super) async fn initialize_loop_state(
     runtime_state.llm.provider_name = config.provider_name.clone();
     runtime_state.llm.fast_model_name = auxiliary_models.fast_model_name.clone();
     runtime_state.llm.background_model_name = auxiliary_models.background_model_name.clone();
-    runtime_state.round.max_rounds = config.max_rounds as u32;
+    runtime_state.round.max_rounds = config.run_budget.max_rounds;
     state_bridge::sync_from_metadata(session, &mut runtime_state);
     runtime_state.status = AgentStatusState::Initializing;
     state_bridge::write_runtime_state(session, &runtime_state);

@@ -348,6 +348,7 @@ impl LoadSkillTool {
             let event_tx = ctx.event_tx.as_ref().unwrap_or(&fallback_tx);
             let execution_context = ToolExecutionContext::for_dispatch(
                 session.id.as_str(),
+                session.root_session_id.as_str(),
                 &call_id,
                 event_tx,
                 &available,
@@ -363,7 +364,10 @@ impl LoadSkillTool {
                 false,
                 None,
                 Some(&provider_input),
-            );
+            )
+            // The repository Session above supplies configuration only. Keep
+            // the incoming lifetime, even if that ID was recreated meanwhile.
+            .with_executing_supervisor(ctx.executing_supervisor_for(&session.id));
             if !plan_allows_dynamic_provider(ctx.plan_read_only, &call.function.name) {
                 blocks.push(bamboo_skills::DynamicContextBlock {
                     provider_id: declaration.id,

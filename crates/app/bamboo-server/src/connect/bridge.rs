@@ -18,8 +18,9 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
-    spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
+    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
+    reserve_session_execution, spawn_session_execution, SessionExecutionArgs,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
@@ -200,9 +201,10 @@ fn create_connect_session(
     model: &str,
     system_prompt: &str,
     base_system_prompt: &str,
-    workspace_path: Option<&str>,
+    workspace: Option<bamboo_engine::session_app::execution_prep::ResolvedExecutionWorkspace<'_>>,
     project_id: Option<&bamboo_domain::ProjectId>,
     reasoning_effort: Option<ReasoningEffort>,
+    permission_mode: bamboo_domain::SessionPermissionMode,
     workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -219,25 +221,27 @@ fn create_connect_session(
     if let Some(project_id) = project_id {
         session.set_project_id_meta(project_id.to_string());
     }
-    if let Some(path) = workspace_path {
-        let final_workspace = workspace_resolver.publish_resolved_workspace(
-            &session_id,
-            PathBuf::from(path),
+    if let Some(workspace) = workspace {
+        bamboo_engine::session_app::execution_prep::publish_resolved_workspace_for_execution(
+            &mut session,
+            workspace,
+            workspace_resolver,
             "connect",
         );
-        session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
-            &final_workspace,
-        ));
     }
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
     }
-    session.add_message(Message::system(system_prompt.to_string()));
-    bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
-    session
+    bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
+        &mut session,
+        Some(system_prompt),
+        None,
+    );
+    let runtime_state = session
         .agent_runtime_state
-        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .no_human_approver = false;
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+    runtime_state.set_permission_mode(permission_mode);
+    runtime_state.no_human_approver = false;
     session
 }
 
@@ -764,9 +768,6 @@ impl ConnectBridge {
         .map_err(|error| {
             format!("Connect workspace is unavailable; no session was created: {error}")
         })?;
-        let final_workspace_display = final_workspace
-            .as_deref()
-            .map(bamboo_config::paths::path_to_display_string);
         let binding_status = match (project_id, final_workspace.as_deref()) {
             (Some(project_id), Some(workspace)) => {
                 let workspace = bamboo_config::paths::path_to_display_string(workspace);
@@ -784,31 +785,32 @@ impl ConnectBridge {
             }
             _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
         };
-        let system_prompt =
-            bamboo_engine::runtime::context::upsert_workspace_prompt_context_with_source(
-                &resolved.system_prompt,
-                final_workspace_display.as_deref(),
-                binding_status,
-                project_id.map(|_| bamboo_engine::project_context::WorkspaceSource::ProjectDefault),
-            );
-        let mut session = create_connect_session(
+        let workspace_source = if project_id.is_some() {
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        } else {
+            bamboo_engine::project_context::WorkspaceSource::Session
+        };
+        let session = create_connect_session(
             key,
             &model,
-            &system_prompt,
+            &resolved.system_prompt,
             &resolved.base_system_prompt,
-            final_workspace_display.as_deref(),
+            final_workspace.as_deref().map(|path| {
+                bamboo_engine::session_app::execution_prep::ResolvedExecutionWorkspace {
+                    path,
+                    source: workspace_source,
+                    binding_status,
+                }
+            }),
             project_id,
             resolved.reasoning_effort,
+            self.ctx
+                .permission_checker
+                .permission_config()
+                .map(|config| config.default_session_permission_mode())
+                .unwrap_or_default(),
             &self.ctx.workspace_resolver,
         );
-        if project_id.is_some() {
-            session.metadata.insert(
-                bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
-                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
-                    .as_str()
-                    .to_string(),
-            );
-        }
         self.set_session_id_for_key(key, &session.id).await;
         Ok(session)
     }
@@ -905,13 +907,14 @@ impl ConnectBridge {
         self.set_cancel_token(key, execution_reservation.cancel_token().clone())
             .await;
 
-        let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
-            session_id.clone(),
-            execution_reservation.run_id().to_string(),
-            session_tx.clone(),
-            self.ctx.agent_runners.clone(),
-            self.ctx.account_feed_inbox.clone(),
-        );
+        let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
+            create_event_forwarder_with_history_commit_barrier(
+                session_id.clone(),
+                execution_reservation.run_id().to_string(),
+                session_tx.clone(),
+                self.ctx.agent_runners.clone(),
+                self.ctx.account_feed_inbox.clone(),
+            );
 
         // Auxiliary (fast/background/summarization) model resolver — mirrors
         // `schedule_app::manager::run_schedule_job` exactly.
@@ -949,6 +952,7 @@ impl ConnectBridge {
             selected_skill_ids: None,
             selected_skill_mode: None,
             mpsc_tx,
+            history_commit_barrier,
             image_fallback: None,
             gold_config: resolved.gold_config.clone(),
             // Approvals (guardian, bash resume) are a later phase of epic
@@ -1639,6 +1643,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_session_creation_stamps_the_permission_policy_default() {
+        let (ctx, _dir) = test_context().await;
+        ctx.permission_checker
+            .permission_config()
+            .expect("permission config")
+            .set_default_session_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let resolved = {
+            let config = ctx.config.read().await.clone();
+            resolve_connect_run_config(&config, &ctx.provider_registry)
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+
+        let session = bridge
+            .create_and_register_session("fake:chat:user", &resolved)
+            .await
+            .expect("Connect session should be created");
+
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .expect("runtime state")
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
     #[test]
     fn connect_publication_uses_the_validating_instance_workspace_root() {
         let instance_root = tempfile::tempdir().expect("instance workspace root");
@@ -1656,9 +1688,17 @@ mod tests {
             "model",
             "system",
             "base",
-            Some(relocated.to_string_lossy().as_ref()),
+            Some(
+                bamboo_engine::session_app::execution_prep::ResolvedExecutionWorkspace {
+                    path: &relocated,
+                    source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+                    binding_status:
+                        bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
+                },
+            ),
             None,
             None,
+            bamboo_domain::SessionPermissionMode::Default,
             &resolver,
         );
 
@@ -1670,6 +1710,42 @@ mod tests {
             relocated.is_dir(),
             "the AppState resolver must materialize its own validated target"
         );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Explicit.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        let system = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("Connect System");
+        assert_eq!(system.content, "system");
+        assert!(!system
+            .content
+            .contains(relocated.to_string_lossy().as_ref()));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("first prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "system");
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(relocated.to_string_lossy().as_ref()));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: unregistered"));
     }
 
     #[tokio::test]
@@ -1715,14 +1791,115 @@ mod tests {
                 .map(String::as_str),
             Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
         );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Registered.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id)
+                .as_deref()
+                .map(bamboo_config::paths::path_to_display_string),
+            project.project_path.clone()
+        );
+        let project_path_display = project.project_path.as_deref().expect("Project path");
         let system_prompt = session
             .messages
             .iter()
             .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
             .expect("Connect system prompt");
-        assert!(system_prompt
+        assert_eq!(system_prompt.content, resolved.system_prompt);
+        assert!(!system_prompt.content.contains(project_path_display));
+        assert!(!system_prompt
             .content
-            .contains("Workspace source: project_default"));
+            .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
+        assert!(!system_prompt
+            .content
+            .contains("BAMBOO_PROJECT_CONTEXT_START"));
+        let snapshot = session.prompt_snapshot.as_ref().expect("prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, resolved.system_prompt);
+        assert!(snapshot
+            .workspace_context
+            .as_deref()
+            .is_some_and(|value| value.contains(project_path_display)));
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(project_path_display));
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
+    }
+
+    #[tokio::test]
+    async fn unassigned_connect_session_publishes_configured_workspace_before_first_snapshot() {
+        let (ctx, _dir) = test_context().await;
+        let configured_workspace = tempfile::tempdir().expect("configured Workspace");
+        {
+            let mut config = ctx.config.write().await;
+            config.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
+                path: Some(configured_workspace.path().to_string_lossy().into_owned()),
+            });
+        }
+        let resolved = {
+            let config = ctx.config.read().await.clone();
+            resolve_connect_run_config(&config, &ctx.provider_registry)
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+
+        let session = bridge
+            .create_and_register_session("fake:configured:user", &resolved)
+            .await
+            .expect("configured Workspace must create an unassigned Connect session");
+        let canonical = configured_workspace
+            .path()
+            .canonicalize()
+            .expect("canonical configured Workspace");
+        let display = bamboo_config::paths::path_to_display_string(&canonical);
+        assert!(session.project_id_meta().is_none());
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(display.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Session.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            Some(canonical)
+        );
+        let system = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("Connect System");
+        assert_eq!(system.content, resolved.system_prompt);
+        assert!(!system.content.contains(&display));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("first prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, resolved.system_prompt);
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&display));
+        assert!(workspace_context.contains("Workspace source: session"));
+        assert!(workspace_context.contains("Binding status: unregistered"));
     }
 
     #[tokio::test]

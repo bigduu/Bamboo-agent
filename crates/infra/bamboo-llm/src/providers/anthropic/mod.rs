@@ -14,20 +14,30 @@ pub use stream::{
     format_sse_data, format_sse_event, map_completion_stream_chunk, AnthropicStreamAdapter,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
-use bamboo_domain::ToolSchema;
-use bamboo_domain::{Message, MessagePart, PromptBlock, Role};
+use bamboo_domain::{
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ToolSchema,
+};
+use bamboo_domain::{
+    Message, MessagePart, PromptBlock, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    ProviderTranscriptOrigin, Role,
+};
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
-use crate::provider::{required_tool_from_options, LLMError, LLMProvider, LLMStream, Result};
+use crate::provider::{
+    required_tool_from_options, LLMError, LLMProvider, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
+};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
@@ -36,6 +46,39 @@ use bamboo_domain::ReasoningEffort;
 
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
+
+const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
+const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+const ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES: [&str; 10] = [
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+];
+
+fn is_official_anthropic_base_url(base_url: &str) -> bool {
+    let normalized = base_url.trim_end_matches('/');
+    normalized.eq_ignore_ascii_case("https://api.anthropic.com")
+        || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
+}
+
+fn supports_anthropic_tool_search(model: &str) -> bool {
+    let model = model.trim();
+    ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES.iter().any(|prefix| {
+        model == *prefix
+            || model.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 9
+                    && suffix.starts_with('-')
+                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
 
 pub(crate) fn reasoning_effort_for_required_tool(
     configured: Option<ReasoningEffort>,
@@ -59,10 +102,15 @@ pub(crate) fn reasoning_effort_for_budget_validation(
     reasoning_effort: Option<ReasoningEffort>,
     messages: &[Message],
     thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
 ) -> Option<ReasoningEffort> {
     if reasoning_effort.is_some()
         && !thinking_replay_always
-        && must_downgrade_thinking_for_unsigned_tool_turn(messages)
+        && must_downgrade_thinking_for_unsigned_tool_turn(
+            messages,
+            native_groups,
+            thinking_replay_always,
+        )
     {
         None
     } else {
@@ -226,6 +274,67 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_none()
+            && is_official_anthropic_base_url(&self.base_url)
+            && supports_anthropic_tool_search(model)
+        {
+            CapabilityLoadingMode::Progressive
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let mode = self.capability_loading_mode(model, required_tool).await;
+        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+            let projected = tools_to_anthropic_json(tools, mode);
+            if projected.is_empty() {
+                return Ok(ProviderVisibleToolFootprint::default());
+            }
+            return Ok(ProviderVisibleToolFootprint {
+                segments: vec![ProviderVisibleToolSegment::from_serializable(
+                    ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                    &projected,
+                )?],
+            });
+        }
+
+        let initial = tools_to_anthropic_json(tools, mode)
+            .into_iter()
+            .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+            .collect::<Vec<_>>();
+        let mut segments = vec![ProviderVisibleToolSegment::from_serializable(
+            ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            &initial,
+        )?];
+        segments.push(ProviderVisibleToolSegment::empty_marker(
+            ProviderVisibleToolSegmentKind::ProviderLateBound,
+        ));
+
+        for definition in validated_anthropic_reference_definitions_in_order(
+            ir.provider_transcript_groups.iter(),
+            tools,
+        )? {
+            segments.push(ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion,
+                &definition,
+            )?);
+        }
+
+        Ok(ProviderVisibleToolFootprint { segments })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -245,8 +354,17 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        self.stream_messages_inner(messages, &[], tools, max_output_tokens, model, options)
-            .await
+        self.stream_messages_inner(
+            messages,
+            &[],
+            &[],
+            tools,
+            max_output_tokens,
+            model,
+            options,
+            CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .await
     }
 
     /// Render the canonical [`PromptIR`] into the Anthropic wire: the structured
@@ -264,19 +382,35 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        let required_tool = options
+            .and_then(|options| options.required_tool.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let capability_loading_mode = self.capability_loading_mode(model, required_tool).await;
         if ir.system_blocks.is_empty() {
             return self
-                .stream_messages_inner(&ir.flatten(), &[], tools, max_output_tokens, model, options)
+                .stream_messages_inner(
+                    &ir.flatten(),
+                    &[],
+                    &ir.provider_transcript_groups,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    options,
+                    capability_loading_mode,
+                )
                 .await;
         }
         let messages = ir.body_chat();
         self.stream_messages_inner(
             &messages,
             &ir.system_blocks,
+            &ir.provider_transcript_groups,
             tools,
             max_output_tokens,
             model,
             options,
+            capability_loading_mode,
         )
         .await
     }
@@ -297,10 +431,12 @@ impl AnthropicProvider {
         &self,
         messages: &[Message],
         system_blocks: &[PromptBlock],
+        native_groups: &[ProviderTranscriptGroup],
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
+        capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
@@ -314,6 +450,7 @@ impl AnthropicProvider {
             reasoning_effort,
             messages,
             self.thinking_replay_always,
+            native_groups,
         );
         crate::providers::common::validate_max_thinking_budget(
             budget_reasoning_effort,
@@ -346,7 +483,7 @@ impl AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let mut body = build_anthropic_request_with_cache_blocks(
+        let mut body = build_anthropic_request_with_cache_blocks_native_mode(
             messages,
             system_blocks,
             tools,
@@ -357,6 +494,8 @@ impl AnthropicProvider {
             parallel_tool_calls,
             cache_plan,
             self.thinking_replay_always,
+            native_groups,
+            capability_loading_mode,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -458,7 +597,7 @@ impl AnthropicProvider {
                     session_log_id,
                     model
                 );
-                let mut fallback_body = build_anthropic_request_with_cache_blocks(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
                     messages,
                     system_blocks,
                     tools,
@@ -469,6 +608,8 @@ impl AnthropicProvider {
                     Some(false),
                     cache_plan,
                     false,
+                    native_groups,
+                    capability_loading_mode,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -510,7 +651,7 @@ impl AnthropicProvider {
                     model
                 );
 
-                let mut fallback_body = build_anthropic_request_with_cache_blocks(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
                     messages,
                     system_blocks,
                     tools,
@@ -521,6 +662,8 @@ impl AnthropicProvider {
                     parallel_tool_calls,
                     cache_plan,
                     self.thinking_replay_always,
+                    native_groups,
+                    capability_loading_mode,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -590,10 +733,10 @@ impl AnthropicProvider {
             ..Default::default()
         };
 
-        let stream =
-            crate::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
-                parse_anthropic_sse_event(&mut state, event, data)
-            });
+        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
+        );
 
         Ok(stream)
     }
@@ -678,12 +821,12 @@ pub fn build_anthropic_request_with_cache(
 /// With empty `system_blocks` this is byte-identical to the legacy path.
 ///
 /// `thinking_replay_always`: see [`AnthropicProvider::with_thinking_replay_always`]
-/// (issue #520) — when `false` (the default for real Anthropic), a `thinking`
-/// block is never replayed from history since bamboo cannot prove it carries a
-/// signature Anthropic itself minted; when `true`, prior `reasoning` text is
-/// unconditionally re-emitted as a `thinking` block whenever the current
-/// request has thinking enabled, matching the legacy behavior some
-/// Anthropic-compatible upstreams (e.g. GLM) require.
+/// (issue #520) — when `false` (the default for real Anthropic), replay requires
+/// either Bamboo's captured provider signature or an exact validated native
+/// thinking/redacted-thinking block. When `true`, prior `reasoning` text is
+/// unconditionally re-emitted as a `thinking` block whenever the current request
+/// has thinking enabled, matching the legacy behavior some Anthropic-compatible
+/// upstreams (e.g. GLM) require.
 #[allow(clippy::too_many_arguments)]
 pub fn build_anthropic_request_with_cache_blocks(
     messages: &[Message],
@@ -696,6 +839,66 @@ pub fn build_anthropic_request_with_cache_blocks(
     parallel_tool_calls: Option<bool>,
     cache: Option<&PromptCachePlan>,
     thinking_replay_always: bool,
+) -> Value {
+    build_anthropic_request_with_cache_blocks_and_native(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_and_native(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+) -> Value {
+    build_anthropic_request_with_cache_blocks_native_mode(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        native_groups,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_native_mode(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
 ) -> Value {
     let default_plan = PromptCachePlan {
         cache_tools: true,
@@ -720,7 +923,11 @@ pub fn build_anthropic_request_with_cache_blocks(
     // block instead, which satisfies its presence requirement.
     let thinking_downgraded = requested_thinking.is_some()
         && !thinking_replay_always
-        && must_downgrade_thinking_for_unsigned_tool_turn(messages);
+        && must_downgrade_thinking_for_unsigned_tool_turn(
+            messages,
+            native_groups,
+            thinking_replay_always,
+        );
     if thinking_downgraded {
         let key = ("unsigned-tool-turn-thinking-downgrade", model);
         let error = "final assistant tool_use turn lacks a signed thinking block";
@@ -752,9 +959,16 @@ pub fn build_anthropic_request_with_cache_blocks(
     // (tools, then system), then on conversation breakpoints nearest the end.
     let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
 
-    let mut tools_json = tools_to_anthropic_json(tools);
+    let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
     if plan.cache_tools && budget > 0 {
-        if let Some(last_tool) = tools_json.last_mut().and_then(|t| t.as_object_mut()) {
+        if let Some(last_tool) = tools_json.iter_mut().rev().find_map(|tool| {
+            let object = tool.as_object_mut()?;
+            (!object
+                .get("defer_loading")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+            .then_some(object)
+        }) {
             last_tool.insert("cache_control".to_string(), cache_control_value(ttl));
             budget -= 1;
         }
@@ -782,8 +996,8 @@ pub fn build_anthropic_request_with_cache_blocks(
                 spans
                     .iter()
                     .rev()
-                    .find(|span| plan.is_breakpoint(&span.id))
-                    .map(|span| (message_idx, span.last_block))
+                    .find(|span| plan.is_breakpoint(&span.id) && span.end_block > span.start_block)
+                    .map(|span| (message_idx, span.end_block - 1))
             })
             .collect();
         // Keep only the breakpoints closest to the end of the conversation.
@@ -796,6 +1010,15 @@ pub fn build_anthropic_request_with_cache_blocks(
             }
         }
     }
+
+    apply_anthropic_native_groups(
+        &mut anthropic_messages,
+        &source_spans,
+        native_groups,
+        thinking_enabled,
+        tools,
+        capability_loading_mode,
+    );
 
     let mut body = json!({
         "model": model,
@@ -825,6 +1048,169 @@ pub fn build_anthropic_request_with_cache_blocks(
     }
 
     body
+}
+
+/// Replace only the normalized source contribution owned by each anchor. Cache
+/// markers are calculated first; an exact provider-owned block deliberately
+/// replaces (and therefore cannot inherit) a generated marker.
+fn apply_anthropic_native_groups(
+    messages: &mut [Value],
+    source_spans: &[Vec<SourceSpan>],
+    groups: &[ProviderTranscriptGroup],
+    thinking_enabled: bool,
+    eligible_tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) {
+    struct Replacement {
+        message_index: usize,
+        span_index: usize,
+        start: usize,
+        end: usize,
+        items: Vec<Value>,
+    }
+
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return;
+    }
+
+    let eligible_execution_names = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut groups_by_anchor: HashMap<&str, Vec<&ProviderTranscriptGroup>> = HashMap::new();
+    for group in groups.iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+    }) {
+        groups_by_anchor
+            .entry(group.anchor_message_id())
+            .or_default()
+            .push(group);
+    }
+
+    let mut replacements = Vec::new();
+    for (anchor, mut anchor_groups) in groups_by_anchor {
+        let Some((message_index, span_index)) =
+            source_spans
+                .iter()
+                .enumerate()
+                .find_map(|(message_index, spans)| {
+                    spans
+                        .iter()
+                        .position(|span| span.id == anchor)
+                        .map(|span_index| (message_index, span_index))
+                })
+        else {
+            continue;
+        };
+        let spans = &source_spans[message_index];
+        let span = &spans[span_index];
+        let start = span.start_block;
+        let end = span.end_block;
+
+        anchor_groups.sort_by_key(|group| group.sequence());
+        let items = anchor_groups
+            .into_iter()
+            .flat_map(|group| group.items().iter().cloned())
+            .collect::<Vec<_>>();
+        if ProviderTranscriptGroup::validate_items(&items).is_err() {
+            continue;
+        }
+        let custom_host_result = items.iter().all(|item| {
+            item.origin() == ProviderTranscriptOrigin::HostToolSearch
+                && item.kind() == ProviderTranscriptItemKind::AnthropicToolResult
+        });
+        if custom_host_result {
+            if !span.is_tool_result {
+                continue;
+            }
+        } else if !span.is_assistant {
+            continue;
+        }
+        if items
+            .iter()
+            .flat_map(anthropic_reference_names)
+            .any(|reference| !eligible_execution_names.contains(reference))
+        {
+            // Anthropic resolves the literal reference against this request's
+            // top-level catalog. Keep the normalized anchor instead of sending
+            // a native group that the provider would reject with a 400.
+            continue;
+        }
+        let thinking_positions = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(
+                    item.payload().get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let native_starts_with_thinking = thinking_positions.first() == Some(&0);
+        let normalized_starts_with_thinking = messages
+            .get(message_index)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.get(start))
+            .is_some_and(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+        let invalid_thinking_replay = thinking_positions.len() > 1
+            || thinking_positions
+                .first()
+                .is_some_and(|index| *index != 0 || span_index > 0 || !thinking_enabled)
+            || (normalized_starts_with_thinking && !native_starts_with_thinking);
+        if invalid_thinking_replay {
+            // Consecutive assistant sources are coalesced to satisfy Anthropic's
+            // alternation rule, and thinking is legal only as the one leading
+            // block of a thinking-enabled assistant turn. Keep the normalized
+            // fallback for this entire anchor rather than replaying a partial
+            // or request-incompatible native group.
+            continue;
+        }
+
+        replacements.push(Replacement {
+            message_index,
+            span_index,
+            start,
+            end,
+            items: items
+                .into_iter()
+                .map(|item| item.payload().clone())
+                .collect(),
+        });
+    }
+
+    // Source spans were calculated before replacement. Apply later spans first
+    // so inserting a multi-block native group cannot shift an earlier index that
+    // another replacement still needs.
+    replacements.sort_by(|left, right| {
+        right
+            .message_index
+            .cmp(&left.message_index)
+            .then_with(|| right.span_index.cmp(&left.span_index))
+    });
+    for replacement in replacements {
+        let Some(content) = messages[replacement.message_index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        if replacement.start <= replacement.end && replacement.end <= content.len() {
+            content.splice(replacement.start..replacement.end, replacement.items);
+        }
+    }
 }
 
 /// Build a `cache_control` value, honoring an optional extended TTL.
@@ -864,7 +1250,11 @@ fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheT
 /// Turns whose reasoning text exists but whose signature was invalidated
 /// (multi-block / redacted thinking) downgrade too: a partial replay would
 /// fail verification.
-fn must_downgrade_thinking_for_unsigned_tool_turn(messages: &[Message]) -> bool {
+fn must_downgrade_thinking_for_unsigned_tool_turn(
+    messages: &[Message],
+    native_groups: &[ProviderTranscriptGroup],
+    thinking_replay_always: bool,
+) -> bool {
     let Some(last_assistant_idx) = messages
         .iter()
         .rposition(|message| matches!(message.role, Role::Assistant))
@@ -888,15 +1278,72 @@ fn must_downgrade_thinking_for_unsigned_tool_turn(messages: &[Message]) -> bool 
     if !submits_tool_results {
         return false;
     }
-    let has_signed_thinking = last_assistant
-        .reasoning
-        .as_deref()
-        .is_some_and(|reasoning| !reasoning.is_empty())
+    let anchor_is_leading =
+        native_thinking_anchor_is_leading(messages, &last_assistant.id, thinking_replay_always);
+    let has_signed_thinking = anchor_is_leading
+        && last_assistant
+            .reasoning
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.is_empty())
         && last_assistant
             .reasoning_signature
             .as_deref()
             .is_some_and(|signature| !signature.is_empty());
-    !has_signed_thinking
+    let has_native_thinking =
+        has_replayable_native_thinking_prefix(&last_assistant.id, native_groups)
+            && anchor_is_leading;
+    !has_signed_thinking && !has_native_thinking
+}
+
+fn native_thinking_anchor_is_leading(
+    messages: &[Message],
+    anchor_message_id: &str,
+    thinking_replay_always: bool,
+) -> bool {
+    let (_, _, source_spans) =
+        messages_to_anthropic_json(messages, &[], true, thinking_replay_always);
+    source_spans.iter().any(|spans| {
+        spans.iter().enumerate().any(|(span_index, span)| {
+            span.id == anchor_message_id && span.is_assistant && span_index == 0
+        })
+    })
+}
+
+fn has_replayable_native_thinking_prefix(
+    anchor_message_id: &str,
+    native_groups: &[ProviderTranscriptGroup],
+) -> bool {
+    let mut groups = native_groups
+        .iter()
+        .filter(|group| {
+            group.family() == ProviderFamily::Anthropic
+                && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+                && group.anchor_message_id() == anchor_message_id
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by_key(|group| group.sequence());
+    let items = groups
+        .into_iter()
+        .flat_map(|group| group.items().iter().cloned())
+        .collect::<Vec<_>>();
+    ProviderTranscriptGroup::validate_items(&items).is_ok()
+        && matches!(
+            items
+                .first()
+                .and_then(|item| item.payload().get("type"))
+                .and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+        && items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.payload().get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+            .count()
+            == 1
 }
 
 fn anthropic_thinking_from_effort(
@@ -930,7 +1377,8 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 ///
 /// Returns the optional `system` block array, the message array, and parallel
 /// source spans recording where each source message's own rendered contribution
-/// ends (so breakpoints remain stable through same-role/tool-result merging).
+/// starts and ends (so anchors and breakpoints remain stable through same-role /
+/// tool-result merging, including empty assistant sources).
 ///
 /// When `system_blocks` is non-empty it is the canonical, structured source for
 /// the system field (each block → its own text block); otherwise the system field
@@ -941,7 +1389,10 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceSpan {
     id: String,
-    last_block: usize,
+    is_assistant: bool,
+    is_tool_result: bool,
+    start_block: usize,
+    end_block: usize,
 }
 
 fn messages_to_anthropic_json(
@@ -1019,28 +1470,38 @@ fn messages_to_anthropic_json(
                                 })
                                 .cloned()
                                 .collect();
+                            let start_block = last_content.len();
                             last_content.extend(appended);
                             // Record exactly where this source's contribution
-                            // ends, not merely which merged output owns it.
+                            // starts and ends, not merely which merged output owns
+                            // it. An empty assistant source therefore owns the
+                            // valid insertion span `n..n` instead of aliasing the
+                            // preceding block.
                             if let Some(last_spans) = out_spans.last_mut() {
                                 last_spans.push(SourceSpan {
                                     id: m.id.clone(),
-                                    last_block: last_content.len().saturating_sub(1),
+                                    is_assistant: matches!(m.role, Role::Assistant),
+                                    is_tool_result: matches!(m.role, Role::Tool),
+                                    start_block,
+                                    end_block: last_content.len(),
                                 });
                             }
                             continue;
                         }
                     }
                 }
-                let last_block = msg_json
+                let end_block = msg_json
                     .get("content")
                     .and_then(Value::as_array)
-                    .map(|blocks| blocks.len().saturating_sub(1))
+                    .map(Vec::len)
                     .unwrap_or(0);
                 out.push(msg_json);
                 out_spans.push(vec![SourceSpan {
                     id: m.id.clone(),
-                    last_block,
+                    is_assistant: matches!(m.role, Role::Assistant),
+                    is_tool_result: matches!(m.role, Role::Tool),
+                    start_block: 0,
+                    end_block,
                 }]);
             }
         }
@@ -1325,21 +1786,6 @@ fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
     Some((media_type.to_string(), data.to_string()))
 }
 
-fn preview_for_log(value: &str, max_chars: usize) -> String {
-    let mut iter = value.chars();
-    let mut preview = String::new();
-    for _ in 0..max_chars {
-        match iter.next() {
-            Some(ch) => preview.push(ch),
-            None => break,
-        }
-    }
-    if iter.next().is_some() {
-        preview.push_str("...");
-    }
-    preview.replace('\n', "\\n").replace('\r', "\\r")
-}
-
 /// Convert a tool-call `arguments` string into an Anthropic `tool_use.input`.
 ///
 /// Anthropic requires `input` to be a JSON **object**, so anything that is not
@@ -1361,17 +1807,15 @@ pub(super) fn tool_arguments_to_input(arguments: &str) -> Value {
         Ok(value) if value.is_object() => value,
         Ok(_) => {
             tracing::warn!(
-                "Anthropic tool_use input fallback to _raw object: arguments are valid JSON but not an object, args_len={}, preview=\"{}\"",
+                "Anthropic tool_use input fallback to _raw object: arguments are valid JSON but not an object, args_len={}",
                 trimmed.len(),
-                preview_for_log(trimmed, 180),
             );
             json!({ "_raw": arguments })
         }
         Err(error) => {
             tracing::warn!(
-                "Anthropic tool_use input fallback to _raw object: invalid JSON arguments, args_len={}, preview=\"{}\", error={}",
+                "Anthropic tool_use input fallback to _raw object: invalid JSON arguments, args_len={}, error={}",
                 trimmed.len(),
-                preview_for_log(trimmed, 180),
                 error
             );
             json!({ "_raw": arguments })
@@ -1388,17 +1832,144 @@ fn tool_call_to_tool_use_block(tool_call: &bamboo_domain::ToolCall) -> Value {
     })
 }
 
-fn tools_to_anthropic_json(tools: &[ToolSchema]) -> Vec<Value> {
-    tools
+fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
+    json!({
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "input_schema": crate::providers::common::tool_schema::canonicalize_json_value(&tool.function.parameters),
+    })
+}
+
+pub(crate) fn tools_to_anthropic_json(
+    tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Vec<Value> {
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return tools.iter().map(tool_to_anthropic_json).collect();
+    }
+
+    let mut rendered = tools
         .iter()
-        .map(|t| {
-            json!({
-                "name": t.function.name,
-                "description": t.function.description,
-                "input_schema": t.function.parameters,
-            })
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            if identity.loading_class() == CapabilityLoadingClass::HostOnly {
+                return None;
+            }
+            let mut value = tool_to_anthropic_json(tool);
+            if identity.loading_class() == CapabilityLoadingClass::Deferred {
+                value["defer_loading"] = Value::Bool(true);
+            }
+            Some(value)
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    rendered.push(json!({
+        "type": ANTHROPIC_TOOL_SEARCH_TYPE,
+        "name": ANTHROPIC_TOOL_SEARCH_NAME,
+    }));
+    rendered
+}
+
+fn anthropic_reference_names(item: &ProviderTranscriptItem) -> Vec<&str> {
+    match item.kind() {
+        ProviderTranscriptItemKind::AnthropicToolSearchToolResult => item
+            .payload()
+            .get("content")
+            .and_then(|content| content.get("tool_references"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        ProviderTranscriptItemKind::AnthropicToolResult => item
+            .payload()
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract provider-loaded tool identities from already typed Anthropic history.
+///
+/// Only references that name an exact definition in this request's eligible
+/// catalog are returned. This keeps the top-level `tools` array authoritative:
+/// an unknown, removed, disabled, HostOnly, or alias-only reference cannot make
+/// a function callable or produce an upstream missing-definition error.
+pub fn validated_anthropic_loaded_tool_names<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Vec<String> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut loaded = BTreeSet::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let Some(execution_name) =
+                resolve_tool_reference_name(reference, |name| catalog.contains(name))
+            else {
+                continue;
+            };
+            // Anthropic expands the literal `tool_name` by looking it up in the
+            // top-level array. Keep only exact request identities; aliases must
+            // be canonicalized before a custom typed result is persisted.
+            if execution_name == reference {
+                loaded.insert(execution_name);
+            }
+        }
+    }
+
+    loaded.into_iter().collect()
+}
+
+/// Resolve every model-visible Anthropic reference occurrence, in transcript
+/// order, to the exact complete definition from this request's frozen catalog.
+/// Repeated references remain repeated because each one is expanded at a
+/// distinct history position by the provider.
+fn validated_anthropic_reference_definitions_in_order<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Result<Vec<Value>> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then_some((identity.execution_name().to_string(), tool))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut definitions = Vec::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let tool = catalog.get(reference).ok_or_else(|| {
+                LLMError::Api(format!(
+                    "Anthropic tool reference '{reference}' was not offered in the eligible catalog"
+                ))
+            })?;
+            definitions.push(tool_to_anthropic_json(tool));
+        }
+    }
+
+    Ok(definitions)
 }
 
 /// Stateful parser for Anthropic SSE streaming events.
@@ -1425,6 +1996,12 @@ pub struct AnthropicStreamState {
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
     request_thinking_budget_tokens: Option<u64>,
+    native_blocks_by_index: HashMap<usize, Value>,
+    native_input_json_by_index: HashMap<usize, String>,
+    native_thinking_signature_indices: HashSet<usize>,
+    invalid_thinking_signature_indices: HashSet<usize>,
+    native_open_indices: HashSet<usize>,
+    native_capture_invalid: bool,
 }
 
 impl AnthropicStreamState {
@@ -1436,6 +2013,226 @@ impl AnthropicStreamState {
     fn thinking_signature_replayable(&self) -> bool {
         self.thinking_blocks_started == 1 && self.redacted_thinking_blocks_started == 0
     }
+}
+
+fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: &str, data: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        if matches!(
+            event_type,
+            "content_block_start" | "content_block_delta" | "content_block_stop"
+        ) {
+            state.native_capture_invalid = true;
+        }
+        return;
+    };
+    let index = value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    match event_type {
+        "content_block_start" => {
+            let Some((index, block)) = index.zip(value.get("content_block")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.insert(index) {
+                state.native_capture_invalid = true;
+            }
+            let supported = matches!(
+                block.get("type").and_then(Value::as_str),
+                Some(
+                    "text"
+                        | "thinking"
+                        | "redacted_thinking"
+                        | "server_tool_use"
+                        | "tool_search_tool_result"
+                        | "tool_use"
+                )
+            );
+            if !supported {
+                state.native_capture_invalid = true;
+                return;
+            }
+            if state
+                .native_blocks_by_index
+                .insert(index, block.clone())
+                .is_some()
+            {
+                state.native_capture_invalid = true;
+            }
+        }
+        "content_block_delta" => {
+            let Some((index, delta)) = index.zip(value.get("delta")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.contains(&index) {
+                state.native_capture_invalid = true;
+                return;
+            }
+            let Some(block_type) = state
+                .native_blocks_by_index
+                .get(&index)
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if block_type == "thinking" && state.native_thinking_signature_indices.contains(&index)
+            {
+                // Anthropic emits exactly one signature delta immediately
+                // before closing the thinking block. Any later delta makes the
+                // signature inconsistent with the normalized reasoning too, so
+                // invalidate both replay lanes before the legacy parser sees it.
+                state.native_capture_invalid = true;
+                state.invalid_thinking_signature_indices.insert(index);
+                state.thinking_signature.clear();
+                return;
+            }
+            let append = |block: &mut Value, field: &str, fragment: &str| {
+                let current = block.get(field).and_then(Value::as_str).unwrap_or("");
+                block[field] = json!(format!("{current}{fragment}"));
+            };
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") if block_type == "text" => {
+                    let Some(fragment) = delta.get("text").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "text", fragment);
+                    }
+                }
+                Some("thinking_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta
+                        .get("thinking")
+                        .or_else(|| delta.get("text"))
+                        .and_then(Value::as_str)
+                    else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "thinking", fragment);
+                    }
+                }
+                Some("signature_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta.get("signature").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    state.native_thinking_signature_indices.insert(index);
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "signature", fragment);
+                    }
+                }
+                Some("input_json_delta")
+                    if matches!(block_type.as_str(), "server_tool_use" | "tool_use") =>
+                {
+                    let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    state
+                        .native_input_json_by_index
+                        .entry(index)
+                        .or_default()
+                        .push_str(fragment);
+                }
+                _ => state.native_capture_invalid = true,
+            }
+        }
+        "content_block_stop" => {
+            let Some(index) = index else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.remove(&index) {
+                state.native_capture_invalid = true;
+            }
+            if let Some(input) = state.native_input_json_by_index.remove(&index) {
+                match serde_json::from_str::<Value>(&input) {
+                    Ok(input) if input.is_object() => {
+                        if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                            block["input"] = input;
+                        } else {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                    _ => state.native_capture_invalid = true,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn take_anthropic_provider_transcript_items(state: &mut AnthropicStreamState) -> Vec<LLMChunk> {
+    let mut blocks = std::mem::take(&mut state.native_blocks_by_index)
+        .into_iter()
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|(index, _)| *index);
+    let invalid = std::mem::take(&mut state.native_capture_invalid)
+        || !state.native_open_indices.is_empty()
+        || !state.native_input_json_by_index.is_empty();
+    state.native_open_indices.clear();
+    state.native_input_json_by_index.clear();
+    state.native_thinking_signature_indices.clear();
+    state.invalid_thinking_signature_indices.clear();
+    if invalid
+        || !blocks.iter().any(|(_, block)| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("server_tool_use" | "tool_search_tool_result")
+            )
+        })
+    {
+        return Vec::new();
+    }
+    let mut items = Vec::with_capacity(blocks.len());
+    for (_, payload) in blocks {
+        let author = match payload.get("type").and_then(Value::as_str) {
+            Some("tool_search_tool_result") => ProviderTranscriptAuthor::ToolResult,
+            _ => ProviderTranscriptAuthor::Model,
+        };
+        let Ok(item) = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            author,
+            payload,
+        ) else {
+            tracing::warn!("Anthropic discovery transcript failed closed during validation");
+            return Vec::new();
+        };
+        items.push(item);
+    }
+    if ProviderTranscriptGroup::validate_items(&items).is_err() {
+        tracing::warn!("Anthropic discovery transcript failed closed during group validation");
+        return Vec::new();
+    }
+    items
+        .into_iter()
+        .map(LLMChunk::ProviderTranscriptItem)
+        .collect()
+}
+
+fn parse_anthropic_sse_event_multi(
+    state: &mut AnthropicStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
+    capture_anthropic_native_event(state, event_type, data);
+    let normalized = parse_anthropic_sse_event(state, event_type, data)?;
+    let mut chunks = if event_type == "message_stop" {
+        take_anthropic_provider_transcript_items(state)
+    } else {
+        Vec::new()
+    };
+    chunks.extend(normalized);
+    Ok(chunks)
 }
 
 /// Parse a single Anthropic SSE event into an optional [`LLMChunk`].
@@ -1569,9 +2366,9 @@ pub fn parse_anthropic_sse_event(
                     }
                     Err(error) => {
                         tracing::debug!(
-                            "Failed to parse Anthropic message_delta payload for logging: {} (payload={})",
+                            "Failed to parse Anthropic message_delta payload for logging: {} (payload_len={})",
                             error,
-                            preview_for_log(data, 120)
+                            data.len()
                         );
                     }
                 }
@@ -1626,12 +2423,17 @@ pub fn parse_anthropic_sse_event(
             // stream error, which would discard the whole already-streamed
             // assistant turn. (#237)
             let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
-                tracing::warn!("Anthropic content_block_start missing index; skipping: {data}");
+                tracing::warn!(
+                    "Anthropic content_block_start missing index; skipping payload_len={}",
+                    data.len()
+                );
                 return Ok(None);
             };
             let Some(content_block) = v.get("content_block") else {
                 tracing::warn!(
-                    "Anthropic content_block_start missing content_block; skipping: {data}"
+                    "Anthropic content_block_start missing content_block; skipping index={} payload_len={}",
+                    index,
+                    data.len()
                 );
                 return Ok(None);
             };
@@ -1672,11 +2474,19 @@ pub fn parse_anthropic_sse_event(
             }
 
             let Some(id) = content_block.get("id").and_then(|s| s.as_str()) else {
-                tracing::warn!("Anthropic tool_use content_block missing id; skipping: {data}");
+                tracing::warn!(
+                    "Anthropic tool_use content_block missing id; skipping index={} payload_len={}",
+                    index,
+                    data.len()
+                );
                 return Ok(None);
             };
             let Some(name) = content_block.get("name").and_then(|s| s.as_str()) else {
-                tracing::warn!("Anthropic tool_use content_block missing name; skipping: {data}");
+                tracing::warn!(
+                    "Anthropic tool_use content_block missing name; skipping index={} payload_len={}",
+                    index,
+                    data.len()
+                );
                 return Ok(None);
             };
 
@@ -1729,7 +2539,13 @@ pub fn parse_anthropic_sse_event(
                     // never announced via content_block_start. (#237)
                     let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
                         tracing::warn!(
-                            "Anthropic input_json_delta missing index; skipping: {data}"
+                            "Anthropic input_json_delta missing index; skipping payload_len={} partial_len={}",
+                            data.len(),
+                            delta
+                                .get("partial_json")
+                                .and_then(|value| value.as_str())
+                                .map(str::len)
+                                .unwrap_or(0)
                         );
                         return Ok(None);
                     };
@@ -1739,9 +2555,25 @@ pub fn parse_anthropic_sse_event(
                         .unwrap_or_default();
 
                     let index = index as usize;
+                    if state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("server_tool_use")
+                    {
+                        // Tool-search server calls are persisted through the
+                        // native lane, not normalized into an executable host
+                        // ToolCall. Their partial arguments may contain paths or
+                        // search terms, so do not route them through the legacy
+                        // "unannounced tool_use" warning that prints raw data.
+                        return Ok(None);
+                    }
                     let Some((id, name)) = state.tool_uses_by_index.get(&index) else {
                         tracing::warn!(
-                            "Anthropic input_json_delta for unannounced tool_use index {index}; skipping: {data}"
+                            "Anthropic input_json_delta for unannounced tool_use index {index}; skipping payload_len={} partial_len={}",
+                            data.len(),
+                            partial.len()
                         );
                         return Ok(None);
                     };
@@ -1808,7 +2640,12 @@ pub fn parse_anthropic_sse_event(
                     let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
                         return Ok(None);
                     };
-                    if state.thinking_blocks_by_index.contains(&(index as usize)) {
+                    let index = index as usize;
+                    if state.invalid_thinking_signature_indices.contains(&index) {
+                        state.thinking_signature.clear();
+                        return Ok(None);
+                    }
+                    if state.thinking_blocks_by_index.contains(&index) {
                         if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
                             state.thinking_signature.push_str(signature);
                         }
@@ -1829,6 +2666,14 @@ pub fn parse_anthropic_sse_event(
                 let index = index as usize;
                 state.tool_uses_by_index.remove(&index);
                 let was_thinking_block = state.thinking_blocks_by_index.remove(&index);
+                if state.invalid_thinking_signature_indices.remove(&index) {
+                    let signature_was_emitted = state.thinking_signature_emitted;
+                    state.thinking_signature_emitted = false;
+                    state.thinking_signature.clear();
+                    return Ok(
+                        signature_was_emitted.then(|| LLMChunk::ReasoningSignature(String::new()))
+                    );
+                }
                 // The turn's single thinking block just closed with a captured
                 // signature → surface it so the engine can persist it alongside
                 // the accumulated reasoning text (#520). Multi-block/redacted
@@ -1853,9 +2698,1492 @@ pub fn parse_anthropic_sse_event(
 #[cfg(test)]
 mod anthropic_request_building {
     use crate::models::{ContentPart, ImageUrl};
+    use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
+    use crate::provider::{LLMProvider, ProviderVisibleToolSegmentKind};
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
+    use serde_json::{json, Value};
+
+    const TEST_PROVIDER_BOUNDARY: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} description"),
+                parameters: json!({"type":"object"}),
+            },
+        }
+    }
+
+    fn native_item(
+        author: super::ProviderTranscriptAuthor,
+        payload: Value,
+    ) -> super::ProviderTranscriptItem {
+        super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::Provider,
+            author,
+            payload,
+        )
+        .unwrap()
+    }
+
+    fn discovery_items() -> Vec<super::ProviderTranscriptItem> {
+        vec![
+            native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"pattern":"weather"}
+                }),
+            ),
+            native_item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_weather"}
+                    ]}
+                }),
+            ),
+            native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_1","name":"get_weather","input":{}
+                }),
+            ),
+        ]
+    }
+
+    fn host_reference_item(
+        tool_use_id: &str,
+        references: &[&str],
+    ) -> super::ProviderTranscriptItem {
+        super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result",
+                "tool_use_id":tool_use_id,
+                "is_error":false,
+                "content":references.iter().map(|name| {
+                    json!({"type":"tool_reference","tool_name":name})
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap()
+    }
+
+    fn anthropic_ir_with_reference_groups(groups: &[(&str, &[&str])]) -> PromptIR {
+        let mut session = bamboo_domain::Session::new("footprint-references", "claude");
+        activate_native_route(&mut session);
+        for (tool_use_id, references) in groups {
+            let result = Message::tool_result(*tool_use_id, "normalized reference result");
+            let anchor = result.id.clone();
+            session.add_message(result);
+            session
+                .append_provider_transcript_group(
+                    &anchor,
+                    None,
+                    vec![host_reference_item(tool_use_id, references)],
+                )
+                .unwrap();
+        }
+        PromptIR {
+            segments: vec![Segment::new(
+                SegmentRole::Conversation,
+                session.messages.clone(),
+            )],
+            provider_transcript_groups: session.provider_transcript.groups().to_vec(),
+            ..PromptIR::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_keeps_initial_array_and_each_reference_occurrence_ordered() {
+        let tools = vec![
+            tool_schema("Read"),
+            tool_schema("alpha_tool"),
+            tool_schema("beta_tool"),
+            tool_schema("Workspace"),
+        ];
+        let ir = anthropic_ir_with_reference_groups(&[
+            ("search_1", &["beta_tool", "Read", "alpha_tool"]),
+            ("search_2", &["beta_tool"]),
+        ]);
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &tools, "claude-sonnet-4-6", None)
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 6);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        let initial: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+        assert_eq!(initial.as_array().unwrap().len(), 2, "Read + search");
+        assert_eq!(initial[0]["name"], "Read");
+        assert_eq!(initial[1]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert!(initial.as_array().unwrap().iter().all(|tool| {
+            tool["name"] != "alpha_tool"
+                && tool["name"] != "beta_tool"
+                && tool["name"] != "Workspace"
+        }));
+        assert_eq!(
+            footprint.segments[1].kind,
+            ProviderVisibleToolSegmentKind::ProviderLateBound
+        );
+        assert!(footprint.segments[1].serialized.is_empty());
+
+        let expanded = footprint.segments[2..]
+            .iter()
+            .map(|segment| {
+                assert_eq!(
+                    segment.kind,
+                    ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion
+                );
+                serde_json::from_str::<Value>(&segment.serialized).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded,
+            vec!["beta_tool", "Read", "alpha_tool", "beta_tool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_rejects_a_reference_missing_from_the_frozen_catalog() {
+        let ir = anthropic_ir_with_reference_groups(&[("search_missing", &["missing_tool"])]);
+        let error = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &[tool_schema("Read")], "claude-sonnet-4-6", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing_tool"));
+        assert!(error.to_string().contains("eligible catalog"));
+    }
+
+    #[tokio::test]
+    async fn unreferenced_deferred_tools_do_not_change_the_initial_footprint() {
+        let provider = super::AnthropicProvider::new("k");
+        let baseline_tools = vec![tool_schema("Read")];
+        let baseline = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &baseline_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut expanded_tools = baseline_tools.clone();
+        expanded_tools.extend((0..100).map(|index| {
+            let mut tool = tool_schema(&format!("deferred_tool_{index}"));
+            tool.function.parameters = json!({
+                "type": "object",
+                "description": "hidden".repeat(1_000),
+            });
+            tool
+        }));
+        let expanded = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &expanded_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expanded.segments, baseline.segments);
+        let baseline_transport = super::tools_to_anthropic_json(
+            &baseline_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let expanded_transport = super::tools_to_anthropic_json(
+            &expanded_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(expanded_transport.len(), baseline_transport.len() + 100);
+        assert_eq!(
+            expanded_transport
+                .iter()
+                .filter(|tool| tool["defer_loading"] == true)
+                .count(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_footprint_matches_the_complete_anthropic_tools_lowering() {
+        let tools = vec![tool_schema("Read"), tool_schema("Glob")];
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &tools,
+                "claude-sonnet-4-6",
+                Some("Read"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 1);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            footprint.segments[0].serialized,
+            serde_json::to_string(&super::tools_to_anthropic_json(
+                &tools,
+                super::CapabilityLoadingMode::LegacyFullCatalog,
+            ))
+            .unwrap()
+        );
+    }
+
+    fn activate_native_route(session: &mut bamboo_domain::Session) {
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+    }
+
+    fn replayable_native_groups(
+        session: &bamboo_domain::Session,
+    ) -> Vec<super::ProviderTranscriptGroup> {
+        session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn parse_native_events(events: &[(&str, Value)]) -> Vec<super::LLMChunk> {
+        let mut state = super::AnthropicStreamState::default();
+        events
+            .iter()
+            .flat_map(|(event, payload)| {
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn valid_discovery_events() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ]
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut self.0, "{}={value:?};", field.name());
+                }
+            }
+
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn discovery_blocks_are_reassembled_and_replayed_at_their_message_anchor() {
+        let mut state = super::AnthropicStreamState::default();
+        let events = [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let mut items = Vec::new();
+        for (event, payload) in events {
+            items.extend(
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|chunk| match chunk {
+                        super::LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                        _ => None,
+                    }),
+            );
+        }
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].payload()["input"]["pattern"], "weather");
+        assert_eq!(items[2].payload()["input"]["city"], "Paris");
+
+        let expected = items
+            .iter()
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+        let mut session = bamboo_domain::Session::new("native-anthropic", "claude");
+        session.add_message(Message::user("weather"));
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let session: bamboo_domain::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
+        let tools = [
+            "Bash",
+            "Read",
+            "Glob",
+            "bash",
+            "Workspace",
+            "discover_capabilities",
+        ]
+        .into_iter()
+        .map(tool_schema)
+        .collect::<Vec<_>>();
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(
+            rendered.len(),
+            5,
+            "HostOnly is replaced by one search entry"
+        );
+        assert_eq!(rendered[0]["name"], "Bash");
+        assert_eq!(rendered[1]["name"], "Read");
+        assert_eq!(rendered[2]["name"], "Glob");
+        assert_eq!(rendered[2]["defer_loading"], true);
+        assert_eq!(rendered[3]["name"], "bash");
+        assert_eq!(
+            rendered[3]["defer_loading"], true,
+            "a custom exact lowercase alias must not inherit Core policy"
+        );
+        assert!(rendered[0].get("defer_loading").is_none());
+        assert!(rendered[1].get("defer_loading").is_none());
+        assert!(rendered[2].get("cache_control").is_none());
+        assert!(rendered[3].get("cache_control").is_none());
+        assert_eq!(rendered[4]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert_eq!(rendered[4]["name"], super::ANTHROPIC_TOOL_SEARCH_NAME);
+        assert!(rendered[4].get("defer_loading").is_none());
+        assert_eq!(rendered[4]["cache_control"]["type"], "ephemeral");
+
+        let legacy = super::build_anthropic_request(
+            &[Message::user("inspect")],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(legacy["tools"].as_array().unwrap().len(), tools.len());
+        assert_eq!(legacy["tools"][5]["name"], "discover_capabilities");
+        assert!(legacy.to_string().find("defer_loading").is_none());
+        assert!(legacy
+            .to_string()
+            .find(super::ANTHROPIC_TOOL_SEARCH_TYPE)
+            .is_none());
+    }
+
+    #[test]
+    fn progressive_cache_can_be_disabled_without_changing_deferred_catalog() {
+        let tools = vec![tool_schema("Bash"), tool_schema("Glob")];
+        let plan = crate::cache::PromptCachePlan {
+            cache_tools: false,
+            ..Default::default()
+        };
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            Some(&plan),
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(rendered[1]["defer_loading"], true);
+        assert!(rendered
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn custom_tool_reference_replays_at_tool_result_anchor_and_loads_exact_name() {
+        let tools = vec![tool_schema("custom_search"), tool_schema("get_weather")];
+        let mut session = bamboo_domain::Session::new("custom-search", "claude");
+        session.add_message(Message::user("weather"));
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized search result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search","is_error":false,
+                "content":[{"type":"tool_reference","tool_name":"get_weather"}]
+            }),
+        )
+        .unwrap();
+        let expected = item.payload().clone();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        assert_eq!(
+            super::validated_anthropic_loaded_tool_names(groups.iter(), &tools),
+            vec!["get_weather"]
+        );
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][2]["content"], json!([expected]));
+        assert!(!body.to_string().contains("normalized search result"));
+    }
+
+    #[test]
+    fn missing_custom_reference_is_not_loaded_or_replayed() {
+        let tools = vec![tool_schema("custom_search")];
+        let mut session = bamboo_domain::Session::new("missing-custom-search", "claude");
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized missing result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search",
+                "content":[{"type":"tool_reference","tool_name":"missing_tool"}]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+        assert!(super::validated_anthropic_loaded_tool_names(groups.iter(), &tools).is_empty());
+
+        for mode in [
+            super::CapabilityLoadingMode::Progressive,
+            super::CapabilityLoadingMode::LegacyFullCatalog,
+        ] {
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                mode,
+            );
+            assert!(body.to_string().contains("normalized missing result"));
+            assert!(!body.to_string().contains("missing_tool"));
+        }
+    }
+
+    #[test]
+    fn native_replacements_run_back_to_front_across_coalesced_assistant_sources() {
+        let item = |author, payload| {
+            super::ProviderTranscriptItem::try_from_payload(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                super::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let first_items = vec![
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"first preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"pattern":"first"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_first"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_1","name":"get_first","input":{}
+                }),
+            ),
+        ];
+        let second_items = vec![
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"second preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_2",
+                    "name":"tool_search_tool_regex","input":{"pattern":"second"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_2",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_second"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_2","name":"get_second","input":{}
+                }),
+            ),
+        ];
+        let expected = first_items
+            .iter()
+            .chain(second_items.iter())
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+
+        let mut session = bamboo_domain::Session::new("native-coalesced", "claude");
+        session.add_message(Message::user("search twice"));
+        let first = Message::assistant("normalized first", None);
+        let first_anchor = first.id.clone();
+        session.add_message(first);
+        let second = Message::assistant("normalized second", None);
+        let second_anchor = second.id.clone();
+        session.add_message(second);
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+        session
+            .append_provider_transcript_group(&first_anchor, None, first_items)
+            .unwrap();
+        session
+            .append_provider_transcript_group(&second_anchor, None, second_items)
+            .unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let tools = vec![tool_schema("get_first"), tool_schema("get_second")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn native_capture_fails_closed_for_unknown_or_incomplete_blocks() {
+        let run = |events: Vec<(&str, Value)>| {
+            let mut state = super::AnthropicStreamState::default();
+            events
+                .into_iter()
+                .flat_map(|(event, payload)| {
+                    super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                        .unwrap()
+                })
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count()
+        };
+
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+                (
+                    "content_block_start",
+                    json!({"index":1,"content_block":{"type":"future_block","data":"opaque"}}),
+                ),
+                ("content_block_stop", json!({"index":1})),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn native_capture_validates_the_complete_discovery_group_atomically() {
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+
+        assert!(parse_native_events(&events)
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+    }
+
+    #[test]
+    fn native_capture_rejects_every_invalid_content_block_lifecycle() {
+        let native_count = |events: &[(&str, Value)]| {
+            parse_native_events(events)
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count()
+        };
+        let valid = valid_discovery_events();
+        assert_eq!(native_count(&valid), 3);
+
+        let mut delta_before_start = valid.clone();
+        delta_before_start.insert(0, valid[1].clone());
+        let mut stop_before_start = valid.clone();
+        stop_before_start.insert(0, valid[2].clone());
+        let mut duplicate_start = valid.clone();
+        duplicate_start.insert(1, valid[0].clone());
+        let mut delta_after_stop = valid.clone();
+        delta_after_stop.insert(3, valid[1].clone());
+        let mut duplicate_stop = valid.clone();
+        duplicate_stop.insert(3, valid[2].clone());
+        let mut message_stop_while_open = valid[..2].to_vec();
+        message_stop_while_open.push(("message_stop", json!({"type":"message_stop"})));
+
+        for invalid in [
+            delta_before_start,
+            stop_before_start,
+            duplicate_start,
+            delta_after_stop,
+            duplicate_stop,
+            message_stop_while_open,
+        ] {
+            assert_eq!(native_count(&invalid), 0);
+        }
+    }
+
+    #[test]
+    fn native_capture_rejects_thinking_after_or_repeated_signature_delta() {
+        let valid = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"private"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            (
+                "content_block_start",
+                json!({"index":3,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":3})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        assert_eq!(
+            parse_native_events(&valid)
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let assert_fails_closed = |events: &[(&str, Value)]| {
+            let chunks = parse_native_events(events);
+            assert!(chunks
+                .iter()
+                .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+            assert!(chunks.iter().all(|chunk| !matches!(
+                chunk,
+                super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty()
+            )));
+
+            let reasoning = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert!(!reasoning.is_empty());
+            let mut assistant = Message::assistant(
+                "normalized",
+                Some(vec![ToolCall {
+                    id: "tool_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            );
+            assistant.reasoning = Some(reasoning);
+            assistant.reasoning_signature = chunks.iter().find_map(|chunk| match chunk {
+                super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty() => {
+                    Some(signature.clone())
+                }
+                _ => None,
+            });
+            let messages = vec![
+                Message::user("search"),
+                assistant,
+                Message::tool_result("tool_1", "sunny"),
+            ];
+            let next_request = super::build_anthropic_request_with_cache_blocks_and_native(
+                &messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                Some(bamboo_domain::ReasoningEffort::Medium),
+                None,
+                None,
+                false,
+                &[],
+            );
+            assert!(next_request.get("thinking").is_none());
+            assert!(next_request["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
+        };
+
+        let mut thinking_after_signature = valid.clone();
+        thinking_after_signature.insert(
+            3,
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"tampered"}}),
+            ),
+        );
+        assert_fails_closed(&thinking_after_signature);
+
+        let mut repeated_signature = valid;
+        repeated_signature.insert(
+            3,
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"duplicate"}}),
+            ),
+        );
+        assert_fails_closed(&repeated_signature);
+    }
+
+    #[test]
+    fn invalid_native_group_preserves_the_complete_normalized_fallback() {
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"text_delta","text":"hello"}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            (
+                "content_block_start",
+                json!({"index":3,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_missing","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":3})),
+            (
+                "content_block_start",
+                json!({"index":4,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":4,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":4})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let native = parse_native_events(&events);
+        assert!(native
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+
+        let mut normalized_state = super::AnthropicStreamState::default();
+        let normalized = events
+            .iter()
+            .filter_map(|(event, payload)| {
+                super::parse_anthropic_sse_event(&mut normalized_state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(format!("{native:?}"), format!("{normalized:?}"));
+        let diagnostic = format!("{native:?}");
+        assert!(diagnostic.contains("ReasoningToken(\"reason\")"));
+        assert!(diagnostic.contains("Token(\"hello\")"));
+        assert!(diagnostic.contains("ToolCalls"));
+        assert!(diagnostic.contains("Done"));
+    }
+
+    #[test]
+    fn native_replay_is_assistant_only_and_supports_empty_assistant_anchors() {
+        for anchored in [
+            Message::user("normalized user"),
+            Message::tool_result("tool_1", "normalized tool result"),
+            Message::system("normalized system"),
+        ] {
+            let anchor = anchored.id.clone();
+            let expected_role = anchored.role.clone();
+            let mut session = bamboo_domain::Session::new("native-role-boundary", "claude");
+            session.add_message(anchored.clone());
+            activate_native_route(&mut session);
+            session
+                .append_provider_transcript_group(&anchor, None, discovery_items())
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                super::CapabilityLoadingMode::Progressive,
+            );
+            let serialized = body.to_string();
+            assert!(!serialized.contains("server_tool_use"));
+            assert!(!serialized.contains("tool_search_tool_result"));
+            assert_eq!(session.messages[0].role, expected_role);
+            assert!(serialized.contains(&anchored.content));
+        }
+
+        let mut session = bamboo_domain::Session::new("native-empty-assistant", "claude");
+        session.add_message(Message::user("search"));
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        activate_native_route(&mut session);
+        let items = discovery_items();
+        let expected = items
+            .iter()
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn coalesced_empty_native_anchors_keep_source_order() {
+        let search_items = |suffix: &str| {
+            let server_id = format!("srv_{suffix}");
+            vec![
+                native_item(
+                    super::ProviderTranscriptAuthor::Model,
+                    json!({
+                        "type":"server_tool_use","id":server_id.clone(),
+                        "name":"tool_search_tool_regex","input":{"pattern":suffix}
+                    }),
+                ),
+                native_item(
+                    super::ProviderTranscriptAuthor::ToolResult,
+                    json!({
+                        "type":"tool_search_tool_result","tool_use_id":server_id,
+                        "content":{"type":"tool_search_tool_search_result","tool_references":[]}
+                    }),
+                ),
+            ]
+        };
+
+        for second_content in ["normalized second", ""] {
+            let mut session = bamboo_domain::Session::new("native-coalesced-empty", "claude");
+            session.add_message(Message::user("search"));
+            let first = Message::assistant("", None);
+            let first_anchor = first.id.clone();
+            session.add_message(first);
+            let second = Message::assistant(second_content, None);
+            let second_anchor = second.id.clone();
+            session.add_message(second);
+            activate_native_route(&mut session);
+
+            let first_items = search_items("first");
+            let second_items = search_items("second");
+            let expected = first_items
+                .iter()
+                .chain(&second_items)
+                .map(|item| item.payload().clone())
+                .collect::<Vec<_>>();
+            session
+                .append_provider_transcript_group(&first_anchor, None, first_items)
+                .unwrap();
+            session
+                .append_provider_transcript_group(&second_anchor, None, second_items)
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                super::CapabilityLoadingMode::Progressive,
+            );
+
+            assert_eq!(body["messages"][1]["content"], json!(expected));
+        }
+    }
+
+    #[test]
+    fn native_thinking_replay_obeys_current_mode_and_prevents_false_downgrade() {
+        let mut items = vec![native_item(
+            super::ProviderTranscriptAuthor::Model,
+            json!({"type":"thinking","thinking":"private","signature":"signed"}),
+        )];
+        items.extend(discovery_items());
+
+        let mut session = bamboo_domain::Session::new("native-thinking", "claude");
+        session.add_message(Message::user("search"));
+        let assistant = Message::assistant(
+            "normalized",
+            Some(vec![ToolCall {
+                id: "tool_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        );
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session.add_message(Message::tool_result("tool_1", "sunny"));
+        activate_native_route(&mut session);
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        let tools = vec![tool_schema("get_weather")];
+        let enabled = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert!(enabled.get("thinking").is_some());
+        assert_eq!(enabled["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(
+            enabled["messages"][1]["content"][1]["type"],
+            "server_tool_use"
+        );
+
+        let disabled = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+        );
+        assert!(disabled.get("thinking").is_none());
+        assert!(disabled["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking" | "server_tool_use")
+            )));
+    }
+
+    #[test]
+    fn interior_native_thinking_cannot_suppress_the_required_downgrade() {
+        for prior_has_native_group in [false, true] {
+            let mut items = vec![native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"thinking","thinking":"private","signature":"signed"}),
+            )];
+            items.extend(discovery_items());
+
+            let mut session = bamboo_domain::Session::new("native-interior-thinking", "claude");
+            session.add_message(Message::user("search"));
+            let prior = Message::assistant("", None);
+            let prior_anchor = prior.id.clone();
+            session.add_message(prior);
+            let mut assistant = Message::assistant(
+                "normalized",
+                Some(vec![ToolCall {
+                    id: "tool_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            );
+            assistant.reasoning = Some("normalized private".to_string());
+            assistant.reasoning_signature = Some("normalized signed".to_string());
+            let anchor = assistant.id.clone();
+            session.add_message(assistant);
+            session.add_message(Message::tool_result("tool_1", "sunny"));
+            activate_native_route(&mut session);
+            if prior_has_native_group {
+                session
+                    .append_provider_transcript_group(
+                        &prior_anchor,
+                        None,
+                        vec![
+                            native_item(
+                                super::ProviderTranscriptAuthor::Model,
+                                json!({"type":"server_tool_use","id":"srv_prior","name":"tool_search_tool_regex","input":{"pattern":"prior"}}),
+                            ),
+                            native_item(
+                                super::ProviderTranscriptAuthor::ToolResult,
+                                json!({"type":"tool_search_tool_result","tool_use_id":"srv_prior","content":{"type":"tool_search_tool_search_result","tool_references":[]}}),
+                            ),
+                        ],
+                    )
+                    .unwrap();
+            }
+            session
+                .append_provider_transcript_group(&anchor, None, items)
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+
+            let body = super::build_anthropic_request_with_cache_blocks_and_native(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                Some(bamboo_domain::ReasoningEffort::Medium),
+                None,
+                None,
+                false,
+                &groups,
+            );
+            assert!(body.get("thinking").is_none());
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            assert!(content.iter().all(|block| !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )));
+            assert!(content
+                .iter()
+                .all(|block| block.get("id").and_then(Value::as_str) != Some("srv_1")));
+            assert!(body.to_string().contains("normalized"));
+        }
+    }
+
+    #[test]
+    fn native_replay_cannot_remove_normalized_signed_thinking() {
+        let mut session = bamboo_domain::Session::new("native-preserve-thinking", "claude");
+        session.add_message(Message::user("search"));
+        let mut assistant = Message::assistant(
+            "normalized",
+            Some(vec![ToolCall {
+                id: "tool_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        );
+        assistant.reasoning = Some("normalized private".to_string());
+        assistant.reasoning_signature = Some("normalized signed".to_string());
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session.add_message(Message::tool_result("tool_1", "sunny"));
+        activate_native_route(&mut session);
+        session
+            .append_provider_transcript_group(&anchor, None, discovery_items())
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+            &groups,
+        );
+
+        assert!(body.get("thinking").is_some());
+        assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(
+            body["messages"][1]["content"][0]["thinking"],
+            "normalized private"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["signature"],
+            "normalized signed"
+        );
+        assert!(body["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) != Some("server_tool_use")));
+    }
+
+    #[test]
+    fn malformed_stream_warnings_never_include_raw_provider_payloads() {
+        const SENTINEL: &str = "LOG_SENTINEL_/private/credential.json";
+        let capture = EventCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+        let mut state = super::AnthropicStreamState::default();
+
+        for (event, payload) in [
+            (
+                "content_block_start",
+                json!({"content_block":{"type":"server_tool_use","input":{"pattern":SENTINEL}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_use","name":"unsafe","input":{"credential":SENTINEL}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta":{"type":"input_json_delta","partial_json":SENTINEL}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":99,"delta":{"type":"input_json_delta","partial_json":SENTINEL}}),
+            ),
+        ] {
+            super::parse_anthropic_sse_event(&mut state, event, &payload.to_string()).unwrap();
+        }
+        super::parse_anthropic_sse_event(
+            &mut state,
+            "message_delta",
+            &format!("{{\"secret\":\"{SENTINEL}\""),
+        )
+        .unwrap();
+        let _ = super::tool_arguments_to_input(SENTINEL);
+        let _ = super::tool_arguments_to_input(&json!(SENTINEL).to_string());
+
+        let logs = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .join("\n");
+        assert!(!logs.contains(SENTINEL));
+        assert!(logs.contains("payload_len"));
+    }
 
     #[test]
     fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
@@ -4168,6 +6496,117 @@ mod anthropic_provider_tests {
                 description: "Load one skill".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_loading_requires_official_endpoint_supported_model_and_no_required_tool() {
+        let provider = AnthropicProvider::new("test-key");
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5-20260830",
+            "claude-opus-5",
+            "claude-opus-4-8-20260830",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::Progressive,
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-opus-4-1",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4-50",
+            "unknown-model",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        assert_eq!(
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_selected_mode_controls_deferred_catalog_shape() {
+        let provider = AnthropicProvider::new("test-key");
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "Read".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                },
+            },
+            load_skill_tool(),
+        ];
+        let render = |mode| {
+            build_anthropic_request_with_cache_blocks_native_mode(
+                &[Message::user("inspect")],
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &[],
+                mode,
+            )
+        };
+
+        let progressive = render(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        );
+        assert_eq!(progressive["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(progressive["tools"][0]["name"], "Read");
+        assert_eq!(progressive["tools"][1]["defer_loading"], true);
+        assert_eq!(progressive["tools"][2]["type"], ANTHROPIC_TOOL_SEARCH_TYPE);
+
+        for mode in [
+            provider
+                .capability_loading_mode("claude-opus-4-1", None)
+                .await,
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        ] {
+            let legacy = render(mode);
+            assert_eq!(legacy["tools"].as_array().unwrap().len(), 2);
+            assert!(legacy.to_string().find("defer_loading").is_none());
+            assert!(legacy
+                .to_string()
+                .find(ANTHROPIC_TOOL_SEARCH_TYPE)
+                .is_none());
         }
     }
 

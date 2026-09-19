@@ -43,22 +43,38 @@ pub(crate) enum OutFrame {
     Binary(Vec<u8>),
 }
 
+/// Encode a top-level server control frame in the connection's negotiated
+/// representation. These frames deliberately do not use a channel envelope.
+fn top_level_type_frame(encoding: Encoding, frame_type: &'static str) -> Option<OutFrame> {
+    #[derive(Serialize)]
+    struct TypeFrame {
+        r#type: &'static str,
+    }
+
+    let frame = TypeFrame { r#type: frame_type };
+    match encoding {
+        Encoding::Json => serde_json::to_string(&frame).ok().map(OutFrame::Text),
+        Encoding::Msgpack => rmp_serde::to_vec_named(&frame).ok().map(OutFrame::Binary),
+    }
+}
+
+/// Encode the acknowledgement for an authorized client `hello`.
+///
+/// The exact logical shape is `{"type":"welcome"}` in both encodings. It
+/// intentionally carries no identity, credential, server configuration, or
+/// channel data. The caller must write this frame directly to the socket so an
+/// acknowledgement cannot be dropped by a best-effort control queue.
+pub(crate) fn welcome_frame(encoding: Encoding) -> Option<OutFrame> {
+    top_level_type_frame(encoding, "welcome")
+}
+
 /// Encode the application-level heartbeat acknowledgement.
 ///
 /// This deliberately is a top-level frame (`{"type":"pong"}`), not a
 /// channel envelope: clients use it to prove that a frame made a complete
 /// round trip through the application read loop.
 pub(crate) fn pong_frame(encoding: Encoding) -> Option<OutFrame> {
-    #[derive(Serialize)]
-    struct PongFrame {
-        r#type: &'static str,
-    }
-
-    let pong = PongFrame { r#type: "pong" };
-    match encoding {
-        Encoding::Json => serde_json::to_string(&pong).ok().map(OutFrame::Text),
-        Encoding::Msgpack => rmp_serde::to_vec_named(&pong).ok().map(OutFrame::Binary),
-    }
+    top_level_type_frame(encoding, "pong")
 }
 
 /// A server→client envelope.
@@ -399,6 +415,43 @@ mod tests {
         };
         let value: Value = rmp_serde::from_slice(&bytes).expect("decodes");
         assert_eq!(value, json!({ "type": "pong" }));
+    }
+
+    #[test]
+    fn welcome_is_exact_top_level_shape_in_json_and_msgpack_and_secret_free() {
+        let json_frame = welcome_frame(Encoding::Json).expect("JSON welcome encodes");
+        assert_eq!(
+            json_frame,
+            OutFrame::Text(r#"{"type":"welcome"}"#.to_string())
+        );
+
+        let OutFrame::Binary(msgpack_bytes) =
+            welcome_frame(Encoding::Msgpack).expect("msgpack welcome encodes")
+        else {
+            panic!("msgpack welcome must be binary");
+        };
+        let msgpack_value: Value =
+            rmp_serde::from_slice(&msgpack_bytes).expect("msgpack welcome decodes");
+        assert_eq!(msgpack_value, json!({ "type": "welcome" }));
+
+        let serialized = match json_frame {
+            OutFrame::Text(text) => text,
+            OutFrame::Binary(_) => unreachable!("JSON welcome is text"),
+        };
+        for forbidden in [
+            "token",
+            "device",
+            "credential",
+            "config",
+            "password",
+            "secret",
+            "server",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "welcome leaked forbidden metadata: {forbidden}"
+            );
+        }
     }
 
     #[test]

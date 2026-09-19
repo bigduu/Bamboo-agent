@@ -63,6 +63,10 @@ pub(super) enum MemoryArgs {
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        entities: Vec<String>,
+        #[serde(default)]
         project_key: Option<String>,
         /// Optional temporal granularity (day/week/month/quarter/year). Orthogonal
         /// to `scope`; omitted means the memory carries no temporal dimension.
@@ -76,6 +80,10 @@ pub(super) enum MemoryArgs {
         content: String,
         #[serde(default)]
         tags: Vec<String>,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        entities: Vec<String>,
         #[serde(default)]
         project_key: Option<String>,
         #[serde(default)]
@@ -100,6 +108,10 @@ pub(super) enum MemoryArgs {
         r#type: Option<String>,
         #[serde(default)]
         tags: Vec<String>,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        entities: Vec<String>,
         #[serde(default)]
         project_key: Option<String>,
         #[serde(default)]
@@ -131,6 +143,10 @@ pub(super) enum MemoryArgs {
         r#type: Option<String>,
         #[serde(default)]
         tags: Vec<String>,
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        entities: Vec<String>,
         #[serde(default)]
         project_key: Option<String>,
     },
@@ -200,4 +216,8 @@ pub(super) struct SplitPiece {
     pub(super) content: String,
     #[serde(default)]
     pub(super) tags: Vec<String>,
+    #[serde(default)]
+    pub(super) keywords: Vec<String>,
+    #[serde(default)]
+    pub(super) entities: Vec<String>,
 }

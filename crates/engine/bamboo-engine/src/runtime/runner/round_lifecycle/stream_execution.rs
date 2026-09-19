@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -6,36 +7,39 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::runner::prompt_context::{
-    append_core_agent_directives, strip_existing_core_directives, strip_existing_external_memory,
-    strip_existing_goal, strip_existing_plan_mode_instructions,
-    strip_existing_plan_runtime_context, strip_existing_task_list,
-};
+use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
-    build_goal_context_block, build_plan_mode_context_block, build_plan_runtime_context_block,
-    build_project_resources_context_block, build_task_list_context_block,
+    build_goal_context_block, build_history_boundary_context_block,
+    build_instruction_overlay_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_project_resources_context_block,
+    build_session_identity_context_block, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
-use bamboo_agent_core::agent::events::TokenBudgetUsage;
+use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
-use bamboo_domain::ReasoningEffort;
-use bamboo_domain::MAX_MODEL_CONTEXT_RENDERED_BYTES;
+use bamboo_domain::{
+    provider_transcript_boundary_sha256, ModelContextEventKind, ModelContextResetReason,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+};
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
-    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
-    SegmentRole,
+    CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
+    ProviderVisibleToolFootprint, ProviderVisibleToolSegmentKind, Segment, SegmentRole,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
+
+use super::PromptMemoryExposureFrame;
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -50,13 +54,16 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
+    pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
 
-const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+pub(super) const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str =
+    "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
+const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
 
 fn interruption_kind(error: &AgentError) -> &'static str {
     match error {
@@ -301,33 +308,23 @@ fn derive_system_remainder_message(
         return None;
     }
 
-    let without_external_memory = strip_existing_external_memory(&message.content);
-    let without_task_list = strip_existing_task_list(&without_external_memory);
-    let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
-    let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
-    // Strip a legacy goal block too: the goal now rides the volatile tail (built from
-    // the active goal), so a stale `<!-- BAMBOO_GOAL_START -->` left in an old
-    // persisted System message must not resurface as a duplicate in the remainder.
-    let without_goal = strip_existing_goal(&without_plan_runtime);
-    // Framework directives always live in the assembled system field and are not
-    // part of the persisted base, so strip them from both sides before comparing.
-    // The directives are inserted INTO the `base` section (between the base text
-    // and the skill/tool-guide/workspace/env contexts) — not as a leading prefix
-    // of the whole frame — so stripping them from both the persisted message and
-    // the reference makes the comparison apples-to-apples (base+contexts vs
-    // base+contexts). Without it, the directive-bearing reference no longer equals
-    // the directive-free persisted base, so the dedup falls through and re-emits
-    // the entire base as a redundant system message. Stripping both sides also
-    // discards a STALE directive block in an old persisted message, so the current
-    // directives (already in the system field) win.
-    let without_directives = strip_existing_core_directives(&without_goal);
-    let trimmed = without_directives.trim();
+    // Compare only the normalized user base. Every host-owned section — including
+    // legacy workspace/instruction markers — is either in the canonical system
+    // blocks or the typed model-context ledger and must never leak as a second
+    // System remainder.
+    let normalized = crate::runtime::runner::session_setup::prompt_setup::normalize_base_prompt(
+        &message.content,
+    );
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let stable_without_directives = strip_existing_core_directives(stable_instructions);
-    let stable_trimmed = stable_without_directives.trim();
+    let stable_normalized =
+        crate::runtime::runner::session_setup::prompt_setup::normalize_base_prompt(
+            stable_instructions,
+        );
+    let stable_trimmed = stable_normalized.trim();
     if stable_trimmed.is_empty() {
         return Some(Message::system(trimmed.to_string()));
     }
@@ -373,17 +370,85 @@ struct PreparedRequestEnvelope {
     prefix_reset_reason: Option<bamboo_domain::ModelContextResetReason>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ProjectedRequestUsage {
+    pub message_input_tokens: u32,
+    pub tool_schema_input_tokens: u32,
     pub input_tokens: u32,
+    pub tool_schema_serialized_bytes: usize,
+    pub tool_schema_serialized_chars: usize,
+    pub tool_schema_segment_count: usize,
+    pub tool_schema_late_bound_segment_count: usize,
     pub ledger_rendered_bytes: usize,
+    /// Complete token cost of model-context snapshot messages that carry the
+    /// current archived-history boundary.
+    pub history_boundary_input_tokens: u32,
 }
 
 fn measure_request_usage(
     session: &Session,
     envelope: &PreparedRequestEnvelope,
+    tool_footprint: &ProviderVisibleToolFootprint,
 ) -> ProjectedRequestUsage {
-    let input_tokens = TiktokenTokenCounter::default().count_messages(&envelope.ir.flatten());
+    let counter = TiktokenTokenCounter::default();
+    let messages = envelope.ir.flatten();
+    let history_boundary_event_ids = session
+        .model_context_state
+        .as_ref()
+        .into_iter()
+        .flat_map(|state| state.events.iter())
+        .filter(|event| {
+            event.block_type == ContextBlockType::HistoryBoundary
+                && event.kind == ModelContextEventKind::Snapshot
+        })
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let history_boundary_input_tokens = messages
+        .iter()
+        .filter(|message| history_boundary_event_ids.contains(message.id.as_str()))
+        .fold(0u32, |total, message| {
+            total.saturating_add(counter.count_message(message))
+        });
+    let mut message_input_tokens = counter.count_messages(&messages);
+    let mut replaced_anchors = HashSet::new();
+    for group in &envelope.ir.provider_transcript_groups {
+        if replaced_anchors.insert(group.anchor_message_id()) {
+            if let Some(anchor) = messages
+                .iter()
+                .find(|message| message.id == group.anchor_message_id())
+            {
+                message_input_tokens =
+                    message_input_tokens.saturating_sub(counter.count_message(anchor));
+            }
+        }
+        let payloads = group
+            .items()
+            .iter()
+            .map(|item| item.payload())
+            .collect::<Vec<_>>();
+        let wire = serde_json::to_string(&payloads).unwrap_or_default();
+        message_input_tokens = message_input_tokens
+            .saturating_add(counter.count_text(&wire))
+            .saturating_add((group.items().len() as u32).saturating_mul(4));
+    }
+    let tool_estimate = counter.estimate_provider_visible_tool_segments(
+        tool_footprint
+            .segments
+            .iter()
+            .filter(|segment| segment.kind != ProviderVisibleToolSegmentKind::ProviderLateBound)
+            .map(|segment| segment.serialized.as_str()),
+    );
+    let tool_schema_segment_count = tool_footprint
+        .segments
+        .iter()
+        .filter(|segment| segment.kind != ProviderVisibleToolSegmentKind::ProviderLateBound)
+        .count();
+    let tool_schema_late_bound_segment_count = tool_footprint
+        .segments
+        .iter()
+        .filter(|segment| segment.kind == ProviderVisibleToolSegmentKind::ProviderLateBound)
+        .count();
+    let input_tokens = message_input_tokens.saturating_add(tool_estimate.input_tokens);
     let ledger_rendered_bytes = session
         .model_context_state
         .as_ref()
@@ -394,17 +459,26 @@ fn measure_request_usage(
         })
         .unwrap_or(0);
     ProjectedRequestUsage {
+        message_input_tokens,
+        tool_schema_input_tokens: tool_estimate.input_tokens,
         input_tokens,
+        tool_schema_serialized_bytes: tool_estimate.serialized_bytes,
+        tool_schema_serialized_chars: tool_estimate.serialized_chars,
+        tool_schema_segment_count,
+        tool_schema_late_bound_segment_count,
         ledger_rendered_bytes,
+        history_boundary_input_tokens,
     }
 }
 
-fn required_tool_for_session(session: &Session) -> Option<&'static str> {
+pub(in crate::runtime::runner) fn required_tool_for_session(
+    session: &Session,
+) -> Option<&'static str> {
     crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
         .then_some("load_skill")
 }
 
-fn effective_tool_schemas<'a>(
+pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
 ) -> Cow<'a, [ToolSchema]> {
@@ -424,14 +498,16 @@ fn effective_tool_schemas<'a>(
 /// mutating the live session. Context preparation uses this shadow pass to
 /// reserve space for snapshots that are created only after ordinary message
 /// fitting (notably when a retention reset seeds a fresh prefix epoch).
-pub(super) fn project_request_usage(
+pub(super) async fn project_request_usage(
     session: &Session,
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
     model: &str,
-) -> ProjectedRequestUsage {
+    llm: &Arc<dyn LLMProvider>,
+) -> Result<ProjectedRequestUsage, AgentError> {
     let mut shadow = session.clone();
+    let required_tool = required_tool_for_session(&shadow);
     let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
     let envelope = build_request_envelope_reconciled(
         &mut shadow,
@@ -440,7 +516,20 @@ pub(super) fn project_request_usage(
         effective_tool_schemas.as_ref(),
         model,
     );
-    measure_request_usage(&shadow, &envelope)
+    let tool_footprint = llm
+        .provider_visible_tool_footprint(
+            &envelope.ir,
+            effective_tool_schemas.as_ref(),
+            model,
+            required_tool,
+        )
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "provider-visible tool footprint projection failed: {error}"
+            ))
+        })?;
+    Ok(measure_request_usage(&shadow, &envelope, &tool_footprint))
 }
 
 fn build_request_envelope_reconciled(
@@ -450,7 +539,39 @@ fn build_request_envelope_reconciled(
     tool_schemas: &[ToolSchema],
     model: &str,
 ) -> PreparedRequestEnvelope {
-    let activated = activated_discoverable_tools(session);
+    let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
+    let requested_protocol = requested_family.map(|family| match family {
+        ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
+        ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+    });
+    let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
+        config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
+    );
+    let had_prior_provider_route = session.provider_transcript.active_family().is_some()
+        || session.provider_transcript.active_protocol().is_some()
+        || session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .is_some()
+        || !session.provider_transcript.groups().is_empty();
+    let provider_route_changed = match (
+        requested_family,
+        requested_protocol,
+        requested_provider_boundary_sha256.as_deref(),
+    ) {
+        (Some(family), Some(protocol), Some(boundary)) => session
+            .activate_provider_transcript_route(family, protocol, boundary)
+            .expect("canonical provider family/protocol/boundary must be valid"),
+        _ => session.deactivate_provider_transcript_route(),
+    };
+    let provider_changed = provider_route_changed && had_prior_provider_route;
+    if provider_changed {
+        session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
+    }
+    let activated = crate::runtime::runner::session_setup::tool_schemas::effective_guide_activation(
+        config, session,
+    );
     let (stable_frame, stable_prefix_sections) =
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
@@ -458,7 +579,50 @@ fn build_request_envelope_reconciled(
     // Host-owned context (recalled memory, task list, plan state, summary) is
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
-    let mut context_blocks = Vec::new();
+    // Session identity leads this run so a newly seeded ledger places it
+    // immediately after the invariant tool-guide prefix. It deliberately does
+    // not participate in `build_compression_context_blocks`: a fork/copy must
+    // never inherit a stale Session ID through generated summary text.
+    let mut context_blocks = vec![build_session_identity_context_block(session)];
+    let newly_activated = activated_discoverable_tools(session)
+        .difference(&activated)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !newly_activated.is_empty() {
+        let names = tool_schemas
+            .iter()
+            .filter(|schema| {
+                newly_activated.contains(&bamboo_domain::canonical_tool_name(&schema.function.name))
+            })
+            .map(|schema| schema.function.name.clone())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let mut guide_context =
+                bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
+                    &stable_instructions,
+                );
+            guide_context.activated_discoverable_tools = newly_activated;
+            guide_context.include_best_practices = false;
+            let schemas = tool_schemas
+                .iter()
+                .filter(|schema| names.contains(&schema.function.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let content = bamboo_tools::guide::EnhancedPromptBuilder::build_for_tools(
+                Some(config.tool_registry.as_ref()),
+                &names,
+                &schemas,
+                &guide_context,
+            );
+            context_blocks.push(ContextBlock::new(
+                ContextBlockType::ToolGuide,
+                ContextBlockPriority::High,
+                ContextBlockStability::RoundDynamic,
+                "Activated Tool Guidance",
+                content,
+            ));
+        }
+    }
     if let Some(block) = build_active_workflow_context_block(session) {
         context_blocks.push(block);
     }
@@ -491,6 +655,9 @@ fn build_request_envelope_reconciled(
         context_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
+        context_blocks.push(block);
+    }
+    if let Some(block) = build_history_boundary_context_block(session) {
         context_blocks.push(block);
     }
 
@@ -593,54 +760,37 @@ fn build_request_envelope_reconciled(
         system_blocks.clear();
     }
 
-    // Session-variable context (workspace path, project instruction overlay,
-    // loaded skills), relocated to ride AFTER the invariant tool guide so it never
-    // shifts the cached head. Each block is session-stable and emitted only when
-    // present; keeping them as separate blocks lets an unchanged block stay inside
-    // the shared prefix even when a sibling changes. The instruction overlay keeps
-    // Critical priority so its authority survives the move out of the system field.
+    // Session-variable context rides AFTER the invariant tool guide so it never
+    // shifts the cached head. Workspace and instructions are added below from
+    // authoritative session metadata, not from these diagnostic sections.
     [
-        (
-            ContextBlockType::Workspace,
-            ContextBlockPriority::High,
-            "Project & Workspace",
-            [section("project"), section("workspace")]
-                .into_iter()
-                .filter(|value| !value.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        ),
-        (
-            ContextBlockType::InstructionOverlay,
-            ContextBlockPriority::Critical,
-            "Project Instructions",
-            section("instruction"),
-        ),
         (
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
             "Loaded Skills",
             section("skill"),
         ),
         (
             ContextBlockType::EnvSnapshot,
             ContextBlockPriority::High,
+            ContextBlockStability::SessionStable,
             "Environment Snapshot",
             section("env"),
         ),
     ]
     .into_iter()
-    .filter(|(_, _, _, content)| !content.trim().is_empty())
-    .map(|(block_type, priority, title, content)| {
-        ContextBlock::new(
-            block_type,
-            priority,
-            ContextBlockStability::SessionStable,
-            title,
-            content,
-        )
+    .filter(|(_, _, _, _, content)| !content.trim().is_empty())
+    .map(|(block_type, priority, stability, title, content)| {
+        ContextBlock::new(block_type, priority, stability, title, content)
     })
     .for_each(|block| context_blocks.push(block));
+    if let Some(block) = build_workspace_context_block(session) {
+        context_blocks.push(block);
+    }
+    if let Some(block) = build_instruction_overlay_context_block(session) {
+        context_blocks.push(block);
+    }
 
     // The Responses-API view (instructions = stable system, guide leading the input
     // array) is no longer pre-baked here: the IR carries the system field + the
@@ -682,6 +832,7 @@ fn build_request_envelope_reconciled(
     real_transcript.extend(conversation_messages);
     let cache_scope = serde_json::json!({
         "model": model,
+        "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
         "stable_prefix": stable_prefix_messages
             .iter()
@@ -703,6 +854,18 @@ fn build_request_envelope_reconciled(
     // The single canonical request: stable prefix followed by one chronological
     // model transcript. Legacy lanes remain supported by PromptIR for external
     // callers, but the normal engine path no longer rebuilds them per round.
+    let provider_transcript_groups = requested_family
+        .zip(requested_protocol)
+        .zip(requested_provider_boundary_sha256.as_deref())
+        .map(|((family, protocol), boundary)| {
+            session
+                .provider_transcript
+                .replayable_groups(family, protocol, boundary)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let ir = PromptIR {
         system_text: lane_system,
         system_blocks,
@@ -710,14 +873,24 @@ fn build_request_envelope_reconciled(
             Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
             Segment::new(SegmentRole::ModelTranscript, ledger.transcript),
         ],
+        provider_transcript_groups,
         cache: cache_plan,
         continuation: None,
     };
 
+    // Prefix-drift diagnostics must observe only bytes that actually participate
+    // in the cacheable head. Keeping dynamic assembly sections here would both
+    // report false cache drift and persist raw workspace paths in diagnostic
+    // snapshots.
+    let stable_prefix_sections = stable_prefix_sections
+        .into_iter()
+        .filter(|section| matches!(section.name, "base" | "core_directives" | "tool_guide"))
+        .collect();
+
     PreparedRequestEnvelope {
         ir,
         stable_prefix_sections,
-        ledger_changed: ledger.changed,
+        ledger_changed: ledger.changed || provider_changed,
         prefix_epoch: ledger.prefix_epoch,
         prefix_reset_reason: ledger.reset_reason,
     }
@@ -758,6 +931,13 @@ pub(crate) struct RequestRenderObservability {
     /// Messages actually sent: the continuation delta size, or the full chat list.
     pub request_message_count: usize,
     pub tool_count: usize,
+    pub message_input_tokens: u32,
+    pub tool_schema_input_tokens: u32,
+    pub total_input_tokens: u32,
+    pub tool_schema_serialized_bytes: usize,
+    pub tool_schema_serialized_chars: usize,
+    pub tool_schema_segment_count: usize,
+    pub tool_schema_late_bound_segment_count: usize,
     pub cache_system: bool,
     pub cache_tools: bool,
     pub cache_breakpoints: usize,
@@ -769,7 +949,7 @@ pub(crate) struct RequestRenderObservability {
 impl RequestRenderObservability {
     fn log(&self, session_id: &str) {
         tracing::info!(
-            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} model_transcript_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} cache(system={}, tools={}, breakpoints={}, ttl={}) prefix_epoch={} prefix_reset_reason={}",
+            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} model_transcript_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} known_input_tokens(message={}, tool_schema={}, total={}) tool_schema_shape(known_segments={}, late_bound_segments={}, bytes={}, chars={}) cache(system={}, tools={}, breakpoints={}, ttl={}) prefix_epoch={} prefix_reset_reason={}",
             session_id,
             self.wire,
             self.system_block_count,
@@ -781,6 +961,13 @@ impl RequestRenderObservability {
             self.volatile_context_messages,
             self.request_message_count,
             self.tool_count,
+            self.message_input_tokens,
+            self.tool_schema_input_tokens,
+            self.total_input_tokens,
+            self.tool_schema_segment_count,
+            self.tool_schema_late_bound_segment_count,
+            self.tool_schema_serialized_bytes,
+            self.tool_schema_serialized_chars,
             self.cache_system,
             self.cache_tools,
             self.cache_breakpoints,
@@ -822,6 +1009,7 @@ fn plan_llm_request(
     reasoning_effort: Option<ReasoningEffort>,
     tool_count: usize,
     required_tool: Option<&str>,
+    usage: ProjectedRequestUsage,
 ) -> LlmRequestPlan {
     let is_continuation = envelope.ir.continuation.is_some();
 
@@ -865,6 +1053,13 @@ fn plan_llm_request(
             envelope.ir.flatten().len()
         },
         tool_count,
+        message_input_tokens: usage.message_input_tokens,
+        tool_schema_input_tokens: usage.tool_schema_input_tokens,
+        total_input_tokens: usage.input_tokens,
+        tool_schema_serialized_bytes: usage.tool_schema_serialized_bytes,
+        tool_schema_serialized_chars: usage.tool_schema_serialized_chars,
+        tool_schema_segment_count: usage.tool_schema_segment_count,
+        tool_schema_late_bound_segment_count: usage.tool_schema_late_bound_segment_count,
         cache_system: envelope.ir.cache.cache_system,
         cache_tools: envelope.ir.cache.cache_tools,
         cache_breakpoints: envelope.ir.cache.breakpoint_message_ids.len(),
@@ -896,12 +1091,19 @@ pub(super) async fn execute_llm_stream(
     prepared_context: &PreparedContext,
     tool_schemas: &[ToolSchema],
     frame: &LlmStreamFrame<'_>,
-) -> Result<(crate::runtime::stream::handler::StreamHandlingOutput, u128), AgentError> {
+) -> Result<
+    (
+        crate::runtime::stream::handler::StreamHandlingOutput,
+        u128,
+        u64,
+    ),
+    AgentError,
+> {
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let cancel_token = frame.cancel_token;
-    let max_context_tokens = frame.max_context_tokens;
-    let max_output_tokens = frame.max_output_tokens;
+    let mut max_context_tokens = frame.max_context_tokens;
+    let mut max_output_tokens = frame.max_output_tokens;
     let model = frame.model;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
@@ -909,59 +1111,124 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
-    let required_tool = required_tool_for_session(session);
-    let effective_tool_schemas = effective_tool_schemas(session, tool_schemas);
-    let tool_schemas = effective_tool_schemas.as_ref();
+    let base_tool_schemas = tool_schemas;
+    let mut prepared_context = prepared_context.clone();
+    let mut required_tool = required_tool_for_session(session);
+    let mut effective_schemas = effective_tool_schemas(session, base_tool_schemas);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
     let responses_policy = engine_responses_policy();
     let continuation_enabled = responses_continuation_enabled(&responses_policy, provider_type);
-    // Owned (not borrowed) so the immutable borrow of `session` ends here and the
-    // drift diagnostic below can take `&mut session`.
-    let previous_response_id = if continuation_enabled {
-        session_previous_response_id(session).map(str::to_string)
-    } else {
-        None
-    };
-
-    let previous_model_context_state = session.model_context_state.clone();
-    let mut prepared_envelope =
-        build_request_envelope_reconciled(session, prepared_context, config, tool_schemas, model);
-    // `prepare_round_context` reserves the already-durable ledger history. The
-    // reconciliation above can append a new host-state snapshot, so verify the
-    // exact final IR again before checkpoint/provider dispatch. Failing closed
-    // preserves the context-window contract without committing an unsendable
-    // ledger candidate.
-    let final_usage = measure_request_usage(session, &prepared_envelope);
-    let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
-    if final_usage.input_tokens > request_input_limit
-        || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
-    {
-        session.model_context_state = previous_model_context_state;
-        return Err(AgentError::Budget(format!(
-            "final PromptIR message input exceeds ledger-safe limits: input_tokens={}, input_limit={request_input_limit}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
-            final_usage.input_tokens, final_usage.ledger_rendered_bytes,
-        )));
-    }
-    // Reconciliation changes the next outbound model transcript. It must become
-    // durable before any provider request is attempted, otherwise a crash/retry
-    // could allocate a different event sequence. Fail closed on checkpoint
-    // failure instead of sending an unrepeatable request.
-    if prepared_envelope.ledger_changed {
-        if let Some(persistence) = config.persistence.as_ref() {
-            if let Err(error) = persistence.checkpoint_runtime_session(session).await {
-                // Reconciliation is an in-memory transaction until its durable
-                // checkpoint succeeds. Restore the prior state so an in-process
-                // retry cannot mistake the failed candidate for a committed
-                // ledger and bypass persistence on its next attempt.
+    let mut checkpoint_reprepares = 0usize;
+    let (mut prepared_envelope, previous_response_id, final_usage) = loop {
+        let tool_schemas = effective_schemas.as_ref();
+        // Owned (not borrowed) so the immutable borrow of `session` ends here and
+        // the drift diagnostic below can take `&mut session`.
+        let previous_response_id = if continuation_enabled {
+            session_previous_response_id(session).map(str::to_string)
+        } else {
+            None
+        };
+        let previous_model_context_state = session.model_context_state.clone();
+        let previous_provider_transcript = session.provider_transcript.clone();
+        let prepared_envelope = build_request_envelope_reconciled(
+            session,
+            &prepared_context,
+            config,
+            tool_schemas,
+            model,
+        );
+        // `prepare_round_context` reserves the already-durable ledger history. The
+        // reconciliation above can append a new host-state snapshot, so verify the
+        // exact final IR again before checkpoint/provider dispatch. Failing closed
+        // preserves the context-window contract without committing an unsendable
+        // ledger candidate.
+        let tool_footprint = match llm
+            .provider_visible_tool_footprint(
+                &prepared_envelope.ir,
+                tool_schemas,
+                model,
+                required_tool,
+            )
+            .await
+        {
+            Ok(footprint) => footprint,
+            Err(error) => {
                 session.model_context_state = previous_model_context_state;
+                session.provider_transcript = previous_provider_transcript;
                 return Err(AgentError::LLM(format!(
-                    "model-context ledger checkpoint failed before provider dispatch: {error}"
+                    "provider-visible tool footprint projection failed before dispatch: {error}"
                 )));
             }
+        };
+        let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
+        let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        if final_usage.input_tokens > request_input_limit
+            || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+        {
+            session.model_context_state = previous_model_context_state;
+            session.provider_transcript = previous_provider_transcript;
+            return Err(AgentError::Budget(format!(
+                "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                final_usage.message_input_tokens,
+                final_usage.tool_schema_input_tokens,
+                final_usage.input_tokens,
+                final_usage.tool_schema_segment_count,
+                final_usage.tool_schema_late_bound_segment_count,
+                final_usage.tool_schema_serialized_bytes,
+                final_usage.tool_schema_serialized_chars,
+                final_usage.ledger_rendered_bytes,
+            )));
         }
-    }
+        // Reconciliation changes the next outbound model transcript. It must become
+        // durable before any provider request is attempted, otherwise a crash/retry
+        // could allocate a different event sequence. The append-safe checkpoint can
+        // itself merge a concurrent durable suffix into `session`; after every
+        // successful checkpoint, rebuild the bounded context and final envelope from
+        // that reconciled Session instead of dispatching the stale candidate.
+        if prepared_envelope.ledger_changed {
+            if let Some(persistence) = config.persistence.as_ref() {
+                if checkpoint_reprepares >= MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES {
+                    session.model_context_state = previous_model_context_state;
+                    session.provider_transcript = previous_provider_transcript;
+                    return Err(AgentError::LLM(format!(
+                        "model-context request could not stabilize after {MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES} append-safe checkpoint reprepares"
+                    )));
+                }
+                if let Err(error) = persistence.checkpoint_runtime_session(session).await {
+                    // Reconciliation is an in-memory transaction until its durable
+                    // checkpoint succeeds. Restore the prior state so an in-process
+                    // retry cannot mistake the failed candidate for a committed
+                    // ledger and bypass persistence on its next attempt.
+                    session.model_context_state = previous_model_context_state;
+                    session.provider_transcript = previous_provider_transcript;
+                    return Err(AgentError::LLM(format!(
+                        "model-context ledger checkpoint failed before provider dispatch: {error}"
+                    )));
+                }
+                checkpoint_reprepares += 1;
+                required_tool = required_tool_for_session(session);
+                effective_schemas = effective_tool_schemas(session, base_tool_schemas);
+                let reprepared = Box::pin(super::context_preparation::prepare_round_context(
+                    session,
+                    config,
+                    model,
+                    session_id,
+                    effective_schemas.as_ref(),
+                    llm,
+                    Some(event_tx),
+                ))
+                .await?;
+                max_context_tokens = reprepared.budget.max_context_tokens;
+                max_output_tokens = reprepared.budget.max_output_tokens;
+                prepared_context = reprepared.prepared_context;
+                continue;
+            }
+        }
+        break (prepared_envelope, previous_response_id, final_usage);
+    };
+    let tool_schemas = effective_schemas.as_ref();
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -997,6 +1264,7 @@ pub(super) async fn execute_llm_stream(
         reasoning_effort,
         tool_schemas.len(),
         required_tool,
+        final_usage,
     );
     if !continuation_enabled {
         tracing::debug!(
@@ -1046,6 +1314,40 @@ pub(super) async fn execute_llm_stream(
         }
     })?;
 
+    // A successful stream bootstrap is the first point at which the final
+    // provider-visible PromptIR is known to have been accepted. Capture the
+    // typed fresh-selection snapshot once here; retries with the same round id
+    // are harmless because SQLite atomically preserves the first snapshot.
+    // Historical compact text already present in the append-only context ledger
+    // is intentionally not reparsed or backfilled into this round's observation.
+    if let (Some(collector), Some(exposure)) = (
+        config.metrics_collector.as_ref(),
+        frame.prompt_memory_exposure,
+    ) {
+        collector.prompt_memory_exposure(exposure.provenance.observation(
+            exposure.round_id,
+            session_id,
+            chrono::Utc::now(),
+        ));
+    }
+
+    // Carry the last completed provider result through prompt preparation. A
+    // newly prepared budget is not evidence of a real zero-cache provider
+    // response, so consumers must not flash it as Cache 0%.
+    let previous_cache_read_input_tokens = session
+        .token_usage
+        .as_ref()
+        .map(|usage| usage.cache_read_input_tokens)
+        .unwrap_or(0);
+    let previous_provider_prompt_usage = session
+        .token_usage
+        .as_ref()
+        .and_then(|usage| usage.provider_prompt_usage)
+        .map(|mut usage| {
+            usage.retained_from_previous_call = true;
+            usage
+        });
+
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
     let usage = TokenBudgetUsage {
@@ -1060,7 +1362,8 @@ pub(super) async fn execute_llm_stream(
         prompt_cached_tool_outputs: prepared_context.prompt_cached_tool_outputs,
         prompt_cached_tool_tokens_saved: prepared_context.prompt_cached_tool_tokens_saved,
         thinking_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: previous_cache_read_input_tokens,
+        provider_prompt_usage: previous_provider_prompt_usage,
     };
 
     session.token_usage = Some(usage.clone());
@@ -1122,6 +1425,14 @@ pub(super) async fn execute_llm_stream(
     if let Some(ref mut usage) = session.token_usage {
         usage.thinking_tokens = stream_output.thinking_tokens as u32;
         usage.cache_read_input_tokens = stream_output.cache_read_input_tokens as u32;
+        let provider_prompt_usage = ProviderPromptUsage {
+            input_tokens: stream_output.input_tokens,
+            cache_creation_input_tokens: stream_output.cache_creation_input_tokens,
+            cache_read_input_tokens: stream_output.cache_read_input_tokens,
+            retained_from_previous_call: false,
+        };
+        usage.provider_prompt_usage =
+            (provider_prompt_usage.total_input_tokens() > 0).then_some(provider_prompt_usage);
     }
 
     if let Some(usage) = session.token_usage.clone() {
@@ -1228,8 +1539,9 @@ pub(super) async fn execute_llm_stream(
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
+    let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
 
-    Ok((stream_output, llm_duration))
+    Ok((stream_output, llm_duration, prompt_tokens))
 }
 
 #[cfg(test)]

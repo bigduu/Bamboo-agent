@@ -83,7 +83,13 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
         let mut runners = state.agent_runners.write().await;
         let mut cancelled = false;
         for id in ids_to_cancel.iter() {
-            if let Some(runner) = runners.remove(id) {
+            if let Some(runner) =
+                bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+                    &mut runners,
+                    id,
+                )
+                .await
+            {
                 runner.cancel_token.cancel();
                 cancelled = true;
             }
@@ -185,11 +191,11 @@ mod tests {
             .expect("save child index");
         state.sessions.insert(
             root.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(root.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())),
         );
         state.sessions.insert(
             child.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(child.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
         );
         let ids = vec!["review".to_string()];
         for session_id in [&root.id, &child.id] {

@@ -299,6 +299,7 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 1,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -327,6 +328,14 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                             streamed_tokens = true;
                         }
                         print_event(&event, raw);
+                    }
+                    Ok(Some(ChildFrame::EventBatch { batch })) => {
+                        for event in batch.events {
+                            if event["type"] == "token" {
+                                streamed_tokens = true;
+                            }
+                            print_event(&event, raw);
+                        }
                     }
                     Ok(Some(ChildFrame::ApprovalRequest { .. })) => {
                         // This CLI does not route gated-tool approvals; ignore.

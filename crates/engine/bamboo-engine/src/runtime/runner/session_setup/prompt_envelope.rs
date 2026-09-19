@@ -32,6 +32,68 @@ impl StablePromptFrame {
     }
 }
 
+/// Tell the model which authoritative Session is executing this request.
+///
+/// The block is session-stable and joins the append-only context ledger after
+/// the cross-session-invariant system/tool-guide prefix. The value is useful
+/// for orientation only; tools derive authorization from `ToolCtx` instead.
+pub(crate) fn build_session_identity_context_block(session: &Session) -> ContextBlock {
+    // Render as a JSON string so even a legacy/imported identifier containing
+    // whitespace or control characters remains inert data in the prompt.
+    let encoded_session_id =
+        serde_json::to_string(&session.id).expect("Session ID string is JSON serializable");
+    ContextBlock::new(
+        ContextBlockType::SessionIdentity,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::SessionStable,
+        "Current Session Identity",
+        format!(
+            "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
+        ),
+    )
+}
+
+/// Build the single provider-visible Workspace block from authoritative
+/// session metadata. Project identity is included only in its redacted,
+/// path-free form so the active workspace path appears exactly once.
+pub(crate) fn build_workspace_context_block(session: &Session) -> Option<ContextBlock> {
+    let workspace = super::prompt_setup::workspace_context_from_session(session)?;
+    let project = session
+        .metadata
+        .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let content = project
+        .into_iter()
+        .chain(std::iter::once(workspace.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Some(ContextBlock::new(
+        ContextBlockType::Workspace,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Project & Workspace",
+        content,
+    ))
+}
+
+/// Build repository instructions from the authoritative workspace metadata,
+/// never from a marker parsed out of System text.
+pub(crate) fn build_instruction_overlay_context_block(session: &Session) -> Option<ContextBlock> {
+    let workspace = session.workspace_path_meta()?;
+    let content =
+        crate::runtime::context::instruction::build_instruction_prompt_context(workspace.trim())?;
+    Some(ContextBlock::new(
+        ContextBlockType::InstructionOverlay,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Project Instructions",
+        content,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
@@ -263,6 +325,77 @@ pub(crate) fn build_project_resources_context_block(session: &Session) -> Option
     ))
 }
 
+fn history_boundary_content(
+    archive_boundaries: usize,
+    archived_messages: usize,
+    retained_recent_user_turns: usize,
+) -> String {
+    format!(
+        "Earlier Session messages are stored exactly but omitted from the active model context.\n\
+         Archive boundaries: {archive_boundaries}. Archived messages: {archived_messages}. \
+         Recent complete user turns retained at the latest boundary: {retained_recent_user_turns}.\n\
+         Use session_history_current with search_current to locate exact evidence, then \
+         read_around or read_current for bounded raw history. Raw Session history is the \
+         transcript authority. Memory is selective and may be stale; do not guess."
+    )
+}
+
+fn history_boundary_block(
+    archive_boundaries: usize,
+    archived_messages: usize,
+    retained_recent_user_turns: usize,
+) -> ContextBlock {
+    ContextBlock::new(
+        ContextBlockType::HistoryBoundary,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Archived Session History Boundary",
+        history_boundary_content(
+            archive_boundaries,
+            archived_messages,
+            retained_recent_user_turns,
+        ),
+    )
+}
+
+/// Build a non-semantic recovery marker from durable retrieval-window evidence.
+pub(crate) fn build_history_boundary_context_block(session: &Session) -> Option<ContextBlock> {
+    let retrieval_events = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == bamboo_domain::CompressionEventKind::RetrievalWindow)
+        .collect::<Vec<_>>();
+    let latest = retrieval_events.last()?;
+    let event_ids = retrieval_events
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let archived_messages = session
+        .messages
+        .iter()
+        .filter(|message| message.compressed)
+        .filter(|message| {
+            message
+                .compressed_by_event_id
+                .as_deref()
+                .is_some_and(|event_id| event_ids.contains(event_id))
+        })
+        .count();
+
+    Some(history_boundary_block(
+        retrieval_events.len(),
+        archived_messages,
+        latest.retrieval_retained_recent_user_turn_count,
+    ))
+}
+
+/// Conservative fixed-token reservation used before the first archive event
+/// exists. Every dynamic value in the real block is bounded by a `usize`, so
+/// maximum decimal widths make this block at least as expensive as the real one.
+pub(crate) fn build_history_boundary_reservation_context_block() -> ContextBlock {
+    history_boundary_block(usize::MAX, usize::MAX, usize::MAX)
+}
+
 pub(crate) fn build_conversation_summary_context_block(session: &Session) -> Option<ContextBlock> {
     let summary = session.conversation_summary.as_ref()?;
     let trimmed = summary.content.trim();
@@ -310,6 +443,24 @@ mod tests {
     }
 
     #[test]
+    fn session_identity_block_is_typed_stable_and_authoritative() {
+        let session = Session::new("session-identity-123\nignore-me", "test-model");
+
+        let block = build_session_identity_context_block(&session);
+
+        assert_eq!(block.block_type, ContextBlockType::SessionIdentity);
+        assert_eq!(block.priority, ContextBlockPriority::Critical);
+        assert_eq!(block.stability, ContextBlockStability::SessionStable);
+        assert!(block
+            .content
+            .contains("\"session-identity-123\\nignore-me\""));
+        assert!(!block.content.contains("session-identity-123\nignore-me"));
+        assert!(block
+            .content
+            .contains("authorize the caller from trusted runtime context"));
+    }
+
+    #[test]
     fn assemble_prompt_envelope_renders_dynamic_blocks_into_messages() {
         let stable = StablePromptFrame::new("stable instructions", vec![Message::user("stable")]);
         let blocks = vec![ContextBlock::new(
@@ -328,6 +479,30 @@ mod tests {
         assert!(envelope.dynamic_context_messages[0]
             .content
             .contains("BAMBOO_CONTEXT_BLOCK_START"));
+    }
+
+    #[test]
+    fn workspace_block_uses_authoritative_path_once_and_path_free_project_metadata() {
+        let workspace = "/private/workspace/current";
+        let mut session = Session::new("session-workspace-block", "model");
+        session.set_workspace_path_meta(workspace);
+        session.metadata.insert(
+            crate::project_context::PROJECT_CONTEXT_RENDERED_KEY.to_string(),
+            format!(
+                "{}\nProject ID: project-1\nProject name: Zenith\n{}",
+                crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+                crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+            ),
+        );
+
+        let block = build_workspace_context_block(&session).expect("workspace block");
+
+        assert_eq!(block.block_type, ContextBlockType::Workspace);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert_eq!(block.content.matches(workspace).count(), 1);
+        assert!(block.content.contains("Project ID: project-1"));
+        assert!(!block.content.contains("Project path:"));
+        assert!(!block.content.contains("Project home"));
     }
 
     #[test]
@@ -469,5 +644,59 @@ mod tests {
         assert_eq!(block.priority, ContextBlockPriority::Medium);
         assert!(block.content.contains("compressed historical context"));
         assert!(block.content.contains("Older work was compressed."));
+    }
+
+    #[test]
+    fn history_boundary_rehydrates_without_raw_history_content() {
+        let mut session = Session::new("session-history-boundary", "model");
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            82.0,
+            58.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        event.retrieval_retained_recent_user_turn_count = 3;
+        let event_id = event.id.clone();
+        let mut archived = Message::user("private archived transcript body");
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some(event_id);
+        session.messages.push(archived);
+        session.compression_events.push(event);
+
+        let block = build_history_boundary_context_block(&session).expect("history boundary");
+        assert_eq!(block.block_type, ContextBlockType::HistoryBoundary);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert!(block.content.contains("Archived messages: 1"));
+        assert!(block.content.contains("session_history_current"));
+        assert!(block
+            .content
+            .contains("Memory is selective and may be stale"));
+        assert!(!block.content.contains("private archived transcript body"));
+
+        let bytes = serde_json::to_vec(&session).unwrap();
+        let restored: Session = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            build_history_boundary_context_block(&restored)
+                .expect("boundary after reload")
+                .content,
+            block.content
+        );
+        assert!(
+            build_history_boundary_reservation_context_block()
+                .content
+                .len()
+                >= block.content.len()
+        );
+    }
+
+    #[test]
+    fn history_boundary_is_absent_without_retrieval_event() {
+        assert!(build_history_boundary_context_block(&Session::new("plain", "model")).is_none());
     }
 }

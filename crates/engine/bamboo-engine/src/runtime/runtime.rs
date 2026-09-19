@@ -63,6 +63,9 @@ pub struct AgentRuntime {
     /// Reloadable LLM provider handle (delegates to the latest provider).
     pub provider: Arc<dyn LLMProvider>,
 
+    /// Concrete Jiandu store shared by every run from this runtime.
+    pub memory_store: bamboo_memory::memory_store::MemoryStore,
+
     /// Default tool executor (root tools with full surface).
     /// Call sites that need a reduced tool set (child / schedule) pass their
     /// own via `ExecuteRequest::tools`.
@@ -101,6 +104,7 @@ pub struct AgentRuntimeBuilder {
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     permission_mode: PermissionMode,
     provider: Option<Arc<dyn LLMProvider>>,
+    memory_store: bamboo_memory::memory_store::MemoryStore,
     default_tools: Option<Arc<dyn ToolExecutor>>,
     hook_runner: Arc<HookRunner>,
 }
@@ -121,6 +125,7 @@ impl AgentRuntimeBuilder {
             permission_config: None,
             permission_mode: PermissionMode::Default,
             provider: None,
+            memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             default_tools: None,
             hook_runner: Arc::new(HookRunner::new()),
         }
@@ -194,6 +199,11 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    pub fn memory_store(mut self, v: bamboo_memory::memory_store::MemoryStore) -> Self {
+        self.memory_store = v;
+        self
+    }
+
     pub fn default_tools(mut self, v: Arc<dyn ToolExecutor>) -> Self {
         self.default_tools = Some(v);
         self
@@ -231,6 +241,7 @@ impl AgentRuntimeBuilder {
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
             provider: self.provider.ok_or_else(|| format_missing("provider"))?,
+            memory_store: self.memory_store,
             default_tools: self
                 .default_tools
                 .ok_or_else(|| format_missing("default_tools"))?,
@@ -298,7 +309,7 @@ pub struct ExecuteRequest {
     /// Optional per-round live resolver for the disabled tool/skill sets (#136).
     /// When `None`, the snapshotted `disabled_tools`/`disabled_skill_ids` are used.
     pub disabled_filter_resolver: Option<DisabledFilterResolver>,
-    /// When `None`, falls back to `Config::disabled_tool_names()`.
+    /// When `None`, falls back to `Config::disabled_tool_references()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
     pub disabled_skill_ids: Option<BTreeSet<String>>,
@@ -668,6 +679,21 @@ fn extract_system_prompt(session: &Session) -> Option<String> {
         .map(|m| m.content.clone())
 }
 
+pub(super) fn should_observe_completed_tool_trace(
+    result: &crate::runtime::runner::Result<()>,
+    final_checkpoint_succeeded: bool,
+    session: &Session,
+) -> bool {
+    final_checkpoint_succeeded
+        && result.is_ok()
+        && session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| matches!(state.status, bamboo_domain::AgentStatusState::Completed))
+        && !session.metadata.contains_key("runtime.suspend_reason")
+        && !session.metadata.contains_key("runtime.completion_reason")
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -686,6 +712,10 @@ impl AgentRuntime {
             Some(router) => Some(Arc::new(parking_lot::Mutex::new(
                 router.subscribe(&session.id).await,
             ))),
+            None => None,
+        };
+        let guidance_active_run_id = match self.activation_router.as_ref() {
+            Some(router) => router.current_run_id(&session.id).await,
             None => None,
         };
         let system_prompt = extract_system_prompt(session);
@@ -747,7 +777,7 @@ impl AgentRuntime {
         );
 
         let loop_config = AgentLoopConfig {
-            max_rounds: 200,
+            guidance_active_run_id,
             system_prompt,
             // Snapshot the legacy model_limits from the live in-memory config so
             // resolve_token_budget never falls back to a disk-reading Config::new(). #38.
@@ -792,6 +822,7 @@ impl AgentRuntime {
                 .as_ref()
                 .map(|memory| memory.summary_target_ratio)
                 .unwrap_or(0.20),
+            context_management: config.context_management.clone(),
             summary_safe_window_percent: config
                 .memory()
                 .as_ref()
@@ -809,7 +840,7 @@ impl AgentRuntime {
             auxiliary_model_resolver,
             disabled_filter_resolver,
             disabled_tools: {
-                let mut merged = config.disabled_tool_names();
+                let mut merged = config.disabled_tool_references();
                 if let Some(dt) = disabled_tools {
                     merged.extend(dt);
                 }
@@ -817,6 +848,7 @@ impl AgentRuntime {
             },
             image_fallback,
             app_data_dir,
+            memory_store: self.memory_store.clone(),
             prompt_memory_flags: config
                 .memory()
                 .as_ref()
@@ -850,6 +882,7 @@ impl AgentRuntime {
 
         drop(config);
 
+        let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
         let result = run_agent_loop_with_config(
@@ -882,19 +915,38 @@ impl AgentRuntime {
         // particular, callers need the original LLM/cancellation error for
         // retry and terminal-status mapping; the failed durability attempt is
         // recorded separately.
-        if let Err(checkpoint_error) = self.persistence.checkpoint_runtime_session(session).await {
-            match &result {
-                Ok(()) => tracing::warn!(
+        let final_checkpoint_succeeded =
+            match self.persistence.checkpoint_runtime_session(session).await {
+                Ok(()) => true,
+                Err(checkpoint_error) => {
+                    match &result {
+                        Ok(()) => tracing::warn!(
+                            session_id = %session.id,
+                            error = %checkpoint_error,
+                            "failed to checkpoint session transcript after successful execution"
+                        ),
+                        Err(execution_error) => tracing::warn!(
+                            session_id = %session.id,
+                            error = %checkpoint_error,
+                            execution_error = %execution_error,
+                            "failed to checkpoint session transcript after execution error"
+                        ),
+                    }
+                    false
+                }
+            };
+
+        if should_observe_completed_tool_trace(&result, final_checkpoint_succeeded, session) {
+            if let Err(error) = self
+                .skill_manager
+                .observe_completed_tool_trace(session, trace_message_start)
+                .await
+            {
+                tracing::warn!(
                     session_id = %session.id,
-                    error = %checkpoint_error,
-                    "failed to checkpoint session transcript after successful execution"
-                ),
-                Err(execution_error) => tracing::warn!(
-                    session_id = %session.id,
-                    error = %checkpoint_error,
-                    execution_error = %execution_error,
-                    "failed to checkpoint session transcript after execution error"
-                ),
+                    %error,
+                    "failed to observe completed tool trace for reuse draft discovery"
+                );
             }
         }
 

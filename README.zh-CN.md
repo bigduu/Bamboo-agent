@@ -6,7 +6,7 @@
 
 ### 本地优先的 AI agent 运行时，Rust 编写。
 
-**持久记忆、22 个内置工具、skills、MCP、workflows、schedules —— 统一在一个 HTTP + SSE API 之后。**
+**持久记忆、22 个内置工具、skills、MCP、workflows、schedules —— 统一在 HTTP + WebSocket + SSE API 之后。**
 既能作为服务器运行，也能把同一套 agent loop 作为 Rust crate 嵌入。数据始终留在你自己机器上。
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
@@ -31,13 +31,13 @@ Bamboo 是一个能在你自己电脑上运行的 AI 助理"大脑"。它不只�
 
 | 能力 | 说明 |
 |---|---|
-| 🧠 **记忆系统** | 会话便签、Dream 笔记本、跨会话的持久记忆，可自动梦境化（auto-dream）与后台整理（gardener） |
+| 🧠 **记忆系统** | 会话便签、由 Jiandu 持有的派生 Dream 快照和跨会话持久记忆，支持自动生成 Dream 与后台整理（gardener） |
 | 🗜️ **上下文压缩** | 滚动摘要 + 近窗保留的混合压缩，超大工具输出自动裁剪，按模型上下文窗口预算执行 |
 | 🛠️ **内置工具** | 22 个内置工具：文件、搜索、Shell、Web、计划模式、任务、权限请求等 |
 | 🎯 **技能系统** | 可选/可发现的技能，按请求提示做轻量选择，含内置 docx / pdf / pptx / xlsx / skill-creator |
 | 🔌 **MCP 扩展** | Model Context Protocol 客户端，挂接外部工具服务器 |
 | ⏰ **工作流与调度** | 声明式工作流装载 + cron 风格的调度触发引擎 |
-| 🌐 **HTTP / SSE** | Actix 服务、REST API、Server-Sent Events 流式，兼容 OpenAI / Anthropic / Gemini 端点 |
+| 🌐 **HTTP / WebSocket / SSE** | Actix 服务、REST API、共享 `/v2/stream` WebSocket、legacy SSE 事件流，以及兼容 OpenAI / Anthropic / Gemini 的端点 |
 | 🏗️ **多 Provider** | anthropic（默认）、openai、gemini、copilot、bodhi 路由 |
 
 ---
@@ -48,7 +48,7 @@ Bamboo 是一个 Cargo **workspace**：根目录是一个很薄的二进制（`b
 
 ```mermaid
 graph TD
-  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows]
+  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + WebSocket + SSE, routes, schedules, workflows]
   SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, metrics]
   ENG --> CORE[bamboo-agent-core<br/>core abstractions]
   CORE --> DOM[bamboo-domain<br/>pure domain types]
@@ -73,23 +73,25 @@ graph TD
 
 …以及根二进制 `bamboo-agent`。
 
-**在 Zenith 中的位置：** lotus（React UI）与 bamboo 通过 **HTTP** 通信；bodhi（Tauri 外壳）只是承载界面的容器。bamboo 是执行引擎，bodhi-server（Go）负责账号/持久化/计费与 LLM 代理。
+**在 Zenith 中的位置：** Bodhi 是 Tauri 桌面外壳，负责启动或复用本机 `bamboo serve`、等待 `GET /api/v1/health`，并管理 sidecar 生命周期。打包版本由 Bamboo 提供内嵌的 Lotus 前端。Lotus 通过 HTTP 发送请求，实时事件默认复用一条共享的 `/v2/stream` WebSocket；只有显式禁用 v2 transport 或首次 WebSocket 连接无法建立时，才回退到 legacy 账号级与会话级 SSE 事件流。Bamboo 仍是执行引擎。`bodhi-server` 是独立、可选的托管账号与 provider 路径；本地 Bodhi → Bamboo → Lotus 链路不依赖它。
 
 ---
 
 ## 旗舰能力深读
 
-### 记忆系统 · `crates/infra/bamboo-memory`
+### 记忆系统 · Jiandu + `crates/infra/bamboo-memory`
 
-记忆分三层：
+Bamboo 不再维护第二套记忆实现。窄 `bamboo-memory` facade 通过精确版本依赖，把规范存储、确定性词法检索、会话便签和 Dream 快照交给 Jiandu。
 
-- **会话便签** — 由 `session_note` 工具写入（动作：`session_read` / `session_append` / `session_replace` / `session_clear` / `session_list_topics`），是当前会话内的临时草稿/事实。
-- **Dream 笔记本** — 后台把一段会话"梦境化"，提炼成结构化的候选记忆并整合进笔记本（`auto_dream.rs`）。
-- **持久记忆** — 跨会话存活，带 frontmatter（类型、状态、来源、关系、检索元数据），作用域分为 `session` / `project` / `global`（`memory_store/types.rs`）。
+Jiandu 持有规范持久化、派生索引、词法召回和落盘的 Dream 快照字节。Bamboo 负责 prompt 选择与预算，可对召回短名单做可选 rerank，并选择刷新 Dream 所用的模型与节奏；它不会复制 Jiandu 的记忆引擎。
 
-**自动梦境**（`MemoryConfig.auto_dream_enabled`，**默认关闭**，因为会消耗模型 token）在会话演进时抽取（extraction）、整合（consolidation）并生成 Dream；支持三种模式：`Incremental`、`Refine`、`Rebuild`。
+- **会话便签** — `session_note` 工具（`read` / `append` / `replace` / `clear` / `list_topics`）保存单个会话内抗压缩的上下文。
+- **持久记忆** — 原子化的 Global 或一等 Project 事实，包含类型、状态、来源、关系和词法检索元数据。Jiandu 是唯一事实源，不存在 embedding 流水线。
+- **Dream** — 由 Jiandu 持有的 Global 或 Project 派生方向快照，不是规范记忆记录。Bamboo 先抽取事实和 Ledger 候选，再捕获 Jiandu generation、读取规范 `MEMORY.md`、只合成一次，最后请求 Jiandu 通过 compare-and-swap 发布，避免过时任务覆盖新事实。
 
-**Gardener（后台园丁）**（`bamboo-engine/src/gardener.rs`，`gardener_enabled` 默认关闭）专门拆分"多主题的 blob 记忆"。它有成本护栏：单次运行硬性拆分上限、缓慢节奏（默认按天），且**当确定性预筛找不到候选时不调用任何 LLM**——空闲的 gardener 零成本。拆分的"工作清单"由 `MemoryStore::scan_blob_candidates` 免费产出，只有拆分"决策"才用模型。
+Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会话和面向未来事项的 Ledger 仍留在 `~/.bamboo`，两套存储不会混在一起。隔离的托管宿主或验收运行可通过 `BAMBOO_JIANDU_DATA_DIR` 为服务进程及其生成的每个本地 Bamboo 运行时工作进程指定同一个非空绝对路径；无效值会在服务或工作进程初始化记忆前终止启动。它只是隔离边界，不是第二种持久化模式或迁移机制，`--data-dir` 仍然只控制 Bamboo 数据。
+
+**Gardener（后台园丁）**（`bamboo-engine/src/gardener.rs`）负责拆分多主题 blob 并整合重复项。它有单次运行硬上限，且**当确定性预筛找不到候选时不调用任何 LLM**；只有经过模型审阅的维护决策会产生模型成本。
 
 > 为什么重要：记忆系统让助理在长期使用中越来越懂你的项目，而成本可控、数据本地。
 
@@ -142,7 +144,7 @@ bamboo serve
 
 | 命令 | 作用 |
 |---|---|
-| `bamboo serve` | 启动 HTTP/SSE 服务（见上）。 |
+| `bamboo serve` | 启动 HTTP/WebSocket/SSE 服务（见上）。 |
 | `bamboo tui` | 全屏终端客户端（聊天、会话、MCP、定时任务、技能、配置），连接运行中的服务；本地服务不可达时会提示自动拉起（`--auto-serve`/`--no-auto-serve`）。 |
 | `bamboo init` | 首次安装引导：写入含 provider + API key 的 `config.json`（交互式，CI 用 `--non-interactive`）。 |
 | `bamboo doctor` | 诊断安装状态（配置存在、provider 已配 key、服务可达）；有阻塞问题时以非零退出。 |
@@ -246,7 +248,7 @@ dirs = "5"
 anyhow = "1"
 ```
 
-> 不想自己管理这些依赖？直接 `bamboo serve` 用上面的 HTTP API —— 它驱动的是完全相同的 loop。完整 SDK 类型参考是 [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) 上的 rustdoc（已发布 crate 把门面重导出为 `bamboo_agent::agent`）；[`docs/guides/API.md`](./docs/guides/API.md) 覆盖 HTTP/SSE 接口。
+> 不想自己管理这些依赖？直接 `bamboo serve` 使用上面的服务 API —— 它们驱动的是完全相同的 loop。完整 SDK 类型参考是 [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) 上的 rustdoc（已发布 crate 把门面重导出为 `bamboo_agent::agent`）；[`docs/guides/API.md`](./docs/guides/API.md) 覆盖 HTTP/WebSocket/SSE 接口。
 
 ### 示例配置
 
@@ -282,6 +284,7 @@ curl http://localhost:9562/api/v1/health
 ### 常用 API 路由
 
 REST 前缀 `/api/v1`：`chat`、`execute/{session_id}`、`stream`、`sessions`、`skills`、`tools`、`tools/execute`、`models`、`commands`、`workflows`、`metrics/*`、`mcp`、`servers`、`stop/{session_id}`、`health`。
+共享实时传输使用 WebSocket `/v2/stream`；`/api/v1/stream` 与 `/api/v1/events/{session_id}` 保留为 legacy SSE 事件流。
 另有 provider 兼容端点：`/openai/v1`、`/anthropic/v1`、`/gemini/v1beta`、`/v1/{chat/completions,responses,messages}`。
 
 ### 测试与质量
@@ -296,16 +299,19 @@ cargo build --release
 
 ## 其余技术栈
 
-Zenith 是一个 monorepo，bamboo 是其中的执行引擎子模块。
+[`Zenith`](https://github.com/bigduu/Zenith) 是一个薄层 monorepo，Bamboo 是其中的执行引擎子模块。
 
 | 模块 | 角色 |
 |---|---|
-| [**bodhi**](../bodhi) | 桌面 AI 产品界面（Tauri 外壳） |
-| [**lotus**](../lotus) | React + Vite 前端 UI 层（通过 HTTP 调用 bamboo） |
-| **bamboo** | 本地优先 Rust 智能体运行时（本仓库） |
-| [**bodhi-server**](../bodhi-server) | Go 后端：认证 / 持久化 / 计费配额 / LLM 代理 |
-| [**pavilion**](../pavilion) | 官网与文档 |
-| [**Zenith (root)**](../) | monorepo 入口 + 子模块指针 + 发布列车 |
+| [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri 桌面外壳：启动或复用 Bamboo、等待健康检查通过、管理 sidecar 生命周期，并展示由 Bamboo 提供的 Lotus |
+| [**Lotus**](https://github.com/bigduu/Lotus) | 当前 React + Vite UI：HTTP 请求、默认共享 `/v2/stream` WebSocket、legacy SSE fallback |
+| [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | 本地优先 Rust 智能体运行时与打包版 Lotus 宿主（本仓库） |
+| [**bodhi-server**](https://github.com/bigduu/bodhi-server) | 可选托管服务：账号、API key、加密 provider 凭据、模型路由、计费配额与 provider proxy |
+| [**Pavilion**](https://github.com/bigduu/Pavilion) | 官方网站与文档入口 |
+| [**Jiandu**](https://github.com/bigduu/Jiandu) | 小型文件系统共享记忆边界：Rust library + stdio MCP server |
+| [**Nova**](https://github.com/bigduu/Nova) | 通过 MCP 暴露的原生 computer-use 能力 |
+| [**Lotus Next**](https://github.com/bigduu/lotus-next) | 与 Lotus 并行开发的实验性下一代前端；不是当前 Bodhi 默认 UI |
+| [**Magpie**](https://github.com/bigduu/Magpie) | Bamboo 的 IM connector，可独立运行，也可作为 Bamboo service plugin 使用 |
 
 **模块内文档：**
 - API 参考: [`docs/guides/API.md`](./docs/guides/API.md)

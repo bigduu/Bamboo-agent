@@ -4,6 +4,10 @@
 //! implementations. Concrete implementations live in infrastructure crates.
 
 use crate::session::types::Session;
+use crate::{
+    SupervisorBootstrapReceipt, SupervisorLinkObservation, SupervisorManagementReceipt,
+    SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
+};
 
 /// Trait for session storage backends.
 ///
@@ -12,7 +16,95 @@ use crate::session::types::Session;
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
-    /// Saves a session's metadata.
+    /// Trusted explicit recreation of a previously deleted Ordinary Root ID.
+    /// The backend constructs a blank Root and assigns a fresh birth marker;
+    /// callers cannot supply an old snapshot or choose its lifetime. Retrying
+    /// after a complete publication returns that surviving lifetime unchanged.
+    /// This is a host/SDK port, never a model-callable creation capability.
+    async fn recreate_root_session(
+        &self,
+        session_id: &str,
+        initial_model: &str,
+    ) -> std::io::Result<Session> {
+        let _ = (session_id, initial_model);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support trusted Root recreation",
+        ))
+    }
+
+    /// Trusted host bootstrap for one stable default Supervisor Root. Only the
+    /// initial model is caller supplied and is used on first creation only.
+    /// Implementations must publish the complete identity atomically, protect it
+    /// from ordinary writers, and return a receipt rather than a partial Session.
+    async fn get_or_create_default_supervisor(
+        &self,
+        initial_model: &str,
+    ) -> std::io::Result<SupervisorBootstrapReceipt> {
+        let _ = initial_model;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support trusted Supervisor bootstrap",
+        ))
+    }
+
+    /// Bounded trusted host scope observation, never a Session directory.
+    async fn inspect_supervisor_scope(
+        &self,
+        supervisor: &SupervisorReference,
+    ) -> std::io::Result<SupervisorScopeObservation> {
+        let _ = supervisor;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
+        ))
+    }
+
+    /// Trusted management CAS at the final durable boundary. Implementations
+    /// must revalidate identity/revision and any attach target under lifecycle,
+    /// Task and ordered Session locks retained through publication. A stale
+    /// revision returns WouldBlock; the caller must reload before a fresh retry.
+    async fn mutate_supervisor_management(
+        &self,
+        request: &SupervisorManagementRequest,
+    ) -> std::io::Result<SupervisorManagementReceipt> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
+        ))
+    }
+
+    /// Strict single-link observation under the same authority locks as CAS.
+    /// Returned authorization expires when those locks are released. A later
+    /// command needs an integrated final authorization + durable admission fence.
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+    ) -> std::io::Result<SupervisorLinkObservation> {
+        let _ = (supervisor, target_session_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
+        ))
+    }
+
+    /// Strict canonical Root control-plane read for authority decisions.
+    /// `None` means absent; partial/corrupt/mismatched published authority is an
+    /// error, never a fallback to stale session.json. Returned messages are empty;
+    /// this observation must not replace a full Session in a history cache.
+    async fn load_root_authority(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        let _ = session_id;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support strict Root authority reads",
+        ))
+    }
+
+    /// Saves a session's metadata. A backend may allow initial creation for a
+    /// never-deleted ID, but an ordinary snapshot must not recreate a deleted
+    /// lifetime. Use the trusted recreation port for an explicitly reused ID.
     async fn save_session(&self, session: &Session) -> std::io::Result<()>;
 
     /// Loads a session by ID, returns None if not found.

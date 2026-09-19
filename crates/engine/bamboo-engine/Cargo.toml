@@ -39,6 +39,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 dashmap = "6"
+arc-swap = "1.9"
+crossbeam-skiplist = "0.1.3"
 parking_lot = "0.12"
 fs2 = "0.4"
 base64 = "0.23"

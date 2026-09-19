@@ -2,8 +2,9 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + compact_context)
-//!   └─> root_tools (base + SubAgent + scheduler + session_history)
+//! base_tools (builtin + MCP + memory + skills + context controls + legacy self-only
+//!             session_history + exact self-only session_history_current)
+//!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
 //! ```
 
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::AgentEvent;
 use bamboo_llm::Config;
 use bamboo_mcp::manager::McpServerManager;
+use bamboo_plugin_protocol::ToolEventPublisher;
 use bamboo_skills::SkillManager;
 use bamboo_storage::LockedSessionStore;
 use bamboo_storage::SessionStoreV2;
@@ -32,6 +34,8 @@ pub(super) fn build_base_tools(
     mcp_manager: Arc<McpServerManager>,
     skill_manager: Arc<SkillManager>,
     session_repo: bamboo_engine::SessionRepository,
+    session_store: Arc<SessionStoreV2>,
+    storage: Arc<dyn Storage>,
     app_data_dir: PathBuf,
     notification_service: Arc<bamboo_notification::NotificationService>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -40,6 +44,8 @@ pub(super) fn build_base_tools(
     project_store: Arc<bamboo_projects::ProjectStore>,
     account_sink: Arc<bamboo_engine::events::AccountEventSink>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    tool_event_publisher: Arc<dyn ToolEventPublisher>,
+    memory_store: bamboo_memory::memory_store::MemoryStore,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -48,7 +54,8 @@ pub(super) fn build_base_tools(
         bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
             config.clone(),
             permission_checker.clone(),
-        ),
+        )
+        .with_tool_event_publisher(tool_event_publisher),
     );
     let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor;
 
@@ -61,6 +68,16 @@ pub(super) fn build_base_tools(
     let base: Arc<dyn ToolExecutor> = Arc::new(bamboo_mcp::executor::CompositeToolExecutor::new(
         builtin_tools,
         mcp_tools,
+    ));
+
+    // Replace the built-in default-root session_note instance so note writes
+    // and next-round prompt reads share this AppState's one concrete store.
+    let session_note_tool = Arc::new(bamboo_tools::tools::SessionNoteTool::with_memory_store(
+        memory_store.clone(),
+    ));
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        base,
+        session_note_tool,
     ));
 
     // Replace the framework Workspace tool with the Project-aware server
@@ -88,10 +105,10 @@ pub(super) fn build_base_tools(
         project_tool,
     ));
 
-    let memory_tool = Arc::new(
-        crate::tools::MemoryTool::new(session_repo.clone(), app_data_dir.clone())
-            .with_project_store(project_store.clone()),
-    );
+    let memory_tool = Arc::new(crate::tools::MemoryTool::with_store(
+        session_repo.clone(),
+        memory_store,
+    ));
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,
         memory_tool,
@@ -144,6 +161,12 @@ pub(super) fn build_base_tools(
         compact_tool,
     ));
 
+    // archive_context is a distinct summary-free retrieval-window control.
+    let archive_tool = Arc::new(crate::tools::ArchiveContextTool);
+    let with_context_controls: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(with_compact, archive_tool),
+    );
+
     // notify is available to all sessions (including headless/scheduled runs
     // with no live subscriber — that's the whole point of proactively
     // alerting the owner) for proactively surfacing something outside the
@@ -155,9 +178,31 @@ pub(super) fn build_base_tools(
         config,
     ));
     let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
-    Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_compact,
+    let with_notify: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_context_controls,
         notify_tool,
+    ));
+
+    // Preserve the legacy self-only name for Base/Child compatibility. Root
+    // replaces only this exact name with the full viewer below.
+    let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
+        session_store.clone(),
+        storage.clone(),
+    ));
+    let with_legacy_history: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(with_notify, self_history_tool),
+    );
+
+    // A distinct exact identity keeps the least-privilege schema Core under
+    // Progressive and StickyFallback loading. It is not an alias for the broad
+    // Root viewer and therefore cannot inherit cross-Session actions.
+    let current_history_tool = Arc::new(crate::tools::SessionInspectorTool::current(
+        session_store,
+        storage,
+    ));
+    Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_legacy_history,
+        current_history_tool,
     ))
 }
 
@@ -189,7 +234,7 @@ pub(super) fn build_root_tools(
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),
-        session_messenger: Some(session_messenger),
+        session_messenger: Some(session_messenger.clone()),
         scheduler: spawn_scheduler,
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),
@@ -206,13 +251,22 @@ pub(super) fn build_root_tools(
     // for session lifecycle, `SubagentResolutionPort` for subagent_type config).
     // The model catalog enables `action=list_models` + explicit `create.model`.
     let sub_agent_tool = Arc::new(
-        crate::tools::SubAgentTool::new(adapter.clone(), adapter).with_model_catalog(Arc::new(
-            crate::tools::RegistryModelCatalog::new(provider_registry),
-        )),
+        crate::tools::SubAgentTool::new(adapter.clone(), adapter.clone()).with_model_catalog(
+            Arc::new(crate::tools::RegistryModelCatalog::new(provider_registry)),
+        ),
     );
     let tools_with_sub_agent: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool),
     );
+
+    // Planning is delegated to one runtime-enforced read-only child. This keeps
+    // the root session in its normal orchestrator posture and reuses the same
+    // durable child/wait/completion path as `SubAgent`.
+    let plan_tool = Arc::new(crate::tools::PlanTool::new(adapter.clone(), adapter));
+    let tools_with_plan: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        tools_with_sub_agent,
+        plan_tool,
+    ));
 
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
@@ -227,9 +281,11 @@ pub(super) fn build_root_tools(
         workspace_resolver,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
+        crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
     );
 
+    // Intentional same-name overlay replacement: Root keeps every privileged
+    // cross-session action while Base/Child expose only current-Session reads.
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store,
         storage,
@@ -237,6 +293,13 @@ pub(super) fn build_root_tools(
     let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
     );
+    let tools_with_control: Arc<dyn ToolExecutor> =
+        Arc::new(crate::tools::OverlayToolExecutor::new(
+            tools_with_inspector,
+            Arc::new(bamboo_server_tools::SessionControlTool::new(
+                session_messenger,
+            )),
+        ));
 
     // When a broker is configured, root agents also get `ask_agent` (command
     // broker-deployed agents, query/steer) and `deploy_agent` (spin up new
@@ -244,7 +307,7 @@ pub(super) fn build_root_tools(
     match broker {
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-                tools_with_inspector,
+                tools_with_control,
                 Arc::new(crate::tools::AskAgentTool::new(
                     b.endpoint.clone(),
                     b.token.clone(),
@@ -272,6 +335,6 @@ pub(super) fn build_root_tools(
                 Arc::new(crate::tools::ClusterTool::new(config, fabric_deployer)),
             ))
         }
-        _ => tools_with_inspector,
+        _ => tools_with_control,
     }
 }

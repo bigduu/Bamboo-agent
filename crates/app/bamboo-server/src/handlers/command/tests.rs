@@ -366,7 +366,7 @@ async fn project_command_is_listed_and_namespace_route_expands_arguments() {
     session.set_workspace_path_meta(project.path().to_string_lossy().to_string());
     app_state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -421,7 +421,7 @@ async fn assigned_project_commands_use_workspace_overlay_then_project_source() {
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     app_state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -545,7 +545,7 @@ async fn production_command_routes_apply_workspace_over_project_over_global_prec
         .expect("persist session");
     app_state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -630,7 +630,7 @@ async fn assigned_project_cannot_read_another_projects_workspace_commands() {
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     app_state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
 
     let app = actix_web::test::init_service(

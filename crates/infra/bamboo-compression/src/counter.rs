@@ -56,6 +56,20 @@ pub trait TokenCounter: Send + Sync {
     fn count_text(&self, text: &str) -> u32;
 }
 
+/// Deterministic aggregate for ordered provider-visible tool positions.
+///
+/// This is a local context-window estimate, not provider-authoritative billing
+/// usage. The provider-reported usage remains authoritative after dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderVisibleToolEstimate {
+    /// Saturating token sum across the ordered positions.
+    pub input_tokens: u32,
+    /// Saturating UTF-8 byte sum across the ordered positions.
+    pub serialized_bytes: usize,
+    /// Saturating Unicode scalar-value sum across the ordered positions.
+    pub serialized_chars: usize,
+}
+
 /// Heuristic token counter using character-based estimation.
 ///
 /// Uses the approximation: tokens ≈ characters / 4, with a 10% safety margin
@@ -164,6 +178,35 @@ impl TiktokenTokenCounter {
     /// Create with a custom metadata overhead.
     pub fn new(metadata_overhead: u32) -> Self {
         Self { metadata_overhead }
+    }
+
+    /// Estimate already-lowered provider-visible tool segments exactly once.
+    ///
+    /// `segments` must contain compact serialized JSON/text in the order the
+    /// selected provider exposes it to the model. Each segment is one contiguous
+    /// model position and is tokenized separately with the same counter used for
+    /// prompt text; provider lowering must serialize adjacent content such as an
+    /// initial tools array into one segment. This prevents BPE merges across
+    /// positions separated by transcript content.
+    ///
+    /// Repeated fragments at different model-visible positions remain repeated
+    /// by design; callers must omit definitions that are not model-visible at
+    /// that position. An empty slice returns an all-zero estimate.
+    pub fn estimate_provider_visible_tool_segments<'a>(
+        &self,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> ProviderVisibleToolEstimate {
+        let mut estimate = ProviderVisibleToolEstimate::default();
+        for segment in segments {
+            estimate.input_tokens = estimate
+                .input_tokens
+                .saturating_add(self.count_text(segment));
+            estimate.serialized_bytes = estimate.serialized_bytes.saturating_add(segment.len());
+            estimate.serialized_chars = estimate
+                .serialized_chars
+                .saturating_add(segment.chars().count());
+        }
+        estimate
     }
 
     /// Truncate `text` to at most `max_tokens` tokens, keeping the START.
@@ -465,6 +508,73 @@ mod tests {
     fn tiktoken_counter_counts_empty_text() {
         let counter = TiktokenTokenCounter::default();
         assert_eq!(counter.count_text(""), 0);
+    }
+
+    #[test]
+    fn provider_visible_tool_estimate_is_zero_for_no_segments() {
+        let counter = TiktokenTokenCounter::default();
+        assert_eq!(
+            counter.estimate_provider_visible_tool_segments(std::iter::empty()),
+            ProviderVisibleToolEstimate::default()
+        );
+    }
+
+    #[test]
+    fn provider_visible_tool_estimate_counts_each_ordered_position_once() {
+        let counter = TiktokenTokenCounter::default();
+        let segments = [
+            r#"{"type":"function","function":{"#.to_string(),
+            r#""name":"lookup","description":"café 工具","#.to_string(),
+            r#""parameters":{"type":"object"}}}"#.to_string(),
+        ];
+        let estimate =
+            counter.estimate_provider_visible_tool_segments(segments.iter().map(String::as_str));
+        let expected_tokens = segments.iter().fold(0u32, |total, segment| {
+            total.saturating_add(counter.count_text(segment))
+        });
+        let expected_bytes = segments.iter().map(String::len).sum::<usize>();
+        let expected_chars = segments
+            .iter()
+            .map(|segment| segment.chars().count())
+            .sum::<usize>();
+
+        assert_eq!(estimate.input_tokens, expected_tokens);
+        assert_eq!(estimate.serialized_bytes, expected_bytes);
+        assert_eq!(estimate.serialized_chars, expected_chars);
+    }
+
+    #[test]
+    fn provider_visible_tool_estimate_keeps_bpe_boundaries_between_positions() {
+        let counter = TiktokenTokenCounter::default();
+        let segments = ["a".to_string(), "b".to_string()];
+
+        let estimate =
+            counter.estimate_provider_visible_tool_segments(segments.iter().map(String::as_str));
+        let separate = counter
+            .count_text(&segments[0])
+            .saturating_add(counter.count_text(&segments[1]));
+
+        assert_eq!(estimate.input_tokens, separate);
+        assert_ne!(estimate.input_tokens, counter.count_text("ab"));
+    }
+
+    #[test]
+    fn larger_provider_visible_tool_segment_increases_every_measure() {
+        let counter = TiktokenTokenCounter::default();
+        let small = [r#"{"parameters":{}}"#.to_string()];
+        let large = [format!(
+            r#"{{"parameters":{{"description":"{}"}}}}"#,
+            "provider visible parameter ".repeat(128)
+        )];
+
+        let small =
+            counter.estimate_provider_visible_tool_segments(small.iter().map(String::as_str));
+        let large =
+            counter.estimate_provider_visible_tool_segments(large.iter().map(String::as_str));
+
+        assert!(large.input_tokens > small.input_tokens);
+        assert!(large.serialized_bytes > small.serialized_bytes);
+        assert!(large.serialized_chars > small.serialized_chars);
     }
 
     #[test]

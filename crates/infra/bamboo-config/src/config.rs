@@ -66,7 +66,7 @@ use std::sync::{OnceLock, RwLock};
 
 use crate::keyword_masking::KeywordMaskingConfig;
 use crate::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
-use bamboo_domain::tool_names::normalize_tool_ref;
+use bamboo_domain::normalize_tool_ref;
 use bamboo_domain::ReasoningEffort;
 
 /// Minimum accepted watchdog deadline. Zero would turn scheduling jitter into
@@ -426,8 +426,8 @@ pub struct MemoryConfig {
     pub capacity_max_archivals_per_run: usize,
     /// Whether the background freshness gardener may conservatively demote Active
     /// day/week-granularity memories to Stale once they cross their documented
-    /// staleness window (issue #61 phase 2; see
-    /// `bamboo_memory::memory_store::freshness::granularity_expired`). Default ON,
+    /// staleness window (issue #61 phase 2; applied by Jiandu's
+    /// `MemoryStore::expire_stale_granularity`). Default ON,
     /// matching the other gardener passes: deterministic (no LLM, no cost), and
     /// non-destructive — it only ever moves Active → Stale, never archives or
     /// deletes. Set false to opt out.
@@ -557,7 +557,7 @@ fn default_true_memory_project_first_dream() -> bool {
 
 /// Per-run resource guardrails (issue #221): a cost/resource ceiling applied
 /// across an entire `AgentRuntime::execute()` call (i.e. one user turn's worth
-/// of internal rounds — the same "run" granularity `max_rounds` already uses).
+/// of internal rounds — the same "run" granularity the round cap uses).
 ///
 /// Every field is `None` by default (unlimited), matching the rest of this
 /// config's opt-in-only posture. A per-request `ExecuteRequest::run_budget`
@@ -567,10 +567,11 @@ fn default_true_memory_project_first_dream() -> bool {
 /// `bamboo_engine::runtime::runtime::AgentRuntime::execute`).
 ///
 /// Exceeding any configured limit gracefully stops the run (mirrors the
-/// `max_rounds` exhaustion path: one final summary turn, then a terminal stop
-/// with `runtime.completion_reason = "budget_exceeded"` on the session, plus a
-/// structured `AgentEvent::BudgetExceeded`) rather than erroring out — the run
-/// stays resumable.
+/// round-cap exhaustion path: one final summary turn, then a terminal stop
+/// with `runtime.completion_reason` = `"budget_exceeded"` for resource fields
+/// and `"max_rounds_reached"` for the round cap, plus a structured
+/// `AgentEvent::BudgetExceeded`) rather than erroring out — the run stays
+/// resumable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunBudgetConfig {
     /// Maximum total tokens (prompt + completion, actual provider-reported
@@ -588,6 +589,14 @@ pub struct RunBudgetConfig {
     /// spawn in total over its lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subagents: Option<u32>,
+    /// Maximum internal rounds for a single run before the run is gracefully
+    /// stopped. `None` (the default) means unlimited: the loop runs until the
+    /// model stops calling tools, another guardrail trips, or the run is
+    /// cancelled. Setting a cap keeps the issue #29 exhaustion contract
+    /// (`runtime.completion_reason = "max_rounds_reached"`, a visible
+    /// notification, and exactly one final summary turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
 }
 
 /// Tighten-only per-field merge: the effective limit is the MINIMUM of the
@@ -624,6 +633,7 @@ impl RunBudgetConfig {
             max_total_tokens: min_limit(self.max_total_tokens, over.max_total_tokens),
             max_tool_calls: min_limit(self.max_tool_calls, over.max_tool_calls),
             max_subagents: min_limit(self.max_subagents, over.max_subagents),
+            max_rounds: min_limit(self.max_rounds, over.max_rounds),
         }
     }
 }
@@ -697,8 +707,9 @@ pub enum CodexApprovalPolicy {
 /// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
-    /// Maximum actor processes running at once; further spawns wait their
-    /// turn. Default: 8.
+    /// Maximum actor activations running at once; further spawns wait their
+    /// turn. Default: 200. Warm-idle process retention has a separate, smaller
+    /// bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
     /// Expert: custom worker binary. Default: the current bamboo executable.
@@ -1447,6 +1458,165 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
     })
 }
 
+/// Host strategy used when the active model context approaches its input limit.
+///
+/// `Summary` remains the compatibility default. `RetrievalWindow` is opt-in and
+/// archives old exact messages only after the runtime has verified that the
+/// current-session history capability is callable and the boundary can be
+/// durably checkpointed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementStrategy {
+    #[default]
+    Summary,
+    RetrievalWindow,
+}
+
+/// Explicit fallback used when retrieval-window cannot satisfy a runtime
+/// precondition. There is deliberately no implicit summary fallback.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementFallbackStrategy {
+    #[default]
+    None,
+    Summary,
+}
+
+fn default_retrieval_window_min_recent_user_turns() -> usize {
+    3
+}
+
+fn default_retrieval_window_trigger_usage_ratio() -> f64 {
+    0.80
+}
+
+fn default_retrieval_window_target_usage_ratio() -> f64 {
+    0.60
+}
+
+fn default_history_tool_required() -> bool {
+    true
+}
+
+/// Selection and safety policy for the opt-in retrieval-window strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RetrievalWindowContextConfig {
+    #[serde(default = "default_retrieval_window_min_recent_user_turns")]
+    pub min_recent_user_turns: usize,
+    #[serde(default = "default_retrieval_window_trigger_usage_ratio")]
+    pub trigger_usage_ratio: f64,
+    #[serde(default = "default_retrieval_window_target_usage_ratio")]
+    pub target_usage_ratio: f64,
+    #[serde(default = "default_history_tool_required")]
+    pub history_tool_required: bool,
+    #[serde(default)]
+    pub fallback_strategy: ContextManagementFallbackStrategy,
+}
+
+impl Default for RetrievalWindowContextConfig {
+    fn default() -> Self {
+        Self {
+            min_recent_user_turns: default_retrieval_window_min_recent_user_turns(),
+            trigger_usage_ratio: default_retrieval_window_trigger_usage_ratio(),
+            target_usage_ratio: default_retrieval_window_target_usage_ratio(),
+            history_tool_required: default_history_tool_required(),
+            fallback_strategy: ContextManagementFallbackStrategy::None,
+        }
+    }
+}
+
+/// Backward-compatible context-management configuration snapshot.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ContextManagementConfig {
+    pub strategy: ContextManagementStrategy,
+    pub retrieval_window: RetrievalWindowContextConfig,
+}
+
+impl Default for ContextManagementConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ContextManagementStrategy::Summary,
+            retrieval_window: RetrievalWindowContextConfig::default(),
+        }
+    }
+}
+
+impl ContextManagementConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let policy = &self.retrieval_window;
+        if policy.min_recent_user_turns == 0 {
+            return Err(
+                "context_management.retrieval_window.min_recent_user_turns must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if !policy.target_usage_ratio.is_finite()
+            || !policy.trigger_usage_ratio.is_finite()
+            || policy.target_usage_ratio < 0.01
+            || policy.target_usage_ratio >= policy.trigger_usage_ratio
+            || policy.trigger_usage_ratio > 1.0
+        {
+            return Err(
+                "context_management retrieval ratios must satisfy 0.01 <= target_usage_ratio < trigger_usage_ratio <= 1"
+                    .to_string(),
+            );
+        }
+        if self.strategy == ContextManagementStrategy::RetrievalWindow
+            && !policy.history_tool_required
+        {
+            return Err(
+                "retrieval_window requires history_tool_required=true in this release".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Planner policy is intentionally percent-based in the domain primitive.
+    /// Flooring keeps fractional configuration conservative rather than
+    /// archiving less history than the configured target permits. The planner's
+    /// minimum representable positive target is one percent.
+    pub fn retrieval_target_usage_percent(&self) -> u8 {
+        ((self.retrieval_window.target_usage_ratio * 100.0).floor() as u8).max(1)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextManagementConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            strategy: ContextManagementStrategy,
+            retrieval_window: RetrievalWindowContextConfig,
+        }
+
+        impl Default for Wire {
+            fn default() -> Self {
+                let defaults = ContextManagementConfig::default();
+                Self {
+                    strategy: defaults.strategy,
+                    retrieval_window: defaults.retrieval_window,
+                }
+            }
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let config = Self {
+            strategy: wire.strategy,
+            retrieval_window: wire.retrieval_window,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -1577,6 +1747,10 @@ pub struct ConfigValues {
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
 
+    /// Host-owned strategy for bounding provider-visible conversation context.
+    #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
+    pub context_management: ContextManagementConfig,
+
     /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
     /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
     /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
@@ -1633,6 +1807,7 @@ impl Default for ConfigValues {
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             stream_timeout: StreamTimeoutConfig::default(),
+            context_management: ContextManagementConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             provider_instances: HashMap::new(),
@@ -1744,6 +1919,8 @@ struct ExecutionConfigSection {
     run_budget: RunBudgetConfig,
     #[serde(default)]
     stream_timeout: StreamTimeoutConfig,
+    #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
+    context_management: ContextManagementConfig,
     #[serde(
         default,
         skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty"
@@ -1856,6 +2033,7 @@ impl From<ConfigValues> for ConfigRoot {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
             mcp,
             notifications,
@@ -1897,6 +2075,7 @@ impl From<ConfigValues> for ConfigRoot {
                 features,
                 run_budget,
                 stream_timeout,
+                context_management,
                 cluster_fabric,
             },
             integrations: IntegrationConfigSection {
@@ -1956,6 +2135,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
         } = execution;
         let IntegrationConfigSection {
@@ -1989,6 +2169,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
             mcp,
             notifications,
@@ -4352,20 +4533,36 @@ impl Config {
         }
     }
 
-    /// Get normalized disabled tool names.
-    pub fn disabled_tool_names(&self) -> BTreeSet<String> {
+    /// Get exact disabled tool references for catalog-aware resolution.
+    ///
+    /// References remain exact here: catalog-aware filtering resolves an exact
+    /// registered name before applying legacy/builtin alias fallback. Eagerly
+    /// rewriting `apply_patch` to `Edit`, for example, would make an exact
+    /// custom `apply_patch` registration indistinguishable from the builtin.
+    pub fn disabled_tool_references(&self) -> BTreeSet<String> {
         self.tools
             .disabled
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
-            .map(|name| normalize_tool_ref(name).unwrap_or_else(|| name.to_string()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Legacy normalized-name facade retained for source compatibility.
+    ///
+    /// New execution/catalog code must use [`Self::disabled_tool_references`]
+    /// so an exact registered alias can be resolved before fallback.
+    pub fn disabled_tool_names(&self) -> BTreeSet<String> {
+        self.disabled_tool_references()
+            .into_iter()
+            .map(|reference| normalize_tool_ref(&reference).unwrap_or(reference))
             .collect()
     }
 
     /// Normalize tool settings (trim / dedupe / sort).
     pub fn normalize_tool_settings(&mut self) {
-        self.tools.disabled = self.disabled_tool_names().into_iter().collect();
+        self.tools.disabled = self.disabled_tool_references().into_iter().collect();
     }
 
     /// Get normalized disabled skill IDs.
@@ -4491,6 +4688,7 @@ impl Config {
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 stream_timeout: StreamTimeoutConfig::default(),
+                context_management: ContextManagementConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
                 provider: default_provider(),
                 provider_instances: HashMap::new(),
@@ -5582,6 +5780,95 @@ mod tests {
     }
 
     #[test]
+    fn context_management_defaults_to_summary_and_is_omitted() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            config.context_management.strategy,
+            ContextManagementStrategy::Summary
+        );
+        assert_eq!(
+            config
+                .context_management
+                .retrieval_window
+                .min_recent_user_turns,
+            3
+        );
+        assert_eq!(
+            config.context_management.retrieval_target_usage_percent(),
+            60
+        );
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("context_management").is_none());
+    }
+
+    #[test]
+    fn retrieval_window_context_management_round_trips() {
+        let json = serde_json::json!({
+            "context_management": {
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "min_recent_user_turns": 4,
+                    "trigger_usage_ratio": 0.82,
+                    "target_usage_ratio": 0.61,
+                    "history_tool_required": true,
+                    "fallback_strategy": "summary"
+                }
+            }
+        });
+        let root: ConfigRoot = serde_json::from_value(json).unwrap();
+        let values = ConfigValues::from(root);
+        assert_eq!(
+            values.context_management.strategy,
+            ContextManagementStrategy::RetrievalWindow
+        );
+        assert_eq!(
+            values.context_management.retrieval_window.fallback_strategy,
+            ContextManagementFallbackStrategy::Summary
+        );
+
+        let persisted = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(
+            persisted["context_management"]["retrieval_window"]["min_recent_user_turns"],
+            4
+        );
+        assert_eq!(
+            persisted["context_management"]["strategy"],
+            "retrieval_window"
+        );
+    }
+
+    #[test]
+    fn retrieval_window_context_management_rejects_unsafe_policy() {
+        for invalid in [
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {"min_recent_user_turns": 0}
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "target_usage_ratio": 0.8,
+                    "trigger_usage_ratio": 0.8
+                }
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "target_usage_ratio": 0.005,
+                    "trigger_usage_ratio": 0.006
+                }
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {"history_tool_required": false}
+            }),
+        ] {
+            serde_json::from_value::<ContextManagementConfig>(invalid)
+                .expect_err("unsafe retrieval-window policy must fail closed");
+        }
+    }
+
+    #[test]
     fn compatibility_serialization_keeps_legacy_provider_in_instance_mode() {
         let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
             "provider_type": "openai",
@@ -5770,6 +6057,7 @@ mod tests {
             max_total_tokens: Some(100_000),
             max_tool_calls: Some(500),
             max_subagents: Some(10),
+            max_rounds: Some(200),
         };
 
         // No override at all: config default passes through unchanged.
@@ -5779,17 +6067,19 @@ mod tests {
             "no override falls back to the config default entirely"
         );
 
-        // Override TIGHTENS exactly one field; the other two keep the config
+        // Override TIGHTENS exactly one field; the others keep the config
         // default (per-field, not all-or-nothing).
         let tighten_one = RunBudgetConfig {
             max_total_tokens: Some(5_000),
             max_tool_calls: None,
             max_subagents: None,
+            max_rounds: None,
         };
         let merged = config_default.merged_with_override(Some(&tighten_one));
         assert_eq!(merged.max_total_tokens, Some(5_000));
         assert_eq!(merged.max_tool_calls, Some(500));
         assert_eq!(merged.max_subagents, Some(10));
+        assert_eq!(merged.max_rounds, Some(200));
 
         // A LOOSER override is clamped to the config default: a client can
         // never raise the operator's ceiling (PR #539 review, finding #3).
@@ -5797,6 +6087,7 @@ mod tests {
             max_total_tokens: Some(999_999_999),
             max_tool_calls: Some(10_000),
             max_subagents: Some(1_000),
+            max_rounds: Some(100_000),
         };
         assert_eq!(
             config_default.merged_with_override(Some(&loosen_attempt)),
@@ -5822,6 +6113,24 @@ mod tests {
         assert_eq!(merged.max_total_tokens, Some(5_000));
         assert_eq!(merged.max_tool_calls, None);
         assert_eq!(merged.max_subagents, None);
+        assert_eq!(merged.max_rounds, None);
+
+        // The round cap tightens the same way: a request can cap rounds below
+        // an unlimited config default but never raise a configured ceiling.
+        let tighten_rounds = RunBudgetConfig {
+            max_total_tokens: None,
+            max_tool_calls: None,
+            max_subagents: None,
+            max_rounds: Some(20),
+        };
+        let merged = unlimited_default.merged_with_override(Some(&tighten_rounds));
+        assert_eq!(merged.max_rounds, Some(20));
+        let merged = config_default.merged_with_override(Some(&tighten_rounds));
+        assert_eq!(
+            merged.max_rounds,
+            Some(20),
+            "a stricter per-request round cap wins over the config default"
+        );
     }
 
     #[test]
@@ -5829,6 +6138,7 @@ mod tests {
         assert_eq!(RunBudgetConfig::default().max_total_tokens, None);
         assert_eq!(RunBudgetConfig::default().max_tool_calls, None);
         assert_eq!(RunBudgetConfig::default().max_subagents, None);
+        assert_eq!(RunBudgetConfig::default().max_rounds, None);
 
         let json = r#"{ "max_total_tokens": 250000, "max_subagents": 3 }"#;
         let cfg: RunBudgetConfig = serde_json::from_str(json).expect("deserializes");
@@ -5837,10 +6147,24 @@ mod tests {
             cfg.max_tool_calls, None,
             "absent field defaults to unlimited"
         );
+        assert_eq!(
+            cfg.max_rounds, None,
+            "absent round cap defaults to unlimited"
+        );
+
         assert_eq!(cfg.max_subagents, Some(3));
 
+        // The round cap round-trips like the other fields.
+        let json = r#"{ "max_rounds": 250 }"#;
+        let cfg: RunBudgetConfig = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(cfg.max_rounds, Some(250));
+        let round_tripped: RunBudgetConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(round_tripped.max_rounds, Some(250));
+        assert_eq!(round_tripped.max_total_tokens, None);
+
         // Absent fields are omitted on serialize (skip_serializing_if), so an
-        // all-default config round-trips to `{}` rather than three explicit
+        // all-default config round-trips to `{}` rather than four explicit
         // nulls.
         let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
         assert_eq!(empty, "{}");
@@ -8495,7 +8819,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_settings_trims_dedupes_canonicalizes_and_sorts() {
+    fn normalize_tool_settings_trims_dedupes_and_sorts_raw_references() {
         let mut config = Config::default();
         config.tools.disabled = vec![
             "  read_file  ".to_string(),
@@ -8503,15 +8827,28 @@ mod tests {
             "read_file".to_string(),
             "bash".to_string(),
             "default::getCurrentDir".to_string(),
+            "default::applyPatch".to_string(),
+            "default::custom_tool".to_string(),
+            "mcp__alpha__inspect".to_string(),
         ];
 
         config.normalize_tool_settings();
 
-        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
+        assert_eq!(
+            config.tools.disabled,
+            vec![
+                "bash",
+                "default::applyPatch",
+                "default::custom_tool",
+                "default::getCurrentDir",
+                "mcp__alpha__inspect",
+                "read_file"
+            ]
+        );
     }
 
     #[test]
-    fn config_load_reads_disabled_tools_as_canonical_names() {
+    fn config_load_preserves_disabled_references_for_catalog_resolution() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
@@ -8523,10 +8860,23 @@ mod tests {
         );
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
-        assert!(config.disabled_tool_names().contains("Bash"));
-        assert!(config.disabled_tool_names().contains("Read"));
-        assert!(config.disabled_tool_names().contains("GetCurrentDir"));
+        assert_eq!(
+            config.tools.disabled,
+            vec!["bash", "default::getCurrentDir", "read_file"]
+        );
+        assert!(config.disabled_tool_references().contains("bash"));
+        assert!(config.disabled_tool_references().contains("read_file"));
+        assert!(config
+            .disabled_tool_references()
+            .contains("default::getCurrentDir"));
+        assert_eq!(
+            config.disabled_tool_names(),
+            BTreeSet::from([
+                "Bash".to_string(),
+                "GetCurrentDir".to_string(),
+                "Read".to_string()
+            ])
+        );
     }
 
     #[test]

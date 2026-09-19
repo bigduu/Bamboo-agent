@@ -38,7 +38,10 @@ pub enum AgentStatusState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RoundRuntimeState {
     pub current_round: u32,
-    pub max_rounds: u32,
+    /// Run's round cap, `None` = unlimited. Mirrors the budget field
+    /// `RunBudgetConfig::max_rounds`; 0 never means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_id: Option<String>,
     /// Cumulative tool calls issued across every round of this run so far.
@@ -369,6 +372,15 @@ pub struct AgentRuntimeState {
     pub stop_hook_forced_continuations: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<PlanModeState>,
+    /// Host-seeded, runtime-enforced authority for a read-only child session.
+    ///
+    /// This is deliberately independent from `subagent_type`: roles are
+    /// routing/display labels and must never grant or remove permissions. Root
+    /// sessions and ordinary children leave this false. Planner/Guardian spawn
+    /// paths set it before the child is persisted, and worker provisioning
+    /// treats it as a hard overlay that Auto/Bypass cannot weaken.
+    #[serde(default)]
+    pub read_only: bool,
     /// First-class session permission mode. Omitted for old/default sessions so
     /// existing runtime files remain compact and backward-compatible.
     #[serde(default, skip_serializing_if = "SessionPermissionMode::is_default")]
@@ -407,6 +419,7 @@ impl AgentRuntimeState {
             hook_contexts: Vec::new(),
             stop_hook_forced_continuations: 0,
             plan_mode: None,
+            read_only: false,
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
@@ -449,6 +462,7 @@ impl Default for AgentRuntimeState {
             hook_contexts: Vec::new(),
             stop_hook_forced_continuations: 0,
             plan_mode: None,
+            read_only: false,
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
@@ -484,7 +498,7 @@ mod tests {
         let mut state = AgentRuntimeState::new("run-abc");
         state.status = AgentStatusState::Running;
         state.round.current_round = 3;
-        state.round.max_rounds = 200;
+        state.round.max_rounds = Some(200);
         state.llm.model_name = Some("gpt-4o".to_string());
         state.memory.overflow_recovery_total = 1;
         state.suspension = Some(SuspensionState {
@@ -518,6 +532,27 @@ mod tests {
         assert_eq!(
             state.effective_permission_mode(),
             SessionPermissionMode::Default
+        );
+        assert!(
+            !state.read_only,
+            "legacy runtime state defaults to writable"
+        );
+    }
+
+    #[test]
+    fn typed_read_only_child_authority_round_trips() {
+        let mut state = AgentRuntimeState::new("planner-run");
+        state.read_only = true;
+        state.set_permission_mode(SessionPermissionMode::Auto);
+
+        let serialized = serde_json::to_string(&state).unwrap();
+        let restored: AgentRuntimeState = serde_json::from_str(&serialized).unwrap();
+
+        assert!(restored.read_only);
+        assert_eq!(
+            restored.effective_permission_mode(),
+            SessionPermissionMode::Auto,
+            "requested permission remains distinct from the read-only overlay"
         );
     }
 

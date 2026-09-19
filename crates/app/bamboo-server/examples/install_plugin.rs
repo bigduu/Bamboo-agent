@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use bamboo_plugin::{InstallDisposition, PluginInstaller};
 use bamboo_server::plugin_installer::ServerPluginInstaller;
-use bamboo_server::plugin_source::{install_plugin_from_source, PluginSourceInput};
+use bamboo_server::plugin_source::{install_server_plugin_from_source, PluginSourceInput};
 use bamboo_server::AppState;
 
 #[tokio::main]
@@ -54,12 +54,13 @@ async fn main() {
             };
             let plugins_root = data_dir.join("plugins");
             let trust = data.config.read().await.plugin_trust.clone();
-            match install_plugin_from_source(
+            match install_server_plugin_from_source(
                 &installer,
                 PluginSourceInput::LocalDir(plugin_dir),
                 &plugins_root,
                 &trust,
                 disposition,
+                None,
             )
             .await
             {

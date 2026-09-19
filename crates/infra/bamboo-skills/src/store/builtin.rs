@@ -442,7 +442,11 @@ mod tests {
         let context = crate::context::build_skill_context(&workflow_skills);
 
         for skill in workflow_skills {
-            assert!(context.contains(&skill.description));
+            let summary = crate::capability_discovery::bounded_summary(&skill.description);
+            assert!(context.contains(&summary));
+            if summary != skill.description {
+                assert!(!context.contains(&skill.description));
+            }
             assert!(context.contains(&format!("skill_id: `{}`", skill.id)));
             assert!(
                 !context.contains(&skill.prompt),

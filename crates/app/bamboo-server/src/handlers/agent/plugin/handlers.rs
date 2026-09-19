@@ -3,18 +3,20 @@
 //! Every handler constructs a fresh `ServerPluginInstaller::new(state.clone())`
 //! per request — the same pattern every other handler in this crate uses for
 //! `web::Data<AppState>` (it's `Arc`-backed, so cloning is cheap) — and either
-//! calls it directly (`list`/`uninstall`) or drives it through
-//! `crate::plugin_source`'s stage-then-install seam (`install`/`update`),
-//! matching `examples/install_plugin.rs`'s reference usage.
+//! calls it directly (`list`/`uninstall`) or drives the prepared-source
+//! transaction (`install`/`update`): prepare privately, acquire the global
+//! operation guard, audit ownership, activate, install, commit/rollback.
 
 use std::path::PathBuf;
 
 use actix_web::{web, HttpResponse, Responder};
-use bamboo_plugin::{InstallDisposition, PluginError, PluginInstaller, PluginSource};
+use bamboo_plugin::{InstallDisposition, PluginInstaller, PluginSource};
 
 use crate::app_state::AppState;
 use crate::plugin_installer::ServerPluginInstaller;
-use crate::plugin_source::{install_plugin_from_source, stage_plugin_source, PluginSourceInput};
+use crate::plugin_source::{
+    install_server_plugin_from_source_with_event_sink_grants, PluginSourceInput,
+};
 
 use super::api_types::{to_view, InstallPluginRequest, PluginListResponse};
 use super::errors::plugin_error_response;
@@ -68,7 +70,8 @@ pub async fn list_plugins(state: web::Data<AppState>) -> impl Responder {
         Ok(entries) => {
             let mut plugins = Vec::with_capacity(entries.len());
             for entry in entries {
-                plugins.push(to_view(entry, &state.service_manager).await);
+                plugins
+                    .push(to_view(entry, &state.service_manager, &state.tool_event_router).await);
             }
             HttpResponse::Ok().json(PluginListResponse { plugins })
         }
@@ -85,19 +88,24 @@ pub async fn install_plugin(
 ) -> impl Responder {
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
-    let input = to_source_input(body.into_inner().source);
+    let request = body.into_inner();
+    let grants = request.event_sink_grants;
+    let input = to_source_input(request.source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    match install_plugin_from_source(
+    match install_server_plugin_from_source_with_event_sink_grants(
         &installer,
         input,
         &root,
         &trust,
         InstallDisposition::FailIfInstalled,
+        None,
+        grants.as_deref(),
     )
     .await
     {
-        Ok(entry) => HttpResponse::Created().json(to_view(entry, &state.service_manager).await),
+        Ok(entry) => HttpResponse::Created()
+            .json(to_view(entry, &state.service_manager, &state.tool_event_router).await),
         Err(error) => plugin_error_response(&error),
     }
 }
@@ -119,68 +127,25 @@ pub async fn update_plugin(
     let path_id = path.into_inner();
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
-    let input = to_source_input(body.into_inner().source);
+    let request = body.into_inner();
+    let grants = request.event_sink_grants;
+    let input = to_source_input(request.source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    // Same-id upgrade ordering (issue #479): `stage_plugin_source` below
-    // swaps `plugin_dir`'s ENTIRE contents (old bundle -> `.backup-*`,
-    // staged bundle -> `plugin_dir`) BEFORE `install()` ever runs — so any
-    // service this plugin currently owns must be stopped BEFORE staging,
-    // not after `install()`'s own `register_services` step, or the old
-    // process could still be holding the about-to-be-replaced binary open
-    // (and would otherwise briefly run stale code post-swap either way).
-    // `path_id` is the ONLY point in this flow where the target id is known
-    // up front (a fresh `install_plugin` has no prior id to look up). See
-    // `ServerPluginInstaller::stop_services_for_upgrade`'s doc comment for
-    // the full stop -> swap -> start sequencing this establishes.
-    let stopped_services = installer.stop_services_for_upgrade(&path_id).await;
-
-    let staged = match stage_plugin_source(input, &root, &trust).await {
-        Ok(staged) => staged,
-        Err(error) => {
-            installer
-                .restart_services_after_failed_upgrade(&path_id, &stopped_services)
-                .await;
-            return plugin_error_response(&error);
-        }
-    };
-    if staged.manifest.id != path_id {
-        let manifest_id = staged.manifest.id.clone();
-        staged.rollback().await;
-        installer
-            .restart_services_after_failed_upgrade(&path_id, &stopped_services)
-            .await;
-        return plugin_error_response(&PluginError::InvalidManifest(format!(
-            "path id '{path_id}' does not match the source's manifest id '{manifest_id}'"
-        )));
-    }
-
-    let manifest = staged.manifest.clone();
-    let plugin_dir = staged.plugin_dir.clone();
-    let source = staged.source.clone();
-    match installer
-        .install(
-            &manifest,
-            &plugin_dir,
-            source,
-            InstallDisposition::Upgrade,
-            chrono::Utc::now(),
-        )
-        .await
+    match install_server_plugin_from_source_with_event_sink_grants(
+        &installer,
+        input,
+        &root,
+        &trust,
+        InstallDisposition::Upgrade,
+        Some(&path_id),
+        grants.as_deref(),
+    )
+    .await
     {
-        Ok(entry) => {
-            staged.commit().await;
-            HttpResponse::Ok().json(to_view(entry, &state.service_manager).await)
-        }
-        Err(error) => {
-            staged.rollback().await;
-            // `plugin_dir` is now back to the pre-upgrade bundle's bytes —
-            // restart exactly what `stop_services_for_upgrade` stopped.
-            installer
-                .restart_services_after_failed_upgrade(&path_id, &stopped_services)
-                .await;
-            plugin_error_response(&error)
-        }
+        Ok(entry) => HttpResponse::Ok()
+            .json(to_view(entry, &state.service_manager, &state.tool_event_router).await),
+        Err(error) => plugin_error_response(&error),
     }
 }
 

@@ -1034,6 +1034,7 @@ async fn create_session_once(
         gold_config_json,
         global_default_prompt.as_str(),
         &config_snapshot,
+        state,
     );
     let configured_default_workspace = config_snapshot.get_default_work_area_path();
     let workspace_source = if let Some(workspace) = final_workspace_display.as_deref() {
@@ -1166,7 +1167,7 @@ async fn create_session_once(
 
     state.sessions.insert(
         id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     // Publish only the exact candidate that passed Project ownership checks,
@@ -1219,10 +1220,22 @@ fn build_new_session(
     gold_config_json: Option<String>,
     global_default_prompt: &str,
     config: &bamboo_llm::Config,
+    state: &AppState,
 ) -> Session {
     use bamboo_engine::session_app::session_create::{
         build_new_session as crate_build, CreateSessionConfig, CreateSessionInput,
     };
+
+    // An explicit request value wins; otherwise stamp the durable
+    // permission-policy seed so new sessions start in the user's chosen
+    // posture. Existing sessions are never touched by this default.
+    let permission_mode = Some(req.permission_mode.unwrap_or_else(|| {
+        state
+            .permission_checker
+            .permission_config()
+            .map(|config| config.default_session_permission_mode())
+            .unwrap_or_default()
+    }));
 
     let input = CreateSessionInput {
         id: id.to_string(),
@@ -1235,6 +1248,7 @@ fn build_new_session(
         reasoning_effort: req.reasoning_effort,
         gold_config_json,
         workspace_path: req.workspace_path.clone(),
+        permission_mode,
     };
     let create_config = CreateSessionConfig {
         default_model: config.get_model(),
@@ -2241,13 +2255,12 @@ mod tests {
             .await
             .unwrap();
         let original_arc = state.sessions.get(&session_id).unwrap().value().clone();
-        {
-            let mut live = original_arc.write();
+        original_arc.update(|live| {
             live.title = "LIVE-SENTINEL".to_string();
             live.metadata
                 .insert("live_sentinel".to_string(), "must-survive".to_string());
             live.updated_at = Utc::now() + Duration::minutes(5);
-        }
+        });
         // Publish the newer live summary into the global index, then restore
         // the older authoritative files to model a delayed transcript snapshot.
         // Succeeded replay must repair identity/path without regressing either
@@ -2502,6 +2515,7 @@ mod tests {
             serde_json::json!({"reasoning_effort": "high"}),
             serde_json::json!({"gold_config": {"gold": true}}),
             serde_json::json!({"workspace_path": "/workspace"}),
+            serde_json::json!({"permission_mode": "auto"}),
         ];
         for value in variants {
             let request: CreateSessionRequest = serde_json::from_value(value.clone()).unwrap();
@@ -2594,6 +2608,110 @@ mod tests {
             detail_body["session"]["workspace_path"].as_str(),
             Some(canonical_workspace_path.as_str())
         );
+    }
+
+    /// An explicit `permission_mode` on `POST /sessions` is stamped onto the
+    /// new session (typed mode + legacy mirror), and the durable
+    /// permission-policy default is applied when the request omits it.
+    #[actix_web::test]
+    async fn create_session_stamps_permission_mode_and_policy_default() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // Set the durable policy seed to bypass through the live config.
+        state
+            .permission_checker
+            .permission_config()
+            .expect("permission config")
+            .set_default_session_permission_mode(bamboo_domain::SessionPermissionMode::Bypass);
+
+        // 1) Omitted mode → policy default (bypass).
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({ "title": "Policy default" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["session"]["permission_mode"].as_str(), Some("bypass"));
+        assert_eq!(body["session"]["bypass_permissions"], true);
+        let policy_session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = state
+            .storage
+            .load_session(&policy_session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode()),
+            Some(bamboo_domain::SessionPermissionMode::Bypass)
+        );
+        assert!(session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.bypass_permissions));
+
+        // 2) Explicit request mode wins over the policy default.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Explicit auto",
+                    "permission_mode": "auto",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["session"]["permission_mode"].as_str(), Some("auto"));
+        assert_eq!(body["session"]["bypass_permissions"], true);
+        let auto_session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = state
+            .storage
+            .load_session(&auto_session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode()),
+            Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
+
+        // 3) An unknown mode string is rejected before any durable write.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Bad mode",
+                    "permission_mode": "yolo",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Omitting `workspace_path` persists the same validated fallback that
@@ -2780,6 +2898,17 @@ mod tests {
         assert!(prompt["project_context"]
             .as_str()
             .is_some_and(|value| value.contains(owner.id.as_str())));
+        let project_context = prompt["project_context"]
+            .as_str()
+            .expect("typed Project context");
+        assert!(!project_context.contains(&nested_workspace_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = prompt["workspace_context"]
+            .as_str()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&nested_workspace_display));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: registered"));
         let effective = prompt["effective_system_prompt"]
             .as_str()
             .expect("effective prompt");
@@ -2787,15 +2916,15 @@ mod tests {
             effective
                 .matches("<!-- BAMBOO_PROJECT_CONTEXT_START -->")
                 .count(),
-            1
+            0
         );
         assert_eq!(
             effective
                 .matches("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")
                 .count(),
-            1
+            0
         );
-        assert!(effective.contains("Binding status: registered"));
+        assert!(!effective.contains(&nested_workspace_display));
     }
 
     #[actix_web::test]
@@ -2917,7 +3046,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn same_project_default_workspace_is_persisted_with_prompt_marker() {
+    async fn same_project_default_workspace_is_persisted_with_dynamic_context() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
         let foreign_default = tempdir().expect("foreign global default");
@@ -2998,22 +3127,33 @@ mod tests {
             .project_context
             .as_deref()
             .expect("Project context");
-        assert!(project_context.contains(&format!("Project path: {canonical_display}")));
-        assert!(project_context.contains("Project home (Bamboo data):"));
+        assert!(project_context.contains(project.id.as_str()));
+        assert!(!project_context.contains(&canonical_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("Workspace context");
+        assert!(workspace_context.contains(&canonical_display));
+        assert!(workspace_context.contains("Binding status: registered"));
+        assert!(workspace_context.contains("Workspace source: project_default"));
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_PROJECT_CONTEXT_START")
                 .count(),
-            1
+            0
         );
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_WORKSPACE_CONTEXT_START")
                 .count(),
-            1
+            0
         );
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(&canonical_display));
     }
 
     #[actix_web::test]

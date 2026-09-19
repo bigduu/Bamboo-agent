@@ -468,7 +468,11 @@ impl ToProvider<GeminiTool> for ToolSchema {
             function_declarations: vec![GeminiFunctionDeclaration {
                 name: self.function.name.clone(),
                 description: Some(self.function.description.clone()),
-                parameters_json_schema: Some(self.function.parameters.clone()),
+                parameters_json_schema: Some(
+                    crate::providers::common::tool_schema::canonicalize_json_value(
+                        &self.function.parameters,
+                    ),
+                ),
                 parameters: None,
             }],
         })
@@ -487,7 +491,11 @@ impl ToProvider<Vec<GeminiTool>> for Vec<ToolSchema> {
             .map(|schema| GeminiFunctionDeclaration {
                 name: schema.function.name.clone(),
                 description: Some(schema.function.description.clone()),
-                parameters_json_schema: Some(schema.function.parameters.clone()),
+                parameters_json_schema: Some(
+                    crate::providers::common::tool_schema::canonicalize_json_value(
+                        &schema.function.parameters,
+                    ),
+                ),
                 parameters: None,
             })
             .collect();

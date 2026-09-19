@@ -7,9 +7,14 @@ use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
-use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
+use bamboo_agent_core::tools::{
+    ExecutingSupervisorObservation, ToolCall, ToolExecutor, ToolSchema,
+};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use bamboo_domain::{AgentHookPoint, AgentRuntimeState};
+use bamboo_domain::{
+    AgentHookPoint, AgentRuntimeState, CapabilityLoadingMode, ClassifiedToolSchema,
+    EffectiveCallableSet,
+};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
@@ -53,6 +58,8 @@ mod loop_state;
 mod output_compressor;
 mod per_call;
 mod policy;
+#[cfg(test)]
+mod supervisor_dispatch_tests;
 mod task;
 pub(crate) mod tool_error_collector;
 
@@ -85,6 +92,25 @@ fn scheduling_mode_for_tool_call(
     }
 }
 
+/// Preserve the current full-catalog behavior at execution boundaries that do
+/// not yet have a progressive provider adapter. The input is already filtered
+/// for this session/round, so the rebuilt classified view contains only those
+/// eligible schemas; HostOnly entries remain non-callable by domain policy.
+pub(crate) fn legacy_effective_callable_set(
+    eligible_tool_schemas: &[ToolSchema],
+) -> EffectiveCallableSet {
+    let catalog = eligible_tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+    EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        std::iter::empty::<&str>(),
+    )
+}
+
 pub(crate) struct RoundToolExecutionResult {
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
@@ -108,6 +134,7 @@ async fn execute_and_apply_single_tool_call(
     session: &mut Session,
     tools: &Arc<dyn ToolExecutor>,
     config: &AgentLoopConfig,
+    effective_callable_set: &EffectiveCallableSet,
     // Pre-built per-round snapshot of the executor's full tool-schema list —
     // avoids re-cloning every schema on each tool call.
     available_tool_schemas: &[ToolSchema],
@@ -131,6 +158,9 @@ async fn execute_and_apply_single_tool_call(
             session,
             config.permission_mode.unwrap_or_default(),
         );
+    let root_session_id = session.root_session_id.clone();
+    let executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(session);
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -143,6 +173,7 @@ async fn execute_and_apply_single_tool_call(
                 tool_name
             );
             let outcome = per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
                 needs_human: None,
                 post_tool_hook_eligible: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
@@ -202,6 +233,7 @@ async fn execute_and_apply_single_tool_call(
                     policy_error
                 );
                 per_call::ToolExecutionOutcome {
+                    permission_replay_origin: None,
                     needs_human: None,
                     post_tool_hook_eligible: false,
                     result: Err(policy_error),
@@ -211,20 +243,25 @@ async fn execute_and_apply_single_tool_call(
                 let before_tool_hooks = config
                     .hook_runner
                     .has_hooks_for(AgentHookPoint::BeforeToolExecution);
-                per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                    tool_call,
-                    event_tx,
-                    metrics_collector,
-                    session_id,
-                    round_id,
-                    round,
-                    tools,
-                    config,
-                    hook_session: before_tool_hooks.then_some(&mut *session),
-                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
-                    session_flags,
-                    available_tool_schemas,
-                })
+                per_call::execute_model_requested_tool_call_only(
+                    effective_callable_set,
+                    per_call::ToolExecutionOnlyContext {
+                        tool_call,
+                        event_tx,
+                        metrics_collector,
+                        session_id,
+                        root_session_id: &root_session_id,
+                        executing_supervisor,
+                        round_id,
+                        round,
+                        tools,
+                        config,
+                        hook_session: before_tool_hooks.then_some(&mut *session),
+                        hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                        session_flags,
+                        available_tool_schemas,
+                    },
+                )
                 .await?
             }
         }
@@ -240,6 +277,7 @@ async fn execute_and_apply_single_tool_call(
                 message
             );
             per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
                 needs_human: None,
                 post_tool_hook_eligible: false,
                 result: Err(message),
@@ -419,6 +457,8 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
     pub(crate) compression_model_name: Option<&'a str>,
     pub(crate) compression_model_provider: Option<&'a Arc<dyn LLMProvider>>,
     pub(crate) tool_schemas: &'a [ToolSchema],
+    /// Provider/session-resolved function membership at this conversation position.
+    pub(crate) effective_callable_set: &'a EffectiveCallableSet,
 }
 
 pub(crate) async fn execute_round_tool_calls(
@@ -433,6 +473,7 @@ pub(crate) async fn execute_round_tool_calls(
         compression_model_name,
         compression_model_provider,
         tool_schemas,
+        effective_callable_set,
     } = execution;
 
     // Bind frame fields as locals so the rest of the function body stays unchanged.
@@ -509,6 +550,7 @@ pub(crate) async fn execute_round_tool_calls(
                         session,
                         tools,
                         config,
+                        effective_callable_set,
                         available_tool_schemas,
                         runtime_state,
                         task_context,
@@ -549,6 +591,7 @@ pub(crate) async fn execute_round_tool_calls(
                     session,
                     tools,
                     config,
+                    effective_callable_set,
                     available_tool_schemas,
                     runtime_state,
                     task_context,
@@ -607,6 +650,10 @@ pub(crate) async fn execute_round_tool_calls(
                 session,
                 config.permission_mode.unwrap_or_default(),
             );
+            let root_session_id = session.root_session_id.clone();
+            let root_session_id = root_session_id.as_str();
+            let executing_supervisor =
+                ExecutingSupervisorObservation::capture_from_executing_session(session);
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -614,24 +661,30 @@ pub(crate) async fn execute_round_tool_calls(
                     async move {
                         tokio::time::timeout(
                             timeout,
-                            per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
-                                tool_call,
-                                event_tx,
-                                metrics_collector,
-                                session_id,
-                                round_id,
-                                round,
-                                tools,
-                                config,
-                                hook_session: None,
-                                hook_runtime_state: None,
-                                session_flags,
-                                available_tool_schemas,
-                            }),
+                            per_call::execute_model_requested_tool_call_only(
+                                effective_callable_set,
+                                per_call::ToolExecutionOnlyContext {
+                                    tool_call,
+                                    event_tx,
+                                    metrics_collector,
+                                    session_id,
+                                    root_session_id,
+                                    executing_supervisor,
+                                    round_id,
+                                    round,
+                                    tools,
+                                    config,
+                                    hook_session: None,
+                                    hook_runtime_state: None,
+                                    session_flags,
+                                    available_tool_schemas,
+                                },
+                            ),
                         )
                         .await
                         .unwrap_or_else(|_| {
                             Ok(per_call::ToolExecutionOutcome {
+                                permission_replay_origin: None,
                                 needs_human: None,
                                 post_tool_hook_eligible: true,
                                 result: Err(format!(
@@ -656,6 +709,7 @@ pub(crate) async fn execute_round_tool_calls(
                     .iter()
                     .map(|_batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
+                            permission_replay_origin: None,
                             needs_human: None,
                             post_tool_hook_eligible: true,
                             result: Err(format!(
@@ -781,6 +835,7 @@ pub(crate) async fn execute_round_tool_calls(
             session,
             tools,
             config,
+            effective_callable_set,
             available_tool_schemas,
             runtime_state,
             task_context,
@@ -815,8 +870,8 @@ pub(crate) async fn execute_round_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_round_tool_calls, scheduling_mode_for_tool_call, RoundToolExecution,
-        RoundToolExecutionResult, ToolSchedulingMode,
+        execute_round_tool_calls, legacy_effective_callable_set, scheduling_mode_for_tool_call,
+        RoundToolExecution, RoundToolExecutionResult, ToolSchedulingMode,
     };
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{
@@ -824,7 +879,10 @@ mod tests {
         ToolResult, ToolSchema,
     };
     use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
-    use bamboo_domain::{AgentRuntimeState, PermissionAuditSnapshot, SessionPermissionMode};
+    use bamboo_domain::{
+        AgentRuntimeState, CapabilityLoadingMode, ClassifiedToolSchema, EffectiveCallableSet,
+        PermissionAuditSnapshot, SessionPermissionMode,
+    };
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_tools::BuiltinToolExecutor;
     use futures::stream;
@@ -1113,8 +1171,34 @@ mod tests {
     async fn run_permission_boundary_calls(
         storage: Arc<BoundaryStorage>,
         executor: Arc<PermissionBoundaryExecutor>,
+        session: Session,
+        calls: &[ToolCall],
+    ) -> (
+        Result<RoundToolExecutionResult, AgentError>,
+        Session,
+        AgentRuntimeState,
+        Vec<AgentEvent>,
+    ) {
+        let tool_schemas = executor.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&tool_schemas);
+        run_permission_boundary_calls_with_set(
+            storage,
+            executor,
+            session,
+            calls,
+            tool_schemas,
+            effective_callable_set,
+        )
+        .await
+    }
+
+    async fn run_permission_boundary_calls_with_set(
+        storage: Arc<BoundaryStorage>,
+        executor: Arc<PermissionBoundaryExecutor>,
         mut session: Session,
         calls: &[ToolCall],
+        tool_schemas: Vec<ToolSchema>,
+        effective_callable_set: EffectiveCallableSet,
     ) -> (
         Result<RoundToolExecutionResult, AgentError>,
         Session,
@@ -1141,7 +1225,6 @@ mod tests {
             llm: &llm,
             tools: &tools,
         };
-        let tool_schemas = tools.list_tools();
         let mut runtime_state = session
             .agent_runtime_state
             .clone()
@@ -1156,6 +1239,7 @@ mod tests {
             compression_model_name: None,
             compression_model_provider: None,
             tool_schemas: &tool_schemas,
+            effective_callable_set: &effective_callable_set,
         })
         .await;
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
@@ -1321,6 +1405,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn progressive_gate_rejects_one_parallel_call_without_aborting_allowed_sibling() {
+        let session =
+            permission_session("progressive-mixed-parallel", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "never",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 1),
+        ));
+        let calls = [
+            named_call("parallel-a", "parallel_a"),
+            named_call("parallel-b", "parallel_b"),
+        ];
+        let tool_schemas = executor.list_tools();
+        let catalog = tool_schemas
+            .iter()
+            .cloned()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let effective_callable_set = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            ["parallel_a"],
+        );
+
+        let (result, session, _, events) = run_permission_boundary_calls_with_set(
+            storage,
+            executor.clone(),
+            session,
+            &calls,
+            tool_schemas,
+            effective_callable_set,
+        )
+        .await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-a")
+        ));
+        assert!(events.iter().all(
+            |event| !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-b")
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-a")
+                && message.content.contains("parallel_a complete")
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-b")
+                && message
+                    .content
+                    .contains("not callable at the current conversation position")
+        }));
+    }
+
     #[test]
     fn read_tools_are_parallel_safe() {
         let tools = builtin_tools();
@@ -1347,6 +1488,7 @@ mod tests {
             "Workspace",
             "BashOutput",
             "session_history",
+            "session_history_current",
             "Sleep",
         ];
         for name in &parallel_tools {
@@ -1525,6 +1667,7 @@ mod tests {
             "WebSearch",
             "BashOutput",
             "session_history",
+            "session_history_current",
             "Sleep",
         ];
         for name in read_only_tools {
@@ -1549,6 +1692,8 @@ mod tests {
             permission_mode: Some(PermissionMode::Plan),
             ..Default::default()
         };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
 
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("test-session");
@@ -1570,7 +1715,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,
@@ -1607,6 +1753,8 @@ mod tests {
             permission_mode: Some(PermissionMode::Plan),
             ..Default::default()
         };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
 
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("test-session");
@@ -1630,7 +1778,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,
@@ -1654,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_request_permissions_returns_error_without_pending_clarification() {
+    async fn host_only_request_permissions_is_rejected_before_tool_start_under_auto() {
         use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use bamboo_config::PermissionMode;
@@ -1667,6 +1816,8 @@ mod tests {
             permission_mode: Some(PermissionMode::Auto),
             ..Default::default()
         };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("auto-no-prompt");
         runtime_state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
@@ -1683,7 +1834,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,
@@ -1698,15 +1850,16 @@ mod tests {
         assert!(!session.has_pending_question());
         assert!(session.messages.last().is_some_and(|message| message
             .content
-            .contains("cannot request expanded permissions")));
+            .contains("not callable at the current conversation position")));
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::NeedClarification { .. } | AgentEvent::ToolStart { .. }
+        )));
     }
 
     #[tokio::test]
-    async fn proactive_request_permissions_without_a_checker_completes_without_legacy_pause() {
+    async fn host_only_request_permissions_is_rejected_before_tool_start_by_default() {
         use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use tokio::sync::mpsc;
@@ -1715,6 +1868,8 @@ mod tests {
         let mut session = Session::new("typed-no-legacy-pause", "test-model");
         let tools = builtin_tools();
         let config = crate::runtime::config::AgentLoopConfig::default();
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("typed-no-legacy-pause");
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
@@ -1739,7 +1894,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,
@@ -1752,14 +1908,14 @@ mod tests {
         assert!(!control.should_break);
         assert!(!control.stop_round);
         assert!(!session.has_pending_question());
-        assert!(session
-            .messages
-            .last()
-            .is_some_and(|message| message.content.contains("permissions_authorized")));
+        assert!(session.messages.last().is_some_and(|message| message
+            .content
+            .contains("not callable at the current conversation position")));
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::NeedClarification { .. } | AgentEvent::ToolStart { .. }
+        )));
     }
 
     #[tokio::test]
@@ -1776,6 +1932,8 @@ mod tests {
             permission_mode: Some(PermissionMode::Plan),
             ..Default::default()
         };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
 
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("test-session");
@@ -1793,7 +1951,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,
@@ -1824,6 +1983,8 @@ mod tests {
         let mut session = Session::new("test-session", "test-model");
         let tools = builtin_tools();
         let config = crate::runtime::config::AgentLoopConfig::default();
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
 
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("test-session");
@@ -1848,7 +2009,8 @@ mod tests {
             &mut session,
             &tools,
             &config,
-            tools.list_tools().as_slice(),
+            &effective_callable_set,
+            &available_tool_schemas,
             &mut runtime_state,
             &mut None,
             &mut state,

@@ -146,6 +146,7 @@ pub async fn execute_tool(
 
     let canonical_tool_name = request::canonical_tool_name_or_error(&tool_name)?;
     let session_id = request::trimmed_session_id(session_id.as_deref());
+    request::validate_direct_dispatch_support(&canonical_tool_name)?;
     request::validate_session_context_requirement(&canonical_tool_name, session_id)?;
     let args = request::parse_arguments(parameters);
     let call = request::build_tool_call(canonical_tool_name, args)?;
@@ -172,7 +173,15 @@ pub async fn execute_tool(
         .execute_with_context(
             &call,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id,
+                root_session_id: persisted_session.as_ref().map(|session| {
+                    if session.root_session_id.trim().is_empty() {
+                        session.id.as_str()
+                    } else {
+                        session.root_session_id.as_str()
+                    }
+                }),
                 tool_call_id: &call.id,
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),

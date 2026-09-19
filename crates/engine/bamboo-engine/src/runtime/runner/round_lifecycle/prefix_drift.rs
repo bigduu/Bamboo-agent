@@ -15,8 +15,9 @@
 //! - Cheap per round: hashes each section and compares against the previous
 //!   round's hashes stored in session metadata. No disk IO when the prefix is
 //!   stable.
-//! - On change: emits a `warn!` summary and writes a drift report plus a full
-//!   session snapshot under `<app_data_dir>/prompt-cache-drift/<session_id>/`.
+//! - On change: emits a `warn!` summary and writes a drift report plus a session
+//!   snapshot with provider-native payloads redacted under
+//!   `<app_data_dir>/prompt-cache-drift/<session_id>/`.
 //! - Bounded: at most [`MAX_DUMPS_PER_SESSION`] report/snapshot pairs are written
 //!   per session; beyond that, detection and logging continue but disk writes
 //!   stop.
@@ -279,7 +280,9 @@ fn write_drift_report(
 }
 
 fn write_session_snapshot(dir: &Path, obs_round: usize, session: &Session) {
-    write_json(&dir.join(format!("session-{obs_round}.json")), session);
+    let mut redacted = session.clone();
+    redacted.provider_transcript = Default::default();
+    write_json(&dir.join(format!("session-{obs_round}.json")), &redacted);
 }
 
 fn write_json<T: serde::Serialize>(path: &Path, value: &T) {
@@ -347,6 +350,27 @@ mod tests {
         let dir = std::env::temp_dir().join("bamboo-prefix-drift-shrink-test");
         let _ = std::fs::remove_dir_all(&dir);
         let mut session = Session::new("drift-shrink", "model");
+        let assistant = bamboo_domain::Message::assistant("normalized discovery", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call",
+                "id":"tsc_drift",
+                "execution":"client",
+                "call_id":"call_drift",
+                "status":"completed",
+                "arguments":{"query":"NATIVE_DIAGNOSTIC_SENTINEL"}
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
 
         record_prefix_drift(
             &mut session,
@@ -377,7 +401,13 @@ mod tests {
         assert_eq!(guide["shrunk"], serde_json::json!(true));
         assert_eq!(guide["old_content"], serde_json::json!("long guide text"));
         assert_eq!(guide["new_content"], serde_json::json!("short"));
-        assert!(session_dir.join("session-2.json").exists());
+        let session_snapshot = std::fs::read_to_string(session_dir.join("session-2.json"))
+            .expect("redacted session snapshot should exist");
+        assert!(!session_snapshot.contains("NATIVE_DIAGNOSTIC_SENTINEL"));
+        let session_snapshot: serde_json::Value = serde_json::from_str(&session_snapshot).unwrap();
+        assert!(session_snapshot["provider_transcript"]["groups"]
+            .as_array()
+            .is_none_or(Vec::is_empty));
         assert_eq!(metadata_usize(&session, DUMP_COUNT_KEY), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

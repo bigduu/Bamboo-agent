@@ -10,24 +10,26 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
+use crate::prompt_ir::PromptIR;
 use crate::provider::{
     required_tool_from_options, LLMError, LLMProvider, LLMRequestOptions, LLMStream,
+    ProviderVisibleToolFootprint, ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
     ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::Message;
-use bamboo_domain::ReasoningEffort;
-use bamboo_domain::ToolSchema;
+use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_strict_multi,
+    parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource,
-    ResponsesSseParser, ResponsesWirePrefixTracker,
+    build_responses_body_with_capability_loading, retain_provider_transcript_family,
+    select_responses_input_messages, tools_to_progressive_responses_deferred_descriptors_json,
+    tools_to_progressive_responses_footprint_json, tools_to_responses_json, ResponsesInputSource,
+    ResponsesSseParser, ResponsesToolSearchExecution, ResponsesWirePrefixTracker,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -39,6 +41,8 @@ pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
     responses_only_models: Vec<String>,
+    tool_search_execution: Option<ResponsesToolSearchExecution>,
+    sticky_tool_loading: bool,
     default_reasoning_effort: Option<ReasoningEffort>,
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
@@ -54,6 +58,8 @@ impl OpenAIProvider {
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
+            tool_search_execution: None,
+            sticky_tool_loading: false,
             default_reasoning_effort: None,
             explicit_prompt_cache: true,
             request_overrides: None,
@@ -84,6 +90,20 @@ impl OpenAIProvider {
     /// Configure models that must use Responses API upstream.
     pub fn with_responses_only_models(mut self, models: Vec<String>) -> Self {
         self.responses_only_models = models;
+        self
+    }
+
+    /// Select whether native Responses tool search runs at OpenAI or in Bamboo.
+    /// Leaving this unset keeps the provider on the legacy full-catalog path.
+    pub fn with_tool_search_execution(mut self, execution: ResponsesToolSearchExecution) -> Self {
+        self.tool_search_execution = Some(execution);
+        self
+    }
+
+    /// Enable Bamboo's sticky conversation-history fallback on Chat-compatible
+    /// routes that do not use native Responses tool search.
+    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
+        self.sticky_tool_loading = enabled;
         self
     }
 
@@ -189,6 +209,12 @@ impl OpenAIProvider {
             .any(|p| Self::matches_model_pattern(p, model))
     }
 
+    fn is_official_base_url(&self) -> bool {
+        let normalized = self.base_url.trim_end_matches('/');
+        normalized.eq_ignore_ascii_case("https://api.openai.com")
+            || normalized.eq_ignore_ascii_case("https://api.openai.com/v1")
+    }
+
     fn looks_like_responses_only_error(status: reqwest::StatusCode, body: &str) -> bool {
         if !(status == 400
             || status == 404
@@ -224,7 +250,13 @@ impl OpenAIProvider {
         reasoning_source: &str,
         request_purpose: &str,
         session_log_id: &str,
+        capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
+        let mut effective_responses_options = responses_options.cloned();
+        if let Some(options) = effective_responses_options.as_mut() {
+            retain_provider_transcript_family(options, bamboo_domain::ProviderFamily::OpenAi);
+        }
+        let responses_options = effective_responses_options.as_ref();
         let retain_protocol_events =
             responses_options.is_some_and(|options| options.retain_protocol_events);
         let input_selection = select_responses_input_messages(messages, responses_options);
@@ -233,7 +265,10 @@ impl OpenAIProvider {
             ResponsesInputSource::Generic => "generic",
         };
         let generated_cache_plan = self.explicit_prompt_cache.then_some(cache_plan).flatten();
-        let mut body = build_responses_body(
+        let tool_search_execution = self
+            .tool_search_execution
+            .unwrap_or(ResponsesToolSearchExecution::Client);
+        let mut body = build_responses_body_with_capability_loading(
             model,
             messages,
             tools,
@@ -242,6 +277,8 @@ impl OpenAIProvider {
             responses_options,
             parallel_tool_calls,
             generated_cache_plan,
+            capability_loading_mode,
+            tool_search_execution,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -318,7 +355,7 @@ impl OpenAIProvider {
 
                 let mut fallback_options = responses_options.cloned().unwrap_or_default();
                 fallback_options.previous_response_id = None;
-                let mut fallback_body = build_responses_body(
+                let mut fallback_body = build_responses_body_with_capability_loading(
                     model,
                     messages,
                     tools,
@@ -327,6 +364,8 @@ impl OpenAIProvider {
                     Some(&fallback_options),
                     parallel_tool_calls,
                     generated_cache_plan,
+                    capability_loading_mode,
+                    tool_search_execution,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -395,7 +434,7 @@ impl OpenAIProvider {
 
                 let mut fallback_options = responses_options.cloned().unwrap_or_default();
                 fallback_options.reasoning_summary = None;
-                let mut fallback_body = build_responses_body(
+                let mut fallback_body = build_responses_body_with_capability_loading(
                     model,
                     messages,
                     tools,
@@ -404,6 +443,8 @@ impl OpenAIProvider {
                     Some(&fallback_options),
                     parallel_tool_calls,
                     generated_cache_plan,
+                    capability_loading_mode,
+                    tool_search_execution,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -482,6 +523,76 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl LLMProvider for OpenAIProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_none()
+            && self.tool_search_execution.is_some()
+            && self.is_official_base_url()
+            && self.uses_responses_api(model)
+        {
+            CapabilityLoadingMode::Progressive
+        } else if required_tool.is_none()
+            && self.sticky_tool_loading
+            && !self.uses_responses_api(model)
+        {
+            CapabilityLoadingMode::StickyFallback
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let mode = self.capability_loading_mode(model, required_tool).await;
+        let (projected, deferred_descriptors, late_bound) = if self.uses_responses_api(model) {
+            match mode {
+                CapabilityLoadingMode::Progressive => {
+                    let execution = self
+                        .tool_search_execution
+                        .unwrap_or(ResponsesToolSearchExecution::Client);
+                    (
+                        tools_to_progressive_responses_footprint_json(tools, execution),
+                        tools_to_progressive_responses_deferred_descriptors_json(tools, execution),
+                        true,
+                    )
+                }
+                CapabilityLoadingMode::LegacyFullCatalog
+                | CapabilityLoadingMode::StickyFallback => {
+                    (tools_to_responses_json(tools), Vec::new(), false)
+                }
+            }
+        } else {
+            (tools_to_openai_compat_json(tools), Vec::new(), false)
+        };
+        if projected.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        let mut segments = vec![ProviderVisibleToolSegment::from_serializable(
+            ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            &projected,
+        )?];
+        if !deferred_descriptors.is_empty() {
+            segments.push(ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialDeferredDescriptor,
+                &deferred_descriptors,
+            )?);
+        }
+        if late_bound {
+            segments.push(ProviderVisibleToolSegment::empty_marker(
+                ProviderVisibleToolSegmentKind::ProviderLateBound,
+            ));
+        }
+        Ok(ProviderVisibleToolFootprint { segments })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -493,11 +604,74 @@ impl LLMProvider for OpenAIProvider {
             .await
     }
 
-    // No `chat_stream_ir` override: the trait default derives the Responses-API
-    // view (input array / instructions / previous_response_id) from the canonical
-    // IR via `PromptIR::responses_request_options` and routes it through
-    // `chat_stream_with_options` below — which dispatches to /responses for
-    // Responses-only models and chat/completions otherwise.
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+
+        // Chat-Completions models keep the existing route. If that route later
+        // falls back to /responses after an upstream error, it also deliberately
+        // stays Legacy because the model was not explicitly configured for the
+        // native search contract.
+        if !self.uses_responses_api(model) {
+            return self
+                .chat_stream_with_options(
+                    &messages,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    Some(&effective_options),
+                )
+                .await;
+        }
+
+        let reasoning_effort = effective_options
+            .reasoning_effort
+            .or(self.default_reasoning_effort);
+        let required_tool = required_tool_from_options(Some(&effective_options), tools)?;
+        let capability_loading_mode = self.capability_loading_mode(model, required_tool).await;
+        let reasoning_source = if effective_options.reasoning_effort.is_some() {
+            "request"
+        } else if self.default_reasoning_effort.is_some() {
+            "provider_default"
+        } else {
+            "none"
+        };
+        self.chat_stream_via_responses(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            effective_options.responses.as_ref(),
+            effective_options.parallel_tool_calls,
+            effective_options.cache.as_ref(),
+            required_tool,
+            reasoning_source,
+            effective_options
+                .request_purpose
+                .as_deref()
+                .unwrap_or("unknown"),
+            effective_options
+                .session_id
+                .as_deref()
+                .unwrap_or("unknown-session"),
+            capability_loading_mode,
+        )
+        .await
+    }
 
     async fn chat_stream_with_options(
         &self,
@@ -545,6 +719,7 @@ impl LLMProvider for OpenAIProvider {
                     reasoning_source,
                     request_purpose,
                     session_log_id,
+                    CapabilityLoadingMode::LegacyFullCatalog,
                 )
                 .await;
         }
@@ -680,6 +855,7 @@ impl LLMProvider for OpenAIProvider {
                         reasoning_source,
                         request_purpose,
                         session_log_id,
+                        CapabilityLoadingMode::LegacyFullCatalog,
                     )
                     .await;
             }
@@ -760,12 +936,16 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_ir::{Segment, SegmentRole};
     use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
     use bamboo_config::{
         BodyPatch, BodyPatchOp, PatchValue, RequestOverridesConfig, RequestScopeOverride,
     };
     use bamboo_domain::Message;
-    use bamboo_domain::{FunctionSchema, ToolSchema};
+    use bamboo_domain::{
+        FunctionSchema, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+        ProviderTranscriptItem, ProviderTranscriptOrigin, ToolSchema,
+    };
 
     // ===== Basic Tests (5 tests) =====
 
@@ -809,6 +989,360 @@ mod tests {
         assert!(provider.uses_responses_api("gpt-5.3-codex"));
         assert!(provider.uses_responses_api("gpt-5.0-any"));
         assert!(!provider.uses_responses_api("gpt-4o-mini"));
+    }
+
+    fn footprint_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("Use {name}"),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            },
+        }
+    }
+
+    fn ir_with_openai_loaded_history() -> PromptIR {
+        let mut session = bamboo_domain::Session::new("footprint-history", "gpt-5.6");
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant.clone());
+        let boundary = bamboo_domain::provider_transcript_boundary_sha256(
+            Some("openai-footprint"),
+            Some("openai"),
+        )
+        .unwrap();
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &boundary,
+            )
+            .unwrap();
+        let output = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client","call_id":"search_1",
+                "status":"completed","tools":[{
+                    "type":"function","name":"Glob","description":"Find files",
+                    "parameters":{"type":"object"},"strict":false,"defer_loading":true
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+        let additional = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::DeveloperContext,
+            ProviderTranscriptAuthor::Host,
+            json!({
+                "type":"additional_tools","role":"developer","tools":[{
+                    "type":"function","name":"extra_tool","description":"Extra",
+                    "parameters":{"type":"object"},"strict":false
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![additional])
+            .unwrap();
+
+        PromptIR {
+            segments: vec![Segment::new(SegmentRole::Conversation, vec![assistant])],
+            provider_transcript_groups: session.provider_transcript.groups().to_vec(),
+            ..PromptIR::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_progressive_footprint_is_core_plus_search_for_client_and_server() {
+        let tools = vec![
+            footprint_schema("Read"),
+            footprint_schema("Glob"),
+            footprint_schema("Workspace"),
+        ];
+        let ir = ir_with_openai_loaded_history();
+        for execution in [
+            ResponsesToolSearchExecution::Client,
+            ResponsesToolSearchExecution::Server,
+        ] {
+            let expected_execution = match execution {
+                ResponsesToolSearchExecution::Client => "client",
+                ResponsesToolSearchExecution::Server => "server",
+            };
+            let provider = OpenAIProvider::new("k")
+                .with_responses_only_models(vec!["gpt-5*".to_string()])
+                .with_tool_search_execution(execution);
+            let footprint = provider
+                .provider_visible_tool_footprint(&ir, &tools, "gpt-5.6", None)
+                .await
+                .unwrap();
+
+            let marker_index = match execution {
+                ResponsesToolSearchExecution::Client => {
+                    assert_eq!(footprint.segments.len(), 2);
+                    1
+                }
+                ResponsesToolSearchExecution::Server => {
+                    assert_eq!(footprint.segments.len(), 3);
+                    assert_eq!(
+                        footprint.segments[1].kind,
+                        ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+                    );
+                    let descriptors: Value =
+                        serde_json::from_str(&footprint.segments[1].serialized).unwrap();
+                    assert_eq!(descriptors.as_array().unwrap().len(), 1);
+                    assert_eq!(descriptors[0]["type"], "function");
+                    assert_eq!(descriptors[0]["name"], "Glob");
+                    assert_eq!(descriptors[0]["description"], "Use Glob");
+                    assert_eq!(descriptors[0]["defer_loading"], true);
+                    assert_eq!(descriptors[0]["strict"], false);
+                    assert!(descriptors[0].get("parameters").is_none());
+                    assert!(!footprint.segments[1].serialized.contains("extra_tool"));
+                    2
+                }
+            };
+            assert_eq!(
+                footprint.segments[0].kind,
+                ProviderVisibleToolSegmentKind::InitialFullDefinition
+            );
+            assert_eq!(
+                footprint.segments[marker_index],
+                ProviderVisibleToolSegment::empty_marker(
+                    ProviderVisibleToolSegmentKind::ProviderLateBound
+                )
+            );
+            let projected: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+            let projected = projected.as_array().unwrap();
+            assert_eq!(projected.len(), 2, "Core definition plus search");
+            assert_eq!(projected[0]["name"], "Read");
+            assert_eq!(projected[1]["type"], "tool_search");
+            assert_eq!(projected[1]["execution"], expected_execution);
+            assert!(projected.iter().all(|tool| tool["name"] != "Glob"));
+            assert!(projected.iter().all(|tool| tool["name"] != "Workspace"));
+            assert!(projected.iter().all(|tool| tool["name"] != "extra_tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_deferred_descriptor_ignores_hidden_parameters_but_tracks_description() {
+        let provider = OpenAIProvider::new("k")
+            .with_responses_only_models(vec!["gpt-5*".to_string()])
+            .with_tool_search_execution(ResponsesToolSearchExecution::Server);
+        let mut tools = vec![footprint_schema("Read"), footprint_schema("Glob")];
+
+        let baseline = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let baseline_descriptor = baseline
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap()
+            .serialized
+            .clone();
+
+        tools[1].function.parameters = json!({
+            "type": "object",
+            "description": "hidden".repeat(50_000),
+        });
+        let huge_hidden_schema = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let huge_descriptor = huge_hidden_schema
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap();
+        assert_eq!(huge_descriptor.serialized, baseline_descriptor);
+        assert!(!huge_descriptor.serialized.contains("hidden"));
+
+        tools[1].function.description = "A different visible description".to_string();
+        let changed_description = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let changed_descriptor = changed_description
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap();
+        assert_ne!(changed_descriptor.serialized, baseline_descriptor);
+        assert!(changed_descriptor
+            .serialized
+            .contains("A different visible description"));
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_and_chat_sticky_footprints_match_their_top_level_lowering() {
+        let full = vec![footprint_schema("Read"), footprint_schema("Glob")];
+        let responses =
+            OpenAIProvider::new("k").with_responses_only_models(vec!["gpt-5*".to_string()]);
+        let legacy = responses
+            .provider_visible_tool_footprint(&PromptIR::default(), &full, "gpt-5.6", None)
+            .await
+            .unwrap();
+        assert_eq!(legacy.segments.len(), 1);
+        assert_eq!(
+            legacy.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            legacy.segments[0].serialized,
+            serde_json::to_string(&tools_to_responses_json(&full)).unwrap()
+        );
+
+        let sticky_tools = vec![
+            footprint_schema("Read"),
+            bamboo_domain::discovery_control_fallback_schema(),
+        ];
+        let sticky = OpenAIProvider::new("k").with_sticky_tool_loading(true);
+        assert_eq!(
+            sticky.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        let sticky_footprint = sticky
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &sticky_tools,
+                "gpt-4o-mini",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sticky_footprint.segments[0].serialized,
+            serde_json::to_string(&tools_to_openai_compat_json(&sticky_tools)).unwrap()
+        );
+
+        let forced = responses
+            .with_tool_search_execution(ResponsesToolSearchExecution::Server)
+            .provider_visible_tool_footprint(&PromptIR::default(), &full, "gpt-5.6", Some("Glob"))
+            .await
+            .unwrap();
+        assert_eq!(
+            forced.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            forced.segments[0].serialized,
+            serde_json::to_string(&tools_to_responses_json(&full)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_loading_requires_official_explicit_responses_route_without_forcing() {
+        let official =
+            || OpenAIProvider::new("k").with_responses_only_models(vec!["gpt-5*".to_string()]);
+        assert_eq!(
+            official().capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            "progressive loading requires explicit execution opt-in"
+        );
+        let client = official().with_tool_search_execution(ResponsesToolSearchExecution::Client);
+        assert_eq!(
+            client.capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::Progressive
+        );
+        assert_eq!(
+            client
+                .capability_loading_mode("gpt-5.6", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        assert_eq!(
+            client.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let server = official().with_tool_search_execution(ResponsesToolSearchExecution::Server);
+        assert_eq!(
+            server.capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::Progressive
+        );
+
+        let custom = OpenAIProvider::new("k")
+            .with_base_url("https://proxy.example/v1")
+            .with_responses_only_models(vec!["gpt-5*".to_string()])
+            .with_tool_search_execution(ResponsesToolSearchExecution::Client);
+        assert_eq!(
+            custom.capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_loading_is_explicit_chat_only_and_native_responses_search_wins() {
+        let unset = OpenAIProvider::new("k");
+        assert_eq!(
+            unset.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let disabled = unset.with_sticky_tool_loading(false);
+        assert_eq!(
+            disabled.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+
+        let sticky = disabled.with_sticky_tool_loading(true);
+        assert_eq!(
+            sticky.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        assert_eq!(
+            sticky
+                .capability_loading_mode("gpt-4o-mini", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+
+        let responses_without_native =
+            sticky.with_responses_only_models(vec!["gpt-5*".to_string()]);
+        assert_eq!(
+            responses_without_native
+                .capability_loading_mode("gpt-5.6", None)
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            "sticky fallback must not replace native Responses search"
+        );
+        let native = responses_without_native
+            .with_tool_search_execution(ResponsesToolSearchExecution::Client);
+        assert_eq!(
+            native.capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::Progressive
+        );
+    }
+
+    #[test]
+    fn client_or_server_tool_search_must_be_explicitly_configured() {
+        let unset = OpenAIProvider::new("k");
+        assert_eq!(unset.tool_search_execution, None);
+        let client = unset.with_tool_search_execution(ResponsesToolSearchExecution::Client);
+        assert_eq!(
+            client.tool_search_execution,
+            Some(ResponsesToolSearchExecution::Client)
+        );
+        let server = client.with_tool_search_execution(ResponsesToolSearchExecution::Server);
+        assert_eq!(
+            server.tool_search_execution,
+            Some(ResponsesToolSearchExecution::Server)
+        );
     }
 
     // ===== Request Building Tests (4 tests) =====

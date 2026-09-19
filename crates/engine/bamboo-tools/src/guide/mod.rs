@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::exposure::{canonical_tool_name, is_core_tool};
+use crate::exposure::{canonical_tool_name, has_full_tool_guide};
 use bamboo_agent_core::ToolSchema;
 use serde::{Deserialize, Serialize};
 
@@ -397,16 +397,16 @@ impl EnhancedPromptBuilder {
     ) -> String {
         let guides = Self::collect_guides(registry, tool_names);
 
-        // Split into core, activated-discoverable, and inactive-discoverable.
+        // Split legacy guide detail independently of callable loading policy.
         let activated = &context.activated_discoverable_tools;
-        let mut core_guides: Vec<ToolGuideSpec> = Vec::new();
+        let mut full_guides: Vec<ToolGuideSpec> = Vec::new();
         let mut activated_discoverable: Vec<ToolGuideSpec> = Vec::new();
         let mut inactive_discoverable: Vec<ToolGuideSpec> = Vec::new();
 
         for guide in guides {
             let canonical = canonical_tool_name(&guide.tool_name);
-            if is_core_tool(&canonical) {
-                core_guides.push(guide);
+            if has_full_tool_guide(&canonical) {
+                full_guides.push(guide);
             } else if activated.contains(&canonical) {
                 activated_discoverable.push(guide);
             } else {
@@ -417,11 +417,11 @@ impl EnhancedPromptBuilder {
         let mut output = String::from("## Tool Usage Guidelines\n");
         let mut rendered_any = false;
 
-        // Render core tools (always full detail).
-        if !core_guides.is_empty() {
+        // Render legacy full-detail guides.
+        if !full_guides.is_empty() {
             rendered_any = true;
             let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
-            for guide in &core_guides {
+            for guide in &full_guides {
                 grouped.entry(guide.category).or_default().push(guide);
             }
 
@@ -488,7 +488,7 @@ impl EnhancedPromptBuilder {
             ));
         }
 
-        let guided_names: BTreeSet<String> = core_guides
+        let guided_names: BTreeSet<String> = full_guides
             .iter()
             .chain(activated_discoverable.iter())
             .chain(inactive_discoverable.iter())
@@ -995,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn build_separates_core_and_discoverable_tools_correctly() {
+    fn build_separates_full_and_expandable_tool_guides_correctly() {
         let registry = ToolRegistry::new();
         registry.register(ReadTool::new()).unwrap();
         registry.register(crate::tools::SleepTool::new()).unwrap();
@@ -1008,14 +1008,14 @@ mod tests {
 
         let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
 
-        // Core tool (Read) should appear in its category section with full detail
+        // Full-guide tool (Read) appears in its category section.
         assert!(
             prompt.contains("### File Reading Tools"),
-            "core tools should appear in category section"
+            "full guides should appear in category section"
         );
         assert!(
             prompt.contains("**Read**"),
-            "core Read should show full guide"
+            "Read should show its full guide"
         );
 
         // Activated discoverable should appear in activated section

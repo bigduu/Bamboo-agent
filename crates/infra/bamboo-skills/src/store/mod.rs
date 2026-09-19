@@ -726,6 +726,54 @@ struct ProcessedWatcherBatch {
     relevant: bool,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillWatcherTestPhase {
+    NotStarted,
+    Starting,
+    Ready,
+    Failed,
+    Stopped,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct SkillWatcherTestState {
+    phase: SkillWatcherTestPhase,
+    registrations: Vec<(PathBuf, notify::RecursiveMode)>,
+    failure: Option<String>,
+}
+
+#[cfg(test)]
+impl Default for SkillWatcherTestState {
+    fn default() -> Self {
+        Self {
+            phase: SkillWatcherTestPhase::NotStarted,
+            registrations: Vec::new(),
+            failure: None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn publish_watcher_test_state(
+    sender: &tokio::sync::watch::Sender<SkillWatcherTestState>,
+    phase: SkillWatcherTestPhase,
+    registered: &HashMap<PathBuf, notify::RecursiveMode>,
+    failure: Option<String>,
+) {
+    let mut registrations: Vec<_> = registered
+        .iter()
+        .map(|(path, mode)| (path.clone(), *mode))
+        .collect();
+    registrations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    sender.send_replace(SkillWatcherTestState {
+        phase,
+        registrations,
+        failure,
+    });
+}
+
 impl SkillWatcherCounters {
     fn snapshot(&self) -> SkillWatcherActivity {
         SkillWatcherActivity {
@@ -906,6 +954,8 @@ pub struct SkillStore {
     watcher_counters: Arc<SkillWatcherCounters>,
     #[cfg(test)]
     processed_watcher_batches: tokio::sync::broadcast::Sender<ProcessedWatcherBatch>,
+    #[cfg(test)]
+    watcher_test_state: tokio::sync::watch::Sender<SkillWatcherTestState>,
     catalog_events: tokio::sync::broadcast::Sender<WorkflowCatalogEvent>,
     reload_lock: tokio::sync::Mutex<()>,
     mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
@@ -1149,6 +1199,8 @@ impl SkillStore {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
         #[cfg(test)]
         let (processed_watcher_batches, _) = tokio::sync::broadcast::channel(128);
+        #[cfg(test)]
+        let (watcher_test_state, _) = tokio::sync::watch::channel(SkillWatcherTestState::default());
         Self {
             store_token: NEXT_SKILL_STORE_TOKEN.fetch_add(1, Ordering::Relaxed),
             snapshot_publish_lock: RwLock::new(()),
@@ -1166,6 +1218,8 @@ impl SkillStore {
             watcher_counters: Arc::new(SkillWatcherCounters::default()),
             #[cfg(test)]
             processed_watcher_batches,
+            #[cfg(test)]
+            watcher_test_state,
             catalog_events,
             reload_lock: tokio::sync::Mutex::new(()),
             mode_stores: RwLock::new(HashMap::new()),
@@ -2926,6 +2980,16 @@ impl SkillStore {
         self.processed_watcher_batches.subscribe()
     }
 
+    #[cfg(test)]
+    fn subscribe_watcher_test_state(&self) -> tokio::sync::watch::Receiver<SkillWatcherTestState> {
+        self.watcher_test_state.subscribe()
+    }
+
+    #[cfg(test)]
+    fn watcher_test_state(&self) -> SkillWatcherTestState {
+        self.watcher_test_state.borrow().clone()
+    }
+
     /// Start an OS-backed catalog watcher. Existing catalog directories alone
     /// are recursive; their nearest existing parents are shallow anchors that
     /// let missing roots be created and dynamically rebound. Raw events enter a
@@ -2936,6 +3000,12 @@ impl SkillStore {
         if self.watcher_started.swap(true, Ordering::SeqCst) {
             return;
         }
+        #[cfg(test)]
+        self.watcher_test_state.send_replace(SkillWatcherTestState {
+            phase: SkillWatcherTestPhase::Starting,
+            registrations: Vec::new(),
+            failure: None,
+        });
         let weak = std::sync::Arc::downgrade(self);
         let plan = self.catalog_watch_plan();
         let counters = self.watcher_counters.clone();
@@ -2974,6 +3044,12 @@ impl SkillStore {
             }) {
                 Ok(watcher) => watcher,
                 Err(error) => {
+                    #[cfg(test)]
+                    self.watcher_test_state.send_replace(SkillWatcherTestState {
+                        phase: SkillWatcherTestPhase::Failed,
+                        registrations: Vec::new(),
+                        failure: Some(error.to_string()),
+                    });
                     tracing::warn!("Failed to start skill catalog watcher: {error}");
                     self.watcher_started.store(false, Ordering::SeqCst);
                     return;
@@ -2981,6 +3057,15 @@ impl SkillStore {
             };
         let mut registered = HashMap::new();
         sync_catalog_watch_registrations(&mut watcher, &plan, &mut registered, counters.as_ref());
+        #[cfg(test)]
+        publish_watcher_test_state(
+            &self.watcher_test_state,
+            SkillWatcherTestPhase::Ready,
+            &registered,
+            None,
+        );
+        #[cfg(test)]
+        let watcher_test_state = self.watcher_test_state.clone();
 
         tokio::spawn(async move {
             // Keep the native watcher alive for exactly as long as the receiver loop.
@@ -3055,6 +3140,13 @@ impl SkillStore {
                         &mut registered,
                         counters.as_ref(),
                     );
+                    #[cfg(test)]
+                    publish_watcher_test_state(
+                        &watcher_test_state,
+                        SkillWatcherTestPhase::Ready,
+                        &registered,
+                        None,
+                    );
                     match store.reload().await {
                         Ok(_) => {
                             counters.reloads.fetch_add(1, Ordering::Relaxed);
@@ -3083,6 +3175,13 @@ impl SkillStore {
                     "skill watcher batch processed"
                 );
             }
+            #[cfg(test)]
+            publish_watcher_test_state(
+                &watcher_test_state,
+                SkillWatcherTestPhase::Stopped,
+                &registered,
+                None,
+            );
         });
     }
 
@@ -3762,7 +3861,7 @@ mod tests {
 
     use super::{
         lexical_normalize_path, ProcessedWatcherBatch, RetainedResourceBudget, SkillSnapshotLimits,
-        SkillStore,
+        SkillStore, SkillWatcherTestPhase,
     };
     use crate::store::builtin::{
         load_builtin_skill_bundles, BuiltinSkillBundle, WORKFLOW_BUILTINS,
@@ -3803,10 +3902,7 @@ mod tests {
         Ok(skill_dir)
     }
 
-    async fn wait_for_processed_watcher_path(
-        batches: &mut tokio::sync::broadcast::Receiver<ProcessedWatcherBatch>,
-        expected_path: &Path,
-    ) -> ProcessedWatcherBatch {
+    fn normalize_watcher_test_path(expected_path: &Path) -> PathBuf {
         let mut existing_prefix = expected_path;
         let mut missing_suffix = Vec::new();
         while !existing_prefix.exists() {
@@ -3822,35 +3918,165 @@ mod tests {
         for component in missing_suffix.iter().rev() {
             expected_path.push(component);
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        expected_path
+    }
+
+    fn watcher_test_diagnostics(
+        store: &SkillStore,
+        expected_event: &str,
+        observed_batches: &[ProcessedWatcherBatch],
+    ) -> String {
+        let state = store.watcher_test_state();
+        format!(
+            "watcher_state={:?}; watcher_failure={:?}; actual_watched_paths={:?}; \
+             watcher_activity={:?}; expected_event={expected_event}; observed_events={observed_batches:?}",
+            state.phase,
+            state.failure,
+            state.registrations,
+            store.watcher_activity(),
+        )
+    }
+
+    async fn wait_for_watcher_registration(
+        store: &SkillStore,
+        expected_path: &Path,
+        expected_mode: notify::RecursiveMode,
+    ) {
+        let expected_path = normalize_watcher_test_path(expected_path);
+        let expected_event = format!(
+            "watcher registration {:?} at {}",
+            expected_mode,
+            expected_path.display()
+        );
+        let mut states = store.subscribe_watcher_test_state();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = states.borrow().clone();
+                if state.phase == SkillWatcherTestPhase::Ready
+                    && state
+                        .registrations
+                        .iter()
+                        .any(|(path, mode)| path == &expected_path && *mode == expected_mode)
+                {
+                    return Ok(());
+                }
+                if matches!(
+                    state.phase,
+                    SkillWatcherTestPhase::Failed | SkillWatcherTestPhase::Stopped
+                ) {
+                    return Err(format!("watcher entered terminal phase {:?}", state.phase));
+                }
+                if states.changed().await.is_err() {
+                    return Err("watcher readiness state channel closed".to_string());
+                }
+            }
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => panic!(
+                "watcher registration handshake failed: {reason}; {}",
+                watcher_test_diagnostics(store, &expected_event, &[])
+            ),
+            Err(_) => panic!(
+                "watcher registration handshake timed out; {}",
+                watcher_test_diagnostics(store, &expected_event, &[])
+            ),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum WatcherPathMatch {
+        Exact,
+        Touching,
+    }
+
+    async fn wait_for_processed_watcher_path(
+        store: &SkillStore,
+        batches: &mut tokio::sync::broadcast::Receiver<ProcessedWatcherBatch>,
+        expected_path: &Path,
+        path_match: WatcherPathMatch,
+        expected_event: &str,
+    ) -> (ProcessedWatcherBatch, Vec<ProcessedWatcherBatch>) {
+        let expected_path = normalize_watcher_test_path(expected_path);
+        let expected_event = format!("{expected_event} at {}", expected_path.display());
+        let mut observed_batches = Vec::new();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match batches.recv().await {
-                    Ok(batch)
-                        if batch.paths.iter().any(|path| {
-                            path == &expected_path
-                                || path.starts_with(&expected_path)
-                                || expected_path.starts_with(path)
-                        }) =>
-                    {
-                        return batch;
+                    Ok(batch) => {
+                        let matches = batch.paths.iter().any(|path| match path_match {
+                            WatcherPathMatch::Exact => path == &expected_path,
+                            WatcherPathMatch::Touching => {
+                                path == &expected_path
+                                    || path.starts_with(&expected_path)
+                                    || expected_path.starts_with(path)
+                            }
+                        });
+                        observed_batches.push(batch.clone());
+                        if matches {
+                            return Ok(batch);
+                        }
                     }
-                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        panic!("skill watcher test observation lagged by {skipped} batches")
+                        return Err(format!(
+                            "watcher observation lagged by {skipped} processed batches"
+                        ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        panic!("skill watcher stopped before processing the expected path")
+                        return Err(
+                            "watcher stopped before processing the expected event".to_string()
+                        );
                     }
                 }
             }
         })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "skill watcher should process the filesystem event touching {}",
-                expected_path.display()
+        .await;
+        match outcome {
+            Ok(Ok(batch)) => (batch, observed_batches),
+            Ok(Err(reason)) => panic!(
+                "watcher event observation failed: {reason}; {}",
+                watcher_test_diagnostics(store, &expected_event, &observed_batches)
+            ),
+            Err(_) => panic!(
+                "watcher event observation timed out; {}",
+                watcher_test_diagnostics(store, &expected_event, &observed_batches)
+            ),
+        }
+    }
+
+    async fn assert_watcher_ready_and_delivering(
+        store: &SkillStore,
+        shallow_watch_root: &Path,
+        probe_path: &Path,
+    ) {
+        wait_for_watcher_registration(
+            store,
+            shallow_watch_root,
+            notify::RecursiveMode::NonRecursive,
+        )
+        .await;
+        let mut batches = store.subscribe_processed_watcher_batches();
+        fs::write(probe_path, b"watcher readiness probe")
+            .await
+            .expect("write watcher readiness probe");
+        let (batch, observed_batches) = wait_for_processed_watcher_path(
+            store,
+            &mut batches,
+            probe_path,
+            WatcherPathMatch::Exact,
+            "readiness probe write",
+        )
+        .await;
+        assert!(
+            !batch.relevant,
+            "watcher readiness probe must stay catalog-irrelevant; {}",
+            watcher_test_diagnostics(
+                store,
+                "catalog-irrelevant readiness probe",
+                &observed_batches
             )
-        })
+        );
     }
 
     #[test]
@@ -5136,6 +5362,10 @@ Use this skill for testing.
             ..Default::default()
         });
         manager.initialize().await.expect("initialize manager");
+        let data_root = directory.path().join("data");
+        let readiness_probe = data_root.join(".plugin-watcher-readiness-probe");
+        assert_watcher_ready_and_delivering(manager.store(), &data_root, &readiness_probe).await;
+
         let initial_revision = manager.store().skill_catalog_snapshot().await.revision;
         let initial_activity = manager.store().watcher_activity();
         let plugin_skills = directory.path().join("data/plugins/late/skills");
@@ -5144,28 +5374,36 @@ Use this skill for testing.
             .await
             .expect("plugin skill");
         let plugin_file = plugin_root.join("SKILL.md");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = manager.store().skill_catalog_snapshot().await;
-                if snapshot.revision > initial_revision
-                    && snapshot
-                        .entries
-                        .iter()
-                        .any(|entry| entry.id == "hot-plugin")
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .expect("watcher should publish plugin without explicit refresh");
+        let (added_batch, added_observed) = wait_for_processed_watcher_path(
+            manager.store(),
+            &mut added_batches,
+            &plugin_file,
+            WatcherPathMatch::Touching,
+            "plugin skill addition",
+        )
+        .await;
         assert!(
-            wait_for_processed_watcher_path(&mut added_batches, &plugin_file)
-                .await
-                .relevant,
-            "a plugin skill addition must be classified as catalog-relevant"
+            added_batch.relevant,
+            "a plugin skill addition must be classified as catalog-relevant; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "catalog-relevant plugin skill addition",
+                &added_observed,
+            )
+        );
+        let added_snapshot = manager.store().skill_catalog_snapshot().await;
+        assert!(
+            added_snapshot.revision > initial_revision
+                && added_snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == "hot-plugin"),
+            "processed plugin addition must already be published; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "published hot-plugin catalog entry",
+                &added_observed,
+            )
         );
 
         let added_activity = manager.store().watcher_activity();
@@ -5174,6 +5412,13 @@ Use this skill for testing.
             added_activity.watch_rebinds > initial_activity.watch_rebinds,
             "creating the missing plugins root must bind its recursive watch"
         );
+        wait_for_watcher_registration(
+            manager.store(),
+            &directory.path().join("data/plugins"),
+            notify::RecursiveMode::Recursive,
+        )
+        .await;
+
         let mut edited_batches = manager.store().subscribe_processed_watcher_batches();
         fs::write(
             &plugin_file,
@@ -5181,56 +5426,74 @@ Use this skill for testing.
         )
         .await
         .expect("edit plugin skill");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if manager
-                    .store()
-                    .skill_catalog_snapshot()
-                    .await
-                    .entries
-                    .iter()
-                    .any(|entry| entry.id == "hot-plugin" && entry.description == "hot edited")
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .expect("recursive plugin watch should publish an edit");
+        let (edited_batch, edited_observed) = wait_for_processed_watcher_path(
+            manager.store(),
+            &mut edited_batches,
+            &plugin_file,
+            WatcherPathMatch::Touching,
+            "plugin skill edit",
+        )
+        .await;
         assert!(
-            wait_for_processed_watcher_path(&mut edited_batches, &plugin_file)
+            edited_batch.relevant,
+            "a plugin skill edit must be classified as catalog-relevant; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "catalog-relevant plugin skill edit",
+                &edited_observed,
+            )
+        );
+        assert!(
+            manager
+                .store()
+                .skill_catalog_snapshot()
                 .await
-                .relevant,
-            "a plugin skill edit must be classified as catalog-relevant"
+                .entries
+                .iter()
+                .any(|entry| entry.id == "hot-plugin" && entry.description == "hot edited"),
+            "processed plugin edit must already be published; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "published hot-plugin edit",
+                &edited_observed,
+            )
         );
 
         let mut removed_batches = manager.store().subscribe_processed_watcher_batches();
         fs::remove_dir_all(&plugin_root)
             .await
             .expect("remove plugin skill");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if !manager
-                    .store()
-                    .skill_catalog_snapshot()
-                    .await
-                    .entries
-                    .iter()
-                    .any(|entry| entry.id == "hot-plugin")
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .expect("recursive plugin watch should publish removal");
+        let (removed_batch, removed_observed) = wait_for_processed_watcher_path(
+            manager.store(),
+            &mut removed_batches,
+            &plugin_root,
+            WatcherPathMatch::Touching,
+            "plugin skill removal",
+        )
+        .await;
         assert!(
-            wait_for_processed_watcher_path(&mut removed_batches, &plugin_root)
+            removed_batch.relevant,
+            "a plugin skill removal must be classified as catalog-relevant; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "catalog-relevant plugin skill removal",
+                &removed_observed,
+            )
+        );
+        assert!(
+            !manager
+                .store()
+                .skill_catalog_snapshot()
                 .await
-                .relevant,
-            "a plugin skill removal must be classified as catalog-relevant"
+                .entries
+                .iter()
+                .any(|entry| entry.id == "hot-plugin"),
+            "processed plugin removal must already be published; {}",
+            watcher_test_diagnostics(
+                manager.store(),
+                "removed hot-plugin catalog entry",
+                &removed_observed,
+            )
         );
     }
 
@@ -5250,6 +5513,9 @@ Use this skill for testing.
             .store_for_workspace(Some(&workspace))
             .await
             .expect("workspace store");
+        let readiness_probe = workspace.join(".workflow-watcher-readiness-probe");
+        assert_watcher_ready_and_delivering(&store, &workspace, &readiness_probe).await;
+
         let initial_revision = store.workflow_catalog_snapshot().await.revision;
 
         let workflows = workspace.join(".bamboo/workflows");
@@ -5259,30 +5525,39 @@ Use this skill for testing.
         fs::write(&workflow_file, "Review the live change.\n")
             .await
             .expect("legacy workflow");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = store.workflow_catalog_snapshot().await;
-                if snapshot.revision > initial_revision
-                    && snapshot.entries.iter().any(|entry| {
-                        entry.id == "live-review"
-                            && entry.migration_status
-                                == Some(crate::LegacyWorkflowMigrationStatus::Available)
-                    })
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .expect("watcher should publish workspace legacy workflow");
+        let (workflow_batch, workflow_observed) = wait_for_processed_watcher_path(
+            &store,
+            &mut workflow_batches,
+            &workflow_file,
+            WatcherPathMatch::Touching,
+            "workspace legacy workflow creation",
+        )
+        .await;
         assert!(
-            wait_for_processed_watcher_path(&mut workflow_batches, &workflow_file)
-                .await
-                .relevant,
-            "a workspace workflow write must be classified as catalog-relevant"
+            workflow_batch.relevant,
+            "a workspace workflow write must be classified as catalog-relevant; {}",
+            watcher_test_diagnostics(
+                &store,
+                "catalog-relevant workspace legacy workflow creation",
+                &workflow_observed,
+            )
         );
+        let published = store.workflow_catalog_snapshot().await;
+        assert!(
+            published.revision > initial_revision
+                && published.entries.iter().any(|entry| {
+                    entry.id == "live-review"
+                        && entry.migration_status
+                            == Some(crate::LegacyWorkflowMigrationStatus::Available)
+                }),
+            "processed workspace workflow event must already be published; {}",
+            watcher_test_diagnostics(
+                &store,
+                "published live-review workspace workflow",
+                &workflow_observed,
+            )
+        );
+        wait_for_watcher_registration(&store, &workflows, notify::RecursiveMode::Recursive).await;
 
         // The watcher keeps only a shallow registration on the workspace root
         // so it can notice `.bamboo` being recreated. A project build tree may
@@ -5301,11 +5576,22 @@ Use this skill for testing.
                 .await
                 .expect("project build artifact");
         }
+        let (build_batch, build_observed) = wait_for_processed_watcher_path(
+            &store,
+            &mut build_batches,
+            &build_root,
+            WatcherPathMatch::Touching,
+            "workspace build churn",
+        )
+        .await;
         assert!(
-            !wait_for_processed_watcher_path(&mut build_batches, &build_root)
-                .await
-                .relevant,
-            "a project build directory must be classified as catalog-irrelevant"
+            !build_batch.relevant,
+            "a project build directory must be classified as catalog-irrelevant; {}",
+            watcher_test_diagnostics(
+                &store,
+                "catalog-irrelevant workspace build churn",
+                &build_observed,
+            )
         );
         let after_churn = store.watcher_activity();
         assert_eq!(

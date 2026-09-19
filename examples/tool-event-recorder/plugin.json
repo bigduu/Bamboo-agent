@@ -1,0 +1,47 @@
+{
+  "id": "tool-event-recorder",
+  "name": "ToolEvent Recorder Example",
+  "version": "0.1.0",
+  "description": "Public-protocol-only metadata recorder for Bamboo ToolEventV1 delivery.",
+  "platforms": ["macos", "linux", "windows"],
+  "provides": {
+    "services": [
+      {
+        "id": "tool-event-recorder-service",
+        "enabled": true,
+        "command": "${platform_bin}",
+        "input_protocol": "ndjson_v1",
+        "restart_policy": {
+          "enabled": true,
+          "initial_backoff_ms": 10,
+          "max_backoff_ms": 100,
+          "max_attempts": 0
+        },
+        "graceful_shutdown": {
+          "signal": "none",
+          "timeout_ms": 0
+        }
+      }
+    ],
+    "event_sinks": [
+      {
+        "id": "tool-event-recorder-events",
+        "service_id": "tool-event-recorder-service",
+        "protocol": {
+          "name": "tool_event",
+          "version": 1
+        },
+        "subscriptions": [
+          {
+            "id": "tool.file_changed.v1"
+          }
+        ],
+        "delivery": {
+          "queue_capacity": 2,
+          "max_event_bytes": 16384
+        },
+        "requested_permissions": ["metadata"]
+      }
+    ]
+  }
+}

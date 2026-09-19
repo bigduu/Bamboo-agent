@@ -66,10 +66,25 @@ pub fn mask_outbound_body(body: &mut Value, config: &KeywordMaskingConfig) {
     if config.entries.is_empty() {
         return;
     }
-    mask_value(body, config, false);
+    mask_value(body, config, false, MaskContext::Root);
 }
 
-fn mask_value(value: &mut Value, config: &KeywordMaskingConfig, under_structural_key: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaskContext {
+    Root,
+    Other,
+    AnthropicMessages,
+    AnthropicMessage,
+    AnthropicContent,
+    AnthropicContentBlock,
+}
+
+fn mask_value(
+    value: &mut Value,
+    config: &KeywordMaskingConfig,
+    under_structural_key: bool,
+    context: MaskContext,
+) {
     match value {
         // A string directly under a structural key is exempt (falls through to `_`).
         Value::String(text) if !under_structural_key => {
@@ -79,17 +94,41 @@ fn mask_value(value: &mut Value, config: &KeywordMaskingConfig, under_structural
             }
         }
         Value::Array(items) => {
-            // Array elements carry no key context — always scanned.
+            let item_context = match context {
+                MaskContext::AnthropicMessages => MaskContext::AnthropicMessage,
+                MaskContext::AnthropicContent => MaskContext::AnthropicContentBlock,
+                _ => MaskContext::Other,
+            };
             for item in items {
-                mask_value(item, config, false);
+                mask_value(item, config, false, item_context);
             }
         }
         Value::Object(map) => {
+            // Anthropic signs the exact thinking text. Exempt it only at the
+            // protocol-defined `messages[].content[]` position and only when a
+            // non-empty sibling signature proves this is a signed thinking
+            // block. A same-named user/tool input field remains maskable.
+            let signed_anthropic_thinking = context == MaskContext::AnthropicContentBlock
+                && map.get("type").and_then(Value::as_str) == Some("thinking")
+                && map
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty());
             for (key, val) in map.iter_mut() {
                 // A structural key exempts only its DIRECT string value; nested
                 // structures under it are still scanned (with their own key context).
-                let structural = STRUCTURAL_KEYS.contains(&key.as_str());
-                mask_value(val, config, structural);
+                let structural = STRUCTURAL_KEYS.contains(&key.as_str())
+                    || (signed_anthropic_thinking && key == "thinking");
+                let child_context = match (context, key.as_str(), &*val) {
+                    (MaskContext::Root, "messages", Value::Array(_)) => {
+                        MaskContext::AnthropicMessages
+                    }
+                    (MaskContext::AnthropicMessage, "content", Value::Array(_)) => {
+                        MaskContext::AnthropicContent
+                    }
+                    _ => MaskContext::Other,
+                };
+                mask_value(val, config, structural, child_context);
             }
         }
         // Numbers / bools / null carry no text.
@@ -187,6 +226,48 @@ mod tests {
         );
         // thinking signature (verification blob) untouched.
         assert_eq!(body["thinking"]["signature"], "secret-signature-blob");
+    }
+
+    #[test]
+    fn preserves_signed_thinking_while_masking_other_anthropic_native_values() {
+        let mut body = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "secret private reasoning",
+                        "signature": "secret-signature-blob"
+                    },
+                    {
+                        "type": "server_tool_use",
+                        "id": "srv_1",
+                        "name": "tool_search_tool_regex",
+                        "input": { "pattern": "secret weather" }
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tool_1",
+                        "name": "get_weather",
+                        "input": {
+                            "value": "secret city",
+                            "thinking": "secret user-controlled thought"
+                        }
+                    }
+                ]
+            }]
+        });
+        mask_outbound_body(&mut body, &config("secret"));
+
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["thinking"], "secret private reasoning");
+        assert_eq!(content[0]["signature"], "secret-signature-blob");
+        assert_eq!(content[1]["input"]["pattern"], "[MASKED] weather");
+        assert_eq!(content[2]["input"]["value"], "[MASKED] city");
+        assert_eq!(
+            content[2]["input"]["thinking"],
+            "[MASKED] user-controlled thought"
+        );
     }
 
     #[test]

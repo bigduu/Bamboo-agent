@@ -173,4 +173,28 @@ mod tests {
         assert!(assembled.contains("Custom user base."));
         assert!(assembled.contains(CORE_DIRECTIVES_START_MARKER));
     }
+
+    #[test]
+    fn real_core_directives_require_the_ordered_six_part_parent_assignment() {
+        let directives = crate::runtime::context::CORE_AGENT_DIRECTIVES;
+        let sections = [
+            "1. Scope.",
+            "2. Inputs and background context.",
+            "3. Allowed actions and mutation scope.",
+            "4. Acceptance criteria and required evidence.",
+            "5. Non-goals.",
+            "6. Stop and report instruction.",
+        ];
+        let mut prior = 0;
+        for section in sections {
+            let position = directives.find(section).expect("delegation section");
+            assert!(position >= prior, "delegation sections must remain ordered");
+            prior = position;
+        }
+        assert!(directives.contains("assignment scope is authoritative"));
+        assert!(directives.contains("forked context cannot expand it"));
+        assert!(directives.contains("runtime-exposed capabilities"));
+        assert!(directives.contains("explicit in the assignment and necessary"));
+        assert!(directives.contains("concrete evidence plus uncertainty or blockers"));
+    }
 }

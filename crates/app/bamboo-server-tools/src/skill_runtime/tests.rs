@@ -128,7 +128,7 @@ RUNNER_RUNTIME_INSTRUCTIONS"#,
     manager.initialize().await.expect("manager");
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
-    let cache = Arc::new(dashmap::DashMap::new());
+    let cache = bamboo_engine::SessionCache::default();
     let repo = bamboo_engine::SessionRepository::new(cache, storage.clone(), locked.clone());
     let config = Arc::new(RwLock::new(Config::default()));
     let load_skill = LoadSkillTool::new(manager.clone(), config.clone(), repo.clone());
@@ -375,7 +375,7 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
     let repo = bamboo_engine::SessionRepository::new(
-        Arc::new(dashmap::DashMap::new()),
+        bamboo_engine::SessionCache::default(),
         storage.clone(),
         locked,
     );
@@ -595,7 +595,9 @@ Use the dynamic context."#,
     .with_test_context_tools(provider.clone());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -675,7 +677,9 @@ Use the dynamic context."#,
     .with_fail_closed_context_registry(provider.clone());
     let calls_before = provider.calls.load(Ordering::SeqCst);
     let production_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(production_session_id),
+        root_session_id: None,
         tool_call_id: "production-authority-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -747,7 +751,9 @@ Use the dynamic context."#,
     let typed_tool = LoadSkillTool::new(manager, runtime_config, repo.clone())
         .with_permission_checked_context_registry(context_tools, Some(permission_config.clone()));
     let typed_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(typed_session_id),
+        root_session_id: None,
         tool_call_id: "typed-authority-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -861,7 +867,9 @@ Plan must block this provider before dispatch."#,
         .with_test_context_tools(provider.clone());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-approval-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -899,7 +907,9 @@ Plan must block this provider before dispatch."#,
         .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
 
     let plan_read_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-plan-read-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -929,7 +939,9 @@ Plan must block this provider before dispatch."#,
     assert!(event_rx.try_recv().is_err());
 
     let invalid_write_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-invalid-write-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -990,10 +1002,10 @@ fn dynamic_context_plan_helper_fail_closes_mutating_and_unknown_tools() {
 
 /// Build a per-session-locked session cache pre-populated with one session.
 fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::SessionCache {
-    let cache = Arc::new(dashmap::DashMap::new());
+    let cache = bamboo_engine::SessionCache::default();
     cache.insert(
         session_id.to_string(),
-        Arc::new(parking_lot::RwLock::new(session.clone())),
+        Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
     cache
 }
@@ -1134,7 +1146,9 @@ Use this demo skill."#,
         bamboo_engine::SessionRepository::new(sessions, storage, persistence),
     );
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-1",
         event_tx: None,
         available_tool_schemas: None,
@@ -1193,7 +1207,9 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
         .expect("publish automatic runtime selection");
     let tool = LoadSkillTool::new(skill_manager, config, repo.clone());
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-runtime-allowlist",
         event_tx: None,
         available_tool_schemas: None,
@@ -1304,7 +1320,9 @@ async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_c
         repo.clone(),
     );
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "runtime-pinned-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -1423,7 +1441,9 @@ Use this demo skill."#,
         ),
     );
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-2",
         event_tx: None,
         available_tool_schemas: None,
@@ -1504,7 +1524,9 @@ Use this demo skill."#,
     let read_tool = ReadSkillResourceTool::new(skill_manager, config, session_repo);
 
     let load_ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -1516,7 +1538,9 @@ Use this demo skill."#,
         pre_parsed_args: None,
     };
     let read_ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-read",
         event_tx: None,
         available_tool_schemas: None,
@@ -1709,10 +1733,20 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         )
         .await
         .expect("auto selection two");
-    assert!(auto_one.iter().any(|skill| skill.id == "only-alpha"));
-    assert!(!auto_one.iter().any(|skill| skill.id == "only-beta"));
-    assert!(auto_two.iter().any(|skill| skill.id == "only-beta"));
-    assert!(!auto_two.iter().any(|skill| skill.id == "only-alpha"));
+    assert_eq!(
+        auto_one
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shared-workflow"]
+    );
+    assert_eq!(
+        auto_two
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shared-workflow"]
+    );
     assert_eq!(
         auto_one
             .iter()
@@ -1742,11 +1776,11 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
         r#"["shared-workflow"]"#.to_string(),
     );
-    let sessions = Arc::new(dashmap::DashMap::new());
+    let sessions = bamboo_engine::SessionCache::default();
     for session in [&session_one, &session_two] {
         sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
     }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
@@ -1773,7 +1807,9 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         ),
     ] {
         let context = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
+            root_session_id: None,
             tool_call_id: "workspace-skill-call",
             event_tx: None,
             available_tool_schemas: None,
@@ -1888,7 +1924,7 @@ async fn runtime_skill_store_keeps_project_home_across_workspace_switches() {
     manager.initialize().await.expect("initialize manager");
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
-    let sessions = Arc::new(dashmap::DashMap::new());
+    let sessions = bamboo_engine::SessionCache::default();
     let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
     let mut session = Session::new("project-runtime-skill", "model");
     session.set_project_id_meta(project.id.to_string());

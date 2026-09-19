@@ -14,7 +14,6 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY, SKILL_RUNTIME_SELECTION_COUNT_KEY,
     SKILL_RUNTIME_SELECTION_SOURCE_KEY, SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
-use bamboo_tools::exposure::activated_discoverable_tools;
 
 use super::logging::DebugLogger;
 
@@ -30,6 +29,10 @@ pub fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
 
 pub fn refresh_prompt_snapshot(session: &mut Session) {
     prompt_setup::refresh_prompt_snapshot_from_session(session)
+}
+
+pub(crate) fn migrate_legacy_workspace_prompt(session: &mut Session) -> bool {
+    prompt_setup::migrate_legacy_workspace_prompt(session)
 }
 
 async fn publish_pending_workflow_lifecycle_event(
@@ -127,6 +130,9 @@ pub(crate) async fn prepare_session_for_loop(
     must_resume_pinned_activation: bool,
     event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> super::Result<Option<TaskLoopContext>> {
+    // Resume compatibility: recover metadata before any workspace-scoped skill
+    // or instruction lookup, then permanently remove the legacy prompt marker.
+    migrate_legacy_workspace_prompt(session);
     publish_pending_workflow_lifecycle_event(session, config, event_tx).await?;
     let skill_result = match skill_context::load_skill_context(
         config,
@@ -303,11 +309,10 @@ The user explicitly selected `{skill_id}`. Your first response step MUST be exac
         }
     }
 
-    let tool_schemas =
-        tool_schemas::resolve_available_tool_schemas_for_session(config, tools, session);
+    let tool_schemas = tool_schemas::resolve_tool_schemas_for_round(config, tools, session);
     let base_prompt_for_language =
         prompt_setup::resolve_base_prompt_for_language(config, session).to_string();
-    let activated = activated_discoverable_tools(session);
+    let activated = tool_schemas::effective_guide_activation(config, session);
     let tool_guide_context = prompt_setup::build_tool_guide_context(
         config,
         &tool_schemas,

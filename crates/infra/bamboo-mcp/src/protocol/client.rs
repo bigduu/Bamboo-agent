@@ -222,6 +222,21 @@ pub struct McpProtocolClient {
     modern_tool_list_changes: Arc<AtomicBool>,
 }
 
+impl Drop for McpProtocolClient {
+    /// Cancellation safety for staged and retired runtimes. Graceful async
+    /// disconnect remains best-effort, but correctness never depends on it:
+    /// dropping an uncommitted client immediately aborts its inbound handler,
+    /// then transport-specific Drop guards stop readers/forwarders/processes.
+    fn drop(&mut self) {
+        if let Some(handler) = self.message_handler.take() {
+            handler.abort();
+        }
+        if let Ok(mut receiver) = self.notification_rx.try_lock() {
+            *receiver = None;
+        }
+    }
+}
+
 impl McpProtocolClient {
     pub fn new(transport: Box<dyn McpTransport>) -> Self {
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);

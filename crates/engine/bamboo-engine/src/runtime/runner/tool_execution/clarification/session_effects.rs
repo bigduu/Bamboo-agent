@@ -11,11 +11,15 @@ pub(super) fn append_waiting_tool_result_message(
     tool_call: &ToolCall,
     tool_result_payload: &str,
     session_id: &str,
+    permission_replay_origin: Option<&crate::session_app::approval_replay::PermissionReplayOrigin>,
 ) {
-    let tool_result_msg = bamboo_agent_core::Message::tool_result(
+    let mut tool_result_msg = bamboo_agent_core::Message::tool_result(
         tool_call.id.clone(),
         tool_result_payload.to_string(),
     );
+    if let Some(origin) = permission_replay_origin {
+        origin.bind_waiting_message(&mut tool_result_msg);
+    }
     tracing::debug!(
         "[{}] Adding tool result message for {}, tool_call_id: {}, message_id: {}",
         session_id,

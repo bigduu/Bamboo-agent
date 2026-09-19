@@ -423,7 +423,7 @@ impl Tool for ProjectWorkspaceTool {
                 })?;
             self.sessions.cache().insert(
                 session_id.to_string(),
-                Arc::new(parking_lot::RwLock::new(authoritative.clone())),
+                Arc::new(bamboo_engine::SessionSnapshot::new(authoritative.clone())),
             );
             drop(persistence_guard);
             project = authoritative_project;
@@ -834,7 +834,9 @@ mod tests {
 
     fn context(session_id: &str, tool: &str) -> ToolCtx {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
+            root_session_id: None,
             tool_call_id: tool,
             event_tx: None,
             available_tool_schemas: None,
@@ -853,7 +855,7 @@ mod tests {
         storage.save_session(&session).await.unwrap();
         let storage: Arc<dyn Storage> = storage;
         SessionRepository::new(
-            Arc::new(dashmap::DashMap::new()),
+            bamboo_engine::SessionCache::default(),
             storage.clone(),
             Arc::new(LockedSessionStore::new(storage)),
         )

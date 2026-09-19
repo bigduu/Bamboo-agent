@@ -7,7 +7,8 @@
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
-    plan_mode_allows_tool, ToolCall, ToolExecutionSessionFlags, ToolResult,
+    plan_mode_allows_tool, ExecutingSupervisorObservation, ToolCall, ToolExecutionSessionFlags,
+    ToolResult,
 };
 use bamboo_agent_core::{AgentError, PendingQuestionSource, Session};
 use bamboo_domain::{permission_request_generation, AgentRuntimeState, PermissionMode};
@@ -18,6 +19,68 @@ use bamboo_tools::permission::{
 use serde::{Deserialize, Serialize};
 
 const PERMISSION_REPLAY_APPROVALS_METADATA_KEY: &str = "permission.replay_approvals.v1";
+
+/// Original host dispatch, retained through result application without reading
+/// a possibly replaced Session or trusting the tool's display payload.
+pub(crate) struct PermissionReplayOrigin {
+    observation: ExecutingSupervisorObservation,
+    session_id: String,
+    tool_call: ToolCall,
+    execution_name: String,
+}
+
+impl PermissionReplayOrigin {
+    pub(crate) fn new(
+        observation: ExecutingSupervisorObservation,
+        session_id: &str,
+        tool_call: &ToolCall,
+        execution_name: &str,
+    ) -> Self {
+        Self {
+            observation,
+            session_id: session_id.into(),
+            tool_call: tool_call.clone(),
+            execution_name: execution_name.into(),
+        }
+    }
+
+    pub(crate) fn bind_waiting_message(&self, message: &mut bamboo_agent_core::Message) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+            return;
+        };
+        if payload.get("status").and_then(serde_json::Value::as_str)
+            != Some("awaiting_permission_approval")
+        {
+            return;
+        }
+        let Some(request) = payload
+            .get("permission_request")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<PermissionRequest>(value).ok())
+        else {
+            return;
+        };
+        if request.session_id != self.session_id
+            || request.request_id != self.tool_call.id
+            || request.tool_name != self.execution_name
+            || request.request_generation.trim().is_empty()
+            || message.tool_call_id.as_deref() != Some(self.tool_call.id.as_str())
+        {
+            return;
+        }
+        let record = self.observation.permission_replay_record(
+            &self.session_id,
+            &message.id,
+            &self.tool_call,
+            &self.execution_name,
+            &request.request_generation,
+        );
+        message.metadata = Some(serde_json::json!({
+            "permission_request": request,
+            ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY: record,
+        }));
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PermissionReplayApproval {
@@ -175,6 +238,8 @@ fn validate_replay_approval(
 ) -> Result<(), AgentError> {
     let request = &approval.request;
     let decision = &approval.decision;
+    // expected_policy_revision was checked as an ingress CAS. A refresh can
+    // retain this request generation while the durable request has its old revision.
     if request.session_id != session.id
         || request.request_id != tool_call_id
         || request.request_generation.trim().is_empty()
@@ -211,36 +276,92 @@ fn selected_replay_matcher(
         })
 }
 
-/// Rebuild the exact runtime capabilities needed by a typed approved replay.
-///
-/// The current receipt and any earlier contexts approved for the same concrete
-/// invocation live on the generation-bound result message. This lets a daemon
-/// restart recover an AllowOnce/AllowSession without broadening it, and lets a
-/// tool with multiple permission contexts restart its checks while retaining
-/// only the contexts the operator already approved.
-pub fn restore_permission_replay_authorization(
-    config: &PermissionConfig,
+/// Pure admission, including present-invalid authority on legacy and Plan
+/// paths. Run this before changing replay markers or installing any grants.
+pub fn validate_permission_replay_authority(
     session: &Session,
     target: &PermissionReplayTarget,
-) -> Result<(), AgentError> {
-    let Some(replay_generation) = target.request_generation() else {
-        return Ok(());
-    };
-    let workspace = session
-        .workspace
-        .as_deref()
-        .map(str::trim)
-        .filter(|workspace| !workspace.is_empty())
-        .map(ToOwned::to_owned);
-    config.set_session_workspace(session.id.clone(), workspace);
+    execution_name: &str,
+) -> Result<Option<ExecutingSupervisorObservation>, AgentError> {
+    let observation = ExecutingSupervisorObservation::restore_permission_replay_record(
+        session,
+        target.result_message_index,
+        &target.tool_call,
+        execution_name,
+        target.request_generation(),
+    )
+    .map_err(|error| AgentError::Tool(error.into()))?;
+    if observation.is_some() {
+        let approvals = validated_replay_approvals(session, target)?;
+        if approvals.is_empty()
+            || approvals
+                .iter()
+                .any(|approval| approval.request.tool_name != execution_name)
+        {
+            return Err(AgentError::Tool(
+                "Supervisor approval owner does not match dispatch".into(),
+            ));
+        }
+    }
+    Ok(observation)
+}
 
+/// An unanswered native approval can be displayed again without a receipt,
+/// but its host identity must already match the waiting operation. This pure
+/// check never returns an executable observation or installs a permission.
+pub fn validate_pending_permission_replay_authority(
+    session: &Session,
+    target: &PermissionReplayTarget,
+    execution_name: &str,
+) -> Result<(), AgentError> {
+    let observation = ExecutingSupervisorObservation::restore_permission_replay_record(
+        session,
+        target.result_message_index,
+        &target.tool_call,
+        execution_name,
+        target.request_generation(),
+    )
+    .map_err(|error| AgentError::Tool(error.into()))?;
+    if observation.is_some() {
+        let metadata = session.messages[target.result_message_index]
+            .metadata
+            .as_ref()
+            .expect("validated host metadata");
+        let request = metadata
+            .get("permission_request")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<PermissionRequest>(value).ok())
+            .ok_or_else(|| {
+                AgentError::Tool(
+                    "Supervisor waiting approval is missing its durable request".into(),
+                )
+            })?;
+        if request.session_id != session.id
+            || request.request_id != target.tool_call.id
+            || request.tool_name != execution_name
+            || target.request_generation() != Some(request.request_generation.as_str())
+            || metadata.get("permission_decision_receipt").is_some()
+        {
+            return Err(AgentError::Tool(
+                "Supervisor waiting approval does not match its request".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validated_replay_approvals(
+    session: &Session,
+    target: &PermissionReplayTarget,
+) -> Result<Vec<PermissionReplayApproval>, AgentError> {
+    let Some(replay_generation) = target.request_generation() else {
+        return Ok(Vec::new());
+    };
     let message = session
         .messages
         .get(target.result_message_index)
         .filter(|message| message.id == target.result_message_id)
-        .ok_or_else(|| {
-            AgentError::Tool("permission replay result occurrence changed".to_string())
-        })?;
+        .ok_or_else(|| AgentError::Tool("permission replay result occurrence changed".into()))?;
     let mut approvals = message
         .metadata
         .as_ref()
@@ -257,7 +378,7 @@ pub fn restore_permission_replay_authorization(
     let (request, receipt) = message_permission_contract(session, target)?;
     if receipt.session_id != session.id || request.request_generation != replay_generation {
         return Err(AgentError::Tool(
-            "permission replay receipt does not match the active generation".to_string(),
+            "permission replay receipt does not match the active generation".into(),
         ));
     }
     approvals.push(PermissionReplayApproval {
@@ -266,52 +387,89 @@ pub fn restore_permission_replay_authorization(
     });
     if approvals.len() > 64 {
         return Err(AgentError::Tool(
-            "permission replay approval ledger exceeded its safety bound".to_string(),
+            "permission replay approval ledger exceeded its safety bound".into(),
         ));
     }
-
     for approval in &approvals {
-        validate_replay_approval(session, target.tool_call.id.as_str(), approval)?;
+        validate_replay_approval(session, &target.tool_call.id, approval)?;
+        match approval.decision.decision {
+            PermissionDecisionKind::AllowOnce => {}
+            PermissionDecisionKind::AllowSession | PermissionDecisionKind::AllowGlobal => {
+                selected_replay_matcher(approval)?;
+            }
+            PermissionDecisionKind::AllowWorkspace => {
+                let workspace = session
+                    .workspace
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|workspace| !workspace.is_empty());
+                if workspace != approval.request.workspace_path.as_deref() {
+                    return Err(AgentError::Tool(
+                        "workspace permission replay does not match the durable session workspace"
+                            .into(),
+                    ));
+                }
+                selected_replay_matcher(approval)?;
+            }
+            PermissionDecisionKind::DenyOnce | PermissionDecisionKind::DenySession => {
+                return Err(AgentError::Tool(
+                    "denied permission unexpectedly carried an execution replay marker".into(),
+                ));
+            }
+        }
+    }
+    Ok(approvals)
+}
+
+/// Rebuild the exact runtime capabilities needed by a typed approved replay.
+///
+/// The current receipt and any earlier contexts approved for the same concrete
+/// invocation live on the generation-bound result message. This lets a daemon
+/// restart recover an AllowOnce/AllowSession without broadening it, and lets a
+/// tool with multiple permission contexts restart its checks while retaining
+/// only the contexts the operator already approved.
+pub fn restore_permission_replay_authorization(
+    config: &PermissionConfig,
+    session: &Session,
+    target: &PermissionReplayTarget,
+    execution_name: &str,
+) -> Result<(), AgentError> {
+    validate_permission_replay_authority(session, target, execution_name)?;
+    let approvals = validated_replay_approvals(session, target)?;
+    let Some(replay_generation) = target.request_generation() else {
+        return Ok(());
+    };
+    config.set_session_workspace(
+        session.id.clone(),
+        session
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .map(ToOwned::to_owned),
+    );
+    // Every record and matcher was validated before the first installation.
+    for approval in &approvals {
         match approval.decision.decision {
             PermissionDecisionKind::AllowOnce => config
                 .grant_once_for_generation(
-                    session.id.as_str(),
-                    target.tool_call.id.as_str(),
+                    &session.id,
+                    &target.tool_call.id,
                     replay_generation,
                     approval.request.permission_type,
                     approval.request.resource.clone(),
                 )
                 .map_err(AgentError::Tool)?,
-            PermissionDecisionKind::AllowSession => {
-                config
-                    .grant_typed_scoped_session_permission(
-                        session.id.as_str(),
-                        approval.request.permission_type,
-                        selected_replay_matcher(approval)?,
-                    )
-                    .map_err(AgentError::Tool)?;
-            }
-            PermissionDecisionKind::AllowWorkspace => {
-                let authoritative = session
-                    .workspace
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|workspace| !workspace.is_empty());
-                if authoritative != approval.request.workspace_path.as_deref() {
-                    return Err(AgentError::Tool(
-                        "workspace permission replay does not match the durable session workspace"
-                            .to_string(),
-                    ));
-                }
-                selected_replay_matcher(approval)?;
-            }
-            PermissionDecisionKind::AllowGlobal => {
-                selected_replay_matcher(approval)?;
-            }
+            PermissionDecisionKind::AllowSession => config
+                .grant_typed_scoped_session_permission(
+                    &session.id,
+                    approval.request.permission_type,
+                    selected_replay_matcher(approval)?,
+                )
+                .map_err(AgentError::Tool)?,
+            PermissionDecisionKind::AllowWorkspace | PermissionDecisionKind::AllowGlobal => {}
             PermissionDecisionKind::DenyOnce | PermissionDecisionKind::DenySession => {
-                return Err(AgentError::Tool(
-                    "denied permission unexpectedly carried an execution replay marker".to_string(),
-                ));
+                unreachable!("validated above")
             }
         }
     }
@@ -326,6 +484,7 @@ pub fn repark_permission_replay(
     session: &mut Session,
     target: &PermissionReplayTarget,
     result: &ToolResult,
+    execution_name: &str,
 ) -> Result<Option<ReparkedPermissionApproval>, AgentError> {
     let payload = match serde_json::from_str::<serde_json::Value>(&result.result) {
         Ok(payload)
@@ -337,6 +496,18 @@ pub fn repark_permission_replay(
         }
         _ => return Ok(None),
     };
+    // Validate the old durable identity/receipt without installing grants again.
+    let original_observation =
+        validate_permission_replay_authority(session, target, execution_name)?;
+    let prior_approvals = validated_replay_approvals(session, target)?;
+    if payload
+        .get(ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY)
+        .is_some()
+    {
+        return Err(AgentError::Tool(
+            "Supervisor authority cannot originate in a replay result payload".into(),
+        ));
+    }
     let new_request = payload
         .get("permission_request")
         .cloned()
@@ -347,7 +518,11 @@ pub fn repark_permission_replay(
     if new_request.session_id != session.id
         || new_request.request_id != target.tool_call.id
         || new_request.request_generation.trim().is_empty()
+        || new_request.tool_name != execution_name
         || target.request_generation() == Some(new_request.request_generation.as_str())
+        || prior_approvals
+            .iter()
+            .any(|approval| approval.request.request_generation == new_request.request_generation)
     {
         return Err(AgentError::Tool(
             "replayed permission gate returned an invalid next-generation identity".to_string(),
@@ -425,6 +600,18 @@ pub fn repark_permission_replay(
         PERMISSION_REPLAY_APPROVALS_METADATA_KEY.to_string(),
         serde_json::to_value(approvals).expect("permission replay approvals serialize"),
     );
+    if let Some(original) = original_observation {
+        object.insert(
+            ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY.to_string(),
+            original.permission_replay_record(
+                &session.id,
+                &target.result_message_id,
+                &target.tool_call,
+                execution_name,
+                &new_request.request_generation,
+            ),
+        );
+    }
     object.insert(
         "permission_request".to_string(),
         serde_json::to_value(&new_request).expect("permission request serializes"),
@@ -821,30 +1008,59 @@ mod tests {
     }
 
     #[test]
-    fn restart_restores_exact_allow_once_and_session_authorizations() {
-        let allow_once = approved_replay_session(
-            "generation-1",
-            "context-one",
-            PermissionDecisionKind::AllowOnce,
-        );
-        let target =
-            find_permission_replay_target(&allow_once, "call-1", Some("generation-1")).unwrap();
-        let restarted = PermissionConfig::new();
-        restore_permission_replay_authorization(&restarted, &allow_once, &target).unwrap();
-        assert!(restarted.consume_once_for_generation(
-            "replay",
-            "call-1",
-            "generation-1",
-            PermissionType::ExecuteCommand,
-            "context-one"
-        ));
-        assert!(!restarted.consume_once_for_generation(
-            "replay",
-            "call-1",
-            "generation-1",
-            PermissionType::ExecuteCommand,
-            "different-context"
-        ));
+    fn restart_restores_refreshed_typed_allow_once_and_session_authorizations() {
+        for expected_policy_revision in [None, Some(0), Some(1)] {
+            let mut allow_once = approved_replay_session(
+                "generation-1",
+                "context-one",
+                PermissionDecisionKind::AllowOnce,
+            );
+            // A same-generation refresh leaves the original durable request at 0.
+            allow_once
+                .messages
+                .last_mut()
+                .unwrap()
+                .metadata
+                .as_mut()
+                .unwrap()["permission_decision_receipt"]["decision"]["expected_policy_revision"] =
+                serde_json::json!(expected_policy_revision);
+            let target =
+                find_permission_replay_target(&allow_once, "call-1", Some("generation-1")).unwrap();
+            assert!(
+                validate_permission_replay_authority(&allow_once, &target, "multi_context")
+                    .unwrap()
+                    .is_none()
+            );
+            let restarted = PermissionConfig::new();
+            restore_permission_replay_authorization(
+                &restarted,
+                &allow_once,
+                &target,
+                "multi_context",
+            )
+            .unwrap();
+            assert!(!restarted.consume_once_for_generation(
+                "replay",
+                "call-1",
+                "generation-1",
+                PermissionType::ExecuteCommand,
+                "different-context"
+            ));
+            assert!(restarted.consume_once_for_generation(
+                "replay",
+                "call-1",
+                "generation-1",
+                PermissionType::ExecuteCommand,
+                "context-one"
+            ));
+            assert!(!restarted.consume_once_for_generation(
+                "replay",
+                "call-1",
+                "generation-1",
+                PermissionType::ExecuteCommand,
+                "context-one"
+            ));
+        }
 
         let allow_session = approved_replay_session(
             "generation-session",
@@ -855,7 +1071,13 @@ mod tests {
             find_permission_replay_target(&allow_session, "call-1", Some("generation-session"))
                 .unwrap();
         let restarted = PermissionConfig::new();
-        restore_permission_replay_authorization(&restarted, &allow_session, &target).unwrap();
+        restore_permission_replay_authorization(
+            &restarted,
+            &allow_session,
+            &target,
+            "multi_context",
+        )
+        .unwrap();
         assert!(restarted.is_scoped_session_granted(
             "replay",
             PermissionType::ExecuteCommand,
@@ -874,7 +1096,8 @@ mod tests {
             find_permission_replay_target(&session, "call-1", Some("generation-workspace"))
                 .unwrap();
         let restarted = PermissionConfig::new();
-        restore_permission_replay_authorization(&restarted, &session, &target).unwrap();
+        restore_permission_replay_authorization(&restarted, &session, &target, "multi_context")
+            .unwrap();
         assert_eq!(
             restarted.session_workspace("replay").as_deref(),
             Some("/workspace/a")
@@ -888,7 +1111,8 @@ mod tests {
         assert!(restore_permission_replay_authorization(
             &PermissionConfig::new(),
             &mismatched,
-            &target
+            &target,
+            "multi_context"
         )
         .is_err());
     }
@@ -925,9 +1149,10 @@ mod tests {
             images: Vec::new(),
         };
 
-        let reparked = repark_permission_replay(&mut session, &target, &next_result)
-            .unwrap()
-            .expect("second context must park");
+        let reparked =
+            repark_permission_replay(&mut session, &target, &next_result, "multi_context")
+                .unwrap()
+                .expect("second context must park");
         assert_eq!(reparked.question, "Approve context two?");
         assert_eq!(
             session
@@ -969,7 +1194,8 @@ mod tests {
         let target =
             find_permission_replay_target(&session, "call-1", Some("generation-2")).unwrap();
         let restarted = PermissionConfig::new();
-        restore_permission_replay_authorization(&restarted, &session, &target).unwrap();
+        restore_permission_replay_authorization(&restarted, &session, &target, "multi_context")
+            .unwrap();
         for resource in ["context-one", "context-two"] {
             assert!(restarted.consume_once_for_generation(
                 "replay",

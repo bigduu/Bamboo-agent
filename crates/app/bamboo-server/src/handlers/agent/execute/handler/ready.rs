@@ -177,7 +177,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     }
     state.sessions.insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
@@ -225,7 +225,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // Create mpsc channel for agent loop.
     let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
-    spawn_event_forwarder(
+    let history_commit_barrier = spawn_event_forwarder(
         state.clone(),
         session_id.to_string(),
         run_id.clone(),
@@ -253,6 +253,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         disabled_tools,
         disabled_skill_ids,
         mpsc_tx,
+        history_commit_barrier,
         image_fallback,
         gold_config,
         app_data_dir: Some(state.app_data_dir.clone()),
@@ -277,7 +278,11 @@ async fn rollback_startup(
         .get(session_id)
         .is_some_and(|runner| runner.run_id == run_id)
     {
-        runners.remove(session_id);
+        bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+            &mut runners,
+            session_id,
+        )
+        .await;
     }
     drop(runners);
 

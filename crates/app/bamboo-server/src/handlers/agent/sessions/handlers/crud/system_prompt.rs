@@ -249,17 +249,23 @@ mod tests {
             let effective = snapshot["effective_system_prompt"]
                 .as_str()
                 .expect("effective prompt");
-            assert_eq!(effective.matches("BAMBOO_PROJECT_CONTEXT_START").count(), 1);
+            assert_eq!(effective.matches("BAMBOO_PROJECT_CONTEXT_START").count(), 0);
             assert_eq!(
                 effective.matches("BAMBOO_WORKSPACE_CONTEXT_START").count(),
-                1
+                0
             );
-            assert!(snapshot["project_context"]
+            let project_context = snapshot["project_context"]
                 .as_str()
-                .is_some_and(|value| value.contains(project.id.as_str())));
-            assert!(snapshot["workspace_context"]
+                .expect("typed Project context");
+            assert!(project_context.contains(project.id.as_str()));
+            assert!(!project_context.contains(workspace.to_string_lossy().as_ref()));
+            assert!(!project_context.contains("Project home (Bamboo data):"));
+            let workspace_context = snapshot["workspace_context"]
                 .as_str()
-                .is_some_and(|value| value.contains(workspace.to_string_lossy().as_ref())));
+                .expect("typed Workspace context");
+            assert!(workspace_context.contains(workspace.to_string_lossy().as_ref()));
+            assert!(workspace_context.contains("Binding status: registered"));
+            assert!(!effective.contains(workspace.to_string_lossy().as_ref()));
 
             let persisted = state
                 .storage

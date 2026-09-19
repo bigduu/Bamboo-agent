@@ -512,9 +512,9 @@ pub enum AgentEvent {
         #[serde(default)]
         status: Option<PlanModeStatus>,
     },
-    /// Current round for a session. Parent streams may carry this inside a
-    /// `SubAgentEvent`, allowing clients to update the exact child row without
-    /// interpreting display text.
+    /// Current round for a session. Legacy parent streams may carry this inside
+    /// a `SubAgentEvent`; current clients subscribe to the child's own session
+    /// stream for full-fidelity progress.
     RunnerProgress {
         session_id: String,
         round_count: u32,
@@ -547,8 +547,8 @@ pub enum AgentEvent {
         #[serde(default)]
         title: Option<String>,
     },
-    /// Full-fidelity child event forwarded on the parent session stream.
-    /// Boxing keeps the recursively-shaped wire contract finite.
+    /// Legacy full-fidelity child projection on the parent session stream.
+    /// Boxing keeps the recursively-shaped compatibility contract finite.
     SubAgentEvent {
         child_session_id: String,
         event: Box<AgentEvent>,

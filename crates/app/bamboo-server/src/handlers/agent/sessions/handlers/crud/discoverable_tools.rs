@@ -86,7 +86,7 @@ pub async fn activate_discoverable_tools(
 
     state.sessions.insert(
         session_id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     let activated = bamboo_tools::exposure::activated_discoverable_tools(&session);
@@ -133,7 +133,7 @@ pub async fn deactivate_discoverable_tools(
 
     state.sessions.insert(
         session_id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     let activated = bamboo_tools::exposure::activated_discoverable_tools(&session);

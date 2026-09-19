@@ -157,6 +157,23 @@ impl SkillResourceScope {
     }
 }
 
+/// Resolve the same Project/workspace-aware catalog store used by Skill
+/// activation so native client tool search cannot drift onto the global store.
+pub(crate) async fn resolve_skill_store_for_session(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> Result<Option<std::sync::Arc<bamboo_skills::SkillStore>>, String> {
+    let Some(skill_manager) = config.skill_manager.as_deref() else {
+        return Ok(None);
+    };
+    let scope = SkillResourceScope::resolve(config, session).await?;
+    scope
+        .store(skill_manager)
+        .await
+        .map(Some)
+        .map_err(|error| format!("Failed to resolve capability discovery store: {error}"))
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct SkillContextLoadResult {
     pub(super) context: String,

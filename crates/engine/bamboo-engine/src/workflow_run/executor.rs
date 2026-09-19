@@ -1567,7 +1567,12 @@ impl RunContext {
                     None => ToolExecutionSessionFlags::default(),
                 };
                 let context = ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some(&session_id),
+                    // WorkflowRunSnapshot does not persist root-session identity.
+                    // Fail closed for tool events instead of treating a child
+                    // session id as authoritative root metadata.
+                    root_session_id: None,
                     tool_call_id: &call.id,
                     event_tx: None,
                     available_tool_schemas: None,

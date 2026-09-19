@@ -16,7 +16,37 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, StoreError};
 
 /// Current spec version written by this crate.
-pub const PROVISION_VERSION: u32 = 1;
+pub const PROVISION_VERSION: u32 = 2;
+
+/// Capability a worker must acknowledge before a typed read-only provision is
+/// delivered. Older workers ignore the provision fields that carry the hard
+/// tool boundary, so the parent probes this capability before starting them.
+pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
+
+/// Non-secret capability document printed by `bamboo subagent-worker
+/// --print-capabilities`. It is deliberately separate from `ProvisionSpec` so
+/// a parent can fail closed before sending a run to an older/custom worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCapabilityReport {
+    pub provision_version: u32,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl WorkerCapabilityReport {
+    pub fn current() -> Self {
+        Self {
+            provision_version: PROVISION_VERSION,
+            capabilities: vec![TYPED_READ_ONLY_WORKER_CAPABILITY.to_string()],
+        }
+    }
+
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|candidate| candidate == capability)
+    }
+}
 
 /// Upper bound for a spec read from stdin (defense in depth against a
 /// runaway writer; a real spec is a few KB).
@@ -155,22 +185,27 @@ pub struct Capabilities {
     /// human; a headless default-mode run does not).
     #[serde(default)]
     pub no_human_approver: bool,
-    /// Whether this worker is a READ-ONLY Guardian reviewer. #71: a guardian
-    /// reviewer keeps `Bash` (its mutating tools are stripped by
-    /// `guardian_read_only_disabled_tools`) so it can fetch the diff and run
-    /// tests — but an unrestricted `Bash` would let it `rm -rf`, `git push`, or
-    /// `curl | sh`, making the read-only guarantee nominal. When `true`, the
-    /// worker installs a `GuardianReadOnlyChecker` that DENIES any `Bash`/
-    /// `execute_command` whose command is not on the read-only allowlist
-    /// (`is_read_only_command`) and runs read-only commands without gating.
-    /// Default `false` preserves the unrestricted-Bash behavior for ordinary
-    /// sub-agents. Set by the host's `build_spec` from the reviewer's session
-    /// marker. Mirrors `no_human_approver` above.
+    /// Runtime-enforced read-only authority for a child such as a planner or
+    /// Guardian reviewer. The worker strips mutating tools, resolves the
+    /// effective permission mode to Plan, and installs a shell-command
+    /// allowlist so Auto/Bypass cannot turn an inspection child into a writer.
+    /// External executors map the same bit to their native read-only posture.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Compatibility bit understood by older workers for Guardian children.
+    /// New workers read it as an alias of `read_only`; new hosts also emit it
+    /// for every read-only child so a rolling-upgrade planner cannot regain an
+    /// unrestricted shell on an older worker.
     #[serde(default)]
     pub guardian_read_only: bool,
 }
 
 impl Capabilities {
+    /// Whether this worker must enforce the generic read-only child boundary.
+    pub fn read_only_enforced(&self) -> bool {
+        self.read_only || self.guardian_read_only
+    }
+
     /// Decode the exact provision-time permission posture. Typed fields are
     /// authoritative for new specs; legacy booleans remain readable during a
     /// rolling upgrade, with Auto normalized independently from Bypass.
@@ -724,6 +759,7 @@ mod tests {
             permission_requested_mode: String::new(),
             permission_effective_mode: String::new(),
             no_human_approver: false,
+            read_only: true,
             guardian_read_only: false,
         };
         let parsed = ProvisionSpec::from_json(&s.to_json().unwrap()).unwrap();
@@ -732,6 +768,7 @@ mod tests {
             Some("/home/u/.bamboo/skills")
         );
         assert!(parsed.capabilities.mcp.is_some());
+        assert!(parsed.capabilities.read_only_enforced());
 
         // Backward compat: a spec without `capabilities` defaults to empty.
         let minimal = serde_json::json!({
@@ -742,6 +779,16 @@ mod tests {
         });
         let parsed = ProvisionSpec::from_json(&minimal.to_string()).unwrap();
         assert_eq!(parsed.capabilities, Capabilities::default());
+    }
+
+    #[test]
+    fn legacy_guardian_read_only_alias_still_enforces_read_only() {
+        let capabilities: Capabilities = serde_json::from_value(serde_json::json!({
+            "guardian_read_only": true
+        }))
+        .unwrap();
+        assert!(!capabilities.read_only);
+        assert!(capabilities.read_only_enforced());
     }
 
     #[test]

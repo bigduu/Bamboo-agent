@@ -17,6 +17,7 @@ members = [
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-plugin-protocol",
     "crates/infra/bamboo-projects",
     "crates/infra/bamboo-permission",
     "crates/infra/bamboo-compression",
@@ -32,6 +33,7 @@ members = [
     "crates/app/bamboo-tui",
     "crates/app/bamboo-client-core",
     "crates/app/bamboo-broker",
+    "examples/tool-event-recorder",
 ]
 # Bare `cargo build`/`test`/`check` (no `-p`/`--workspace`) operate on these.
 # `bamboo-analytics` is intentionally omitted: it is a dev-only analysis tool
@@ -58,6 +60,7 @@ default-members = [
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-plugin-protocol",
     "crates/infra/bamboo-projects",
     "crates/infra/bamboo-permission",
     "crates/infra/bamboo-compression",
@@ -135,6 +138,7 @@ bamboo-subagent = { path = "crates/infra/bamboo-subagent" }
 bamboo-broker = { path = "crates/app/bamboo-broker" }
 bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-memory = { path = "crates/infra/bamboo-memory" }
 bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
 bamboo-tui = { path = "crates/app/bamboo-tui" }
 

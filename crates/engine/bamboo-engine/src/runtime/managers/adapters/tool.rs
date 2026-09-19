@@ -64,6 +64,8 @@ impl ToolManager for DefaultToolManager {
             .agent_runtime_state
             .clone()
             .unwrap_or_else(|| bamboo_domain::AgentRuntimeState::new(session_id));
+        let effective_callable_set =
+            crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
 
         // Mirror the live pipeline's #30 biased-cancel wrap so a cancel issued
         // DURING tool execution (e.g. a long foreground Bash run) is honored on
@@ -91,6 +93,7 @@ impl ToolManager for DefaultToolManager {
                         .as_ref()
                         .or(config.background_model_provider.as_ref()),
                     tool_schemas,
+                    effective_callable_set: &effective_callable_set,
                 },
             ) => result?,
         };

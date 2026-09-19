@@ -5,277 +5,159 @@ use crate::protocol::models::JsonRpcNotification;
 use super::*;
 
 impl McpServerManager {
-    /// Attempt to reconnect a degraded server with exponential backoff.
-    pub(super) async fn attempt_reconnection(&self, runtime: Arc<ServerRuntime>) -> Result<()> {
-        let server_id = runtime.config.id.clone();
-
-        // Check if already reconnecting
+    /// Health and QoS share this runtime-local singleflight. Every attempt is
+    /// affine to the exact expected publication/runtime and can never reconnect
+    /// a successor selected only by server id.
+    pub(super) async fn attempt_reconnection(&self, expected: ExpectedPublication) -> Result<()> {
+        let runtime = expected.runtime().clone();
         if runtime
+            .runtime
             .reconnecting
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            info!(
-                "Reconnection already in progress for MCP server '{}'",
-                server_id
-            );
             return Ok(());
         }
 
-        let reconnect_config = &runtime.config.reconnect;
-        let mut current_backoff = reconnect_config.initial_backoff_ms;
+        let reconnect = runtime.runtime.config.reconnect.clone();
+        let mut backoff = reconnect.initial_backoff_ms;
         let mut attempt = 0u32;
-
-        info!(
-            "Starting reconnection attempts for MCP server '{}' (max_attempts: {})",
-            server_id,
-            if reconnect_config.max_attempts == 0 {
-                "unlimited".to_string()
-            } else {
-                reconnect_config.max_attempts.to_string()
-            }
-        );
-
         loop {
-            // Check if shutdown was requested
-            if runtime.shutdown.load(Ordering::SeqCst)
-                || !self.is_current_runtime(&server_id, &runtime)
-            {
-                info!(
-                    "Reconnection cancelled due to shutdown or replacement for MCP server '{}'",
-                    server_id
-                );
-                runtime.reconnecting.store(false, Ordering::SeqCst);
+            if !self.is_current_publication(&expected) {
+                runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                 return Ok(());
             }
-
-            // Check max attempts
-            if reconnect_config.max_attempts > 0 && attempt >= reconnect_config.max_attempts {
+            if reconnect.max_attempts > 0 && attempt >= reconnect.max_attempts {
+                let sequence = self.event_sequence_lock.clone().lock_owned().await;
                 let reconcile = self.reconcile_lock.lock().await;
-                if runtime.shutdown.load(Ordering::SeqCst)
-                    || !self.is_current_runtime(&server_id, &runtime)
-                {
-                    runtime.reconnecting.store(false, Ordering::SeqCst);
+                if !self.is_current_publication(&expected) {
+                    runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                     return Ok(());
                 }
-                error!(
-                    "Max reconnection attempts ({}) reached for MCP server '{}'",
-                    reconnect_config.max_attempts, server_id
-                );
-
-                // Update status to Error
-                let mut info = runtime.info.write().await;
-                info.status = ServerStatus::Error;
-                info.last_error = Some("Max reconnection attempts reached".to_string());
-                info.disconnected_at = Some(Utc::now());
-                drop(info);
-
-                // Emit error event
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx
-                        .send(McpEvent::ServerStatusChanged {
-                            server_id: server_id.clone(),
-                            status: ServerStatus::Error,
-                            error: Some("Max reconnection attempts reached".to_string()),
-                        })
-                        .await;
+                {
+                    let mut info = runtime.runtime.info.write().await;
+                    info.status = ServerStatus::Error;
+                    info.last_error = Some("Max reconnection attempts reached".to_string());
+                    info.disconnected_at = Some(Utc::now());
                 }
+                let events = self.prepare_event_batch(
+                    sequence,
+                    vec![McpEvent::ServerStatusChanged {
+                        server_id: expected.server_id().to_string(),
+                        status: ServerStatus::Error,
+                        error: Some("Max reconnection attempts reached".to_string()),
+                    }],
+                    Vec::new(),
+                );
+                runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                 drop(reconcile);
-
-                runtime.reconnecting.store(false, Ordering::SeqCst);
-                return Err(McpError::Connection(format!(
-                    "Max reconnection attempts reached for server '{}'",
-                    server_id
-                )));
+                events.activate();
+                return Err(McpError::Connection(
+                    "maximum MCP reconnection attempts reached".to_string(),
+                ));
             }
 
-            attempt += 1;
-            info!(
-                "Reconnection attempt {} for MCP server '{}' (backoff: {}ms)",
-                attempt, server_id, current_backoff
-            );
-
-            // Wait for backoff period
-            tokio::time::sleep(Duration::from_millis(current_backoff)).await;
-            if runtime.shutdown.load(Ordering::SeqCst)
-                || !self.is_current_runtime(&server_id, &runtime)
-            {
-                runtime.reconnecting.store(false, Ordering::SeqCst);
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+            if !self.is_current_publication(&expected) {
+                runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                 return Ok(());
             }
 
-            // Attempt reconnection
-            match self.reconnect_server(runtime.clone()).await {
+            match self.reconnect_server(expected.clone()).await {
                 Ok(false) => {
-                    runtime.reconnecting.store(false, Ordering::SeqCst);
+                    runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                     return Ok(());
                 }
                 Ok(true) => {
-                    let reconcile = self.reconcile_lock.lock().await;
-                    if runtime.shutdown.load(Ordering::SeqCst)
-                        || !self.is_current_runtime(&server_id, &runtime)
-                    {
-                        runtime.reconnecting.store(false, Ordering::SeqCst);
-                        return Ok(());
-                    }
-                    info!(
-                        "Successfully reconnected MCP server '{}' after {} attempt(s)",
-                        server_id, attempt
-                    );
-
-                    // Update runtime info
-                    let mut info = runtime.info.write().await;
-                    info.status = ServerStatus::Ready;
-                    info.last_error = None;
-                    info.restart_count += 1;
-                    info.disconnected_at = None;
-                    drop(info);
-
-                    // Emit recovery event
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx
-                            .send(McpEvent::ServerStatusChanged {
-                                server_id: server_id.clone(),
-                                status: ServerStatus::Ready,
-                                error: None,
-                            })
-                            .await;
-                    }
-                    drop(reconcile);
-
-                    runtime.reconnecting.store(false, Ordering::SeqCst);
+                    runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                     return Ok(());
                 }
-                Err(e) => {
-                    let reconcile = self.reconcile_lock.lock().await;
-                    if runtime.shutdown.load(Ordering::SeqCst)
-                        || !self.is_current_runtime(&server_id, &runtime)
-                    {
-                        runtime.reconnecting.store(false, Ordering::SeqCst);
+                Err(error) => {
+                    let _sequence = self.event_sequence_lock.lock().await;
+                    let _reconcile = self.reconcile_lock.lock().await;
+                    if !self.is_current_publication(&expected) {
+                        runtime.runtime.reconnecting.store(false, Ordering::SeqCst);
                         return Ok(());
                     }
-                    warn!(
-                        "Reconnection attempt {} failed for MCP server '{}': {}",
-                        attempt, server_id, e
-                    );
-
-                    // Update error info
-                    let mut info = runtime.info.write().await;
-                    info.last_error = Some(e.to_string());
-                    drop(info);
-                    drop(reconcile);
-
-                    // Calculate next backoff with exponential increase
-                    if reconnect_config.max_backoff_ms > current_backoff {
-                        current_backoff =
-                            std::cmp::min(current_backoff * 2, reconnect_config.max_backoff_ms);
+                    runtime.runtime.info.write().await.last_error = Some(error.to_string());
+                    if reconnect.max_backoff_ms > backoff {
+                        backoff = backoff.saturating_mul(2).min(reconnect.max_backoff_ms);
                     }
                 }
             }
         }
     }
 
-    /// Internal method to reconnect a single server.
-    async fn reconnect_server(&self, runtime: Arc<ServerRuntime>) -> Result<bool> {
-        let server_id = runtime.config.id.clone();
-
-        info!("Attempting to reconnect MCP server '{}'", server_id);
-
-        // Disconnect existing client if connected
-        {
-            let mut client = runtime.client.write().await;
-            if client.is_connected().await {
-                let _ = client.disconnect().await;
-            }
-        }
-
-        let (client, tools, instructions, notification_rx) = self
-            .bootstrap_server_client(&server_id, &runtime.config, "reconnect")
-            .await?;
-
-        Ok(self
-            .publish_reconnected_runtime_if_current(
-                &server_id,
-                &runtime,
-                client,
-                tools,
-                instructions,
-                notification_rx,
+    pub(super) async fn reconnect_server(&self, expected: ExpectedPublication) -> Result<bool> {
+        let restart_count = expected
+            .runtime()
+            .runtime
+            .info
+            .read()
+            .await
+            .restart_count
+            .saturating_add(1);
+        let prepared = self
+            .prepare_server_runtime_with_restart(
+                expected.runtime().runtime.config.clone(),
+                "reconnect",
+                restart_count,
             )
-            .await)
+            .await?;
+        self.publish_reconnected_runtime_if_current(expected, prepared)
+            .await
     }
 
     pub(super) async fn publish_reconnected_runtime_if_current(
         &self,
-        server_id: &str,
-        runtime: &Arc<ServerRuntime>,
-        mut client: McpProtocolClient,
-        tools: Vec<McpTool>,
-        instructions: Option<String>,
-        notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
-    ) -> bool {
-        // Bootstrap may span a replacement. Serialize this final generation
-        // check with transactional commit before touching runtime state or the
-        // shared tool index.
-        let _reconcile = self.reconcile_lock.lock().await;
-        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
-            drop(_reconcile);
-            let _ = client.disconnect().await;
-            return false;
+        expected: ExpectedPublication,
+        prepared: PreparedServerRuntime,
+    ) -> Result<bool> {
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        if !self.is_current_publication(&expected) {
+            return Ok(false);
         }
-
-        // Update client
-        {
-            let mut client_lock = runtime.client.write().await;
-            *client_lock = client;
+        let replacement = prepared.publication().clone();
+        let base = self.authority.generation();
+        if !Arc::ptr_eq(
+            base.servers
+                .get(expected.server_id())
+                .expect("validated current server"),
+            &expected.publication,
+        ) {
+            return Ok(false);
         }
+        let next = McpRuntimeGeneration::plan(
+            &base,
+            std::slice::from_ref(&replacement),
+            &[],
+            self.authority.ledger_relationship_limit,
+            true,
+        )?;
 
-        // Spawn the notification drain only AFTER the new client is swapped in, so
-        // an immediate `tools/list_changed` refreshes against the NEW connection
-        // (not the old, disconnected one). (#420)
-        if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.to_string(), runtime.clone(), rx);
-        }
-
-        // Update tools
-        {
-            let mut tools_lock = runtime.tools.write().await;
-            *tools_lock = tools.clone();
-        }
-
-        // Refresh the server's prompt instructions from the new init result.
-        {
-            let mut info = runtime.info.write().await;
-            info.instructions = instructions;
-        }
-
-        // Re-register tools in index
-        self.index.remove_server_tools(server_id);
-        let aliases = self.index.register_server_tools(
-            server_id,
-            &tools,
-            &runtime.config.allowed_tools,
-            &runtime.config.denied_tools,
+        let events = self.prepare_event_batch(
+            sequence,
+            self.runtime_ready_events(&replacement),
+            Vec::new(),
         );
+        let mut commit = prepared.into_commit();
 
-        info!(
-            "Re-registered {} MCP tools for server '{}'",
-            aliases.len(),
-            server_id
-        );
-
-        // Emit tools changed event
-        if let Some(ref tx) = self.event_tx {
-            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
-            let _ = tx
-                .send(McpEvent::ToolsChanged {
-                    server_id: server_id.to_string(),
-                    tools: tool_names,
-                })
-                .await;
-        }
-
-        true
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::BeforeFenceAndSwap);
+        self.authority.replace_prevalidated_with(&base, next, || {
+            expected.publication.retire_with_runtime();
+            #[cfg(test)]
+            self.observe_publish(PublishProbePhase::AfterFencesBeforeSwap);
+        });
+        commit.mark_published();
+        commit.activate();
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::AfterTransferAndSwapBeforeUnlock);
+        drop(reconcile);
+        events.activate();
+        Ok(true)
     }
 
     pub(super) async fn bootstrap_server_client(
@@ -291,56 +173,29 @@ impl McpServerManager {
     )> {
         let transport = self.build_transport(&config.transport).await?;
         let mut client = McpProtocolClient::new(transport);
-
-        client.connect().await.map_err(|e| {
+        client.connect().await.map_err(|error| {
             error!(
                 "Failed to connect MCP server '{}' during {}: {}",
-                server_id, phase, e
+                server_id, phase, error
             );
-            e
+            error
         })?;
-
         let init_result = client
             .initialize(config.request_timeout_ms)
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 error!(
                     "Failed to initialize MCP server '{}' during {}: {}",
-                    server_id, phase, e
+                    server_id, phase, error
                 );
-                e
+                error
             })?;
-
-        info!(
-            "MCP server '{}' initialized during {}: {} v{}",
-            server_id, phase, init_result.server_info.name, init_result.server_info.version
-        );
-
-        // The server's optional `instructions` (how-to-use guidance) — surfaced
-        // into the system prompt while this server is connected.
         let instructions = init_result
             .instructions
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
+            .map(|instructions| instructions.trim().to_string())
+            .filter(|instructions| !instructions.is_empty());
         let tools = client.list_tools(config.request_timeout_ms).await?;
-        info!(
-            "MCP server '{}' has {} tools during {}",
-            server_id,
-            tools.len(),
-            phase
-        );
-
-        // Take this client's server-notification receiver (#366) and hand it BACK
-        // to the caller rather than spawning the drain here. The drain dispatches
-        // `tools/list_changed` -> `refresh_tools`, which resolves the runtime by
-        // `server_id` and reads `runtime.client` — so it must not start until the
-        // caller has REGISTERED the runtime (`start`) / SWAPPED in the new client
-        // (`reconnect`). Spawning it inside bootstrap raced those: an immediate
-        // notification could hit `ServerNotFound` (start) or read the old,
-        // disconnected client (reconnect). (#420)
         let notification_rx = client.take_notification_receiver().await;
-
         Ok((client, tools, instructions, notification_rx))
     }
 
@@ -350,14 +205,14 @@ impl McpServerManager {
                 Ok(Box::new(StdioTransport::new(stdio_config.clone())))
             }
             TransportConfig::Sse(sse_config) => {
-                // SSE uses HTTP; ensure it respects user-configured proxy settings when available.
-                if let Some(cfg_handle) = self.config.as_ref() {
-                    let cfg = cfg_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&cfg).map_err(|e| {
-                        McpError::InvalidConfig(format!(
-                            "Failed to build HTTP client for MCP SSE transport: {e}"
-                        ))
-                    })?;
+                if let Some(config_handle) = self.config.as_ref() {
+                    let config = config_handle.read().await.clone();
+                    let client =
+                        bamboo_llm::http_client::build_http_client(&config).map_err(|error| {
+                            McpError::InvalidConfig(format!(
+                                "Failed to build HTTP client for MCP SSE transport: {error}"
+                            ))
+                        })?;
                     Ok(Box::new(SseTransport::new_with_client(
                         sse_config.clone(),
                         client,
@@ -366,21 +221,22 @@ impl McpServerManager {
                     Ok(Box::new(SseTransport::new(sse_config.clone())))
                 }
             }
-            TransportConfig::StreamableHttp(sh_config) => {
-                // Streamable HTTP uses HTTP; respect user-configured proxy settings.
-                if let Some(cfg_handle) = self.config.as_ref() {
-                    let cfg = cfg_handle.read().await.clone();
-                    let client = bamboo_llm::http_client::build_http_client(&cfg).map_err(|e| {
-                        McpError::InvalidConfig(format!(
-                            "Failed to build HTTP client for MCP StreamableHTTP transport: {e}"
-                        ))
-                    })?;
+            TransportConfig::StreamableHttp(http_config) => {
+                if let Some(config_handle) = self.config.as_ref() {
+                    let config = config_handle.read().await.clone();
+                    let client = bamboo_llm::http_client::build_http_client(&config).map_err(
+                        |error| {
+                            McpError::InvalidConfig(format!(
+                                "Failed to build HTTP client for MCP StreamableHTTP transport: {error}"
+                            ))
+                        },
+                    )?;
                     Ok(Box::new(StreamableHttpTransport::new_with_client(
-                        sh_config.clone(),
+                        http_config.clone(),
                         client,
                     )))
                 } else {
-                    Ok(Box::new(StreamableHttpTransport::new(sh_config.clone())))
+                    Ok(Box::new(StreamableHttpTransport::new(http_config.clone())))
                 }
             }
         }

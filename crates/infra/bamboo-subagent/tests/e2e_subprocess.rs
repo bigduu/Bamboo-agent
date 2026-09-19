@@ -12,6 +12,39 @@ use bamboo_subagent::transport::ChildClient;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn typed_read_only_rejects_worker_without_capability_ack_before_provision() {
+    let worker = Path::new(env!("CARGO_BIN_EXE_subagent-demo-worker"));
+    let dir = TempDir::new().unwrap();
+    let fabric = dir.path().join("agents");
+    let mut spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: "legacy-read-only".into(),
+            parent_id: Some("p1".into()),
+            project_key: None,
+            role: "planner".into(),
+            depth: 0,
+        },
+        ExecutorSpec::Echo,
+        fabric.to_string_lossy().into_owned(),
+    );
+    spec.capabilities.read_only = true;
+
+    let error = match spawn_worker(worker, &[], &spec, Duration::from_secs(15)).await {
+        Ok(spawned) => {
+            spawned.kill().await;
+            panic!("a worker without the capability acknowledgement must be rejected");
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("worker capability probe failed"));
+    assert!(Fabric::at(&fabric)
+        .resolve("legacy-read-only")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn spawn_discover_run_stream_terminal() {
     let worker = Path::new(env!("CARGO_BIN_EXE_subagent-demo-worker"));
     let dir = TempDir::new().unwrap();
@@ -49,6 +82,7 @@ async fn spawn_discover_run_stream_terminal() {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -61,6 +95,7 @@ async fn spawn_discover_run_stream_terminal() {
     while let Some(frame) = client.next_frame().await.unwrap() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
+            ChildFrame::EventBatch { batch } => events.extend(batch.events),
             ChildFrame::ApprovalRequest { .. } => {}
             ChildFrame::SessionMessageAdmitted { confirmation } => {
                 panic!("echo run emitted unexpected SessionInbox confirmation: {confirmation:?}")
@@ -126,6 +161,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))

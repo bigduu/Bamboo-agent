@@ -16,6 +16,8 @@ pub trait LifecycleManager: Send + Sync {
     fn initialize_run(&self, session: &Session, config: &AgentLoopConfig) -> AgentRuntimeState;
 
     /// Prepare for a new round. Returns the round ID.
+    ///
+    /// `max_rounds` is the run's round cap; `None` = unlimited.
     #[allow(clippy::too_many_arguments)]
     async fn prepare_round(
         &self,
@@ -23,7 +25,7 @@ pub trait LifecycleManager: Send + Sync {
         task_context: &mut Option<TaskLoopContext>,
         runtime_state: &mut AgentRuntimeState,
         round: usize,
-        max_rounds: usize,
+        max_rounds: Option<usize>,
         config: &AgentLoopConfig,
         cancel_token: &CancellationToken,
         metrics_collector: Option<&bamboo_metrics::MetricsCollector>,

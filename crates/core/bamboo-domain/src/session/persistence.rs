@@ -5,6 +5,17 @@ use crate::session::task::TaskList;
 use crate::session::types::Session;
 use crate::session::PermissionAuditSeed;
 
+/// Result of the retrieval-window-specific execute-boundary checkpoint.
+///
+/// `Rebased` means persistence observed a newer durable transcript, made no
+/// write, and replaced the caller's staged value with a clean reconciled base
+/// that must be planned and prepared again before dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalWindowCheckpointOutcome {
+    Committed,
+    Rebased,
+}
+
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
 ///
@@ -28,6 +39,10 @@ pub fn append_missing_runtime_messages(session: &mut Session, durable: &Session)
         .collect::<Vec<_>>();
     let appended = missing.len();
     session.messages = durable.messages.iter().cloned().chain(missing).collect();
+    // Provider-native groups are message-anchored and append-only as well. A
+    // concurrent durable prefix must not be erased by a stale runner save, and
+    // a runner's newly completed group must remain paired with its new message.
+    session.merge_provider_transcript_from_durable(durable);
     appended
 }
 
@@ -293,6 +308,86 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Atomically commit a staged retrieval-window transcript rewrite.
+    ///
+    /// `expected_base` is the exact pre-archive Session used for planning.
+    /// Implementations must compare it with the latest durable transcript while
+    /// holding their per-session serialization lock. If a concurrent append or
+    /// rewrite is present, they must perform no save, rebase `staged` onto that
+    /// durable snapshot, and return [`RetrievalWindowCheckpointOutcome::Rebased`].
+    /// Otherwise they must preserve the staged message archive flags and commit
+    /// them with the compression event and model-context reset.
+    ///
+    /// There is no safe fallback through the ordinary append-only checkpoint,
+    /// because that path deliberately restores durable message clones and would
+    /// erase the new archive flags. Custom persisters therefore fail closed
+    /// until they implement this boundary explicitly.
+    async fn checkpoint_retrieval_window(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support retrieval-window checkpoints",
+        ))
+    }
+
+    /// Atomically commit a provider-visible System-prompt rewrite.
+    ///
+    /// This is deliberately separate from both the append-safe runtime
+    /// checkpoint (which must restore durable message content) and the
+    /// retrieval-window archive checkpoint (which requires a new archive
+    /// event). Implementations compare `expected_base` under their per-session
+    /// lock, return `Rebased` without writing on conflict, and accept only the
+    /// bounded prompt rewrite plus its provider/model-context reset.
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support prompt-rewrite checkpoints",
+        ))
+    }
+
+    /// Atomically commit one permanently rejected `archive_context` result.
+    ///
+    /// This boundary permits only the correlated Tool result rewrite, the
+    /// bounded consumed/rejection metadata, and the provider/model-context
+    /// reset required to make that rewrite visible. Implementations compare
+    /// `expected_base` under their per-session lock and return `Rebased`
+    /// without writing when the durable transcript changed concurrently.
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support manual archive-rejection checkpoints",
+        ))
+    }
+
+    /// Atomically consume one successful no-op `archive_context` request.
+    ///
+    /// This boundary permits only the correlated consumed-occurrence marker.
+    /// Implementations compare `expected_base` under their per-session lock
+    /// and return `Rebased` without writing when any durable transcript,
+    /// metadata, runtime metadata, or execution-profile field changed. The
+    /// caller must then restage the marker from the returned durable snapshot.
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support manual archive-consumption checkpoints",
+        ))
+    }
+
     /// Load the latest runtime-visible session snapshot when the persistence
     /// implementation can coordinate reads. Tools may update a repository-owned
     /// clone while an agent loop holds its own live Session; the loop uses this
@@ -413,6 +508,46 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_retrieval_window(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_prompt_rewrite(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_manual_archive_rejection(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_manual_archive_consumption(expected_base, staged)
+            .await
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> io::Result<Option<Session>> {

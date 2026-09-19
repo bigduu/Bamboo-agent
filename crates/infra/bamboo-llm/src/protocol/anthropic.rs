@@ -208,7 +208,9 @@ impl ToProvider<AnthropicTool> for ToolSchema {
         Ok(AnthropicTool {
             name: self.function.name.clone(),
             description: Some(self.function.description.clone()),
-            input_schema: self.function.parameters.clone(),
+            input_schema: crate::providers::common::tool_schema::canonicalize_json_value(
+                &self.function.parameters,
+            ),
         })
     }
 }

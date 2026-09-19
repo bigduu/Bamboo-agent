@@ -23,13 +23,45 @@ pub fn sanitize_openai_function_parameters_schema(parameters: &Value) -> Value {
         object.insert("properties".to_string(), json!({}));
     }
 
-    Value::Object(object)
+    canonicalize_json_value(&Value::Object(object))
+}
+
+/// Canonical object ordering for provider-visible schemas; array order is semantic.
+pub fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonicalize_json_value(&object[key])))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_openai_function_parameters_schema;
+    use super::{canonicalize_json_value, sanitize_openai_function_parameters_schema};
     use serde_json::json;
+
+    #[test]
+    fn schema_bytes_are_independent_of_object_insertion_order() {
+        let a: serde_json::Value = serde_json::from_str(r#"{"properties":{"z":{"type":"string","description":"z"},"a":{"type":"number"}},"required":["z","a"]}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{"required":["z","a"],"properties":{"a":{"type":"number"},"z":{"description":"z","type":"string"}}}"#).unwrap();
+        assert_eq!(
+            canonicalize_json_value(&a).to_string(),
+            canonicalize_json_value(&b).to_string()
+        );
+        assert_eq!(canonicalize_json_value(&a)["required"], json!(["z", "a"]));
+        assert_eq!(
+            sanitize_openai_function_parameters_schema(&a).to_string(),
+            sanitize_openai_function_parameters_schema(&b).to_string()
+        );
+    }
 
     #[test]
     fn sanitize_removes_forbidden_top_level_keywords() {

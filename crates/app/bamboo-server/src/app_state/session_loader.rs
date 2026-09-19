@@ -109,7 +109,7 @@ mod tests {
         // Seed memory cache.
         state.sessions.insert(
             session_id.to_string(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
 
         let loaded = state.load_session(session_id).await;
@@ -182,7 +182,7 @@ mod tests {
 
         state.sessions.insert(
             session_id.to_string(),
-            Arc::new(parking_lot::RwLock::new(memory_session)),
+            Arc::new(bamboo_engine::SessionSnapshot::new(memory_session)),
         );
         state
             .storage

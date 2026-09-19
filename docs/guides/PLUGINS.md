@@ -109,3 +109,11 @@ into `~/.bamboo/workflows`. Check registered shared capabilities with
 `skill_dirs` fields), or `bamboo mcp status` for MCP servers specifically.
 `workflow_filenames` is retained only to clean provenance written by older
 installers and is empty for new installs.
+
+## ToolEvent sink example
+
+[`examples/tool-event-recorder`](../../examples/tool-event-recorder/README.md)
+is an independently buildable native service/plugin that consumes only the
+public ToolEvent protocol. It includes the generated JSON schema, a
+metadata-only golden event, cross-platform bundle layout, explicit permission
+upgrade guidance, delivery guarantees and limits, and lifecycle diagnostics.

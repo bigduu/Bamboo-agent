@@ -1,7 +1,8 @@
 //! Wire protocol: discovery record + parent/child WebSocket frames.
 //!
 //! The session/event payloads are kept opaque (`serde_json::Value`) so this crate stays a leaf;
-//! the real `AgentEvent` serializes into [`ChildFrame::Event`] verbatim (design §6, zero mapping).
+//! the real `AgentEvent` serializes into a sequenced [`ActorEventBatch`]. The legacy
+//! [`ChildFrame::Event`] remains decodable during rolling upgrades.
 
 use bamboo_domain::{ProjectId, SessionActivationPolicy, SessionMessageEnvelope};
 use chrono::{DateTime, Utc};
@@ -57,6 +58,13 @@ pub struct RunSpec {
     /// a delivery's own run-id field is never accepted as self-authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_run_id: Option<String>,
+    /// Host-issued fencing epoch for this concrete execution attempt. A retry
+    /// on a different worker gets a newer epoch even when it belongs to the
+    /// same logical activation, so late frames from the replaced worker can be
+    /// rejected. Zero is reserved for legacy senders and selects the legacy
+    /// one-event wire shape on a new worker during rolling upgrades.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub execution_epoch: u64,
     /// Canonical logical-session deliveries that caused this idle actor
     /// activation. The worker durably enqueues these before entering its first
     /// provider boundary, then confirms admission over the child frame stream.
@@ -75,6 +83,214 @@ pub struct LogicalSessionIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Delivery semantics for one actor event batch.
+///
+/// `Durable` batches must use the broker's acknowledged mailbox lane.
+/// `Snapshot` and `Ephemeral` batches may use the bounded live lane: sequence
+/// gaps tell a consumer to reload the authoritative session snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorEventQos {
+    Durable,
+    Snapshot,
+    Ephemeral,
+}
+
+impl ActorEventQos {
+    /// Classify opaque serialized `AgentEvent` JSON without making this leaf
+    /// crate depend on `bamboo-agent-core`.
+    pub fn classify(event: &serde_json::Value) -> Self {
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token" | "reasoning_token" | "tool_token" | "sub_agent_heartbeat") => {
+                Self::Ephemeral
+            }
+            // A raw child projection inherits the inner event's semantics. New
+            // hosts no longer recursively project these to parents, but this is
+            // needed for rolling-upgrade workers that still do.
+            Some("sub_agent_event") => event
+                .get("event")
+                .map(Self::classify)
+                .unwrap_or(Self::Durable),
+            Some("runner_progress" | "token_budget_updated" | "context_pressure_notification") => {
+                Self::Snapshot
+            }
+            // This is a versioned delta, not a reconstructable full snapshot.
+            // Losing it can leave task state behind even when later unrelated
+            // events arrive, and core exposes it on the durable account feed.
+            Some("task_list_item_progress") => Self::Durable,
+            // Unknown events are never silently downgraded onto a lossy lane.
+            _ => Self::Durable,
+        }
+    }
+}
+
+/// Maximum event count accepted in one actor wire batch. This bounds decode
+/// and fan-out work per frame independently of payload byte limits enforced by
+/// WebSocket implementations.
+pub const MAX_ACTOR_EVENT_BATCH_EVENTS: usize = 64;
+
+/// A compact, ordered actor event batch. Route/fencing metadata is common to
+/// the batch; `first_seq..=last_seq` assigns one sequence number per item in
+/// `events` and is scoped to `(logical session, activation, execution epoch)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorEventBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_session: Option<LogicalSessionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub execution_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_actor_id: Option<String>,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub qos: ActorEventQos,
+    pub events: Vec<serde_json::Value>,
+}
+
+impl ActorEventBatch {
+    /// Reject malformed ranges, oversized batches, and QoS downgrades before a
+    /// broker routes the frame onto a lossy lane.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.events.is_empty() {
+            return Err("actor event batch is empty".to_string());
+        }
+        if self.events.len() > MAX_ACTOR_EVENT_BATCH_EVENTS {
+            return Err(format!(
+                "actor event batch has {} events; maximum is {MAX_ACTOR_EVENT_BATCH_EVENTS}",
+                self.events.len()
+            ));
+        }
+        let expected_last = self
+            .first_seq
+            .checked_add(self.events.len() as u64 - 1)
+            .ok_or_else(|| "actor event batch sequence range overflows".to_string())?;
+        if self.first_seq == 0 || self.last_seq != expected_last {
+            return Err("actor event batch has an invalid sequence range".to_string());
+        }
+        if self
+            .events
+            .iter()
+            .any(|event| ActorEventQos::classify(event) != self.qos)
+        {
+            return Err("actor event batch QoS does not match its events".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingActorEventBatch {
+    first_seq: u64,
+    qos: ActorEventQos,
+    events: Vec<serde_json::Value>,
+}
+
+/// Per-run event batch builder shared by direct and broker transports. Durable
+/// events flush immediately; snapshot/ephemeral events coalesce until a QoS
+/// boundary, size bound, or the caller's latency timer fires.
+#[derive(Debug)]
+pub struct ActorEventBatcher {
+    logical_session: Option<LogicalSessionIdentity>,
+    activation_id: Option<String>,
+    execution_epoch: u64,
+    source_node_id: Option<String>,
+    source_actor_id: Option<String>,
+    next_seq: u64,
+    pending: Option<PendingActorEventBatch>,
+}
+
+impl ActorEventBatcher {
+    pub fn for_run(
+        spec: &RunSpec,
+        source_node_id: Option<String>,
+        source_actor_id: Option<String>,
+    ) -> Self {
+        Self {
+            logical_session: spec.logical_session.clone(),
+            activation_id: spec.activation_run_id.clone(),
+            execution_epoch: spec.execution_epoch,
+            source_node_id,
+            source_actor_id,
+            next_seq: 1,
+            pending: None,
+        }
+    }
+
+    /// Add one event and return every batch that became ready. At most two are
+    /// returned: an older lossy batch followed by an immediate durable event.
+    pub fn push(&mut self, event: serde_json::Value) -> Vec<ActorEventBatch> {
+        let qos = ActorEventQos::classify(&event);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let mut ready = Vec::with_capacity(2);
+
+        if qos == ActorEventQos::Durable {
+            if let Some(batch) = self.flush() {
+                ready.push(batch);
+            }
+            ready.push(self.build(seq, qos, vec![event]));
+            return ready;
+        }
+
+        let boundary = self.pending.as_ref().is_some_and(|pending| {
+            pending.qos != qos || pending.events.len() >= MAX_ACTOR_EVENT_BATCH_EVENTS
+        });
+        if boundary {
+            if let Some(batch) = self.flush() {
+                ready.push(batch);
+            }
+        }
+        let pending = self.pending.get_or_insert_with(|| PendingActorEventBatch {
+            first_seq: seq,
+            qos,
+            events: Vec::with_capacity(MAX_ACTOR_EVENT_BATCH_EVENTS),
+        });
+        pending.events.push(event);
+        if pending.events.len() >= MAX_ACTOR_EVENT_BATCH_EVENTS {
+            if let Some(batch) = self.flush() {
+                ready.push(batch);
+            }
+        }
+        ready
+    }
+
+    pub fn flush(&mut self) -> Option<ActorEventBatch> {
+        let pending = self.pending.take()?;
+        Some(self.build(pending.first_seq, pending.qos, pending.events))
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn build(
+        &self,
+        first_seq: u64,
+        qos: ActorEventQos,
+        events: Vec<serde_json::Value>,
+    ) -> ActorEventBatch {
+        let last_seq = first_seq + events.len() as u64 - 1;
+        ActorEventBatch {
+            logical_session: self.logical_session.clone(),
+            activation_id: self.activation_id.clone(),
+            execution_epoch: self.execution_epoch,
+            source_node_id: self.source_node_id.clone(),
+            source_actor_id: self.source_actor_id.clone(),
+            first_seq,
+            last_seq,
+            qos,
+            events,
+        }
+    }
 }
 
 /// One canonical inbox claim forwarded to an active actor. The activation run
@@ -273,6 +489,9 @@ pub enum ParentFrame {
 pub enum ChildFrame {
     /// One agent event, serialized verbatim (the real `AgentEvent` lands here as JSON).
     Event { event: serde_json::Value },
+    /// Sequenced event batch used by current workers. Route metadata prevents a
+    /// stale/replaced Cluster actor from updating the wrong logical activation.
+    EventBatch { batch: ActorEventBatch },
     /// The worker hit a tool needing human approval (Phase 2 child→parent
     /// approval delegation). Proxied to the host — which surfaces it to the
     /// human via the parent session's pending-question / notification path. The
@@ -290,9 +509,9 @@ pub enum ChildFrame {
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        /// Full worker transcript (serialized domain `Message`s) shipped on
-        /// suspend so the host can persist it onto the child session and
-        /// rehydrate the worker on resume. Empty for non-suspend terminals.
+        /// Compatibility-only suspend payload. Current hosts reject Suspended
+        /// and never consume this field; canonical session checkpoints are the
+        /// transcript authority. Retained for rolling wire compatibility.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transcript: Vec<serde_json::Value>,
     },
@@ -343,6 +562,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }),
@@ -359,6 +579,27 @@ mod tests {
             event: serde_json::json!({"type":"token","content":"hi"}),
         };
         assert_eq!(ChildFrame::from_text(&e.to_text()).unwrap(), e);
+        let batch = ChildFrame::EventBatch {
+            batch: ActorEventBatch {
+                logical_session: Some(LogicalSessionIdentity {
+                    session_id: "child".into(),
+                    parent_session_id: Some("parent".into()),
+                    root_session_id: "root".into(),
+                }),
+                activation_id: Some("run-7".into()),
+                execution_epoch: 9,
+                source_node_id: Some("node-a".into()),
+                source_actor_id: Some("worker-2".into()),
+                first_seq: 1,
+                last_seq: 2,
+                qos: ActorEventQos::Ephemeral,
+                events: vec![
+                    serde_json::json!({"type":"token","content":"a"}),
+                    serde_json::json!({"type":"token","content":"b"}),
+                ],
+            },
+        };
+        assert_eq!(ChildFrame::from_text(&batch.to_text()).unwrap(), batch);
         let t = ChildFrame::Terminal {
             status: TerminalStatus::Completed,
             result: Some("done".into()),
@@ -404,6 +645,7 @@ mod tests {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
@@ -433,6 +675,7 @@ mod tests {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: RunSecrets {
                 codex_provider_token: Some(secret),
@@ -463,6 +706,7 @@ mod tests {
             permission_policy: Some(context.clone()),
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
@@ -547,6 +791,7 @@ mod tests {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
@@ -562,5 +807,81 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("invalid project id"));
+    }
+
+    #[test]
+    fn actor_event_batcher_sequences_and_separates_qos() {
+        let spec = RunSpec {
+            assignment: "work".into(),
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: "child".into(),
+                parent_session_id: Some("parent".into()),
+                root_session_id: "root".into(),
+            }),
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: Vec::new(),
+            activation_run_id: Some("activation-1".into()),
+            execution_epoch: 4,
+            initial_session_messages: Vec::new(),
+            secrets: Default::default(),
+        };
+        let mut batcher =
+            ActorEventBatcher::for_run(&spec, Some("node-a".into()), Some("actor-a".into()));
+        assert!(batcher
+            .push(serde_json::json!({"type":"token","content":"a"}))
+            .is_empty());
+        assert!(batcher
+            .push(serde_json::json!({"type":"token","content":"b"}))
+            .is_empty());
+
+        let ready = batcher.push(serde_json::json!({
+            "type":"tool_start",
+            "tool_call_id":"t1",
+            "tool_name":"Read",
+            "arguments":{}
+        }));
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].qos, ActorEventQos::Ephemeral);
+        assert_eq!((ready[0].first_seq, ready[0].last_seq), (1, 2));
+        assert_eq!(ready[1].qos, ActorEventQos::Durable);
+        assert_eq!((ready[1].first_seq, ready[1].last_seq), (3, 3));
+        assert!(ready.iter().all(|batch| batch.validate().is_ok()));
+        assert_eq!(ready[1].activation_id.as_deref(), Some("activation-1"));
+        assert_eq!(ready[1].execution_epoch, 4);
+        assert!(!batcher.has_pending());
+    }
+
+    #[test]
+    fn actor_event_batch_rejects_qos_downgrade_and_bad_range() {
+        let mut batch = ActorEventBatch {
+            logical_session: None,
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: None,
+            first_seq: 1,
+            last_seq: 1,
+            qos: ActorEventQos::Ephemeral,
+            events: vec![serde_json::json!({"type":"tool_start"})],
+        };
+        assert!(batch.validate().unwrap_err().contains("QoS"));
+        batch.qos = ActorEventQos::Durable;
+        batch.last_seq = 2;
+        assert!(batch.validate().unwrap_err().contains("sequence"));
+    }
+
+    #[test]
+    fn task_item_progress_delta_is_never_put_on_a_lossy_lane() {
+        let event = serde_json::json!({
+            "type": "task_list_item_progress",
+            "session_id": "child",
+            "item_id": "task-1",
+            "status": "in_progress",
+            "tool_calls_count": 2,
+            "version": 3
+        });
+        assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
     }
 }

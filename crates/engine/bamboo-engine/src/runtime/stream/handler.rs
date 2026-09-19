@@ -186,6 +186,9 @@ pub struct StreamHandlingOutput {
     /// total with a saturating, cache-subset policy; the raw total remains in
     /// [`Self::provider_usage`].
     pub input_tokens: u64,
+    /// Validated native items awaiting atomic commit with this round's ordinary
+    /// assistant message. Never exposed as streaming UI events.
+    pub provider_transcript_items: Vec<bamboo_domain::ProviderTranscriptItem>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

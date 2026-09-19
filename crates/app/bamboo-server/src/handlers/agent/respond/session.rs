@@ -30,7 +30,7 @@ mod tests {
 
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(memory_session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(memory_session)),
         );
         state
             .storage

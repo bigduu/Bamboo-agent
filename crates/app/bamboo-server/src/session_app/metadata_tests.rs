@@ -446,6 +446,7 @@ async fn manual_title_beats_generated_title_without_lying_event() {
 async fn set_pinned_then_runtime_save_does_not_clobber() {
     let state = make_state().await;
     seed_session(&state, "p1", "Title").await;
+    let mut runtime_copy = state.storage.load_session("p1").await.unwrap().unwrap();
 
     SessionMetadataService::set_pinned(&state, "p1", true, None)
         .await
@@ -455,11 +456,6 @@ async fn set_pinned_then_runtime_save_does_not_clobber() {
     let after_pin = state.storage.load_session("p1").await.unwrap().unwrap();
     assert!(after_pin.pinned);
     assert_eq!(after_pin.metadata_version, 1);
-
-    let mut runtime_copy = Session::new("p1".to_string(), "test-model");
-    runtime_copy.pinned = false;
-    runtime_copy.metadata_version = 0;
-    runtime_copy.title = "Title".to_string();
 
     state
         .persistence

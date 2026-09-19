@@ -1,0 +1,1 @@
+{"schema_version":1,"event_type":"file_changed","subscription_id":"tool.file_changed.v1","context":{"session_id":"session-1","root_session_id":"root-session-1","tool_name":"Write","tool_call_id":"call-1"},"data":{"path":"/workspace/zenith/src/lib.rs"}}

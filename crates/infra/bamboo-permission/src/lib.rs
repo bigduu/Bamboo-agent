@@ -46,7 +46,7 @@ pub use checker::{
     is_read_only_command, is_safe_edit_command, AllowAllPermissionChecker, ConfigPermissionChecker,
     DenyDangerousPermissionChecker, GuardianReadOnlyChecker, LoggingPermissionChecker,
     ModeAwarePermissionChecker, PermissionChecker, PermissionCheckerExt, PermissionContext,
-    PermissionError, PermissionResult,
+    PermissionError, PermissionResult, ReadOnlyCommandChecker,
 };
 pub use config::{
     explicit_deny_policy_reason, PermissionConfig, PermissionMode, PermissionRule, PermissionType,

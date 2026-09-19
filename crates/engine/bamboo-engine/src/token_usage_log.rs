@@ -132,6 +132,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 42,
             thinking_tokens: 7,
             cache_read_input_tokens: 12_000,
+            provider_prompt_usage: None,
         };
         let record = TokenUsageRecord::new(
             "2026-06-15T00:00:00Z".to_string(),

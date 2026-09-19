@@ -78,7 +78,7 @@ pub async fn handler(state: web::Data<AppState>) -> Result<HttpResponse> {
         .map(|(session_id, runner)| {
             (
                 session_id.clone(),
-                runner.last_event_at.unwrap_or(runner.started_at),
+                runner.last_activity_at().unwrap_or(runner.started_at),
             )
         })
         .collect::<HashMap<_, _>>();

@@ -39,8 +39,22 @@ use uuid::Uuid;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
-    MessagePart, ProjectId, Role, Session, SessionKind, TaskList, TokenBudgetUsage,
+    MessagePart, ProjectId, Role, Session, SessionAuthorityIdentity, SessionKind,
+    SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
+
+mod root_context;
+#[cfg(test)]
+mod root_context_tests;
+mod root_lifetime;
+#[cfg(test)]
+mod root_lifetime_tests;
+mod supervisor;
+mod supervisor_management;
+#[cfg(test)]
+mod supervisor_management_tests;
+#[cfg(test)]
+mod supervisor_tests;
 
 use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
@@ -264,9 +278,13 @@ pub struct SessionCopyProjectionGuard {
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
-fn runtime_sidecar_snapshot(session: &Session) -> Session {
+pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    // Native transcript groups are committed atomically with the ordinary
+    // message that anchors them. Never let runtime.json expose a load/search
+    // item without the corresponding session.json history boundary.
+    snapshot.provider_transcript = Default::default();
     if let Some(metadata) = snapshot.runtime_metadata.as_mut() {
         // Admission ids must be committed atomically with their transcript
         // messages in session.json. Duplicating them into runtime.json would
@@ -291,6 +309,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
                 .as_ref()
                 .and_then(|metadata| metadata.session_inbox_admission.clone());
             side.messages = main.messages;
+            side.provider_transcript = main.provider_transcript;
             if let Some(admission) = admission {
                 side.runtime_metadata
                     .get_or_insert_with(Default::default)
@@ -1029,6 +1048,8 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
+    #[cfg(test)]
+    root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1083,6 +1104,8 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
 fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
+    copy.authority_identity = SessionAuthorityIdentity::Ordinary;
+    copy.supervisor_management = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -1121,6 +1144,9 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         copy.messages.pop();
     }
     copy.clear_derived_context_state();
+    // A copied conversation is a normalized history fork, not a continuation
+    // of the source provider's native loading/cache epoch.
+    copy.provider_transcript = Default::default();
     copy.model_context_state = None;
     copy.prompt_snapshot = None;
     for message in &mut copy.messages {
@@ -1320,6 +1346,8 @@ impl SessionStoreV2 {
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            root_publication_fault: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -1341,10 +1369,24 @@ impl SessionStoreV2 {
             storage
                 .recover_all_session_copy_transactions_locked()
                 .await?;
+            storage.reconcile_root_revocations().await?;
         }
 
         if needs_rebuild {
             storage.rebuild_index_from_disk().await?;
+            // Compatibility rebuild reads can recover children or a main-file
+            // fallback from an unavailable recreated Root. Reconcile the same
+            // canonical revocation evidence after the scan as well, without
+            // introducing another durable quarantine or recovery state.
+            let _lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+            storage
+                .recover_all_runtime_task_transactions_locked()
+                .await?;
+            storage
+                .recover_all_session_copy_transactions_locked()
+                .await?;
+            storage.reconcile_root_revocations().await?;
         }
 
         Ok(storage)
@@ -1516,7 +1558,7 @@ impl SessionStoreV2 {
     ) -> io::Result<bool> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let Some(session) = Self::load_session_from_dir(abs_dir, session_id).await else {
+        let Some(session) = self.load_session_from_dir(abs_dir, session_id).await else {
             return Ok(false);
         };
         self.repair_index_from_authoritative_session(&session, rel_path)
@@ -1533,7 +1575,7 @@ impl SessionStoreV2 {
     /// missing `session.json` yields `None` silently; a corrupt/unreadable one is
     /// skipped with a warning; a sidecar read error degrades to "no sidecar"
     /// rather than failing recovery. `id` is used only for log context.
-    async fn load_session_from_dir(abs_dir: &Path, id: &str) -> Option<Session> {
+    async fn load_session_from_dir(&self, abs_dir: &Path, id: &str) -> Option<Session> {
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
@@ -1549,6 +1591,14 @@ impl SessionStoreV2 {
                 return None;
             }
         };
+        match self.session_lifetime_is_live(&main).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!("index rebuild: skipping unavailable Root lifetime {id}: {error}");
+                return None;
+            }
+        }
         let sidecar =
             match Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), id).await {
                 Ok(sidecar) => sidecar,
@@ -1557,6 +1607,10 @@ impl SessionStoreV2 {
                     None
                 }
             };
+        if let Err(error) = supervisor::validate_overlay(&main, sidecar.as_ref()) {
+            tracing::warn!("index rebuild: skipping invalid authority for {id}: {error}");
+            return None;
+        }
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Some(session)
@@ -1566,6 +1620,7 @@ impl SessionStoreV2 {
     /// a missing source from corrupt/unreadable authoritative state and must
     /// never silently fall back to stale `session.json` control-plane data.
     async fn load_session_from_dir_strict(
+        &self,
         abs_dir: &Path,
         id: &str,
         expected_kind: SessionKind,
@@ -1601,6 +1656,9 @@ impl SessionStoreV2 {
         if canonical_legacy_root {
             main.root_session_id = id.to_string();
         }
+        if !self.session_lifetime_is_live(&main).await? {
+            return Ok(None);
+        }
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let sidecar = match fs::read_to_string(&runtime_path).await {
             Ok(raw) => {
@@ -1631,6 +1689,7 @@ impl SessionStoreV2 {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -1677,6 +1736,34 @@ impl SessionStoreV2 {
     /// not require this; it exists for callers that require search read-after-write.
     pub async fn flush_search_index(&self) {
         self.search_index_queue.flush().await;
+    }
+
+    /// Read the durable source revision paired with a Session's derived search
+    /// snapshot. Callers compare this marker with the revision stored in SQLite
+    /// after a queue flush; absence or mismatch means search completeness is
+    /// unknown and must fail over to canonical Session data.
+    pub async fn search_source_revision(&self, session_id: &str) -> io::Result<Option<String>> {
+        let Some(session_json) = self.session_json_path(session_id).await? else {
+            return Ok(None);
+        };
+        let session_dir = session_json.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session path has no parent")
+        })?;
+        match fs::read_to_string(session_dir.join(SEARCH_INDEX_REVISION_FILE)).await {
+            Ok(revision) => {
+                let revision = revision.trim();
+                if revision.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty search-index revision marker",
+                    ))
+                } else {
+                    Ok(Some(revision.to_string()))
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn persistence_metrics(&self) -> SessionPersistenceMetricsSnapshot {
@@ -1772,12 +1859,9 @@ impl SessionStoreV2 {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let guard = lock.lock_owned().await;
-        // Construct the self-cleaning guard before awaiting the cross-process
-        // file lock. If this future is cancelled while flock is contended, the
-        // process-local DashMap entry is still reclaimed.
+        // Arm cleanup before either the process-local or cross-process wait.
         let mut session_guard = SessionWriteGuard {
-            guard: Some(guard),
+            guard: None,
             file: None,
             locks: self.session_write_locks.clone(),
             session_id: session_id.to_string(),
@@ -1785,6 +1869,7 @@ impl SessionStoreV2 {
             acquired: Instant::now(),
             metrics: self.persistence_metrics.clone(),
         };
+        session_guard.guard = Some(lock.lock_owned().await);
         let file = self.open_session_write_lock_file(session_id).await?;
         session_guard.file = Some(file);
         drop(waiting);
@@ -2123,6 +2208,9 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
     ) -> io::Result<Option<Session>> {
+        if self.root_directory_is_revoked(session_id).await? {
+            return Ok(None);
+        }
         let abs_dir = self.sessions_dir.join(session_id);
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
@@ -2137,6 +2225,7 @@ impl SessionStoreV2 {
         })?;
         let sidecar =
             Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), session_id).await?;
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         if session.id != session_id || session.kind != SessionKind::Root {
@@ -2387,8 +2476,15 @@ impl SessionStoreV2 {
         session_id: &str,
     ) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
+        if session_id == DEFAULT_SUPERVISOR_SESSION_ID {
+            if let Some(root) = self.load_root_authority_unchecked(session_id).await? {
+                return Ok(Some(root));
+            }
+            // An Ordinary Child may already own this ID in another tree.
+            // Only canonical Root absence permits its normal control-plane read.
+        }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
-            return Ok(Some(side));
+            return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
             return Ok(None);
@@ -2400,6 +2496,10 @@ impl SessionStoreV2 {
         };
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+        supervisor::validate_identity(&session)?;
+        if !self.session_lifetime_is_live(&session).await? {
+            return Ok(None);
+        }
         session.messages.clear();
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -2716,9 +2816,11 @@ impl SessionStoreV2 {
                 ));
             }
         }
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.messages.clear();
         session.clear_stale_root_token_budget();
+        self.validate_root_context_for_save(&session).await?;
         Ok(Some((abs_dir, session)))
     }
 
@@ -3158,19 +3260,20 @@ impl SessionStoreV2 {
         })?;
         if state == SessionCopyJournalMarkerState::Committed {
             let target_dir = self.sessions_dir.join(&journal.target_id);
-            let target = Self::load_session_from_dir_strict(
-                &target_dir,
-                &journal.target_id,
-                SessionKind::Root,
-                &journal.target_id,
-            )
-            .await?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "committed copied session target is missing",
+            let target = self
+                .load_session_from_dir_strict(
+                    &target_dir,
+                    &journal.target_id,
+                    SessionKind::Root,
+                    &journal.target_id,
                 )
-            })?;
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "committed copied session target is missing",
+                    )
+                })?;
             if target.kind != SessionKind::Root || target.root_session_id != target.id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3327,7 +3430,11 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
-        if !Self::runtime_task_owned_snapshot_matches(&current, original)? {
+        self.validate_root_context_for_save(&current).await?;
+        if current.authority_identity != original.authority_identity
+            || current.supervisor_management != original.supervisor_management
+            || !Self::runtime_task_owned_snapshot_matches(&current, original)?
+        {
             return Ok(false);
         }
         let mut committed = current;
@@ -3415,7 +3522,13 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
-        if !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
+        self.validate_root_context_for_save(&current_first).await?;
+        self.validate_root_context_for_save(&current_second).await?;
+        if current_first.authority_identity != first_original.authority_identity
+            || current_second.authority_identity != second_original.authority_identity
+            || current_first.supervisor_management != first_original.supervisor_management
+            || current_second.supervisor_management != second_original.supervisor_management
+            || !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
             || !Self::runtime_task_owned_snapshot_matches(&current_second, second_original)?
         {
             return Ok(false);
@@ -3586,10 +3699,22 @@ impl SessionStoreV2 {
     /// their cache. Fail before any write so the locked persistence boundary
     /// can adopt the durable Task fields and retry with one coherent snapshot.
     async fn reject_regressing_runtime_task(&self, incoming: &Session) -> io::Result<()> {
-        if let Some(durable) = self
-            .load_runtime_control_plane_unchecked(&incoming.id)
+        let durable = if incoming.kind == SessionKind::Root {
+            // Root writers also operate with an out-of-date local index. The
+            // final Root fence has validated this canonical sidecar already.
+            Self::read_runtime_sidecar_at(
+                &self
+                    .sessions_dir
+                    .join(&incoming.id)
+                    .join(RUNTIME_SIDECAR_FILE),
+                &incoming.id,
+            )
             .await?
-        {
+        } else {
+            self.load_runtime_control_plane_unchecked(&incoming.id)
+                .await?
+        };
+        if let Some(durable) = durable {
             if Self::ordinary_task_write_would_regress(incoming, &durable)? {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -3628,6 +3753,7 @@ impl SessionStoreV2 {
     /// (potentially huge) `messages` history cleared. This is what makes
     /// runtime-only saves O(1) in conversation length.
     async fn write_runtime_sidecar(&self, abs_dir: &Path, session: &Session) -> io::Result<()> {
+        self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
         let bytes =
@@ -3643,6 +3769,7 @@ impl SessionStoreV2 {
         abs_dir: &Path,
         session: &Session,
     ) -> io::Result<()> {
+        self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
         let bytes = serde_json::to_vec_pretty(&snapshot)
@@ -3650,14 +3777,13 @@ impl SessionStoreV2 {
         durable_atomic_write(&path, &bytes).await
     }
 
-    /// One-shot migration: create the runtime sidecar (`runtime.json`) for every
-    /// existing session that predates the message/control-plane split.
+    /// One-shot migration of legacy Child sidecars (`runtime.json`).
     ///
     /// Loading already tolerates a missing sidecar (it falls back to the embedded
-    /// control-plane in `session.json`), so this is an *optimization* migration,
-    /// not a correctness one — but running it once means the fast runtime-save
-    /// path is in effect immediately for legacy sessions, and the denormalized
-    /// `children` id vectors (now `#[serde(skip)]`) drop out of the sidecar.
+    /// control-plane in `session.json`). A main-only Root is indistinguishable
+    /// from a Root that lost a newer Project revision, so it remains readable
+    /// but cannot be reconstructed here. Its canonical runtime must be restored
+    /// before any mutation; this migration cannot establish that authority.
     ///
     /// Idempotent and cheap on later boots: guarded by a marker file, and any
     /// session that already has a sidecar is skipped. Returns the number of
@@ -3696,6 +3822,16 @@ impl SessionStoreV2 {
                     continue;
                 }
             };
+            supervisor::validate_identity(&session)?;
+            if !matches!(
+                session.authority_identity,
+                SessionAuthorityIdentity::Ordinary
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot reconstruct missing Supervisor authority from session.json",
+                ));
+            }
             self.write_runtime_sidecar(&abs_dir, &session).await?;
             migrated += 1;
         }
@@ -3724,7 +3860,8 @@ impl SessionStoreV2 {
 
     /// Read + deserialize a runtime sidecar (`runtime.json`) from a known path.
     /// A missing file yields `None`; a corrupt one is ignored with a warning
-    /// (the authoritative copy still lives in `session.json`). Shared by
+    /// for Ordinary compatibility. Supervisor callers validate the canonical
+    /// pair and reject missing or corrupt runtime authority. Shared by
     /// [`Self::read_runtime_sidecar`] (index-resolved path) and the index
     /// rebuild (directory-scanned path) so both overlay the sidecar identically.
     async fn read_runtime_sidecar_at(path: &Path, id: &str) -> io::Result<Option<Session>> {
@@ -3734,14 +3871,15 @@ impl SessionStoreV2 {
         let raw = fs::read_to_string(path).await?;
         match serde_json::from_str::<Session>(&raw) {
             Ok(mut side) => {
+                supervisor::validate_identity(&side)?;
                 // The control-plane path (`load_runtime_control_plane`) returns
                 // this directly, so migrate a stale Root token_budget here too (#230).
                 side.clear_stale_root_token_budget();
                 Ok(Some(side))
             }
             Err(error) => {
-                // A corrupt sidecar must never make a session unloadable — the
-                // authoritative copy still lives in session.json. Warn and ignore.
+                // Ordinary Sessions may recover from session.json. Supervisor
+                // pair validation rejects this fallback before use or writes.
                 tracing::warn!("ignoring corrupt runtime sidecar for {id}: {error}");
                 Ok(None)
             }
@@ -3919,6 +4057,29 @@ impl SessionStoreV2 {
         raw_base64_or_data_url: &str,
         mime_hint: Option<&str>,
     ) -> io::Result<(String, String)> {
+        self.write_image_attachment_inner(session, raw_base64_or_data_url, mime_hint, false)
+            .await
+    }
+
+    /// Store immutable image content under a repeatable reference for durable
+    /// message admission retries. Ordinary chat attachment naming is unchanged.
+    pub async fn write_image_attachment_deduplicated(
+        &self,
+        session: &Session,
+        raw_base64_or_data_url: &str,
+        mime_hint: Option<&str>,
+    ) -> io::Result<(String, String)> {
+        self.write_image_attachment_inner(session, raw_base64_or_data_url, mime_hint, true)
+            .await
+    }
+
+    async fn write_image_attachment_inner(
+        &self,
+        session: &Session,
+        raw_base64_or_data_url: &str,
+        mime_hint: Option<&str>,
+        deduplicate: bool,
+    ) -> io::Result<(String, String)> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let (mime, base64_data) =
@@ -3933,7 +4094,20 @@ impl SessionStoreV2 {
             .decode(base64_data.as_bytes())
             .map_err(|e| other_io_error(format!("invalid base64 image data: {e}")))?;
 
-        let attachment_id = Uuid::new_v4().to_string();
+        let attachment_id = if deduplicate {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(mime.as_bytes());
+            digest.update([0]);
+            digest.update(&bytes);
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        } else {
+            Uuid::new_v4().to_string()
+        };
         let ext = mime_to_extension(mime.as_str()).unwrap_or("bin");
 
         let rel_path = self.ensure_session_dirs(session).await?;
@@ -4043,21 +4217,28 @@ impl SessionStoreV2 {
                 "copied session id already exists",
             ));
         }
+        if self.root_revocation(new_id).await?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "copied session ID was deleted; use a new ID or trusted Root recreation",
+            ));
+        }
 
         let source_dir = self.abs_path_from_rel(&source_rel);
-        let source = Self::load_session_from_dir_strict(
-            &source_dir,
-            source_id,
-            expected_source_kind,
-            &expected_source_root,
-        )
-        .await?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "indexed source session.json is missing",
+        let source = self
+            .load_session_from_dir_strict(
+                &source_dir,
+                source_id,
+                expected_source_kind,
+                &expected_source_root,
             )
-        })?;
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "indexed source session.json is missing",
+                )
+            })?;
         let target_rel = Self::root_rel_path(new_id);
         let target_dir = self.abs_path_from_rel(&target_rel);
         if fs::try_exists(&target_dir).await? {
@@ -4262,16 +4443,14 @@ impl SessionStoreV2 {
         };
         let rel_path = entry.rel_path.clone();
         let abs_dir = self.abs_path_from_rel(&rel_path);
-        let Some(mut session) = Self::load_session_from_dir_strict(
-            &abs_dir,
-            session_id,
-            entry.kind,
-            &entry.root_session_id,
-        )
-        .await?
+        let Some(mut session) = self
+            .load_session_from_dir_strict(&abs_dir, session_id, entry.kind, &entry.root_session_id)
+            .await?
         else {
             return Ok(false);
         };
+
+        self.validate_root_context_for_save(&session).await?;
 
         // Keep only the first System message if present; drop all other messages.
         let system_msg = session
@@ -4425,9 +4604,12 @@ impl SessionStoreV2 {
 
     /// Development-only: hard reset all sessions and the index.
     ///
-    /// This is the supported "greenfield" mechanism. It deletes:
+    /// This is the supported "greenfield" history/index mechanism. It deletes:
     /// - `bamboo_home_dir/sessions/`
     /// - `bamboo_home_dir/sessions.json` (rewritten to empty index)
+    ///
+    /// Root revocations remain canonical so surviving processes cannot restore
+    /// their deleted snapshots after this reset.
     pub async fn dev_reset(&self) -> io::Result<()> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
@@ -4449,9 +4631,24 @@ impl SessionStoreV2 {
             })
             .collect::<Vec<_>>();
 
-        // Remove the sessions directory entirely.
-        let _ = fs::remove_dir_all(&self.sessions_dir).await;
+        // Revoke canonical Roots before removing the tree, including Roots
+        // omitted by this process's stale index. Preserve the revocations
+        // outside sessions/: stale writers may survive this development reset.
+        let mut roots = fs::read_dir(&self.sessions_dir).await?;
+        while let Some(root) = roots.next_entry().await? {
+            if root.file_type().await?.is_dir() {
+                if let Some(id) = root.file_name().to_str() {
+                    self.revoke_root_lifetime(id).await?;
+                }
+            }
+        }
+        match fs::remove_dir_all(&self.sessions_dir).await {
+            Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::create_dir_all(&self.sessions_dir).await?;
+        sync_parent_directory_entry(&self.sessions_dir).await?;
 
         // Reset through the same cross-process rebase/publish boundary as every
         // other index mutation; dev reset must not race a stale direct writer.
@@ -4489,7 +4686,65 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
+        validate_session_id(session_id)?;
         let entry = self.get_index_entry(session_id).await;
+        let root_birth = self.canonical_root_birth(session_id).await?;
+        let revoked_directory = root_birth.is_none()
+            && self.root_revocation(session_id).await?.is_some()
+            && fs::try_exists(self.sessions_dir.join(session_id)).await?;
+        if root_birth.is_some()
+            || revoked_directory
+            || entry
+                .as_ref()
+                .is_some_and(|entry| entry.kind == SessionKind::Root)
+        {
+            if !force
+                && (entry.as_ref().is_some_and(|entry| entry.pinned)
+                    || self
+                        .load_authoritative_root_session(session_id)
+                        .await?
+                        .is_some_and(|root| root.pinned))
+            {
+                return Err(other_io_error(
+                    "refusing to delete pinned session without force",
+                ));
+            }
+            if !self.revoke_root_lifetime(session_id).await? {
+                return Err(other_io_error(
+                    "cannot revoke Root without canonical birth evidence",
+                ));
+            }
+            let directory = self.sessions_dir.join(session_id);
+            match fs::remove_dir_all(&directory).await {
+                Ok(()) => sync_parent_directory_entry(&directory).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let removed = self
+                .update_index(|index| {
+                    let removed = index
+                        .sessions
+                        .values()
+                        .filter(|entry| {
+                            entry.id == session_id || entry.root_session_id == session_id
+                        })
+                        .map(|entry| (entry.id.clone(), entry.rel_path.clone()))
+                        .collect::<Vec<_>>();
+                    for (id, _) in &removed {
+                        index.sessions.remove(id);
+                    }
+                    Ok(removed)
+                })
+                .await?;
+            for (id, rel) in removed {
+                self.search_index_queue.enqueue_delete(
+                    &id,
+                    self.abs_path_from_rel(&rel)
+                        .join(SEARCH_INDEX_REVISION_FILE),
+                );
+            }
+            return Ok(true);
+        }
         let Some(entry) = entry else {
             return Ok(false);
         };
@@ -4513,40 +4768,7 @@ impl SessionStoreV2 {
                     .enqueue_delete(session_id, abs_dir.join(SEARCH_INDEX_REVISION_FILE));
                 Ok(true)
             }
-            SessionKind::Root => {
-                let root_id = entry.id.clone();
-                let abs_dir = self.abs_path_from_rel(&entry.rel_path);
-                let _ = fs::remove_dir_all(&abs_dir).await;
-
-                let to_remove = {
-                    let index = self.index.read().await;
-                    index
-                        .sessions
-                        .values()
-                        .filter(|e| e.root_session_id == root_id)
-                        .map(|entry| {
-                            (
-                                entry.id.clone(),
-                                self.abs_path_from_rel(&entry.rel_path)
-                                    .join(SEARCH_INDEX_REVISION_FILE),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                };
-
-                self.update_index(|index| {
-                    for (id, _) in &to_remove {
-                        index.sessions.remove(id);
-                    }
-                    Ok(())
-                })
-                .await?;
-
-                for (id, revision_path) in to_remove {
-                    self.search_index_queue.enqueue_delete(&id, revision_path);
-                }
-                Ok(true)
-            }
+            SessionKind::Root => unreachable!("Root deletion handled from canonical placement"),
         }
     }
 }
@@ -4757,7 +4979,11 @@ impl SessionStoreV2 {
         let raw = fs::read_to_string(path).await?;
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
+        if !self.session_lifetime_is_live(&session).await? {
+            return Ok(None);
+        }
         let sidecar = self.read_runtime_sidecar(session_id).await?;
+        supervisor::validate_overlay(&session, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
         session.clear_stale_root_token_budget();
@@ -4767,12 +4993,58 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn recreate_root_session(
+        &self,
+        session_id: &str,
+        initial_model: &str,
+    ) -> io::Result<Session> {
+        self.recreate_ordinary_root(session_id, initial_model).await
+    }
+
+    async fn get_or_create_default_supervisor(
+        &self,
+        initial_model: &str,
+    ) -> io::Result<SupervisorBootstrapReceipt> {
+        self.bootstrap_default_supervisor(initial_model).await
+    }
+
+    async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_root_authority_unchecked(session_id).await
+    }
+
+    async fn inspect_supervisor_scope(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorScopeObservation> {
+        self.management_scope(supervisor).await
+    }
+
+    async fn mutate_supervisor_management(
+        &self,
+        request: &bamboo_domain::SupervisorManagementRequest,
+    ) -> io::Result<bamboo_domain::SupervisorManagementReceipt> {
+        self.management_mutate(request).await
+    }
+
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
+        self.management_link(supervisor, target_session_id).await
+    }
+
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let _session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
+        self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_full_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
 
         let mut stages = SaveStageDurations::default();
@@ -4854,8 +5126,29 @@ impl Storage for SessionStoreV2 {
     async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
         // Fast path: write ONLY the small runtime sidecar (no messages), leaving
         // session.json — which carries the full conversation history — untouched.
-        // This is O(1) in conversation length, unlike `save_session`.
-        let Some(rel) = self.resolve_rel_path(&session.id).await else {
+        // Ordinary sessions retain O(1) I/O in conversation length. Supervisor
+        // validation additionally reads main-file bytes to verify its identity.
+        validate_session_id(&session.id)?;
+        let mut rel = self.resolve_rel_path(&session.id).await;
+        if rel.is_none() && session.kind == SessionKind::Root {
+            // The index is only a hint. Another Store may have created this
+            // Root since our index loaded. Keep the existing Root on the
+            // runtime path so a context update cannot overwrite its history.
+            // Either canonical file is enough to select this path, never to
+            // authorize it: the final guard requires the complete valid pair.
+            let directory = self.sessions_dir.join(&session.id);
+            for file in ["session.json", RUNTIME_SIDECAR_FILE] {
+                match fs::symlink_metadata(directory.join(file)).await {
+                    Ok(_) => {
+                        rel = Some(Self::root_rel_path(&session.id));
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let Some(rel) = rel else {
             // Session was never fully persisted yet — fall back to a full save so
             // session.json and the index get created. Deliberately acquire no
             // shared Task guard before this call: `save_session` owns that
@@ -4867,6 +5160,8 @@ impl Storage for SessionStoreV2 {
         let _session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Runtime)
             .await?;
+        self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
         let abs_dir = self.abs_path_from_rel(&rel);
         let mut stages = SaveStageDurations::default();
@@ -4888,22 +5183,35 @@ impl Storage for SessionStoreV2 {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let runtime_index_changed = self
-            .get_index_entry(&session.id)
-            .await
-            .is_some_and(|entry| {
-                entry.workspace_path != workspace_path || entry.project_id != project_id
-            });
+        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
+            entry.workspace_path != workspace_path || entry.project_id != project_id
+        });
         if runtime_index_changed {
             let index_started = Instant::now();
-            self.update_index(|index| {
-                if let Some(entry) = index.sessions.get_mut(&session.id) {
-                    entry.workspace_path = workspace_path;
-                    entry.project_id = project_id;
-                }
-                Ok(())
-            })
-            .await?;
+            let index_updated = self
+                .update_index(|index| {
+                    if let Some(entry) = index.sessions.get_mut(&session.id) {
+                        entry.workspace_path = workspace_path;
+                        entry.project_id = project_id;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })
+                .await?;
+            if !index_updated && session.kind == SessionKind::Root {
+                // Exceptional recovery of a globally missing index entry must
+                // preserve the real history count, not the caller's snapshot.
+                // Only this recovery path reads main; ordinary runtime saves
+                // and a merely stale local index remain transcript-independent.
+                let authoritative = self
+                    .load_authoritative_root_session(&session.id)
+                    .await?
+                    .ok_or_else(|| {
+                        other_io_error("runtime Root disappeared during index repair")
+                    })?;
+                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
+                    .await?;
+            }
             stages.index_publication = index_started.elapsed();
         }
         let index_entry_count = self.index.read().await.sessions.len();
@@ -6267,7 +6575,23 @@ mod tests {
     #[tokio::test]
     async fn save_session_writes_runtime_sidecar() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
-        let s = session_with_history("sc-1", 2, "run-A");
+        let mut s = session_with_history("sc-1", 2, "run-A");
+        let assistant = Message::assistant("discovery", None);
+        let anchor = assistant.id.clone();
+        s.add_message(assistant);
+        let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","id":"tsc_search_sidecar","execution":"client","call_id":"search_sidecar",
+                "status":"completed","arguments":{"query":"weather"}
+            }),
+        )
+        .unwrap();
+        s.append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
         storage.save_session(&s).await?;
 
         let sidecar_path = storage.runtime_json_path("sc-1").await?.unwrap();
@@ -6279,7 +6603,10 @@ mod tests {
         // Sidecar must NOT carry the message history.
         let side = storage.read_runtime_sidecar("sc-1").await?.unwrap();
         assert!(side.messages.is_empty(), "sidecar messages must be cleared");
+        assert!(side.provider_transcript.is_empty());
         assert_eq!(side.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
+        let loaded = storage.load_session("sc-1").await?.unwrap();
+        assert_eq!(loaded.provider_transcript.groups().len(), 1);
         Ok(())
     }
 
@@ -6517,6 +6844,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_last_waiter_reclaims_session_write_locks() -> io::Result<()> {
+        let temp = TempDir::new()?;
+        let store = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        for index in 0..512 {
+            let id = format!("cancelled-child-{index}");
+            let held = store.acquire_session_maintenance_lock(&id).await?;
+            let mut waiter = Box::pin(store.acquire_session_write_lock(&id, SaveKind::Runtime));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(waiter.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            drop(held);
+            drop(waiter);
+        }
+        assert!(store.session_write_locks.is_empty());
+        assert_eq!(
+            store
+                .persistence_metrics
+                .waiting_saves
+                .load(Ordering::Relaxed),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn independent_stores_serialize_same_session_without_blocking_other_ids() -> io::Result<()>
     {
         let temp = TempDir::new().map_err(io::Error::other)?;
@@ -6605,6 +6960,20 @@ mod tests {
         storage.save_session(&session).await?;
         storage.flush_search_index().await;
 
+        let published_revision = storage
+            .search_source_revision(&session.id)
+            .await?
+            .expect("saved Session publishes a search revision");
+        let page = storage
+            .search_index()
+            .search_messages_in_session(&session.id, "msg", usize::MAX, &[], 10)
+            .await?;
+        assert_eq!(
+            page.indexed_source_revision.as_deref(),
+            Some(published_revision.as_str())
+        );
+        assert_eq!(page.indexed_updated_at, Some(session.updated_at));
+
         storage
             .search_index()
             .upsert_session_if_current(&stale_session, &revision_path, &stale_revision)
@@ -6635,6 +7004,9 @@ mod tests {
             .iter()
             .all(|entry| entry.session_id != "search-generation"));
 
+        session = storage
+            .recreate_root_session(&session.id, &session.model)
+            .await?;
         session.title = "recreated searchable title".to_string();
         session.updated_at = Utc::now() + chrono::Duration::milliseconds(2);
         storage.save_session(&session).await?;
@@ -6647,6 +7019,50 @@ mod tests {
         assert!(recreated
             .iter()
             .any(|entry| entry.session_id == "search-generation"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_rebuild_repairs_unchanged_snapshots_without_replacing_message_ids(
+    ) -> io::Result<()> {
+        let (storage, temp) = create_temp_storage().await?;
+        let mut session = session_with_history("search-repair", 2, "run-a");
+        session.title = "repairable beacon".into();
+        session.messages[0].content = "repairable quartz".into();
+        storage.save_session(&session).await?;
+        storage.flush_search_index().await;
+        let conn = rusqlite::Connection::open(storage.search_index().db_path()).unwrap();
+        let identities = |conn: &rusqlite::Connection| {
+            conn.prepare(
+                "SELECT message_id, search_rowid FROM session_messages_search ORDER BY message_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = identities(&conn);
+        conn.execute_batch(
+            "DELETE FROM sessions_search_fts;
+            UPDATE session_messages_search_fts SET content='stale payload';",
+        )
+        .unwrap();
+        drop(storage);
+
+        // Reopen the store and run the same rebuild used by server startup.
+        let reopened = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        reopened.rebuild_search_index().await?;
+        assert_eq!(identities(&conn), before);
+        assert_eq!(reopened.search_index().search("beacon", 10).await?.len(), 1);
+        assert_eq!(reopened.search_index().search("quartz", 10).await?.len(), 1);
+        assert!(reopened
+            .search_index()
+            .search("stale", 10)
+            .await?
+            .is_empty());
         Ok(())
     }
 
@@ -6934,6 +7350,7 @@ mod tests {
         );
 
         session.set_project_id_meta(" 01JPROJECTLATEST00000000000 ");
+        session.metadata_version += 1;
         storage.save_runtime_state(&session).await?;
         assert_eq!(
             storage
@@ -7091,15 +7508,21 @@ mod tests {
     // ── ⑤ Runtime sidecar migration ──────────────────────────────────────
 
     #[tokio::test]
-    async fn migration_backfills_sidecars_for_legacy_sessions() -> io::Result<()> {
+    async fn migration_backfills_sidecars_for_legacy_children() -> io::Result<()> {
         let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
         let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
 
-        // Persist two sessions, then delete their sidecars to simulate the
-        // legacy on-disk layout (session.json only).
-        let a = session_with_history("mig-a", 3, "run-A");
-        let b = session_with_history("mig-b", 1, "run-B");
+        // Child migration remains compatible. A main-only Root is ambiguous
+        // and cannot establish a current Project revision through migration.
+        let parent = Session::new("migration-root", "model");
+        storage.save_session(&parent).await?;
+        let mut a = Session::new_child("mig-a", &parent.id, "model", "child");
+        a.messages = session_with_history("history-a", 3, "run-A").messages;
+        a.agent_runtime_state = Some(AgentRuntimeState::new("run-A"));
+        let mut b = Session::new_child("mig-b", &parent.id, "model", "child");
+        b.messages = session_with_history("history-b", 1, "run-B").messages;
+        b.agent_runtime_state = Some(AgentRuntimeState::new("run-B"));
         storage.save_session(&a).await?;
         storage.save_session(&b).await?;
         for id in ["mig-a", "mig-b"] {
@@ -7150,7 +7573,11 @@ mod tests {
         // old denormalized children id vectors. After migration the sidecar must
         // not contain them (they are now derived from the index).
         let (storage, _t) = create_temp_storage().await?;
-        let mut s = session_with_history("mig-legacy", 1, "run-L");
+        let parent = Session::new("migration-root", "model");
+        storage.save_session(&parent).await?;
+        let mut s = Session::new_child("mig-legacy", &parent.id, "model", "child");
+        s.messages = session_with_history("history-legacy", 1, "run-L").messages;
+        s.agent_runtime_state = Some(AgentRuntimeState::new("run-L"));
         storage.save_session(&s).await?;
 
         // Hand-write a legacy session.json containing children.active_ids and
@@ -7626,6 +8053,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 0,
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_prompt_usage: None,
         });
         source.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("run-1"));
         source

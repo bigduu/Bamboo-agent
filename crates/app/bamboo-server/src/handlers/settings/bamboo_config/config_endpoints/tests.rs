@@ -102,6 +102,42 @@ fn model_limits_file_path_appends_model_limits_json_filename() {
     );
 }
 
+#[test]
+fn provider_only_compatibility_routing_is_fail_closed() {
+    for key in [
+        "provider",
+        "providers",
+        "defaults",
+        "provider_instances",
+        "default_provider_instance",
+        "features",
+    ] {
+        let mut patch = serde_json::Map::new();
+        patch.insert(key.to_string(), serde_json::Value::Null);
+        assert!(
+            super::set::is_provider_only_patch(&patch),
+            "{key} is owned by Providers"
+        );
+    }
+
+    assert!(!super::set::is_provider_only_patch(&serde_json::Map::new()));
+    for key in ["model", "headless_auth", "server", "future_root_field"] {
+        let mut patch = serde_json::Map::new();
+        patch.insert(key.to_string(), serde_json::Value::Null);
+        assert!(
+            !super::set::is_provider_only_patch(&patch),
+            "{key} must stay on the generic compatibility writer"
+        );
+    }
+    let mixed = serde_json::json!({
+        "defaults": {"chat": {"provider": "work", "model": "gpt-test"}},
+        "headless_auth": true
+    });
+    assert!(!super::set::is_provider_only_patch(
+        mixed.as_object().expect("object patch")
+    ));
+}
+
 #[actix_web::test]
 async fn redacted_config_json_masks_provider_api_key_and_hides_encrypted_proxy_auth() {
     let mut config = Config::default();
@@ -563,6 +599,319 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(limits.len(), 2);
     assert_eq!(limits[0]["model_pattern"], "gpt-4o");
     assert_eq!(limits[0]["max_context_tokens"], 128000);
+}
+
+#[actix_web::test]
+async fn defaults_patch_repairs_unknown_refs_without_persisting_live_core_drift() {
+    use crate::app_state::AppState;
+    use crate::handlers::settings::provider_instances::{
+        create_provider_instance, CreateInstanceRequest,
+    };
+    use actix_web::{http::StatusCode, test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let mut state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    state.stop_config_watcher_for_test();
+    let data_dir = state.app_data_dir.clone();
+    let app_state = web::Data::new(state);
+
+    create_provider_instance(
+        app_state.clone(),
+        web::Json(CreateInstanceRequest {
+            provider_type: "openai".to_string(),
+            label: Some("Repair target".to_string()),
+            enabled: Some(true),
+            config: serde_json::json!({
+                "api_key": "sk-defaults-repair-secret",
+                "model": "gpt-seed"
+            }),
+        }),
+    )
+    .await
+    .expect("provider instance should be created");
+    let (instance_id, credential_ref) = {
+        let config = app_state.config.read().await;
+        let (instance_id, instance) = config
+            .provider_instances
+            .iter()
+            .next()
+            .expect("provider instance exists");
+        (
+            instance_id.clone(),
+            instance
+                .credential_ref
+                .clone()
+                .expect("provider credential reference"),
+        )
+    };
+
+    let model_limits = serde_json::json!([{
+        "model_pattern": "gpt-*",
+        "max_context_tokens": 128000,
+        "max_output_tokens": 16384,
+        "safety_margin": 1024
+    }]);
+    write_model_limits_file(&data_dir, Some(&model_limits))
+        .await
+        .expect("model limits should be seeded");
+    let model_limits_path = model_limits_file_path(&data_dir);
+    let model_limits_before =
+        std::fs::read(&model_limits_path).expect("model limits section exists");
+
+    let invalid_defaults: bamboo_config::DefaultsConfig =
+        serde_json::from_value(serde_json::json!({
+            "chat": {"provider": "missing-provider", "model": "missing-chat"},
+            "fast": {"provider": "missing-provider", "model": "missing-fast"},
+            "subagent_models": {
+                "researcher": {"provider": "missing-provider", "model": "missing-research"}
+            }
+        }))
+        .expect("invalid relationship fixture remains structurally valid");
+    let facade = app_state
+        .config_facade
+        .as_ref()
+        .expect("modular config facade");
+    let provider_snapshot = facade.registry().providers.snapshot();
+    let mut provider_data = provider_snapshot.data.as_ref().clone();
+    provider_data.defaults = Some(invalid_defaults.clone());
+    provider_data.features.provider_model_ref = true;
+    facade
+        .registry()
+        .providers
+        .commit(provider_snapshot.revision, provider_data)
+        .expect("structurally valid but relationally degraded Providers fixture");
+    {
+        let mut config = app_state.config.write().await;
+        config.defaults = Some(invalid_defaults);
+        config.features.provider_model_ref = true;
+        // Deterministic stand-in for Docker's BAMBOO_BIND=0.0.0.0 overlay.
+        config.server.bind = "0.0.0.0".to_string();
+    }
+
+    let provider_revision = facade.registry().providers.snapshot().revision;
+    let core_revision = facade.registry().core.snapshot().revision;
+    let core_path = data_dir.join("core.json");
+    let core_before = std::fs::read(&core_path).expect("core section exists");
+    let event_baseline = app_state.account_sink.latest_seq();
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    // This matches Lotus Next's write shape: it carries an unchanged
+    // model-limits sidecar while replacing every invalid defaults reference.
+    let repaired_defaults = serde_json::json!({
+        "chat": {"provider": instance_id, "model": "gpt-repaired-chat"},
+        "fast": {"provider": instance_id, "model": "gpt-repaired-fast"},
+        "task_summary": null,
+        "vision": null,
+        "memory_background": null,
+        "planning": null,
+        "search": null,
+        "code_review": null,
+        "sub_agent": null,
+        "subagent_models": {
+            "researcher": {"provider": instance_id, "model": "gpt-repaired-research"}
+        }
+    });
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "defaults": repaired_defaults,
+                "model_limits": model_limits
+            }))
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let response_body = test::read_body(response).await;
+    let response_text = String::from_utf8(response_body.to_vec()).expect("UTF-8 response");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "defaults repair failed: {response_text}"
+    );
+    assert!(!response_text.contains("sk-defaults-repair-secret"));
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("valid response JSON");
+    assert_eq!(response_json["defaults"]["chat"]["provider"], instance_id);
+    assert_eq!(
+        response_json["defaults"]["subagent_models"]["researcher"]["model"],
+        "gpt-repaired-research"
+    );
+
+    assert_eq!(
+        std::fs::read(&core_path).expect("core section remains readable"),
+        core_before,
+        "defaults repair must not persist the live Core overlay"
+    );
+    assert_eq!(
+        facade.registry().core.snapshot().revision,
+        core_revision,
+        "defaults repair must not advance Core"
+    );
+    assert_eq!(
+        facade.registry().providers.snapshot().revision,
+        provider_revision + 1,
+        "defaults repair must advance only Providers exactly once"
+    );
+    assert_eq!(
+        std::fs::read(&model_limits_path).expect("model limits remain readable"),
+        model_limits_before,
+        "an unchanged Lotus sidecar echo must not be rewritten"
+    );
+    {
+        let config = app_state.config.read().await;
+        let defaults = config.defaults.as_ref().expect("repaired defaults");
+        assert_eq!(defaults.chat.provider, instance_id);
+        assert_eq!(defaults.chat.model, "gpt-repaired-chat");
+        assert_eq!(defaults.subagent_models["researcher"].provider, instance_id);
+        assert_eq!(config.server.bind, "0.0.0.0");
+        assert_eq!(
+            config.provider_instances[&instance_id]
+                .credential_ref
+                .as_ref(),
+            Some(&credential_ref)
+        );
+    }
+    assert_eq!(
+        app_state
+            .credential_store
+            .resolve(&credential_ref)
+            .expect("credential lookup")
+            .expect("credential remains configured")
+            .expose(),
+        "sk-defaults-repair-secret"
+    );
+    let provider_document =
+        std::fs::read_to_string(data_dir.join("providers.json")).expect("Providers document");
+    assert!(!provider_document.contains("sk-defaults-repair-secret"));
+
+    let events = bamboo_engine::events::journal::read_since(
+        app_state.account_sink.events_dir(),
+        event_baseline,
+    )
+    .expect("config events should be journaled");
+    let provider_events = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+            | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                if section == "providers" =>
+            {
+                Some(*revision)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(provider_events, vec![provider_revision + 1]);
+    assert!(events.iter().all(|event| {
+        !matches!(
+            &event.event,
+            bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                if section == "core"
+        )
+    }));
+
+    // Mixed ownership stays on the generic writer and is rejected atomically.
+    let mixed_files_before = [
+        "core.json",
+        "providers.json",
+        "credentials.json",
+        "model_limits.json",
+    ]
+    .into_iter()
+    .map(|name| {
+        (
+            name,
+            std::fs::read(data_dir.join(name)).expect("section file"),
+        )
+    })
+    .collect::<BTreeMap<_, _>>();
+    let mixed_live_before = app_state
+        .config
+        .read()
+        .await
+        .to_compatibility_value()
+        .expect("live config should serialize");
+    let mixed = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "defaults": {
+                    "chat": {"provider": instance_id, "model": "must-not-commit"},
+                    "subagent_models": {}
+                },
+                "headless_auth": !app_state.config.read().await.headless_auth
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(mixed.status(), StatusCode::BAD_REQUEST);
+    let mixed_body = String::from_utf8(test::read_body(mixed).await.to_vec()).unwrap();
+    assert!(mixed_body.contains("split the request"), "{mixed_body}");
+    for (name, before) in mixed_files_before {
+        assert_eq!(
+            std::fs::read(data_dir.join(name)).expect("section file after rejection"),
+            before,
+            "mixed-domain rejection changed {name}"
+        );
+    }
+    assert_eq!(
+        app_state
+            .config
+            .read()
+            .await
+            .to_compatibility_value()
+            .expect("live config should serialize"),
+        mixed_live_before
+    );
+    assert_eq!(facade.registry().core.snapshot().revision, core_revision);
+    assert_eq!(
+        facade.registry().providers.snapshot().revision,
+        provider_revision + 1
+    );
+
+    drop(app);
+    drop(app_state);
+    let restarted = AppState::new(data_dir)
+        .await
+        .expect("repaired configuration should restart");
+    let restarted_config = restarted.config.read().await;
+    assert_eq!(
+        restarted_config
+            .defaults
+            .as_ref()
+            .expect("repaired defaults survive restart")
+            .chat
+            .model,
+        "gpt-repaired-chat"
+    );
+    assert_eq!(
+        restarted_config.provider_instances[&instance_id]
+            .credential_ref
+            .as_ref(),
+        Some(&credential_ref)
+    );
+    drop(restarted_config);
+    assert_eq!(
+        restarted
+            .credential_store
+            .resolve(&credential_ref)
+            .expect("restart credential lookup")
+            .expect("credential remains configured after restart")
+            .expose(),
+        "sk-defaults-repair-secret"
+    );
 }
 
 #[actix_web::test]

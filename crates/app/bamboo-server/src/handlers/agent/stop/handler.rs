@@ -24,40 +24,62 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> imp
     }
 }
 
-/// Cancel a running agent session, returning whether anything was actually
-/// cancelled. Mirrors the v1 `POST /stop/{session_id}` behavior exactly so the
-/// v2 WS `control` channel (`{"type":"stop"}`) can reuse it without duplicating
-/// the runner + legacy-token cancellation discipline.
+/// Cancel a running agent session through the shared v1 HTTP / v2 WebSocket
+/// control path, returning whether an active cancellation was acknowledged.
 pub(crate) async fn cancel_session(state: &web::Data<AppState>, session_id: &str) -> bool {
-    let runner_cancelled = cancel_running_runner(state, session_id).await;
-    let legacy_cancelled = cancel_legacy_token(state, session_id).await;
-
-    if runner_cancelled || legacy_cancelled {
-        mark_runner_cancelled(state, session_id).await;
-        true
-    } else {
-        false
+    match cancel_running_runner(state, session_id).await {
+        RunnerCancelOutcome::Triggered { run_id } => {
+            // The authoritative token has already fired. Do not queue this
+            // modern stop behind the unrelated legacy token registry.
+            mark_runner_cancelled(state, session_id, Some(&run_id)).await;
+            true
+        }
+        // Retried control frames must acknowledge the same exact stop without
+        // falling through to unrelated legacy bookkeeping.
+        RunnerCancelOutcome::AlreadyCancelled => true,
+        RunnerCancelOutcome::NotActive => {
+            let legacy_cancelled = cancel_legacy_token(state, session_id).await;
+            if legacy_cancelled {
+                mark_runner_cancelled(state, session_id, None).await;
+            }
+            legacy_cancelled
+        }
     }
 }
 
-async fn cancel_running_runner(state: &web::Data<AppState>, session_id: &str) -> bool {
+enum RunnerCancelOutcome {
+    Triggered { run_id: String },
+    AlreadyCancelled,
+    NotActive,
+}
+
+async fn cancel_running_runner(
+    state: &web::Data<AppState>,
+    session_id: &str,
+) -> RunnerCancelOutcome {
     let runners = state.agent_runners.read().await;
     let Some(runner) = runners.get(session_id) else {
-        return false;
+        return RunnerCancelOutcome::NotActive;
     };
 
-    if !matches!(runner.status, AgentStatus::Running) {
-        tracing::warn!(
-            "[{}] Runner not in Running status: {:?}",
-            session_id,
-            runner.status
-        );
-        return false;
+    match runner.status {
+        AgentStatus::Running => {
+            runner.cancel_token.cancel();
+            tracing::info!("[{}] Runner cancellation triggered", session_id);
+            RunnerCancelOutcome::Triggered {
+                run_id: runner.run_id.clone(),
+            }
+        }
+        AgentStatus::Cancelled => RunnerCancelOutcome::AlreadyCancelled,
+        _ => {
+            tracing::warn!(
+                "[{}] Runner not in Running status: {:?}",
+                session_id,
+                runner.status
+            );
+            RunnerCancelOutcome::NotActive
+        }
     }
-
-    runner.cancel_token.cancel();
-    tracing::info!("[{}] Runner cancellation triggered", session_id);
-    true
 }
 
 async fn cancel_legacy_token(state: &web::Data<AppState>, session_id: &str) -> bool {
@@ -71,9 +93,16 @@ async fn cancel_legacy_token(state: &web::Data<AppState>, session_id: &str) -> b
     true
 }
 
-async fn mark_runner_cancelled(state: &web::Data<AppState>, session_id: &str) {
+pub(super) async fn mark_runner_cancelled(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    expected_run_id: Option<&str>,
+) {
     let mut runners = state.agent_runners.write().await;
     if let Some(runner) = runners.get_mut(session_id) {
+        if expected_run_id.is_some_and(|run_id| runner.run_id != run_id) {
+            return;
+        }
         runner.status = AgentStatus::Cancelled;
         runner.completed_at = Some(chrono::Utc::now());
     }

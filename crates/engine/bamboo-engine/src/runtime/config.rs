@@ -67,6 +67,8 @@ fn default_gold_min_confidence() -> GoldConfidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct GoldConfig {
+    #[serde(default)]
+    pub recovery: super::goal_recovery::GoalRecoveryPolicy,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
     pub enabled: bool,
@@ -115,6 +117,7 @@ pub struct GoldConfig {
 impl Default for GoldConfig {
     fn default() -> Self {
         Self {
+            recovery: Default::default(),
             enabled: false,
             auto_answer_enabled: false,
             auto_continue_enabled: false,
@@ -351,7 +354,8 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 /// rather than widening the snapshot.
 #[non_exhaustive]
 pub struct AgentLoopConfig {
-    pub(crate) max_rounds: usize,
+    /// Keep tool guidance stable while activation updates append to model context.
+    pub freeze_tool_exposure_for_cache: bool,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
@@ -377,6 +381,7 @@ pub struct AgentLoopConfig {
     /// Optional runtime persistence for non-authoritative session saves.
     /// When set, engine save sites use this instead of `storage` for writes.
     pub(crate) persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+    pub(crate) guidance_active_run_id: Option<String>,
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
@@ -420,6 +425,9 @@ pub struct AgentLoopConfig {
     /// Desired final summary size relative to the raw source tokens represented
     /// by it. Values are normalized at the compression boundary.
     pub(crate) summary_target_ratio: f64,
+    /// Frozen host context-management strategy for this run. Missing public
+    /// configuration resolves to the legacy summary behavior.
+    pub(crate) context_management: bamboo_config::ContextManagementConfig,
     /// Safe request ceiling as a percentage of the selected summarization
     /// model's context window.
     pub(crate) summary_safe_window_percent: u8,
@@ -451,6 +459,9 @@ pub struct AgentLoopConfig {
     /// Used by runtime features that persist auxiliary artifacts outside the
     /// session store, such as durable plan mode files under `~/.bamboo/plan`.
     pub(crate) app_data_dir: Option<PathBuf>,
+    /// Jiandu memory handle for this run. The default is the independent
+    /// `~/.jiandu` store; explicit construction is used by isolated tests.
+    pub(crate) memory_store: bamboo_memory::memory_store::MemoryStore,
     /// Tool names that should be excluded from schemas sent to the LLM.
     pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
@@ -543,14 +554,17 @@ pub struct AgentLoopConfig {
     /// per-request override merged over the config-level default (see
     /// [`AgentRuntime::execute`](crate::runtime::runtime::AgentRuntime::execute)).
     /// Checked after every round; exceeding a configured limit gracefully
-    /// stops the run (mirrors the `max_rounds` exhaustion path).
+    /// stops the run. Includes the run's round cap (`max_rounds`): `None`
+    /// means unlimited rounds (the historical hard-coded 200 was removed);
+    /// a configured cap keeps the issue #29 exhaustion contract (metadata
+    /// stamp, visible notification, exactly one final summary turn).
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
 }
 
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 200,
+            freeze_tool_exposure_for_cache: true,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
@@ -562,6 +576,7 @@ impl Default for AgentLoopConfig {
             skip_initial_user_message: false,
             storage: None,
             persistence: None,
+            guidance_active_run_id: None,
             session_inbox: None,
             session_activation_notifications: None,
             attachment_reader: None,
@@ -575,6 +590,7 @@ impl Default for AgentLoopConfig {
             search_model_name: None,
             compression_instructions: None,
             summary_target_ratio: 0.20,
+            context_management: bamboo_config::ContextManagementConfig::default(),
             summary_safe_window_percent: 80,
             summarization_model_name: None,
             background_model_provider: None,
@@ -583,6 +599,7 @@ impl Default for AgentLoopConfig {
             provider_type: None,
             reasoning_effort: None,
             app_data_dir: None,
+            memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             disabled_tools: BTreeSet::new(),
             token_budget: None,
             legacy_model_limits: None,

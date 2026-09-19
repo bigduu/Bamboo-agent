@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 
 use crate::protocol::gemini::GeminiRequest;
 use crate::protocol::ToProvider;
-use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::provider::{
+    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
+};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
@@ -174,6 +177,25 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &crate::prompt_ir::PromptIR,
+        tools: &[ToolSchema],
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        if tools.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        let projected: Vec<crate::protocol::gemini::GeminiTool> = tools.to_vec().to_provider()?;
+        Ok(ProviderVisibleToolFootprint {
+            segments: vec![ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                &projected,
+            )?],
+        })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -425,6 +447,50 @@ impl LLMProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_footprint_reuses_grouped_gemini_function_declarations() {
+        let tools = vec!["lookup", "summarize"]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_domain::FunctionSchema {
+                    name: name.to_string(),
+                    description: format!("Use {name}"),
+                    parameters: json!({"type":"object"}),
+                },
+            })
+            .collect::<Vec<_>>();
+        let expected: Vec<crate::protocol::gemini::GeminiTool> =
+            tools.clone().to_provider().unwrap();
+        let footprint = GeminiProvider::new("k")
+            .provider_visible_tool_footprint(
+                &crate::prompt_ir::PromptIR::default(),
+                &tools,
+                "gemini-test",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 1);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            footprint.segments[0].serialized,
+            serde_json::to_string(&expected).unwrap()
+        );
+        let rendered: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+        assert_eq!(
+            rendered[0]["functionDeclarations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn max_reasoning_uses_a_distinct_larger_thinking_budget() {

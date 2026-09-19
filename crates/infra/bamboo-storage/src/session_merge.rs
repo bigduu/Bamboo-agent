@@ -39,12 +39,20 @@ use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::Storage;
 use bamboo_domain::{
     latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
-    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY,
+    CONSUMED_RESPONSE_OCCURRENCES_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
+    "workspace_source",
+    "workspace_binding_status",
+    "project_context_rendered",
+    "project_resources_rendered",
+    "runtime_prompt_snapshot",
+];
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
     CONSUMED_RESPONSE_OCCURRENCES_KEY,
@@ -60,6 +68,19 @@ const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
 ];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
+const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
+    "context_management.last_manual_archive_occurrence.v1";
+const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_rejections.v1";
+const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
+const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+
+fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
+    !result.as_ref().err().is_some_and(|error| {
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+    })
+}
 
 /// A pending response is an authoritative compare-and-consume transaction.
 /// When a stale runner still carries the consumed ask, its terminal save must
@@ -299,12 +320,16 @@ impl LockedSessionStore {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let guard = lock.lock_owned().await;
-        SessionLockGuard {
-            guard: Some(guard),
+        // Arm cleanup before the cancellable wait. The previous holder may
+        // drop while this waiter owns the last extra Arc; cancelling that waiter
+        // must still reclaim the map entry without needing another acquisition.
+        let mut guard = SessionLockGuard {
+            guard: None,
             locks: self.locks.clone(),
             session_id: session_id.to_string(),
-        }
+        };
+        guard.guard = Some(lock.lock_owned().await);
+        guard
     }
 
     /// Save a full snapshot while preserving Task generations advanced by an
@@ -408,7 +433,8 @@ impl LockedSessionStore {
     /// guard across an await. The callback also runs when the durable save
     /// fails, preserving [`RuntimeSessionPersistence::save_runtime_control_plane`]
     /// implementations that publish current runtime authorization state while
-    /// still returning the storage error.
+    /// still returning the storage error. Authority conflicts are excluded:
+    /// publishing a rejected identity would disagree with durable authority.
     pub async fn save_runtime_only_and_publish<F>(
         &self,
         session: &mut Session,
@@ -432,7 +458,9 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        publish(session);
+        if may_publish_runtime_result(&result) {
+            publish(session);
+        }
         result
     }
 
@@ -656,9 +684,10 @@ impl LockedSessionStore {
     /// Merge-save a runtime session and synchronously publish the resulting
     /// snapshot before releasing its per-session serialization lock.
     ///
-    /// The callback receives whether the durable save committed. It always runs
+    /// The callback receives whether the durable save committed. It runs
     /// after the save attempt so repository callers can preserve their existing
-    /// cache-on-failure policy without reopening a durable-to-cache race.
+    /// cache-on-failure policy without reopening a durable-to-cache race,
+    /// except when authority validation rejects the snapshot.
     pub async fn merge_save_runtime_and_publish<F>(
         &self,
         session: &mut Session,
@@ -722,8 +751,155 @@ impl LockedSessionStore {
         }
 
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
+    }
+
+    /// Commit a retrieval-window rewrite without passing its message mutations
+    /// through the ordinary append-only reconciliation path.
+    ///
+    /// A concurrent durable transcript change returns a clean rebased Session
+    /// without writing. The engine must replan from that value before retrying.
+    pub async fn checkpoint_retrieval_window_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_retrieval_window_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = rebase_retrieval_window_base(expected_base, latest);
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
+    /// Commit a bounded System-prompt rewrite without routing it through the
+    /// append-safe checkpoint or pretending that an archive event occurred.
+    pub async fn checkpoint_prompt_rewrite_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_prompt_rewrite_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = rebase_retrieval_window_base(expected_base, latest);
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
+    /// Commit one bounded `archive_context` rejection rewrite.
+    ///
+    /// Unlike the append-safe runtime checkpoint, this preserves the staged
+    /// Tool result content while fencing the write with the exact durable base.
+    pub async fn checkpoint_manual_archive_rejection_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_manual_archive_rejection_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = latest.clone();
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
+    /// Commit the consumed marker for a successful no-op `archive_context`.
+    ///
+    /// The marker is a metadata rewrite, so the append-safe runtime checkpoint
+    /// is insufficient: it could full-save stale open metadata after a
+    /// concurrent runtime writer. Fence the complete retrieval base and let the
+    /// engine restage from the latest durable snapshot on any conflict.
+    pub async fn checkpoint_manual_archive_consumption_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_manual_archive_consumption_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = latest.clone();
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
@@ -809,7 +985,9 @@ impl LockedSessionStore {
             adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
     }
 
@@ -870,7 +1048,9 @@ impl LockedSessionStore {
         incoming_audit.write_to(&mut session.metadata);
 
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
     }
 
@@ -1247,6 +1427,42 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         LockedSessionStore::checkpoint_runtime_session(self, session).await
     }
 
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_retrieval_window_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_prompt_rewrite_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_manual_archive_rejection_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_manual_archive_consumption_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
@@ -1344,6 +1560,521 @@ fn ensure_model_context_checkpoint_is_current(
     Ok(())
 }
 
+fn message_matches_retrieval_window_base(
+    expected: &bamboo_domain::Message,
+    durable: &bamboo_domain::Message,
+) -> std::io::Result<bool> {
+    if durable.image_ocr.is_some() && durable.image_ocr != expected.image_ocr {
+        return Ok(false);
+    }
+    let mut expected = expected.clone();
+    let mut durable = durable.clone();
+    // A staged OCR cache may legitimately be newer than disk and is committed
+    // with the archive. Every other message field must still describe the exact
+    // durable prefix used for planning.
+    expected.image_ocr = None;
+    durable.image_ocr = None;
+    let expected = serde_json::to_vec(&expected)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let durable = serde_json::to_vec(&durable)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(expected == durable)
+}
+
+fn invalid_retrieval_window_checkpoint(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_staged_manual_archive_consumption_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let occurrence = staged
+        .metadata
+        .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-consumption checkpoint is missing its consumed occurrence",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<ResponseOccurrence>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-consumption checkpoint has an invalid consumed occurrence: {error}"
+                ))
+            })
+        })?;
+    let result_index = expected
+        .messages
+        .iter()
+        .position(|message| {
+            message.id == occurrence.tool_result_message_id
+                && message.tool_call_id.as_deref() == Some(occurrence.tool_call_id.as_str())
+                && matches!(message.role, bamboo_domain::Role::Tool)
+        })
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-consumption checkpoint occurrence does not identify a Tool result",
+            )
+        })?;
+    let correlated_archive_call = expected.messages[..result_index]
+        .iter()
+        .rev()
+        .find(|message| !matches!(message.role, bamboo_domain::Role::Tool))
+        .filter(|message| matches!(message.role, bamboo_domain::Role::Assistant))
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|call| {
+            call.id == occurrence.tool_call_id
+                && bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
+        });
+    if !correlated_archive_call {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint is not correlated to the current archive_context batch",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    canonical.metadata.insert(
+        LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+        staged
+            .metadata
+            .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+            .expect("validated occurrence metadata")
+            .clone(),
+    );
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint contains mutations outside the correlated consumed marker",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_manual_archive_rejection_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let occurrence = staged
+        .metadata
+        .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint is missing its consumed occurrence",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<ResponseOccurrence>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-rejection checkpoint has an invalid consumed occurrence: {error}"
+                ))
+            })
+        })?;
+    let result_index = expected
+        .messages
+        .iter()
+        .position(|message| {
+            message.id == occurrence.tool_result_message_id
+                && message.tool_call_id.as_deref() == Some(occurrence.tool_call_id.as_str())
+                && matches!(message.role, bamboo_domain::Role::Tool)
+        })
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint occurrence does not identify a Tool result",
+            )
+        })?;
+    let before = &expected.messages[result_index];
+    let after = &staged.messages[result_index];
+    let rejection_reason = after
+        .content
+        .strip_prefix("archive_context rejected: ")
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint has an invalid Tool result message",
+            )
+        })?;
+    if after.tool_success != Some(false)
+        || (before.content == after.content && before.tool_success == after.tool_success)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint did not reject the Tool result",
+        ));
+    }
+
+    let correlated_archive_call = expected.messages[..result_index]
+        .iter()
+        .rev()
+        .find(|message| !matches!(message.role, bamboo_domain::Role::Tool))
+        .filter(|message| matches!(message.role, bamboo_domain::Role::Assistant))
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|call| {
+            call.id == occurrence.tool_call_id
+                && bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
+        });
+    if !correlated_archive_call {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint is not correlated to the current archive_context batch",
+        ));
+    }
+
+    let staged_rejections = staged
+        .metadata
+        .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint is missing its rejection ledger",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-rejection checkpoint has an invalid rejection ledger: {error}"
+                ))
+            })
+        })?;
+    let occurrence_value = serde_json::to_value(&occurrence)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some(last_rejection) = staged_rejections.last() else {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint has an empty rejection ledger",
+        ));
+    };
+    if last_rejection.get("occurrence") != Some(&occurrence_value)
+        || last_rejection
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            != Some(rejection_reason)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint ledger does not match its Tool result",
+        ));
+    }
+    let mut expected_rejections = expected
+        .metadata
+        .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<serde_json::Value>>(value).ok())
+        .unwrap_or_default();
+    expected_rejections.retain(|rejection| rejection.get("occurrence") != Some(&occurrence_value));
+    expected_rejections.push(last_rejection.clone());
+    if expected_rejections.len() > MAX_MANUAL_ARCHIVE_REJECTIONS {
+        expected_rejections.drain(..expected_rejections.len() - MAX_MANUAL_ARCHIVE_REJECTIONS);
+    }
+    if expected_rejections != staged_rejections {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint rewrote unrelated rejection-ledger entries",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    canonical.messages[result_index]
+        .content
+        .clone_from(&after.content);
+    canonical.messages[result_index].tool_success = Some(false);
+    canonical.metadata.insert(
+        LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+        staged
+            .metadata
+            .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+            .expect("validated occurrence metadata")
+            .clone(),
+    );
+    canonical.metadata.insert(
+        MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
+        staged
+            .metadata
+            .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+            .expect("validated rejection metadata")
+            .clone(),
+    );
+    canonical
+        .metadata
+        .remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    canonical
+        .reset_model_context_epoch(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint contains mutations outside the correlated Tool result, bounded metadata, and provider reset",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_prompt_rewrite_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    let mut rewrote_system_prompt = false;
+    for ((before, after), canonical_message) in expected
+        .messages
+        .iter()
+        .zip(&staged.messages)
+        .zip(&mut canonical.messages)
+    {
+        if before.id != after.id {
+            return Err(invalid_retrieval_window_checkpoint(
+                "prompt-rewrite checkpoint reordered or replaced a message",
+            ));
+        }
+        if before.content != after.content {
+            if !matches!(before.role, bamboo_domain::Role::System)
+                || !matches!(after.role, bamboo_domain::Role::System)
+            {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "prompt-rewrite checkpoint changed non-System message content",
+                ));
+            }
+            canonical_message.content.clone_from(&after.content);
+            rewrote_system_prompt = true;
+        }
+    }
+    if !rewrote_system_prompt {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint did not change System message content",
+        ));
+    }
+
+    canonical.metadata.remove("responses.previous_response_id");
+    canonical
+        .reset_model_context_epoch(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint contains mutations outside the System prompt and provider reset",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_retrieval_window_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint Session IDs differ",
+        ));
+    }
+    if expected.conversation_summary.is_some() || staged.conversation_summary.is_some() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint cannot contain a conversation summary",
+        ));
+    }
+    if expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint must preserve the message array",
+        ));
+    }
+    if staged.compression_events.len() != expected.compression_events.len().saturating_add(1) {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint must append exactly one compression event",
+        ));
+    }
+
+    let expected_events = serde_json::to_vec(&expected.compression_events)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged_prefix =
+        serde_json::to_vec(&staged.compression_events[..expected.compression_events.len()])
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if expected_events != staged_prefix {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint rewrote an existing compression event",
+        ));
+    }
+
+    let event = staged
+        .compression_events
+        .last()
+        .expect("length check guarantees a staged compression event");
+    if event.kind != bamboo_domain::CompressionEventKind::RetrievalWindow
+        || event.id.is_empty()
+        || expected
+            .compression_events
+            .iter()
+            .any(|existing| existing.id == event.id)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint has an invalid archive event",
+        ));
+    }
+
+    let mut newly_archived = 0usize;
+    for (before, after) in expected.messages.iter().zip(&staged.messages) {
+        if before.id != after.id {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint reordered or replaced a message",
+            ));
+        }
+
+        let is_new_archive = !before.compressed && after.compressed;
+        if is_new_archive {
+            if before.compressed_by_event_id.is_some()
+                || after.compressed_by_event_id.as_deref() != Some(event.id.as_str())
+            {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "retrieval-window checkpoint has an invalid message correlation",
+                ));
+            }
+            newly_archived = newly_archived.saturating_add(1);
+        } else if before.compressed != after.compressed
+            || before.compressed_by_event_id != after.compressed_by_event_id
+        {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint contains an unsupported archive mutation",
+            ));
+        }
+
+        let mut normalized_after = after.clone();
+        normalized_after.compressed = before.compressed;
+        normalized_after
+            .compressed_by_event_id
+            .clone_from(&before.compressed_by_event_id);
+        let before = serde_json::to_vec(before)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let after = serde_json::to_vec(&normalized_after)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if before != after {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint mutated message content",
+            ));
+        }
+    }
+
+    if newly_archived == 0 || newly_archived != event.messages_compressed {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint event count does not match message correlations",
+        ));
+    }
+    if staged
+        .model_context_state
+        .as_ref()
+        .and_then(|state| state.last_reset_reason)
+        != Some(bamboo_domain::ModelContextResetReason::Compression)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint is missing its model-context reset",
+        ));
+    }
+
+    Ok(())
+}
+
+fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::io::Result<bool> {
+    if expected.id != durable.id || durable.messages.len() > expected.messages.len() {
+        return Ok(false);
+    }
+    for (durable_message, expected_message) in durable.messages.iter().zip(expected.messages.iter())
+    {
+        if !message_matches_retrieval_window_base(expected_message, durable_message)? {
+            return Ok(false);
+        }
+    }
+
+    if durable.compression_events.len() > expected.compression_events.len() {
+        return Ok(false);
+    }
+    for (durable_event, expected_event) in durable
+        .compression_events
+        .iter()
+        .zip(expected.compression_events.iter())
+    {
+        let durable_event = serde_json::to_vec(durable_event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let expected_event = serde_json::to_vec(expected_event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if durable_event != expected_event {
+            return Ok(false);
+        }
+    }
+
+    let summary_matches = serde_json::to_vec(&expected.conversation_summary)
+        .and_then(|expected| {
+            serde_json::to_vec(&durable.conversation_summary).map(|durable| expected == durable)
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !summary_matches {
+        return Ok(false);
+    }
+
+    // Narrow runtime writers commit arbitrary metadata keys under the same
+    // per-session lock (for example pending background-completion injections,
+    // workflow indexes, or skill activation state). Authoritative PATCHes also
+    // change execution-profile fields under `metadata_version`. A
+    // prompt/archive rewrite planned before either commit must rebase instead
+    // of full-saving its stale metadata or model configuration snapshot.
+    if expected.metadata != durable.metadata
+        || expected.runtime_metadata != durable.runtime_metadata
+        || expected.metadata_version != durable.metadata_version
+        || expected.model != durable.model
+        || expected.model_ref != durable.model_ref
+        || expected.reasoning_effort != durable.reasoning_effort
+    {
+        return Ok(false);
+    }
+
+    Ok(ensure_model_context_checkpoint_is_current(expected, durable).is_ok())
+}
+
+fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Session {
+    let mut rebased = expected.clone();
+    bamboo_domain::append_missing_runtime_messages(&mut rebased, durable);
+    rebased.metadata.clone_from(&durable.metadata);
+    rebased
+        .runtime_metadata
+        .clone_from(&durable.runtime_metadata);
+    rebased.model.clone_from(&durable.model);
+    rebased.model_ref.clone_from(&durable.model_ref);
+    rebased.reasoning_effort = durable.reasoning_effort;
+    bamboo_domain::merge_session_inbox_admission(&mut rebased, durable);
+    rebased
+        .conversation_summary
+        .clone_from(&durable.conversation_summary);
+    rebased
+        .compression_events
+        .clone_from(&durable.compression_events);
+    rebased.token_usage.clone_from(&durable.token_usage);
+    rebased
+        .model_context_state
+        .clone_from(&durable.model_context_state);
+    if durable.updated_at > rebased.updated_at {
+        rebased.updated_at = durable.updated_at;
+    }
+    rebased
+}
+
 /// Adopt the on-disk typed permission posture into the session about to be
 /// saved when the durable posture is semantically fresher.
 ///
@@ -1404,6 +2135,63 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    // Identity is independent of the UI metadata revision. Preserve it in the
+    // caller snapshot too, so a successful merge-save cannot downgrade the cache.
+    // Never replace an explicit Supervisor incarnation: the final storage guard
+    // must reject stale identities after deletion/recreation rather than hiding them.
+    // A newly constructed or previously deleted Ordinary session with this ID
+    // is not a snapshot of the current Root and must not be rebound to it.
+    if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
+        session.authority_identity = latest.authority_identity.clone();
+    }
+    // Relationships are a separate monotonic authority, independent of UI
+    // metadata. Adopt the canonical state into the actual caller snapshot only
+    // for the same Root lifetime/incarnation; never rebind stale identities.
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+        && session.created_at == latest.created_at
+        && session.authority_identity == latest.authority_identity
+    {
+        session.supervisor_management = latest.supervisor_management.clone();
+    }
+    // Project and its revision are one fence. Never stamp a newer disk revision
+    // onto the caller's old Project; that would manufacture a fresh-looking
+    // stale assignment. Equal-revision runtime workspace refreshes within the
+    // same Project remain valid, while an actual reassignment adopts its whole
+    // workspace context before the caller can be published to a cache.
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+        && session.created_at == latest.created_at
+        && latest.metadata_version >= session.metadata_version
+        && (latest.metadata_version > session.metadata_version
+            || latest.project_id_meta() != session.project_id_meta())
+    {
+        match latest.project_id_meta() {
+            Some(project) => session.set_project_id_meta(project),
+            None => session.clear_project_id_meta(),
+        }
+        match latest.workspace_path_meta() {
+            Some(workspace) => session.set_workspace_path_meta(workspace),
+            None => {
+                session.metadata.remove("workspace_path");
+                if let Some(metadata) = session.runtime_metadata.as_mut() {
+                    metadata.workspace_path = None;
+                }
+            }
+        }
+        session.workspace.clone_from(&latest.workspace);
+        for key in ROOT_PROJECT_CONTEXT_KEYS {
+            match latest.metadata.get(*key) {
+                Some(value) => {
+                    session.metadata.insert((*key).to_string(), value.clone());
+                }
+                None => {
+                    session.metadata.remove(*key);
+                }
+            }
+        }
+        session.prompt_snapshot.clone_from(&latest.prompt_snapshot);
+    }
     if latest.metadata_version >= session.metadata_version {
         session.title = latest.title.clone();
         session.title_version = latest.title_version;
@@ -1448,6 +2236,381 @@ mod tests {
     use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn authority_merge_updates_ordinary_cache_but_does_not_hide_stale_incarnation() {
+        let mut latest = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        latest.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let mut stale = latest.clone();
+        stale.authority_identity = bamboo_domain::SessionAuthorityIdentity::Ordinary;
+        stale.metadata_version = 100;
+        apply_authoritative_metadata(&mut stale, &latest);
+        assert_eq!(stale.authority_identity, latest.authority_identity);
+        let old_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        stale.authority_identity = old_identity.clone();
+        apply_authoritative_metadata(&mut stale, &latest);
+        assert_eq!(stale.authority_identity, old_identity);
+    }
+
+    struct AuthoritySavePauseStorage {
+        inner: Arc<SessionStoreV2>,
+        reached: tokio::sync::Barrier,
+        release: tokio::sync::Barrier,
+    }
+
+    #[tokio::test]
+    async fn root_project_merge_publishes_project_revision_and_workspace_together() {
+        for runtime_only in [false, true] {
+            for equal_revision in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let storage = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+                let mut stale = Session::new("root-project-merge", "model");
+                stale.set_project_id_meta("project-a");
+                stale.set_workspace_path_meta("/project-a");
+                stale.metadata.insert(
+                    "runtime_prompt_snapshot".into(),
+                    "old Project A prompt".into(),
+                );
+                stale.add_message(bamboo_domain::Message::user("Keep transcript"));
+                storage.save_session(&stale).await.unwrap();
+                let mut current = stale.clone();
+                current.metadata_version += 1;
+                current.set_project_id_meta("project-b");
+                current.set_workspace_path_meta("/project-b");
+                current.metadata.remove("runtime_prompt_snapshot");
+                current
+                    .metadata
+                    .insert("workspace_source".into(), "project_default".into());
+                current
+                    .metadata
+                    .insert("project_context_rendered".into(), "Project B".into());
+                storage.save_session(&current).await.unwrap();
+                if equal_revision {
+                    // The pre-fix merge could already have copied only the
+                    // version. Reconcile this equal-version divergent Project.
+                    stale.metadata_version = current.metadata_version;
+                }
+                let locked = LockedSessionStore::new(storage.clone());
+                let published = AtomicBool::new(false);
+                let publish = |saved: &Session| {
+                    assert!(!saved.metadata.contains_key("runtime_prompt_snapshot"));
+                    assert_eq!(saved.project_id_meta().as_deref(), Some("project-b"));
+                    assert_eq!(saved.workspace_path_meta().as_deref(), Some("/project-b"));
+                    assert_eq!(saved.metadata_version, current.metadata_version);
+                    assert_eq!(
+                        saved.metadata.get("workspace_source").map(String::as_str),
+                        Some("project_default")
+                    );
+                    assert_eq!(
+                        saved
+                            .metadata
+                            .get("project_context_rendered")
+                            .map(String::as_str),
+                        Some("Project B")
+                    );
+                    published.store(true, Ordering::SeqCst);
+                };
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, publish)
+                        .await
+                        .unwrap();
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |saved, committed| {
+                            assert!(committed);
+                            publish(saved);
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert!(published.load(Ordering::SeqCst));
+                assert_eq!(stale.project_id_meta(), current.project_id_meta());
+                let loaded = storage.load_session(&stale.id).await.unwrap().unwrap();
+                assert_eq!(loaded.project_id_meta(), current.project_id_meta());
+                assert_eq!(loaded.messages.len(), 1);
+                storage.flush_search_index().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_project_change_after_merge_read_rejects_without_cache_publication() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let mut stale = Session::new("root-project-race", "model");
+            stale.set_project_id_meta("project-a");
+            stale.add_message(bamboo_domain::Message::user("Keep transcript"));
+            first.save_session(&stale).await.unwrap();
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let mut current = stale.clone();
+            current.metadata_version += 1;
+            current.set_project_id_meta("project-b");
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let update = async {
+                paused.reached.wait().await;
+                second.save_session(&current).await.unwrap();
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, update)
+            })
+            .await
+            .expect("deterministic Project/save race completes");
+            assert!(!may_publish_runtime_result(&Err(result.unwrap_err())));
+            assert!(!published.load(Ordering::SeqCst));
+            let loaded = first.load_session(&current.id).await.unwrap().unwrap();
+            assert_eq!(loaded.project_id_meta(), current.project_id_meta());
+            assert_eq!(loaded.metadata_version, current.metadata_version);
+            assert_eq!(loaded.messages.len(), 1);
+            first.flush_search_index().await;
+            second.flush_search_index().await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for AuthoritySavePauseStorage {
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+        async fn load_runtime_control_plane(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(id).await
+        }
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.reached.wait().await;
+            self.release.wait().await;
+            self.inner.save_session(session).await
+        }
+        async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.reached.wait().await;
+            self.release.wait().await;
+            self.inner.save_runtime_state(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn root_deleted_after_merge_read_rejects_without_cache_or_event_publication() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let mut stale = Session::new("root-delete-race", "model");
+            stale.set_project_id_meta("project-a");
+            stale.add_message(bamboo_domain::Message::user("Old lifetime"));
+            first.save_session(&stale).await.unwrap();
+            let id = stale.id.clone();
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let delete = async {
+                paused.reached.wait().await;
+                assert!(second.delete_session(&id).await.unwrap());
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, delete)
+            })
+            .await
+            .expect("deterministic delete/save race completes");
+            assert!(!may_publish_runtime_result(&Err(result.unwrap_err())));
+            assert!(!published.load(Ordering::SeqCst));
+            assert!(first.load_root_authority(&id).await.unwrap().is_none());
+            assert!(!first.sessions_root_dir().join(&id).exists());
+            first.flush_search_index().await;
+            second.flush_search_index().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_bootstrap_between_merge_read_and_save_rejects_without_publishing() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let store = LockedSessionStore::new(paused.clone());
+            let mut stale = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "stale");
+            stale.add_message(bamboo_domain::Message::user(
+                "must not enter new Supervisor",
+            ));
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    store
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    store
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let bootstrap = async {
+                // The merge read saw None. Publish from an independent V2 store
+                // before allowing the loser to take its final filesystem lock.
+                paused.reached.wait().await;
+                let receipt = second
+                    .get_or_create_default_supervisor("supervisor")
+                    .await
+                    .unwrap();
+                paused.release.wait().await;
+                receipt
+            };
+            let (result, receipt) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(save, bootstrap)
+                })
+                .await
+                .expect("deterministic bootstrap/save race completes");
+            let error = result.unwrap_err();
+            assert!(!may_publish_runtime_result(&Err(error)));
+            assert!(!published.load(Ordering::SeqCst));
+            assert!(stale.authority_identity.is_ordinary());
+            let observed = first
+                .load_root_authority(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // The independent store's ordinary lookup index can remain stale;
+            // strict authority must observe canonical publication without it.
+            let durable = second
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.model, "supervisor");
+            assert_eq!(observed.authority_identity, durable.authority_identity);
+            assert!(durable.messages.is_empty());
+            assert_eq!(
+                durable.authority_identity,
+                bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: receipt.incarnation_id,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_merge_publishes_adopted_identity_but_never_a_rejected_incarnation() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let receipt = storage
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let baseline = storage
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = baseline.authority_identity.clone();
+            let store = LockedSessionStore::new(storage.clone());
+            for case in 0..3 {
+                let rejected = case != 0;
+                let mut snapshot = baseline.clone();
+                snapshot.authority_identity = if case == 1 {
+                    bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    }
+                } else {
+                    bamboo_domain::SessionAuthorityIdentity::Ordinary
+                };
+                if case == 2 {
+                    snapshot.created_at -= chrono::Duration::seconds(1);
+                    snapshot.model = "stale Ordinary instance".into();
+                    snapshot.add_message(bamboo_domain::Message::user("must not be rebound"));
+                }
+                let published = AtomicBool::new(false);
+                let callback = |saved: &Session| {
+                    assert_eq!(saved.authority_identity, expected);
+                    published.store(true, Ordering::SeqCst);
+                };
+                let result = if runtime_only {
+                    store
+                        .save_runtime_only_and_publish(&mut snapshot, callback)
+                        .await
+                } else {
+                    store
+                        .merge_save_runtime_and_publish(&mut snapshot, |saved, committed| {
+                            assert!(committed);
+                            callback(saved);
+                        })
+                        .await
+                };
+                assert_eq!(result.is_err(), rejected);
+                assert_eq!(published.load(Ordering::SeqCst), !rejected);
+                if !rejected {
+                    assert_eq!(snapshot.authority_identity, expected);
+                }
+                let durable = storage
+                    .load_session(&receipt.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(durable.authority_identity, expected);
+                assert_eq!(durable.created_at, baseline.created_at);
+                assert_eq!(durable.model, baseline.model);
+                assert!(durable.messages.is_empty());
+            }
+        }
+    }
 
     struct CountingControlPlaneStorage {
         inner: Arc<SessionStoreV2>,
@@ -1503,6 +2666,181 @@ mod tests {
             self.inner
                 .save_task_control_plane_if_matches(original, updated)
                 .await
+        }
+
+        async fn save_task_control_planes_atomically(
+            &self,
+            first_original: &Session,
+            first_updated: &Session,
+            second_original: &Session,
+            second_updated: &Session,
+        ) -> std::io::Result<bool> {
+            self.commit_reached.wait().await;
+            self.release_commit.wait().await;
+            self.inner
+                .save_task_control_planes_atomically(
+                    first_original,
+                    first_updated,
+                    second_original,
+                    second_updated,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds(
+    ) {
+        use bamboo_domain::{
+            SupervisorManagementMutation, SupervisorManagementRequest, SupervisorReference,
+        };
+
+        for mode in 0..4 {
+            let home = tempfile::tempdir().unwrap();
+            let inner = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let receipt = inner
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let reference = SupervisorReference::from(&receipt);
+            let mut root = inner
+                .load_session(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let list = bamboo_domain::TaskList {
+                session_id: root.id.clone(),
+                title: "original".into(),
+                items: vec![],
+                created_at: root.created_at,
+                updated_at: root.created_at,
+            };
+            let updated = bamboo_domain::TaskList {
+                title: "updated".into(),
+                ..list.clone()
+            };
+            root.task_list = Some(list.clone());
+            root.set_task_list_version_meta("1");
+            inner.save_session(&root).await.unwrap();
+            let child_id = if mode == 2 { "aaa-child" } else { "zzz-child" };
+            let mut child = Session::new_child_of(child_id, &root, "model", "child");
+            child.task_list = Some(list.clone());
+            child.set_task_list_version_meta("1");
+            inner.save_session(&child).await.unwrap();
+            let independent = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let commit_reached = Arc::new(tokio::sync::Barrier::new(2));
+            let release_commit = Arc::new(tokio::sync::Barrier::new(2));
+            let paused = LockedSessionStore::new(Arc::new(SingleCommitPauseStorage {
+                inner: inner.clone(),
+                commit_reached: commit_reached.clone(),
+                release_commit: release_commit.clone(),
+            }));
+            let published = AtomicBool::new(false);
+            let loser = async {
+                if mode == 0 {
+                    paused
+                        .update_task_list_control_plane_and_publish(&root.id, &updated, "2", |_| {
+                            published.store(true, Ordering::SeqCst)
+                        })
+                        .await
+                } else if mode == 1 {
+                    paused
+                        .update_task_list_control_plane_if_version_and_publish(
+                            &root.id,
+                            "1",
+                            &list,
+                            &updated,
+                            "2",
+                            |_| published.store(true, Ordering::SeqCst),
+                        )
+                        .await
+                } else {
+                    paused
+                        .update_task_list_control_planes_if_version_and_publish(
+                            child_id,
+                            &root.id,
+                            "1",
+                            &list,
+                            &updated,
+                            "2",
+                            |_, _| published.store(true, Ordering::SeqCst),
+                        )
+                        .await
+                }
+            };
+            let winner = async {
+                commit_reached.wait().await;
+                independent
+                    .mutate_supervisor_management(&SupervisorManagementRequest {
+                        supervisor: reference.clone(),
+                        expected_state_revision: 0,
+                        mutation: SupervisorManagementMutation::ConfigureProjectScope {
+                            allowed_projects: ["project-a".parse().unwrap()].into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                release_commit.wait().await;
+            };
+            let (result, ()) = tokio::join!(loser, winner);
+            if mode == 0 {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert!(!published.load(Ordering::SeqCst));
+            for id in [&root.id, &child.id] {
+                assert_eq!(
+                    inner
+                        .load_runtime_control_plane(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task_list_version_meta()
+                        .as_deref(),
+                    Some("1")
+                );
+            }
+            let fresh = LockedSessionStore::new(inner.clone());
+            let check = |saved: &Session| {
+                assert_eq!(saved.supervisor_management.as_ref().unwrap().revision, 1);
+                published.store(true, Ordering::SeqCst);
+            };
+            let retried = if mode == 0 {
+                fresh
+                    .update_task_list_control_plane_and_publish(&root.id, &updated, "2", check)
+                    .await
+            } else if mode == 1 {
+                fresh
+                    .update_task_list_control_plane_if_version_and_publish(
+                        &root.id, "1", &list, &updated, "2", check,
+                    )
+                    .await
+            } else {
+                fresh
+                    .update_task_list_control_planes_if_version_and_publish(
+                        child_id,
+                        &root.id,
+                        "1",
+                        &list,
+                        &updated,
+                        "2",
+                        |_, shared| check(shared),
+                    )
+                    .await
+            };
+            assert!(retried.unwrap());
+            assert!(published.load(Ordering::SeqCst));
+            assert_eq!(
+                inner
+                    .load_runtime_control_plane(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task_list_version_meta()
+                    .as_deref(),
+                Some("2")
+            );
         }
     }
 
@@ -1685,6 +3023,28 @@ mod tests {
         Session::new(id.to_string(), "test-model".to_string())
     }
 
+    fn stage_retrieval_window_archive(expected: &Session, message_index: usize) -> Session {
+        let mut staged = expected.clone();
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            80.0,
+            60.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        let event_id = event.id.clone();
+        staged.messages[message_index].compressed = true;
+        staged.messages[message_index].compressed_by_event_id = Some(event_id);
+        staged.compression_events.push(event);
+        staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        staged
+    }
+
     fn typed_permission_result(
         tool_call_id: &str,
         message_id: &str,
@@ -1791,6 +3151,7 @@ mod tests {
         storage.save_session(&durable).await.unwrap();
 
         let mut cached = fresh(session_id);
+        cached.created_at = durable.created_at;
         cached.title = "Stale cached title".to_string();
         cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
         cached.set_pending_question(
@@ -2043,9 +3404,11 @@ mod tests {
             ),
         ];
         let mut previous_revision = 0;
+        let created_at = fresh(session_id).created_at;
 
         for (index, (requested, configured, expected_effective)) in cases.into_iter().enumerate() {
             let mut activation = fresh(session_id);
+            activation.created_at = created_at;
             activation
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
@@ -2408,6 +3771,7 @@ mod tests {
         storage.save_session(&durable).await.unwrap();
 
         let mut stale = fresh(session_id);
+        stale.created_at = durable.created_at;
         store.merge_save_runtime(&mut stale).await.unwrap();
         let saved = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(
@@ -2841,6 +4205,531 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_commits_without_an_archive_event() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        expected.add_message(Message::user("continue"));
+        expected.metadata.insert(
+            "responses.previous_response_id".to_string(),
+            "response-before-rewrite".to_string(),
+        );
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.metadata.remove("responses.previous_response_id");
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(saved.messages[0].content, "Base");
+        assert!(saved.compression_events.is_empty());
+        assert!(!saved
+            .metadata
+            .contains_key("responses.previous_response_id"));
+        assert_eq!(
+            saved
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
+        );
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_a_concurrent_suffix_without_writing() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-rebase";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        let mut concurrent = Message::user("concurrent durable suffix");
+        concurrent.id = "prompt-rewrite-concurrent-suffix".to_string();
+        durable.add_message(concurrent);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert_eq!(staged.messages[1].id, "prompt-rewrite-concurrent-suffix");
+        assert!(staged.model_context_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_a_concurrent_pending_injection() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-pending-injection";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "content": "background shell completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert_eq!(
+            staged.pending_injected_messages(),
+            durable.pending_injected_messages()
+        );
+        assert!(staged.model_context_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_concurrent_open_runtime_metadata() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-open-runtime-metadata";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.metadata.insert(
+            "concurrent.runtime.marker".to_string(),
+            "latest".to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            staged
+                .metadata
+                .get("concurrent.runtime.marker")
+                .map(String::as_str),
+            Some("latest")
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert!(staged.model_context_state.is_none());
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_concurrent_reasoning_update() {
+        use bamboo_domain::{reasoning::ReasoningEffort, session::types::Message};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-reasoning-update";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.reasoning_effort = Some(ReasoningEffort::High);
+        durable.metadata_version = 1;
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(staged.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(staged.metadata_version, 1);
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert!(staged.model_context_state.is_none());
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_archive_rejection_checkpoint_persists_the_rewritten_tool_result() {
+        use bamboo_domain::{FunctionCall, Message, ToolCall};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "manual-archive-rejection-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive older context"));
+        let mut assistant = Message::assistant("", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "archive-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "archive_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        expected.add_message(assistant);
+        let mut result = Message::tool_result("archive-call", "Retrieval-window archive requested");
+        result.id = "archive-result".to_string();
+        result.tool_success = Some(true);
+        expected.add_message(result);
+        expected.metadata.insert(
+            RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+            "response-before-rejection".to_string(),
+        );
+        storage.save_session(&expected).await.unwrap();
+
+        let occurrence = ResponseOccurrence {
+            tool_call_id: "archive-call".to_string(),
+            tool_result_message_id: "archive-result".to_string(),
+            permission_generation: None,
+        };
+        let reason = "no eligible active logical group can be archived";
+        let stage_rejection = |base: &Session| {
+            let mut staged = base.clone();
+            let staged_result = staged
+                .messages
+                .iter_mut()
+                .find(|message| message.id == "archive-result")
+                .unwrap();
+            staged_result.tool_success = Some(false);
+            staged_result.content = format!("archive_context rejected: {reason}");
+            staged.metadata.insert(
+                LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+                serde_json::to_string(&occurrence).unwrap(),
+            );
+            staged.metadata.insert(
+                MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
+                serde_json::to_string(&vec![serde_json::json!({
+                    "occurrence": occurrence.clone(),
+                    "reason": reason,
+                })])
+                .unwrap(),
+            );
+            staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            staged.reset_model_context_epoch(
+                bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+            );
+            staged
+        };
+
+        let mut staged = stage_rejection(&expected);
+        let mut durable = expected.clone();
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "content": "background shell completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_manual_archive_rejection_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            staged.pending_injected_messages(),
+            durable.pending_injected_messages()
+        );
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&unchanged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+
+        expected = staged;
+        let mut staged = stage_rejection(&expected);
+
+        let outcome = store
+            .checkpoint_manual_archive_rejection_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let saved_result = saved
+            .messages
+            .iter()
+            .find(|message| message.id == "archive-result")
+            .unwrap();
+        assert_eq!(saved_result.tool_success, Some(false));
+        assert_eq!(
+            saved_result.content,
+            "archive_context rejected: no eligible active logical group can be archived"
+        );
+        assert!(saved
+            .metadata
+            .contains_key(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY));
+        assert!(saved.metadata.contains_key(MANUAL_ARCHIVE_REJECTIONS_KEY));
+        assert!(!saved
+            .metadata
+            .contains_key(RESPONSES_PREVIOUS_RESPONSE_ID_KEY));
+        assert_eq!(
+            saved.pending_injected_messages(),
+            durable.pending_injected_messages()
+        );
+        assert_eq!(
+            saved
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
+        );
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&staged).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_archive_consumption_checkpoint_rebases_concurrent_open_metadata() {
+        use bamboo_domain::{FunctionCall, Message, ToolCall};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "manual-archive-consumption-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive older context"));
+        let mut assistant = Message::assistant("", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "archive-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "archive_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        expected.add_message(assistant);
+        let mut result = Message::tool_result("archive-call", "Retrieval-window archive requested");
+        result.id = "archive-result".to_string();
+        result.tool_success = Some(true);
+        expected.add_message(result);
+        storage.save_session(&expected).await.unwrap();
+
+        let occurrence = ResponseOccurrence {
+            tool_call_id: "archive-call".to_string(),
+            tool_result_message_id: "archive-result".to_string(),
+            permission_generation: None,
+        };
+        let stage_consumption = |base: &Session| {
+            let mut staged = base.clone();
+            staged.metadata.insert(
+                LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+                serde_json::to_string(&occurrence).unwrap(),
+            );
+            staged
+        };
+
+        let mut staged = stage_consumption(&expected);
+        let mut durable = expected.clone();
+        durable.metadata.insert(
+            "concurrent.workflow_index".to_string(),
+            "workflow-42".to_string(),
+        );
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "id": "bash-1",
+            "status": "completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_manual_archive_consumption_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&unchanged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+
+        expected = staged;
+        let mut staged = stage_consumption(&expected);
+        let outcome = store
+            .checkpoint_manual_archive_consumption_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.metadata.get("concurrent.workflow_index"),
+            Some(&"workflow-42".to_string())
+        );
+        assert_eq!(
+            saved.pending_injected_messages(),
+            Some(vec![serde_json::json!({
+                "id": "bash-1",
+                "status": "completed",
+            })])
+        );
+        assert_eq!(
+            saved.metadata.get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY),
+            Some(&serde_json::to_string(&occurrence).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_preserves_staged_archive_flags() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "retrieval-checkpoint-archive-flags";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive me"));
+        expected.add_message(Message::assistant("retain me", None));
+        storage.save_session(&expected).await.unwrap();
+        let mut staged = stage_retrieval_window_archive(&expected, 0);
+        let event_id = staged.compression_events[0].id.clone();
+        let published = Arc::new(std::sync::Mutex::new(None));
+        let published_clone = Arc::clone(&published);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, move |saved| {
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.messages[0].compressed);
+        assert_eq!(
+            saved.messages[0].compressed_by_event_id.as_deref(),
+            Some(event_id.as_str())
+        );
+        assert!(!saved.messages[1].compressed);
+        assert_eq!(saved.compression_events.len(), 1);
+        assert_eq!(
+            saved.compression_events[0].kind,
+            bamboo_domain::CompressionEventKind::RetrievalWindow
+        );
+        assert_eq!(
+            serde_json::to_value(published.lock().unwrap().as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_rebases_concurrent_suffix_without_writing() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "retrieval-checkpoint-concurrent-suffix";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive candidate"));
+        storage.save_session(&expected).await.unwrap();
+        let mut staged = stage_retrieval_window_archive(&expected, 0);
+
+        let mut durable = expected.clone();
+        let mut concurrent = Message::user("concurrent durable suffix");
+        concurrent.id = "concurrent-durable-suffix".to_string();
+        durable.add_message(concurrent);
+        storage.save_session(&durable).await.unwrap();
+        let published = Arc::new(AtomicBool::new(false));
+        let published_clone = Arc::clone(&published);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, move |_| {
+                published_clone.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert!(!published.load(Ordering::SeqCst));
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap(),
+            "a conflict must not write the staged archive"
+        );
+        assert_eq!(staged.messages.len(), 2);
+        assert_eq!(staged.messages[1].id, "concurrent-durable-suffix");
+        assert!(staged.messages.iter().all(|message| !message.compressed));
+        assert!(staged.compression_events.is_empty());
+        assert!(staged.model_context_state.is_none());
     }
 
     #[tokio::test]
@@ -3445,6 +5334,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale Default".to_string();
         runtime_copy.title_version = 0;
         runtime_copy.title_generated = false;
@@ -3475,6 +5365,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale".to_string();
         runtime_copy.title_version = 1;
         runtime_copy.metadata_version = 0;
@@ -3500,6 +5391,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.pinned = false;
         runtime_copy.metadata_version = 0;
 
@@ -3527,6 +5419,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut authoritative_copy = fresh(session_id);
+        authoritative_copy.created_at = on_disk.created_at;
         authoritative_copy.title = "New Authoritative".to_string();
         authoritative_copy.title_version = 2;
         authoritative_copy.metadata_version = 4;
@@ -3555,6 +5448,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale".to_string();
         runtime_copy.metadata_version = 0;
         runtime_copy.messages = vec![bamboo_domain::session::types::Message {
@@ -4614,6 +6508,28 @@ mod tests {
             0,
             "acquiring locks for many distinct ids must not grow the map"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_last_waiter_reclaims_hundreds_of_session_locks() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage);
+        for index in 0..512 {
+            let id = format!("cancelled-child-{index}");
+            let held = store.acquire_lock(&id).await;
+            let mut waiter = Box::pin(store.acquire_lock(&id));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(waiter.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            drop(held);
+            // Cancel after the previous holder handed ownership to the waiter,
+            // but before the waiter is polled again to construct its guard.
+            drop(waiter);
+        }
+        assert!(store.locks.is_empty());
     }
 
     #[tokio::test]

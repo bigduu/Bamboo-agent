@@ -40,10 +40,14 @@
 //! The SDK never reimplements the agent loop. `run` / `run_stream` funnel into
 //! `bamboo_engine::Agent::execute` (the single canonical execution path).
 
+mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
 mod tools;
+
+#[cfg(test)]
+mod approval_replay_tests;
 
 use std::sync::Arc;
 
@@ -52,9 +56,7 @@ pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
 use tokio::sync::mpsc;
 
-use bamboo_engine::session_app::approval_replay::{
-    refresh_approval_replay_posture, ApprovalReplayDecision,
-};
+use approval_replay::ReplayDisposition;
 use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
 use bamboo_engine::session_app::repository::SessionAccess;
 use bamboo_engine::session_app::respond::{
@@ -85,7 +87,16 @@ pub use bamboo_domain::{
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
     SessionProviderMessage, SessionRuntimeInstruction, TaskItem, TaskItemStatus, TaskList,
 };
+pub use bamboo_domain::{
+    SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
+    SupervisorLinkObservation, SupervisorManagedLink, SupervisorManagementMutation,
+    SupervisorManagementReceipt, SupervisorManagementRequest, SupervisorManagementState,
+    SupervisorReference, SupervisorScopeObservation, DEFAULT_SUPERVISOR_SESSION_ID,
+    MAX_SUPERVISOR_LINKS, MAX_SUPERVISOR_PROJECTS, MAX_SUPERVISOR_SESSION_ID_BYTES,
+    SUPERVISOR_MANAGEMENT_SCHEMA_VERSION,
+};
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
+pub use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 pub use bamboo_engine::{
     Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
     LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook,
@@ -375,26 +386,118 @@ impl Agent {
         let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
         if session.project_id_meta().is_none() {
             if let Some(project_id) = self.project_id.as_ref() {
-                session.set_project_id_meta(project_id.to_string());
+                let existing = if session.kind == bamboo_domain::SessionKind::Root {
+                    match self.storage().load_root_authority(&session.id).await {
+                        // Preserve compatibility for custom Storage backends that
+                        // predate the strict Root port. V2 always uses its canonical
+                        // directory lookup, even when this instance's index is stale.
+                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                            self.storage().load_session(&session.id).await
+                        }
+                        result => result,
+                    }
+                    .map_err(|error| AgentError::ProjectContext(error.to_string()))?
+                } else {
+                    None
+                };
+                if let Some(current) = existing {
+                    if current.kind != bamboo_domain::SessionKind::Root
+                        || current.created_at != session.created_at
+                        || current.metadata_version != session.metadata_version
+                        || current.authority_identity != session.authority_identity
+                        || current.project_id_meta().is_some()
+                    {
+                        return Err(AgentError::ProjectContext(
+                            "Session context changed; reload before assigning its first Project"
+                                .to_string(),
+                        ));
+                    }
+                    let next_version =
+                        current.metadata_version.checked_add(1).ok_or_else(|| {
+                            AgentError::ProjectContext(
+                                "Session metadata revision cannot advance".to_string(),
+                            )
+                        })?;
+                    let mut candidate = session.clone();
+                    candidate.set_project_id_meta(project_id.to_string());
+                    candidate.metadata_version = next_version;
+                    candidate.updated_at = std::time::SystemTime::now().into();
+                    self.inner
+                        .prepare_external_project_assignment_read_only(&mut candidate)
+                        .await?;
+                    #[cfg(test)]
+                    reexecute_and_child_approval_tests::pause_project_assignment(&session.id).await;
+                    // Commit the narrow context change before publishing a runtime
+                    // workspace or replaying an approved tool. The final writer
+                    // fences an independent store's competing assignment. The
+                    // V2 runtime path leaves conversation history untouched.
+                    self.storage()
+                        .save_runtime_state(&candidate)
+                        .await
+                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
+                    *session = candidate;
+                } else {
+                    // First creation keeps its existing revision and persistence
+                    // lifecycle; Child assignment keeps its prior SDK semantics.
+                    session.set_project_id_meta(project_id.to_string());
+                }
             }
         }
+
+        // Complete the external Project/Workspace handoff before replaying an
+        // approved mutating tool. The replay executor reads the runtime
+        // workspace registry, so deferring this until the loop's first round
+        // would execute against stale process state. Assigned sessions fail
+        // closed here when this runtime has no Project resolver; the pending
+        // replay marker remains intact for a correctly configured retry.
+        self.inner
+            .prepare_external_session_for_execution(session)
+            .await?;
+
         // If `answer()` just approved a gated tool call, `session.metadata` carries
         // the re-execution marker `submit_pending_response` set — the gated tool
         // never actually ran (the permission gate intercepted it before
         // execution), so re-run it now for real and write the genuine output back
-        // before the loop resumes. No-op when the marker is absent (the common,
-        // non-permission path), so this is safe to run unconditionally on every
-        // entry into the loop, not just `resume`. See
+        // before the loop resumes. An unanswered typed request also keeps this
+        // entry waiting after its replay markers have been cleared. Check every
+        // ergonomic entry into the loop, not just `resume`. See
         // `reexecute_approved_tool_if_pending` for the full rationale.
-        self.reexecute_approved_tool_if_pending(session, &event_tx)
-            .await?;
+        match self
+            .reexecute_approved_tool_if_pending(session, &event_tx)
+            .await
+        {
+            Ok(ReplayDisposition::Continue) => {}
+            Ok(ReplayDisposition::AwaitingApproval(pending)) => {
+                direct_lease.abandon().await;
+                let _ = event_tx
+                    .send(AgentEvent::NeedClarification {
+                        question: pending.question,
+                        options: (!pending.options.is_empty()).then_some(pending.options),
+                        tool_call_id: Some(pending.tool_call_id),
+                        tool_name: Some(pending.tool_name),
+                        allow_custom: pending.allow_custom,
+                        source: Some(pending.source),
+                    })
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                direct_lease.abandon().await;
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+        }
 
-        // Apply the instruction as the session's leading System message and set
-        // the configured model via the single authoritative pre-execution
-        // mutation point. The builder's prompt is AUTHORITATIVE: it replaces a
-        // leading System message, otherwise inserts one at index 0, so a
-        // caller-supplied session can't silently shadow the configured
-        // instruction.
+        // Apply the instruction as the session's leading System message, set
+        // the configured model, and refresh the typed prompt snapshot via the
+        // single authoritative pre-execution mutation point. This intentionally
+        // follows replay: a failed replay remains observable without replacing
+        // caller System bytes, while a successful handoff always reaches the
+        // provider with one clean configured System message.
         bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
             session,
             self.system_prompt.as_deref(),
@@ -424,162 +527,15 @@ impl Agent {
             .await
     }
 
-    /// Port of `bamboo-server`'s `resume_adapter.rs` re-execution logic: after
-    /// [`answer`](Self::answer) approves a permission prompt,
-    /// `submit_pending_response` stamps `session.metadata` with
-    /// [`PERMISSION_REEXECUTE_METADATA_KEY`] (the approved tool call's id) — the
-    /// gated tool was intercepted BEFORE it ran, so its recorded result is only
-    /// the synthetic "Selected response: Approve" placeholder. This re-runs the
-    /// original tool call for real, against the SAME executor the loop itself
-    /// uses ([`bamboo_engine::Agent::default_tools`]), and overwrites the
-    /// placeholder tool-result message with the genuine output — so the resumed
-    /// loop sees what the operation actually did instead of inferring it.
-    ///
-    /// Emits the same `ToolStart`/`ToolComplete` (or `ToolError`) lifecycle
-    /// events onto `event_tx` that a normal dispatch would, so a streaming
-    /// consumer sees the re-run tool card update exactly like the HTTP surface
-    /// does. Best-effort persists the updated session via
-    /// [`persistence`](Self::persistence) so the real output survives even if the
-    /// process stops before the loop's own next save — logged, not propagated,
-    /// since the loop's subsequent save will also capture it.
-    ///
-    /// No-op (returns immediately) when the marker is absent, so it is safe to
-    /// call unconditionally at the top of every execution, not just resumes.
-    async fn reexecute_approved_tool_if_pending(
-        &self,
-        session: &mut Session,
-        event_tx: &mpsc::Sender<AgentEvent>,
-    ) -> Result<(), AgentError> {
-        let Some(tool_call_id) = session
-            .metadata
-            .get(PERMISSION_REEXECUTE_METADATA_KEY)
-            .cloned()
-        else {
-            return Ok(());
-        };
-
-        let Some(tool_call) = find_pending_tool_call(session, &tool_call_id) else {
-            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-            tracing::warn!(
-                session_id = %session.id,
-                tool_call_id = %tool_call_id,
-                "Permission re-exec marker set but tool call not found in history"
-            );
-            return Ok(());
-        };
-
-        let tool_name = tool_call.function.name.clone();
-        let decision = refresh_approval_replay_posture(
-            self.storage().as_ref(),
-            session,
-            self.permission_mode,
-            &tool_name,
-        )
-        .await?;
-
-        let flags = match decision {
-            ApprovalReplayDecision::Execute(flags) => flags,
-            ApprovalReplayDecision::BlockedByPlan(_) => {
-                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-                apply_tool_result(
-                    session,
-                    &tool_call_id,
-                    format!(
-                        "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
-                    ),
-                    false,
-                );
-                if let Err(error) = self.persistence().save_runtime_session(session).await {
-                    tracing::warn!(
-                        session_id = %session.id,
-                        %error,
-                        "Failed to persist Plan-blocked approval replay (loop's own save will retry)"
-                    );
-                }
-                return Ok(());
-            }
-        };
-        session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-
-        let executor = self.inner.default_tools();
-        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
-            == bamboo_tools::orchestrator::ToolMutability::Mutating;
-
-        // Frame the re-run with the same lifecycle events the normal loop emits
-        // (via ToolEmitter) so a streaming consumer's tool card updates
-        // (running -> finished) and ToolComplete carries the REAL output — raw
-        // `execute_with_context` only streams tool tokens, not lifecycle.
-        let mut emitter = bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
-        emitter.set_auto_approved(true);
-        let _ = event_tx
-            .send(emitter.begin().clone().into_agent_event())
-            .await;
-
-        let exec_result = {
-            let ctx = bamboo_agent_core::tools::ToolExecutionContext {
-                session_id: Some(session.id.as_str()),
-                tool_call_id: tool_call_id.as_str(),
-                event_tx: Some(event_tx),
-                available_tool_schemas: None,
-                bypass_permissions: flags.bypass_permissions,
-                auto_approve_permissions: flags.auto_approve_permissions,
-                plan_read_only: flags.plan_read_only,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            };
-            executor.execute_with_context(&tool_call, ctx).await
-        };
-
-        let (content, success) = match exec_result {
-            Ok(tool_result) => {
-                let _ = event_tx
-                    .send(
-                        emitter
-                            .finish(Some("Re-executed after approval".to_string()))
-                            .clone()
-                            .into_agent_event(),
-                    )
-                    .await;
-                let _ = event_tx
-                    .send(AgentEvent::ToolComplete {
-                        tool_call_id: tool_call.id.clone(),
-                        result: tool_result.clone(),
-                    })
-                    .await;
-                (tool_result.result, tool_result.success)
-            }
-            Err(error) => {
-                let message = format!("Tool re-execution after approval failed: {error}");
-                let _ = event_tx
-                    .send(emitter.error(message.clone()).clone().into_agent_event())
-                    .await;
-                (message, false)
-            }
-        };
-
-        tracing::info!(
-            session_id = %session.id,
-            tool_name = %tool_name,
-            tool_call_id = %tool_call_id,
-            success,
-            "Re-executed approved tool after permission grant"
-        );
-        apply_tool_result(session, &tool_call_id, content, success);
-
-        if let Err(error) = self.persistence().save_runtime_session(session).await {
-            tracing::warn!(
-                session_id = %session.id,
-                %error,
-                "Failed to persist session after tool re-execution (loop's own save will retry)"
-            );
-        }
-        Ok(())
-    }
-
     /// Access the shared storage backend.
     pub fn storage(&self) -> &Arc<dyn bamboo_agent_core::storage::Storage> {
         self.inner.storage()
+    }
+
+    /// Trusted identity bootstrap using this Agent's canonical Storage backend.
+    /// Creating this service does not create a Session or inherit SDK Project settings.
+    pub fn supervisor_sessions(&self) -> SupervisorSessionService {
+        SupervisorSessionService::new(self.storage().clone())
     }
 
     /// Access the runtime persistence adapter.
@@ -648,6 +604,12 @@ impl Agent {
     /// and overwrites the synthetic "Selected response: Approve" placeholder
     /// with the operation's genuine output before the loop continues — see
     /// `reexecute_approved_tool_if_pending`.
+    ///
+    /// This text-only method does not issue typed permission receipts. A typed
+    /// permission decision must be submitted through a typed response adapter
+    /// before resuming. Although a valid text option can consume the pending
+    /// question here, subsequent replay rejects its missing generation/receipt;
+    /// it does not restore the consumed question or infer approval from text.
     ///
     /// NOTE: `ChildApprovalRequested` (an out-of-process sub-agent worker's
     /// gated tool, proxied over the actor protocol) is a SEPARATE mechanism
@@ -914,32 +876,6 @@ impl SessionAccess for Agent {
 
     async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError> {
         SessionAccess::save_session(self, session).await
-    }
-}
-
-/// Find the original tool call (with its arguments) by id in the session
-/// history. Mirrors `bamboo-server`'s `resume_adapter::find_pending_tool_call`.
-fn find_pending_tool_call(
-    session: &Session,
-    tool_call_id: &str,
-) -> Option<bamboo_agent_core::tools::ToolCall> {
-    session.messages.iter().find_map(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.iter().find(|call| call.id == tool_call_id).cloned())
-    })
-}
-
-/// Overwrite the tool-result message for `tool_call_id` with the real tool
-/// output. Mirrors `bamboo-server`'s `resume_adapter::apply_tool_result`.
-fn apply_tool_result(session: &mut Session, tool_call_id: &str, content: String, success: bool) {
-    for message in &mut session.messages {
-        if message.tool_call_id.as_deref() == Some(tool_call_id) {
-            message.content = content;
-            message.tool_success = Some(success);
-            return;
-        }
     }
 }
 
@@ -1307,9 +1243,46 @@ mod reexecute_and_child_approval_tests {
     use bamboo_agent_core::tools::{
         FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome,
     };
+    use bamboo_domain::Storage as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
+
+    struct ProjectAssignmentHook {
+        reached: Notify,
+        resume: Notify,
+    }
+
+    fn project_assignment_hooks(
+    ) -> &'static StdMutex<std::collections::HashMap<String, Arc<ProjectAssignmentHook>>> {
+        static HOOKS: std::sync::OnceLock<
+            StdMutex<std::collections::HashMap<String, Arc<ProjectAssignmentHook>>>,
+        > = std::sync::OnceLock::new();
+        HOOKS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+    }
+
+    fn install_project_assignment_hook(session_id: &str) -> Arc<ProjectAssignmentHook> {
+        let hook = Arc::new(ProjectAssignmentHook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        project_assignment_hooks()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause_project_assignment(session_id: &str) {
+        let hook = project_assignment_hooks()
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
 
     /// A tool whose real output is trivially distinguishable from the
     /// synthetic "Selected response: Approve" placeholder `submit_pending_response`
@@ -1318,6 +1291,7 @@ mod reexecute_and_child_approval_tests {
     struct RealOutputTool {
         calls: AtomicUsize,
         flags: StdMutex<Vec<ToolExecutionSessionFlags>>,
+        workspaces: StdMutex<Vec<Option<std::path::PathBuf>>>,
     }
 
     impl RealOutputTool {
@@ -1325,6 +1299,7 @@ mod reexecute_and_child_approval_tests {
             Self {
                 calls: AtomicUsize::new(0),
                 flags: StdMutex::new(Vec::new()),
+                workspaces: StdMutex::new(Vec::new()),
             }
         }
     }
@@ -1365,6 +1340,10 @@ mod reexecute_and_child_approval_tests {
 
     struct ImmediateDoneProvider;
 
+    struct CountingDoneProvider {
+        calls: AtomicUsize,
+    }
+
     #[async_trait]
     impl bamboo_llm::LLMProvider for ImmediateDoneProvider {
         async fn chat_stream(
@@ -1374,6 +1353,23 @@ mod reexecute_and_child_approval_tests {
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl bamboo_llm::LLMProvider for CountingDoneProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(futures::stream::iter([
                 Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
                 Ok(bamboo_llm::LLMChunk::Done),
@@ -1406,6 +1402,11 @@ mod reexecute_and_child_approval_tests {
                 auto_approve_permissions: ctx.auto_approve_permissions,
                 plan_read_only: ctx.plan_read_only,
             });
+            self.workspaces.lock().unwrap().push(
+                ctx.session_id
+                    .as_deref()
+                    .and_then(bamboo_agent_core::workspace_state::get_workspace),
+            );
             Ok(ToolOutcome::Completed(
                 bamboo_agent_core::tools::ToolResult::text(true, format!("REAL TOOL OUTPUT #{n}")),
             ))
@@ -1631,6 +1632,536 @@ mod reexecute_and_child_approval_tests {
             .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
             .expect("tool result message present");
         assert_eq!(reloaded_result.content, "REAL TOOL OUTPUT #0");
+    }
+
+    #[tokio::test]
+    async fn normal_run_prepares_project_workspace_before_approved_tool_replay() {
+        let data_dir = tempfile::tempdir().expect("SDK data dir");
+        let project_path = tempfile::tempdir().expect("SDK Project path");
+        let project = bamboo_projects::ProjectStore::open(data_dir.path())
+            .expect("Project store")
+            .create_with_project_path(
+                "Replay Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Replay Project");
+        std::fs::write(
+            data_dir.path().join("config.json"),
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                }
+            }"#,
+        )
+        .expect("SDK config");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .model("claude-test")
+            .instruction("configured System")
+            .project_id(project.id.to_string())
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("Project-backed SDK agent");
+
+        let seed = seed_gated_tool_session("sdk-project-replay", "project-replay-call");
+        agent
+            .storage()
+            .save_session(&seed)
+            .await
+            .expect("seed replay session");
+        let outcome = agent
+            .answer("sdk-project-replay", "Approve")
+            .await
+            .expect("approve replay");
+        let mut session = outcome.session;
+        session.add_message(Message::user("continue after replay"));
+        let original_version = session.metadata_version;
+
+        agent
+            .run_session(&mut session)
+            .await
+            .expect("normal run should complete");
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.metadata_version, original_version + 1);
+        let reopened = bamboo_storage::SessionStoreV2::new(
+            agent
+                .session_store
+                .as_ref()
+                .unwrap()
+                .bamboo_home_dir()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let persisted = reopened
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, original_version + 1);
+        assert_eq!(persisted.project_id_meta(), session.project_id_meta());
+        let canonical = project_path
+            .path()
+            .canonicalize()
+            .expect("canonical Project workspace");
+        assert_eq!(
+            tool.workspaces.lock().unwrap().as_slice(),
+            &[Some(canonical.clone())],
+            "approved replay must observe the published Project workspace on its first call"
+        );
+        assert_eq!(
+            session.project_id_meta().as_deref(),
+            Some(project.id.as_str())
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(bamboo_config::paths::path_to_display_string(&canonical).as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Registered.as_str())
+        );
+        let systems = session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0].content, "configured System");
+        assert!(!systems[0]
+            .content
+            .contains(canonical.to_string_lossy().as_ref()));
+        assert!(!systems[0].content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("SDK prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "configured System");
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed SDK Workspace context");
+        assert!(workspace_context.contains(canonical.to_string_lossy().as_ref()));
+        assert!(workspace_context.contains("Workspace source: project_default"));
+        assert!(workspace_context.contains("Binding status: registered"));
+    }
+
+    async fn root_context_test_agent(
+        data_dir: &std::path::Path,
+        project_path: &std::path::Path,
+    ) -> (Agent, Arc<RealOutputTool>, Arc<CountingDoneProvider>) {
+        let project = bamboo_projects::ProjectStore::open(data_dir)
+            .unwrap()
+            .create_with_project_path(
+                "Context fence Project",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        std::fs::write(
+            data_dir.join("config.json"),
+            r#"{
+            "provider":"anthropic",
+            "providers":{"anthropic":{"api_key":"test-key","model":"claude-test"}}
+        }"#,
+        )
+        .unwrap();
+        let tool = Arc::new(RealOutputTool::new());
+        let provider = Arc::new(CountingDoneProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let agent = AgentBuilder::new()
+            .provider(provider.clone())
+            .model("claude-test")
+            .instruction("configured System")
+            .project_id(project.id.to_string())
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        (agent, tool, provider)
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_rejects_final_store_race() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
+        let mut session = seed_gated_tool_session("sdk-root-context-race", "context-race-call");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "context-race-call".to_string(),
+        );
+        agent.storage().save_session(&session).await.unwrap();
+        let second = bamboo_storage::SessionStoreV2::new(data.path().to_path_buf())
+            .await
+            .unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        let session_path = data
+            .path()
+            .join("sessions")
+            .join(&session.id)
+            .join("session.json");
+        let before_history = std::fs::read(&session_path).unwrap();
+        let before_workspace = bamboo_agent_core::workspace_state::get_workspace(&session.id);
+        let hook = install_project_assignment_hook(&session.id);
+        let mut winner = session.clone();
+        winner.set_project_id_meta("competing-project");
+        winner.metadata_version += 1;
+        let (tx, mut rx) = mpsc::channel(16);
+        let run = agent.execute_internal(&mut session, tx, CancellationToken::new());
+        let compete = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+                .await
+                .unwrap();
+            second.save_runtime_state(&winner).await.unwrap();
+            hook.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(run, compete);
+        let error = result.expect_err("final V2 writer must reject the competing assignment");
+        assert!(
+            matches!(error, AgentError::ProjectContext(ref message) if message.contains("authority conflict")),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+        assert_eq!(std::fs::read(&session_path).unwrap(), before_history);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            before_workspace
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+        let persisted = second
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.project_id_meta(), winner.project_id_meta());
+        assert_eq!(persisted.metadata_version, winner.metadata_version);
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_uses_canonical_root_with_stale_index()
+    {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, _, _) = root_context_test_agent(data.path(), workspace.path()).await;
+        let second = bamboo_storage::SessionStoreV2::new(data.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut session = Session::new("sdk-root-context-stale-index", "claude-test");
+        session.add_message(Message::user("continue"));
+        second.save_session(&session).await.unwrap();
+        assert!(
+            agent
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "SDK instance intentionally predates this Root"
+        );
+        agent.run_session(&mut session).await.unwrap();
+        let persisted = second
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 1);
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            agent.project_id.as_ref().map(|id| id.as_str())
+        );
+        assert_eq!(session.metadata_version, 1);
+
+        let mut unsaved = Session::new("sdk-root-context-new", "claude-test");
+        unsaved.add_message(Message::user("first run"));
+        agent.run_session(&mut unsaved).await.unwrap();
+        assert_eq!(
+            unsaved.metadata_version, 0,
+            "new sessions retain the initial revision"
+        );
+        let persisted = second
+            .load_root_authority(&unsaved.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 0);
+        assert_eq!(persisted.project_id_meta(), unsaved.project_id_meta());
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_overflow_preserves_retry_state() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
+        let mut session = seed_gated_tool_session("sdk-root-context-overflow", "overflow-call");
+        session.metadata_version = u64::MAX;
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "overflow-call".to_string(),
+        );
+        agent.storage().save_session(&session).await.unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let error = agent
+            .execute_internal(&mut session, tx, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::ProjectContext(ref message) if message.contains("revision cannot advance"))
+        );
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+        let persisted = agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap()
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn normal_run_recovers_serialized_legacy_workspace_before_replay_and_replaces_system() {
+        let data_dir = tempfile::tempdir().expect("SDK data dir");
+        let legacy_workspace = tempfile::tempdir().expect("legacy SDK Workspace");
+        let canonical = legacy_workspace
+            .path()
+            .canonicalize()
+            .expect("canonical legacy Workspace");
+        let display = bamboo_config::paths::path_to_display_string(&canonical);
+        std::fs::write(
+            data_dir.path().join("config.json"),
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                }
+            }"#,
+        )
+        .expect("SDK config");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .model("claude-test")
+            .instruction("configured System")
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("SDK agent");
+
+        let mut legacy = seed_gated_tool_session("sdk-legacy-replay", "legacy-replay-call");
+        legacy.messages.insert(
+            0,
+            Message::system(
+                bamboo_engine::runtime::context::build_workspace_prompt_context(&display)
+                    .expect("legacy Workspace marker"),
+            ),
+        );
+        assert!(legacy.workspace_path_meta().is_none());
+        let serialized = serde_json::to_vec(&legacy).expect("serialize legacy SDK session");
+        let legacy: Session =
+            serde_json::from_slice(&serialized).expect("deserialize legacy SDK session");
+        agent
+            .storage()
+            .save_session(&legacy)
+            .await
+            .expect("seed serialized legacy session");
+        let outcome = agent
+            .answer("sdk-legacy-replay", "Approve")
+            .await
+            .expect("approve legacy replay");
+        let mut session = outcome.session;
+        session.add_message(Message::user("continue after legacy replay"));
+
+        agent
+            .run_session(&mut session)
+            .await
+            .expect("normal legacy run should complete");
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tool.workspaces.lock().unwrap().as_slice(),
+            &[Some(canonical.clone())],
+            "legacy Workspace must be published before the approved tool is replayed"
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(display.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Session.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        let systems = session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0].content, "configured System");
+        assert!(!systems[0].content.contains(&display));
+        assert!(!systems[0].content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("SDK prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "configured System");
+        assert!(snapshot
+            .workspace_context
+            .as_deref()
+            .is_some_and(|context| context.contains(&display)));
+    }
+
+    #[tokio::test]
+    async fn missing_project_resolver_stops_sdk_before_replay_system_replacement_or_provider() {
+        let data_dir = tempfile::tempdir().expect("manual SDK data dir");
+        let legacy_workspace = tempfile::tempdir().expect("retryable legacy Workspace");
+        let legacy_display = bamboo_config::paths::path_to_display_string(legacy_workspace.path());
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(data_dir.path().join("sessions"))
+                .await
+                .expect("session store"),
+        );
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                data_dir.path().join("metrics.db"),
+            )),
+            7,
+        );
+        let tool = Arc::new(RealOutputTool::new());
+        let registry = bamboo_tools::ToolRegistry::new();
+        registry
+            .register_shared(tool.clone())
+            .expect("register replay tool");
+        let provider = Arc::new(CountingDoneProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = bamboo_engine::Agent::builder()
+            .storage(store.clone())
+            .persistence(persistence)
+            .attachment_reader(store.clone())
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+            .metrics_collector(metrics)
+            .config(Arc::new(tokio::sync::RwLock::new(
+                bamboo_llm::Config::default(),
+            )))
+            .provider(provider.clone())
+            .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(
+                registry,
+            )))
+            .build()
+            .expect("manual runtime without Project resolver");
+        let agent = Agent::from_runtime_with_config(
+            runtime,
+            Some("configured System".to_string()),
+            Some("configured-model".to_string()),
+            None,
+            None,
+            None,
+            None,
+            PermissionMode::Default,
+        );
+
+        let mut session = seed_gated_tool_session("sdk-missing-resolver", "missing-resolver-call");
+        let legacy_block =
+            bamboo_engine::runtime::context::build_workspace_prompt_context(&legacy_display)
+                .expect("retryable legacy Workspace marker");
+        session.messages.insert(
+            0,
+            Message::system(format!("caller System\n\n{legacy_block}")),
+        );
+        session.set_project_id_meta("project-missing-resolver");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "missing-resolver-call".to_string(),
+        );
+        session.prompt_snapshot = Some(
+            serde_json::from_value(serde_json::json!({
+                "base_system_prompt": "stale SDK snapshot",
+                "effective_system_prompt": "stale SDK snapshot"
+            }))
+            .expect("synthetic stale SDK prompt snapshot"),
+        );
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed assigned replay session");
+        let before = serde_json::to_vec(&session).expect("serialize retryable SDK session");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        let error = agent
+            .execute_internal(&mut session, event_tx, CancellationToken::new())
+            .await
+            .expect_err("assigned SDK session must fail without Project resolver");
+
+        assert!(matches!(error, AgentError::ProjectContext(_)));
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "prep failure must emit no events"
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).expect("serialize failed SDK session"),
+            before,
+            "missing resolver must preserve the full serialized retry state"
+        );
+        assert!(session.messages[0].content.contains(&legacy_display));
+        assert!(session.messages[0]
+            .content
+            .contains("BAMBOO_WORKSPACE_CONTEXT"));
+        assert_eq!(
+            session
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("missing-resolver-call"),
+            "approval replay marker must remain retryable"
+        );
     }
 
     #[tokio::test]

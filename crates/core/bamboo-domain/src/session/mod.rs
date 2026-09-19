@@ -1,5 +1,6 @@
 //! Bamboo session domain — Session, Message, Role, TaskList, and supporting types.
 
+pub mod authority;
 pub mod budget_types;
 pub mod composition;
 pub mod context_block;
@@ -10,16 +11,21 @@ pub mod model_context;
 pub mod permission;
 pub mod persistence;
 pub mod prompt_block;
+pub mod provider_transcript;
 pub mod response_control;
 pub mod runtime_metadata;
 pub mod runtime_metadata_access;
 pub mod runtime_state;
+pub mod supervisor_management;
 pub mod task;
 pub mod tool_types;
 pub mod types;
 
 // Re-exports for ergonomic access
-pub use budget_types::{BudgetStrategy, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown};
+pub use authority::*;
+pub use budget_types::{
+    BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
+};
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;
@@ -29,9 +35,11 @@ pub use model_context::*;
 pub use permission::*;
 pub use persistence::*;
 pub use prompt_block::{CacheControl, PromptBlock};
+pub use provider_transcript::*;
 pub use response_control::*;
 pub use runtime_metadata::SessionRuntimeMetadata;
 pub use runtime_state::*;
+pub use supervisor_management::*;
 pub use task::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;

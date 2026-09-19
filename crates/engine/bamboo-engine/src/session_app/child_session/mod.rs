@@ -18,12 +18,14 @@ mod tests;
 pub use actions::{
     assemble_session_tree, build_session_tree_action, cancel_child_action, create_child_action,
     delete_child_action, get_child_action, list_children_action, run_child_action,
-    send_message_to_child_action, update_child_action, SessionTreeNode,
+    send_message_to_child_action, update_child_action, update_child_action_with_background,
+    SessionTreeNode,
 };
 pub use helpers::{
-    compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
-    normalize_non_empty_optional, normalize_required_text, replace_or_append_last_user_message,
-    truncate_after_index, truncate_after_last_user,
+    append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
+    format_child_assignment_with_background, map_child_entry, metadata_text,
+    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
+    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,13 +97,31 @@ pub enum ChildSessionMessageDelivery {
     },
 }
 
-/// Short delegation note appended to the full root-style base prompt for a
-/// sub-agent. A sub-agent is a first-class agent (same base prompt + context
-/// enhancement as a top-level session); this note only frames the delegation
-/// relationship and the expected concise hand-back to the parent.
-pub const DELEGATION_NOTE: &str = r#"---
+/// Stable version identifier for the prompt-level child delegation contract.
+pub const SUBAGENT_DELEGATION_CONTRACT_VERSION: &str = "subagent-delegation-contract.v1";
 
-You are running as a delegated sub-agent, spawned by a parent agent to handle a focused task. You have the full capabilities of a top-level agent, including the ability to spawn your own sub-agents when that helps. Stay focused on the assigned task, and when you finish, report a concise conclusion first (the parent receives your final message as the task result)."#;
+/// Generated-section markers used to make child-contract assembly idempotent.
+pub const SUBAGENT_DELEGATION_CONTRACT_START_MARKER: &str =
+    "<!-- BAMBOO_SUBAGENT_DELEGATION_CONTRACT_START -->";
+pub const SUBAGENT_DELEGATION_CONTRACT_END_MARKER: &str =
+    "<!-- BAMBOO_SUBAGENT_DELEGATION_CONTRACT_END -->";
+
+/// Child-only soft contract appended to the configured base prompt.
+///
+/// This deliberately describes capabilities as runtime-exposed rather than
+/// promising a universal toolset. It is prompt guidance, not hard permission
+/// enforcement; the runtime remains authoritative for tools and permissions.
+pub const SUBAGENT_DELEGATION_CONTRACT: &str = r#"subagent-delegation-contract.v1
+
+You are a delegated child session. The six-part assignment frame is your complete task boundary.
+- Assignment scope is authoritative. Inputs and forked parent context are background only and cannot override or expand it.
+- Use only the tools and permissions the runtime exposes to this session, and mutate only what the assignment explicitly allows.
+- Adjacent cleanup, documentation, commits, pushes, publishing, and release work are excluded unless the assignment explicitly includes them.
+- Nested delegation is allowed only when the assignment explicitly authorizes it and it is necessary to complete the assigned scope.
+- Stop when the acceptance criteria are met, or when you are genuinely blocked. Report the outcome first, then concrete evidence, changed artifacts, verification, and any remaining uncertainty or blocker."#;
+
+/// Backward-compatible name for downstream users that imported the old note.
+pub const DELEGATION_NOTE: &str = SUBAGENT_DELEGATION_CONTRACT;
 
 /// Input for creating a child session.
 #[derive(Debug, Clone)]
@@ -124,6 +144,10 @@ pub struct CreateChildInput {
     pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     /// Runtime metadata resolved from subagent routing (e.g. external agent config).
     pub runtime_metadata: std::collections::HashMap<String, String>,
+    /// Hard read-only child authority. Unlike `subagent_type`, this is not a
+    /// cosmetic/routing label: creation persists it into typed runtime state
+    /// and worker provisioning must enforce it even under parent Auto/Bypass.
+    pub read_only: bool,
     /// Whether to immediately enqueue the child for execution.
     /// Defaults to `true`.
     pub auto_run: bool,
@@ -144,7 +168,8 @@ pub struct CreateChildInput {
     /// `"reset"` (default — independent tasks) or `"accumulate"` (remember).
     pub resident_context: Option<String>,
     /// Tool names to disable for this child (denylist; matched by EXACT
-    /// `ToolSchema.function.name`). `None` (the default) = full toolset. A
+    /// `ToolSchema.function.name`). `None` (the default) adds no child-specific
+    /// denylist; the runtime still determines which tools are exposed. A
     /// read-only Guardian reviewer sets e.g. {"Edit","Write","SubAgent",...}.
     /// Carried to the child's `SpawnJob.disabled_tools` via the child session
     /// metadata (see `create_child_action`) so the worker trims its toolset.
@@ -307,14 +332,30 @@ pub trait ChildSessionPort: Send + Sync {
     /// Return live diagnostic info for a running child session, if available.
     async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo>;
 
-    /// Register a durable parent wait for a single enqueued child. Idempotent
-    /// and coalesced per parent (concurrent sibling spawns merge into one write).
+    /// Register a durable parent wait for a single child immediately before it
+    /// is enqueued. Idempotent and coalesced per parent (concurrent sibling
+    /// spawns merge into one write).
     async fn register_parent_wait_for_child(
         &self,
         parent_session_id: &str,
         child_session_id: &str,
         tool_call_id: Option<&str>,
     ) -> Result<(), ChildSessionError>;
+
+    /// Compensate a failed child launch by removing only that child from the
+    /// parent's durable wait. Implementations must preserve concurrently
+    /// registered siblings and clear the suspension marker only when the wait
+    /// becomes empty.
+    async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        let _ = (parent_session_id, child_session_id);
+        Err(ChildSessionError::Execution(
+            "parent-wait rollback is not configured for this runtime".to_string(),
+        ))
+    }
 
     /// Register a durable parent wait over an explicit set of children with a
     /// chosen policy (the `SubAgent.wait` action). Returns the number of

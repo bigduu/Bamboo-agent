@@ -1,7 +1,9 @@
 use crate::provider_model_ref::ProviderModelRef;
 use crate::reasoning::ReasoningEffort;
+use crate::session::authority::SessionAuthorityIdentity;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
 use crate::session::message_part::{ImageUrlRef, MessagePart};
+use crate::session::supervisor_management::SupervisorManagementState;
 use crate::session::task::{TaskItemStatus, TaskList};
 use crate::session::tool_types::ToolCall;
 use crate::tool_types::ToolResultImage;
@@ -130,6 +132,14 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
@@ -456,11 +466,25 @@ pub enum CompressionTriggerType {
     CriticalOverflow,
 }
 
+/// Durable strategy that produced a context-compression event.
+///
+/// `Summary` is the compatibility default for events written before the
+/// discriminator existed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionEventKind {
+    #[default]
+    Summary,
+    RetrievalWindow,
+}
+
 /// Persistent context-compression event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionEvent {
     pub id: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub kind: CompressionEventKind,
     pub messages_compressed: usize,
     pub segments_removed: usize,
     #[serde(default)]
@@ -509,6 +533,65 @@ pub struct CompressionEvent {
     pub summarization_reduce_calls: u32,
     #[serde(default)]
     pub summarization_fallback_used: bool,
+    /// Exact active input tokens before a summary-free retrieval-window
+    /// boundary. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_active_tokens_before: u32,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_active_message_count_before: usize,
+    /// Versioned digest of the token-relevant active message state accepted by
+    /// the retrieval-window planner. Absent for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_active_state_sha256: Option<String>,
+    /// Versioned digest of the fixed prompt cost and provider-prepared
+    /// per-message token overrides accepted by a retrieval-window boundary.
+    /// Absent for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_token_accounting_sha256: Option<String>,
+    /// Exact active input tokens after a summary-free retrieval-window
+    /// boundary. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_active_tokens_after: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_target_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retrieval_target_usage_percent: u8,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_archived_group_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_archived_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_archived_message_tokens: u32,
+    /// Provider-visible tokens outside `Session.messages` that the committed
+    /// retrieval boundary reclaimed by resetting the model-context/provider
+    /// transcript epoch. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_boundary_reclaimed_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_system_message_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_context_window_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_request_input_limit_tokens: u32,
+    /// Configured recent-turn floor accepted by the retrieval-window planner.
+    /// This remains distinct from the actual retained count when the Session
+    /// contains fewer user turns than the configured floor.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_min_recent_user_turns: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_retained_recent_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_retained_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_oldest_retained_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_oldest_retained_user_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_provider_message_token_override_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_protected_active_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_incomplete_protocol_group_count: usize,
 }
 
 impl CompressionEvent {
@@ -527,6 +610,7 @@ impl CompressionEvent {
         Self {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now(),
+            kind: CompressionEventKind::Summary,
             messages_compressed,
             segments_removed,
             usage_before_percent,
@@ -547,6 +631,28 @@ impl CompressionEvent {
             summarization_map_calls: 0,
             summarization_reduce_calls: 0,
             summarization_fallback_used: false,
+            retrieval_active_tokens_before: 0,
+            retrieval_active_message_count_before: 0,
+            retrieval_active_state_sha256: None,
+            retrieval_token_accounting_sha256: None,
+            retrieval_active_tokens_after: 0,
+            retrieval_target_tokens: 0,
+            retrieval_target_usage_percent: 0,
+            retrieval_archived_group_count: 0,
+            retrieval_archived_user_turn_count: 0,
+            retrieval_archived_message_tokens: 0,
+            retrieval_boundary_reclaimed_tokens: 0,
+            retrieval_system_message_tokens: 0,
+            retrieval_context_window_tokens: 0,
+            retrieval_request_input_limit_tokens: 0,
+            retrieval_min_recent_user_turns: 0,
+            retrieval_retained_recent_user_turn_count: 0,
+            retrieval_retained_user_turn_count: 0,
+            retrieval_oldest_retained_message_id: None,
+            retrieval_oldest_retained_user_message_id: None,
+            retrieval_provider_message_token_override_count: 0,
+            retrieval_protected_active_tokens: 0,
+            retrieval_incomplete_protocol_group_count: 0,
         }
     }
 }
@@ -653,6 +759,12 @@ pub struct Session {
     pub metadata_version: u64,
     #[serde(default)]
     pub kind: SessionKind,
+    /// Trusted identity; raw metadata and ordinary persistence cannot assign it.
+    #[serde(default, skip_serializing_if = "SessionAuthorityIdentity::is_ordinary")]
+    pub authority_identity: SessionAuthorityIdentity,
+    /// Trusted host-managed scope and links; ordinary constructors never inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_management: Option<SupervisorManagementState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(default)]
@@ -702,6 +814,14 @@ pub struct Session {
     /// `messages` or the existing session API/UI transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_state: Option<crate::session::model_context::ModelContextState>,
+    /// Durable provider-native discovery history. This is separate from the
+    /// user-visible `messages` lane and is replayed only through a matching
+    /// provider family/protocol adapter.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::provider_transcript::ProviderTranscriptState::is_empty"
+    )]
+    pub provider_transcript: crate::session::provider_transcript::ProviderTranscriptState,
     /// Custom instructions for conversation summarization at the session level.
     /// Overrides config-level `compression_instructions` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,6 +899,8 @@ impl Session {
             title_generated: false,
             metadata_version: 0,
             kind: SessionKind::Root,
+            authority_identity: SessionAuthorityIdentity::Ordinary,
+            supervisor_management: None,
             parent_session_id: None,
             root_session_id: id,
             spawn_depth: 0,
@@ -798,6 +920,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -864,6 +987,8 @@ impl Session {
             title_generated: true,
             metadata_version: 0,
             kind: SessionKind::Child,
+            authority_identity: SessionAuthorityIdentity::Ordinary,
+            supervisor_management: None,
             parent_session_id: Some(parent_session_id),
             root_session_id,
             spawn_depth,
@@ -883,6 +1008,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -943,6 +1069,7 @@ impl Session {
         &mut self,
         reason: crate::session::model_context::ModelContextResetReason,
     ) {
+        self.reset_provider_transcript_for_model_context(reason);
         let state = self
             .model_context_state
             .get_or_insert_with(Default::default);
@@ -963,6 +1090,47 @@ impl Session {
             }
         } else {
             state.reset_epoch(reason);
+        }
+    }
+
+    /// Apply a model-context boundary to the provider-native replay lane.
+    /// Engine reconciliation uses this when it discovers an implicit boundary;
+    /// callers that already declared a full model-context reset use
+    /// [`Self::reset_model_context_epoch`] so both lanes move atomically.
+    pub fn reset_provider_transcript_for_model_context(
+        &mut self,
+        reason: crate::session::model_context::ModelContextResetReason,
+    ) {
+        use crate::session::provider_transcript::ProviderTranscriptResetReason;
+
+        match reason {
+            crate::session::model_context::ModelContextResetReason::Compression => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::Compression),
+            crate::session::model_context::ModelContextResetReason::HardTruncation => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::HardTruncation),
+            crate::session::model_context::ModelContextResetReason::CacheScopeChanged => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::CacheScopeChanged),
+            crate::session::model_context::ModelContextResetReason::RetentionLimit => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::RetentionLimit),
+            crate::session::model_context::ModelContextResetReason::Rollback => {
+                self.prune_provider_transcript();
+            }
+            // Editing/replacing history can leave every message id intact while
+            // changing the meaning of the provider-native chain anchored there.
+            // A dangling-anchor prune is therefore insufficient: the complete
+            // loading epoch must become unreachable before the rewritten
+            // transcript is dispatched again.
+            crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::ExplicitHistoryRewrite),
+            // `activate_provider_transcript_route` already advanced the native
+            // epoch. Avoid advancing it twice while resetting the PromptIR/cache
+            // ledger at the same provider boundary.
+            crate::session::model_context::ModelContextResetReason::ProviderSwitch => {}
         }
     }
 
@@ -1422,6 +1590,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 0,
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_prompt_usage: None,
         });
         session.conversation_summary = Some(ConversationSummary::new("summary", 5, 100));
         session.compression_events = vec![CompressionEvent::new(
@@ -1570,6 +1739,9 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: CompressionEvent = serde_json::from_str(&json).unwrap();
 
+        assert!(json.contains("\"kind\":\"summary\""));
+        assert!(!json.contains("retrieval_"));
+        assert_eq!(back.kind, CompressionEventKind::Summary);
         assert_eq!(back.messages_compressed, 42);
         assert_eq!(back.segments_removed, 10);
         assert!((back.usage_before_percent - 92.5).abs() < 0.01);
@@ -1626,9 +1798,97 @@ mod tests {
         }"#;
         let event: CompressionEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.trigger_type, CompressionTriggerType::Auto); // default
+        assert_eq!(event.kind, CompressionEventKind::Summary); // default
         assert_eq!(event.compression_ratio, 0.0); // default
         assert!(event.model_used.is_none()); // default
         assert_eq!(event.latency_ms, 0); // default
+        assert_eq!(event.retrieval_active_tokens_before, 0);
+        assert_eq!(event.retrieval_request_input_limit_tokens, 0);
+        assert_eq!(event.retrieval_boundary_reclaimed_tokens, 0);
+        assert_eq!(event.retrieval_min_recent_user_turns, 0);
+        assert!(event.retrieval_active_state_sha256.is_none());
+        assert!(event.retrieval_token_accounting_sha256.is_none());
+        assert!(event.retrieval_oldest_retained_message_id.is_none());
+    }
+
+    #[test]
+    fn retrieval_window_compression_event_roundtrips_with_distinct_kind() {
+        let mut event = CompressionEvent::new(
+            4,
+            2,
+            80.0,
+            40.0,
+            0,
+            CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = CompressionEventKind::RetrievalWindow;
+        event.source_tokens = 400;
+        event.fixed_prompt_tokens = 50;
+        event.retrieval_active_tokens_before = 1_000;
+        event.retrieval_active_message_count_before = 8;
+        event.retrieval_active_state_sha256 = Some("a".repeat(64));
+        event.retrieval_token_accounting_sha256 = Some("b".repeat(64));
+        event.retrieval_active_tokens_after = 600;
+        event.retrieval_target_tokens = 640;
+        event.retrieval_target_usage_percent = 50;
+        event.retrieval_archived_group_count = 2;
+        event.retrieval_archived_user_turn_count = 2;
+        event.retrieval_archived_message_tokens = 400;
+        event.retrieval_boundary_reclaimed_tokens = 75;
+        event.retrieval_system_message_tokens = 100;
+        event.retrieval_context_window_tokens = 1_280;
+        event.retrieval_request_input_limit_tokens = 1_024;
+        event.retrieval_min_recent_user_turns = 3;
+        event.retrieval_retained_recent_user_turn_count = 1;
+        event.retrieval_retained_user_turn_count = 1;
+        event.retrieval_oldest_retained_message_id = Some("user-3".to_string());
+        event.retrieval_oldest_retained_user_message_id = Some("user-3".to_string());
+        event.retrieval_provider_message_token_override_count = 1;
+        event.retrieval_protected_active_tokens = 300;
+        event.retrieval_incomplete_protocol_group_count = 1;
+
+        let json = serde_json::to_string(&event).unwrap();
+        let back: CompressionEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.kind, CompressionEventKind::RetrievalWindow);
+        assert_eq!(back.summary_tokens, 0);
+        assert_eq!(back.retrieval_active_tokens_before, 1_000);
+        assert_eq!(back.retrieval_active_message_count_before, 8);
+        assert_eq!(
+            back.retrieval_active_state_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            back.retrieval_token_accounting_sha256.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(back.retrieval_active_tokens_after, 600);
+        assert_eq!(back.retrieval_target_tokens, 640);
+        assert_eq!(back.retrieval_target_usage_percent, 50);
+        assert_eq!(back.retrieval_archived_group_count, 2);
+        assert_eq!(back.retrieval_archived_user_turn_count, 2);
+        assert_eq!(back.retrieval_archived_message_tokens, 400);
+        assert_eq!(back.retrieval_boundary_reclaimed_tokens, 75);
+        assert_eq!(back.retrieval_system_message_tokens, 100);
+        assert_eq!(back.retrieval_context_window_tokens, 1_280);
+        assert_eq!(back.retrieval_request_input_limit_tokens, 1_024);
+        assert_eq!(back.retrieval_min_recent_user_turns, 3);
+        assert_eq!(back.retrieval_retained_recent_user_turn_count, 1);
+        assert_eq!(back.retrieval_retained_user_turn_count, 1);
+        assert_eq!(
+            back.retrieval_oldest_retained_message_id.as_deref(),
+            Some("user-3")
+        );
+        assert_eq!(
+            back.retrieval_oldest_retained_user_message_id.as_deref(),
+            Some("user-3")
+        );
+        assert_eq!(back.retrieval_provider_message_token_override_count, 1);
+        assert_eq!(back.retrieval_protected_active_tokens, 300);
+        assert_eq!(back.retrieval_incomplete_protocol_group_count, 1);
     }
 
     #[test]

@@ -263,15 +263,15 @@ pub fn read_guardian_config(session: &Session) -> Option<crate::runtime::config:
 ///
 /// The terminal gate appends the run's concrete completion criteria and goal
 /// after this template (see the guardian gate in the runner). The reviewer runs
-/// as a real read-only sub-agent: it fetches the diff and runs tests *itself*
-/// via its Bash/Read/Grep tools (so the engine never needs an in-process git),
-/// and emits a single JSON verdict as its final message.
+/// as a real read-only sub-agent: it inspects the named source via dedicated
+/// Read/Glob/Grep tools, evaluates already-recorded diff/test evidence, and
+/// emits a single JSON verdict as its final message.
 pub const GUARDIAN_REVIEW_RUBRIC: &str = r#"You are an adversarial code reviewer (Guardian). Another agent claims its task is complete. Independently VERIFY the work and decide whether the run may stop.
 
 Verify, do not trust:
-- Run `git diff` and `git status` in the workspace to see exactly what changed.
-- Read the changed files and the surrounding code to judge correctness.
-- If the task implies behavior, run the relevant tests or build (e.g. `cargo test`, `npm test`) and confirm they pass.
+- Inspect the implementer's exact changed-file/diff evidence. If it is absent or insufficient, reject with the exact evidence still needed.
+- Read the named changed files and the surrounding code with the dedicated read/search tools to judge correctness.
+- Inspect the implementer's exact test/build evidence. Do not invoke Bash, shells, builds, tests, package managers, repository programs, or executable helpers: ambient command resolution is not a hard read-only boundary. If required evidence is absent or insufficient, reject with the exact verification still needed.
 - Check every completion criterion below against real evidence, not the agent's claims.
 
 Be skeptical. Flag real bugs, missed requirements, broken or skipped tests, and unmet criteria. You are READ-ONLY: do not modify files.
@@ -280,15 +280,15 @@ Emit your verdict as your FINAL message and ONLY as a single JSON object (no pro
 {"approve": <true|false>, "summary": "<one-line rationale>", "findings": ["<concrete issue>", "..."]}
 Set approve=true ONLY if the work is correct and every criterion is met; otherwise approve=false with concrete, actionable findings."#;
 
-/// The denylist of tool names disabled for a read-only guardian reviewer.
+/// The denylist of tool names disabled for any runtime-enforced read-only child.
 ///
 /// A DENYLIST matched by EXACT `ToolSchema.function.name` (see the worker's
-/// `tool_schemas` retain). The reviewer keeps read/search/shell tools (Read,
-/// Grep, Glob, GetFileInfo, Bash + its companions) so it can fetch the diff and
-/// run tests, but loses every file-mutating, escalation, web, and interaction
-/// tool. Names not registered in a given build are simply never matched, so the
-/// list is safe to keep conservative and forward-looking.
-pub fn guardian_read_only_disabled_tools() -> BTreeSet<String> {
+/// `tool_schemas` retain). The child keeps only dedicated read/search surfaces
+/// (Read, Grep, Glob, GetFileInfo) for workspace inspection and loses every
+/// shell, file-mutating, escalation, persistence, web, and interaction tool.
+/// Names not registered in a given build are simply never matched, so the list
+/// is safe to keep conservative and forward-looking.
+pub fn read_only_child_disabled_tools() -> BTreeSet<String> {
     [
         // File mutation.
         "Edit",
@@ -298,19 +298,35 @@ pub fn guardian_read_only_disabled_tools() -> BTreeSet<String> {
         "MultiEdit",
         // Escalation / spawning / persistent side effects.
         "Task",
+        "Plan",
         "SubAgent",
+        "ask_agent",
+        "cluster",
+        "deploy_agent",
         "DeployAgent",
         "AskAgent",
+        "Project",
         "scheduler",
         "sub_session_manager",
+        "session_control",
         "session_note",
         "memory_note",
+        "memory",
+        "ledger",
+        "load_skill",
+        "notify",
+        "update_goal",
+        "workflow_run",
         // Plan-mode / interaction / permissions.
         "EnterPlanMode",
         "ExitPlanMode",
         "request_permissions",
         "conclusion_with_options",
-        // Arbitrary execution surfaces beyond Bash, and web.
+        // Ambient/arbitrary execution surfaces, and web.
+        "Bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
         "SlashCommand",
         "js_repl",
         "Workspace",
@@ -320,6 +336,12 @@ pub fn guardian_read_only_disabled_tools() -> BTreeSet<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// Compatibility wrapper for the existing Guardian terminal gate and
+/// downstream callers that imported the former Guardian-specific name.
+pub fn guardian_read_only_disabled_tools() -> BTreeSet<String> {
+    read_only_child_disabled_tools()
 }
 
 /// Parse a [`GuardianVerdict`] from the reviewer child's final message.
@@ -554,12 +576,36 @@ mod tests {
 
     #[test]
     fn read_only_denylist_blocks_mutation_keeps_read() {
-        let denied = guardian_read_only_disabled_tools();
-        for tool in ["Edit", "Write", "SubAgent", "WebFetch", "Task", "js_repl"] {
+        let denied = read_only_child_disabled_tools();
+        for tool in [
+            "Edit",
+            "Write",
+            "Plan",
+            "SubAgent",
+            "Project",
+            "session_control",
+            "memory",
+            "ledger",
+            "workflow_run",
+            "Bash",
+            "BashOutput",
+            "KillShell",
+            "WebFetch",
+            "Task",
+            "js_repl",
+        ] {
             assert!(denied.contains(tool), "{tool} should be denied");
         }
-        for tool in ["Read", "Grep", "Bash", "Glob", "GetFileInfo"] {
+        for tool in ["Read", "Grep", "Glob", "GetFileInfo"] {
             assert!(!denied.contains(tool), "{tool} should remain allowed");
         }
+    }
+
+    #[test]
+    fn guardian_rubric_requests_only_non_executable_verification() {
+        assert!(GUARDIAN_REVIEW_RUBRIC.contains("dedicated read/search tools"));
+        assert!(GUARDIAN_REVIEW_RUBRIC.contains("Do not invoke Bash"));
+        assert!(!GUARDIAN_REVIEW_RUBRIC.contains("`cargo test`"));
+        assert!(!GUARDIAN_REVIEW_RUBRIC.contains("`git status`"));
     }
 }

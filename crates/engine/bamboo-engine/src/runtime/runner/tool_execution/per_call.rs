@@ -5,16 +5,20 @@ use tokio::sync::mpsc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
-    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
-    ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, ExecutingSupervisorObservation, ToolCall, ToolExecutionContext,
+    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, HookToolOutcome};
+use bamboo_domain::{
+    AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
+    HookToolOutcome,
+};
 use bamboo_metrics::MetricsCollector;
 
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
 use super::policy;
+use crate::session_app::approval_replay::PermissionReplayOrigin;
 
 fn preview_for_log(value: &str, max_chars: usize) -> String {
     let mut iter = value.chars();
@@ -36,6 +40,11 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
     pub session_id: &'a str,
+    /// Root-session identity snapshotted from the executing Session before any
+    /// parallel dispatch borrow begins.
+    pub root_session_id: &'a str,
+    /// Original executing lifetime captured before this call is handed off.
+    pub executing_supervisor: Option<ExecutingSupervisorObservation>,
     pub round_id: &'a str,
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
@@ -81,6 +90,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 }
 
 pub(super) struct ToolExecutionOutcome {
+    pub permission_replay_origin: Option<PermissionReplayOrigin>,
     pub result: Result<ToolResult, String>,
     /// Set when the tool returned [`ToolOutcome::NeedsHuman`] — the structured
     /// pending question the loop suspends on (its display `result` is carried in
@@ -94,7 +104,55 @@ pub(super) struct ToolExecutionOutcome {
     pub tool_duration: std::time::Duration,
 }
 
+/// Admit one model-requested function call before it enters Bamboo's existing
+/// tool execution pipeline.
+///
+/// Capability loading changes availability only: an admitted call retains its
+/// original spelling and continues through the exact same argument, event,
+/// hook, permission, and executor path below. A rejected call is represented as
+/// an ordinary per-call outcome so sibling calls in a parallel batch keep
+/// running and the normal result-application path can append the corresponding
+/// tool error without emitting `ToolStart` or entering downstream hooks.
+pub(super) async fn execute_model_requested_tool_call_only(
+    effective_callable_set: &EffectiveCallableSet,
+    ctx: ToolExecutionOnlyContext<'_>,
+) -> Result<ToolExecutionOutcome, AgentError> {
+    let Some(execution_name) =
+        effective_callable_set.resolve_callable_reference(&ctx.tool_call.function.name)
+    else {
+        let message = format!(
+            "Tool '{}' is not callable at the current conversation position",
+            ctx.tool_call.function.name
+        );
+        tracing::warn!(
+            "[{}][round:{}] Tool call rejected by capability loading before ToolStart: tool_call_id={}, tool_name={}",
+            ctx.session_id,
+            ctx.round,
+            ctx.tool_call.id,
+            ctx.tool_call.function.name,
+        );
+        return Ok(ToolExecutionOutcome {
+            permission_replay_origin: None,
+            result: Err(message),
+            needs_human: None,
+            post_tool_hook_eligible: false,
+            tool_duration: std::time::Duration::ZERO,
+        });
+    };
+
+    execute_tool_call_only_with_execution_name(&execution_name, ctx).await
+}
+
+#[cfg(test)]
 pub(super) async fn execute_tool_call_only(
+    ctx: ToolExecutionOnlyContext<'_>,
+) -> Result<ToolExecutionOutcome, AgentError> {
+    let execution_name = ctx.tool_call.function.name.clone();
+    execute_tool_call_only_with_execution_name(&execution_name, ctx).await
+}
+
+async fn execute_tool_call_only_with_execution_name(
+    execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
     if let Err(policy_error) = policy::validate_tool_call_arguments(ctx.tool_call) {
@@ -107,6 +165,7 @@ pub(super) async fn execute_tool_call_only(
             policy_error
         );
         return Ok(ToolExecutionOutcome {
+            permission_replay_origin: None,
             needs_human: None,
             post_tool_hook_eligible: false,
             result: Err(policy_error),
@@ -212,6 +271,7 @@ pub(super) async fn execute_tool_call_only(
                 let end_event = emitter.error(reason.clone()).clone();
                 let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
                 return Ok(ToolExecutionOutcome {
+                    permission_replay_origin: None,
                     result: Err(format!("Tool execution denied by hook: {reason}")),
                     needs_human: None,
                     post_tool_hook_eligible: false,
@@ -270,6 +330,7 @@ pub(super) async fn execute_tool_call_only(
     // once in `execute_round_tool_calls`) instead of re-cloning every call.
     let tool_ctx = ToolExecutionContext::for_dispatch(
         ctx.session_id,
+        ctx.root_session_id,
         &ctx.tool_call.id,
         ctx.event_tx,
         ctx.available_tool_schemas,
@@ -290,20 +351,20 @@ pub(super) async fn execute_tool_call_only(
         // `args` came from `parse_tool_args_best_effort`, the same parser the
         // executor would call, so reuse is byte-for-byte equivalent.
         Some(&args),
-    );
+    )
+    .with_executing_supervisor(ctx.executing_supervisor);
 
     // Outcome-aware dispatch. Extract a NeedsHuman pending question (handled in
     // apply before the success path) and collapse the rest to a ToolResult so the
     // compressor / policy / transcript path is unchanged. Completed -> its result,
     // Running -> its synthetic ack, NeedsHuman -> its rich display result.
-    let dispatch = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
-        ctx.tool_call,
-        ctx.tools.as_ref(),
-        // Agent execution does not route through the legacy composition
-        // runtime; catalog-pinned workflow_run is the sole orchestrator.
-        None,
-        tool_ctx,
-    );
+    // Dispatch through the exact identity already selected by the effective
+    // callable-set resolver. Events, hooks, and permission handling above keep
+    // the model's original call spelling, while the executor cannot re-resolve
+    // that spelling to a different (possibly excluded) exact owner.
+    let dispatch =
+        ctx.tools
+            .execute_exact_with_context_outcome(ctx.tool_call, execution_name, tool_ctx);
     let (needs_human, result, post_tool_hook_eligible) =
         match bamboo_tools::with_hook_permission_override(
             permission_override,
@@ -345,6 +406,9 @@ pub(super) async fn execute_tool_call_only(
     );
 
     Ok(ToolExecutionOutcome {
+        permission_replay_origin: ctx.executing_supervisor.map(|observation| {
+            PermissionReplayOrigin::new(observation, ctx.session_id, ctx.tool_call, execution_name)
+        }),
         result: result.map_err(|error| error.to_string()),
         needs_human,
         post_tool_hook_eligible,
@@ -425,6 +489,7 @@ async fn hook_ask_outcome(
             })
             .await;
         return (!approved).then(|| ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Err("Tool execution denied by parent agent review".to_string()),
             needs_human: None,
             post_tool_hook_eligible: false,
@@ -433,6 +498,7 @@ async fn hook_ask_outcome(
     }
 
     Some(ToolExecutionOutcome {
+        permission_replay_origin: None,
         result: Err(
             "Hook requested approval, but no parent-agent reviewer is available; denied"
                 .to_string(),
@@ -567,6 +633,7 @@ pub(super) async fn apply_tool_execution_outcome(
         .await;
         super::clarification::suspend_for_pending_question(
             ctx.tool_call,
+            outcome.permission_replay_origin.as_ref(),
             pending_question,
             display_result,
             ctx.session,
@@ -585,6 +652,7 @@ pub(super) async fn apply_tool_execution_outcome(
                 let r = execution_paths::handle_successful_tool_result(
                     execution_paths::SuccessPathContext {
                         tool_call: ctx.tool_call,
+                        permission_replay_origin: outcome.permission_replay_origin.as_ref(),
                         result: &result,
                         event_tx: ctx.event_tx,
                         metrics_collector: ctx.metrics_collector,
@@ -639,7 +707,15 @@ pub(super) async fn apply_tool_execution_outcome(
         .rev()
         .find(|m| m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
     {
-        msg.metadata = Some(metadata_value);
+        let metadata = msg.metadata.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(object) = metadata.as_object_mut() {
+            object.extend(
+                metadata_value
+                    .as_object()
+                    .expect("lifecycle metadata object")
+                    .clone(),
+            );
+        }
     }
 
     if let Some(hook_outcome) = deferred_hook_control {
@@ -659,11 +735,13 @@ mod hook_tests {
     use super::*;
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
-        AsyncWaitKind, FunctionCall, RunningCompletion, RunningHandle, ToolError,
+        AsyncWaitKind, FunctionCall, FunctionSchema, RunningCompletion, RunningHandle, ToolError,
     };
     use bamboo_agent_core::AgentHook;
     use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig};
+    use bamboo_domain::{CapabilityLoadingMode, ClassifiedToolSchema};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct BlockingPendingPersistence {
@@ -880,6 +958,82 @@ mod hook_tests {
         }
     }
 
+    struct NameRecordingExecutor {
+        entered: Mutex<Vec<String>>,
+        schemas: Vec<ToolSchema>,
+    }
+
+    impl NameRecordingExecutor {
+        fn new(schema_names: &[&str]) -> Self {
+            Self {
+                entered: Mutex::new(Vec::new()),
+                schemas: schema_names.iter().copied().map(tool_schema).collect(),
+            }
+        }
+
+        fn entered(&self) -> Vec<String> {
+            self.entered
+                .lock()
+                .expect("capability gate probe lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for NameRecordingExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            self.entered
+                .lock()
+                .expect("capability gate probe lock")
+                .push(call.function.name.clone());
+            Ok(ToolResult::text(true, "executed"))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.schemas.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct ExactOwnerRecordingExecutor {
+        ordinary_dispatches: Mutex<Vec<String>>,
+        exact_dispatches: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ExactOwnerRecordingExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            self.ordinary_dispatches
+                .lock()
+                .expect("ordinary dispatch probe lock")
+                .push(call.function.name.clone());
+            Ok(ToolResult::text(true, "ordinary dispatch"))
+        }
+
+        async fn execute_exact_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolOutcome, ToolError> {
+            self.exact_dispatches
+                .lock()
+                .expect("exact dispatch probe lock")
+                .push((call.function.name.clone(), execution_name.to_string()));
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                "exact dispatch",
+            )))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["Edit", "apply_patch"]
+                .into_iter()
+                .map(tool_schema)
+                .collect()
+        }
+    }
+
     enum NonTerminalOutcome {
         Running,
         NeedsHuman,
@@ -948,6 +1102,251 @@ mod hook_tests {
         }
     }
 
+    fn tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} capability gate probe"),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    fn effective_callable_set(
+        catalog_names: &[&str],
+        mode: CapabilityLoadingMode,
+        loaded_names: &[&str],
+    ) -> EffectiveCallableSet {
+        let catalog = catalog_names
+            .iter()
+            .copied()
+            .map(tool_schema)
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        EffectiveCallableSet::from_catalog(&catalog, mode, loaded_names.iter().copied())
+    }
+
+    async fn execute_without_hooks(
+        effective_callable_set: &EffectiveCallableSet,
+        tools: &Arc<dyn ToolExecutor>,
+        tool_call: &ToolCall,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> ToolExecutionOutcome {
+        let session = Session::new("capability-gate-session", "model");
+        execute_model_requested_tool_call_only(
+            effective_callable_set,
+            ToolExecutionOnlyContext {
+                executing_supervisor: None,
+                tool_call,
+                event_tx,
+                metrics_collector: None,
+                session_id: "capability-gate-session",
+                root_session_id: "capability-gate-session",
+                round_id: "round-1",
+                round: 0,
+                tools,
+                config: &AgentLoopConfig::default(),
+                hook_session: None,
+                hook_runtime_state: None,
+                session_flags: ToolExecutionSessionFlags::from_session(&session),
+                available_tool_schemas: &[],
+            },
+        )
+        .await
+        .expect("capability admission is a per-call outcome")
+    }
+
+    #[tokio::test]
+    async fn capability_gate_allows_legacy_deferred_and_progressive_core_or_loaded_calls() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&["Read", "probe"]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let legacy = effective_callable_set(
+            &["Read", "probe"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let progressive = effective_callable_set(
+            &["Read", "probe"],
+            CapabilityLoadingMode::Progressive,
+            &["probe"],
+        );
+
+        let legacy_deferred =
+            execute_without_hooks(&legacy, &tools, &probe_call("probe"), &event_tx).await;
+        let progressive_core =
+            execute_without_hooks(&progressive, &tools, &probe_call("Read"), &event_tx).await;
+        let progressive_loaded =
+            execute_without_hooks(&progressive, &tools, &probe_call("probe"), &event_tx).await;
+
+        assert!(legacy_deferred.result.is_ok());
+        assert!(progressive_core.result.is_ok());
+        assert!(progressive_loaded.result.is_ok());
+        assert_eq!(concrete_tools.entered(), ["probe", "Read", "probe"]);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_gate_rejects_unloaded_host_only_unknown_and_excluded_before_hooks() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&[
+            "Read",
+            "probe",
+            "Workspace",
+            "excluded",
+        ]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        let effective_callable_set = effective_callable_set(
+            &["Read", "probe", "Workspace"],
+            CapabilityLoadingMode::Progressive,
+            &[],
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(DenyToolHook));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let unloaded_call = probe_call("probe");
+        let mut session = Session::new("capability-gate-hook-session", "model");
+        let session_flags = ToolExecutionSessionFlags::from_session(&session);
+        let mut runtime_state = AgentRuntimeState::new(&session.id);
+        let unloaded = execute_model_requested_tool_call_only(
+            &effective_callable_set,
+            ToolExecutionOnlyContext {
+                executing_supervisor: None,
+                tool_call: &unloaded_call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id: "capability-gate-hook-session",
+                root_session_id: "capability-gate-hook-session",
+                round_id: "round-1",
+                round: 0,
+                tools: &tools,
+                config: &config,
+                hook_session: Some(&mut session),
+                hook_runtime_state: Some(&mut runtime_state),
+                session_flags,
+                available_tool_schemas: &[],
+            },
+        )
+        .await
+        .expect("unloaded rejection is a per-call outcome");
+
+        let mut outcomes = vec![("probe", unloaded)];
+        for name in ["Workspace", "unknown_tool", "excluded"] {
+            outcomes.push((
+                name,
+                execute_without_hooks(
+                    &effective_callable_set,
+                    &tools,
+                    &probe_call(name),
+                    &event_tx,
+                )
+                .await,
+            ));
+        }
+
+        for (name, outcome) in outcomes {
+            assert!(matches!(
+                outcome.result,
+                Err(ref error)
+                    if error.contains(name)
+                        && error.contains("not callable at the current conversation position")
+            ));
+        }
+        assert!(concrete_tools.entered().is_empty());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::ToolStart { .. } | AgentEvent::HookLifecycle { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn capability_gate_preserves_exact_shadow_without_alias_fallback() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&["Edit", "apply_patch"]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let core_only = effective_callable_set(
+            &["Edit", "apply_patch"],
+            CapabilityLoadingMode::Progressive,
+            &[],
+        );
+        let exact_loaded = effective_callable_set(
+            &["Edit", "apply_patch"],
+            CapabilityLoadingMode::Progressive,
+            &["apply_patch"],
+        );
+        let exact_call = probe_call("apply_patch");
+
+        let rejected = execute_without_hooks(&core_only, &tools, &exact_call, &event_tx).await;
+        let admitted = execute_without_hooks(&exact_loaded, &tools, &exact_call, &event_tx).await;
+
+        assert!(matches!(
+            rejected.result,
+            Err(ref error) if error.contains("not callable at the current conversation position")
+        ));
+        assert!(admitted.result.is_ok());
+        assert_eq!(concrete_tools.entered(), ["apply_patch"]);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_gate_dispatches_the_resolved_owner_without_reresolving_original_shadow() {
+        let concrete_tools = Arc::new(ExactOwnerRecordingExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let effective_callable_set =
+            effective_callable_set(&["Edit"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let call = probe_call("apply_patch");
+        assert_eq!(
+            effective_callable_set
+                .resolve_callable_reference(&call.function.name)
+                .as_deref(),
+            Some("Edit"),
+            "with no exact registration in the eligible catalog, the shared resolver selects the allowed builtin owner"
+        );
+
+        let outcome =
+            execute_without_hooks(&effective_callable_set, &tools, &call, &event_tx).await;
+
+        assert!(outcome.result.is_ok());
+        assert!(concrete_tools
+            .ordinary_dispatches
+            .lock()
+            .expect("ordinary dispatch probe lock")
+            .is_empty());
+        assert_eq!(
+            *concrete_tools
+                .exact_dispatches
+                .lock()
+                .expect("exact dispatch probe lock"),
+            vec![("apply_patch".to_string(), "Edit".to_string())]
+        );
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStart { tool_name, .. } if tool_name == "apply_patch"
+        )));
+    }
+
     async fn apply_test_outcome(
         config: &AgentLoopConfig,
         tools: &Arc<dyn ToolExecutor>,
@@ -996,6 +1395,7 @@ mod hook_tests {
         let tool_call = probe_call("canonical-tool");
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Ok(ToolResult::text(false, "decision pending")),
             needs_human: Some(bamboo_agent_core::PendingQuestion {
                 tool_call_id: "stale-call".to_string(),
@@ -1093,10 +1493,12 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-deny-session",
+            root_session_id: "hook-deny-session",
             round_id: "round-1",
             round: 0,
             tools: &(tools.clone() as Arc<dyn ToolExecutor>),
@@ -1151,10 +1553,12 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "configured-hook-deny",
+            root_session_id: "configured-hook-deny",
             round_id: "round-1",
             round: 0,
             tools: &tools,
@@ -1228,10 +1632,12 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-allow-engine",
+            root_session_id: "hook-allow-engine",
             round_id: "round-1",
             round: 0,
             tools: &tools,
@@ -1281,10 +1687,12 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
                 metrics_collector: None,
                 session_id: "hook-ask-session",
+                root_session_id: "hook-ask-session",
                 round_id: "round-1",
                 round: 0,
                 tools: &tool_executor,
@@ -1316,6 +1724,7 @@ mod hook_tests {
         let tool_call = probe_call("probe");
         let mut session = Session::new("post-feedback", "model");
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Ok(ToolResult::text(true, "raw output")),
             needs_human: None,
             post_tool_hook_eligible: true,
@@ -1359,6 +1768,7 @@ mod hook_tests {
         let tool_call = probe_call("probe");
         let mut session = Session::new("post-error-feedback", "model");
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Err("executor exploded".to_string()),
             needs_human: None,
             post_tool_hook_eligible: true,
@@ -1411,10 +1821,12 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
                 metrics_collector: None,
                 session_id,
+                root_session_id: session_id,
                 round_id: "round-1",
                 round: 0,
                 tools: &tools,
@@ -1468,10 +1880,12 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-ask-no-parent",
+            root_session_id: "hook-ask-no-parent",
             round_id: "round-1",
             round: 0,
             tools: &tool_executor,

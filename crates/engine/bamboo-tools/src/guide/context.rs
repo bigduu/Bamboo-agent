@@ -77,11 +77,11 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
-                "Use ExitPlanMode before switching from planning to implementation.",
+                "When Plan is available, delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
             ],
             GuideLanguage::English => &[
                 "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
@@ -93,11 +93,11 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, WebFetch, WebSearch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
-                "Use ExitPlanMode before switching from planning to implementation.",
+                "When Plan is available, delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
             ],
         }
     }
@@ -120,6 +120,19 @@ mod tests {
             GuideLanguage::detect("Please help me modify this file"),
             GuideLanguage::English
         );
+    }
+
+    #[test]
+    fn best_practices_prefer_delegated_plan_without_legacy_mode_switch() {
+        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
+            let context = GuideBuildContext {
+                language,
+                ..GuideBuildContext::default()
+            };
+            let guidance = context.best_practices().join("\n");
+            assert!(guidance.contains("delegate planning to its read-only child"));
+            assert!(guidance.contains("already-active legacy plan-mode session"));
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::Session;
+use bamboo_domain::RetrievalWindowCheckpointOutcome;
 use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
@@ -93,7 +94,7 @@ impl SessionRepository {
             Ok(Some(session)) => {
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(session.clone())),
+                    Arc::new(crate::SessionSnapshot::new(session.clone())),
                 );
                 Some(session)
             }
@@ -120,7 +121,7 @@ impl SessionRepository {
         if let Some(ref session) = loaded {
             self.cache.insert(
                 session_id.to_string(),
-                Arc::new(parking_lot::RwLock::new(session.clone())),
+                Arc::new(crate::SessionSnapshot::new(session.clone())),
             );
         }
         Ok(loaded)
@@ -137,7 +138,7 @@ impl SessionRepository {
                     self.run_post_durable_hook("save_full", &saved.id);
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
             })
@@ -159,14 +160,15 @@ impl SessionRepository {
         self.persistence
             .update_runtime_config_and_publish(session_id, mutate, |saved| {
                 if let Some(cached) = self.cache.get(session_id) {
-                    let mut cached = cached.write();
-                    for key in metadata_keys {
-                        if let Some(value) = saved.metadata.get(*key) {
-                            cached.metadata.insert((*key).to_string(), value.clone());
-                        } else {
-                            cached.metadata.remove(*key);
+                    cached.update(|cached| {
+                        for key in metadata_keys {
+                            if let Some(value) = saved.metadata.get(*key) {
+                                cached.metadata.insert((*key).to_string(), value.clone());
+                            } else {
+                                cached.metadata.remove(*key);
+                            }
                         }
-                    }
+                    });
                 }
             })
             .await
@@ -235,7 +237,7 @@ impl SessionRepository {
                 if prefer_storage && chosen.updated_at >= memory_updated_at {
                     self.cache.insert(
                         session_id.to_string(),
-                        Arc::new(parking_lot::RwLock::new(chosen.clone())),
+                        Arc::new(crate::SessionSnapshot::new(chosen.clone())),
                     );
                 }
                 Some(chosen)
@@ -244,7 +246,7 @@ impl SessionRepository {
             (None, Some(storage)) => {
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(storage.clone())),
+                    Arc::new(crate::SessionSnapshot::new(storage.clone())),
                 );
                 Some(storage)
             }
@@ -279,7 +281,7 @@ impl SessionRepository {
                 self.run_post_durable_hook("save_and_cache", &saved.id);
                 self.cache.insert(
                     saved.id.clone(),
-                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
                 );
             })
             .await;
@@ -292,7 +294,7 @@ impl SessionRepository {
         match self.storage.load_runtime_control_plane(session_id).await {
             Ok(Some(durable)) => {
                 if let Some(cached) = self.cache.get(session_id) {
-                    adopt_task_control_plane(&mut cached.write(), &durable);
+                    cached.update(|cached| adopt_task_control_plane(cached, &durable));
                 }
             }
             Ok(None) => {}
@@ -356,7 +358,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 self.run_post_durable_hook("save_runtime_session", &saved.id);
                 self.cache.insert(
                     saved.id.clone(),
-                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
                 );
             })
             .await
@@ -370,7 +372,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 if committed {
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
             })
@@ -393,7 +395,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                     self.run_post_durable_hook("permission_posture_activation", &saved.id);
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 },
             )
@@ -414,23 +416,26 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 // persistence and is therefore preserved alongside the cached
                 // messages, matching the V2 sidecar overlay contract.
                 if let Some(cached) = self.cache.get(&saved.id) {
-                    let mut cached = cached.write();
-                    let messages = cached.messages.clone();
-                    let admission = cached
-                        .runtime_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.session_inbox_admission.clone());
-                    let mut refreshed = saved.clone();
-                    refreshed.messages = messages;
-                    if let Some(admission) = admission {
-                        refreshed
+                    cached.update(|cached| {
+                        let messages = cached.messages.clone();
+                        let provider_transcript = cached.provider_transcript.clone();
+                        let admission = cached
                             .runtime_metadata
-                            .get_or_insert_with(Default::default)
-                            .session_inbox_admission = Some(admission);
-                    } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
-                        metadata.session_inbox_admission = None;
-                    }
-                    *cached = refreshed;
+                            .as_ref()
+                            .and_then(|metadata| metadata.session_inbox_admission.clone());
+                        let mut refreshed = saved.clone();
+                        refreshed.messages = messages;
+                        refreshed.provider_transcript = provider_transcript;
+                        if let Some(admission) = admission {
+                            refreshed
+                                .runtime_metadata
+                                .get_or_insert_with(Default::default)
+                                .session_inbox_admission = Some(admission);
+                        } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+                            metadata.session_inbox_admission = None;
+                        }
+                        *cached = refreshed;
+                    });
                 }
             })
             .await
@@ -465,9 +470,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 // in memory cannot be replaced by a stale whole-control-
                 // plane snapshot.
                 if let Some(cached) = self.cache.get(session_id) {
-                    let mut cached = cached.write();
-                    cached.set_task_list(task_list.clone());
-                    cached.set_task_list_version_meta(version.to_string());
+                    cached.update(|cached| {
+                        cached.set_task_list(task_list.clone());
+                        cached.set_task_list_version_meta(version.to_string());
+                    });
                 }
             })
             .await;
@@ -501,9 +507,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 version,
                 |_| {
                     if let Some(cached) = self.cache.get(session_id) {
-                        let mut cached = cached.write();
-                        cached.set_task_list(task_list.clone());
-                        cached.set_task_list_version_meta(version.to_string());
+                        cached.update(|cached| {
+                            cached.set_task_list(task_list.clone());
+                            cached.set_task_list_version_meta(version.to_string());
+                        });
                     }
                 },
             )
@@ -530,9 +537,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 |_, _| {
                     for id in [session_id, shared_session_id] {
                         if let Some(cached) = self.cache.get(id) {
-                            let mut cached = cached.write();
-                            cached.set_task_list(task_list.clone());
-                            cached.set_task_list_version_meta(version.to_string());
+                            cached.update(|cached| {
+                                cached.set_task_list(task_list.clone());
+                                cached.set_task_list_version_meta(version.to_string());
+                            });
                         }
                     }
                 },
@@ -554,9 +562,77 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 if committed {
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
+            })
+            .await
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_retrieval_window_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_retrieval_window", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_prompt_rewrite_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_prompt_rewrite", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_manual_archive_rejection_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_manual_archive_rejection", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_manual_archive_consumption_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_manual_archive_consumption", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
             })
             .await
     }
@@ -580,7 +656,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 self.run_post_durable_hook("clear_legacy", session_id);
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(latest.clone())),
+                    Arc::new(crate::SessionSnapshot::new(latest.clone())),
                 );
             })
             .await
@@ -706,7 +782,7 @@ mod tests {
     }
 
     fn test_repo(storage: Arc<dyn Storage>) -> SessionRepository {
-        let cache: SessionCache = Arc::new(dashmap::DashMap::new());
+        let cache: SessionCache = Arc::default();
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
         SessionRepository::new(cache, storage, persistence)
     }
@@ -714,7 +790,7 @@ mod tests {
     fn cache_put(repo: &SessionRepository, session: &Session) {
         repo.cache().insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(crate::SessionSnapshot::new(session.clone())),
         );
     }
 
@@ -727,6 +803,27 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn staged_retrieval_window_archive(expected: &Session) -> Session {
+        let mut staged = expected.clone();
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            80.0,
+            60.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        staged.messages[0].compressed = true;
+        staged.messages[0].compressed_by_event_id = Some(event.id.clone());
+        staged.compression_events.push(event);
+        staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        staged
     }
 
     #[tokio::test]
@@ -1551,6 +1648,23 @@ mod tests {
         let id = "control-plane-ledger-cache";
         let mut initial = Session::new(id, "model");
         initial.add_message(bamboo_agent_core::Message::user("durable transcript"));
+        let assistant = bamboo_agent_core::Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        initial.add_message(assistant);
+        let native_item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","id":"tsc_cache_native","execution":"client","call_id":"cache_native",
+                "status":"completed","arguments":{"query":"CACHE_NATIVE_PAYLOAD_SENTINEL"}
+            }),
+        )
+        .unwrap();
+        initial
+            .append_provider_transcript_group(&anchor, None, vec![native_item])
+            .unwrap();
         storage.save_session(&initial).await.unwrap();
         cache_put(&repo, &initial);
         let mut stale = initial.clone();
@@ -1575,10 +1689,15 @@ mod tests {
             .unwrap();
 
         let expected = runner.model_context_state;
+        let expected_native = runner.provider_transcript;
         let durable = storage.load_session(id).await.unwrap().unwrap();
         let cached = read_cached_session(repo.cache(), id).expect("cached session");
-        for (tier, session) in [("durable", durable), ("cache", cached)] {
+        for (tier, session) in [("durable", durable), ("cache", cached.clone())] {
             assert_eq!(session.model_context_state, expected, "tier={tier}");
+            assert_eq!(
+                session.provider_transcript, expected_native,
+                "tier={tier} must retain the message-anchored native transcript"
+            );
             assert_eq!(
                 session
                     .metadata
@@ -1587,8 +1706,25 @@ mod tests {
                 Some("waiting"),
                 "tier={tier}"
             );
-            assert_eq!(session.messages.len(), 1, "tier={tier}");
+            assert_eq!(session.messages.len(), 2, "tier={tier}");
         }
+
+        let runtime_json =
+            std::fs::read_to_string(temp.path().join("sessions").join(id).join("runtime.json"))
+                .unwrap();
+        assert!(!runtime_json.contains("CACHE_NATIVE_PAYLOAD_SENTINEL"));
+
+        // Prove the cache projection cannot turn a runtime-only update into a
+        // later durable loss when that cached value becomes a full checkpoint.
+        let mut cache_writer = cached;
+        bamboo_domain::RuntimeSessionPersistence::checkpoint_runtime_session(
+            &repo,
+            &mut cache_writer,
+        )
+        .await
+        .unwrap();
+        let restarted = storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(restarted.provider_transcript, expected_native);
     }
 
     #[tokio::test]
@@ -1849,6 +1985,48 @@ mod tests {
             "previous",
             "checkpoint must publish only after a durable commit"
         );
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_publishes_the_exact_archived_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("SessionStoreV2"),
+        );
+        let repo = test_repo(storage.clone());
+        let id = "retrieval-window-repository-checkpoint";
+        let mut expected = Session::new(id, "model");
+        expected.add_message(bamboo_agent_core::Message::user("archive candidate"));
+        expected.add_message(bamboo_agent_core::Message::assistant("retain", None));
+        storage.save_session(&expected).await.unwrap();
+        cache_put(&repo, &expected);
+        let mut staged = staged_retrieval_window_archive(&expected);
+
+        let outcome = bamboo_domain::RuntimeSessionPersistence::checkpoint_retrieval_window(
+            &repo,
+            &expected,
+            &mut staged,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached archived Session");
+        for (tier, saved) in [("durable", durable), ("cache", cached)] {
+            assert!(saved.messages[0].compressed, "tier={tier}");
+            assert_eq!(
+                saved.messages[0].compressed_by_event_id, staged.messages[0].compressed_by_event_id,
+                "tier={tier}"
+            );
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&staged).unwrap(),
+                "tier={tier}"
+            );
+        }
     }
 
     #[tokio::test]

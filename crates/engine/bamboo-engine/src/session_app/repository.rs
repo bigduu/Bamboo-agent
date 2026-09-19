@@ -137,7 +137,7 @@ impl SessionAccess for SessionRepository {
                 move |saved| {
                     publish_cache.insert(
                         saved.id.clone(),
-                        std::sync::Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        std::sync::Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 },
             )

@@ -190,7 +190,7 @@ bamboo broker-agent serve --broker ws://host:9600 --token $T \
 
 ```jsonc
 "subagents": {
-  "max_concurrent": 8,
+  "max_concurrent": 200,
   "broker": { "endpoint": "ws://broker-host:9600", "token": "…" },  // 启用 broker 工具 + MCP 代理服务
   "mcp_role_allowlist": [                                          // 可选(issue #54):按角色收窄代理工具面
     { "role": "researcher", "tools": ["fetch_url"] },
@@ -211,15 +211,69 @@ bamboo broker-agent serve --broker ws://host:9600 --token $T \
 
 ---
 
-## 7. 线协议小结
+## 7. 高并发 sub-agent 事件面（#1031）
+
+sub-agent 的完整事件流只发布到它自己的 session channel；parent channel 只保留
+`SubAgentStarted` / `SubAgentHeartbeat` / `SubAgentCompleted`。因此 200 个并行 child
+不会把逐 token 事件递归复制到每一层祖先，前端打开 child session 时仍可直接订阅其完整事件。
+
+actor wire 使用 `ActorEventBatch`，路由键为 logical session，fence 由
+`activation_id + execution_epoch + source_actor_id` 组成，batch 内用单调 `seq` 排序。本地 actor
+和 `Schedulable` Cluster actor 走 broker path；迟到的旧 worker frame 会在 host 侧被拒绝。
+固定 `Placement::Remote` 目前仍走 direct WebSocket，只共享 batch wire，尚未统一到 broker 的
+durable path。
+
+| QoS | 典型事件 | 传输语义 |
+|---|---|---|
+| `durable` | tool/permission/terminal boundary 与未知事件 | Maildir + receipt；背压，不丢 |
+| `snapshot` | runner/token-budget/context-pressure gauge | 有界 live lane；过载可丢，后续 batch 的 sequence gap 可暴露丢失 |
+| `ephemeral` | token/reasoning token/heartbeat | 有界 live lane；批量，过载可丢 |
+
+`task_list_item_progress` 是 delta，不是全量 snapshot，因此走 `durable`。当前 host 对 sequence gap
+只记录告警；“向前端发出 reload control 并从 session snapshot 恢复”仍是下一阶段契约，不能把
+现有告警等同于已经完成恢复。
+
+每个 worker 固定使用一条 inbound subscription，加 control/event 两条 outbound uplink；连接数不再随
+并行 Run 数量线性增加。control 与 event 队列独立，cancel/approval/admission 不会排在 token 后面；
+同一 Run 的 live batch、durable event、Outcome 仍在 ordered event lane 上保持顺序。默认允许 200 个
+active actor，但 warm-idle pool 单独限制为 16，避免为了并发上限长期保留 200 个空闲进程。
+
+### 7.1 当前边界与下一阶段
+
+当前实现解决的是事件放大、队列无界增长和 worker uplink 随 Run 增长的问题，尚不是完整的
+可重放 Session Home。合并更高并发 Cluster 执行前还需要：
+
+1. `Outcome` 携带最终 event-seq watermark；尾部 live batch 丢失时也能检测，而不依赖下一批事件。
+2. durable Event/Outcome 在 host 验证、幂等 apply 并 checkpoint cursor 后再 ACK；不能在
+   `BrokerChildLink` 解码后立即 ACK。
+3. control/event uplink 由统一 supervisor 管理；关键 lane 断开即撤销 worker readiness，Outcome
+   投递失败不得把原 Run 标成已处理。
+4. executor 目前已有本地 Run-slot 隔离：安全默认值为 1，只有无共享可变状态的实现可显式提高；
+   因此真实 `BambooRuntimeExecutor` 不会并行复用 permission config / escalation bridge。下一步仍需
+   worker 对外发布 `max_slots` 并由 scheduler 原子租约；全局 200 并行由多个 worker/slot 提供。
+5. parent ingress 改为少量 session-hash shard，而不是每 Run 一条 WebSocket；否则 200 个本地
+   worker 的 broker accepted FD 加 host client FD 会逼近常见的 `RLIMIT_NOFILE=1024`。
+6. 持久化 `session_id -> home_node + home_epoch + lease`；frontend 使用
+   `snapshot + cursor + live tail`，非 home gateway proxy 或订阅共享 session topic。
+
+此外，`source_node_id` 尚未由 broker 可信地 stamp，worker role/actor identity 仍是 bearer-token
+连接自报。跨节点 fencing 最终应绑定认证连接身份，而不是只信任 payload。
+
+滚动升级时，`execution_epoch = 0` 选择旧的逐事件 wire；新 host 发出的非零 epoch 才启用 batch
+协议。`ChildOutcome.transcript` 目前只是兼容字段：host 不消费它，session checkpoint 才是 transcript
+真相源。
+
+---
+
+## 8. 线协议小结
 
 | 层 | 帧 / 消息 |
 |---|---|
-| broker 总线 | `ClientFrame{Hello,Deliver,Subscribe,Ack}` ↔ `BrokerFrame{Welcome,Error,Message,Delivered}` |
-| 邮箱消息 | `InboxMessage{id, from, kind, body, correlation_id}`;`InboxKind{Task,Ask,Reply,McpRequest,McpReply}` |
+| broker 总线 | `ClientFrame{Hello,Deliver,PublishEventBatch,Subscribe,Ack}` ↔ `BrokerFrame{Welcome,Error,Message,EventBatch,Delivered}` |
+| 邮箱消息 | `InboxMessage{id, from, kind, body, correlation_id}`;`InboxKind{Task,Ask,Reply,Run,Event,Outcome,McpRequest,McpReply}` |
 | ask | `Ask{AskBody{question,mode}}` → `Reply{ReplyBody{answer}}`(按 correlation_id 配对)|
 | mcp 代理 | `McpRequest{Manifest \| Call{tool,arguments}}` → `McpReply{manifest? \| result? \| error?}` |
-| actor 直连(老路径) | `ParentFrame{Run,Cancel,Message}` ↔ `ChildFrame{Event,Terminal}` |
+| actor 直连 | `ParentFrame{Run,Cancel,Message}` ↔ `ChildFrame{EventBatch,Terminal}`（`Event` 为滚动兼容） |
 
 ---
 

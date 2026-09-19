@@ -18,9 +18,11 @@ pub async fn reset(state: web::Data<AppState>) -> Result<HttpResponse> {
     state.sessions.clear();
     {
         let mut runners = state.agent_runners.write().await;
-        for (_, runner) in runners.drain() {
+        for runner in runners.values() {
             runner.cancel_token.cancel();
+            runner.event_publication.retire().await;
         }
+        runners.clear();
     }
     {
         let mut tokens = state.cancel_tokens.write().await;

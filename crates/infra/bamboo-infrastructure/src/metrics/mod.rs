@@ -5,6 +5,7 @@
 //! rusqlite dependency); the live metrics pipeline (bus / collector / worker)
 //! lives in the engine and depends on these abstractions.
 
+mod mutations;
 pub mod storage;
 pub mod types;
 

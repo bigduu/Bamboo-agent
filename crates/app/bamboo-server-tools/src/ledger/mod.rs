@@ -20,10 +20,9 @@ use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome,
 use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus};
 use bamboo_domain::schedule::ScheduleTrigger;
 use bamboo_domain::{TaskItemStatus, TaskPriority};
+use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerRecordDocument, LedgerStore, RecordFilter};
-use bamboo_memory::memory_store::project_key_from_path;
-use bamboo_tools::tools::workspace_state;
 
 #[cfg(test)]
 mod tests;
@@ -44,11 +43,6 @@ pub struct LedgerTool {
     store: LedgerStore,
     schedule_bridge: Option<Arc<dyn LedgerScheduleBridge>>,
     project_store: Option<Arc<bamboo_projects::ProjectStore>>,
-}
-
-struct ResolvedLedgerProjectAccess {
-    project_key: Option<String>,
-    writable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,86 +203,44 @@ impl LedgerTool {
         &self,
         explicit: Option<&str>,
         session_id: &str,
-    ) -> Result<ResolvedLedgerProjectAccess, ToolError> {
-        let explicit = explicit
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+    ) -> Result<Option<String>, ToolError> {
+        let explicit = explicit.map(str::trim).filter(|value| !value.is_empty());
         let Some(session) = self.session_repo.load(session_id).await else {
             if explicit.is_some() {
                 return Err(ToolError::InvalidArguments(
                     "A missing session cannot select an arbitrary project_key".to_string(),
                 ));
             }
-            return Ok(ResolvedLedgerProjectAccess {
-                project_key: None,
-                writable: false,
-            });
+            return Ok(None);
         };
-        if let bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) =
-            bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
-                &session,
-            )
-        {
-            if explicit
-                .as_deref()
-                .is_some_and(|requested| requested != project_id.as_str())
-            {
-                return Err(ToolError::InvalidArguments(format!(
-                    "project_key does not match assigned Project '{}'",
-                    project_id
-                )));
+        match ProjectContextResolver::session_project_identity(&session) {
+            SessionProjectIdentity::Assigned(project_id) => {
+                if explicit.is_some_and(|requested| requested != project_id.as_str()) {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "project_key does not match assigned Project '{}'",
+                        project_id
+                    )));
+                }
+                let project_store = self.project_store.as_ref().ok_or_else(|| {
+                    ToolError::Execution(
+                        "Assigned Project ledger resolution is unavailable".to_string(),
+                    )
+                })?;
+                project_store.get(&project_id).map_err(|error| {
+                    ToolError::Execution(format!("Assigned Project is unavailable: {error}"))
+                })?;
+                Ok(Some(project_id.to_string()))
             }
-            let project_store = self.project_store.as_ref().ok_or_else(|| {
-                ToolError::Execution(
-                    "Assigned Project ledger resolution is unavailable".to_string(),
-                )
-            })?;
-            project_store.get(&project_id).map_err(|error| {
-                ToolError::Execution(format!("Assigned Project is unavailable: {error}"))
-            })?;
-            return Ok(ResolvedLedgerProjectAccess {
-                project_key: Some(project_id.to_string()),
-                writable: true,
-            });
-        }
-        if let bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } =
-            bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
-                &session,
-            )
-        {
-            return Err(ToolError::Execution(format!(
+            SessionProjectIdentity::Invalid { raw, message } => Err(ToolError::Execution(format!(
                 "Session '{session_id}' has invalid Project identity '{raw}': {message}"
-            )));
+            ))),
+            SessionProjectIdentity::Unassigned if explicit.is_some() => {
+                Err(ToolError::InvalidArguments(
+                    "Unassigned sessions cannot select an arbitrary project_key".to_string(),
+                ))
+            }
+            SessionProjectIdentity::Unassigned => Ok(None),
         }
-        let derived = session
-            .workspace_path_meta()
-            .map(std::path::PathBuf::from)
-            .or_else(|| workspace_state::get_workspace(session_id))
-            .or_else(workspace_state::get_configured_default_workspace)
-            .map(|path| project_key_from_path(&path));
-        if explicit.is_some() && explicit != derived {
-            return Err(ToolError::InvalidArguments(
-                "Unassigned sessions cannot select an arbitrary project_key".to_string(),
-            ));
-        }
-        Ok(ResolvedLedgerProjectAccess {
-            project_key: derived,
-            writable: false,
-        })
-    }
-
-    fn ensure_project_mutation_allowed(
-        access: &ResolvedLedgerProjectAccess,
-        scope: LedgerScope,
-    ) -> Result<(), ToolError> {
-        if scope == LedgerScope::Project && !access.writable {
-            return Err(ToolError::Execution(
-                "Unassigned sessions may read legacy Project ledger records but cannot mutate them"
-                    .to_string(),
-            ));
-        }
-        Ok(())
     }
 
     /// Find a record by id: the explicitly requested scope first, otherwise
@@ -428,10 +380,10 @@ impl LedgerTool {
                 })
             })
             .transpose()?;
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
-        let project_key = project_access.project_key.as_deref();
+        let project_key = project_key.as_deref();
 
         let existing = match args
             .id
@@ -485,8 +437,6 @@ impl LedgerTool {
                 record
             }
         };
-        Self::ensure_project_mutation_allowed(&project_access, record.scope)?;
-
         // Field updates apply to both paths; on update, absent args leave the
         // existing value untouched.
         if let Some(title) = args
@@ -562,16 +512,12 @@ impl LedgerTool {
         let status = parse_status(args.status.as_deref().ok_or_else(|| {
             ToolError::InvalidArguments("transition requires a status".to_string())
         })?)?;
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
-        let Some(located) = self
-            .locate_record(id, None, project_access.project_key.as_deref())
-            .await?
-        else {
+        let Some(located) = self.locate_record(id, None, project_key.as_deref()).await? else {
             return Err(ToolError::Execution(format!("record not found: {id}")));
         };
-        Self::ensure_project_mutation_allowed(&project_access, located.record.scope)?;
 
         let updated = self
             .store
@@ -609,13 +555,10 @@ impl LedgerTool {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .ok_or_else(|| ToolError::InvalidArguments("get requires an id".to_string()))?;
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
-        let Some(doc) = self
-            .locate_record(id, None, project_access.project_key.as_deref())
-            .await?
-        else {
+        let Some(doc) = self.locate_record(id, None, project_key.as_deref()).await? else {
             return Err(ToolError::Execution(format!("record not found: {id}")));
         };
 
@@ -645,10 +588,9 @@ impl LedgerTool {
         args: &LedgerArgs,
         session_id: &str,
     ) -> Result<serde_json::Value, ToolError> {
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
-        let project_key = project_access.project_key;
         let scopes: Vec<(LedgerScope, Option<String>)> = match args.scope.as_deref() {
             Some("global") => vec![(LedgerScope::Global, None)],
             Some("project") => vec![(LedgerScope::Project, project_key.clone())],
@@ -711,7 +653,7 @@ impl LedgerTool {
         for (scope, key) in &scopes {
             if *scope == LedgerScope::Project && key.is_none() {
                 return Err(ToolError::InvalidArguments(
-                    "project scope requires a project_key (or a session workspace)".to_string(),
+                    "project scope requires an assigned Project".to_string(),
                 ));
             }
             let docs = self
@@ -737,10 +679,9 @@ impl LedgerTool {
         args: &LedgerArgs,
         session_id: &str,
     ) -> Result<serde_json::Value, ToolError> {
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
-        let project_key = project_access.project_key;
         let mut scopes: Vec<(LedgerScope, Option<String>)> = vec![(LedgerScope::Global, None)];
         if project_key.is_some() {
             scopes.push((LedgerScope::Project, project_key));
@@ -789,19 +730,17 @@ impl LedgerTool {
                 "decompose supports at most {MAX_DECOMPOSE_CHILDREN} children per call"
             )));
         }
-        let project_access = self
+        let project_key = self
             .resolve_project_key(args.project_key.as_deref(), session_id)
             .await?;
         let Some(parent) = self
-            .locate_record(parent_id, None, project_access.project_key.as_deref())
+            .locate_record(parent_id, None, project_key.as_deref())
             .await?
         else {
             return Err(ToolError::Execution(format!(
                 "parent record not found: {parent_id}"
             )));
         };
-        Self::ensure_project_mutation_allowed(&project_access, parent.record.scope)?;
-
         let mut created = Vec::with_capacity(children.len());
         for child in children {
             let kind = match child.kind.as_deref() {

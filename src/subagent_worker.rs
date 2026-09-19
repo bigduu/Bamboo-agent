@@ -28,6 +28,9 @@ use bamboo_domain::{
     SessionRuntimeInstruction,
 };
 use bamboo_llm::{create_provider_by_name, Config, LLMChunk, LLMProvider};
+use bamboo_memory::memory_store::{
+    resolve_jiandu_data_root, MemoryStore, BAMBOO_JIANDU_DATA_DIR_ENV,
+};
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
@@ -148,7 +151,11 @@ pub async fn run() -> std::result::Result<(), String> {
                 inherit_user_config.unwrap_or(false),
                 forward_env.clone().unwrap_or_default(),
             )
-            .with_provisioned_permission_resolution(provisioned_permission),
+            .with_provisioned_permission_resolution(provisioned_permission)
+            .with_provisioned_tool_policy(
+                spec.disabled_tools.clone().unwrap_or_default(),
+                spec.capabilities.read_only_enforced(),
+            ),
         ),
         ExecutorSpec::Codex {
             binary,
@@ -360,6 +367,9 @@ pub struct BambooRuntimeExecutor {
     /// Exact provision-time requested/effective posture. Per-activation
     /// RunSpec policy replaces it for warm workers.
     provisioned_permission: bamboo_domain::PermissionModeResolution,
+    /// Whether this worker enforces the typed read-only child boundary through
+    /// its host-provisioned tool denylist and ReadOnlyCommandChecker.
+    read_only_child: bool,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -378,10 +388,50 @@ pub struct BambooRuntimeExecutor {
     child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
 }
 
+/// The reusable runner must release its current run's host bridge on every
+/// exit. Descendants already capture their own clone when they are spawned.
+struct RunEscalationBinding(Arc<dyn bamboo_engine::execution::ExternalChildRunner>);
+
+impl Drop for RunEscalationBinding {
+    fn drop(&mut self) {
+        self.0.set_escalation_bridge(None);
+    }
+}
+
 fn provisioned_permission_resolution(
     capabilities: &bamboo_subagent::provision::Capabilities,
 ) -> Result<bamboo_domain::PermissionModeResolution, String> {
     capabilities.permission_resolution()
+}
+
+/// Read-only children use a stricter authorization layer than legacy PlanMode:
+/// mutating and shell tools are absent, while ReadOnlyCommandChecker hard-denies
+/// even an unadvertised/direct shell call. Keep the approval layer in Auto so
+/// dedicated read tools need no human response; the checker's platform hard-deny
+/// executes before Auto/Bypass and remains authoritative.
+fn bamboo_runtime_execution_permission_mode(
+    read_only_child: bool,
+    audited: bamboo_domain::PermissionModeResolution,
+) -> bamboo_domain::PermissionMode {
+    if read_only_child {
+        bamboo_domain::PermissionMode::Auto
+    } else {
+        audited.effective
+    }
+}
+
+fn bind_worker_session_note(
+    builtin: &bamboo_tools::BuiltinToolExecutor,
+    memory_store: MemoryStore,
+) -> Result<(), String> {
+    if !builtin.registry().unregister("session_note") {
+        return Err("builtin session_note tool is unavailable for Jiandu root binding".to_string());
+    }
+    builtin
+        .register_tool(bamboo_tools::tools::SessionNoteTool::with_memory_store(
+            memory_store,
+        ))
+        .map_err(|error| format!("bind session_note to the worker Jiandu store: {error}"))
 }
 
 impl BambooRuntimeExecutor {
@@ -390,6 +440,21 @@ impl BambooRuntimeExecutor {
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
         let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
+        // Local actor processes inherit the managed launcher's environment.
+        // Resolve again at the worker boundary, then inject this single store
+        // into both prompt preparation and the worker's session_note tool.
+        let jiandu_selection =
+            resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))?;
+        let jiandu_mode = jiandu_selection.mode();
+        let jiandu_root = jiandu_selection.into_path();
+        tracing::info!(
+            target: "bamboo.memory",
+            worker_id = %spec.identity.child_id,
+            mode = jiandu_mode,
+            root = %jiandu_root.display(),
+            "selected subagent worker Jiandu data root"
+        );
+        let memory_store = MemoryStore::new(jiandu_root);
         let storage_dir = spec.storage_dir.clone().map(PathBuf::from).unwrap_or(
             default_worker_storage_dir(spec.workspace.as_deref(), &spec.identity.child_id).await,
         );
@@ -475,7 +540,7 @@ impl BambooRuntimeExecutor {
 
         let config = Arc::new(tokio::sync::RwLock::new(config));
         let (builtin, permission_config): (
-            Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+            bamboo_tools::BuiltinToolExecutor,
             Option<Arc<bamboo_tools::permission::PermissionConfig>>,
         ) = if spec.capabilities.enforce_permissions {
             // Phase 6 (#69): enforce permissions so a sub-agent's GATED tools
@@ -493,36 +558,31 @@ impl BambooRuntimeExecutor {
             let mut checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
                 bamboo_tools::permission::ConfigPermissionChecker::new(perm_config.clone()),
             );
-            // #71: a READ-ONLY Guardian reviewer keeps `Bash` so it can fetch
-            // the diff and run tests, but its shell must NOT be able to mutate /
-            // push / exfiltrate. Wrap the checker so any `Bash`/`execute_command`
-            // whose command is not on the read-only allowlist is DENIED (fail
-            // closed — the reviewer has no human approver), while read-only
-            // commands (`cargo test`, `git diff | head`, `rg …`) run WITHOUT a
-            // gate. Other mutating tools are already stripped by the reviewer's
-            // denylist, so they never reach here.
-            if spec.capabilities.guardian_read_only {
-                checker = Arc::new(bamboo_tools::permission::GuardianReadOnlyChecker::new(
+            // A read-only planner or Guardian receives only dedicated read and
+            // search tools. Wrap the checker as a second runtime boundary so an
+            // unadvertised/direct `Bash` or `execute_command` call is hard-denied
+            // before ambient PATH, shell startup, or repository configuration
+            // can resolve an executable. Auto/Bypass cannot widen this boundary.
+            if spec.capabilities.read_only_enforced() {
+                checker = Arc::new(bamboo_tools::permission::ReadOnlyCommandChecker::new(
                     checker,
                 ));
             }
             (
-                Arc::new(
-                    bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
-                        config.clone(),
-                        checker,
-                    ),
+                bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+                    config.clone(),
+                    checker,
                 ),
                 Some(perm_config),
             )
         } else {
             (
-                Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_config(
-                    config.clone(),
-                )),
+                bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
                 None,
             )
         };
+        bind_worker_session_note(&builtin, memory_store.clone())?;
+        let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(builtin);
         // MCP composition (absent for actor children → builtin-only, unchanged):
         //   1. mcp_proxy set → proxy ALL MCP to the orchestrator over the broker
         //      (it runs the host-bound servers like nova; P2).
@@ -595,10 +655,17 @@ impl BambooRuntimeExecutor {
         // read_skill_resource) over its synced skills_dir, so it can pull a
         // skill's full SKILL.md — not just see the description. The orchestrator's
         // root surface has these; the worker previously only had the builtin set.
-        let worker_sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        let worker_sessions: bamboo_engine::SessionCache = Arc::default();
         let worker_runners = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let worker_event_senders =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        bamboo_server::app_state::init::spawn_session_map_cleanup_task(
+            worker_runners.clone(),
+            worker_event_senders.clone(),
+            bamboo_server::app_state::watchers::SessionWatchers::new(),
+            worker_sessions.clone(),
+            Some("actor-worker"),
+        );
         let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = {
             let session_repo = bamboo_engine::SessionRepository::new(
                 worker_sessions.clone(),
@@ -657,6 +724,7 @@ impl BambooRuntimeExecutor {
             .metrics_collector(metrics_collector)
             .config(config)
             .provider(provider)
+            .memory_store(memory_store)
             // Base tools only; the real SubAgent tool is added per-run via
             // `ExecuteRequestBuilder.tools()` (see `run_tools` below) to break
             // the agent→tools→adapter→scheduler→agent construction cycle.
@@ -808,6 +876,7 @@ impl BambooRuntimeExecutor {
             run_tools,
             spawn_depth: spec.identity.depth,
             provisioned_permission,
+            read_only_child: spec.capabilities.read_only_enforced(),
             permission_config,
             no_human_review,
             child_runner,
@@ -1175,7 +1244,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             };
             config.publish_persistent_policy(context.revision, &policy);
-            config.set_mode(permission_resolution.effective);
+            config.set_mode(bamboo_runtime_execution_permission_mode(
+                self.read_only_child,
+                permission_resolution,
+            ));
             policy_revision = context.revision;
             effective_workspace = context.workspace_path.clone().or(effective_workspace);
             session.metadata.insert(
@@ -1183,7 +1255,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 context.inherit_session_grants.to_string(),
             );
         } else if let Some(config) = self.permission_config.as_ref() {
-            config.set_mode(permission_resolution.effective);
+            config.set_mode(bamboo_runtime_execution_permission_mode(
+                self.read_only_child,
+                permission_resolution,
+            ));
         }
         if let Err(error) = bamboo_domain::record_permission_audit(
             &mut session.metadata,
@@ -1198,10 +1273,23 @@ impl ChildExecutor for BambooRuntimeExecutor {
             ));
         }
         session.workspace = effective_workspace;
-        if let (Some(config), Some(workspace)) =
-            (self.permission_config.as_ref(), session.workspace.as_ref())
-        {
-            config.register_session_workspace(session.id.clone(), workspace.clone());
+        if let Some(workspace) = session.workspace.clone() {
+            // The host already resolved and authorized this activation's
+            // workspace. Publish that exact path in the worker process too:
+            // pathless Read/Glob/Grep resolve through this process-local
+            // registry, not through `Session.workspace` or the parent server's
+            // registry. Without this handoff a worker launched from another
+            // directory silently inspects its process cwd instead.
+            let workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+                &session.id,
+                PathBuf::from(workspace),
+            )
+            .to_string_lossy()
+            .into_owned();
+            session.workspace = Some(workspace.clone());
+            if let Some(config) = self.permission_config.as_ref() {
+                config.register_session_workspace(session.id.clone(), workspace);
+            }
         }
         // Phase 6: re-establish this worker's nesting depth on its fresh run
         // session (Session::new starts at 0), so the depth cap accumulates across
@@ -1210,10 +1298,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6, Part B: re-establish bypass on the fresh run session so the
         // worker's own tools honor it AND create_child_action propagates it to
         // grandchildren (whose forced-ask actions then reach the model-reviewer).
-        session
+        let runtime = session
             .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .set_permission_mode(permission_resolution.requested);
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.set_permission_mode(permission_resolution.requested);
+        runtime.read_only = self.read_only_child;
         // #73 review (P1): mirror the bypass re-stamp for "no human approver", so
         // create_child_action propagates it to in-process grandchildren. Without
         // this, a depth-2+ child of an unattended run does NOT inherit the flag,
@@ -1441,12 +1530,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
                         delivery.envelope.id
                     ));
                 }
-                events.confirm_session_message(SessionMessageAdmissionConfirmation {
-                    target_session_id: delivery.target_session_id.clone(),
-                    envelope_id: delivery.envelope.id.as_str().to_string(),
-                    canonical_claim_generation: delivery.canonical_claim_generation,
-                    activation_run_id: delivery.activation_run_id.clone(),
-                });
+                events
+                    .confirm_session_message(SessionMessageAdmissionConfirmation {
+                        target_session_id: delivery.target_session_id.clone(),
+                        envelope_id: delivery.envelope.id.as_str().to_string(),
+                        canonical_claim_generation: delivery.canonical_claim_generation,
+                        activation_run_id: delivery.activation_run_id.clone(),
+                    })
+                    .await;
             }
         }
 
@@ -1459,8 +1550,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
         let steer_events = events.clone();
         let steer_activation_run_id = expected_activation_run_id.clone();
         let steer_done = CancellationToken::new();
+        let _steer_cancel_on_drop = steer_done.clone().drop_guard();
         let steer_done_task = steer_done.clone();
-        let steer_task = tokio::spawn(async move {
+        let steer_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 let message = tokio::select! {
                     _ = steer_done_task.cancelled() => break,
@@ -1610,7 +1702,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                         .await
                     {
                         Ok(true) => {
-                            steer_events.confirm_session_message(confirmation);
+                            steer_events.confirm_session_message(confirmation).await;
                             break;
                         }
                         Ok(false) => {}
@@ -1630,7 +1722,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     }
                 }
             }
-        });
+        }));
 
         // Phase 2: if the host wired an approval bridge, install a per-run
         // ApprovalProxy so this run's gated tools delegate the decision to the
@@ -1655,19 +1747,20 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // a fire-and-forget grandchild outliving this run still escalates through
         // the run's own bridge rather than a stale/overwritten global. `None` for
         // a leaf worker (no spawn stack), which never drives grandchildren.
-        if let Some(runner) = &self.child_runner {
+        let _escalation_binding = self.child_runner.as_ref().map(|runner| {
             runner.set_escalation_bridge(events.host().cloned());
-        }
+            RunEscalationBinding(runner.clone())
+        });
 
         // AgentEvents stream to the parent verbatim (zero mapping).
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
-        let forward = tokio::spawn(async move {
+        let forward = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
                 if let Ok(value) = serde_json::to_value(&ev) {
-                    events.emit(value);
+                    events.emit(value).await;
                 }
             }
-        });
+        }));
         if let Some(audit) =
             bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
         {
@@ -1809,10 +1902,40 @@ fn build_isolated_config(
 mod tests {
     use super::*;
     use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
+    use bamboo_agent_core::tools::{ToolCall, ToolCtx, ToolError, ToolResult, ToolSchema};
+    use bamboo_agent_core::Tool;
     use bamboo_subagent::executor::ExecutorControl;
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+
+    #[test]
+    fn read_only_worker_keeps_plan_audit_but_uses_no_shell_authorization() {
+        for requested in [
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::SessionPermissionMode::Auto,
+            bamboo_domain::SessionPermissionMode::Bypass,
+        ] {
+            let audited = bamboo_domain::resolve_permission_mode_with_read_only(
+                requested,
+                bamboo_domain::PermissionMode::Default,
+                true,
+            );
+            assert_eq!(audited.effective, bamboo_domain::PermissionMode::Plan);
+            assert_eq!(
+                bamboo_runtime_execution_permission_mode(true, audited),
+                bamboo_domain::PermissionMode::Auto
+            );
+        }
+
+        let ordinary = bamboo_domain::resolve_permission_mode(
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::PermissionMode::AcceptEdits,
+        );
+        assert_eq!(
+            bamboo_runtime_execution_permission_mode(false, ordinary),
+            bamboo_domain::PermissionMode::AcceptEdits
+        );
+    }
 
     struct NoTools;
 
@@ -1830,6 +1953,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingWorkerProvider {
         calls: std::sync::Mutex<Vec<Vec<Message>>>,
+        hold: bool,
+        started: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1842,6 +1967,10 @@ mod tests {
             _model: &str,
         ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
             self.calls.lock().unwrap().push(messages.to_vec());
+            if self.hold {
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+            }
             let chunks: Vec<bamboo_llm::provider::Result<LLMChunk>> =
                 vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)];
             Ok(Box::pin(futures::stream::iter(chunks)))
@@ -1901,11 +2030,98 @@ mod tests {
                 bamboo_domain::SessionPermissionMode::Default,
                 bamboo_domain::PermissionMode::Default,
             ),
+            read_only_child: false,
             permission_config: None,
             no_human_review: None,
             child_runner: None,
         };
         (temp, executor, store, inbox)
+    }
+
+    #[derive(Default)]
+    struct BridgeCapturingRunner(std::sync::Mutex<Option<bamboo_subagent::HostBridge>>);
+
+    #[async_trait]
+    impl bamboo_engine::execution::ExternalChildRunner for BridgeCapturingRunner {
+        async fn should_handle(&self, _session: &Session) -> bool {
+            false
+        }
+
+        async fn execute_external_child(
+            &self,
+            _session: &mut Session,
+            _job: &bamboo_engine::execution::SpawnJob,
+            _events: mpsc::Sender<AgentEvent>,
+            _cancel: CancellationToken,
+        ) -> bamboo_engine::runtime::runner::Result<()> {
+            unreachable!("fixture does not spawn descendants")
+        }
+
+        fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::HostBridge>) {
+            *self.0.lock().unwrap() = bridge;
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_warm_run_releases_its_nested_escalation_bridge() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider).await;
+        let runner = Arc::new(BridgeCapturingRunner::default());
+        executor.child_runner = Some(runner.clone());
+        let (bridge, mut requests) = bamboo_subagent::HostBridge::channel();
+        let (events, _event_rx) = EventSink::channel();
+        let outcome = executor
+            .run(
+                protocol_run("child-bridge", "bridge-run", Vec::new()),
+                events.with_host_bridge(bridge),
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert!(runner.0.lock().unwrap().is_none());
+        assert!(
+            matches!(
+                requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "completed worker must let the broker's approval drain finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_worker_run_releases_helpers_and_nested_escalation_bridge() {
+        let provider = Arc::new(RecordingWorkerProvider {
+            hold: true,
+            ..Default::default()
+        });
+        let (_temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        let runner = Arc::new(BridgeCapturingRunner::default());
+        executor.child_runner = Some(runner.clone());
+        let (bridge, mut requests) = bamboo_subagent::HostBridge::channel();
+        let (events, _event_rx) = EventSink::channel();
+        let (_steer_sender, steer) = SteerInbox::channel();
+        let task = tokio::spawn(async move {
+            executor
+                .run(
+                    protocol_run("aborted-bridge", "bridge-run", Vec::new()),
+                    events.with_host_bridge(bridge),
+                    steer,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            provider.started.notified(),
+        )
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(runner.0.lock().unwrap().is_none());
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.expect("aborted worker must drop forwarding and steering tasks, including their HostBridge clones");
+        assert!(request.is_none());
     }
 
     fn protocol_run(
@@ -1928,6 +2144,7 @@ mod tests {
                 serde_json::to_value(Message::user("base task")).unwrap(),
             ],
             activation_run_id: Some(activation_run_id.to_string()),
+            execution_epoch: 1,
             initial_session_messages: deliveries,
             secrets: RunSecrets::default(),
         }
@@ -1970,6 +2187,51 @@ mod tests {
             confirmations.push(confirmation);
         }
         (outcome, confirmations)
+    }
+
+    #[tokio::test]
+    async fn bamboo_runtime_publishes_workspace_for_pathless_inspection_tools() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider).await;
+        let workspace = temp.path().join("selected-project");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(
+            workspace.join("only-in-selected-workspace.rs"),
+            "fn selected() {}",
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            workspace,
+            "the regression needs a workspace distinct from the worker cwd"
+        );
+        executor.workspace = Some(workspace.to_string_lossy().into_owned());
+
+        let session_id = "pathless-inspection-workspace";
+        let (outcome, _confirmations) =
+            execute_protocol_run(&executor, protocol_run(session_id, "workspace-run", vec![]))
+                .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::workspace_or_process_cwd(Some(session_id)),
+            workspace
+        );
+
+        let mut ctx = ToolCtx::none("pathless-glob");
+        ctx.session_id = Some(Arc::<str>::from(session_id));
+        let result = bamboo_tools::GlobTool::new()
+            .invoke(serde_json::json!({"pattern": "**/*.rs"}), ctx)
+            .await
+            .expect("pathless Glob resolves the activation workspace");
+        let bamboo_agent_core::ToolOutcome::Completed(result) = result else {
+            panic!("pathless Glob should complete")
+        };
+        assert!(
+            result.result.contains("only-in-selected-workspace.rs"),
+            "pathless Glob inspected the wrong directory: {}",
+            result.result
+        );
     }
 
     #[tokio::test]
@@ -2268,6 +2530,43 @@ mod tests {
             model: m.into(),
         });
         s
+    }
+
+    #[tokio::test]
+    async fn worker_session_note_uses_the_injected_jiandu_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected_store = MemoryStore::new(temp.path().join("selected-jiandu"));
+        let builtin = bamboo_tools::BuiltinToolExecutor::new_with_config(Arc::new(
+            tokio::sync::RwLock::new(Config::default()),
+        ));
+        bind_worker_session_note(&builtin, selected_store.clone())
+            .expect("bind worker session_note");
+
+        let tool = builtin
+            .registry()
+            .get("session_note")
+            .expect("bound session_note tool");
+        let mut context = ToolCtx::none("worker-note-call");
+        context.session_id = Some(Arc::from("worker-note-session"));
+        tool.invoke(
+            serde_json::json!({
+                "action": "replace",
+                "topic": "acceptance",
+                "content": "isolated worker note"
+            }),
+            context,
+        )
+        .await
+        .expect("write worker session note");
+
+        assert_eq!(
+            selected_store
+                .read_session_topic("worker-note-session", "acceptance")
+                .await
+                .expect("read injected Jiandu store")
+                .as_deref(),
+            Some("isolated worker note")
+        );
     }
 
     #[test]

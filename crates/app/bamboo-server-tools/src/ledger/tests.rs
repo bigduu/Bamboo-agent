@@ -38,7 +38,9 @@ impl Storage for TestStorage {
 
 fn test_context(session_id: &str) -> ToolCtx {
     ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-1",
         event_tx: None,
         available_tool_schemas: None,
@@ -69,11 +71,11 @@ fn build_tool_with_optional_session(
     session: Option<Session>,
     project_store: Option<Arc<bamboo_projects::ProjectStore>>,
 ) -> (LedgerTool, Arc<dyn Storage>) {
-    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions: bamboo_engine::SessionCache = Arc::default();
     if let Some(session) = session {
         sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session)),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
     }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
@@ -137,6 +139,7 @@ async fn assigned_project_ledger_scope_is_stable_across_workspace_switches() {
         serde_json::json!({
             "action": "upsert",
             "scope": "project",
+            "project_key": project.id.as_str(),
             "title": "First Project record"
         }),
     )
@@ -169,14 +172,6 @@ async fn assigned_project_ledger_scope_is_stable_across_workspace_switches() {
         .join(project.id.as_str())
         .join("records")
         .is_dir());
-    for workspace in [&workspace_one, &workspace_two] {
-        let legacy_key = project_key_from_path(workspace);
-        assert!(!dir
-            .path()
-            .join("ledger/v1/scopes/projects")
-            .join(legacy_key)
-            .exists());
-    }
 }
 
 #[tokio::test]
@@ -206,7 +201,7 @@ async fn ledger_rejects_cross_project_key_and_unassigned_project_writes() {
         .to_string()
         .contains("does not match assigned Project"));
 
-    let workspace = dir.path().join("legacy-workspace");
+    let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let mut unassigned = Session::new("session-1", "test-model");
     unassigned.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
@@ -222,12 +217,23 @@ async fn ledger_rejects_cross_project_key_and_unassigned_project_writes() {
         )
         .await
         .expect_err("unassigned Project write must fail");
-    assert!(denied.to_string().contains("cannot mutate"));
-    assert!(!dir
-        .path()
-        .join("ledger/v1/scopes/projects")
-        .join(project_key_from_path(&workspace))
-        .exists());
+    assert!(denied
+        .to_string()
+        .contains("project scope requires an assigned Project"));
+
+    let mut invalid = Session::new("invalid-session", "test-model");
+    invalid.set_project_id_meta("../malformed");
+    let (invalid_tool, _) = build_tool_for_session(dir.path(), invalid, Some(project_store));
+    let invalid_identity = invalid_tool
+        .invoke(
+            serde_json::json!({"action": "query", "scope": "all"}),
+            test_context("invalid-session"),
+        )
+        .await
+        .expect_err("invalid persisted Project identity must fail closed");
+    assert!(invalid_identity
+        .to_string()
+        .contains("invalid Project identity"));
 }
 
 #[tokio::test]

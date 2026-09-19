@@ -169,8 +169,6 @@ pub struct ProjectManifest {
     /// authoritative registered root and is not duplicated in this collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_bindings: Vec<WorkspaceBinding>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub legacy_project_keys: Vec<String>,
     /// CAS token for metadata and workspace binding updates.
     #[serde(default = "initial_project_revision")]
     pub revision: u64,
@@ -197,7 +195,6 @@ impl ProjectManifest {
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
             workspace_bindings: Vec::new(),
-            legacy_project_keys: Vec::new(),
             revision: 1,
             resource_revision: 1,
             created_at: now,
@@ -303,7 +300,7 @@ pub struct ProjectResourceSummary {
 }
 
 /// Legacy session input for the migration dry-run seam. Callers may provide
-/// canonical/Git/key evidence explicitly; the server can enrich only omitted
+/// canonical/Git evidence explicitly; the server can enrich only omitted
 /// evidence from a readable `workspace_path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacySessionProjectInput {
@@ -314,8 +311,6 @@ pub struct LegacySessionProjectInput {
     pub canonical_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_common_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub legacy_project_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,7 +332,6 @@ pub struct LegacyProjectSuggestion {
     pub basis: LegacyProjectMatchBasis,
     pub session_ids: Vec<String>,
     pub workspace_paths: Vec<String>,
-    pub legacy_project_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,65 +350,6 @@ pub struct LegacyProjectDryRunReport {
     pub unassigned: Vec<LegacyProjectUnassigned>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyMemoryMigrationPhase {
-    Copying,
-    Verified,
-    Committed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyMemoryFileDisposition {
-    Pending,
-    Staged,
-    Copied,
-    ExistingIdentical,
-    TargetConflict,
-    /// The source remains untouched as a read-only legacy record, but is not
-    /// copied into Project primary storage because canonical validation failed.
-    SkippedInvalid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyMemoryMigrationFile {
-    /// Slash-separated relative path below the legacy/project memory roots.
-    pub relative_path: String,
-    pub size: u64,
-    pub sha256: String,
-    pub disposition: LegacyMemoryFileDisposition,
-    /// Redacted validation diagnostic. This describes why an individual
-    /// source record was isolated without embedding its contents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<String>,
-}
-
-/// Durable status returned by the actual copy -> verify -> commit migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyMemoryMigrationReport {
-    pub project_id: ProjectId,
-    pub legacy_project_key: String,
-    pub transaction_id: String,
-    pub phase: LegacyMemoryMigrationPhase,
-    pub files: Vec<LegacyMemoryMigrationFile>,
-    pub started_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub committed_at: Option<DateTime<Utc>>,
-}
-
-/// Read-compatibility alias. The Project-home root always has precedence; the
-/// legacy scope is read-only and only fills entries absent from the new root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyMemoryReadAlias {
-    pub legacy_project_key: String,
-    pub read_only: bool,
-    pub project_home_precedence: bool,
-    pub source_available: bool,
-    pub migration_committed: bool,
 }
 
 #[cfg(test)]
@@ -452,7 +387,6 @@ mod tests {
             ProjectPathStatus::NeedsConfiguration
         );
         assert!(manifest.workspace_bindings.is_empty());
-        assert!(manifest.legacy_project_keys.is_empty());
         assert_eq!(manifest.revision, 1);
         assert_eq!(manifest.resource_revision, 1);
     }

@@ -33,6 +33,11 @@ pub struct CreateSessionInput {
     /// on disk (`ensure_session_workspace`) is a handler-layer concern, same
     /// split as the chat turn use case.
     pub workspace_path: Option<String>,
+    /// Initial session-scoped permission mode, already resolved by the caller
+    /// (explicit request value wins over the durable permission-policy
+    /// default). `None` leaves the runtime default (Default) untouched so
+    /// callers without permission context keep the old behavior.
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
 /// Configuration defaults for session creation.
@@ -68,9 +73,30 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     }
     if let Some(workspace_path) = trimmed_non_empty(input.workspace_path.as_deref()) {
         session.set_workspace_path_meta(workspace_path);
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            crate::project_context::WorkspaceSource::Explicit
+                .as_str()
+                .to_string(),
+        );
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+            crate::project_context::WorkspaceBindingStatus::Unregistered
+                .as_str()
+                .to_string(),
+        );
     }
     if let Some(project_id) = input.project_id.as_ref() {
         session.set_project_id_meta(project_id.to_string());
+    }
+    // Stamp the resolved initial permission mode exactly once at creation.
+    // `set_permission_mode` keeps the typed mode and legacy boolean mirror
+    // consistent; later changes flow through the CAS-guarded PATCH contract.
+    if let Some(mode) = input.permission_mode {
+        session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .set_permission_mode(mode);
     }
 
     let explicit_title = trimmed_non_empty(input.title.as_deref());
@@ -189,6 +215,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -221,6 +248,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
 
         let session = build_new_session(&input, &default_config());
@@ -241,6 +269,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -272,6 +301,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &config);
 
@@ -297,6 +327,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -319,6 +350,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -348,6 +380,7 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: Some("  /tmp/my-workspace  ".to_string()),
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
@@ -370,9 +403,55 @@ mod tests {
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
+            permission_mode: None,
         };
         let session = build_new_session(&input, &default_config());
 
         assert!(session.workspace_path_meta().is_none());
+    }
+
+    #[test]
+    fn build_new_session_stamps_permission_mode_with_legacy_mirror() {
+        let input = CreateSessionInput {
+            id: "session-permission".to_string(),
+            project_id: None,
+            title: None,
+            title_generated: None,
+            system_prompt: None,
+            model: Some("gpt-5".to_string()),
+            model_ref: None,
+            reasoning_effort: None,
+            gold_config_json: None,
+            workspace_path: None,
+            permission_mode: Some(bamboo_domain::SessionPermissionMode::Auto),
+        };
+        let session = build_new_session(&input, &default_config());
+        let runtime = session.agent_runtime_state.as_ref().expect("runtime state");
+        assert_eq!(
+            runtime.effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        // The legacy boolean mirror keeps old clients conservative.
+        assert!(runtime.bypass_permissions);
+
+        // None leaves the runtime state untouched — no state is created and
+        // persisted sessions stay byte-compatible with the pre-field format.
+        let unset = build_new_session(
+            &CreateSessionInput {
+                id: "session-permission-unset".to_string(),
+                project_id: None,
+                title: None,
+                title_generated: None,
+                system_prompt: None,
+                model: Some("gpt-5".to_string()),
+                model_ref: None,
+                reasoning_effort: None,
+                gold_config_json: None,
+                workspace_path: None,
+                permission_mode: None,
+            },
+            &default_config(),
+        );
+        assert!(unset.agent_runtime_state.is_none());
     }
 }

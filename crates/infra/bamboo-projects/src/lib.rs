@@ -22,9 +22,6 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
-mod legacy_memory;
-pub use legacy_memory::{LegacyMemoryReadRoot, ProjectMemoryReadRoots};
-
 const PROJECT_MANIFEST_FILE: &str = "project.json";
 const PROJECT_MANIFEST_BACKUP_FILE: &str = "project.json.bak";
 const PROJECT_MANIFEST_REVISION_FILE: &str = "manifest-revision";
@@ -139,22 +136,6 @@ fn validate_component(value: &str) -> ProjectStoreResult<()> {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
-    if valid {
-        Ok(())
-    } else {
-        Err(ProjectStoreError::InvalidPathComponent(value.to_string()))
-    }
-}
-
-pub(crate) fn validate_legacy_project_key(value: &str) -> ProjectStoreResult<()> {
-    let valid = !value.is_empty()
-        && value.len() <= 256
-        && value.trim() == value
-        && value != "."
-        && value != ".."
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains('\0');
     if valid {
         Ok(())
     } else {
@@ -1567,15 +1548,6 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
             validate_absolute_path(git_common_dir, "git common dir")?;
         }
     }
-    let mut legacy_keys = HashSet::new();
-    for key in &manifest.legacy_project_keys {
-        validate_legacy_project_key(key)?;
-        if !legacy_keys.insert(key) {
-            return Err(ProjectStoreError::Validation(
-                "legacy project keys must be unique".to_string(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -1995,20 +1967,17 @@ fn suggest_groups<'a>(
     for group in groups.into_values().filter(|group| group.len() >= 2) {
         let mut session_ids = BTreeSet::new();
         let mut workspace_paths = BTreeSet::new();
-        let mut legacy_project_keys = BTreeSet::new();
         for input in group {
             session_ids.insert(input.session_id.clone());
             if let Some(workspace_path) = &input.workspace_path {
                 workspace_paths.insert(workspace_path.clone());
             }
-            legacy_project_keys.extend(input.legacy_project_keys.iter().cloned());
         }
         suggested.extend(session_ids.iter().cloned());
         report.suggestions.push(LegacyProjectSuggestion {
             basis,
             session_ids: session_ids.into_iter().collect(),
             workspace_paths: workspace_paths.into_iter().collect(),
-            legacy_project_keys: legacy_project_keys.into_iter().collect(),
         });
     }
 }
@@ -2031,6 +2000,10 @@ mod tests {
             label: None,
             git_common_dir: None,
         }
+    }
+
+    fn retired_memory_key_field() -> String {
+        ["legacy", "project", "keys"].join("_")
     }
 
     #[test]
@@ -2068,6 +2041,35 @@ mod tests {
     }
 
     #[test]
+    fn current_manifest_ignores_retired_memory_key_without_rewrite() {
+        let (temp, store) = store();
+        let project = store.create("Legacy v2", None).unwrap();
+        let manifest_path = store.paths().manifest_path(&project.id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            retired_memory_key_field(),
+            serde_json::json!(["legacy-project-alias"]),
+        );
+        let original_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&manifest_path, &original_bytes).unwrap();
+        drop(store);
+
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+
+        let listed = reopened.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, project.id);
+        assert_eq!(listed[0].revision, project.revision);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+
+        let loaded = reopened.get(&project.id).unwrap();
+        assert_eq!(loaded.revision, project.revision);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+    }
+
+    #[test]
     fn unarchive_is_atomic_and_preserves_project_identity_and_resources() {
         let (temp, store) = store();
         let project_path = temp.path().join("project");
@@ -2098,14 +2100,6 @@ mod tests {
         );
 
         let project = store
-            .update(&project.id, project.revision, |manifest| {
-                manifest
-                    .legacy_project_keys
-                    .push("legacy-zenith".to_string());
-                Ok(())
-            })
-            .unwrap();
-        let project = store
             .bump_resource_revision(&project.id, project.revision)
             .unwrap();
         let settings_path = store.paths().settings_path(&project.id);
@@ -2126,7 +2120,6 @@ mod tests {
         assert_eq!(restored.project_path, archived.project_path);
         assert_eq!(restored.project_path_status, archived.project_path_status);
         assert_eq!(restored.workspace_bindings, archived.workspace_bindings);
-        assert_eq!(restored.legacy_project_keys, archived.legacy_project_keys);
         assert_eq!(restored.resource_revision, archived.resource_revision);
         assert_eq!(restored.created_at, archived.created_at);
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
@@ -2269,6 +2262,10 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             value["schema_version"] = serde_json::json!(1);
             value.as_object_mut().unwrap().remove("project_path");
+            value.as_object_mut().unwrap().insert(
+                retired_memory_key_field(),
+                serde_json::json!(["legacy-project-alias"]),
+            );
             std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         }
 
@@ -2304,6 +2301,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(backup["schema_version"], 1);
+        assert!(backup.get(retired_memory_key_field().as_str()).is_some());
 
         let zero = store.create("zero", None).unwrap();
         rewrite_as_v1(&store, &zero);
@@ -2935,7 +2933,6 @@ mod tests {
                 workspace_path: Some(linked_canonical.to_string_lossy().into_owned()),
                 canonical_path: Some(linked_canonical.to_string_lossy().into_owned()),
                 git_common_dir: Some(linked_git_common_dir),
-                legacy_project_keys: Vec::new(),
             }],
             &[migrated],
         );
@@ -2985,7 +2982,6 @@ mod tests {
                         .into_owned(),
                 ),
                 git_common_dir: Some(replacement_common_dir),
-                legacy_project_keys: Vec::new(),
             }],
             &[project],
         );
@@ -3165,28 +3161,24 @@ mod tests {
                 workspace_path: Some("/work/main".to_string()),
                 canonical_path: Some("/work/main".to_string()),
                 git_common_dir: None,
-                legacy_project_keys: vec![],
             },
             LegacySessionProjectInput {
                 session_id: "linked-a".to_string(),
                 workspace_path: Some("/other/a".to_string()),
                 canonical_path: Some("/other/a".to_string()),
                 git_common_dir: Some("/other/repo/.git".to_string()),
-                legacy_project_keys: vec!["old-a".to_string()],
             },
             LegacySessionProjectInput {
                 session_id: "linked-b".to_string(),
                 workspace_path: Some("/other/b".to_string()),
                 canonical_path: Some("/other/b".to_string()),
                 git_common_dir: Some("/other/repo/.git".to_string()),
-                legacy_project_keys: vec!["old-b".to_string()],
             },
             LegacySessionProjectInput {
                 session_id: "basename-only".to_string(),
                 workspace_path: Some("/missing/zenith".to_string()),
                 canonical_path: None,
                 git_common_dir: None,
-                legacy_project_keys: vec!["zenith-hash".to_string()],
             },
         ];
         let report = plan_legacy_migration(&inputs, &[existing]);

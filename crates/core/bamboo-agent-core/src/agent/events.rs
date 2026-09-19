@@ -78,10 +78,12 @@ fn default_title_generated() -> bool {
 /// - `TokenBudgetUpdated` - Context budget changed
 /// - `ContextCompressionStatus` - Context compression lifecycle progress
 /// - `ContextSummarized` - Old messages summarized
+/// - `ContextArchived` - Exact old messages excluded from the active window
 ///
 /// ## Sub-agents (Async Spawn)
 /// - `SubAgentStarted` - A child session is created and scheduled to run
-/// - `SubAgentEvent` - Forwarded raw child event (full fidelity)
+/// - `SubAgentEvent` - Legacy parent projection of a raw child event; current
+///   runtimes publish full fidelity on the child's own session channel
 /// - `SubAgentHeartbeat` - Periodic heartbeat while the child is running
 /// - `SubAgentCompleted` - Child session finished (completed/cancelled/error)
 ///
@@ -370,6 +372,27 @@ pub enum AgentEvent {
         trigger_type: String,
     },
 
+    /// Emitted after a retrieval-window boundary is durably checkpointed.
+    /// Contains structural evidence only; raw message and memory content must
+    /// never enter this event.
+    ContextArchived {
+        archive_event_id: String,
+        trigger_type: String,
+        messages_archived: usize,
+        groups_archived: usize,
+        user_turns_archived: usize,
+        active_tokens_before: u32,
+        active_tokens_after: u32,
+        target_tokens: u32,
+        retained_recent_user_turns: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_retained_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_retained_user_message_id: Option<String>,
+        model_context_epoch: u64,
+        reset_reason: String,
+    },
+
     /// Emitted when context pressure reaches warning or critical levels.
     /// Frontend should display this to the user as a proactive notification.
     ContextPressureNotification {
@@ -390,9 +413,9 @@ pub enum AgentEvent {
         title: Option<String>,
     },
 
-    /// Forwarded raw child event to the parent session stream.
-    ///
-    /// Child sessions are not allowed to spawn further sessions, so this should not nest.
+    /// Legacy raw child projection on the parent session stream. Retained for
+    /// wire compatibility; current runtimes publish raw events only on the
+    /// child's own independently subscribable session channel.
     SubAgentEvent {
         parent_session_id: String,
         child_session_id: String,
@@ -572,6 +595,14 @@ pub enum AgentEvent {
         content: String,
         created_at: chrono::DateTime<chrono::Utc>,
     },
+
+    /// The runtime session snapshot for a run has been saved successfully.
+    ///
+    /// `Complete` ends the low-latency token stream and may be observed before
+    /// the final checkpoint. This durable change-feed barrier is emitted only
+    /// after `/history/{id}` can read the saved assistant/tool tail, allowing
+    /// clients to reconcile without guessing at persistence timing.
+    SessionHistoryCommitted { session_id: String },
 
     /// Execution run has started and the runner is now active.
     ///
@@ -817,6 +848,7 @@ impl AgentEvent {
             | AgentEvent::SessionDeleted { session_id, .. }
             | AgentEvent::SessionCleared { session_id, .. }
             | AgentEvent::MessageAppended { session_id, .. }
+            | AgentEvent::SessionHistoryCommitted { session_id }
             | AgentEvent::ExecutionStarted { session_id, .. }
             | AgentEvent::BudgetExceeded { session_id, .. }
             | AgentEvent::WorkflowActivated { session_id, .. }
@@ -884,6 +916,7 @@ impl AgentEvent {
         matches!(
             self,
             AgentEvent::MessageAppended { .. }
+                | AgentEvent::SessionHistoryCommitted { .. }
                 | AgentEvent::SessionCreated { .. }
                 | AgentEvent::SessionDeleted { .. }
                 | AgentEvent::SessionCleared { .. }
@@ -1015,7 +1048,7 @@ pub enum TitleSource {
 /// See [`bamboo_domain::TokenUsage`] for the canonical definition.
 pub use bamboo_domain::TokenUsage;
 
-pub use bamboo_domain::budget_types::TokenBudgetUsage;
+pub use bamboo_domain::budget_types::{ProviderPromptUsage, TokenBudgetUsage};
 
 #[cfg(test)]
 mod tests {
@@ -1051,6 +1084,44 @@ mod tests {
         assert!(value.get("task_list").is_some());
         assert_eq!(value["version"], 7);
         assert!(value.get("todo_list").is_none());
+    }
+
+    #[test]
+    fn context_archived_serializes_structural_evidence_without_history_content() {
+        let event = AgentEvent::ContextArchived {
+            archive_event_id: "compression-event-1".to_string(),
+            trigger_type: "auto".to_string(),
+            messages_archived: 8,
+            groups_archived: 4,
+            user_turns_archived: 4,
+            active_tokens_before: 9_000,
+            active_tokens_after: 5_000,
+            target_tokens: 6_000,
+            retained_recent_user_turns: 3,
+            oldest_retained_message_id: Some("message-9".to_string()),
+            oldest_retained_user_message_id: Some("message-9".to_string()),
+            model_context_epoch: 2,
+            reset_reason: "compression".to_string(),
+        };
+
+        let value = serde_json::to_value(&event).expect("archive event should serialize");
+        assert_eq!(value["type"], "context_archived");
+        assert_eq!(value["messages_archived"], 8);
+        assert_eq!(value["active_tokens_after"], 5_000);
+        assert_eq!(value["reset_reason"], "compression");
+        let wire = serde_json::to_string(&value).unwrap();
+        assert!(!wire.contains("summary"));
+        assert!(!wire.contains("raw_message"));
+        assert!(!wire.contains("tool_result"));
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(value).unwrap(),
+            AgentEvent::ContextArchived {
+                archive_event_id,
+                messages_archived: 8,
+                model_context_epoch: 2,
+                ..
+            } if archive_event_id == "compression-event-1"
+        ));
     }
 
     #[test]
@@ -1116,6 +1187,25 @@ mod tests {
             value["message"],
             serde_json::Value::String("Agent execution cancelled by user".to_string())
         );
+    }
+
+    #[test]
+    fn session_history_committed_is_a_routable_durable_barrier() {
+        let event = AgentEvent::SessionHistoryCommitted {
+            session_id: "session-1".to_string(),
+        };
+
+        let value = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(value["type"], "session_history_committed");
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(event.session_id(), Some("session-1"));
+        assert!(event.is_durable_change());
+
+        let restored: AgentEvent = serde_json::from_value(value).expect("event should deserialize");
+        assert!(matches!(
+            restored,
+            AgentEvent::SessionHistoryCommitted { session_id } if session_id == "session-1"
+        ));
     }
 
     #[test]

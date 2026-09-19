@@ -4,6 +4,7 @@ use actix_web::{test, web, App};
 use bamboo_agent::server::handlers::tools;
 use serde_json::{json, Value};
 
+mod archive;
 mod basic;
 mod compact;
 mod edit_flow;
