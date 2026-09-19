@@ -204,6 +204,7 @@ fn create_connect_session(
     workspace: Option<bamboo_engine::session_app::execution_prep::ResolvedExecutionWorkspace<'_>>,
     project_id: Option<&bamboo_domain::ProjectId>,
     reasoning_effort: Option<ReasoningEffort>,
+    permission_mode: bamboo_domain::SessionPermissionMode,
     workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -236,10 +237,11 @@ fn create_connect_session(
         Some(system_prompt),
         None,
     );
-    session
+    let runtime_state = session
         .agent_runtime_state
-        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .no_human_approver = false;
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+    runtime_state.set_permission_mode(permission_mode);
+    runtime_state.no_human_approver = false;
     session
 }
 
@@ -802,6 +804,11 @@ impl ConnectBridge {
             }),
             project_id,
             resolved.reasoning_effort,
+            self.ctx
+                .permission_checker
+                .permission_config()
+                .map(|config| config.default_session_permission_mode())
+                .unwrap_or_default(),
             &self.ctx.workspace_resolver,
         );
         self.set_session_id_for_key(key, &session.id).await;
@@ -1636,6 +1643,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_session_creation_stamps_the_permission_policy_default() {
+        let (ctx, _dir) = test_context().await;
+        ctx.permission_checker
+            .permission_config()
+            .expect("permission config")
+            .set_default_session_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let resolved = {
+            let config = ctx.config.read().await.clone();
+            resolve_connect_run_config(&config, &ctx.provider_registry)
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+
+        let session = bridge
+            .create_and_register_session("fake:chat:user", &resolved)
+            .await
+            .expect("Connect session should be created");
+
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .expect("runtime state")
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
     #[test]
     fn connect_publication_uses_the_validating_instance_workspace_root() {
         let instance_root = tempfile::tempdir().expect("instance workspace root");
@@ -1663,6 +1698,7 @@ mod tests {
             ),
             None,
             None,
+            bamboo_domain::SessionPermissionMode::Default,
             &resolver,
         );
 
