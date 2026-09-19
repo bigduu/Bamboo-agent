@@ -345,10 +345,14 @@ pub fn build_gold_messages(
         .as_ref()
         .map(|state| {
             format!(
-                "status={:?} | current_round={} | max_rounds={} | suspend_reason={} | waiting_for_children={}",
+                "status={:?} | current_round={} | round_cap={} | suspend_reason={} | waiting_for_children={}",
                 state.status,
                 state.round.current_round,
-                state.round.max_rounds,
+                state
+                    .round
+                    .max_rounds
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string()),
                 state
                     .suspension
                     .as_ref()

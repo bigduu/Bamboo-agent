@@ -26,7 +26,8 @@ use bamboo_agent_core::PromptSnapshot;
 pub(crate) struct RoundPreludeFrame<'a> {
     pub execution_id: &'a str,
     pub round: usize,
-    pub max_rounds: usize,
+    /// Round cap; `None` = unlimited. Logging surfaces it as `null`.
+    pub max_rounds: Option<usize>,
     pub debug_enabled: bool,
     pub cancel_token: &'a CancellationToken,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -173,11 +174,11 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
 pub(super) fn update_task_round_state(
     task_context: &mut Option<TaskLoopContext>,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
 ) {
     if let Some(ctx) = task_context.as_mut() {
         ctx.current_round = round as u32;
-        ctx.max_rounds = max_rounds as u32;
+        ctx.max_rounds = max_rounds.map(|value| value as u32);
     }
 }
 
@@ -210,7 +211,7 @@ pub(super) fn log_round_start(
     debug_enabled: bool,
     session_id: &str,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
     message_count: usize,
 ) {
     if debug_enabled {
@@ -219,7 +220,7 @@ pub(super) fn log_round_start(
             session_id,
             serde_json::json!({
                 "round": round + 1,
-                "total_rounds": max_rounds,
+                "round_cap": max_rounds,
                 "message_count": message_count,
             })
         );

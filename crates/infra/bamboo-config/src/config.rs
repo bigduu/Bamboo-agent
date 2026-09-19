@@ -557,7 +557,7 @@ fn default_true_memory_project_first_dream() -> bool {
 
 /// Per-run resource guardrails (issue #221): a cost/resource ceiling applied
 /// across an entire `AgentRuntime::execute()` call (i.e. one user turn's worth
-/// of internal rounds — the same "run" granularity `max_rounds` already uses).
+/// of internal rounds — the same "run" granularity the round cap uses).
 ///
 /// Every field is `None` by default (unlimited), matching the rest of this
 /// config's opt-in-only posture. A per-request `ExecuteRequest::run_budget`
@@ -567,10 +567,11 @@ fn default_true_memory_project_first_dream() -> bool {
 /// `bamboo_engine::runtime::runtime::AgentRuntime::execute`).
 ///
 /// Exceeding any configured limit gracefully stops the run (mirrors the
-/// `max_rounds` exhaustion path: one final summary turn, then a terminal stop
-/// with `runtime.completion_reason = "budget_exceeded"` on the session, plus a
-/// structured `AgentEvent::BudgetExceeded`) rather than erroring out — the run
-/// stays resumable.
+/// round-cap exhaustion path: one final summary turn, then a terminal stop
+/// with `runtime.completion_reason` = `"budget_exceeded"` for resource fields
+/// and `"max_rounds_reached"` for the round cap, plus a structured
+/// `AgentEvent::BudgetExceeded`) rather than erroring out — the run stays
+/// resumable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunBudgetConfig {
     /// Maximum total tokens (prompt + completion, actual provider-reported
@@ -588,6 +589,14 @@ pub struct RunBudgetConfig {
     /// spawn in total over its lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subagents: Option<u32>,
+    /// Maximum internal rounds for a single run before the run is gracefully
+    /// stopped. `None` (the default) means unlimited: the loop runs until the
+    /// model stops calling tools, another guardrail trips, or the run is
+    /// cancelled. Setting a cap keeps the issue #29 exhaustion contract
+    /// (`runtime.completion_reason = "max_rounds_reached"`, a visible
+    /// notification, and exactly one final summary turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
 }
 
 /// Tighten-only per-field merge: the effective limit is the MINIMUM of the
@@ -624,6 +633,7 @@ impl RunBudgetConfig {
             max_total_tokens: min_limit(self.max_total_tokens, over.max_total_tokens),
             max_tool_calls: min_limit(self.max_tool_calls, over.max_tool_calls),
             max_subagents: min_limit(self.max_subagents, over.max_subagents),
+            max_rounds: min_limit(self.max_rounds, over.max_rounds),
         }
     }
 }
@@ -6047,6 +6057,7 @@ mod tests {
             max_total_tokens: Some(100_000),
             max_tool_calls: Some(500),
             max_subagents: Some(10),
+            max_rounds: Some(200),
         };
 
         // No override at all: config default passes through unchanged.
@@ -6056,17 +6067,19 @@ mod tests {
             "no override falls back to the config default entirely"
         );
 
-        // Override TIGHTENS exactly one field; the other two keep the config
+        // Override TIGHTENS exactly one field; the others keep the config
         // default (per-field, not all-or-nothing).
         let tighten_one = RunBudgetConfig {
             max_total_tokens: Some(5_000),
             max_tool_calls: None,
             max_subagents: None,
+            max_rounds: None,
         };
         let merged = config_default.merged_with_override(Some(&tighten_one));
         assert_eq!(merged.max_total_tokens, Some(5_000));
         assert_eq!(merged.max_tool_calls, Some(500));
         assert_eq!(merged.max_subagents, Some(10));
+        assert_eq!(merged.max_rounds, Some(200));
 
         // A LOOSER override is clamped to the config default: a client can
         // never raise the operator's ceiling (PR #539 review, finding #3).
@@ -6074,6 +6087,7 @@ mod tests {
             max_total_tokens: Some(999_999_999),
             max_tool_calls: Some(10_000),
             max_subagents: Some(1_000),
+            max_rounds: Some(100_000),
         };
         assert_eq!(
             config_default.merged_with_override(Some(&loosen_attempt)),
@@ -6099,6 +6113,24 @@ mod tests {
         assert_eq!(merged.max_total_tokens, Some(5_000));
         assert_eq!(merged.max_tool_calls, None);
         assert_eq!(merged.max_subagents, None);
+        assert_eq!(merged.max_rounds, None);
+
+        // The round cap tightens the same way: a request can cap rounds below
+        // an unlimited config default but never raise a configured ceiling.
+        let tighten_rounds = RunBudgetConfig {
+            max_total_tokens: None,
+            max_tool_calls: None,
+            max_subagents: None,
+            max_rounds: Some(20),
+        };
+        let merged = unlimited_default.merged_with_override(Some(&tighten_rounds));
+        assert_eq!(merged.max_rounds, Some(20));
+        let merged = config_default.merged_with_override(Some(&tighten_rounds));
+        assert_eq!(
+            merged.max_rounds,
+            Some(20),
+            "a stricter per-request round cap wins over the config default"
+        );
     }
 
     #[test]
@@ -6106,6 +6138,7 @@ mod tests {
         assert_eq!(RunBudgetConfig::default().max_total_tokens, None);
         assert_eq!(RunBudgetConfig::default().max_tool_calls, None);
         assert_eq!(RunBudgetConfig::default().max_subagents, None);
+        assert_eq!(RunBudgetConfig::default().max_rounds, None);
 
         let json = r#"{ "max_total_tokens": 250000, "max_subagents": 3 }"#;
         let cfg: RunBudgetConfig = serde_json::from_str(json).expect("deserializes");
@@ -6114,10 +6147,24 @@ mod tests {
             cfg.max_tool_calls, None,
             "absent field defaults to unlimited"
         );
+        assert_eq!(
+            cfg.max_rounds, None,
+            "absent round cap defaults to unlimited"
+        );
+
         assert_eq!(cfg.max_subagents, Some(3));
 
+        // The round cap round-trips like the other fields.
+        let json = r#"{ "max_rounds": 250 }"#;
+        let cfg: RunBudgetConfig = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(cfg.max_rounds, Some(250));
+        let round_tripped: RunBudgetConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(round_tripped.max_rounds, Some(250));
+        assert_eq!(round_tripped.max_total_tokens, None);
+
         // Absent fields are omitted on serialize (skip_serializing_if), so an
-        // all-default config round-trips to `{}` rather than three explicit
+        // all-default config round-trips to `{}` rather than four explicit
         // nulls.
         let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
         assert_eq!(empty, "{}");
