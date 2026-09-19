@@ -20,7 +20,7 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
-use bamboo_agent_core::agent::events::TokenBudgetUsage;
+use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
@@ -1331,6 +1331,23 @@ pub(super) async fn execute_llm_stream(
         ));
     }
 
+    // Carry the last completed provider result through prompt preparation. A
+    // newly prepared budget is not evidence of a real zero-cache provider
+    // response, so consumers must not flash it as Cache 0%.
+    let previous_cache_read_input_tokens = session
+        .token_usage
+        .as_ref()
+        .map(|usage| usage.cache_read_input_tokens)
+        .unwrap_or(0);
+    let previous_provider_prompt_usage = session
+        .token_usage
+        .as_ref()
+        .and_then(|usage| usage.provider_prompt_usage)
+        .map(|mut usage| {
+            usage.retained_from_previous_call = true;
+            usage
+        });
+
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
     let usage = TokenBudgetUsage {
@@ -1345,7 +1362,8 @@ pub(super) async fn execute_llm_stream(
         prompt_cached_tool_outputs: prepared_context.prompt_cached_tool_outputs,
         prompt_cached_tool_tokens_saved: prepared_context.prompt_cached_tool_tokens_saved,
         thinking_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: previous_cache_read_input_tokens,
+        provider_prompt_usage: previous_provider_prompt_usage,
     };
 
     session.token_usage = Some(usage.clone());
@@ -1407,6 +1425,14 @@ pub(super) async fn execute_llm_stream(
     if let Some(ref mut usage) = session.token_usage {
         usage.thinking_tokens = stream_output.thinking_tokens as u32;
         usage.cache_read_input_tokens = stream_output.cache_read_input_tokens as u32;
+        let provider_prompt_usage = ProviderPromptUsage {
+            input_tokens: stream_output.input_tokens,
+            cache_creation_input_tokens: stream_output.cache_creation_input_tokens,
+            cache_read_input_tokens: stream_output.cache_read_input_tokens,
+            retained_from_previous_call: false,
+        };
+        usage.provider_prompt_usage =
+            (provider_prompt_usage.total_input_tokens() > 0).then_some(provider_prompt_usage);
     }
 
     if let Some(usage) = session.token_usage.clone() {

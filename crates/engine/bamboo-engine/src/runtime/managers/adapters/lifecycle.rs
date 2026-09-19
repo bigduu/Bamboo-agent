@@ -37,7 +37,7 @@ impl LifecycleManager for DefaultLifecycleManager {
         state.llm.provider_name = config.provider_name.clone();
         state.llm.fast_model_name = config.fast_model_name.clone();
         state.llm.background_model_name = config.background_model_name.clone();
-        state.round.max_rounds = config.max_rounds as u32;
+        state.round.max_rounds = config.run_budget.max_rounds;
         state.status = AgentStatusState::Initializing;
         state
     }
@@ -49,7 +49,8 @@ impl LifecycleManager for DefaultLifecycleManager {
         task_context: &mut Option<TaskLoopContext>,
         runtime_state: &mut AgentRuntimeState,
         round: usize,
-        max_rounds: usize,
+        // Round cap; `None` = unlimited.
+        max_rounds: Option<usize>,
         config: &AgentLoopConfig,
         cancel_token: &CancellationToken,
         metrics_collector: Option<&MetricsCollector>,
@@ -92,11 +93,15 @@ impl LifecycleManager for DefaultLifecycleManager {
 
         if should_break {
             runtime_state.status = AgentStatusState::Finalizing;
-        } else if round as u32 >= runtime_state.round.max_rounds {
+        } else if runtime_state
+            .round
+            .max_rounds
+            .is_some_and(|max_rounds| round as u32 >= max_rounds)
+        {
             tracing::info!(
                 "[{}] Reached max rounds ({})",
                 session.id,
-                runtime_state.round.max_rounds
+                runtime_state.round.max_rounds.unwrap_or_default()
             );
             return Ok(true);
         }
@@ -239,7 +244,7 @@ mod tests {
                 &mut task_context,
                 &mut runtime_state,
                 0,
-                1,
+                Some(1),
                 &config,
                 &cancel,
                 None,
@@ -326,7 +331,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 1,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let provider: Arc<dyn LLMProvider> = Arc::new(UnusedProvider);
@@ -342,7 +350,7 @@ mod tests {
                 &mut task_context,
                 &mut runtime_state,
                 0,
-                1,
+                Some(1),
                 &config,
                 &cancel,
                 None,

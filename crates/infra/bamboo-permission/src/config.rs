@@ -786,6 +786,12 @@ pub struct PermissionConfig {
     /// reused within one session.
     pending_requests: DashMap<(String, String), PermissionRequest>,
     decision_receipts: DashMap<(String, String, String), PermissionDecisionReceipt>,
+    /// Durable, session-scoped default permission mode seeded onto NEW
+    /// sessions. Runtime-only (never serialized by `to_serializable`; the
+    /// durable value lives in `SerializablePermissionConfig` and is published
+    /// through the permission section snapshot).
+    default_session_permission_mode: RwLock<bamboo_domain::SessionPermissionMode>,
+
     /// Stable workspace identity registered by the execution boundary. This is
     /// non-durable runtime context, keyed by session to prevent workspace rules
     /// from leaking across sessions when tool arguments omit `cwd`.
@@ -819,6 +825,9 @@ impl PermissionConfig {
             policy_revision: AtomicU64::new(0),
             pending_requests: DashMap::new(),
             decision_receipts: DashMap::new(),
+            default_session_permission_mode: RwLock::new(
+                bamboo_domain::SessionPermissionMode::Default,
+            ),
             session_workspaces: DashMap::new(),
         }
     }
@@ -843,6 +852,9 @@ impl PermissionConfig {
             policy_revision: AtomicU64::new(0),
             pending_requests: DashMap::new(),
             decision_receipts: DashMap::new(),
+            default_session_permission_mode: RwLock::new(
+                bamboo_domain::SessionPermissionMode::Default,
+            ),
             session_workspaces: DashMap::new(),
         }
     }
@@ -865,6 +877,24 @@ impl PermissionConfig {
     /// Set the permission mode
     pub fn set_mode(&self, mode: PermissionMode) {
         *self.mode.write().recover_poison() = mode;
+    }
+
+    /// Get the default session-scoped permission mode stamped onto new sessions.
+    ///
+    /// This is the durable initial-value seed published from the permission
+    /// section (`permissions.json`); it never overrides an existing session's
+    /// stored mode and remains bounded by the process-wide `mode` and any
+    /// read-only/plan gates at execution time.
+    pub fn default_session_permission_mode(&self) -> bamboo_domain::SessionPermissionMode {
+        *self.default_session_permission_mode.read().recover_poison()
+    }
+
+    /// Set the default session-scoped permission mode for new sessions.
+    pub fn set_default_session_permission_mode(&self, mode: bamboo_domain::SessionPermissionMode) {
+        *self
+            .default_session_permission_mode
+            .write()
+            .recover_poison() = mode;
     }
 
     /// Get the minimum risk level that requires confirmation.
@@ -1092,6 +1122,11 @@ impl PermissionConfig {
         self.set_confirm_threshold(candidate.confirm_threshold.unwrap_or(RiskLevel::Low));
         self.set_ask_rules(candidate.ask_rules.clone());
         self.replace_durable_rules(candidate.durable_rules.clone());
+        self.set_default_session_permission_mode(
+            candidate
+                .default_session_permission_mode
+                .unwrap_or_default(),
+        );
         self.set_policy_revision(revision);
     }
 
@@ -2040,6 +2075,7 @@ impl PermissionConfig {
             confirm_threshold: Some(self.confirm_threshold()),
             ask_rules: self.ask_rule_patterns(),
             durable_rules: self.durable_rules(),
+            default_session_permission_mode: Some(self.default_session_permission_mode()),
         }
     }
 
@@ -2053,6 +2089,8 @@ impl PermissionConfig {
 
         let mode = config.mode.unwrap_or_default();
         let confirm_threshold = config.confirm_threshold.unwrap_or(RiskLevel::Low);
+        let default_session_permission_mode =
+            config.default_session_permission_mode.unwrap_or_default();
         let ask_rules = config
             .ask_rules
             .iter()
@@ -2081,6 +2119,7 @@ impl PermissionConfig {
             policy_revision: AtomicU64::new(0),
             pending_requests: DashMap::new(),
             decision_receipts: DashMap::new(),
+            default_session_permission_mode: RwLock::new(default_session_permission_mode),
             session_workspaces: DashMap::new(),
         }
     }
@@ -2120,6 +2159,16 @@ impl PermissionConfig {
 
         // Enabled flag from other takes precedence
         merged.set_enabled(other.is_enabled());
+
+        // New-session seed: only an EXPLICIT non-default value in the higher
+        // priority source overrides; otherwise keep the lower priority value so
+        // a project config with an unset field cannot erase the user default.
+        if other.default_session_permission_mode() != bamboo_domain::SessionPermissionMode::Default
+        {
+            merged.set_default_session_permission_mode(other.default_session_permission_mode());
+        } else {
+            merged.set_default_session_permission_mode(self.default_session_permission_mode());
+        }
 
         // "Always ask" rules: union of both, other's appended after self's.
         let mut ask_rules = self.ask_rules.read().recover_poison().clone();
@@ -2233,6 +2282,12 @@ pub struct SerializablePermissionConfig {
     /// and are evaluated without broadening during the migration window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub durable_rules: Vec<DurablePermissionRule>,
+    /// Default session-scoped permission mode stamped onto NEW sessions at
+    /// creation time (`default` | `bypass` | `auto`). Purely an initial-value
+    /// seed: it never reinterprets an existing session's stored mode, and the
+    /// process-wide `mode`/read-only gates still bound it at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_session_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
 /// Conservative external-runner preflight for explicit Bamboo deny policy.
@@ -2270,6 +2325,7 @@ impl Default for SerializablePermissionConfig {
             confirm_threshold: None,
             ask_rules: Vec::new(),
             durable_rules: Vec::new(),
+            default_session_permission_mode: None,
         }
     }
 }

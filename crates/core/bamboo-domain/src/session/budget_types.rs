@@ -294,6 +294,39 @@ impl TokenUsageBreakdown {
     }
 }
 
+/// Provider-reported prompt usage for one completed LLM call.
+///
+/// `input_tokens` is the normalized fresh (non-cached) input. Together with
+/// cache reads and cache creation it forms the disjoint prompt total used for
+/// an exact prefix-cache hit rate.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderPromptUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// True when a prompt-preparation/compression snapshot is carrying the
+    /// previous completed call forward while the next provider result is not
+    /// available yet.
+    #[serde(default)]
+    pub retained_from_previous_call: bool,
+}
+
+impl ProviderPromptUsage {
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let total = self.total_input_tokens();
+        (total > 0).then(|| self.cache_read_input_tokens as f64 / total as f64)
+    }
+}
+
 /// Token budget usage information sent to frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBudgetUsage {
@@ -314,6 +347,11 @@ pub struct TokenBudgetUsage {
     pub thinking_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// Exact provider-side prompt/cache split for the latest completed call.
+    /// `None` means this snapshot was prepared before the provider completed,
+    /// or the provider did not report usable prompt usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_prompt_usage: Option<ProviderPromptUsage>,
 }
 
 #[cfg(test)]

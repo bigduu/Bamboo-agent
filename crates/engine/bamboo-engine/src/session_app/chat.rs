@@ -170,6 +170,15 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
             session.set_project_id_meta(project_id.to_string());
         }
         session.reasoning_effort = input.reasoning_effort;
+        // Stamp the resolved initial permission mode exactly once at session
+        // creation. The typed mode and legacy boolean mirror stay consistent
+        // via `set_permission_mode`; later changes go through PATCH.
+        if let Some(mode) = input.permission_mode {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .set_permission_mode(mode);
+        }
     }
 
     // ---- Resolve base prompt ----
@@ -917,6 +926,7 @@ mod tests {
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
             workspace_path: None,
+            permission_mode: None,
             default_workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,

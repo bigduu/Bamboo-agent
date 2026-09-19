@@ -71,7 +71,7 @@ mod tests {
             }],
             active_item_id: Some("deploy".to_string()),
             current_round: 3,
-            max_rounds: 20,
+            max_rounds: Some(20),
             created_at: now,
             updated_at: now,
             version: 8,

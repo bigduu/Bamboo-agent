@@ -32,9 +32,15 @@ Review the task list and execution history, then decide if any tasks should be m
 
     messages.push(Message::system(system_prompt));
 
+    // Mirror the prompt-side header: with no configured round cap the run is
+    // unlimited, so show the current round without a denominator.
+    let round_header = match ctx.max_rounds {
+        Some(max_rounds) => format!("(Round {}/{})", ctx.current_round + 1, max_rounds),
+        None => format!("(Round {})", ctx.current_round + 1),
+    };
     let task_context = format!(
         r#"
-## Current Task List (Round {}/{})
+## Current Task List {round_header}
 
 {}
 
@@ -49,8 +55,6 @@ Review each "in_progress" task above. For each task:
 
 Remember: You are NOT executing the task. You are only evaluating if existing work has completed it.
 "#,
-        ctx.current_round + 1,
-        ctx.max_rounds,
         ctx.format_for_prompt(),
         format_recent_tools(ctx, 5),
     );

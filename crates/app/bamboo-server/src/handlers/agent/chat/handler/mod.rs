@@ -889,6 +889,16 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     }
     let workspace_was_explicit = req.workspace_path.is_some();
     let requested_workflow_selection = req.workflow_selection.clone();
+    // An explicit request value wins; otherwise stamp the durable
+    // permission-policy seed for a NEW session. The engine applies this only
+    // on the startup branch, so existing sessions stay authoritative.
+    let chat_permission_mode = Some(req.permission_mode.unwrap_or_else(|| {
+        state
+            .permission_checker
+            .permission_config()
+            .map(|config| config.default_session_permission_mode())
+            .unwrap_or_default()
+    }));
     let mut input = bamboo_engine::session_app::types::ChatTurnInput {
         session_id: session_id.clone(),
         project_id: effective_project_id,
@@ -896,6 +906,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         model_ref: req.model_ref.clone(),
         provider: req.provider.clone(),
         reasoning_effort: req.reasoning_effort,
+        permission_mode: chat_permission_mode,
         message: req.message.clone(),
         system_prompt: request::optional_non_empty(req.system_prompt.as_deref()).map(String::from),
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())

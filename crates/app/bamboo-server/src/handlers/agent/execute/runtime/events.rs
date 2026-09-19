@@ -776,6 +776,13 @@ mod tests {
             })
             .await
             .unwrap();
+        // The post-persistence history barrier follows the low-latency terminal.
+        mpsc_tx
+            .send(AgentEvent::SessionHistoryCommitted {
+                session_id: session_id.into(),
+            })
+            .await
+            .unwrap();
         mpsc_tx
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
@@ -799,7 +806,7 @@ mod tests {
 
         let journaled =
             bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
-        assert_eq!(journaled.len(), 4, "ephemeral Token must be excluded");
+        assert_eq!(journaled.len(), 5, "ephemeral Token must be excluded");
         assert!(matches!(
             journaled[0].event,
             AgentEvent::ExecutionStarted { .. }
@@ -811,9 +818,14 @@ mod tests {
         assert!(matches!(journaled[2].event, AgentEvent::Complete { .. }));
         // The terminal event routed to the right session via caller context.
         assert_eq!(journaled[2].session_id.as_deref(), Some(session_id));
-        assert_eq!(journaled[3].session_id.as_deref(), Some("parent-session"));
         assert!(matches!(
             journaled[3].event,
+            AgentEvent::SessionHistoryCommitted { .. }
+        ));
+        assert_eq!(journaled[3].session_id.as_deref(), Some(session_id));
+        assert_eq!(journaled[4].session_id.as_deref(), Some("parent-session"));
+        assert!(matches!(
+            journaled[4].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
         // Sequence numbers are monotonic and 1-based.
@@ -821,6 +833,7 @@ mod tests {
         assert_eq!(journaled[1].seq, 2);
         assert_eq!(journaled[2].seq, 3);
         assert_eq!(journaled[3].seq, 4);
+        assert_eq!(journaled[4].seq, 5);
     }
 
     #[tokio::test]

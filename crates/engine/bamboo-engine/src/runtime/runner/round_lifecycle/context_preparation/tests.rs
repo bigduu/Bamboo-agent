@@ -930,6 +930,7 @@ fn bounded_compression_session(id: &str) -> Session {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
     session.force_manual_compression = Some("Preserve concrete evidence".to_string());
     session
@@ -1160,6 +1161,7 @@ async fn same_size_chat_and_summary_windows_still_split_near_critical_pressure()
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
     let (summary_llm, captured) =
         bounded_compression_llm_with_limits(BoundedFailureMode::None, 24_000, 6_000);
@@ -1359,6 +1361,7 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_every_summary_
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -1425,6 +1428,7 @@ async fn host_context_compression_skips_when_no_background_model_is_configured()
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -2240,6 +2244,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -2326,6 +2331,7 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -2495,6 +2501,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -2605,6 +2612,7 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
     assert!(session.messages.iter().all(|message| {
         !message.content.contains("WORKFLOW_PRIVATE_INSTRUCTION_872")
@@ -4608,6 +4616,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -4688,6 +4697,7 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -4769,6 +4779,7 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let mut config = AgentLoopConfig {
@@ -4957,6 +4968,7 @@ async fn multi_round_compression_cycle() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let exposure1 = estimate_context_compression_exposure(
@@ -5036,6 +5048,7 @@ async fn multi_round_compression_cycle() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     // ---- Compress round 2 (anchor_index == 0 or small) ----
@@ -5482,6 +5495,7 @@ async fn pre_summarization_degradation_skips_llm_for_auto_triggered_compression(
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -5567,6 +5581,7 @@ async fn tokens_saved_is_computed_from_compressed_messages() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     let config = AgentLoopConfig {
@@ -5623,6 +5638,7 @@ fn pressure_usage(total_tokens: u32, max_context_tokens: u32) -> TokenBudgetUsag
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     }
 }
 

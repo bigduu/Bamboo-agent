@@ -12,7 +12,9 @@ use super::execute_llm_stream;
 use super::LlmStreamFrame;
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolSchema};
-use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{
+    AgentError, AgentEvent, Message, ProviderPromptUsage, Role, Session, TokenBudgetUsage,
+};
 use bamboo_compression::{BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};
 use bamboo_llm::{
     Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
@@ -1401,6 +1403,26 @@ fn late_bound_marker_is_explicit_but_not_claimed_as_known_input() {
 async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-final-budget", "test-model");
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 10,
+        summary_tokens: 0,
+        window_tokens: 90,
+        total_tokens: 100,
+        max_context_tokens: 400_000,
+        budget_limit: 399_872,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 80,
+        provider_prompt_usage: Some(ProviderPromptUsage {
+            input_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 80,
+            retained_from_previous_call: false,
+        }),
+    });
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
     let config = test_config("system");
 
@@ -1468,7 +1490,16 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     {
         AgentEvent::TokenBudgetUpdated { usage } => {
             assert_eq!(usage.thinking_tokens, 0);
-            assert_eq!(usage.cache_read_input_tokens, 0);
+            assert_eq!(usage.cache_read_input_tokens, 80);
+            assert_eq!(
+                usage.provider_prompt_usage,
+                Some(ProviderPromptUsage {
+                    input_tokens: 20,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 80,
+                    retained_from_previous_call: true,
+                })
+            );
         }
         other => panic!("unexpected first event: {other:?}"),
     }
@@ -1477,6 +1508,14 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
         AgentEvent::TokenBudgetUpdated { usage } => {
             assert_eq!(usage.thinking_tokens, 24);
             assert_eq!(usage.cache_read_input_tokens, 34);
+            let provider_prompt = usage
+                .provider_prompt_usage
+                .expect("completed provider prompt usage");
+            assert_eq!(provider_prompt.input_tokens, 66);
+            assert_eq!(provider_prompt.cache_creation_input_tokens, 0);
+            assert_eq!(provider_prompt.cache_read_input_tokens, 34);
+            assert_eq!(provider_prompt.total_input_tokens(), 100);
+            assert_eq!(provider_prompt.cache_hit_rate(), Some(0.34));
         }
         other => panic!("unexpected second event: {other:?}"),
     }
@@ -1492,11 +1531,21 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
         Some(100)
     );
     assert_eq!(
-        session
-            .token_usage
-            .as_ref()
-            .map(|usage| (usage.thinking_tokens, usage.cache_read_input_tokens)),
-        Some((24, 34))
+        session.token_usage.as_ref().map(|usage| (
+            usage.thinking_tokens,
+            usage.cache_read_input_tokens,
+            usage.provider_prompt_usage,
+        )),
+        Some((
+            24,
+            34,
+            Some(bamboo_agent_core::ProviderPromptUsage {
+                input_tokens: 66,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 34,
+                retained_from_previous_call: false,
+            }),
+        ))
     );
 }
 

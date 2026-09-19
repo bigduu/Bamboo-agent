@@ -53,6 +53,13 @@ pub struct ChatRequest {
     /// the CAS-guarded session PATCH endpoint.
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional initial session-scoped permission mode for a newly-created
+    /// chat (`default` | `bypass` | `auto`). Existing sessions are never
+    /// reassigned through chat; later changes go through the CAS-guarded
+    /// session PATCH endpoint. When omitted on a new session, the durable
+    /// permission-policy default is stamped instead.
+    #[serde(default)]
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -179,6 +186,7 @@ mod tests {
             provider: None,
             model_ref: None,
             reasoning_effort: Some(ReasoningEffort::High),
+            permission_mode: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("ChatRequest"));
