@@ -31,8 +31,8 @@ pub struct CreateProjectRequest {
     pub workspace_bindings: Vec<WorkspaceBinding>,
 }
 
-/// Explicitly-present nullable description: absent leaves it unchanged, null clears it.
-fn deserialize_nullable_description<'de, D>(
+/// Explicitly-present nullable string: absent leaves it unchanged, null clears it.
+fn deserialize_nullable_string<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<String>>, D::Error>
 where
@@ -45,8 +45,12 @@ where
 pub struct PatchProjectRequest {
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_nullable_description")]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub description: Option<Option<String>>,
+    /// Optional user-defined sidebar grouping. `null` removes the Project from
+    /// its Section while an absent field leaves the current value unchanged.
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub section: Option<Option<String>>,
     /// Select a new authoritative Project folder using the same Project CAS
     /// revision as name/description updates.
     #[serde(default)]
@@ -352,6 +356,9 @@ pub async fn patch_project(
         }
         if let Some(description) = request.description.as_ref() {
             project.description = description.clone();
+        }
+        if let Some(section) = request.section.as_ref() {
+            project.section = section.as_ref().map(|value| value.trim().to_string());
         }
         Ok(())
     };
@@ -716,7 +723,10 @@ mod tests {
             test::TestRequest::patch()
                 .uri(&format!("/projects/{}", created.id))
                 .insert_header((header::IF_MATCH, "\"1\""))
-                .set_json(serde_json::json!({"name":"Renamed"}))
+                .set_json(serde_json::json!({
+                    "name": "Renamed",
+                    "section": "Development"
+                }))
                 .to_request(),
         )
         .await;
@@ -725,6 +735,7 @@ mod tests {
         let renamed: ProjectManifest = test::read_body_json(patched).await;
         assert_eq!(renamed.id, created.id);
         assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.section.as_deref(), Some("Development"));
         assert_eq!(state.project_store.paths().project_home(&renamed.id), home);
         let updated_event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
             .await
@@ -799,6 +810,7 @@ mod tests {
         let listed: Value = test::read_body_json(listed).await;
         assert_eq!(listed["projects"][0]["id"], renamed.id.to_string());
         assert_eq!(listed["projects"][0]["project_path_status"], "configured");
+        assert_eq!(listed["projects"][0]["section"], "Development");
 
         // Resource API returns only counts/revisions; file contents and secret
         // values never cross the contract.
@@ -873,6 +885,77 @@ mod tests {
         .await;
         assert_eq!(dry_run.status(), StatusCode::OK);
         drop(dir);
+    }
+
+    #[actix_web::test]
+    async fn project_section_patch_is_nullable_trimmed_and_revisioned() {
+        let (dir, state) = app_state().await;
+        let project_path = dir.path().join("sectioned-project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Sectioned",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let app = test::init_service(project_app!(state.clone())).await;
+
+        let sectioned = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", project.id))
+                .insert_header((header::IF_MATCH, "\"1\""))
+                .set_json(serde_json::json!({"section": "  Development  "}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(sectioned.status(), StatusCode::OK);
+        let sectioned: ProjectManifest = test::read_body_json(sectioned).await;
+        assert_eq!(sectioned.section.as_deref(), Some("Development"));
+        assert_eq!(sectioned.revision, 2);
+
+        let renamed = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", project.id))
+                .insert_header((header::IF_MATCH, "\"2\""))
+                .set_json(serde_json::json!({"name": "Still sectioned"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed: ProjectManifest = test::read_body_json(renamed).await;
+        assert_eq!(renamed.section.as_deref(), Some("Development"));
+        assert_eq!(renamed.revision, 3);
+
+        let cleared = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", project.id))
+                .insert_header((header::IF_MATCH, "\"3\""))
+                .set_json(serde_json::json!({"section": null}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared: ProjectManifest = test::read_body_json(cleared).await;
+        assert!(cleared.section.is_none());
+        assert_eq!(cleared.revision, 4);
+
+        let invalid = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", project.id))
+                .insert_header((header::IF_MATCH, "\"4\""))
+                .set_json(serde_json::json!({"section": "line\nbreak"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::CONFLICT);
+        assert_eq!(state.project_store.get(&project.id).unwrap().revision, 4);
     }
 
     #[actix_web::test]
