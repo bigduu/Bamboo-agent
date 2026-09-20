@@ -577,12 +577,19 @@ fn build_retrieval_window_extraction_batches(
             }
             let created_after_watermark =
                 extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
+            let linked_to_new_retrieval_event = message
+                .compressed_by_event_id
+                .as_deref()
+                .is_some_and(|event_id| eligible_event_ids.contains(event_id));
             // A legacy ordinary-outline watermark never proved coverage of the
             // full transcript. The first retrieval transition therefore reads
-            // every canonical non-system content item once. Afterwards,
-            // creation time is authoritative: active messages are extracted
-            // before a later archive event can move them out of the window.
-            if retrieval_source_acknowledged && !created_after_watermark {
+            // every canonical non-system content item once. Afterwards, select
+            // both messages created after the watermark and older messages
+            // newly archived by a later retrieval event.
+            if retrieval_source_acknowledged
+                && !created_after_watermark
+                && !linked_to_new_retrieval_event
+            {
                 return None;
             }
             let (role, content) = match message.role {
@@ -3437,6 +3444,12 @@ mod tests {
             .push(retrieval_event("event-old", test_time(10)));
         for (id, content, created_at, event_id) in [
             ("old-archived", "OLD_ARCHIVED", 2, Some("event-old")),
+            (
+                "old-message-new-event",
+                "ARCHIVED_BY_NEW_EVENT",
+                3,
+                Some("event-new"),
+            ),
             ("old-active", "OLD_ACTIVE", 19, None),
             ("equal-active", "EQUAL_ACTIVE", 20, None),
             ("new-archived", "NEW_ARCHIVED", 21, Some("event-new")),
@@ -3454,6 +3467,7 @@ mod tests {
             build_retrieval_window_extraction_batches(&session, Some(test_time(20)), true);
         assert_eq!(batches.len(), 1);
         let delta = &batches[0];
+        assert!(delta.contains("ARCHIVED_BY_NEW_EVENT"));
         assert!(delta.contains("NEW_ARCHIVED"));
         assert!(delta.contains("NEW_ACTIVE"));
         assert!(!delta.contains("OLD_ARCHIVED"));
@@ -4411,6 +4425,7 @@ mod tests {
             transaction_id: "b".repeat(64),
             batch_index: 0,
             batch_count: 1,
+            topics_fingerprint: None,
             extracted: ExtractedCandidateBatch {
                 memory: vec![DurableExtractionCandidate {
                     title: "Credential".to_string(),
