@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// These values are surfaced to clients and can be mapped to provider-specific
 /// request parameters where supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,

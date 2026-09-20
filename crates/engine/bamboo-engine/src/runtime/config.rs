@@ -408,7 +408,7 @@ pub struct AgentLoopConfig {
     pub(crate) auxiliary_evaluation_max_concurrency: usize,
     /// Fast/cheap model for memory/background tasks.
     ///
-    /// This must not silently fall back to the main interaction model.
+    /// Resolution follows the shared dedicated → fast → chat fallback chain.
     pub(crate) background_model_name: Option<String>,
 
     /// Model for planning/coordination tasks (task decomposition, architecture).

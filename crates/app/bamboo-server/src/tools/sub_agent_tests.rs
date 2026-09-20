@@ -1428,10 +1428,10 @@ async fn create_uses_async_subagent_model_resolver() {
     let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
         Box::pin(async move {
             assert_eq!(subagent_type, "coder");
-            Some(bamboo_domain::ProviderModelRef::new(
-                "openai",
-                "gpt-resolved-coder",
-            ))
+            Some(
+                bamboo_domain::ProviderModelRef::new("openai", "gpt-resolved-coder")
+                    .with_reasoning_effort(bamboo_domain::ReasoningEffort::Low),
+            )
         })
     });
     let harness = build_test_harness_with_resolver(Some(resolver)).await;
@@ -1469,6 +1469,7 @@ async fn create_uses_async_subagent_model_resolver() {
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
     assert_eq!(payload["model"], "gpt-resolved-coder");
+    assert_eq!(payload["reasoning_effort"], "low");
 
     let child_id = payload["child_session_id"]
         .as_str()
@@ -1482,10 +1483,14 @@ async fn create_uses_async_subagent_model_resolver() {
     assert_eq!(child.model, "gpt-resolved-coder");
     assert_eq!(
         child.model_ref,
-        Some(bamboo_domain::ProviderModelRef::new(
-            "openai",
-            "gpt-resolved-coder",
-        ))
+        Some(
+            bamboo_domain::ProviderModelRef::new("openai", "gpt-resolved-coder")
+                .with_reasoning_effort(bamboo_domain::ReasoningEffort::Low),
+        )
+    );
+    assert_eq!(
+        child.reasoning_effort,
+        Some(bamboo_domain::ReasoningEffort::Low)
     );
     assert_eq!(
         child.metadata.get("provider_name").map(String::as_str),

@@ -2387,15 +2387,15 @@ pub struct DefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_background: Option<bamboo_domain::ProviderModelRef>,
     /// Model for planning/coordination tasks (task decomposition, architecture).
-    /// Falls back to `chat` when unset.
+    /// Falls back to `fast`, then `chat`, when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planning: Option<bamboo_domain::ProviderModelRef>,
     /// Model for search/navigation tasks (grep, file listing, symbol resolution).
-    /// Falls back to `fast` when unset.
+    /// Falls back to `fast`, then `chat`, when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<bamboo_domain::ProviderModelRef>,
     /// Model for code review tasks.
-    /// Falls back to `chat` when unset.
+    /// Falls back to `fast`, then `chat`, when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<bamboo_domain::ProviderModelRef>,
     /// Default model for child SubAgent runs.
@@ -2408,7 +2408,7 @@ pub struct DefaultsConfig {
     pub sub_agent: Option<bamboo_domain::ProviderModelRef>,
     /// Per-subagent-type model overrides.
     /// Key = subagent_type (e.g. "researcher", "coder"), Value = ProviderModelRef.
-    /// Falls back to `chat` when no match is found for a given type.
+    /// Falls back to `sub_agent`, then `fast`, then `chat` when no match is found.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub subagent_models: HashMap<String, bamboo_domain::ProviderModelRef>,
 }
@@ -4319,7 +4319,7 @@ impl Config {
     ///
     /// When `features.provider_model_ref` is enabled, reads from
     /// `defaults.task_summary` before falling back through
-    /// `defaults.memory_background` → `defaults.fast` → `defaults.chat`.
+    /// `defaults.fast` → `defaults.chat`.
     ///
     /// This is used for conversation/task summarization and context compression.
     pub fn get_task_summary_model(&self) -> Option<String> {
@@ -4328,11 +4328,6 @@ impl Config {
                 .defaults
                 .as_ref()
                 .and_then(|d| d.task_summary.as_ref())
-                .or_else(|| {
-                    self.defaults
-                        .as_ref()
-                        .and_then(|d| d.memory_background.as_ref())
-                })
                 .or_else(|| self.defaults.as_ref().and_then(|d| d.fast.as_ref()))
                 .or_else(|| self.defaults.as_ref().map(|d| &d.chat))
             {
@@ -4340,21 +4335,16 @@ impl Config {
             }
         }
 
-        self.get_memory_background_model()
-            .or_else(|| self.get_model())
+        self.get_fast_model()
     }
 
     /// Get the configured memory/background summarization model.
     ///
     /// When `features.provider_model_ref` is enabled, reads from
-    /// `defaults.memory_background` before falling back to legacy config.
+    /// `defaults.memory_background` before falling back through
+    /// `defaults.fast` → `defaults.chat`.
     ///
-    /// Falls back to the provider fast model when no background model is
-    /// configured or resolves to an empty string.
-    ///
-    /// IMPORTANT: this intentionally does **not** fall back to the main
-    /// interaction model. Memory compaction / reflection should be skipped or
-    /// fail loudly when no background/fast model is configured.
+    /// Legacy configuration follows the same dedicated → fast → chat order.
     pub fn get_memory_background_model(&self) -> Option<String> {
         if self.features.provider_model_ref {
             if let Some(model_ref) = self
@@ -4367,6 +4357,9 @@ impl Config {
             if let Some(model_ref) = self.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
                 return Some(model_ref.model.clone());
             }
+            if let Some(model_ref) = self.defaults.as_ref().map(|d| &d.chat) {
+                return Some(model_ref.model.clone());
+            }
         }
         let configured = self
             .memory
@@ -4375,35 +4368,7 @@ impl Config {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        configured.or_else(|| {
-            let provider = self.effective_default_provider();
-            if let Some(instance) = self.provider_instances.get(provider) {
-                return instance.fast_model.clone();
-            }
-            match provider {
-                "openai" => self
-                    .providers
-                    .openai
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                "anthropic" => self
-                    .providers
-                    .anthropic
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                "gemini" => self
-                    .providers
-                    .gemini
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                "copilot" => self
-                    .providers
-                    .copilot
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                _ => None,
-            }
-        })
+        configured.or_else(|| self.get_fast_model())
     }
 
     /// Resolve the configured default work area path when present.
@@ -4444,8 +4409,24 @@ impl Config {
     /// Get the vision-capable model for the currently active provider.
     ///
     /// Used for image understanding tasks.
-    /// Falls back to `get_model()` when no vision_model is configured.
+    /// Falls back to the fast model, then the chat model, when no vision model
+    /// is configured.
     pub fn get_vision_model(&self) -> Option<String> {
+        if self.features.provider_model_ref {
+            if let Some(model_ref) = self
+                .defaults
+                .as_ref()
+                .and_then(|defaults| defaults.vision.as_ref())
+                .or_else(|| {
+                    self.defaults
+                        .as_ref()
+                        .and_then(|defaults| defaults.fast.as_ref())
+                })
+                .or_else(|| self.defaults.as_ref().map(|defaults| &defaults.chat))
+            {
+                return Some(model_ref.model.clone());
+            }
+        }
         let provider = self.effective_default_provider();
         let vision = if let Some(instance) = self.provider_instances.get(provider) {
             instance.vision_model.clone()
@@ -4474,11 +4455,20 @@ impl Config {
                 _ => None,
             }
         };
-        vision.or_else(|| self.get_model())
+        vision.or_else(|| self.get_fast_model())
     }
 
-    /// Get the default reasoning effort for the currently active provider.
+    /// Get the default reasoning effort for the chat role.
+    ///
+    /// A role-specific preference wins over the provider-instance default.
     pub fn get_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        if self.features.provider_model_ref {
+            if let Some(chat) = self.defaults.as_ref().map(|defaults| &defaults.chat) {
+                return chat
+                    .reasoning_effort
+                    .or_else(|| self.reasoning_effort_for_key(&chat.provider));
+            }
+        }
         self.reasoning_effort_for_key(self.effective_default_provider())
     }
 
@@ -8464,6 +8454,42 @@ mod tests {
     }
 
     #[test]
+    fn chat_role_reasoning_uses_its_provider_before_the_compatibility_default() {
+        let mut config = Config::default();
+        config.features.provider_model_ref = true;
+        config.provider_instances.insert(
+            "compatibility-default".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "reasoning_effort": "low",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.provider_instances.insert(
+            "chat-provider".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "reasoning_effort": "high",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("compatibility-default".to_string());
+        config.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": { "provider": "chat-provider", "model": "claude" }
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(config.get_reasoning_effort(), Some(ReasoningEffort::High));
+
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(ReasoningEffort::Max);
+        assert_eq!(config.get_reasoning_effort(), Some(ReasoningEffort::Max));
+    }
+
+    #[test]
     fn runtime_env_overrides_select_and_hydrate_only_marked_instances() {
         let _provider =
             crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("openai"));
@@ -8549,7 +8575,7 @@ mod tests {
     }
 
     #[test]
-    fn get_memory_background_model_does_not_fall_back_to_main_model() {
+    fn get_memory_background_model_falls_back_to_chat_when_fast_is_unset() {
         let mut config = Config::default();
         config.features.provider_model_ref = false;
         config.provider = "openai".to_string();
@@ -8568,7 +8594,10 @@ mod tests {
             api_key_from_env: false,
         });
 
-        assert!(config.get_memory_background_model().is_none());
+        assert_eq!(
+            config.get_memory_background_model().as_deref(),
+            Some("gpt-main")
+        );
     }
 
     #[test]

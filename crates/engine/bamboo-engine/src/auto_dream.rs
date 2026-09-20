@@ -15,8 +15,8 @@ use bamboo_agent_core::{Message, SessionKind};
 use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
+use bamboo_llm::ProviderRegistry;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
-use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
 use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
@@ -1825,48 +1825,29 @@ async fn run_auto_dream_once_for_scope(
     // ProviderModelRef). Doing this after the session check keeps an idle default-on
     // instance without a model quiet; a "no model" warn here means real work exists
     // that we can't do.
-    let provider_ref_enabled = config_snapshot.features.provider_model_ref;
-    let model_ref = if provider_ref_enabled {
-        config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| {
-                config_snapshot
-                    .defaults
-                    .as_ref()
-                    .and_then(|d| d.fast.as_ref())
-            })
-    } else {
-        None
-    };
-    let (bg_provider, model): (Arc<dyn LLMProvider>, String) = if let Some(ref mr) = model_ref {
-        let router = ProviderModelRouter::new(ctx.provider_registry.clone());
-        let routed = router.route(mr).map_err(|e| {
-            format!(
-                "[auto_dream] failed to route background model ref '{}': {}",
-                mr, e
+    let resolved_background =
+        if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
+            crate::model_config_helper::resolve_background_model(
+                &config_snapshot,
+                config_snapshot.effective_default_provider(),
+                &ctx.provider_registry,
             )
-        })?;
-        tracing::debug!(
-            target: DREAM_TRACING_TARGET,
-            model_ref = %mr,
-            "Resolved background model via ProviderModelRef"
-        );
-        (routed, mr.model.clone())
-    } else {
-        let Some(model) = config_snapshot.get_memory_background_model() else {
-            tracing::warn!(
-                target: DREAM_TRACING_TARGET,
-                event = "run_skip",
-                reason = "no_background_model",
-                scope = scope_label,
-                project_key = project_key.unwrap_or(""),
-                "[auto_dream] skipped: no memory.background_model / provider.fast_model configured"
-            );
-            return Ok(None);
+            .map(|resolved| (resolved.provider, resolved.model_name))
+        } else {
+            config_snapshot
+                .get_memory_background_model()
+                .map(|model| (ctx.provider.clone(), model))
         };
-        (ctx.provider.clone(), model)
+    let Some((bg_provider, model)) = resolved_background else {
+        tracing::warn!(
+            target: DREAM_TRACING_TARGET,
+            event = "run_skip",
+            reason = "no_background_model",
+            scope = scope_label,
+            project_key = project_key.unwrap_or(""),
+            "[auto_dream] skipped: no background/fast/chat model configured"
+        );
+        return Ok(None);
     };
 
     tracing::info!(
