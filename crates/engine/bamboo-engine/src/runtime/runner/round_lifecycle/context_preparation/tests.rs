@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
-    emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    mark_manual_archive_request_consumed, maybe_apply_host_context_compression,
-    pending_manual_archive_request, prepare_round_context, surface_manual_archive_rejection,
-    LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
+    effective_context_pressure_strategy, emit_context_pressure_notification,
+    enforce_model_context_ledger_retention, mark_manual_archive_request_consumed,
+    maybe_apply_host_context_compression, pending_manual_archive_request, prepare_round_context,
+    surface_manual_archive_rejection, LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -5667,7 +5667,11 @@ fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
 
     // Drive 10 rounds at the same pressure level.
     for _ in 0..10 {
-        emit_context_pressure_notification(&mut session, Some(&event_tx));
+        emit_context_pressure_notification(
+            &mut session,
+            Some(&event_tx),
+            ContextManagementStrategy::Summary,
+        );
     }
     drop(event_tx);
 
@@ -5680,7 +5684,7 @@ fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
     // Dedup state persists across rounds in metadata.
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"warning".to_string())
+        Some(&"summary:warning".to_string())
     );
 }
 
@@ -5693,14 +5697,26 @@ fn context_pressure_notification_refires_only_on_level_transition() {
 
     // Round 1: 80% warning -> emits.
     session.token_usage = Some(pressure_usage(80_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 2: still 80% warning -> deduped, no re-fire.
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 3: drops to 50% (below threshold) -> clears stored level, no fire.
     session.token_usage = Some(pressure_usage(50_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
     assert!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY).is_none(),
         "stored level should be cleared once pressure drops below threshold"
@@ -5708,14 +5724,26 @@ fn context_pressure_notification_refires_only_on_level_transition() {
 
     // Round 4: back to 80% warning -> re-fires (reset transition).
     session.token_usage = Some(pressure_usage(80_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 5: escalates to 95% critical -> level transition, fires again.
     session.token_usage = Some(pressure_usage(95_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 6: still 95% critical -> deduped, no re-fire.
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
     drop(event_tx);
 
     let levels = drain_pressure_notifications(&mut event_rx);
@@ -5731,6 +5759,125 @@ fn context_pressure_notification_refires_only_on_level_transition() {
     );
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"critical".to_string())
+        Some(&"summary:critical".to_string())
     );
+}
+
+#[test]
+fn context_pressure_notification_refires_when_strategy_changes_at_same_level() {
+    let mut session = Session::new("session-pressure-strategy-transition", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextPressureNotification { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].contains("compact_context"));
+    assert!(events[1].contains("session_history_current"));
+    assert_eq!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
+        Some(&"retrieval_window:warning".to_string())
+    );
+}
+
+#[test]
+fn context_pressure_notification_copy_is_strategy_aware() {
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let mut summary_session = Session::new("pressure-summary-copy", "test-model");
+    summary_session.token_usage = Some(pressure_usage(80_000, 100_000));
+    emit_context_pressure_notification(
+        &mut summary_session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
+    let AgentEvent::ContextPressureNotification {
+        message: summary_message,
+        ..
+    } = event_rx.try_recv().expect("summary pressure event")
+    else {
+        panic!("expected summary pressure event");
+    };
+    assert_eq!(
+        summary_message,
+        "Context window filling up (~80%). Consider using compact_context to compress older \
+         conversation history before auto-compression triggers."
+    );
+
+    for (total_tokens, expected_level) in [(80_000, "warning"), (95_000, "critical")] {
+        let mut retrieval_session =
+            Session::new(format!("pressure-retrieval-{expected_level}"), "test-model");
+        retrieval_session.token_usage = Some(pressure_usage(total_tokens, 100_000));
+        emit_context_pressure_notification(
+            &mut retrieval_session,
+            Some(&event_tx),
+            ContextManagementStrategy::RetrievalWindow,
+        );
+        let AgentEvent::ContextPressureNotification { level, message, .. } =
+            event_rx.try_recv().expect("retrieval pressure event")
+        else {
+            panic!("expected retrieval pressure event");
+        };
+        assert_eq!(level, expected_level);
+        assert!(message.contains("archiv"));
+        assert!(message.contains("session_history_current"));
+        assert!(message.contains("session_note"));
+        assert!(message.contains("decisions, paths, progress, and blockers"));
+        assert!(message.contains("Do not copy raw transcript"));
+        assert!(!message.contains("compact_context"));
+        assert!(!message.contains("Auto-compression"));
+    }
+}
+
+#[test]
+fn context_pressure_notification_reports_explicit_summary_fallback_for_summarized_session() {
+    let mut session = Session::new("pressure-summary-fallback", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "Existing summary",
+        8,
+        2_000,
+    ));
+    let context_management = ContextManagementConfig {
+        strategy: ContextManagementStrategy::RetrievalWindow,
+        retrieval_window: RetrievalWindowContextConfig {
+            fallback_strategy: ContextManagementFallbackStrategy::Summary,
+            ..RetrievalWindowContextConfig::default()
+        },
+    };
+    let effective_strategy = effective_context_pressure_strategy(&session, &context_management);
+    assert_eq!(effective_strategy, ContextManagementStrategy::Summary);
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+    emit_context_pressure_notification(&mut session, Some(&event_tx), effective_strategy);
+    let AgentEvent::ContextPressureNotification { message, .. } = event_rx
+        .try_recv()
+        .expect("summary fallback pressure event")
+    else {
+        panic!("expected summary fallback pressure event");
+    };
+    assert!(message.contains("auto-compression"));
+    assert!(message.contains("compact_context"));
+    assert!(!message.contains("Retrieval-window"));
+    assert!(!message.contains("session_history_current"));
 }

@@ -23,7 +23,9 @@ use bamboo_compression::{
     RetrievalWindowPolicy, RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget,
     TokenCounter,
 };
-use bamboo_config::{ContextManagementFallbackStrategy, ContextManagementStrategy};
+use bamboo_config::{
+    ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
+};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason, ResponseOccurrence,
     RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
@@ -497,9 +499,25 @@ async fn emit_context_compression_status(
         .await;
 }
 
+fn effective_context_pressure_strategy(
+    session: &Session,
+    context_management: &ContextManagementConfig,
+) -> ContextManagementStrategy {
+    if context_management.strategy == ContextManagementStrategy::RetrievalWindow
+        && context_management.retrieval_window.fallback_strategy
+            == ContextManagementFallbackStrategy::Summary
+        && session.conversation_summary.is_some()
+    {
+        ContextManagementStrategy::Summary
+    } else {
+        context_management.strategy
+    }
+}
+
 fn emit_context_pressure_notification(
     session: &mut Session,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    strategy: ContextManagementStrategy,
 ) {
     let Some(tx) = event_tx else { return };
     let Some(usage) = session.token_usage.as_ref() else {
@@ -517,22 +535,10 @@ fn emit_context_pressure_notification(
     let pct = (usage.total_tokens as f64 / denominator as f64) * 100.0;
     // `usage`'s immutable borrow ends here; the metadata mutations below need it.
 
-    let (level, message) = if pct >= 90.0 {
-        (
-            "critical",
-            format!(
-                "Context window is critically full (~{pct:.0}%). Auto-compression is imminent. \
-                 Consider using compact_context to compress on your terms."
-            ),
-        )
+    let level = if pct >= 90.0 {
+        "critical"
     } else if pct >= 70.0 {
-        (
-            "warning",
-            format!(
-                "Context window filling up (~{pct:.0}%). Consider using compact_context \
-                 to compress older conversation history before auto-compression triggers."
-            ),
-        )
+        "warning"
     } else {
         // Pressure dropped below the warning threshold: clear the stored level so
         // that re-entering pressure later re-notifies. Dedup is per level
@@ -540,20 +546,46 @@ fn emit_context_pressure_notification(
         session.metadata.remove(LAST_PRESSURE_LEVEL_KEY);
         return;
     };
+    let message = match (strategy, level) {
+        (ContextManagementStrategy::RetrievalWindow, "critical") => format!(
+            "Context window is critically full (~{pct:.0}%). Retrieval-window archival is \
+             imminent: older complete turns will be archived exactly and remain recoverable \
+             through session_history_current. Use session_note for concise live decisions, \
+             paths, progress, and blockers. Do not copy raw transcript into Project or Global \
+             memory."
+        ),
+        (ContextManagementStrategy::RetrievalWindow, _) => format!(
+            "Context window filling up (~{pct:.0}%). Retrieval-window management will archive \
+             older complete turns exactly; recover them through session_history_current. Use \
+             session_note for concise live decisions, paths, progress, and blockers. Do not \
+             copy raw transcript into Project or Global memory."
+        ),
+        (ContextManagementStrategy::Summary, "critical") => format!(
+            "Context window is critically full (~{pct:.0}%). Auto-compression is imminent. \
+             Consider using compact_context to compress on your terms."
+        ),
+        (ContextManagementStrategy::Summary, _) => format!(
+            "Context window filling up (~{pct:.0}%). Consider using compact_context \
+             to compress older conversation history before auto-compression triggers."
+        ),
+    };
 
-    // Dedup across rounds via session.metadata: skip if the current level matches
-    // the last one we emitted for this session.
+    let strategy_label = match strategy {
+        ContextManagementStrategy::Summary => "summary",
+        ContextManagementStrategy::RetrievalWindow => "retrieval_window",
+    };
+    let dedup_key = format!("{strategy_label}:{level}");
     if session
         .metadata
         .get(LAST_PRESSURE_LEVEL_KEY)
         .map(String::as_str)
-        == Some(level)
+        == Some(dedup_key.as_str())
     {
         return;
     }
     session
         .metadata
-        .insert(LAST_PRESSURE_LEVEL_KEY.to_string(), level.to_string());
+        .insert(LAST_PRESSURE_LEVEL_KEY.to_string(), dedup_key);
 
     let _ = tx.try_send(AgentEvent::ContextPressureNotification {
         percent: pct,
@@ -2428,7 +2460,9 @@ pub(super) async fn prepare_round_context(
 
     // Dedup state for pressure notifications lives in session.metadata so it
     // persists across rounds (see LAST_PRESSURE_LEVEL_KEY).
-    emit_context_pressure_notification(session, event_tx);
+    let pressure_strategy =
+        effective_context_pressure_strategy(session, &config.context_management);
+    emit_context_pressure_notification(session, event_tx, pressure_strategy);
 
     Ok(PreparedRoundContext {
         prepared_context,
