@@ -131,7 +131,10 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
 
     let (event_tx, _event_rx) = mpsc::channel(64);
     let config = AgentLoopConfig {
-        max_rounds: 3,
+        run_budget: bamboo_config::RunBudgetConfig {
+            max_rounds: Some(3),
+            ..Default::default()
+        },
         system_prompt: Some("sys".to_string()),
         model_name: Some("test-model".to_string()),
         ..Default::default()
@@ -286,7 +289,10 @@ async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation(
 
     let (event_tx, _event_rx) = mpsc::channel(64);
     let config = AgentLoopConfig {
-        max_rounds: 5,
+        run_budget: bamboo_config::RunBudgetConfig {
+            max_rounds: Some(5),
+            ..Default::default()
+        },
         system_prompt: Some("sys".to_string()),
         model_name: Some("sticky-chat-model".to_string()),
         auxiliary_model_resolver: Some(Arc::new(move || {
@@ -591,7 +597,10 @@ async fn suspended_restart_with_empty_selection_does_not_require_snapshot() {
             skill_manager: Some(manager),
             selected_skill_ids: Some(Vec::new()),
             model_name: Some("model".to_string()),
-            max_rounds: 1,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -914,7 +923,10 @@ async fn create_runner_metrics() -> (
 
 fn runner_metrics_config(collector: &bamboo_metrics::MetricsCollector) -> AgentLoopConfig {
     AgentLoopConfig {
-        max_rounds: 2,
+        run_budget: bamboo_config::RunBudgetConfig {
+            max_rounds: Some(2),
+            ..Default::default()
+        },
         system_prompt: Some("metrics regression test".to_string()),
         model_name: Some("test-model".to_string()),
         metrics_collector: Some(collector.clone()),

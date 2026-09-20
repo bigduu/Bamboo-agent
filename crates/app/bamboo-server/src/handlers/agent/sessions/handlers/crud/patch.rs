@@ -1417,6 +1417,12 @@ mod tests {
         )
         .await;
         let id = create_session!(app);
+        let before = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load initial session")
+            .expect("initial session");
 
         let response = test::call_service(
             &app,
@@ -1437,7 +1443,8 @@ mod tests {
             .await
             .expect("load")
             .expect("session");
-        assert!(persisted.agent_runtime_state.is_none());
+        assert_eq!(persisted.metadata_version, before.metadata_version);
+        assert_eq!(persisted.agent_runtime_state, before.agent_runtime_state);
     }
 
     async fn seed_session(

@@ -24,8 +24,8 @@ use tokio::sync::broadcast;
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
-    SessionExecutionReserveOutcome,
+    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
+    reserve_session_execution, SessionExecutionReserveOutcome,
 };
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
@@ -626,13 +626,14 @@ impl ResumeExecutionPort for ConnectResumePort {
             ),
         };
 
-        let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
-            session_id.clone(),
-            execution_reservation.run_id().to_string(),
-            event_sender,
-            self.ctx.agent_runners.clone(),
-            self.ctx.account_feed_inbox.clone(),
-        );
+        let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
+            create_event_forwarder_with_history_commit_barrier(
+                session_id.clone(),
+                execution_reservation.run_id().to_string(),
+                event_sender,
+                self.ctx.agent_runners.clone(),
+                self.ctx.account_feed_inbox.clone(),
+            );
 
         // If the user just approved a permission prompt, the gated tool call
         // was intercepted before it ran — its recorded result is only a
@@ -676,6 +677,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 selected_skill_ids: None,
                 selected_skill_mode: None,
                 mpsc_tx,
+                history_commit_barrier,
                 image_fallback: config.image_fallback.clone(),
                 gold_config: config.gold_config.clone(),
                 guardian_config: None,
@@ -965,6 +967,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 selected_skill_ids: None,
                 selected_skill_mode: None,
                 mpsc_tx,
+                history_commit_barrier,
                 image_fallback: config.image_fallback.clone(),
                 gold_config: config.gold_config.clone(),
                 guardian_config: None,

@@ -2566,6 +2566,12 @@ async fn run_pipeline_inner(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
+    if config.run_budget.max_rounds == Some(0) {
+        return Err(AgentError::Budget(
+            "run_budget.max_rounds must be at least 1".to_string(),
+        ));
+    }
+
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -2672,6 +2678,7 @@ async fn run_pipeline_inner(
                 session,
                 &mut state.runtime_state,
                 config,
+                Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
                 Some(&runtime_context),
@@ -2681,7 +2688,7 @@ async fn run_pipeline_inner(
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
             ctx.current_round = turn_counter;
-            ctx.max_rounds = config.max_rounds as u32;
+            ctx.max_rounds = config.run_budget.max_rounds;
         }
 
         // --- Debug log ---
@@ -2691,7 +2698,7 @@ async fn run_pipeline_inner(
                 state.session_id,
                 serde_json::json!({
                     "round": turn_counter + 1,
-                    "total_rounds": config.max_rounds,
+                    "round_cap": config.run_budget.max_rounds,
                     "message_count": session.messages.len(),
                 })
             );
@@ -3583,10 +3590,16 @@ async fn run_pipeline_inner(
             break;
         }
 
-        // --- Guard against max_rounds (issue #29) ---
+        // --- Guard against the run's round cap (issue #29) ---
         //
-        // Hitting the round budget must be DISTINGUISHABLE from a normal
-        // completion, not silent. On exhaustion we:
+        // The cap is `config.run_budget.max_rounds` — `None` (the default)
+        // means UNLIMITED rounds: this guard is skipped entirely and the run
+        // ends only when the model stops calling tools, another guardrail
+        // trips, or the run is cancelled. The historical hard-coded 200 was
+        // removed in favor of this opt-in budget field.
+        //
+        // When a cap IS configured, hitting it must be DISTINGUISHABLE from a
+        // normal completion, not silent. On exhaustion we:
         //   1. stamp `runtime.completion_reason` = "max_rounds_reached"
         //      (mirroring the `runtime.suspend_reason` convention) so the
         //      finalize/Complete path — and the UI reading session metadata —
@@ -3601,39 +3614,41 @@ async fn run_pipeline_inner(
         // unconditionally — regardless of what that turn did (including ignoring
         // the instruction and emitting more tool calls). It can therefore never
         // recurse or extend the loop indefinitely.
-        if turn_counter >= config.max_rounds as u32 {
-            if !max_rounds_summary_used {
-                tracing::warn!(
-                    "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
-                    state.session_id,
-                    config.max_rounds
-                );
-                session.metadata.insert(
-                    "runtime.completion_reason".to_string(),
-                    "max_rounds_reached".to_string(),
-                );
-                // Single visible user turn that both notifies the user WHY the
-                // run stopped and prompts the model to summarize. It MUST be one
-                // message: two consecutive user messages would violate strict
-                // role alternation (Anthropic 400s on it), breaking the summary
-                // turn and the next resume. One user turn keeps alternation valid
-                // (a preceding Tool message is merged into it by the serializer).
-                session.add_message(Message::user(format!(
-                    "Reached the maximum of {0} rounds; the task was stopped before \
-                     completion. Stop working now and summarize your progress so far \
-                     and what remains.",
-                    config.max_rounds
-                )));
-                max_rounds_summary_used = true;
-                continue;
-            }
+        if let Some(max_rounds) = config.run_budget.max_rounds {
+            if turn_counter >= max_rounds {
+                if !max_rounds_summary_used {
+                    tracing::warn!(
+                        "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
+                        state.session_id,
+                        max_rounds
+                    );
+                    session.metadata.insert(
+                        "runtime.completion_reason".to_string(),
+                        "max_rounds_reached".to_string(),
+                    );
+                    // Single visible user turn that both notifies the user WHY the
+                    // run stopped and prompts the model to summarize. It MUST be one
+                    // message: two consecutive user messages would violate strict
+                    // role alternation (Anthropic 400s on it), breaking the summary
+                    // turn and the next resume. One user turn keeps alternation valid
+                    // (a preceding Tool message is merged into it by the serializer).
+                    session.add_message(Message::user(format!(
+                        "Reached the maximum of {0} rounds; the task was stopped before \
+                         completion. Stop working now and summarize your progress so far \
+                         and what remains.",
+                        max_rounds
+                    )));
+                    max_rounds_summary_used = true;
+                    continue;
+                }
 
-            tracing::warn!(
-                "[{}] Reached max rounds ({}) — stopping the run before completion.",
-                state.session_id,
-                config.max_rounds
-            );
-            break;
+                tracing::warn!(
+                    "[{}] Reached max rounds ({}) — stopping the run before completion.",
+                    state.session_id,
+                    max_rounds
+                );
+                break;
+            }
         }
     }
 
@@ -5888,7 +5903,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 5,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(5),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
 
@@ -6017,7 +6035,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: MAX_ROUNDS,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -6026,6 +6043,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(MAX_ROUNDS as u32),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let mut state = e2e_loop_state("session-max-rounds");
@@ -6385,6 +6406,37 @@ mod tests {
                 .push((started, completed));
             Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
         }
+    }
+
+    #[tokio::test]
+    async fn zero_max_rounds_is_rejected_before_the_first_provider_call() {
+        use std::sync::atomic::Ordering;
+
+        let mut session = Session::new("session-zero-max-rounds", "model");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let provider = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(0),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-zero-max-rounds");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let error =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect_err("a zero round cap must be rejected before execution");
+
+        assert!(matches!(error, AgentError::Budget(_)));
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -7103,7 +7155,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50, // high enough that max_rounds never fires first
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -7116,6 +7167,7 @@ mod tests {
                 max_total_tokens: Some(20),
                 max_tool_calls: None,
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -7197,7 +7249,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -7210,6 +7261,7 @@ mod tests {
                 max_total_tokens: None,
                 max_tool_calls: Some(2),
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -7249,7 +7301,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -7262,6 +7313,7 @@ mod tests {
                 max_total_tokens: None,
                 max_tool_calls: None,
                 max_subagents: Some(1),
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -7301,7 +7353,6 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let config = AgentLoopConfig {
-            max_rounds: 2,
             prompt_memory_flags: PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -7314,6 +7365,7 @@ mod tests {
                 max_total_tokens: Some(1_000_000),
                 max_tool_calls: Some(1_000_000),
                 max_subagents: Some(1_000_000),
+                max_rounds: Some(2),
             },
             ..AgentLoopConfig::default()
         };
@@ -7562,13 +7614,13 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = provider.clone();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let tripping_config = AgentLoopConfig {
-            max_rounds: 50,
             prompt_memory_flags: flags,
             model_name: Some("model".to_string()),
             run_budget: bamboo_config::RunBudgetConfig {
                 max_total_tokens: None,
                 max_tool_calls: Some(1),
                 max_subagents: None,
+                max_rounds: Some(50),
             },
             ..AgentLoopConfig::default()
         };
@@ -7604,9 +7656,12 @@ mod tests {
         });
         let llm2: Arc<dyn LLMProvider> = provider2.clone();
         let unlimited_config = AgentLoopConfig {
-            max_rounds: 2,
             prompt_memory_flags: flags,
             model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(2),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let mut state2 = e2e_loop_state("session-budget-metadata-hygiene");
@@ -7698,6 +7753,7 @@ mod tests {
             max_total_tokens: Some(5),
             max_tool_calls: Some(1),
             max_subagents: Some(1),
+            max_rounds: None,
         };
         let exceeded =
             check_run_budget_exceeded(&round, &all_exceeded).expect("some guardrail trips");
@@ -7709,6 +7765,7 @@ mod tests {
             max_total_tokens: None,
             max_tool_calls: Some(3),
             max_subagents: None,
+            max_rounds: None,
         };
         let exceeded =
             check_run_budget_exceeded(&round, &tool_calls_only).expect("tool-call guardrail trips");
@@ -7908,10 +7965,13 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 1,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let mut state = e2e_loop_state(&running.id);
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -7950,6 +8010,18 @@ mod tests {
         assert!(observability.latest_user_query_present);
         assert_eq!(observability.relevant_memory_status, "lexical");
         assert_eq!(observability.relevant_memory_count, 1);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageAppended {
+                        ref message_id,
+                        ref content,
+                        ..
+                    } if message_id == envelope.id.as_str() && content == query
+                )
+            })
+        );
     }
 
     #[tokio::test]
@@ -7994,7 +8066,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 1,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
@@ -9884,7 +9959,10 @@ mod tests {
                 ledger_agenda: false,
             },
             model_name: Some("model".to_string()),
-            max_rounds: 5,
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(5),
+                ..Default::default()
+            },
             ..AgentLoopConfig::default()
         }
     }

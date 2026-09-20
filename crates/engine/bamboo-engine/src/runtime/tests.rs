@@ -41,7 +41,6 @@ fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
 #[test]
 fn agent_loop_config_default() {
     let config = AgentLoopConfig::default();
-    assert_eq!(config.max_rounds, 200);
     assert!(config.system_prompt.is_none());
     assert!(config.additional_tool_schemas.is_empty());
     assert!(config.tool_registry.is_empty());
@@ -50,8 +49,11 @@ fn agent_loop_config_default() {
     assert!(config.disabled_tools.is_empty());
     assert!(!config.skip_initial_user_message);
     // Issue #221: no budget configured anywhere means unlimited, matching
-    // every other resource knob's opt-in-only default.
+    // every other resource knob's opt-in-only default. The round cap follows
+    // the same posture: `max_rounds: None` = unlimited (the historical
+    // hard-coded 200-round default was removed).
     assert_eq!(config.run_budget, bamboo_config::RunBudgetConfig::default());
+    assert_eq!(config.run_budget.max_rounds, None);
 }
 
 /// Issue #221 plumb-through (engine hop): `ExecuteRequestBuilder::run_budget`
@@ -69,6 +71,7 @@ fn execute_request_builder_carries_run_budget_override_through_to_the_request() 
         max_total_tokens: Some(42_000),
         max_tool_calls: Some(7),
         max_subagents: None,
+        max_rounds: Some(200),
     };
 
     let request = ExecuteRequestBuilder::new("hello", tx, CancellationToken::new())

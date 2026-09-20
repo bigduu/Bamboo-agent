@@ -23,11 +23,15 @@ impl TaskLoopContext {
             return String::new();
         }
 
-        let mut output = format!(
-            "\n\n## Current Task List (Round {}/{})\n",
-            self.current_round + 1,
-            self.max_rounds
-        );
+        // With no configured round cap the run is unlimited: show the current
+        // round alone rather than a misleading denominator.
+        let header = match self.max_rounds {
+            Some(max_rounds) => {
+                format!(" (Round {}/{})", self.current_round + 1, max_rounds)
+            }
+            None => format!(" (Round {})", self.current_round + 1),
+        };
+        let mut output = format!("\n\n## Current Task List{header}\n");
 
         for item in &self.items {
             let status_icon = match item.status {

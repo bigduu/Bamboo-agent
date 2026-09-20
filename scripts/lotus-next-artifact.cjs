@@ -189,10 +189,12 @@ function parseCanonicalJson(filePath, label) {
   } catch (error) {
     throw new Error(`${label} is not valid JSON: ${error.message}`);
   }
-  if (source !== `${JSON.stringify(value, null, 2)}\n`) {
+  const canonicalSource = `${JSON.stringify(value, null, 2)}\n`;
+  const canonicalCrLfSource = canonicalSource.replace(/\n/g, "\r\n");
+  if (source !== canonicalSource && source !== canonicalCrLfSource) {
     throw new Error(`${label} is not canonical pretty-printed JSON`);
   }
-  return { source, value };
+  return { source: canonicalSource, value };
 }
 
 function readArtifactLock(lockPath) {

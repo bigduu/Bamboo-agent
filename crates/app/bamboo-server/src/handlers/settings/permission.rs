@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use actix_web::{web, HttpResponse};
 use bamboo_config::{ConfigStoreError, SectionSnapshot, SectionSourceKind, SectionStatus};
+use bamboo_domain::SessionPermissionMode;
 use bamboo_tools::permission::{
     DurablePermissionRule, ParsedRule, PermissionDecisionKind, PermissionEvaluation,
     PermissionOutcome, PermissionType, SerializablePermissionConfig, TemporaryPermissionGrant,
@@ -131,6 +132,76 @@ fn require_current_revision(expected: u64, actual: u64) -> Result<(), AppError> 
     } else {
         Err(AppError::ConfigConflict { expected, actual })
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DefaultSessionPermissionModeResponse {
+    /// The mode stamped onto NEW sessions at creation:
+    /// `default` | `bypass` | `auto`.
+    pub mode: SessionPermissionMode,
+    pub revision: u64,
+    pub loaded_at: DateTime<Utc>,
+    pub source_path: PathBuf,
+    pub source_kind: SectionSourceKind,
+    pub status: SectionStatus,
+    pub last_error: Option<String>,
+}
+
+impl DefaultSessionPermissionModeResponse {
+    fn from_snapshot(snapshot: &SectionSnapshot<SerializablePermissionConfig>) -> Self {
+        Self {
+            mode: snapshot
+                .data
+                .default_session_permission_mode
+                .unwrap_or_default(),
+            revision: snapshot.revision,
+            loaded_at: snapshot.loaded_at,
+            source_path: snapshot.source_path.clone(),
+            source_kind: snapshot.source_kind,
+            status: snapshot.status,
+            last_error: snapshot.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateDefaultSessionPermissionModeRequest {
+    /// Clients should send the revision returned by GET. Optional only for
+    /// compatibility; the store-level CAS still applies.
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+    /// `default` | `bypass` | `auto`. Unknown values fail deserialization and
+    /// are rejected with 400 before any durable write.
+    pub mode: SessionPermissionMode,
+}
+
+pub async fn get_default_session_permission_mode(
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let snapshot = app_state.permission_section.snapshot();
+    Ok(
+        HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+            &snapshot,
+        )),
+    )
+}
+
+/// Replace the new-session permission-mode seed with durable-before-live ordering.
+pub async fn update_default_session_permission_mode(
+    app_state: web::Data<AppState>,
+    payload: web::Json<UpdateDefaultSessionPermissionModeRequest>,
+) -> Result<HttpResponse, AppError> {
+    let req = payload.into_inner();
+    let snapshot = app_state.permission_section.snapshot();
+    let expected_revision = req.expected_revision.unwrap_or(snapshot.revision);
+    let mut candidate = snapshot.data.as_ref().clone();
+    candidate.default_session_permission_mode = Some(req.mode);
+    let snapshot = commit_permission_candidate(&app_state, expected_revision, candidate).await?;
+    Ok(
+        HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+            &snapshot,
+        )),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -672,5 +743,98 @@ mod tests {
                 actual: 2
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn default_session_permission_mode_round_trips_durably_and_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(temp.path().to_path_buf())
+                .await
+                .expect("app state should initialize"),
+        );
+
+        // Fresh state reports Default and the live checker mirrors it.
+        let response = get_default_session_permission_mode(state.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let initial: DefaultSessionPermissionModeResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(initial.mode, SessionPermissionMode::Default);
+        assert_eq!(
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .default_session_permission_mode(),
+            SessionPermissionMode::Default,
+        );
+
+        let response = update_default_session_permission_mode(
+            state.clone(),
+            web::Json(UpdateDefaultSessionPermissionModeRequest {
+                expected_revision: Some(0),
+                mode: SessionPermissionMode::Auto,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let updated: DefaultSessionPermissionModeResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated.mode, SessionPermissionMode::Auto);
+        assert_eq!(updated.revision, 1);
+
+        // Live publication happened.
+        assert_eq!(
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .default_session_permission_mode(),
+            SessionPermissionMode::Auto,
+        );
+        // Durable document carries the new value.
+        let reopened = bamboo_tools::permission::PermissionSection::open(temp.path()).unwrap();
+        assert_eq!(reopened.snapshot().revision, 1);
+        assert_eq!(
+            reopened.snapshot().data.default_session_permission_mode,
+            Some(SessionPermissionMode::Auto)
+        );
+
+        // Stale CAS is rejected without touching live or durable state.
+        let stale = update_default_session_permission_mode(
+            state.clone(),
+            web::Json(UpdateDefaultSessionPermissionModeRequest {
+                expected_revision: Some(0),
+                mode: SessionPermissionMode::Bypass,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale,
+            AppError::ConfigConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .default_session_permission_mode(),
+            SessionPermissionMode::Auto,
+        );
     }
 }

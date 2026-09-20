@@ -320,6 +320,13 @@ pub struct CreateSessionRequest {
     /// `connect::bridge::create_connect_session`).
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// Optional initial session-scoped permission mode (`default` | `bypass`
+    /// | `auto`). When omitted the durable permission-policy default
+    /// (`default_session_permission_mode`) is stamped instead. The typed mode
+    /// plus its legacy mirror are written once here; later changes go through
+    /// the CAS-guarded PATCH contract like any other session.
+    #[serde(default)]
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
 #[derive(Debug, Serialize)]
@@ -503,6 +510,7 @@ mod tests {
             reasoning_effort: None,
             gold_config: None,
             workspace_path: None,
+            permission_mode: None,
         };
 
         let debug_str = format!("{:?}", req);

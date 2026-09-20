@@ -23,7 +23,9 @@ pub mod types;
 
 // Re-exports for ergonomic access
 pub use authority::*;
-pub use budget_types::{BudgetStrategy, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown};
+pub use budget_types::{
+    BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
+};
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;

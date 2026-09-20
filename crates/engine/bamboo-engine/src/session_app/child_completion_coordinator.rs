@@ -16,9 +16,9 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    create_event_forwarder, finalize_runner, reserve_runner_core, reserve_session_execution,
-    spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler,
-    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
+    create_event_forwarder_with_history_commit_barrier, finalize_runner, reserve_runner_core,
+    reserve_session_execution, spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion,
+    ChildCompletionHandler, ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
     SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
@@ -1107,13 +1107,14 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         )
         .or(config.gold_config.clone());
 
-        let (mpsc_tx, _forwarder) = create_event_forwarder(
-            session_id.clone(),
-            execution_reservation.run_id().to_string(),
-            event_sender,
-            self.agent_runners.clone(),
-            self.account_feed_inbox.clone(),
-        );
+        let (mpsc_tx, _forwarder, history_commit_barrier) =
+            create_event_forwarder_with_history_commit_barrier(
+                session_id.clone(),
+                execution_reservation.run_id().to_string(),
+                event_sender,
+                self.agent_runners.clone(),
+                self.account_feed_inbox.clone(),
+            );
 
         let config_handle = self.config.clone();
         let cached_config = Arc::new(StdRwLock::new(config_snapshot.clone()));
@@ -1183,6 +1184,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             selected_skill_ids: None,
             selected_skill_mode: None,
             mpsc_tx,
+            history_commit_barrier,
             image_fallback: config.image_fallback,
             gold_config,
             guardian_config,

@@ -225,7 +225,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // Create mpsc channel for agent loop.
     let (mpsc_tx, mpsc_rx) = mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
-    spawn_event_forwarder(
+    let history_commit_barrier = spawn_event_forwarder(
         state.clone(),
         session_id.to_string(),
         run_id.clone(),
@@ -253,6 +253,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         disabled_tools,
         disabled_skill_ids,
         mpsc_tx,
+        history_commit_barrier,
         image_fallback,
         gold_config,
         app_data_dir: Some(state.app_data_dir.clone()),

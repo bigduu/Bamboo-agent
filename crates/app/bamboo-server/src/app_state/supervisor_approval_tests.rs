@@ -390,6 +390,22 @@ impl Fixture {
 
 #[actix_web::test]
 async fn server_native_typed_supervisor_approval_survives_policy_refresh_and_rejects_corruption() {
+    // The permission replay fixture drives deeply nested async state machines
+    // that overflow the default 2 MiB libtest worker stack on Linux CI (fine
+    // on macOS's 8 MiB main thread). Run the body on a dedicated thread with
+    // an 8 MiB stack, in its own actix System like #[actix_web::test] does,
+    // so the test is platform-stable.
+    let body = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            actix_web::rt::System::new()
+                .block_on(server_native_typed_supervisor_approval_fixture_replay_body());
+        })
+        .expect("spawn test thread");
+    body.join().expect("test thread completed");
+}
+
+async fn server_native_typed_supervisor_approval_fixture_replay_body() {
     for corrupt in [false, true] {
         let fixture = Box::pin(Fixture::pending()).await;
         if corrupt {
@@ -482,6 +498,19 @@ async fn server_native_typed_supervisor_approval_survives_policy_refresh_and_rej
 
 #[actix_web::test]
 async fn server_old_decision_cannot_answer_a_recreated_supervisor() {
+    // Same 2 MiB libtest worker stack concern as the fixture-replay test
+    // above; run on a dedicated 8 MiB-stack thread.
+    let body = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            actix_web::rt::System::new()
+                .block_on(server_old_decision_cannot_answer_a_recreated_supervisor_body());
+        })
+        .expect("spawn test thread");
+    body.join().expect("test thread completed");
+}
+
+async fn server_old_decision_cannot_answer_a_recreated_supervisor_body() {
     let mut fixture = Box::pin(Fixture::pending()).await;
     let old_decision = fixture.decision().await;
     let old = fixture.original.clone();

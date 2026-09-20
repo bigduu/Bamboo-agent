@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::AgentRuntimeState;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
@@ -26,7 +27,8 @@ use bamboo_agent_core::PromptSnapshot;
 pub(crate) struct RoundPreludeFrame<'a> {
     pub execution_id: &'a str,
     pub round: usize,
-    pub max_rounds: usize,
+    /// Round cap; `None` = unlimited. Logging surfaces it as `null`.
+    pub max_rounds: Option<usize>,
     pub debug_enabled: bool,
     pub cancel_token: &'a CancellationToken,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -99,6 +101,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
@@ -129,6 +132,22 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
             admitted_messages = turn_refresh.merged,
             "turn boundary admitted durable SessionInbox work"
         );
+    }
+    // A queued user message is already part of the durable transcript here,
+    // and the current tool result is already complete. Publish the append now
+    // so clients can render it before the next provider response begins.
+    if let Some(event_tx) = event_tx {
+        for message in &turn_refresh.committed_messages {
+            let _ = event_tx
+                .send(AgentEvent::MessageAppended {
+                    session_id: session.id.clone(),
+                    message_id: message.id.clone(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    created_at: message.created_at,
+                })
+                .await;
+        }
     }
     if let Some(disk_mode) = turn_refresh.disk_permission_mode {
         runtime_state.set_permission_mode(disk_mode);
@@ -173,11 +192,11 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
 pub(super) fn update_task_round_state(
     task_context: &mut Option<TaskLoopContext>,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
 ) {
     if let Some(ctx) = task_context.as_mut() {
         ctx.current_round = round as u32;
-        ctx.max_rounds = max_rounds as u32;
+        ctx.max_rounds = max_rounds.map(|value| value as u32);
     }
 }
 
@@ -210,7 +229,7 @@ pub(super) fn log_round_start(
     debug_enabled: bool,
     session_id: &str,
     round: usize,
-    max_rounds: usize,
+    max_rounds: Option<usize>,
     message_count: usize,
 ) {
     if debug_enabled {
@@ -219,7 +238,7 @@ pub(super) fn log_round_start(
             session_id,
             serde_json::json!({
                 "round": round + 1,
-                "total_rounds": max_rounds,
+                "round_cap": max_rounds,
                 "message_count": message_count,
             })
         );
@@ -387,6 +406,7 @@ pub(crate) async fn prepare_round(
         session,
         runtime_state,
         config,
+        None,
         cancel_token,
         metrics_collector,
         Some(&runtime_context),

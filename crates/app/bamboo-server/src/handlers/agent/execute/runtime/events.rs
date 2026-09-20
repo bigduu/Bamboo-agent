@@ -5,6 +5,7 @@ use tracing::Instrument;
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
 use bamboo_engine::config::GoldConfig;
+use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
 /// Returns true for events that carry critical state a late subscriber must see.
@@ -22,7 +23,8 @@ pub(crate) fn spawn_event_forwarder(
     mut mpsc_rx: mpsc::Receiver<AgentEvent>,
     session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     gold_config: Option<GoldConfig>,
-) {
+) -> HistoryCommitBarrier {
+    let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
     // Always-on relay: previously the notification relay only started when an
     // SSE/WS client subscribed, so a run that finishes (or hits a
     // clarification/approval gate) before any client ever connects — a race
@@ -81,6 +83,8 @@ pub(crate) fn spawn_event_forwarder(
                 let needs_runner_update = is_critical_event(&event)
                     || matches!(&event, AgentEvent::TokenBudgetUpdated { .. });
                 if needs_runner_update {
+                    let is_history_commit =
+                        matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
                     let mut runners = state.agent_runners.write().await;
                     let Some(runner) = runners
                         .get_mut(&session_id)
@@ -110,13 +114,21 @@ pub(crate) fn spawn_event_forwarder(
                     let route_session_id = event.session_id().unwrap_or(&session_id);
                     state.account_sink.record(Some(route_session_id), &event);
                     let _ = session_tx.send(event);
+                    if is_history_commit {
+                        history_commit_acknowledger.acknowledge();
+                    }
                 } else {
+                    let is_history_commit =
+                        matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
                     if !publication.publish(|| {
                         let route_session_id = event.session_id().unwrap_or(&session_id);
                         state.account_sink.record(Some(route_session_id), &event);
                         let _ = session_tx.send(event);
                     }) {
                         return;
+                    }
+                    if is_history_commit {
+                        history_commit_acknowledger.acknowledge();
                     }
                 }
             }
@@ -173,6 +185,8 @@ pub(crate) fn spawn_event_forwarder(
         }
         .instrument(session_span),
     );
+
+    history_commit_barrier
 }
 
 #[cfg(test)]
@@ -751,7 +765,7 @@ mod tests {
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        spawn_event_forwarder(
+        let mut history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
             current_run_id(&state, session_id).await,
@@ -776,6 +790,13 @@ mod tests {
             })
             .await
             .unwrap();
+        // The post-persistence history barrier follows the low-latency terminal.
+        assert!(
+            history_commit_barrier
+                .send_and_wait(&mpsc_tx, session_id.into())
+                .await,
+            "history barrier must be durably published before the producer continues"
+        );
         mpsc_tx
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
@@ -799,7 +820,7 @@ mod tests {
 
         let journaled =
             bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
-        assert_eq!(journaled.len(), 4, "ephemeral Token must be excluded");
+        assert_eq!(journaled.len(), 5, "ephemeral Token must be excluded");
         assert!(matches!(
             journaled[0].event,
             AgentEvent::ExecutionStarted { .. }
@@ -811,9 +832,14 @@ mod tests {
         assert!(matches!(journaled[2].event, AgentEvent::Complete { .. }));
         // The terminal event routed to the right session via caller context.
         assert_eq!(journaled[2].session_id.as_deref(), Some(session_id));
-        assert_eq!(journaled[3].session_id.as_deref(), Some("parent-session"));
         assert!(matches!(
             journaled[3].event,
+            AgentEvent::SessionHistoryCommitted { .. }
+        ));
+        assert_eq!(journaled[3].session_id.as_deref(), Some(session_id));
+        assert_eq!(journaled[4].session_id.as_deref(), Some("parent-session"));
+        assert!(matches!(
+            journaled[4].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
         // Sequence numbers are monotonic and 1-based.
@@ -821,6 +847,7 @@ mod tests {
         assert_eq!(journaled[1].seq, 2);
         assert_eq!(journaled[2].seq, 3);
         assert_eq!(journaled[3].seq, 4);
+        assert_eq!(journaled[4].seq, 5);
     }
 
     #[tokio::test]

@@ -356,7 +356,6 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 pub struct AgentLoopConfig {
     /// Keep tool guidance stable while activation updates append to model context.
     pub freeze_tool_exposure_for_cache: bool,
-    pub(crate) max_rounds: usize,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
@@ -555,7 +554,10 @@ pub struct AgentLoopConfig {
     /// per-request override merged over the config-level default (see
     /// [`AgentRuntime::execute`](crate::runtime::runtime::AgentRuntime::execute)).
     /// Checked after every round; exceeding a configured limit gracefully
-    /// stops the run (mirrors the `max_rounds` exhaustion path).
+    /// stops the run. Includes the run's round cap (`max_rounds`): `None`
+    /// means unlimited rounds (the historical hard-coded 200 was removed);
+    /// a configured cap keeps the issue #29 exhaustion contract (metadata
+    /// stamp, visible notification, exactly one final summary turn).
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
 }
 
@@ -563,7 +565,6 @@ impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
             freeze_tool_exposure_for_cache: true,
-            max_rounds: 200,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,

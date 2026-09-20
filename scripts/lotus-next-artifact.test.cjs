@@ -8,6 +8,7 @@ const test = require("node:test");
 
 const {
   calculateResourcesSha256,
+  readArtifactLock,
   verifyLotusNextArtifact,
 } = require("./lotus-next-artifact.cjs");
 
@@ -80,6 +81,43 @@ test("verifies the exact clean Lotus Next artifact identity and resources", (t) 
 
   assert.equal(result.manifest.resources.length, 2);
   assert.match(result.manifestSha256, /^[0-9a-f]{64}$/);
+});
+
+test("accepts canonical CRLF JSON with stable manifest identity", (t) => {
+  const fixture = artifactFixture();
+  t.after(() => fs.rmSync(fixture.directory, { recursive: true, force: true }));
+
+  const manifestPath = path.join(
+    fixture.directory,
+    "lotus-next-manifest.json",
+  );
+  const canonicalManifestSource = fs.readFileSync(manifestPath, "utf8");
+  fs.writeFileSync(
+    manifestPath,
+    canonicalManifestSource.replace(/\n/g, "\r\n"),
+  );
+
+  const result = verifyLotusNextArtifact({
+    distDirectory: fixture.directory,
+  });
+  assert.equal(result.manifestSha256, sha256(canonicalManifestSource));
+
+  const lock = {
+    schemaVersion: 1,
+    packageName: fixture.manifest.packageName,
+    packageVersion: fixture.manifest.packageVersion,
+    sourceRevision: fixture.manifest.sourceRevision,
+    sourceDirty: false,
+    entrypoint: fixture.manifest.entrypoint,
+    resourcesSha256: fixture.manifest.resourcesSha256,
+    manifestSha256: result.manifestSha256,
+  };
+  const lockPath = path.join(fixture.directory, "artifact-lock.json");
+  fs.writeFileSync(
+    lockPath,
+    `${JSON.stringify(lock, null, 2)}\n`.replace(/\n/g, "\r\n"),
+  );
+  assert.deepEqual(readArtifactLock(lockPath), lock);
 });
 
 test("rejects a resource whose bytes changed after the manifest was written", (t) => {

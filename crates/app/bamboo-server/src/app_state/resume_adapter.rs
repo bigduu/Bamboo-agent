@@ -194,7 +194,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
-        spawn_event_forwarder(
+        let history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.clone(),
             execution_reservation.run_id().to_string(),
@@ -262,6 +262,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     disabled_tools: config.disabled_tools,
                     disabled_skill_ids: config.disabled_skill_ids,
                     mpsc_tx,
+                    history_commit_barrier,
                     image_fallback,
                     gold_config,
                     app_data_dir: Some(state.app_data_dir.clone()),
@@ -543,6 +544,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 disabled_tools: config.disabled_tools,
                 disabled_skill_ids: config.disabled_skill_ids,
                 mpsc_tx,
+                history_commit_barrier,
                 image_fallback,
                 gold_config,
                 app_data_dir: Some(state.app_data_dir.clone()),

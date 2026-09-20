@@ -1590,6 +1590,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 0,
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_prompt_usage: None,
         });
         session.conversation_summary = Some(ConversationSummary::new("summary", 5, 100));
         session.compression_events = vec![CompressionEvent::new(
