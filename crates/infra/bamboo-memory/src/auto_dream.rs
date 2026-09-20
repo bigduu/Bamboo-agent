@@ -385,7 +385,7 @@ pub fn build_extraction_prompt(candidates: &[DreamCandidateInfo]) -> String {
     prompt.push_str("Rules:\n");
     prompt.push_str("- Return JSON only, no markdown fences or commentary unless the entire response is fenced JSON.\n");
     prompt.push_str("- Output shape: {\"candidates\":[{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"scope\":\"project\"|\"global\",\"content\":string,\"tags\":string[],\"session_id\":string,\"confidence\":\"high\"|\"medium\"|\"low\"}],\"source_exhausted\":boolean}\n");
-    prompt.push_str("- Include at most 8 candidates in this response page.\n");
+    prompt.push_str("- Include at most 8 durable-memory candidates and at most 8 Ledger candidates in this response page.\n");
     prompt.push_str("- Set source_exhausted=true only after examining the entire supplied source and returning every remaining durable-memory candidate. Set it to false when more candidates remain beyond this page; Bamboo will request another page before acknowledging the source watermark.\n");
     prompt.push_str("- A continuation request lists candidates already returned. Do not repeat them; return only the next remaining candidates.\n");
     prompt.push_str("- Each candidate must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts into a single candidate.\n");

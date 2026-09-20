@@ -457,7 +457,8 @@ struct ExtractedCandidateBatch {
 
 /// Retry state contains only parsed, privacy-checked candidates and hashed
 /// source identity. Raw Session text, prompts, provider payloads, tool
-/// arguments, paths, and memory bodies are deliberately absent.
+/// arguments/results, paths, and pre-existing memory bodies are deliberately
+/// absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExtractionCheckpoint {
     version: u32,
@@ -637,6 +638,29 @@ fn extraction_checkpoint_path(
     extraction_checkpoint_session_dir(ctx, session_id).join(format!("{checkpoint_id}.json"))
 }
 
+fn validate_extracted_candidate_batch(extracted: &ExtractedCandidateBatch) -> Result<(), String> {
+    if extracted.memory.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        || extracted.ledger.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+    {
+        return Err(format!(
+            "AutoDream extraction checkpoint exceeds the {} candidate safety cap",
+            EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        ));
+    }
+    if !extracted
+        .memory
+        .iter()
+        .all(durable_candidate_is_secret_safe)
+        || !extracted.ledger.iter().all(ledger_candidate_is_secret_safe)
+    {
+        return Err(
+            "AutoDream extraction checkpoint contains a candidate that failed the privacy boundary"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 async fn read_extraction_checkpoint(
     path: &Path,
     checkpoint_id: &str,
@@ -670,6 +694,7 @@ async fn read_extraction_checkpoint(
     {
         return Err("AutoDream extraction checkpoint identity mismatch".to_string());
     }
+    validate_extracted_candidate_batch(&checkpoint.extracted)?;
     Ok(Some(checkpoint))
 }
 
@@ -677,6 +702,7 @@ async fn write_extraction_checkpoint(
     path: &Path,
     checkpoint: &ExtractionCheckpoint,
 ) -> Result<bool, String> {
+    validate_extracted_candidate_batch(&checkpoint.extracted)?;
     let bytes = serde_json::to_vec_pretty(checkpoint)
         .map_err(|error| format!("failed to serialize AutoDream extraction checkpoint: {error}"))?;
     let parent = path
@@ -1141,14 +1167,7 @@ async fn extract_durable_candidate_batch(
     for page_index in 0..EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH {
         let raw = collect_stream_text(provider.clone(), model, request_prompt).await?;
         let mut page_memory = parse_extraction_candidates(&raw)?;
-        if page_memory.len() > EXTRACTION_MAX_CANDIDATES {
-            return Err(format!(
-                "AutoDream extraction page returned {} candidates; maximum is {}",
-                page_memory.len(),
-                EXTRACTION_MAX_CANDIDATES
-            ));
-        }
-        let source_exhausted = extraction_page_source_exhausted(&raw, page_memory.len())?;
+        let source_exhausted = extraction_page_source_exhausted(&raw)?;
         page_memory.retain_mut(|candidate| {
             restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
         });
@@ -1199,17 +1218,35 @@ async fn extract_durable_candidate_batch(
     ))
 }
 
-fn extraction_page_source_exhausted(
-    raw: &str,
-    memory_candidate_count: usize,
-) -> Result<bool, String> {
+fn extraction_page_source_exhausted(raw: &str) -> Result<bool, String> {
     let value =
         serde_json::from_str::<serde_json::Value>(bamboo_memory::auto_dream::strip_json_fence(raw))
             .map_err(|error| format!("failed to parse extraction page status: {error}"))?;
+    let candidate_count = |field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let memory_candidate_count = candidate_count("candidates");
+    let ledger_candidate_count = candidate_count("ledger_candidates");
+    for (label, count) in [
+        ("durable-memory", memory_candidate_count),
+        ("Ledger", ledger_candidate_count),
+    ] {
+        if count > EXTRACTION_MAX_CANDIDATES {
+            return Err(format!(
+                "AutoDream extraction page returned {count} {label} candidates; maximum is {}",
+                EXTRACTION_MAX_CANDIDATES
+            ));
+        }
+    }
+    let page_is_saturated = memory_candidate_count == EXTRACTION_MAX_CANDIDATES
+        || ledger_candidate_count == EXTRACTION_MAX_CANDIDATES;
     match value.get("source_exhausted") {
         Some(serde_json::Value::Bool(exhausted)) => Ok(*exhausted),
         Some(_) => Err("AutoDream extraction source_exhausted must be a boolean".to_string()),
-        None if memory_candidate_count < EXTRACTION_MAX_CANDIDATES => Ok(true),
+        None if !page_is_saturated => Ok(true),
         None => Err(
             "AutoDream extraction saturated the eight-candidate page without source_exhausted; source watermark was not acknowledged"
                 .to_string(),
@@ -1245,18 +1282,11 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
 ) -> Result<ExtractionWrites, String> {
+    validate_extracted_candidate_batch(&extracted)?;
     let ExtractedCandidateBatch {
         memory: candidates,
         ledger: ledger_candidates,
     } = extracted;
-    if candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
-        || ledger_candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
-    {
-        return Err(format!(
-            "AutoDream extraction checkpoint exceeds the {} candidate safety cap",
-            EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
-        ));
-    }
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
@@ -3007,6 +3037,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extraction_checkpoint_io_revalidates_the_privacy_boundary() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint_id = "a".repeat(64);
+        let checkpoint_path = temp_dir.path().join(format!("{checkpoint_id}.json"));
+        let checkpoint = ExtractionCheckpoint {
+            version: EXTRACTION_CHECKPOINT_VERSION,
+            batch_id: checkpoint_id.clone(),
+            session_key: extraction_checkpoint_session_key("session-checkpoint-privacy"),
+            source_updated_at: "2026-09-20T00:00:20Z".to_string(),
+            transaction_id: "b".repeat(64),
+            batch_index: 0,
+            batch_count: 1,
+            extracted: ExtractedCandidateBatch {
+                memory: vec![DurableExtractionCandidate {
+                    title: "Credential".to_string(),
+                    kind: "reference".to_string(),
+                    content: "OPENAI_API_KEY=sk-proj-12345678901234567890".to_string(),
+                    scope: Some("global".to_string()),
+                    tags: Vec::new(),
+                    session_id: Some("session-checkpoint-privacy".to_string()),
+                    confidence: Some("high".to_string()),
+                }],
+                ledger: Vec::new(),
+            },
+        };
+
+        let write_error = write_extraction_checkpoint(&checkpoint_path, &checkpoint)
+            .await
+            .expect_err("unsafe candidates must not be checkpointed");
+        assert!(write_error.contains("privacy boundary"));
+        assert!(!checkpoint_path.exists());
+
+        tokio::fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint).expect("serialize tampered checkpoint"),
+        )
+        .await
+        .expect("write tampered checkpoint");
+        let read_error = read_extraction_checkpoint(&checkpoint_path, &checkpoint_id)
+            .await
+            .expect_err("unsafe persisted candidates must not be replayed");
+        assert!(read_error.contains("privacy boundary"));
+    }
+
+    #[tokio::test]
     async fn sink_failure_replays_checkpoint_without_a_second_provider_call() {
         const RAW_SOURCE: &str = "RAW_SINK_RETRY_SOURCE_MUST_NOT_ENTER_CHECKPOINT";
 
@@ -3177,6 +3252,32 @@ mod tests {
         .await
         .expect_err("a repeated continuation page must fail closed");
         assert!(error.contains("made no safe, deduplicated progress"));
+
+        let oversized_ledger_page = serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": (0..=EXTRACTION_MAX_CANDIDATES)
+                .map(|index| serde_json::json!({
+                    "title": format!("Commitment {index}"),
+                    "kind": "todo",
+                    "excerpt": format!("I will complete commitment {index}."),
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                }))
+                .collect::<Vec<_>>(),
+            "source_exhausted": true
+        })
+        .to_string();
+        let oversized = Arc::new(SequenceProvider::new(vec![oversized_ledger_page]));
+        let oversized_provider: Arc<dyn LLMProvider> = oversized;
+        let error = extract_durable_candidate_batch(
+            &oversized_provider,
+            "fast-model",
+            "bounded source".to_string(),
+            "session-pagination",
+        )
+        .await
+        .expect_err("Ledger candidates share the per-page safety cap");
+        assert!(error.contains("Ledger candidates; maximum is 8"));
     }
 
     #[tokio::test]
