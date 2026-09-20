@@ -5,7 +5,7 @@
 //! orchestration in `bamboo_engine::auto_dream`. The orchestration itself
 //! (LLM provider / session-store driven runs) lives in the engine, not here.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Extraction types
@@ -35,7 +35,7 @@ struct RawDurableExtractionEnvelope {
     _source_exhausted: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableExtractionCandidate {
     pub title: String,
@@ -56,7 +56,7 @@ pub struct DurableExtractionCandidate {
 /// proposed by the same extraction pass that produces durable memory
 /// candidates — no extra LLM call. Missing fields are defaulted; a malformed
 /// typed item degrades the Ledger array without invalidating Memory candidates.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LedgerExtractionCandidate {
     #[serde(default)]
@@ -384,8 +384,10 @@ pub fn build_extraction_prompt(candidates: &[DreamCandidateInfo]) -> String {
     prompt.push_str("Extract only durable memory candidates that should become canonical project/global memory.\n\n");
     prompt.push_str("Rules:\n");
     prompt.push_str("- Return JSON only, no markdown fences or commentary unless the entire response is fenced JSON.\n");
-    prompt.push_str("- Output shape: {\"candidates\":[{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"scope\":\"project\"|\"global\",\"content\":string,\"tags\":string[],\"session_id\":string,\"confidence\":\"high\"|\"medium\"|\"low\"}]}\n");
-    prompt.push_str("- Include at most 8 candidates total.\n");
+    prompt.push_str("- Output shape: {\"candidates\":[{\"title\":string,\"type\":\"user\"|\"feedback\"|\"project\"|\"reference\",\"scope\":\"project\"|\"global\",\"content\":string,\"tags\":string[],\"session_id\":string,\"confidence\":\"high\"|\"medium\"|\"low\"}],\"source_exhausted\":boolean}\n");
+    prompt.push_str("- Include at most 8 candidates in this response page.\n");
+    prompt.push_str("- Set source_exhausted=true only after examining the entire supplied source and returning every remaining durable-memory candidate. Set it to false when more candidates remain beyond this page; Bamboo will request another page before acknowledging the source watermark.\n");
+    prompt.push_str("- A continuation request lists candidates already returned. Do not repeat them; return only the next remaining candidates.\n");
     prompt.push_str("- Each candidate must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts into a single candidate.\n");
     prompt.push_str("- The title must concisely summarize THAT candidate's own content so it can be found later by keyword search; never use a generic title that does not match the content.\n");
     prompt.push_str("- Skip transient scratch state, code/project structure derivable from tools, and anything low-confidence or secret-like.\n");

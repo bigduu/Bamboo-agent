@@ -1,10 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::{Message, SessionKind};
@@ -18,7 +22,8 @@ use bamboo_memory::auto_dream::{
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
     parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
     parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild, truncate_chars,
-    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, LedgerExtractionCandidate,
+    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, DurableExtractionCandidate,
+    LedgerExtractionCandidate,
 };
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
@@ -44,6 +49,11 @@ const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
 const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
+const EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH: usize = 32;
+const EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH: usize =
+    EXTRACTION_MAX_CANDIDATES * EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH;
+const EXTRACTION_CHECKPOINT_VERSION: u32 = 3;
+const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v3";
 
 fn provider_session_alias(index: usize) -> String {
     format!("source-session-{:04}", index + 1)
@@ -439,6 +449,426 @@ struct ExtractionWrites {
     ledger: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtractedCandidateBatch {
+    memory: Vec<DurableExtractionCandidate>,
+    ledger: Vec<LedgerExtractionCandidate>,
+}
+
+/// Retry state contains only parsed, privacy-checked candidates and hashed
+/// source identity. Raw Session text, prompts, provider payloads, tool
+/// arguments, paths, and memory bodies are deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtractionCheckpoint {
+    version: u32,
+    batch_id: String,
+    session_key: String,
+    source_updated_at: String,
+    transaction_id: String,
+    batch_index: usize,
+    batch_count: usize,
+    extracted: ExtractedCandidateBatch,
+}
+
+#[derive(Debug)]
+struct PreparedExtractionBatch {
+    context_index: usize,
+    extracted: ExtractedCandidateBatch,
+}
+
+#[derive(Debug)]
+struct PendingExtractionBatch {
+    context_index: usize,
+    prompt: String,
+    checkpoint_id: String,
+    transaction_id: String,
+    batch_index: usize,
+    batch_count: usize,
+}
+
+#[derive(Debug)]
+struct StoredExtractionTransaction {
+    source_updated_at: String,
+    transaction_id: String,
+    batches: Vec<ExtractionCheckpoint>,
+}
+
+fn extraction_prompt(session: &CandidateSessionContext) -> String {
+    let provider_session_id = provider_session_alias(0);
+    let provider_project_key = session
+        .project_key
+        .as_ref()
+        .map(|_| provider_project_alias(0));
+    build_extraction_prompt(&[sanitized_extraction_candidate_info(
+        session,
+        provider_session_id,
+        provider_project_key,
+    )])
+}
+
+fn extraction_checkpoint_session_key(session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-extraction-session-v1\0");
+    digest.update(session_id.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn extraction_checkpoint_id(
+    model: &str,
+    session_id: &str,
+    source_updated_at: &str,
+    prompt: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-extraction-checkpoint-v3\0");
+    digest.update(model.as_bytes());
+    digest.update(b"\0");
+    digest.update(extraction_checkpoint_session_key(session_id).as_bytes());
+    digest.update(b"\0");
+    digest.update(source_updated_at.as_bytes());
+    digest.update(b"\0");
+    digest.update(prompt.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn extraction_transaction_id(
+    session_id: &str,
+    source_updated_at: &str,
+    checkpoint_ids: &[String],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-extraction-transaction-v3\0");
+    digest.update(extraction_checkpoint_session_key(session_id).as_bytes());
+    digest.update(b"\0");
+    digest.update(source_updated_at.as_bytes());
+    for checkpoint_id in checkpoint_ids {
+        digest.update(b"\0");
+        digest.update(checkpoint_id.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn build_pending_extraction_batches(
+    model: &str,
+    sessions: &[CandidateSessionContext],
+) -> Vec<PendingExtractionBatch> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(context_index, session)| {
+            let prompt = extraction_prompt(session);
+            let source_updated_at = session.entry.updated_at.to_rfc3339();
+            PendingExtractionBatch {
+                context_index,
+                checkpoint_id: extraction_checkpoint_id(
+                    model,
+                    &session.session_id,
+                    &source_updated_at,
+                    &prompt,
+                ),
+                prompt,
+                transaction_id: String::new(),
+                batch_index: 0,
+                batch_count: 0,
+            }
+        })
+        .collect()
+}
+
+fn assign_pending_extraction_transactions(
+    sessions: &[CandidateSessionContext],
+    pending_batches: &mut [PendingExtractionBatch],
+) -> HashMap<String, Vec<usize>> {
+    let mut indexes_by_session: HashMap<String, Vec<usize>> = HashMap::new();
+    for (pending_index, pending) in pending_batches.iter().enumerate() {
+        indexes_by_session
+            .entry(sessions[pending.context_index].session_id.clone())
+            .or_default()
+            .push(pending_index);
+    }
+    for (session_id, pending_indexes) in &indexes_by_session {
+        let checkpoint_ids = pending_indexes
+            .iter()
+            .map(|index| pending_batches[*index].checkpoint_id.clone())
+            .collect::<Vec<_>>();
+        let source_updated_at = sessions[pending_batches[pending_indexes[0]].context_index]
+            .entry
+            .updated_at
+            .to_rfc3339();
+        let transaction_id =
+            extraction_transaction_id(session_id, &source_updated_at, &checkpoint_ids);
+        let batch_count = pending_indexes.len();
+        for (batch_index, pending_index) in pending_indexes.iter().enumerate() {
+            let pending = &mut pending_batches[*pending_index];
+            pending.transaction_id.clone_from(&transaction_id);
+            pending.batch_index = batch_index;
+            pending.batch_count = batch_count;
+        }
+    }
+    indexes_by_session
+}
+
+fn checkpoint_matches_pending_batch(
+    checkpoint: &ExtractionCheckpoint,
+    session_id: &str,
+    source_updated_at: &str,
+    pending: &PendingExtractionBatch,
+) -> bool {
+    checkpoint.session_key == extraction_checkpoint_session_key(session_id)
+        && checkpoint.source_updated_at == source_updated_at
+        && checkpoint.transaction_id == pending.transaction_id
+        && checkpoint.batch_id == pending.checkpoint_id
+        && checkpoint.batch_index == pending.batch_index
+        && checkpoint.batch_count == pending.batch_count
+}
+
+fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -> PathBuf {
+    ctx.session_store
+        .bamboo_home_dir()
+        .join(EXTRACTION_CHECKPOINT_DIR)
+        .join(extraction_checkpoint_session_key(session_id))
+}
+
+fn extraction_checkpoint_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    checkpoint_id: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!("{checkpoint_id}.json"))
+}
+
+async fn read_extraction_checkpoint(
+    path: &Path,
+    checkpoint_id: &str,
+) -> Result<Option<ExtractionCheckpoint>, String> {
+    let raw = match tokio::fs::read(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read AutoDream extraction checkpoint: {error}"
+            ));
+        }
+    };
+    let checkpoint: ExtractionCheckpoint = serde_json::from_slice(&raw)
+        .map_err(|error| format!("failed to parse AutoDream extraction checkpoint: {error}"))?;
+    if checkpoint.version != EXTRACTION_CHECKPOINT_VERSION
+        || checkpoint.batch_id != checkpoint_id
+        || checkpoint.session_key.len() != 64
+        || !checkpoint
+            .session_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || checkpoint.transaction_id.len() != 64
+        || !checkpoint
+            .transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || checkpoint.batch_count == 0
+        || checkpoint.batch_index >= checkpoint.batch_count
+        || DateTime::parse_from_rfc3339(&checkpoint.source_updated_at).is_err()
+    {
+        return Err("AutoDream extraction checkpoint identity mismatch".to_string());
+    }
+    Ok(Some(checkpoint))
+}
+
+async fn write_extraction_checkpoint(
+    path: &Path,
+    checkpoint: &ExtractionCheckpoint,
+) -> Result<bool, String> {
+    let bytes = serde_json::to_vec_pretty(checkpoint)
+        .map_err(|error| format!("failed to serialize AutoDream extraction checkpoint: {error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "AutoDream extraction checkpoint has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create AutoDream checkpoint directory: {error}"))?;
+    let temporary_path = parent.join(format!(
+        ".{}.{}.tmp",
+        checkpoint.batch_id,
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::hard_link(&temporary_path, path).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temporary_path).await;
+    match write_result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(format!(
+            "failed to persist AutoDream extraction checkpoint: {error}"
+        )),
+    }
+}
+
+async fn remove_extraction_checkpoint(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    checkpoint_id: &str,
+) {
+    let path = extraction_checkpoint_path(ctx, session_id, checkpoint_id);
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                target: DREAM_TRACING_TARGET,
+                event = "extraction_checkpoint_cleanup_failed",
+                checkpoint_id,
+                "Could not remove an acknowledged AutoDream extraction checkpoint: {error}"
+            );
+        }
+    }
+}
+
+async fn load_extraction_checkpoint_transactions(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+) -> Result<Vec<StoredExtractionTransaction>, String> {
+    let directory = extraction_checkpoint_session_dir(ctx, session_id);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect AutoDream extraction checkpoints: {error}"
+            ));
+        }
+    };
+    let expected_session_key = extraction_checkpoint_session_key(session_id);
+    let mut grouped: HashMap<String, Vec<ExtractionCheckpoint>> = HashMap::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to enumerate AutoDream extraction checkpoints: {error}"))?
+    {
+        let path = entry.path();
+        let Some(checkpoint_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if checkpoint_id.len() != 64 || !checkpoint_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let checkpoint = read_extraction_checkpoint(&path, checkpoint_id)
+            .await?
+            .ok_or_else(|| {
+                "AutoDream extraction checkpoint disappeared during inspection".to_string()
+            })?;
+        if checkpoint.session_key != expected_session_key {
+            return Err("AutoDream extraction checkpoint Session identity mismatch".to_string());
+        }
+        grouped
+            .entry(checkpoint.transaction_id.clone())
+            .or_default()
+            .push(checkpoint);
+    }
+
+    let mut complete = Vec::new();
+    for (transaction_id, mut batches) in grouped {
+        batches.sort_by_key(|batch| batch.batch_index);
+        let first = batches
+            .first()
+            .expect("checkpoint group constructed from at least one entry");
+        if batches.iter().any(|batch| {
+            batch.transaction_id != transaction_id
+                || batch.source_updated_at != first.source_updated_at
+                || batch.batch_count != first.batch_count
+        }) {
+            return Err("AutoDream extraction transaction metadata mismatch".to_string());
+        }
+        if batches.len() != first.batch_count
+            || !batches
+                .iter()
+                .enumerate()
+                .all(|(index, batch)| batch.batch_index == index)
+        {
+            continue;
+        }
+        let ordered_ids = batches
+            .iter()
+            .map(|batch| batch.batch_id.clone())
+            .collect::<Vec<_>>();
+        if extraction_transaction_id(session_id, &first.source_updated_at, &ordered_ids)
+            != transaction_id
+        {
+            return Err("AutoDream extraction transaction identity mismatch".to_string());
+        }
+        complete.push(StoredExtractionTransaction {
+            source_updated_at: first.source_updated_at.clone(),
+            transaction_id,
+            batches,
+        });
+    }
+    complete.sort_by(|left, right| {
+        left.source_updated_at
+            .cmp(&right.source_updated_at)
+            .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+    });
+    Ok(complete)
+}
+
+async fn remove_superseded_extraction_checkpoints(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    retained_checkpoint_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let directory = extraction_checkpoint_session_dir(ctx, session_id);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect AutoDream extraction checkpoints: {error}"
+            ));
+        }
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to enumerate AutoDream extraction checkpoints: {error}"))?
+    {
+        let path = entry.path();
+        let Some(checkpoint_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if checkpoint_id.len() != 64
+            || !checkpoint_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || retained_checkpoint_ids.contains(checkpoint_id)
+        {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove superseded AutoDream extraction checkpoint: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn extract_and_persist_durable_candidates(
     ctx: &AutoDreamContext,
@@ -469,46 +899,371 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
-    let mut provider_aliases = HashMap::new();
-    let mut provider_project_aliases = HashMap::<String, String>::new();
-    let candidates_info: Vec<DreamCandidateInfo> = sessions
+    let extraction_sessions = sessions.to_vec();
+    let mut pending_batches = build_pending_extraction_batches(model, &extraction_sessions);
+    let pending_indexes_by_session =
+        assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+    let source_updated_at_by_session = extraction_sessions
         .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let alias = provider_session_alias(index);
-            provider_aliases.insert(alias.clone(), session.session_id.clone());
-            let project_alias = session.project_key.as_ref().map(|project_key| {
-                let next_index = provider_project_aliases.len();
-                provider_project_aliases
-                    .entry(project_key.clone())
-                    .or_insert_with(|| provider_project_alias(next_index))
-                    .clone()
-            });
-            sanitized_extraction_candidate_info(session, alias, project_alias)
+        .map(|session| {
+            (
+                session.session_id.clone(),
+                session.entry.updated_at.to_rfc3339(),
+            )
         })
-        .collect();
-    let prompt = build_extraction_prompt(&candidates_info);
-    let raw = collect_stream_text(provider.clone(), model, prompt).await?;
-    let mut candidates = parse_extraction_candidates(&raw)?;
-    candidates.retain_mut(|candidate| {
-        restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
+        .collect::<HashMap<_, _>>();
+    let mut total_writes = ExtractionWrites::default();
+    let mut completed_transactions = HashSet::new();
+    let mut replayed_watermarks = HashMap::new();
+
+    // Replay complete candidate-only checkpoints before asking the provider for
+    // a newer source. A later sink or watermark failure therefore never asks
+    // the model to restate a prefix that was already extracted successfully.
+    for (session_id, pending_indexes) in &pending_indexes_by_session {
+        let retained = pending_indexes
+            .iter()
+            .map(|index| pending_batches[*index].checkpoint_id.clone())
+            .collect::<HashSet<_>>();
+        let transactions = load_extraction_checkpoint_transactions(ctx, session_id).await?;
+        let context = extraction_sessions
+            .iter()
+            .find(|session| session.session_id == *session_id)
+            .expect("pending extraction Session must have a context");
+        let state = memory
+            .read_session_state(session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to read extraction watermark before checkpoint replay for {session_id}: {error}"
+                )
+            })?;
+        let mut acknowledged_watermark = state
+            .last_extracted_at
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "invalid extraction watermark before checkpoint replay for {session_id}: {error}"
+                )
+            })?
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+
+        for transaction in transactions {
+            let source_watermark = DateTime::parse_from_rfc3339(&transaction.source_updated_at)
+                .expect("stored checkpoint timestamp was validated while loading")
+                .with_timezone(&Utc);
+            if source_watermark > context.entry.updated_at {
+                return Err(format!(
+                    "AutoDream extraction checkpoint watermark is newer than Session authority for {session_id}"
+                ));
+            }
+            let checkpoint_ids = transaction
+                .batches
+                .iter()
+                .map(|batch| batch.batch_id.clone())
+                .collect::<Vec<_>>();
+            if acknowledged_watermark.is_none_or(|watermark| watermark < source_watermark) {
+                for checkpoint in transaction.batches {
+                    let writes = persist_durable_candidate_batch_with_project_resolver(
+                        ctx,
+                        memory,
+                        ledger,
+                        std::slice::from_ref(context),
+                        checkpoint.extracted,
+                        project_resolver,
+                        current_store_is_project_scoped,
+                    )
+                    .await?;
+                    total_writes.memory = total_writes.memory.saturating_add(writes.memory);
+                    total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
+                }
+                memory
+                    .mark_session_extracted(session_id, &transaction.source_updated_at)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to acknowledge replayed extraction transaction for {session_id}: {error}"
+                        )
+                    })?;
+                acknowledged_watermark = Some(source_watermark);
+                replayed_watermarks.insert(session_id.clone(), source_watermark);
+            }
+            completed_transactions.insert((session_id.clone(), transaction.transaction_id));
+            for checkpoint_id in checkpoint_ids {
+                remove_extraction_checkpoint(ctx, session_id, &checkpoint_id).await;
+            }
+        }
+        remove_superseded_extraction_checkpoints(ctx, session_id, &retained).await?;
+    }
+
+    pending_batches.retain(|pending| {
+        let session = &extraction_sessions[pending.context_index];
+        !completed_transactions
+            .contains(&(session.session_id.clone(), pending.transaction_id.clone()))
+            && replayed_watermarks
+                .get(&session.session_id)
+                .is_none_or(|watermark| session.entry.updated_at >= *watermark)
     });
+    if pending_batches.is_empty() {
+        return Ok(total_writes);
+    }
+
+    let mut prepared_batches = Vec::with_capacity(pending_batches.len());
+    let mut checkpoint_ids_by_session: HashMap<String, Vec<String>> = HashMap::new();
+    for pending in &pending_batches {
+        checkpoint_ids_by_session
+            .entry(
+                extraction_sessions[pending.context_index]
+                    .session_id
+                    .clone(),
+            )
+            .or_default()
+            .push(pending.checkpoint_id.clone());
+    }
+
+    // Complete and durably checkpoint every provider batch before either sink
+    // starts. A later provider failure therefore produces zero sink writes.
+    for pending in pending_batches {
+        let session = &extraction_sessions[pending.context_index];
+        let source_updated_at = source_updated_at_by_session
+            .get(&session.session_id)
+            .expect("every pending Session has a source watermark");
+        let checkpoint_path =
+            extraction_checkpoint_path(ctx, &session.session_id, &pending.checkpoint_id);
+        let extracted = match read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
+            .await?
+        {
+            Some(checkpoint) => {
+                if !checkpoint_matches_pending_batch(
+                    &checkpoint,
+                    &session.session_id,
+                    source_updated_at,
+                    &pending,
+                ) {
+                    return Err("AutoDream pending checkpoint metadata mismatch".to_string());
+                }
+                checkpoint.extracted
+            }
+            None => {
+                let extracted = extract_durable_candidate_batch(
+                    provider,
+                    model,
+                    pending.prompt.clone(),
+                    &session.session_id,
+                )
+                .await?;
+                let checkpoint = ExtractionCheckpoint {
+                    version: EXTRACTION_CHECKPOINT_VERSION,
+                    batch_id: pending.checkpoint_id.clone(),
+                    session_key: extraction_checkpoint_session_key(&session.session_id),
+                    source_updated_at: source_updated_at.clone(),
+                    transaction_id: pending.transaction_id.clone(),
+                    batch_index: pending.batch_index,
+                    batch_count: pending.batch_count,
+                    extracted: extracted.clone(),
+                };
+                if write_extraction_checkpoint(&checkpoint_path, &checkpoint).await? {
+                    extracted
+                } else {
+                    let checkpoint =
+                        read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
+                            .await?
+                            .ok_or_else(|| {
+                                "concurrent AutoDream checkpoint disappeared before reuse"
+                                    .to_string()
+                            })?;
+                    if !checkpoint_matches_pending_batch(
+                        &checkpoint,
+                        &session.session_id,
+                        source_updated_at,
+                        &pending,
+                    ) {
+                        return Err("concurrent AutoDream checkpoint metadata mismatch".to_string());
+                    }
+                    checkpoint.extracted
+                }
+            }
+        };
+        prepared_batches.push(PreparedExtractionBatch {
+            context_index: pending.context_index,
+            extracted,
+        });
+    }
+
+    for batch in prepared_batches {
+        let writes = persist_durable_candidate_batch_with_project_resolver(
+            ctx,
+            memory,
+            ledger,
+            std::slice::from_ref(&extraction_sessions[batch.context_index]),
+            batch.extracted,
+            project_resolver,
+            current_store_is_project_scoped,
+        )
+        .await?;
+        total_writes.memory = total_writes.memory.saturating_add(writes.memory);
+        total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
+    }
+
+    for (session_id, checkpoint_ids) in checkpoint_ids_by_session {
+        let source_updated_at = source_updated_at_by_session
+            .get(&session_id)
+            .expect("every checkpointed Session has a source watermark");
+        memory
+            .mark_session_extracted(&session_id, source_updated_at)
+            .await
+            .map_err(|error| {
+                format!("failed to update session extraction state for {session_id}: {error}")
+            })?;
+        for checkpoint_id in checkpoint_ids {
+            remove_extraction_checkpoint(ctx, &session_id, &checkpoint_id).await;
+        }
+    }
+
+    Ok(total_writes)
+}
+
+async fn extract_durable_candidate_batch(
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+    prompt: String,
+    session_id: &str,
+) -> Result<ExtractedCandidateBatch, String> {
+    let base_prompt = prompt;
+    let mut request_prompt = base_prompt.clone();
+    let mut memory = Vec::new();
+    let mut ledger = Vec::new();
+    let mut memory_fingerprints = HashSet::new();
+    let mut ledger_fingerprints = HashSet::new();
+    let provider_aliases = HashMap::from([(provider_session_alias(0), session_id.to_string())]);
+
+    for page_index in 0..EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH {
+        let raw = collect_stream_text(provider.clone(), model, request_prompt).await?;
+        let mut page_memory = parse_extraction_candidates(&raw)?;
+        if page_memory.len() > EXTRACTION_MAX_CANDIDATES {
+            return Err(format!(
+                "AutoDream extraction page returned {} candidates; maximum is {}",
+                page_memory.len(),
+                EXTRACTION_MAX_CANDIDATES
+            ));
+        }
+        let source_exhausted = extraction_page_source_exhausted(&raw, page_memory.len())?;
+        page_memory.retain_mut(|candidate| {
+            restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
+        });
+        let mut page_ledger = parse_ledger_candidates(&raw);
+        page_ledger.retain_mut(|candidate| {
+            restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
+        });
+        let memory_count_before = memory.len();
+        let ledger_count_before = ledger.len();
+
+        for candidate in page_memory
+            .into_iter()
+            .filter(durable_candidate_is_secret_safe)
+        {
+            let fingerprint = serde_json::to_string(&candidate)
+                .map_err(|error| format!("failed to fingerprint memory candidate: {error}"))?;
+            if memory_fingerprints.insert(fingerprint) {
+                memory.push(candidate);
+            }
+        }
+        for candidate in page_ledger
+            .into_iter()
+            .filter(ledger_candidate_is_secret_safe)
+        {
+            let fingerprint = serde_json::to_string(&candidate)
+                .map_err(|error| format!("failed to fingerprint Ledger candidate: {error}"))?;
+            if ledger_fingerprints.insert(fingerprint) {
+                ledger.push(candidate);
+            }
+        }
+
+        if source_exhausted {
+            return Ok(ExtractedCandidateBatch { memory, ledger });
+        }
+        if memory.len() == memory_count_before && ledger.len() == ledger_count_before {
+            return Err(
+                "AutoDream extraction declared remaining candidates but its continuation page made no safe, deduplicated progress"
+                    .to_string(),
+            );
+        }
+        request_prompt =
+            extraction_continuation_prompt(&base_prompt, page_index + 2, &memory, &ledger)?;
+    }
+
+    Err(format!(
+        "AutoDream extraction did not exhaust its source within {} pages; source watermark was not acknowledged",
+        EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH
+    ))
+}
+
+fn extraction_page_source_exhausted(
+    raw: &str,
+    memory_candidate_count: usize,
+) -> Result<bool, String> {
+    let value =
+        serde_json::from_str::<serde_json::Value>(bamboo_memory::auto_dream::strip_json_fence(raw))
+            .map_err(|error| format!("failed to parse extraction page status: {error}"))?;
+    match value.get("source_exhausted") {
+        Some(serde_json::Value::Bool(exhausted)) => Ok(*exhausted),
+        Some(_) => Err("AutoDream extraction source_exhausted must be a boolean".to_string()),
+        None if memory_candidate_count < EXTRACTION_MAX_CANDIDATES => Ok(true),
+        None => Err(
+            "AutoDream extraction saturated the eight-candidate page without source_exhausted; source watermark was not acknowledged"
+                .to_string(),
+        ),
+    }
+}
+
+fn extraction_continuation_prompt(
+    base_prompt: &str,
+    page_number: usize,
+    memory: &[DurableExtractionCandidate],
+    ledger: &[LedgerExtractionCandidate],
+) -> Result<String, String> {
+    let already_returned = serde_json::to_string(&serde_json::json!({
+        "candidates": memory,
+        "ledger_candidates": ledger,
+    }))
+    .map_err(|error| format!("failed to serialize extraction continuation state: {error}"))?;
+    Ok(format!(
+        "{base_prompt}\n\n## Exhaustive continuation page {page_number}\n\
+The preceding response declared source_exhausted=false. Re-examine the same source, skip every candidate in already_returned, and return the next page only. Do not acknowledge exhaustion until every remaining durable-memory candidate has been emitted.\n\
+- already_returned: {already_returned}\n"
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_durable_candidate_batch_with_project_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    ledger: &LedgerStore,
+    sessions: &[CandidateSessionContext],
+    extracted: ExtractedCandidateBatch,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+) -> Result<ExtractionWrites, String> {
+    let ExtractedCandidateBatch {
+        memory: candidates,
+        ledger: ledger_candidates,
+    } = extracted;
+    if candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        || ledger_candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+    {
+        return Err(format!(
+            "AutoDream extraction checkpoint exceeds the {} candidate safety cap",
+            EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        ));
+    }
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
         session_project_keys.insert(session.session_id.clone(), session.project_key.clone());
     }
-    // Tolerant by design: absent/malformed ledger array → empty vec. A model-
-    // supplied source ID is routing metadata, so accept it only when it names
-    // an authoritative Session in this exact extraction input. Missing IDs
-    // remain compatible with the existing optional Ledger provenance field.
-    let mut parsed_ledger_candidates = parse_ledger_candidates(&raw);
-    parsed_ledger_candidates.retain_mut(|candidate| {
-        restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
-    });
-    let ledger_candidates = parsed_ledger_candidates
+    let ledger_candidates = ledger_candidates
         .into_iter()
-        .filter(ledger_candidate_is_secret_safe)
         .filter(|candidate| {
             candidate
                 .session_id
@@ -520,25 +1275,12 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         .collect();
 
     let mut writes = 0usize;
-    let session_source_updated_at = sessions
-        .iter()
-        .map(|session| {
-            (
-                session.session_id.clone(),
-                session.entry.updated_at.to_rfc3339(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
     type ExtractionFingerprint = (DurableMemoryType, String, String, String);
     let mut existing_by_scope: HashMap<
         (MemoryScope, Option<String>),
         HashSet<ExtractionFingerprint>,
     > = HashMap::new();
-    for candidate in candidates
-        .into_iter()
-        .filter(durable_candidate_is_secret_safe)
-        .take(EXTRACTION_MAX_CANDIDATES)
-    {
+    for candidate in candidates {
         let Some(memory_type) = parse_candidate_type(&candidate.kind) else {
             continue;
         };
@@ -721,23 +1463,6 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     }
 
     let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
-
-    // Extraction completion is acknowledged only after both durable sinks have
-    // accepted the batch. Store the source session's captured update watermark,
-    // not the later wall-clock completion time: if the session changes while the
-    // model is extracting, its newer index timestamp must remain retryable.
-    for session in sessions {
-        let session_id = &session.session_id;
-        let source_updated_at = session_source_updated_at
-            .get(session_id)
-            .expect("a touched candidate must come from the extraction input");
-        memory
-            .mark_session_extracted(session_id, source_updated_at)
-            .await
-            .map_err(|error| {
-                format!("failed to update session extraction state for {session_id}: {error}")
-            })?;
-    }
 
     Ok(ExtractionWrites {
         memory: writes,
@@ -1485,6 +2210,64 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ScriptedProvider {
+        steps: Arc<Mutex<Vec<Result<String, String>>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(steps: Vec<Result<String, String>>) -> Self {
+            Self {
+                steps: Arc::new(Mutex::new(steps)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded_prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ScriptedProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if let Some(prompt) = messages.last().map(|message| message.content.clone()) {
+                self.prompts.lock().expect("lock poisoned").push(prompt);
+            }
+            match self.steps.lock().expect("lock poisoned").remove(0) {
+                Ok(text) => Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token(text)),
+                    Ok(LLMChunk::Done),
+                ]))),
+                Err(message) => Err(LLMError::Api(message)),
+            }
+        }
+    }
+
+    fn extraction_response(title: &str, content: &str) -> String {
+        serde_json::json!({
+            "candidates": [{
+                "title": title,
+                "type": "reference",
+                "scope": "global",
+                "content": content,
+                "tags": ["auto-dream-test"],
+                "session_id": "source-session-0001",
+                "confidence": "high"
+            }],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()
+    }
+
     #[async_trait]
     impl LLMProvider for SequenceProvider {
         async fn chat_stream(
@@ -1881,7 +2664,7 @@ mod tests {
                     "scope": "global",
                     "content": TOPIC_SECRET,
                     "tags": ["credential"],
-                    "session_id": "source-session-0005",
+                    "session_id": "source-session-0001",
                     "confidence": "high"
                 },
                 {
@@ -1899,7 +2682,7 @@ mod tests {
                     "scope": "global",
                     "content": "The opaque authority fixture remains eligible.",
                     "tags": ["provenance"],
-                    "session_id": "source-session-0002",
+                    "session_id": "source-session-0001",
                     "confidence": "high"
                 }
             ],
@@ -1908,7 +2691,7 @@ mod tests {
                     "title": "PIN",
                     "kind": "todo",
                     "excerpt": "1234",
-                    "session_id": "source-session-0005",
+                    "session_id": "source-session-0001",
                     "confidence": "high"
                 },
                 {
@@ -1928,7 +2711,19 @@ mod tests {
             ]
         })
         .to_string();
-        let sequence = Arc::new(SequenceProvider::new(vec![response]));
+        let empty_response = serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence = Arc::new(SequenceProvider::new(vec![
+            response,
+            empty_response.clone(),
+            empty_response.clone(),
+            empty_response.clone(),
+            empty_response,
+        ]));
         let provider: Arc<dyn LLMProvider> = sequence.clone();
         let context = AutoDreamContext {
             session_store,
@@ -2021,8 +2816,8 @@ mod tests {
         );
 
         let prompts = sequence.recorded_prompts();
-        assert_eq!(prompts.len(), 1);
-        let prompt = &prompts[0];
+        assert_eq!(prompts.len(), contexts.len());
+        let prompt = prompts.join("\n");
         for (case, forbidden) in [
             ("title", TITLE_SECRET),
             ("summary", SUMMARY_SECRET),
@@ -2060,6 +2855,328 @@ mod tests {
             .expect("list Ledger records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record.title, "Renew passport");
+    }
+
+    #[tokio::test]
+    async fn extraction_batches_checkpoint_before_sinks_and_resume_without_restatement() {
+        const FIRST_RAW_SOURCE: &str = "RAW_FIRST_SOURCE_MUST_NOT_ENTER_CHECKPOINT";
+        const SECOND_RAW_SOURCE: &str = "RAW_SECOND_SOURCE_MUST_NOT_ENTER_CHECKPOINT";
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = bamboo_agent_core::Session::new("session-batched-retry", "model");
+        session.title = "Batched extraction".to_string();
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            FIRST_RAW_SOURCE,
+            1,
+            32,
+        ));
+        storage.save_session(&session).await.expect("save session");
+
+        let first_response = extraction_response("First durable fact", "First safe output");
+        let failing_provider = Arc::new(ScriptedProvider::new(vec![
+            Ok(first_response),
+            Err("injected later-batch failure".to_string()),
+        ]));
+        let provider: Arc<dyn LLMProvider> = failing_provider.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store: session_store.clone(),
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let mut contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+        contexts[0].summary = Some(FIRST_RAW_SOURCE.to_string());
+        contexts[0].topics.clear();
+        let mut second = contexts[0].clone();
+        second.summary = Some(SECOND_RAW_SOURCE.to_string());
+        contexts.push(second);
+
+        let ledger = LedgerStore::new(temp_dir.path());
+        let error = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect_err("a later provider batch must fail the whole transaction");
+        assert!(error.contains("injected later-batch failure"));
+        assert_eq!(failing_provider.recorded_prompts().len(), 2);
+        assert!(memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list memory after provider failure")
+            .is_empty());
+        assert!(ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list Ledger after provider failure")
+            .is_empty());
+        assert!(memory
+            .read_session_state("session-batched-retry")
+            .await
+            .expect("read retry state")
+            .last_extracted_at
+            .is_none());
+
+        let checkpoint_dir = extraction_checkpoint_session_dir(&context, "session-batched-retry");
+        let mut entries = tokio::fs::read_dir(&checkpoint_dir)
+            .await
+            .expect("read checkpoint directory");
+        let checkpoint_path = entries
+            .next_entry()
+            .await
+            .expect("read checkpoint entry")
+            .expect("one completed batch checkpoint")
+            .path();
+        assert!(entries
+            .next_entry()
+            .await
+            .expect("read end of checkpoint directory")
+            .is_none());
+        let checkpoint = tokio::fs::read_to_string(&checkpoint_path)
+            .await
+            .expect("read candidate-only checkpoint");
+        assert!(checkpoint.contains("First safe output"));
+        assert!(!checkpoint.contains(FIRST_RAW_SOURCE));
+        assert!(!checkpoint.contains(SECOND_RAW_SOURCE));
+        assert!(!checkpoint.contains(&temp_dir.path().to_string_lossy().to_string()));
+
+        let retry_sequence = Arc::new(SequenceProvider::new(vec![extraction_response(
+            "Second durable fact",
+            "Second safe output",
+        )]));
+        let retry_provider: Arc<dyn LLMProvider> = retry_sequence.clone();
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &retry_provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("retry should reuse the completed first batch");
+        assert_eq!(writes.memory, 2);
+        assert_eq!(retry_sequence.recorded_prompts().len(), 1);
+        assert!(retry_sequence.recorded_prompts()[0].contains(SECOND_RAW_SOURCE));
+        assert!(!retry_sequence.recorded_prompts()[0].contains(FIRST_RAW_SOURCE));
+        assert_eq!(
+            memory
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .expect("list completed extraction")
+                .len(),
+            2
+        );
+        assert_eq!(
+            memory
+                .read_session_state("session-batched-retry")
+                .await
+                .expect("read completed watermark")
+                .last_extracted_at
+                .as_deref(),
+            Some(contexts[0].entry.updated_at.to_rfc3339().as_str())
+        );
+        let mut remaining = tokio::fs::read_dir(&checkpoint_dir)
+            .await
+            .expect("read cleaned checkpoint directory");
+        assert!(remaining
+            .next_entry()
+            .await
+            .expect("read cleaned checkpoint directory")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sink_failure_replays_checkpoint_without_a_second_provider_call() {
+        const RAW_SOURCE: &str = "RAW_SINK_RETRY_SOURCE_MUST_NOT_ENTER_CHECKPOINT";
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = bamboo_agent_core::Session::new("session-sink-retry", "model");
+        session.title = "Sink retry".to_string();
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            RAW_SOURCE, 1, 32,
+        ));
+        storage.save_session(&session).await.expect("save session");
+
+        let response = serde_json::json!({
+            "candidates": [{
+                "title": "Sink retry durable fact",
+                "type": "reference",
+                "scope": "global",
+                "content": "Sanitized durable output",
+                "tags": ["retry"],
+                "session_id": "source-session-0001",
+                "confidence": "high"
+            }],
+            "ledger_candidates": [{
+                "title": "Confirm sink retry",
+                "kind": "todo",
+                "excerpt": "I will confirm the sink retry.",
+                "session_id": "source-session-0001",
+                "confidence": "high"
+            }],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence = Arc::new(SequenceProvider::new(vec![response]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+
+        let invalid_ledger_root = temp_dir.path().join("ledger-root-is-a-file");
+        std::fs::write(&invalid_ledger_root, "not a directory").expect("write invalid root");
+        let failing_ledger = LedgerStore::new(&invalid_ledger_root);
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &failing_ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect_err("Ledger sink must fail after the memory write");
+        assert_eq!(sequence.recorded_prompts().len(), 1);
+        assert_eq!(
+            memory
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .expect("list partial memory sink")
+                .len(),
+            1
+        );
+        assert!(memory
+            .read_session_state("session-sink-retry")
+            .await
+            .expect("read failed sink watermark")
+            .last_extracted_at
+            .is_none());
+
+        let no_call_sequence = Arc::new(SequenceProvider::new(Vec::new()));
+        let no_call_provider: Arc<dyn LLMProvider> = no_call_sequence.clone();
+        let good_ledger = LedgerStore::new(temp_dir.path().join("good-ledger-root"));
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &no_call_provider,
+            &memory,
+            &good_ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("retry should replay the exact checkpoint");
+        assert_eq!(writes.memory, 0);
+        assert_eq!(writes.ledger, 1);
+        assert!(no_call_sequence.recorded_prompts().is_empty());
+        assert_eq!(
+            good_ledger
+                .list_records(LedgerScope::Global, None, &RecordFilter::default())
+                .await
+                .expect("list replayed Ledger sink")
+                .len(),
+            1
+        );
+        assert_eq!(
+            memory
+                .read_session_state("session-sink-retry")
+                .await
+                .expect("read replayed watermark")
+                .last_extracted_at
+                .as_deref(),
+            Some(contexts[0].entry.updated_at.to_rfc3339().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_extraction_pages_continue_to_exhaustion_and_reject_no_progress() {
+        let first_page_candidates = (0..EXTRACTION_MAX_CANDIDATES)
+            .map(|index| {
+                serde_json::json!({
+                    "title": format!("Fact {index}"),
+                    "type": "reference",
+                    "scope": "global",
+                    "content": format!("Safe fact {index}"),
+                    "tags": [],
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                })
+            })
+            .collect::<Vec<_>>();
+        let first_page = serde_json::json!({
+            "candidates": first_page_candidates,
+            "ledger_candidates": [],
+            "source_exhausted": false
+        })
+        .to_string();
+        let final_page = extraction_response("Fact 8", "Safe fact 8");
+        let sequence = Arc::new(SequenceProvider::new(vec![first_page.clone(), final_page]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
+        let extracted = extract_durable_candidate_batch(
+            &provider,
+            "fast-model",
+            "bounded source".to_string(),
+            "session-pagination",
+        )
+        .await
+        .expect("saturated source should continue to exhaustion");
+        assert_eq!(extracted.memory.len(), EXTRACTION_MAX_CANDIDATES + 1);
+        let prompts = sequence.recorded_prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("Exhaustive continuation page 2"));
+        assert!(prompts[1].contains("already_returned"));
+
+        let repeated = Arc::new(SequenceProvider::new(vec![first_page.clone(), first_page]));
+        let repeated_provider: Arc<dyn LLMProvider> = repeated;
+        let error = extract_durable_candidate_batch(
+            &repeated_provider,
+            "fast-model",
+            "bounded source".to_string(),
+            "session-pagination",
+        )
+        .await
+        .expect_err("a repeated continuation page must fail closed");
+        assert!(error.contains("made no safe, deduplicated progress"));
     }
 
     #[tokio::test]
