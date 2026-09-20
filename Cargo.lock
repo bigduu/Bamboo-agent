@@ -1084,6 +1084,7 @@ dependencies = [
  "rust_ocr",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",

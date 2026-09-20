@@ -25,12 +25,18 @@ pub enum DreamGenerationMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DurableExtractionEnvelope {
+#[serde(deny_unknown_fields)]
+struct RawDurableExtractionEnvelope {
     #[serde(default)]
-    pub candidates: Vec<DurableExtractionCandidate>,
+    candidates: Vec<serde_json::Value>,
+    #[serde(default)]
+    ledger_candidates: Vec<serde_json::Value>,
+    #[serde(default, rename = "source_exhausted")]
+    _source_exhausted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableExtractionCandidate {
     pub title: String,
     #[serde(rename = "type")]
@@ -48,9 +54,10 @@ pub struct DurableExtractionCandidate {
 
 /// A ledger record candidate (commitment/deadline/appointment the USER stated)
 /// proposed by the same extraction pass that produces durable memory
-/// candidates — no extra LLM call. Every field is defaulted so a partially
-/// malformed item degrades instead of failing the envelope parse.
+/// candidates — no extra LLM call. Missing fields are defaulted; a malformed
+/// typed item degrades the Ledger array without invalidating Memory candidates.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerExtractionCandidate {
     #[serde(default)]
     pub title: String,
@@ -66,12 +73,6 @@ pub struct LedgerExtractionCandidate {
     pub session_id: Option<String>,
     #[serde(default)]
     pub confidence: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LedgerExtractionEnvelope {
-    #[serde(default)]
-    ledger_candidates: Vec<LedgerExtractionCandidate>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +92,10 @@ pub fn strip_json_fence(raw: &str) -> &str {
 
 pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCandidate>, String> {
     let payload = strip_json_fence(raw);
-    let parsed: DurableExtractionEnvelope = serde_json::from_str(payload)
+    let parsed: RawDurableExtractionEnvelope = serde_json::from_str(payload)
         .map_err(|error| format!("failed to parse durable extraction candidates: {error}"))?;
-    Ok(parsed.candidates)
+    serde_json::from_value(serde_json::Value::Array(parsed.candidates))
+        .map_err(|error| format!("failed to parse durable extraction candidates: {error}"))
 }
 
 /// Parse the ledger-candidate array out of the extraction response.
@@ -103,8 +105,11 @@ pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCan
 /// JSON) yields an empty vec — never an error that kills the auto-dream pass.
 pub fn parse_ledger_candidates(raw: &str) -> Vec<LedgerExtractionCandidate> {
     let payload = strip_json_fence(raw);
-    serde_json::from_str::<LedgerExtractionEnvelope>(payload)
-        .map(|envelope| envelope.ledger_candidates)
+    serde_json::from_str::<RawDurableExtractionEnvelope>(payload)
+        .ok()
+        .and_then(|envelope| {
+            serde_json::from_value(serde_json::Value::Array(envelope.ledger_candidates)).ok()
+        })
         .unwrap_or_default()
 }
 
@@ -579,7 +584,9 @@ pub fn build_rebuild_consolidation_prompt(
 /// Derive a brief text outline from a session for dream extraction context.
 ///
 /// Uses the task list if available, otherwise falls back to the 6 most recent
-/// non-system messages (truncated to 300 chars each).
+/// user/assistant messages (truncated to 300 chars each). Tool results are not
+/// extraction source; canonical Session notes arrive separately through Jiandu
+/// Session topics.
 pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<String> {
     use bamboo_agent_core::Role;
 
@@ -597,7 +604,7 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
             .messages
             .iter()
             .rev()
-            .filter(|message| !matches!(message.role, Role::System))
+            .filter(|message| matches!(message.role, Role::User | Role::Assistant))
             .take(6)
             .collect::<Vec<_>>();
         if recent_messages.is_empty() {
@@ -608,8 +615,7 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
             let role = match message.role {
                 Role::User => "User",
                 Role::Assistant => "Assistant",
-                Role::Tool => "Tool",
-                Role::System => continue,
+                Role::Tool | Role::System => continue,
             };
             rendered.push_str(&format!(
                 "**{}**: {}\n\n",
@@ -695,6 +701,37 @@ mod tests {
         let candidates = parse_extraction_candidates(input).expect("should parse");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "T");
+    }
+
+    #[test]
+    fn parse_extraction_candidates_rejects_unknown_candidate_fields() {
+        let input = r#"{"candidates":[{"title":"Production database","type":"reference","content":"hunter2","credential_label":"password","session_id":"session-1"}]}"#;
+        assert!(
+            parse_extraction_candidates(input).is_err(),
+            "unknown fields must not disappear before the sink privacy boundary"
+        );
+    }
+
+    #[test]
+    fn parse_extraction_candidates_rejects_unknown_envelope_fields() {
+        let input = r#"{"credential_label":"password","candidates":[{"title":"Production database","type":"reference","content":"hunter2","session_id":"session-1"}]}"#;
+        assert!(
+            parse_extraction_candidates(input).is_err(),
+            "unknown envelope fields must not disappear before candidate validation"
+        );
+    }
+
+    #[test]
+    fn parse_extraction_candidates_ignores_malformed_ledger_items() {
+        let input = r#"{"candidates":[{"title":"T","type":"user","content":"C"}],"ledger_candidates":[{"title":"Broken deadline","kind":"todo","due_at":42}]}"#;
+        let candidates = parse_extraction_candidates(input)
+            .expect("a malformed Ledger item must not invalidate Memory candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "T");
+        assert!(
+            parse_ledger_candidates(input).is_empty(),
+            "the malformed Ledger array must still degrade to empty"
+        );
     }
 
     #[test]
@@ -818,6 +855,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_ledger_candidates_rejects_unknown_candidate_fields() {
+        let raw = r#"{"ledger_candidates":[{"title":"Production login","kind":"todo","excerpt":"hunter2","credential_label":"password"}]}"#;
+        assert!(
+            parse_ledger_candidates(raw).is_empty(),
+            "unknown Ledger fields must fail closed before persistence"
+        );
+    }
+
+    #[test]
+    fn parse_ledger_candidates_rejects_unknown_envelope_fields() {
+        let raw = r#"{"credential_label":"password","ledger_candidates":[{"title":"Production login","kind":"todo","excerpt":"hunter2"}]}"#;
+        assert!(
+            parse_ledger_candidates(raw).is_empty(),
+            "unknown envelope fields must fail closed for Ledger candidates"
+        );
+    }
+
+    #[test]
     fn parse_ledger_candidates_defaults_missing_fields() {
         let raw = "{\"ledger_candidates\":[{\"title\":\"Book dentist appointment\"}]}";
         let candidates = parse_ledger_candidates(raw);
@@ -833,6 +888,27 @@ mod tests {
         let prompt = build_extraction_prompt(&[]);
         assert!(prompt.contains("Bamboo Durable Memory Extraction"));
         assert!(prompt.contains("Candidate sessions"));
+    }
+
+    #[test]
+    fn session_outline_excludes_system_and_tool_output() {
+        let mut session = bamboo_agent_core::Session::new("session-outline", "model");
+        session.add_message(bamboo_agent_core::Message::user("USER_SOURCE_MARKER"));
+        session.add_message(bamboo_agent_core::Message::assistant(
+            "ASSISTANT_SOURCE_MARKER",
+            None,
+        ));
+        session.add_message(bamboo_agent_core::Message::system("SYSTEM_SOURCE_MARKER"));
+        session.add_message(bamboo_agent_core::Message::tool_result(
+            "call-1",
+            "TOOL_SOURCE_MARKER",
+        ));
+
+        let outline = derive_session_outline(&session).expect("content outline");
+        assert!(outline.contains("USER_SOURCE_MARKER"));
+        assert!(outline.contains("ASSISTANT_SOURCE_MARKER"));
+        assert!(!outline.contains("SYSTEM_SOURCE_MARKER"));
+        assert!(!outline.contains("TOOL_SOURCE_MARKER"));
     }
 
     fn sample_consolidation_session(id: &str) -> ConsolidationSessionInfo {
