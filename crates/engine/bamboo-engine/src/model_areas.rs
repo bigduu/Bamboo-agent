@@ -4,12 +4,13 @@
 //! The product configures models for many distinct *areas* (chat, fast,
 //! task-summary, memory-background, vision, sub-agent, …). The scope rules are:
 //!
-//! - **Session-bound** — ONLY the main *chat* model + *reasoning effort*. A
-//!   session may override these; they cascade `session → request → provider
-//!   default` (see `session_app::execute`).
+//! - **Session-bound** — ONLY the main *chat* model + its effective reasoning
+//!   effort. A session may override these; they cascade `session → request →
+//!   selected chat role → provider default` (see `session_app::execute`).
 //! - **Global** — every *auxiliary* area (fast, task-summary, memory-background,
-//!   vision, sub-agent). These are read from server config (`defaults.<area>`
-//!   with a provider/global fallback) and **must never be read from a session**.
+//!   vision, sub-agent), including each area's optional reasoning effort. These
+//!   are read from server config (`defaults.<area>` with fast/chat fallback)
+//!   and **must never be read from a session**.
 //!
 //! This module is the one place that enforces that split. The resolver here
 //! takes no [`Session`](bamboo_domain::Session) and *cannot* — so an auxiliary
@@ -31,9 +32,9 @@ use crate::model_config_helper::{
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
 /// given provider routing key. None of these are session-bound.
 ///
-/// Each `*_ref` is the configured `defaults.<area>` [`ProviderModelRef`] (or
-/// `None` in legacy mode), kept alongside the resolved model so callers that
-/// snapshot the reference (e.g. the execute config snapshot) don't re-read it.
+/// Each `*_ref` is the effective [`ProviderModelRef`] after the same fallback
+/// chain as its resolved model (or `None` in legacy mode), kept alongside the
+/// provider so snapshot callers never lose the winning role's reasoning policy.
 pub struct GlobalAreaModels {
     /// Fast/cheap model — title generation, lightweight tasks.
     pub fast: Option<ResolvedModel>,
@@ -59,14 +60,25 @@ pub fn resolve_global_area_models(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> GlobalAreaModels {
-    let defaults = config.defaults.as_ref();
+    let refs = config
+        .defaults
+        .as_ref()
+        .filter(|_| config.features.provider_model_ref)
+        .map(|defaults| {
+            let fast = defaults.fast.as_ref().unwrap_or(&defaults.chat);
+            (
+                fast.clone(),
+                defaults.memory_background.as_ref().unwrap_or(fast).clone(),
+                defaults.task_summary.as_ref().unwrap_or(fast).clone(),
+            )
+        });
     GlobalAreaModels {
         fast: resolve_fast_model(config, provider_name, provider_registry),
-        fast_ref: defaults.and_then(|d| d.fast.clone()),
+        fast_ref: refs.as_ref().map(|(fast, _, _)| fast.clone()),
         background: resolve_background_model(config, provider_name, provider_registry),
-        background_ref: defaults.and_then(|d| d.memory_background.clone()),
+        background_ref: refs.as_ref().map(|(_, background, _)| background.clone()),
         summarization: resolve_task_summary_model(config, provider_name, provider_registry),
-        summarization_ref: defaults.and_then(|d| d.task_summary.clone()),
+        summarization_ref: refs.map(|(_, _, summarization)| summarization),
     }
 }
 
@@ -100,6 +112,7 @@ pub fn resolve_global_subagent_model(
 pub enum ReasoningEffortSource {
     Session,
     Request,
+    ModelDefault,
     ProviderDefault,
     None,
 }
@@ -109,13 +122,15 @@ impl ReasoningEffortSource {
         match self {
             Self::Session => "session",
             Self::Request => "request",
+            Self::ModelDefault => "model_default",
             Self::ProviderDefault => "provider_default",
             Self::None => "none",
         }
     }
 }
 
-/// The single reasoning-effort cascade: `session → request → provider default`.
+/// The single reasoning-effort cascade:
+/// `session → request → selected model role → provider default`.
 ///
 /// Returns `None` when nothing is configured (so non-reasoning models send no
 /// reasoning parameter). When a *concrete* terminal value is required (e.g. the
@@ -125,12 +140,15 @@ impl ReasoningEffortSource {
 pub fn resolve_effective_reasoning_effort(
     session_effort: Option<ReasoningEffort>,
     request_effort: Option<ReasoningEffort>,
+    model_default: Option<ReasoningEffort>,
     provider_default: Option<ReasoningEffort>,
 ) -> (Option<ReasoningEffort>, ReasoningEffortSource) {
     if let Some(effort) = session_effort {
         (Some(effort), ReasoningEffortSource::Session)
     } else if let Some(effort) = request_effort {
         (Some(effort), ReasoningEffortSource::Request)
+    } else if let Some(effort) = model_default {
+        (Some(effort), ReasoningEffortSource::ModelDefault)
     } else if let Some(effort) = provider_default {
         (Some(effort), ReasoningEffortSource::ProviderDefault)
     } else {
@@ -312,6 +330,27 @@ mod tests {
             areas.background.as_ref().map(|m| m.model_name.as_str()),
             Some("gpt-fast")
         );
+        assert_eq!(
+            areas.background_ref,
+            Some(ProviderModelRef::new("openai", "gpt-fast"))
+        );
+    }
+
+    #[test]
+    fn global_area_refs_keep_the_fallback_models_reasoning_effort() {
+        let mut defaults = defaults_with_all_areas();
+        defaults.chat = defaults.chat.with_reasoning_effort(ReasoningEffort::Max);
+        defaults.fast = None;
+        defaults.memory_background = None;
+        defaults.task_summary = None;
+        let expected = defaults.chat.clone();
+        let config = config_with_defaults(defaults);
+
+        let areas = resolve_global_area_models(&config, "openai", &test_registry());
+
+        assert_eq!(areas.fast_ref, Some(expected.clone()));
+        assert_eq!(areas.background_ref, Some(expected.clone()));
+        assert_eq!(areas.summarization_ref, Some(expected));
     }
 
     #[test]
@@ -353,12 +392,13 @@ mod tests {
     // ---- reasoning effort cascade ----
 
     #[test]
-    fn reasoning_prefers_session_then_request_then_provider() {
+    fn reasoning_prefers_session_then_request_then_model_then_provider() {
         assert_eq!(
             resolve_effective_reasoning_effort(
                 Some(ReasoningEffort::Max),
                 Some(ReasoningEffort::High),
                 Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Medium),
             ),
             (Some(ReasoningEffort::Max), ReasoningEffortSource::Session)
         );
@@ -367,11 +407,24 @@ mod tests {
                 None,
                 Some(ReasoningEffort::High),
                 Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Medium),
             ),
             (Some(ReasoningEffort::High), ReasoningEffortSource::Request)
         );
         assert_eq!(
-            resolve_effective_reasoning_effort(None, None, Some(ReasoningEffort::Low)),
+            resolve_effective_reasoning_effort(
+                None,
+                None,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Medium),
+            ),
+            (
+                Some(ReasoningEffort::Low),
+                ReasoningEffortSource::ModelDefault
+            )
+        );
+        assert_eq!(
+            resolve_effective_reasoning_effort(None, None, None, Some(ReasoningEffort::Low),),
             (
                 Some(ReasoningEffort::Low),
                 ReasoningEffortSource::ProviderDefault
@@ -381,7 +434,7 @@ mod tests {
 
     #[test]
     fn reasoning_none_when_nothing_configured() {
-        let (effort, source) = resolve_effective_reasoning_effort(None, None, None);
+        let (effort, source) = resolve_effective_reasoning_effort(None, None, None, None);
         assert_eq!(effort, None);
         assert_eq!(source, ReasoningEffortSource::None);
     }
@@ -391,7 +444,7 @@ mod tests {
         // The one place "medium" is defined; callers needing a concrete value
         // use this rather than hardcoding a level.
         assert_eq!(DEFAULT_REASONING_EFFORT, ReasoningEffort::Medium);
-        let (effort, _) = resolve_effective_reasoning_effort(None, None, None);
+        let (effort, _) = resolve_effective_reasoning_effort(None, None, None, None);
         assert_eq!(
             effort.unwrap_or(DEFAULT_REASONING_EFFORT),
             ReasoningEffort::Medium

@@ -292,6 +292,9 @@ impl Tool for PlanTool {
         let model_override = model_ref_override
             .as_ref()
             .map(|model_ref| model_ref.model.clone());
+        let reasoning_effort = model_ref_override
+            .as_ref()
+            .and_then(|model_ref| model_ref.reasoning_effort);
         let runtime_metadata =
             require_actor_runtime(self.resolver.resolve_runtime_metadata(PLANNER_ROLE).await)?;
         let child_id = Uuid::new_v4().to_string();
@@ -313,7 +316,7 @@ impl Tool for PlanTool {
                 // Plan must arm the durable parent wait before the scheduler
                 // can run a fast child to completion. Enqueue explicitly below.
                 auto_run: false,
-                reasoning_effort: None,
+                reasoning_effort,
                 lifecycle: None,
                 resident_name: None,
                 resident_context: None,

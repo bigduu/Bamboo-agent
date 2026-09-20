@@ -399,36 +399,41 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
     })
 }
 
+fn resolve_role_ref_chain<'a>(
+    provider_registry: &Arc<ProviderRegistry>,
+    candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
+) -> Option<ResolvedModel> {
+    // A present-but-invalid reference fails closed. Automatic fallback applies
+    // only when a role is unset, never when an explicit provider id is stale.
+    let model_ref = candidates.into_iter().flatten().next()?;
+    let provider = ProviderModelRouter::new(provider_registry.clone())
+        .route(model_ref)
+        .ok()?;
+    Some(ResolvedModel::from_ref(provider, model_ref))
+}
+
 /// Resolve the task summarization model for conversation/task compression.
 ///
-/// Fallback chain:
-/// 1. `defaults.task_summary` (ProviderModelRef, routed via registry)
-/// 2. `defaults.memory_background` / `defaults.fast` / legacy memory background
-/// 3. `defaults.chat` / legacy default model
+/// Fallback chain: `defaults.task_summary` → `defaults.fast` → `defaults.chat`.
 pub fn resolve_task_summary_model(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config
-            .defaults
-            .as_ref()
-            .and_then(|d| d.task_summary.as_ref())
-        {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.task_summary.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
 
-    resolve_background_model(config, provider_name, provider_registry)
-        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
+    resolve_fast_model(config, provider_name, provider_registry)
 }
 
 /// Resolve the background/fast summarization model considering both
@@ -437,35 +442,28 @@ pub fn resolve_task_summary_model(
 /// Resolution order:
 /// 1. `defaults.memory_background` (ProviderModelRef, routed via registry)
 /// 2. `defaults.fast` (ProviderModelRef, routed via registry)
-/// 3. Legacy: `memory.background_model` / provider `fast_model` string + registry lookup
+/// 3. `defaults.chat` (ProviderModelRef, routed via registry)
+/// 4. Legacy: `memory.background_model` / provider fast/chat string + registry lookup
 pub fn resolve_background_model(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| config.defaults.as_ref().and_then(|d| d.fast.as_ref()))
-        {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.memory_background.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
     let model_name = get_memory_background_model_for_provider(config, provider_name)?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel {
-        provider,
-        model_name,
-    })
+    Some(ResolvedModel::new(provider, model_name))
 }
 
 /// Resolve the fast model for lightweight tasks like title generation.
@@ -475,23 +473,16 @@ pub fn resolve_fast_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.fast.as_ref()) {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [defaults.fast.as_ref(), Some(&defaults.chat)],
+            );
         }
     }
     let model_name = get_fast_model_for_provider(config, provider_name)?;
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel {
-        provider,
-        model_name,
-    })
+    Some(ResolvedModel::new(provider, model_name))
 }
 
 /// Resolve the vision-capable model for image understanding.
@@ -501,15 +492,15 @@ pub fn resolve_vision_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.vision.as_ref()) {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.vision.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
     let model_name = if let Some(instance) = config.provider_instances.get(provider_name) {
@@ -522,38 +513,35 @@ pub fn resolve_vision_model(
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(ToString::to_string)
-            .or_else(|| get_default_model_for_provider(config, provider_name).ok())?
+            .or_else(|| get_fast_model_for_provider(config, provider_name))?
     } else {
         config.get_vision_model()?
     };
     let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel {
-        provider,
-        model_name,
-    })
+    Some(ResolvedModel::new(provider, model_name))
 }
 
 /// Resolve the planning/coordination model for architecture and task decomposition.
 ///
-/// Fallback chain: `defaults.planning` → `defaults.chat`.
+/// Fallback chain: `defaults.planning` → `defaults.fast` → `defaults.chat`.
 pub fn resolve_planning_model(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.planning.as_ref()) {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.planning.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
-    resolve_default_chat_model(config, provider_name, provider_registry)
+    resolve_fast_model(config, provider_name, provider_registry)
 }
 
 /// Resolve the search/navigation model for grep, file listing, and symbol resolution.
@@ -565,46 +553,41 @@ pub fn resolve_search_model(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config.defaults.as_ref().and_then(|d| d.search.as_ref()) {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.search.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
     resolve_fast_model(config, provider_name, provider_registry)
-        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
 }
 
 /// Resolve the code review model for PR and code analysis tasks.
 ///
-/// Fallback chain: `defaults.code_review` → `defaults.chat`.
+/// Fallback chain: `defaults.code_review` → `defaults.fast` → `defaults.chat`.
 pub fn resolve_code_review_model(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
     if config.features.provider_model_ref {
-        if let Some(model_ref) = config
-            .defaults
-            .as_ref()
-            .and_then(|d| d.code_review.as_ref())
-        {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
+        if let Some(defaults) = config.defaults.as_ref() {
+            return resolve_role_ref_chain(
+                provider_registry,
+                [
+                    defaults.code_review.as_ref(),
+                    defaults.fast.as_ref(),
+                    Some(&defaults.chat),
+                ],
+            );
         }
     }
-    resolve_default_chat_model(config, provider_name, provider_registry)
+    resolve_fast_model(config, provider_name, provider_registry)
 }
 
 /// Resolve the provider+model reference for a specific subagent type.
@@ -624,18 +607,15 @@ pub fn resolve_subagent_model_ref(
                 defaults.subagent_models.get(subagent_type),
                 defaults.sub_agent.as_ref(),
                 defaults.fast.as_ref(),
+                Some(&defaults.chat),
             ];
 
-            for model_ref in candidate_refs.into_iter().flatten() {
-                if router.route(model_ref).is_ok() {
-                    return Some(model_ref.clone());
-                }
-            }
+            let model_ref = candidate_refs.into_iter().flatten().next()?;
+            return router.route(model_ref).ok().map(|_| model_ref.clone());
         }
     }
 
     resolve_fast_model(config, provider_name, provider_registry)
-        .or_else(|| resolve_default_chat_model(config, provider_name, provider_registry))
         .map(|resolved| bamboo_domain::ProviderModelRef::new(provider_name, resolved.model_name))
 }
 
@@ -659,38 +639,7 @@ pub fn resolve_subagent_model(
             })
         })
         .ok()?;
-    Some(ResolvedModel {
-        provider,
-        model_name: model_ref.model,
-    })
-}
-
-/// Resolve the default chat model from config.
-///
-/// This is the terminal fallback for capability-specific model resolvers.
-fn resolve_default_chat_model(
-    config: &Config,
-    provider_name: &str,
-    provider_registry: &Arc<ProviderRegistry>,
-) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(model_ref) = config.defaults.as_ref().map(|d| &d.chat) {
-            if let Ok(provider) =
-                ProviderModelRouter::new(provider_registry.clone()).route(model_ref)
-            {
-                return Some(ResolvedModel {
-                    provider,
-                    model_name: model_ref.model.clone(),
-                });
-            }
-        }
-    }
-    let model_name = get_default_model_for_provider(config, provider_name).ok()?;
-    let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel {
-        provider,
-        model_name,
-    })
+    Some(ResolvedModel::from_ref(provider, &model_ref))
 }
 
 /// Resolve the image-fallback configuration from a config snapshot.
@@ -1273,6 +1222,84 @@ mod tests {
             .expect("fast model should resolve");
 
         assert_eq!(resolved, ProviderModelRef::new("openai", "gpt-fast"));
+    }
+
+    #[test]
+    fn every_unset_specialist_role_falls_back_to_fast_before_chat() {
+        let config = test_config! {
+            provider: "openai".to_string(),
+            features: bamboo_config::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: Some(ProviderModelRef::new("openai", "gpt-fast")),
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
+        };
+        let registry = test_registry();
+
+        for resolved in [
+            resolve_task_summary_model(&config, "openai", &registry),
+            resolve_background_model(&config, "openai", &registry),
+            resolve_vision_model(&config, "openai", &registry),
+            resolve_planning_model(&config, "openai", &registry),
+            resolve_search_model(&config, "openai", &registry),
+            resolve_code_review_model(&config, "openai", &registry),
+            resolve_subagent_model(&config, "openai", &registry, "coder"),
+        ] {
+            assert_eq!(
+                resolved.map(|model| model.model_name),
+                Some("gpt-fast".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn every_unset_specialist_role_falls_back_to_chat_when_fast_is_unset() {
+        let config = test_config! {
+            provider: "openai".to_string(),
+            features: bamboo_config::FeatureFlags {
+                provider_model_ref: true,
+                ..Default::default()
+            },
+            defaults: Some(DefaultsConfig {
+                chat: ProviderModelRef::new("openai", "gpt-chat"),
+                fast: None,
+                task_summary: None,
+                vision: None,
+                memory_background: None,
+                planning: None,
+                search: None,
+                code_review: None,
+                sub_agent: None,
+                subagent_models: HashMap::new(),
+            }),
+        };
+        let registry = test_registry();
+
+        for resolved in [
+            resolve_task_summary_model(&config, "openai", &registry),
+            resolve_background_model(&config, "openai", &registry),
+            resolve_vision_model(&config, "openai", &registry),
+            resolve_planning_model(&config, "openai", &registry),
+            resolve_search_model(&config, "openai", &registry),
+            resolve_code_review_model(&config, "openai", &registry),
+            resolve_subagent_model(&config, "openai", &registry, "coder"),
+        ] {
+            assert_eq!(
+                resolved.map(|model| model.model_name),
+                Some("gpt-chat".to_string())
+            );
+        }
     }
 
     // ---- S-T1.1: infer_provider mapping ----

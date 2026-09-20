@@ -45,10 +45,10 @@ enum SubAgentArgs {
         /// spawning everything, to suspend until they finish.
         #[serde(default)]
         wait: Option<bool>,
-        /// Optional reasoning effort for the child session. When omitted,
-        /// the child stays at `None` so the provider's default applies
-        /// (it does NOT inherit the parent's reasoning_effort). The LLM
-        /// should pass an explicit value (e.g. `"low"` for cheap fan-outs,
+        /// Optional reasoning effort for the child session. When omitted, the
+        /// selected sub-agent model preference applies before the provider
+        /// default (it does NOT inherit the parent's reasoning_effort). The
+        /// LLM should pass an explicit value (e.g. `"low"` for cheap fan-outs,
         /// `"high"`/`"max"` for hard reasoning) when it has a preference.
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
@@ -483,7 +483,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             "reasoning_effort": {
                 "type": "string",
                 "enum": ["low", "medium", "high", "xhigh", "max"],
-                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to leave at provider default; the child does NOT inherit the parent's reasoning_effort."
+                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to use the selected sub-agent model preference, then the provider default; the child does NOT inherit the parent's reasoning_effort."
             },
             "model": {
                 "type": "string",
@@ -708,7 +708,7 @@ impl Tool for SubAgentTool {
                     None => None,
                 };
 
-                let (child_session_id, child_model, reused) =
+                let (child_session_id, child_model, reused, child_reasoning_effort) =
                     if let Some(existing_id) = existing_resident {
                         // A resident is stable Project identity. A root may
                         // have been explicitly reassigned since this resident
@@ -864,13 +864,13 @@ impl Tool for SubAgentTool {
                                     .map_err(tool_error_from_child_session)?;
                             }
                         }
-                        let model = self
+                        let (model, child_reasoning_effort) = self
                             .sessions
                             .load_child_for_parent(&parent.id, &existing_id)
                             .await
-                            .map(|c| c.model)
+                            .map(|child| (child.model, child.reasoning_effort))
                             .unwrap_or_default();
-                        (existing_id, model, true)
+                        (existing_id, model, true, child_reasoning_effort)
                     } else {
                         let child_id = Uuid::new_v4().to_string();
                         // Model precedence: explicit `model` arg > per-subagent_type
@@ -887,6 +887,11 @@ impl Tool for SubAgentTool {
                         let model_override = model_ref_override
                             .as_ref()
                             .map(|model_ref| model_ref.model.clone());
+                        let effective_reasoning_effort = reasoning_effort.or_else(|| {
+                            model_ref_override
+                                .as_ref()
+                                .and_then(|model_ref| model_ref.reasoning_effort)
+                        });
                         let runtime_metadata =
                             self.resolver.resolve_runtime_metadata(&subagent_type).await;
                         let result = child_session::create_child_action(
@@ -905,7 +910,7 @@ impl Tool for SubAgentTool {
                                 runtime_metadata,
                                 read_only: false,
                                 auto_run: should_auto_run,
-                                reasoning_effort,
+                                reasoning_effort: effective_reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
                                 resident_name: resident_name.clone(),
                                 resident_context: resident_name
@@ -919,7 +924,12 @@ impl Tool for SubAgentTool {
                         )
                         .await
                         .map_err(tool_error_from_child_session)?;
-                        (result.child_session_id, result.model, false)
+                        (
+                            result.child_session_id,
+                            result.model,
+                            false,
+                            effective_reasoning_effort,
+                        )
                     };
 
                 // Ensure index entry is visible immediately (best-effort).
@@ -967,7 +977,7 @@ impl Tool for SubAgentTool {
                     "child_session_id": child_session_id,
                     "parent_session_id": parent_session_id,
                     "model": child_model,
-                    "reasoning_effort": reasoning_effort.map(|effort| effort.as_str()),
+                    "reasoning_effort": child_reasoning_effort.map(|effort| effort.as_str()),
                     "status": status,
                     "lifecycle": resident_name.as_ref().map(|_| "resident"),
                     "resident_name": resident_name.clone(),
