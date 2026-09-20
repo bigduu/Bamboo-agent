@@ -1204,6 +1204,7 @@ fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) ->
         serde_yaml::Value::Tagged(value) => {
             yaml_contains_structured_environment_credential(&value.value)
         }
+        serde_yaml::Value::String(value) => contains_line_oriented_credential_assignment(value),
         _ => false,
     }
 }
@@ -2541,6 +2542,10 @@ mod tests {
                 "// This comment mentions dbPassword=hunter2",
             ),
             (
+                "nested credential assignment placeholder",
+                r#"{"env":["dbPassword=${DB_PASSWORD}"]}"#,
+            ),
+            (
                 "commented camelCase placeholder",
                 "# dbPassword=${DB_PASSWORD}",
             ),
@@ -2975,6 +2980,10 @@ mod tests {
             (
                 "Java properties camelCase password",
                 "dbPassword=hunter2",
+            ),
+            (
+                "nested credential assignment",
+                r#"{"env":["dbPassword=hunter2"]}"#,
             ),
             ("commented camelCase password", "# dbPassword=hunter2"),
             ("slash-commented camelCase API token", "// apiToken=hunter2"),
