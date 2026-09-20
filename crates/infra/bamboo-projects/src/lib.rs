@@ -1494,6 +1494,17 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
             "project description exceeds 4096 bytes".to_string(),
         ));
     }
+    if manifest.section.as_ref().is_some_and(|section| {
+        section.trim() != section
+            || section.is_empty()
+            || section.chars().count() > 80
+            || section.chars().any(char::is_control)
+    }) {
+        return Err(ProjectStoreError::Validation(
+            "project section must be 1..=80 characters without surrounding whitespace or control characters"
+                .to_string(),
+        ));
+    }
     if manifest.revision == 0 || manifest.resource_revision == 0 {
         return Err(ProjectStoreError::Validation(
             "project revisions must be positive".to_string(),
@@ -3057,6 +3068,52 @@ mod tests {
             1
         );
         assert_eq!(store.get(&project.id).unwrap().revision, 2);
+    }
+
+    #[test]
+    fn sidebar_section_is_revisioned_validated_and_indexed() {
+        let (_temp, store) = store();
+        let project = store.create("Sectioned", None).unwrap();
+        let sectioned = store
+            .update(&project.id, project.revision, |manifest| {
+                manifest.section = Some("Development".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(sectioned.section.as_deref(), Some("Development"));
+        assert_eq!(
+            store.index().unwrap().projects[&project.id]
+                .section
+                .as_deref(),
+            Some("Development")
+        );
+
+        for invalid in [
+            String::new(),
+            " padded ".to_string(),
+            "line\nbreak".to_string(),
+            "x".repeat(81),
+        ] {
+            assert!(store
+                .update(&project.id, sectioned.revision, |manifest| {
+                    manifest.section = Some(invalid);
+                    Ok(())
+                })
+                .is_err());
+            assert_eq!(store.get(&project.id).unwrap().revision, sectioned.revision);
+        }
+
+        let cleared = store
+            .update(&project.id, sectioned.revision, |manifest| {
+                manifest.section = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(cleared.section.is_none());
+        assert!(store.index().unwrap().projects[&project.id]
+            .section
+            .is_none());
     }
 
     #[test]
