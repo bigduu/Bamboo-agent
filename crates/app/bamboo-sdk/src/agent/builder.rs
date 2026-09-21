@@ -280,7 +280,7 @@ impl AgentBuilder {
     /// ```rust,no_run
     /// # use bamboo_sdk::{Agent, BuiltinTool};
     /// let builder = Agent::builder()
-    ///     .tools([BuiltinTool::WebSearch.tool(), BuiltinTool::Read.tool()]);
+    ///     .tools([BuiltinTool::WebFetch.tool(), BuiltinTool::Read.tool()]);
     /// # let _ = builder;
     /// ```
     ///
@@ -403,7 +403,7 @@ impl AgentBuilder {
     ///
     /// Once gated, a tool call that needs approval suspends the run (a
     /// `NeedClarification`/`ToolApprovalRequested` event, session
-    /// `pending_question` set) exactly like a `conclusion_with_options`
+    /// `pending_question` set) exactly like a custom `NeedsHuman`
     /// clarification — resolve it with [`Agent::answer`](super::Agent::answer).
     pub fn permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
         self.permission_checker = Some(checker);

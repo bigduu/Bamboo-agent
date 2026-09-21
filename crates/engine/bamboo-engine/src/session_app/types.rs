@@ -83,7 +83,6 @@ pub struct ChatTurnInput {
     pub selected_skill_ids: Option<Vec<String>>,
     pub workflow_selection: Option<bamboo_skills::WorkflowSelection>,
     pub orchestration_opt_in: Option<bool>,
-    pub copilot_conclusion_with_options_enhancement_enabled: Option<bool>,
     /// Optional data directory for workspace path fallback when neither request
     /// nor metadata provides one.
     pub data_dir: Option<std::path::PathBuf>,

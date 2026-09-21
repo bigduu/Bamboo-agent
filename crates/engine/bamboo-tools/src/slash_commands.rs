@@ -400,7 +400,7 @@ fn create_default_commands() -> Vec<SlashCommand> {
             scope: "default".to_string(),
             namespace: None,
             file_path: "".to_string(),
-            content: "I want an evidence-grounded plan before implementation. Call the Plan tool with a self-contained version of my request so a runtime-enforced read-only planner child can inspect the current workspace. Keep this root session in normal orchestration mode; do not call legacy EnterPlanMode. When the planner returns, review its evidence and present the concrete plan, tests, risks, assumptions, and non-goals to me.".to_string(),
+            content: "I want an evidence-grounded plan before implementation. Call the Plan tool with a self-contained version of my request so a runtime-enforced read-only planner child can inspect the current workspace. Keep this root session in normal orchestration mode. When the planner returns, review its evidence and present the concrete plan, tests, risks, assumptions, and non-goals to me.".to_string(),
             description: Some("Delegate complex planning to a read-only child".to_string()),
             allowed_tools: vec![],
             has_bash_commands: false,

@@ -223,47 +223,29 @@ async fn execute_and_apply_single_tool_call(
     let mut stop_round = false;
     let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
         Ok(()) => {
-            if let Err(policy_error) = policy::validate_tool_call_context(tool_call, session) {
-                tracing::warn!(
-                    "[{}][round:{}] Tool call blocked by context policy before ToolStart: tool_call_id={}, tool_name={}, error={}",
+            let before_tool_hooks = config
+                .hook_runner
+                .has_hooks_for(AgentHookPoint::BeforeToolExecution);
+            per_call::execute_model_requested_tool_call_only(
+                effective_callable_set,
+                per_call::ToolExecutionOnlyContext {
+                    tool_call,
+                    event_tx,
+                    metrics_collector,
                     session_id,
+                    root_session_id: &root_session_id,
+                    executing_supervisor,
+                    round_id,
                     round,
-                    tool_call.id,
-                    tool_call.function.name,
-                    policy_error
-                );
-                per_call::ToolExecutionOutcome {
-                    permission_replay_origin: None,
-                    needs_human: None,
-                    post_tool_hook_eligible: false,
-                    result: Err(policy_error),
-                    tool_duration: std::time::Duration::ZERO,
-                }
-            } else {
-                let before_tool_hooks = config
-                    .hook_runner
-                    .has_hooks_for(AgentHookPoint::BeforeToolExecution);
-                per_call::execute_model_requested_tool_call_only(
-                    effective_callable_set,
-                    per_call::ToolExecutionOnlyContext {
-                        tool_call,
-                        event_tx,
-                        metrics_collector,
-                        session_id,
-                        root_session_id: &root_session_id,
-                        executing_supervisor,
-                        round_id,
-                        round,
-                        tools,
-                        config,
-                        hook_session: before_tool_hooks.then_some(&mut *session),
-                        hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
-                        session_flags,
-                        available_tool_schemas,
-                    },
-                )
-                .await?
-            }
+                    tools,
+                    config,
+                    hook_session: before_tool_hooks.then_some(&mut *session),
+                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                    session_flags,
+                    available_tool_schemas,
+                },
+            )
+            .await?
         }
         Err(violation) => {
             stop_round = violation.should_stop_round();
@@ -1579,7 +1561,6 @@ mod tests {
             "Write",
             "Edit",
             "Bash",
-            "conclusion_with_options",
             "Task",
             "NotebookEdit",
             "KillShell",
@@ -1627,7 +1608,6 @@ mod tests {
             "EnterPlanMode",
             "ExitPlanMode",
             "request_permissions",
-            "conclusion_with_options",
             "compact_context",
         ] {
             assert!(

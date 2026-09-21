@@ -21,11 +21,6 @@ use bamboo_skills::{SkillManager, SkillStoreConfig};
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
 
-const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
-    "copilot_conclusion_with_options_enhancement_enabled";
-const ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT: &str =
-    "If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text.";
-
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
 }
@@ -955,7 +950,6 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
             "mcp__alpha__inspect",
             "mcp__beta__inspect",
             "Workspace",
-            "conclusion_with_options",
             "request_permissions",
         ]
         .into_iter()
@@ -984,11 +978,7 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Deferred, "{name}");
     }
-    for name in [
-        "Workspace",
-        "conclusion_with_options",
-        "request_permissions",
-    ] {
+    for name in ["Workspace", "request_permissions"] {
         assert_eq!(classes[name], CapabilityLoadingClass::HostOnly, "{name}");
     }
 
@@ -1007,11 +997,7 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert!(model_names.contains(name), "legacy projection lost {name}");
     }
-    for name in [
-        "Workspace",
-        "conclusion_with_options",
-        "request_permissions",
-    ] {
+    for name in ["Workspace", "request_permissions"] {
         assert!(!model_names.contains(name), "HostOnly leaked: {name}");
     }
 
@@ -1314,72 +1300,6 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         Some("value")
     );
     assert_eq!(session.metadata.len(), 1);
-}
-
-#[test]
-fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_disabled() {
-    let config = crate::runtime::config::AgentLoopConfig::default();
-    let tools = StaticToolExecutor {
-        schemas: vec![schema("conclusion_with_options")],
-    };
-    let session = Session::new("session-1", "model");
-
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    assert!(resolved
-        .iter()
-        .all(|schema| schema.function.name != "conclusion_with_options"));
-
-    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
-    let host_entry = catalog
-        .iter()
-        .find(|entry| entry.execution_name() == "conclusion_with_options")
-        .expect("host catalog keeps compatibility entry");
-    assert_eq!(
-        host_entry.schema().function.description,
-        "conclusion_with_options tool"
-    );
-    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
-    assert!(!host_entry
-        .schema()
-        .function
-        .description
-        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
-}
-
-#[test]
-fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_enabled() {
-    let config = crate::runtime::config::AgentLoopConfig::default();
-    let tools = StaticToolExecutor {
-        schemas: vec![schema("conclusion_with_options")],
-    };
-    let mut session = Session::new("session-1", "model");
-    session.metadata.insert(
-        COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    assert!(resolved
-        .iter()
-        .all(|schema| schema.function.name != "conclusion_with_options"));
-
-    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
-    let host_entry = catalog
-        .iter()
-        .find(|entry| entry.execution_name() == "conclusion_with_options")
-        .expect("host catalog keeps compatibility entry");
-    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
-    assert!(host_entry
-        .schema()
-        .function
-        .description
-        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
-    assert!(host_entry
-        .schema()
-        .function
-        .description
-        .contains("conclusion"));
-    assert!(host_entry.schema().function.description.contains("OK"));
 }
 
 #[test]

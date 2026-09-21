@@ -72,35 +72,8 @@ pub(crate) fn resolve_tool_schemas_for_round(
     resolve_available_tool_schemas_for_session(config, tools, session)
 }
 
-const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
-    "copilot_conclusion_with_options_enhancement_enabled";
-const CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION: &str = "Ask the user a question with options and wait for the user to select or enter a custom answer. If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text. For completion confirmation, include a `conclusion` object with both `summary` and `mermaid.graph`, and include `OK` as one of the options.";
-
-fn is_copilot_conclusion_with_options_enhancement_enabled(session: &Session) -> bool {
-    session
-        .metadata
-        .get(COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-}
-
-fn apply_session_tool_schema_overrides(session: &Session, tool_schemas: &mut [ToolSchema]) {
-    if !is_copilot_conclusion_with_options_enhancement_enabled(session) {
-        return;
-    }
-
-    if let Some(schema) = tool_schemas.iter_mut().find(|schema| {
-        schema
-            .function
-            .name
-            .eq_ignore_ascii_case("conclusion_with_options")
-    }) {
-        schema.function.description = CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION.to_string();
-    }
-}
-
-/// Prefer delegated planning only when the live, post-disable catalog actually
-/// contains `Plan`. A persisted session already inside the legacy PlanMode
-/// state machine keeps `ExitPlanMode` as its recovery path.
+/// A persisted session already inside the legacy PlanMode state machine keeps
+/// `ExitPlanMode` as its recovery path. New sessions use delegated `Plan` only.
 fn prefer_delegated_plan_tool(
     session: &Session,
     catalog: &mut std::collections::BTreeMap<String, ClassifiedToolSchema>,
@@ -109,7 +82,6 @@ fn prefer_delegated_plan_tool(
         return;
     }
 
-    catalog.remove("EnterPlanMode");
     let legacy_plan_active = session
         .agent_runtime_state
         .as_ref()
@@ -235,8 +207,6 @@ fn resolve_catalog_with_activation(
         }
     }
 
-    apply_session_tool_schema_overrides(session, &mut tool_schemas);
-
     let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
     for entry in tool_schemas
         .into_iter()
@@ -292,7 +262,7 @@ mod live_disabled_tests {
     }
 
     fn plan_catalog() -> std::collections::BTreeMap<String, ClassifiedToolSchema> {
-        ["Plan", "EnterPlanMode", "ExitPlanMode", "Read"]
+        ["Plan", "ExitPlanMode", "Read"]
             .into_iter()
             .map(schema)
             .filter_map(ClassifiedToolSchema::new)
@@ -301,7 +271,7 @@ mod live_disabled_tests {
     }
 
     #[test]
-    fn delegated_plan_replaces_legacy_mode_tools_for_inactive_sessions() {
+    fn delegated_plan_hides_legacy_exit_for_inactive_sessions() {
         let session = Session::new("s", "m");
         let mut catalog = plan_catalog();
 
@@ -336,14 +306,13 @@ mod live_disabled_tests {
     }
 
     #[test]
-    fn legacy_plan_mode_tools_remain_when_plan_is_not_available() {
+    fn legacy_exit_remains_when_plan_is_not_available() {
         let session = Session::new("s", "m");
         let mut catalog = plan_catalog();
         catalog.remove("Plan");
 
         prefer_delegated_plan_tool(&session, &mut catalog);
 
-        assert!(catalog.contains_key("EnterPlanMode"));
         assert!(catalog.contains_key("ExitPlanMode"));
     }
 

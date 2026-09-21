@@ -2,7 +2,7 @@ use super::{apply_image_fallback_to_llm_messages, persistable_image_urls};
 use crate::runtime::config::{ImageFallbackConfig, ImageFallbackMode};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, Message, Session};
+use bamboo_agent_core::{AgentError, Message, Session, ToolResultImage};
 use bamboo_domain::MessagePart;
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{LLMError, LLMProvider, LLMStream};
@@ -188,6 +188,44 @@ async fn image_fallback_vision_rewrites_with_llm_description() {
     assert!(messages[0]
         .content
         .contains("[Vision description of image 1:"));
+    assert!(messages[0].content.contains("vision summary"));
+    assert_eq!(
+        recording
+            .models
+            .lock()
+            .expect("model lock should not be poisoned")
+            .as_slice(),
+        ["vision-model-test"]
+    );
+}
+
+#[tokio::test]
+async fn image_fallback_vision_describes_base64_tool_result_images() {
+    let mut messages = vec![Message::tool_result_with_images(
+        "view-image-call",
+        "local image",
+        true,
+        vec![ToolResultImage {
+            mime_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        }],
+    )];
+
+    let recording = Arc::new(RecordingVisionProvider::default());
+    let llm: Arc<dyn LLMProvider> = recording.clone();
+    apply_image_fallback_to_llm_messages(
+        &mut messages,
+        ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-model-test".to_string()),
+        },
+        None,
+        Some(&llm),
+    )
+    .await
+    .expect("vision fallback should describe a base64 tool-result image");
+
+    assert!(messages[0].content_parts.is_none());
     assert!(messages[0].content.contains("vision summary"));
     assert_eq!(
         recording

@@ -95,13 +95,13 @@ fn should_apply_workspace_update_when_target_is_outside_workspace() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let workspace = temp_dir.path().join("workspace");
     let external_dir = temp_dir.path().join("external");
-    let notebook_path = external_dir.join("notes.ipynb");
+    let file_path = external_dir.join("notes.md");
     std::fs::create_dir_all(&workspace).expect("create workspace dir");
     std::fs::create_dir_all(&external_dir).expect("create external dir");
-    std::fs::write(&notebook_path, "{}").expect("write notebook");
+    std::fs::write(&file_path, "notes").expect("write file");
 
     let workspace_display = bamboo_config::paths::path_to_display_string(&workspace);
-    let notebook_display = bamboo_config::paths::path_to_display_string(&notebook_path);
+    let file_display = bamboo_config::paths::path_to_display_string(&file_path);
 
     let mut session = Session::new("session-1", "test-model");
     session
@@ -112,8 +112,8 @@ fn should_apply_workspace_update_when_target_is_outside_workspace() {
         id: "call_1".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "NotebookEdit".to_string(),
-            arguments: serde_json::json!({ "notebook_path": notebook_display }).to_string(),
+            name: "Edit".to_string(),
+            arguments: serde_json::json!({ "file_path": file_display }).to_string(),
         },
     };
 

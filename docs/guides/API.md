@@ -299,7 +299,8 @@ Check if the agent is waiting for user input.
 POST /api/v1/sessions/{session_id}/respond
 ```
 
-Submit a response to a pending question from the `conclusion_with_options` tool.
+Submit a response to a pending question from a pause-capable custom tool, a
+permission gate, or a compatible persisted session.
 
 **Path Parameters:**
 

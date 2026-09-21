@@ -566,7 +566,7 @@ impl Agent {
     // ------------------------------------------------------------------
 
     /// Answer a suspended session's pending question — a
-    /// `conclusion_with_options` clarification OR a permission-approval
+    /// custom `NeedsHuman` clarification OR a permission-approval
     /// prompt (`NeedClarification` / `ToolApprovalRequested` events; both
     /// suspend via the same `session.pending_question` mechanism, per
     /// `bamboo_engine::session_app::respond`). This is the in-process
