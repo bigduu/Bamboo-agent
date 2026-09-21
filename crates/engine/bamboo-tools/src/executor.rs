@@ -13,10 +13,9 @@ use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
-    BashInputTool, BashOutputTool, BashTool, ConclusionWithOptionsTool, EditTool,
-    EnterPlanModeTool, ExitPlanModeTool, GetFileInfoTool, GlobTool, GrepTool, JsReplTool,
-    KillShellTool, NotebookEditTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool,
-    TaskTool, ToolRegistry, UpdateGoalTool, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
+    BashInputTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GetFileInfoTool, GlobTool,
+    GrepTool, KillShellTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool,
+    TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool, WebFetchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -130,7 +129,7 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with all built-in tools registered
     pub fn new() -> Self {
         let registry = ToolRegistry::new();
-        let framework_builtin_tools = Self::register_builtin_tools(&registry, None);
+        let framework_builtin_tools = Self::register_builtin_tools(&registry);
         Self {
             registry,
             permission_checker: None,
@@ -142,7 +141,7 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with a permission checker
     pub fn new_with_permissions(permission_checker: Arc<dyn PermissionChecker>) -> Self {
         let registry = ToolRegistry::new();
-        let framework_builtin_tools = Self::register_builtin_tools(&registry, None);
+        let framework_builtin_tools = Self::register_builtin_tools(&registry);
         Self {
             registry,
             permission_checker: Some(permission_checker),
@@ -151,34 +150,18 @@ impl BuiltinToolExecutor {
         }
     }
 
-    /// Creates a new executor that can read the shared, hot-reloadable config.
-    ///
-    /// Use this when running inside the Bamboo server so tools (notably
-    /// `http_request`) honor proxy settings from `config.json`.
-    pub fn new_with_config(config: Arc<RwLock<Config>>) -> Self {
-        let registry = ToolRegistry::new();
-        let framework_builtin_tools = Self::register_builtin_tools(&registry, Some(config));
-        Self {
-            registry,
-            permission_checker: None,
-            framework_builtin_tools,
-            tool_event_publisher: Self::default_tool_event_publisher(),
-        }
+    /// Compatibility constructor for callers that already hold shared config.
+    /// Current built-ins have no executor-time configuration dependency.
+    pub fn new_with_config(_config: Arc<RwLock<Config>>) -> Self {
+        Self::new()
     }
 
     /// Creates a new executor with both shared config and a permission checker.
     pub fn new_with_config_and_permissions(
-        config: Arc<RwLock<Config>>,
+        _config: Arc<RwLock<Config>>,
         permission_checker: Arc<dyn PermissionChecker>,
     ) -> Self {
-        let registry = ToolRegistry::new();
-        let framework_builtin_tools = Self::register_builtin_tools(&registry, Some(config));
-        Self {
-            registry,
-            permission_checker: Some(permission_checker),
-            framework_builtin_tools,
-            tool_event_publisher: Self::default_tool_event_publisher(),
-        }
+        Self::new_with_permissions(permission_checker)
     }
 
     /// Creates a new executor from an existing registry
@@ -230,12 +213,10 @@ impl BuiltinToolExecutor {
         if !Arc::ptr_eq(builtin, tool) {
             return None;
         }
-        let path_field = match tool_name {
-            "Write" | "Edit" => "file_path",
-            "NotebookEdit" => "notebook_path",
-            _ => return None,
-        };
-        let path = args.get(path_field)?.as_str()?.trim();
+        if !matches!(tool_name, "Write" | "Edit") {
+            return None;
+        }
+        let path = args.get("file_path")?.as_str()?.trim();
         FileChangedV1::bounded_from(path).ok()
     }
 
@@ -270,14 +251,9 @@ impl BuiltinToolExecutor {
     }
 
     /// Registers all built-in tools to the given registry
-    fn register_builtin_tools(
-        registry: &ToolRegistry,
-        config: Option<Arc<RwLock<Config>>>,
-    ) -> BTreeMap<String, Arc<dyn Tool>> {
+    fn register_builtin_tools(registry: &ToolRegistry) -> BTreeMap<String, Arc<dyn Tool>> {
         let mut framework_tools = BTreeMap::new();
-        let _ = config;
         // NOTE: apply_patch is now an alias for Edit – no separate registration.
-        let _ = registry.register(ConclusionWithOptionsTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
             framework_tools.insert(name, tool);
         }
@@ -286,7 +262,6 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
             framework_tools.insert(name, tool);
         }
-        let _ = registry.register(EnterPlanModeTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
         // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());
@@ -295,21 +270,16 @@ impl BuiltinToolExecutor {
         }
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
-        let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(SessionNoteTool::new());
-        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, NotebookEditTool::new())
-        {
-            framework_tools.insert(name, tool);
-        }
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);
         }
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TaskTool::new());
+        let _ = registry.register(ViewImageTool::new());
         let _ = registry.register(WebFetchTool::new());
-        let _ = registry.register(WebSearchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
         let _ = registry.register(WorkspaceTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteTool::new()) {
@@ -351,7 +321,7 @@ impl BuiltinToolExecutor {
     /// Returns all built-in tool schemas
     pub fn tool_schemas() -> Vec<ToolSchema> {
         let registry = ToolRegistry::new();
-        let _ = Self::register_builtin_tools(&registry, None);
+        let _ = Self::register_builtin_tools(&registry);
         registry.list_tools()
     }
 
@@ -900,15 +870,18 @@ impl BuiltinToolExecutorBuilder {
     /// Registers all default built-in tools
     pub fn with_default_tools(mut self) -> Self {
         self.framework_builtin_tools
-            .extend(BuiltinToolExecutor::register_builtin_tools(
-                &self.registry,
-                None,
-            ));
+            .extend(BuiltinToolExecutor::register_builtin_tools(&self.registry));
         self
     }
 
     /// Registers a specific filesystem tool by name
     pub fn with_filesystem_tool(mut self, name: &str) -> Result<Self, ToolError> {
+        if name == "ViewImage" {
+            self.registry
+                .register(ViewImageTool::new())
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            return Ok(self);
+        }
         let (name, tool) = match name {
             "Read" => {
                 BuiltinToolExecutor::register_tracked_builtin(&self.registry, ReadTool::new())?
@@ -920,10 +893,6 @@ impl BuiltinToolExecutorBuilder {
             "Edit" | "apply_patch" => {
                 BuiltinToolExecutor::register_tracked_builtin(&self.registry, EditTool::new())?
             }
-            "NotebookEdit" => BuiltinToolExecutor::register_tracked_builtin(
-                &self.registry,
-                NotebookEditTool::new(),
-            )?,
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         };
         self.framework_builtin_tools.insert(name, tool);
@@ -1644,6 +1613,23 @@ mod tests {
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
         for tool_name in BUILTIN_TOOL_NAMES {
             assert!(tool_names.contains(&tool_name.to_string()));
+        }
+    }
+
+    #[test]
+    fn retired_tools_are_not_registered() {
+        let executor = BuiltinToolExecutor::new();
+        let tool_names = executor.registry().list_tool_names();
+
+        for retired in [
+            "EnterPlanMode",
+            "js_repl",
+            "NotebookEdit",
+            "SlashCommand",
+            "WebSearch",
+            "conclusion_with_options",
+        ] {
+            assert!(!tool_names.iter().any(|name| name == retired), "{retired}");
         }
     }
 
@@ -3566,57 +3552,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn successful_notebook_edit_emits_one_bounded_file_changed_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notebook-event.ipynb");
-        fs::write(
-            &path,
-            r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#,
-        )
-        .await
-        .unwrap();
-        let path_string = path.to_string_lossy().into_owned();
-        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
-        let executor = BuiltinToolExecutorBuilder::new()
-            .with_filesystem_tool("NotebookEdit")
-            .unwrap()
-            .with_tool_event_publisher(recorder.clone())
-            .build();
-        let call = make_tool_call_with_id(
-            "notebook-call",
-            "NotebookEdit",
-            json!({
-                "notebook_path": format!(" {path_string} "),
-                "new_source": "print('hello')",
-                "cell_type": "code",
-                "edit_mode": "insert"
-            }),
-        );
-
-        let result = executor
-            .execute_with_context(
-                &call,
-                tool_event_context(
-                    &call,
-                    Some("notebook-session"),
-                    Some("notebook-root-session"),
-                ),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert_single_file_changed(
-            &recorder,
-            "notebook-session",
-            "notebook-root-session",
-            "NotebookEdit",
-            "notebook-call",
-            &path_string,
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn write_through_intermediate_symlink_fails_and_emits_zero_events() {
@@ -3694,49 +3629,6 @@ mod tests {
             "Edit must fail closed for a symlinked final file"
         );
         assert_eq!(fs::read_to_string(&real).await.unwrap(), "before\n");
-        assert!(recorder.try_snapshot().unwrap().is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn notebook_edit_through_intermediate_symlink_fails_and_emits_zero_events() {
-        use std::os::unix::fs::symlink;
-
-        let workspace = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        let real_notebook = external.path().join("real.ipynb");
-        let original = r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
-        fs::write(&real_notebook, original).await.unwrap();
-        let linked_dir = workspace.path().join("linked");
-        symlink(external.path(), &linked_dir).unwrap();
-        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
-        let executor = BuiltinToolExecutorBuilder::new()
-            .with_filesystem_tool("NotebookEdit")
-            .unwrap()
-            .with_tool_event_publisher(recorder.clone())
-            .build();
-        let call = make_tool_call_with_id(
-            "symlink-notebook",
-            "NotebookEdit",
-            json!({
-                "notebook_path": linked_dir.join("real.ipynb"),
-                "new_source": "print('must not write')",
-                "cell_type": "code",
-                "edit_mode": "insert"
-            }),
-        );
-
-        let result = executor
-            .execute_with_context(
-                &call,
-                tool_event_context(&call, Some("symlink-session"), Some("symlink-root")),
-            )
-            .await;
-        assert!(
-            result.is_err() || result.as_ref().is_ok_and(|result| !result.success),
-            "NotebookEdit must fail closed through an intermediate symlink"
-        );
-        assert_eq!(fs::read_to_string(&real_notebook).await.unwrap(), original);
         assert!(recorder.try_snapshot().unwrap().is_empty());
     }
 

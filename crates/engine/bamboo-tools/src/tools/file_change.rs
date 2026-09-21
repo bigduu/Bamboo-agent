@@ -21,7 +21,7 @@ pub async fn read_existing_bytes(path: &Path) -> Result<Option<Vec<u8>>, ToolErr
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AtomicWriteExpectation<'a> {
     /// Preserve the historical behavior for callers without a read-before-write
-    /// baseline (for example NotebookEdit).
+    /// baseline.
     Unchecked,
     /// Refuse to replace a path that appeared after the caller observed it as
     /// missing.

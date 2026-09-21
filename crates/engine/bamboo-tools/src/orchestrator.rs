@@ -240,6 +240,7 @@ mod tests {
         assert_eq!(classify_tool("Read"), ToolMutability::ReadOnly);
         assert_eq!(classify_tool("Grep"), ToolMutability::ReadOnly);
         assert_eq!(classify_tool("Glob"), ToolMutability::ReadOnly);
+        assert_eq!(classify_tool("ViewImage"), ToolMutability::ReadOnly);
         assert_eq!(classify_tool("WebSearch"), ToolMutability::ReadOnly);
         assert_eq!(classify_tool("Sleep"), ToolMutability::ReadOnly);
     }

@@ -20,7 +20,7 @@
 //!   alongside the event receiver; a background watchdog cancels the run if it
 //!   runs unexpectedly long.
 //! - **Approval / clarification + resume**: if the model calls a tool that
-//!   pauses for user input (`conclusion_with_options`, or a gated tool under a
+//!   pauses for user input (a custom `NeedsHuman` tool, or a gated tool under a
 //!   configured `PermissionChecker`), the event loop sees
 //!   `AgentEvent::NeedClarification` / `ToolApprovalRequested`, answers it via
 //!   `Agent::answer`, and resumes the run via `Agent::resume_stream` — the
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(event) = rx.recv().await {
         // Approval / clarification + resume demo: the loop suspended waiting
-        // for input (a `conclusion_with_options` call, or a gated tool under a
+        // for input (a custom NeedsHuman tool, or a gated tool under a
         // configured permission checker). Both suspend via the same
         // `session.pending_question` mechanism, so both are answered the same
         // way. Answer it, then resume the run from where it left off — if this

@@ -6,7 +6,7 @@
 
 ### The local-first AI agent runtime, in Rust.
 
-**Persistent memory, 22 built-in tools, skills, MCP, workflows & schedules — behind HTTP + WebSocket + SSE APIs.**
+**Persistent memory, 19 built-in tools, skills, MCP, workflows & schedules — behind HTTP + WebSocket + SSE APIs.**
 Run it as a server, or embed the same agent loop as a Rust crate. Your data stays on your machine.
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
@@ -33,7 +33,7 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 |---|---|
 | 🧠 **Memory system** | Session notes, Jiandu-owned derived Dream snapshots, and cross-session durable memory, with auto-dream and background gardener |
 | 🗜️ **Context compression** | Hybrid compression with rolling summary + recent-window retention, automatic trimming of oversized tool output, executed against the model's context-window budget |
-| 🛠️ **Built-in tools** | 22 built-in tools: files, search, Shell, Web, plan mode, tasks, permission requests, and more |
+| 🛠️ **Built-in tools** | 19 built-in tools: files, images, search, Shell, Web fetch, tasks, permission requests, and more |
 | 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in docx / pdf / pptx / xlsx / skill-creator |
 | 🔌 **MCP** | Model Context Protocol client that hooks into external tool servers |
 | ⏰ **Workflows & schedules** | Declarative workflow loading + a cron-style schedule trigger engine |
@@ -56,7 +56,7 @@ graph TD
   ENG --> CMP[bamboo-compression<br/>token budgeting, summarizer, limits]
   ENG --> SKILLS[bamboo-skills<br/>selection, access control, runtime metadata]
   ENG --> MCP[bamboo-mcp<br/>MCP client: manager, protocol, transports, tool_index]
-  ENG --> TOOLS[bamboo-tools<br/>22 built-in tools, registry, guides, permissions]
+  ENG --> TOOLS[bamboo-tools<br/>19 built-in tools, registry, guides, permissions]
   ENG --> HOOKS[bamboo-hooks<br/>lifecycle dispatch, command + external scripts]
   ENG --> INFRA[bamboo-infrastructure<br/>config, LLM providers, session store]
   HOOKS --> CORE
@@ -142,7 +142,7 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 
 ### Tools, Workflows, Schedules, MCP
 
-- **Tools** (`bamboo-tools`, **22 built-in**, registered in `executor.rs::register_builtin_tools`): `Bash`, `BashOutput`, `KillShell`, `Read`, `Write`, `Edit`, `NotebookEdit`, `Glob`, `Grep`, `GetFileInfo`, `Workspace`, `WebFetch`, `WebSearch`, `JsRepl`, `Task`, `Sleep`, `EnterPlanMode`, `ExitPlanMode`, `RequestPermissions`, `SessionNote`, `ConclusionWithOptions`, and more. Tools come with **usage guides** injected at runtime, a **permission/policy-aware** execution path, and parallel execution support (`parallel.rs`).
+- **Tools** (`bamboo-tools`, **19 built-in**, registered in `executor.rs::register_builtin_tools`): `Bash`, `BashInput`, `BashOutput`, `KillShell`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `GetFileInfo`, `ViewImage`, `Workspace`, `WebFetch`, `Task`, `Sleep`, `ExitPlanMode`, `request_permissions`, `session_note`, and `update_goal`. Tools come with **usage guides** injected at runtime, a **permission/policy-aware** execution path, and parallel execution support (`parallel.rs`).
 - **Workflows** — declarative loading (`bamboo-server/src/workflow/loader.rs`), exposed via `/bamboo/workflows`.
 - **Schedules** — a cron-style trigger engine and store (`bamboo-server/src/schedules/`: `manager`, `trigger_engine`, `session_factory`, `store`).
 - **MCP** — Model Context Protocol client (`crates/infra/bamboo-mcp/`: `manager`, `protocol`, `transports`, `tool_index`), managing external tool servers via the `/mcp`, `/servers` routes.
@@ -380,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
 
 > Don't need the event stream? `agent.run(&mut session, input).await?` drives the turn to completion and leaves the answer as the last message on `session`. For full control over per-request overrides (split fast/background/summarization models, skill selection, provider handles, …) build an `ExecuteRequest` with `ExecuteRequestBuilder` (both re-exported from `bamboo_sdk::agent`) and call `agent.execute(&mut session, req)` — the same canonical engine path `run` / `run_stream` funnel into.
 
-**Approval / clarification + resume.** A run can pause mid-loop waiting for input — a `conclusion_with_options` clarification, or a gated tool call under a configured `PermissionChecker` — surfaced as `AgentEvent::NeedClarification` / `ToolApprovalRequested`. Resolve it with `agent.answer(session_id, "Approve").await?` (the in-process equivalent of the HTTP `POST /sessions/{id}/respond` endpoint — same use-case function under the hood, so behavior matches exactly), then continue with `agent.resume_stream(outcome.session)` / `agent.resume(&mut session)` — or do both in one call with `agent.answer_and_resume_stream(session_id, "Approve").await?`. `AnswerOutcome` also carries any plan-mode transition and the permission grants an approval implied (auto-applied to the builder's `.permission_checker(...)`, if one was configured). When the approved question was a gated tool call, resuming also **re-executes that tool for real** — against the agent's own tool executor — and writes the genuine output back over the synthetic placeholder before the loop continues, matching the HTTP server's behavior exactly (no extra call needed).
+**Approval / clarification + resume.** A run can pause mid-loop waiting for input — from a custom `NeedsHuman` tool or a gated tool call under a configured `PermissionChecker` — surfaced as `AgentEvent::NeedClarification` / `ToolApprovalRequested`. Resolve it with `agent.answer(session_id, "Approve").await?` (the in-process equivalent of the HTTP `POST /sessions/{id}/respond` endpoint — same use-case function under the hood, so behavior matches exactly), then continue with `agent.resume_stream(outcome.session)` / `agent.resume(&mut session)` — or do both in one call with `agent.answer_and_resume_stream(session_id, "Approve").await?`. `AnswerOutcome` also carries any plan-mode transition and the permission grants an approval implied (auto-applied to the builder's `.permission_checker(...)`, if one was configured). When the approved question was a gated tool call, resuming also **re-executes that tool for real** — against the agent's own tool executor — and writes the genuine output back over the synthetic placeholder before the loop continues, matching the HTTP server's behavior exactly (no extra call needed).
 >
 > A separate mechanism, `AgentEvent::ChildApprovalRequested`, covers an out-of-process CHILD sub-agent's gated tool (only reachable if you've also wired the engine's actor/broker transport — `with_defaults_for_data_dir` does not). Answer those with `agent.answer_child_approval(child_session_id, request_id, approved)` instead of `agent.answer`.
 

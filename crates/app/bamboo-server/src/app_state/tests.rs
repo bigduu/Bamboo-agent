@@ -244,6 +244,20 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("session_note"));
+    assert!(names.contains("ViewImage"));
+    for retired in [
+        "EnterPlanMode",
+        "js_repl",
+        "NotebookEdit",
+        "SlashCommand",
+        "WebSearch",
+        "conclusion_with_options",
+    ] {
+        assert!(
+            !names.contains(retired),
+            "retired tool {retired} leaked into the root catalog"
+        );
+    }
 
     let history = state
         .tools_for(ToolSurface::Root)

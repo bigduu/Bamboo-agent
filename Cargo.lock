@@ -1591,7 +1591,6 @@ dependencies = [
  "dirs",
  "futures",
  "globset",
- "parking_lot",
  "regex",
  "reqwest",
  "serde",
@@ -1606,7 +1605,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
- "wiremock",
 ]
 
 [[package]]

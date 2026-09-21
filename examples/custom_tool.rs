@@ -71,7 +71,7 @@ impl Tool for WeatherTool {
     /// synchronous case. `ToolOutcome` also has `Running` (detach and
     /// complete later — for long-lived background work) and `NeedsHuman`
     /// (suspend the turn for approval/clarification, like the built-in
-    /// `RequestPermissions`/`ConclusionWithOptions` tools) — most custom
+    /// `RequestPermissions` tool) — most custom
     /// tools only ever need `Completed`.
     async fn invoke(
         &self,

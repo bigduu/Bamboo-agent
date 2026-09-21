@@ -6,29 +6,25 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 24] = [
-    "conclusion_with_options",
+pub const BUILTIN_GUIDE_NAMES: [&str; 20] = [
     "Bash",
     "BashInput",
     "BashOutput",
     "Edit",
-    "EnterPlanMode",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
     "Grep",
-    "js_repl",
     "KillShell",
     "session_note",
-    "NotebookEdit",
     "Plan",
     "Read",
     "request_permissions",
     "Sleep",
     "Task",
     "update_goal",
+    "ViewImage",
     "WebFetch",
-    "WebSearch",
     "Workspace",
     "Write",
 ];
@@ -52,56 +48,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 json!({"file_path":"/workspace/project/src/main.rs","patch":"<<<<<<< SEARCH\nlet v = 1;\n=======\nlet v = 2;\n>>>>>>> REPLACE"}),
                 "Use when you want a dedicated patch tool call instead of Edit.",
             )],
-        )),
-        "conclusion_with_options" => Some(guide(
-            "conclusion_with_options",
-            ToolCategory::UserInteraction,
-            "Ask the user for confirmation or missing input with selectable options. Use this as the final interaction step when wrapping up a task turn, handing off execution, or asking the user to choose next steps.",
-            "Do not use repeatedly for routine status updates during active execution; reserve it for true clarification points, explicit user decisions, or the required final confirmation flow.",
-            &["ExitPlanMode"],
-            vec![
-                example(
-                    "Confirm before finishing",
-                    json!({
-                        "question":"Any other requests before I finish?",
-                        "conclusion":{
-                            "title":"Conclusion",
-                            "summary":"Core validation is complete and release is ready.",
-                            "key_points":["All targeted tests passed","No blocking regressions"],
-                            "next_steps":["Proceed with release train"],
-                            "confidence":"high",
-                            "mermaid":{"graph":"graph TD\nA[Validation]-->B[Ready to release]"}
-                        }
-                    }),
-                    "Use when user intent is required before finalizing. Defaults to options [\"OK\", \"Need changes\"] when options are omitted.",
-                ),
-                example(
-                    "Ask the user to choose the next step",
-                    json!({
-                        "question":"Which next step should I take?",
-                        "options":["Implement it","Refine the plan","Stop here","OK"],
-                        "conclusion":{
-                            "summary":"I finished the review and identified two viable implementation paths.",
-                            "key_points":["Minimal change path is lower risk","Broader refactor will simplify future maintenance"],
-                            "mermaid":{"graph":"graph TD\nA[Review done]-->B[Choose next step]"}
-                        }
-                    }),
-                    "Use when the user must choose among concrete next actions instead of receiving plain prose.",
-                ),
-                example(
-                    "Wrap up a review turn",
-                    json!({
-                        "question":"Want me to proceed with the recommended fix?",
-                        "options":["Proceed","Need changes","OK"],
-                        "conclusion":{
-                            "summary":"The review is complete and I found one blocking issue plus two minor cleanups.",
-                            "key_points":["Blocking issue identified","Fix scope is localized"],
-                            "mermaid":{"graph":"graph TD\nA[Review complete]-->B[Decision needed]"}
-                        }
-                    }),
-                    "Use at the end of review/explanation turns instead of a plain final paragraph.",
-                ),
-            ],
         )),
         "Read" => Some(guide(
             "Read",
@@ -230,30 +176,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when process should no longer run.",
             )],
         )),
-        "NotebookEdit" => Some(guide(
-            "NotebookEdit",
-            ToolCategory::FileWriting,
-            "Edit notebook cells by replace/insert/delete.",
-            "Do not use for non-notebook files.",
-            &["Read", "Write"],
-            vec![example(
-                "Replace first cell",
-                json!({"notebook_path":"/workspace/project/demo.ipynb","new_source":"print('ok')"}),
-                "Use with absolute notebook path.",
-            )],
-        )),
-        "SlashCommand" => Some(guide(
-            "SlashCommand",
-            ToolCategory::UserInteraction,
-            "Resolve and execute a slash command template.",
-            "Do not use for arbitrary shell execution.",
-            &["Bash", "Read"],
-            vec![example(
-                "Run review command",
-                json!({"command":"/review"}),
-                "Useful for reusable prompt workflows.",
-            )],
-        )),
         "Task" => Some(guide(
             "Task",
             ToolCategory::TaskManagement,
@@ -270,24 +192,12 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "Plan",
             ToolCategory::TaskManagement,
             "Delegate a complex planning request to one runtime-enforced read-only planner child. The root remains the normal orchestrator and resumes automatically with the planner result.",
-            "Do not use for a trivial lookup or as a substitute for implementation after the approach is already clear; do not call legacy EnterPlanMode when Plan is available.",
+            "Do not use for a trivial lookup or as a substitute for implementation after the approach is already clear.",
             &["Task", "SubAgent"],
             vec![example(
                 "Delegate an implementation plan",
                 json!({"task":"Inspect the current authentication flow and return an ordered migration plan with affected files, tests, risks, and explicit non-goals.","title":"Plan authentication migration","fork_last_messages":2}),
                 "The planner runs read-only; the parent waits internally and resumes without a mode-switch question.",
-            )],
-        )),
-        "EnterPlanMode" => Some(guide(
-            "EnterPlanMode",
-            ToolCategory::UserInteraction,
-            "Legacy compatibility tool for hosts where delegated Plan is unavailable.",
-            "Do not call when Plan is available; ordinary server sessions should delegate planning without switching the root mode.",
-            &["Plan", "Task", "ExitPlanMode"],
-            vec![example(
-                "Start planning a complex refactor",
-                json!({"reason":"This refactor touches multiple crates and needs careful design"}),
-                "Use when facing a complex task that requires exploration before implementation.",
             )],
         )),
         "ExitPlanMode" => Some(guide(
@@ -303,36 +213,29 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             )],
         )),
         // FileExists guide moved next to GetFileInfo (see below).
+        "ViewImage" => Some(guide(
+            "ViewImage",
+            ToolCategory::FileReading,
+            "Load a local raster image for visual inspection. With hooks.image_fallback enabled in vision mode, Bamboo replaces the image with the resolved vision model's description; otherwise the tool returns base64 multimodal image content.",
+            "Do not use for text files, directories, SVG/vector files, or images larger than 10 MB; use Read for textual content.",
+            &["Read", "GetFileInfo"],
+            vec![example(
+                "Inspect a local screenshot",
+                json!({"path":"/workspace/project/artifacts/screenshot.png"}),
+                "Supports PNG, JPEG, GIF, and WebP content and detects the format from its bytes rather than trusting the extension.",
+            )],
+        )),
         "WebFetch" => Some(guide(
             "WebFetch",
             ToolCategory::CommandExecution,
             "Fetch a webpage by URL when you need cleaned page text from a known target.",
             "Do not use for broad discovery queries.",
-            &["WebSearch"],
+            &[],
             vec![example(
                 "Fetch a target page",
                 json!({"url":"https://target-host/path","prompt":"Extract setup steps"}),
                 "The prompt field is context for downstream handling; WebFetch itself returns cleaned text + metadata.",
             )],
-        )),
-        "WebSearch" => Some(guide(
-            "WebSearch",
-            ToolCategory::CommandExecution,
-            "Search the web with optional domain allow/block filters. When searching for recent information, documentation, or current events, include the current year in the query to get up-to-date results.",
-            "Do not use for local codebase search. Do not specify both allowed_domains and blocked_domains in the same request.",
-            &["WebFetch", "Grep"],
-            vec![
-                example(
-                    "Search official docs",
-                    json!({"query":"rust async trait object", "allowed_domains":["doc.rust-lang.org"]}),
-                    "Use before WebFetch when URL is unknown.",
-                ),
-                example(
-                    "Search recent documentation",
-                    json!({"query":"React documentation 2026", "max_results": 5}),
-                    "Include the current year for recent docs or current events.",
-                ),
-            ],
         )),
         // GetCurrentDir is now an alias for Workspace (get mode)
         "GetCurrentDir" => Some(guide(
@@ -488,24 +391,12 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
             ],
         )),
-        "js_repl" => Some(guide(
-            "js_repl",
-            ToolCategory::CommandExecution,
-            "Execute JavaScript code using Node.js with top-level await support. Each invocation runs in a fresh process.",
-            "Do not use for tasks better handled by Bash. Requires Node.js installed on the host.",
-            &["Bash"],
-            vec![example(
-                "Evaluate a JS expression",
-                json!({"code":"console.log(2 + 2)"}),
-                "Use for quick calculations, JSON manipulation, or any JS-specific task.",
-            )],
-        )),
         "request_permissions" => Some(guide(
             "request_permissions",
             ToolCategory::UserInteraction,
             "Request one or more remembered permission scopes through independent typed decisions. Batch entries are reviewed one at a time.",
             "Do not use this for a one-shot operation: invoke the target tool directly so Allow once is bound to that exact tool-call occurrence.",
-            &["conclusion_with_options", "Write", "Edit", "Bash", "WebFetch"],
+            &["Write", "Edit", "Bash", "WebFetch"],
             vec![example(
                 "Request remembered file-write permission",
                 json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),

@@ -146,6 +146,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "Grep",
     "WebFetch",
     "WebSearch",
+    "ViewImage",
     "Workspace",
     "BashOutput",
     "session_note",
@@ -194,7 +195,6 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "EnterPlanMode",
             "ExitPlanMode",
             "request_permissions",
-            "conclusion_with_options",
             "archive_context",
             "compact_context",
         ]

@@ -8,28 +8,24 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
-    "conclusion_with_options",
+pub const BUILTIN_TOOL_NAMES: [&str; 19] = [
     "Bash",
     "BashInput",
     "BashOutput",
     "Edit",
-    "EnterPlanMode",
     "ExitPlanMode",
     "GetFileInfo",
     "Glob",
     "Grep",
-    "js_repl",
     "KillShell",
     "session_note",
-    "NotebookEdit",
     "Read",
     "request_permissions",
     "Sleep",
     "Task",
     "update_goal",
+    "ViewImage",
     "WebFetch",
-    "WebSearch",
     "Workspace",
     "Write",
 ];
@@ -63,8 +59,7 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 10] = [
 ///
 /// This table is public so classification, compatibility tests, and future
 /// admission code can prove that every accepted spelling shares one resolver.
-pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 33] = [
-    ("conclusionWithOptions", "conclusion_with_options"),
+pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 34] = [
     ("execute_command", "Bash"),
     ("file_exists", "FileExists"),
     ("fileExists", "FileExists"),
@@ -94,6 +89,8 @@ pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 33] = [
     ("subAgent", "SubAgent"),
     ("SubSession", "SubAgent"),
     ("subsession", "SubAgent"),
+    ("view_image", "ViewImage"),
+    ("viewImage", "ViewImage"),
     ("write_file", "Write"),
     ("sessionInspector", "session_inspector"),
     ("scheduleTasks", "schedule_tasks"),
@@ -250,6 +247,16 @@ mod tests {
             normalize_tool_ref("default::sleep"),
             Some("Sleep".to_string())
         );
+        assert_eq!(
+            normalize_tool_ref("default::viewImage"),
+            Some("ViewImage".to_string())
+        );
+    }
+
+    #[test]
+    fn retired_conclusion_tool_and_alias_are_not_recognized() {
+        assert_eq!(normalize_tool_ref("conclusion_with_options"), None);
+        assert_eq!(normalize_tool_ref("default::conclusionWithOptions"), None);
     }
 
     #[test]

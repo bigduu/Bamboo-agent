@@ -92,7 +92,7 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 /// ```rust,no_run
 /// # use bamboo_sdk::{Agent, BuiltinTool};
 /// let builder = Agent::builder()
-///     .tools([BuiltinTool::WebSearch.tool(), BuiltinTool::Read.tool()]);
+///     .tools([BuiltinTool::WebFetch.tool(), BuiltinTool::Read.tool()]);
 /// # let _ = builder;
 /// ```
 ///
@@ -100,55 +100,47 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 /// drift-guard test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinTool {
-    ConclusionWithOptions,
     Bash,
     BashInput,
     BashOutput,
     Edit,
-    EnterPlanMode,
     ExitPlanMode,
     GetFileInfo,
     Glob,
     Grep,
-    JsRepl,
     KillShell,
     SessionNote,
-    NotebookEdit,
     Read,
     RequestPermissions,
     Sleep,
     Task,
     UpdateGoal,
+    ViewImage,
     WebFetch,
-    WebSearch,
     Workspace,
     Write,
 }
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 23] = [
-        BuiltinTool::ConclusionWithOptions,
+    pub const ALL: [BuiltinTool; 19] = [
         BuiltinTool::Bash,
         BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
         BuiltinTool::Edit,
-        BuiltinTool::EnterPlanMode,
         BuiltinTool::ExitPlanMode,
         BuiltinTool::GetFileInfo,
         BuiltinTool::Glob,
         BuiltinTool::Grep,
-        BuiltinTool::JsRepl,
         BuiltinTool::KillShell,
         BuiltinTool::SessionNote,
-        BuiltinTool::NotebookEdit,
         BuiltinTool::Read,
         BuiltinTool::RequestPermissions,
         BuiltinTool::Sleep,
         BuiltinTool::Task,
         BuiltinTool::UpdateGoal,
+        BuiltinTool::ViewImage,
         BuiltinTool::WebFetch,
-        BuiltinTool::WebSearch,
         BuiltinTool::Workspace,
         BuiltinTool::Write,
     ];
@@ -156,27 +148,23 @@ impl BuiltinTool {
     /// The canonical runtime name for this tool (matches [`BUILTIN_TOOL_NAMES`]).
     pub const fn name(self) -> &'static str {
         match self {
-            BuiltinTool::ConclusionWithOptions => "conclusion_with_options",
             BuiltinTool::Bash => "Bash",
             BuiltinTool::BashInput => "BashInput",
             BuiltinTool::BashOutput => "BashOutput",
             BuiltinTool::Edit => "Edit",
-            BuiltinTool::EnterPlanMode => "EnterPlanMode",
             BuiltinTool::ExitPlanMode => "ExitPlanMode",
             BuiltinTool::GetFileInfo => "GetFileInfo",
             BuiltinTool::Glob => "Glob",
             BuiltinTool::Grep => "Grep",
-            BuiltinTool::JsRepl => "js_repl",
             BuiltinTool::KillShell => "KillShell",
             BuiltinTool::SessionNote => "session_note",
-            BuiltinTool::NotebookEdit => "NotebookEdit",
             BuiltinTool::Read => "Read",
             BuiltinTool::RequestPermissions => "request_permissions",
             BuiltinTool::Sleep => "Sleep",
             BuiltinTool::Task => "Task",
             BuiltinTool::UpdateGoal => "update_goal",
+            BuiltinTool::ViewImage => "ViewImage",
             BuiltinTool::WebFetch => "WebFetch",
-            BuiltinTool::WebSearch => "WebSearch",
             BuiltinTool::Workspace => "Workspace",
             BuiltinTool::Write => "Write",
         }

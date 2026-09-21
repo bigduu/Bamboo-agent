@@ -10,20 +10,18 @@ pub(super) fn is_workspace_update_tool(tool_call: &ToolCall) -> Option<bool> {
         normalized_tool_name == "SetWorkspace"
             || normalized_tool_name == "Workspace"
             || normalized_tool_name == "Write"
-            || normalized_tool_name == "Edit"
-            || normalized_tool_name == "NotebookEdit",
+            || normalized_tool_name == "Edit",
     )
 }
 
 pub(super) fn is_write_or_edit_tool_name(tool_name: String) -> bool {
-    tool_name == "Write" || tool_name == "Edit" || tool_name == "NotebookEdit"
+    tool_name == "Write" || tool_name == "Edit"
 }
 
 pub(super) fn extract_target_file_path_from_tool_call(tool_call: &ToolCall) -> Option<String> {
     let normalized_tool_name = normalized_tool_name(tool_call)?;
     let argument_key = match normalized_tool_name.as_str() {
         "Write" | "Edit" => "file_path",
-        "NotebookEdit" => "notebook_path",
         _ => return None,
     };
 
@@ -62,14 +60,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_write_or_edit_tool_name_notebook() {
-        assert!(is_write_or_edit_tool_name("NotebookEdit".to_string()));
-    }
-
-    #[test]
     fn test_is_write_or_edit_tool_name_other() {
         assert!(!is_write_or_edit_tool_name("Bash".to_string()));
         assert!(!is_write_or_edit_tool_name("Read".to_string()));
+        assert!(!is_write_or_edit_tool_name("NotebookEdit".to_string()));
     }
 
     #[test]
@@ -87,16 +81,6 @@ mod tests {
         );
         let path = extract_target_file_path_from_tool_call(&tool_call);
         assert_eq!(path, Some("/src/main.rs".to_string()));
-    }
-
-    #[test]
-    fn test_extract_target_file_path_notebook() {
-        let tool_call = make_tool_call(
-            "NotebookEdit",
-            r#"{"notebook_path":"/test.ipynb","cell_number":0}"#,
-        );
-        let path = extract_target_file_path_from_tool_call(&tool_call);
-        assert_eq!(path, Some("/test.ipynb".to_string()));
     }
 
     #[test]

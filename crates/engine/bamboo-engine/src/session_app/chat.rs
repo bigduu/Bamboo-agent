@@ -23,7 +23,6 @@ use super::types::{ChatTurnInput, ChatWorkspaceFallbackPolicy};
 const BASE_SYSTEM_PROMPT_KEY: &str = "base_system_prompt";
 const SKILL_RUNTIME_LOADED_KEY: &str = "skill_runtime_loaded_skill_ids";
 const SKILL_RUNTIME_LAST_KEY: &str = "skill_runtime_last_loaded_skill_id";
-const COPILOT_CONCLUSION_KEY: &str = "copilot_conclusion_with_options_enhancement_enabled";
 const PROMPT_COMPOSER_VERSION_KEY: &str = "prompt_composer_version";
 const PROMPT_FINGERPRINT_KEY: &str = "prompt_fingerprint";
 const PROMPT_COMPONENT_FLAGS_KEY: &str = "prompt_component_flags";
@@ -193,12 +192,6 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     resolve_enhance_prompt(&mut session, input.enhance_prompt.as_deref());
     let enhance_prompt = session.enhance_prompt();
 
-    // ---- Resolve copilot conclusion with options enhancement ----
-    resolve_copilot_conclusion_with_options_enhancement(
-        &mut session,
-        input.copilot_conclusion_with_options_enhancement_enabled,
-    );
-
     // ---- Resolve workspace path (metadata only, no filesystem) ----
     let allow_legacy_workspace_fallback = matches!(
         crate::project_context::ProjectContextResolver::session_project_identity(&session),
@@ -341,19 +334,6 @@ pub fn resolve_enhance_prompt(session: &mut Session, enhance_prompt_from_request
         session.set_enhance_prompt(prompt);
     } else {
         session.clear_enhance_prompt();
-    }
-}
-
-pub fn resolve_copilot_conclusion_with_options_enhancement(
-    session: &mut Session,
-    enabled_from_request: Option<bool>,
-) {
-    if let Some(enabled) = enabled_from_request {
-        session
-            .metadata
-            .insert(COPILOT_CONCLUSION_KEY.to_string(), enabled.to_string());
-    } else {
-        session.metadata.remove(COPILOT_CONCLUSION_KEY);
     }
 }
 
@@ -931,7 +911,6 @@ mod tests {
             selected_skill_ids: None,
             workflow_selection: None,
             orchestration_opt_in: None,
-            copilot_conclusion_with_options_enhancement_enabled: None,
             data_dir: None,
         }
     }

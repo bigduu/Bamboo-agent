@@ -51,16 +51,17 @@ impl Tool for EchoTool {
 fn s_t4_1_tool_catalog_and_custom_tool_selection() {
     // The catalog resolves each variant to a real Tool whose advertised name
     // matches the canonical name.
-    let web: SharedTool = BuiltinTool::WebSearch.tool();
-    assert_eq!(web.name(), "WebSearch");
+    let web: SharedTool = BuiltinTool::WebFetch.tool();
+    assert_eq!(web.name(), "WebFetch");
     assert_eq!(BuiltinTool::Read.tool().name(), "Read");
+    assert_eq!(BuiltinTool::ViewImage.tool().name(), "ViewImage");
 
     // `.tools([..])` takes actual tools (Arc<dyn Tool>); `.tool(..)` adds a
     // custom one. The fluent chain compiles and runs without panicking.
     let _builder: AgentBuilder = Agent::builder()
         .model("test-model")
         .instruction("You are a careful research assistant.")
-        .tools([BuiltinTool::Read.tool(), BuiltinTool::WebSearch.tool()])
+        .tools([BuiltinTool::Read.tool(), BuiltinTool::ViewImage.tool()])
         .tool(EchoTool);
 }
 
