@@ -1891,7 +1891,6 @@ mod tests {
             schema("custom_tool", "inspect custom", json!({})),
             schema("mcp__alpha__inspect", "inspect mcp", json!({})),
             schema("Workspace", "inspect host", json!({})),
-            schema("conclusion_with_options", "inspect host", json!({})),
             schema("request_permissions", "inspect host", json!({})),
         ];
         let raw = project_tool_capability_metadata(&schemas);
@@ -1924,7 +1923,6 @@ mod tests {
     fn snapshot_boundary_rejects_forged_host_only_metadata() {
         let mut metadata = [
             "Workspace",
-            "conclusion_with_options",
             "request_permissions",
             "GetCurrentDir",
             "SetWorkspace",
