@@ -499,7 +499,7 @@ async fn emit_context_compression_status(
         .await;
 }
 
-fn effective_context_pressure_strategy(
+pub(super) fn effective_context_pressure_strategy(
     session: &Session,
     context_management: &ContextManagementConfig,
 ) -> ContextManagementStrategy {

@@ -8,8 +8,7 @@ use futures::stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::execute_llm_stream;
-use super::LlmStreamFrame;
+use super::{context_management_telemetry, execute_llm_stream, LlmStreamFrame};
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionSchema, ToolSchema};
 use bamboo_agent_core::{
@@ -200,6 +199,67 @@ fn test_config(system_prompt: &str) -> crate::runtime::config::AgentLoopConfig {
         system_prompt: Some(system_prompt.to_string()),
         ..Default::default()
     }
+}
+
+#[test]
+fn context_management_telemetry_tracks_effective_strategy_and_latest_boundary() {
+    let mut session = Session::new("telemetry-context", "test-model");
+    session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+
+    let mut first = bamboo_domain::CompressionEvent::new(
+        2,
+        1,
+        80.0,
+        60.0,
+        0,
+        bamboo_domain::CompressionTriggerType::Manual,
+        0.0,
+        None,
+        0,
+    );
+    first.id = "archive-event-1".to_string();
+    first.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+    let mut latest = bamboo_domain::CompressionEvent::new(
+        2,
+        1,
+        82.0,
+        58.0,
+        0,
+        bamboo_domain::CompressionTriggerType::CriticalOverflow,
+        0.0,
+        None,
+        0,
+    );
+    latest.id = "archive-event-2".to_string();
+    latest.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+    session.compression_events.extend([first, latest]);
+
+    let mut config = test_config("system");
+    config.context_management.strategy = bamboo_config::ContextManagementStrategy::RetrievalWindow;
+    let telemetry = context_management_telemetry(&session, &config);
+    assert_eq!(telemetry.strategy, "retrieval_window");
+    assert_eq!(telemetry.model_context_epoch, 1);
+    assert_eq!(
+        telemetry.model_context_reset_reason.as_deref(),
+        Some("compression")
+    );
+    assert_eq!(telemetry.retrieval_archive_event_count, 2);
+    assert_eq!(
+        telemetry.latest_retrieval_archive_event_id.as_deref(),
+        Some("archive-event-2")
+    );
+    assert_eq!(
+        telemetry.latest_retrieval_archive_trigger_type.as_deref(),
+        Some("critical_overflow")
+    );
+
+    config.context_management.retrieval_window.fallback_strategy =
+        bamboo_config::ContextManagementFallbackStrategy::Summary;
+    session.conversation_summary = Some(ConversationSummary::new("fallback", 4, 100));
+    assert_eq!(
+        context_management_telemetry(&session, &config).strategy,
+        "summary"
+    );
 }
 
 async fn prompt_exposure_metrics(

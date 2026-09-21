@@ -16,6 +16,34 @@
 use bamboo_domain::TokenBudgetUsage;
 use serde::Serialize;
 
+/// Non-content context-management correlation captured for one provider call.
+///
+/// These fields deliberately contain only strategy/lifecycle identifiers. Raw
+/// messages, search queries/results, memory, tool arguments, file paths, and
+/// provider payloads must never enter the token-usage sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextManagementTelemetry {
+    pub strategy: String,
+    pub model_context_epoch: u64,
+    pub model_context_reset_reason: Option<String>,
+    pub retrieval_archive_event_count: usize,
+    pub latest_retrieval_archive_event_id: Option<String>,
+    pub latest_retrieval_archive_trigger_type: Option<String>,
+}
+
+impl Default for ContextManagementTelemetry {
+    fn default() -> Self {
+        Self {
+            strategy: "summary".to_string(),
+            model_context_epoch: 0,
+            model_context_reset_reason: None,
+            retrieval_archive_event_count: 0,
+            latest_retrieval_archive_event_id: None,
+            latest_retrieval_archive_trigger_type: None,
+        }
+    }
+}
+
 /// One per-LLM-call usage record. Flattened for line-oriented analysis
 /// (jq / DuckDB / pandas over the JSONL).
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +85,17 @@ pub struct TokenUsageRecord {
     pub prompt_cached_tool_tokens_saved: u32,
     pub truncation_occurred: bool,
     pub segments_removed: usize,
+
+    // --- context-management correlation (never raw content) ---
+    pub context_management_strategy: String,
+    pub model_context_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_context_reset_reason: Option<String>,
+    pub retrieval_archive_event_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_retrieval_archive_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_retrieval_archive_trigger_type: Option<String>,
 }
 
 impl TokenUsageRecord {
@@ -78,6 +117,7 @@ impl TokenUsageRecord {
         input_tokens: u64,
         output_tokens: u64,
         thinking_tokens: u64,
+        context_management: ContextManagementTelemetry,
     ) -> Self {
         Self {
             ts,
@@ -103,6 +143,13 @@ impl TokenUsageRecord {
                 .unwrap_or(0),
             truncation_occurred: usage.map(|u| u.truncation_occurred).unwrap_or(false),
             segments_removed: usage.map(|u| u.segments_removed).unwrap_or(0),
+            context_management_strategy: context_management.strategy,
+            model_context_epoch: context_management.model_context_epoch,
+            model_context_reset_reason: context_management.model_context_reset_reason,
+            retrieval_archive_event_count: context_management.retrieval_archive_event_count,
+            latest_retrieval_archive_event_id: context_management.latest_retrieval_archive_event_id,
+            latest_retrieval_archive_trigger_type: context_management
+                .latest_retrieval_archive_trigger_type,
         }
     }
 
@@ -147,6 +194,14 @@ mod tests {
             800, // input_tokens (fresh, non-cached)
             300,
             7,
+            ContextManagementTelemetry {
+                strategy: "retrieval_window".to_string(),
+                model_context_epoch: 4,
+                model_context_reset_reason: Some("compression".to_string()),
+                retrieval_archive_event_count: 2,
+                latest_retrieval_archive_event_id: Some("archive-event-2".to_string()),
+                latest_retrieval_archive_trigger_type: Some("auto".to_string()),
+            },
         );
         let line = record.to_json_line().expect("serializes");
         assert!(!line.contains('\n'), "must be a single line");
@@ -155,6 +210,12 @@ mod tests {
         assert!(line.contains("\"cache_write_input_tokens\":0"));
         assert!(line.contains("\"input_tokens\":800"));
         assert!(line.contains("\"session_id\":\"sess-1\""));
+        assert!(line.contains("\"context_management_strategy\":\"retrieval_window\""));
+        assert!(line.contains("\"model_context_epoch\":4"));
+        assert!(line.contains("\"model_context_reset_reason\":\"compression\""));
+        assert!(line.contains("\"retrieval_archive_event_count\":2"));
+        assert!(line.contains("\"latest_retrieval_archive_event_id\":\"archive-event-2\""));
+        assert!(line.contains("\"latest_retrieval_archive_trigger_type\":\"auto\""));
     }
 
     #[test]
@@ -172,6 +233,7 @@ mod tests {
             232,
             120,
             20,
+            ContextManagementTelemetry::default(),
         );
 
         let prompt_total = record
@@ -186,5 +248,8 @@ mod tests {
         assert!((cache_hit_ratio - 0.768).abs() < f64::EPSILON);
         assert_eq!(record.output_tokens, 120);
         assert_eq!(record.thinking_tokens, 20);
+        assert_eq!(record.context_management_strategy, "summary");
+        assert_eq!(record.model_context_epoch, 0);
+        assert!(record.model_context_reset_reason.is_none());
     }
 }

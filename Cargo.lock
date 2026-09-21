@@ -935,6 +935,7 @@ name = "bamboo-analytics"
 version = "0.0.0"
 dependencies = [
  "duckdb",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
