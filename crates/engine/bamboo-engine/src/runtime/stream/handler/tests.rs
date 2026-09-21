@@ -377,6 +377,7 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
+                crate::token_usage_log::ContextManagementTelemetry::default(),
             );
             assert_eq!(log_record.output_tokens, expected_output);
             assert_eq!(log_record.thinking_tokens, expected_reasoning);
@@ -461,6 +462,7 @@ async fn provider_cache_reconciles_without_input_total_in_both_orders() {
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
+                crate::token_usage_log::ContextManagementTelemetry::default(),
             );
             assert_eq!(log_record.cache_creation_input_tokens, expected_creation);
             assert_eq!(log_record.cache_read_input_tokens, expected_read);

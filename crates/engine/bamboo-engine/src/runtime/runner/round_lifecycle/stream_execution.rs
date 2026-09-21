@@ -27,9 +27,11 @@ use bamboo_agent_core::{
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
+use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
-    provider_transcript_boundary_sha256, ModelContextEventKind, ModelContextResetReason,
-    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    provider_transcript_boundary_sha256, CompressionEventKind, CompressionTriggerType,
+    ModelContextEventKind, ModelContextResetReason, ProviderFamily, ProviderProtocol,
+    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
@@ -64,6 +66,49 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+
+fn context_management_telemetry(
+    session: &Session,
+    config: &AgentLoopConfig,
+) -> crate::token_usage_log::ContextManagementTelemetry {
+    let strategy = super::context_preparation::effective_context_pressure_strategy(
+        session,
+        &config.context_management,
+    );
+    let strategy = match strategy {
+        ContextManagementStrategy::Summary => "summary",
+        ContextManagementStrategy::RetrievalWindow => "retrieval_window",
+    };
+    let model_context_state = session.model_context_state.as_ref();
+    let latest_retrieval_event = session
+        .compression_events
+        .iter()
+        .rev()
+        .find(|event| event.kind == CompressionEventKind::RetrievalWindow);
+    let latest_retrieval_archive_trigger_type = latest_retrieval_event.map(|event| {
+        match event.trigger_type {
+            CompressionTriggerType::Auto => "auto",
+            CompressionTriggerType::Manual => "manual",
+            CompressionTriggerType::CriticalOverflow => "critical_overflow",
+        }
+        .to_string()
+    });
+
+    crate::token_usage_log::ContextManagementTelemetry {
+        strategy: strategy.to_string(),
+        model_context_epoch: model_context_state.map_or(0, |state| state.prefix_epoch),
+        model_context_reset_reason: model_context_state
+            .and_then(|state| state.last_reset_reason)
+            .map(|reason| reason.as_str().to_string()),
+        retrieval_archive_event_count: session
+            .compression_events
+            .iter()
+            .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
+            .count(),
+        latest_retrieval_archive_event_id: latest_retrieval_event.map(|event| event.id.clone()),
+        latest_retrieval_archive_trigger_type,
+    }
+}
 
 fn interruption_kind(error: &AgentError) -> &'static str {
     match error {
@@ -1491,6 +1536,7 @@ pub(super) async fn execute_llm_stream(
                 stream_output.input_tokens,
                 stream_output.output_tokens,
                 stream_output.thinking_tokens,
+                context_management_telemetry(session, config),
             );
             match record.to_json_line() {
                 Ok(line) => {

@@ -72,6 +72,70 @@ fn main() -> ExitCode {
         Err(error) => eprintln!("compaction_events failed: {error}"),
     }
 
+    println!("\n== Context strategy / epoch cache health ==");
+    match db.strategy_epoch_cache_health() {
+        Ok(rows) if !rows.is_empty() => {
+            for r in &rows {
+                let epoch = r
+                    .model_context_epoch
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string());
+                println!(
+                    "{} epoch={} provider={} model={} calls={} prompt={} fresh_input={} output={} cache_read/create/write={}/{}/{} cached={:.1}% prompt_p50/p95/p99={:.0}/{:.0}/{:.0} trunc={} overflow={}",
+                    r.strategy,
+                    epoch,
+                    r.provider,
+                    r.model,
+                    r.calls,
+                    r.prompt_input_tokens,
+                    r.fresh_input_tokens,
+                    r.output_tokens,
+                    r.cache_read_tokens,
+                    r.cache_creation_tokens,
+                    r.cache_write_tokens,
+                    r.cached_fraction * 100.0,
+                    r.prompt_tokens_p50,
+                    r.prompt_tokens_p95,
+                    r.prompt_tokens_p99,
+                    r.truncation_calls,
+                    r.budget_overflow_calls,
+                );
+            }
+        }
+        Ok(_) => println!("(none)"),
+        Err(error) => eprintln!("strategy_epoch_cache_health failed: {error}"),
+    }
+
+    println!("\n== Explicit context-boundary calls ==");
+    match db.context_boundary_calls() {
+        Ok(rows) if !rows.is_empty() => {
+            for r in &rows {
+                println!(
+                    "{} epoch={} strategy={} reset={} cache_read_first/next={}/{} cache_create_first/next={}/{} trunc={} overflow={} archive_event={}",
+                    truncate(&r.session_id, 20),
+                    r.model_context_epoch,
+                    r.strategy,
+                    r.reset_reason,
+                    r.cache_read_tokens,
+                    r.next_cache_read_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    r.cache_creation_tokens,
+                    r.next_cache_creation_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    r.truncation_occurred,
+                    r.budget_overflow,
+                    r.latest_retrieval_archive_event_id
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                );
+            }
+        }
+        Ok(_) => println!("(none)"),
+        Err(error) => eprintln!("context_boundary_calls failed: {error}"),
+    }
+
     println!(
         "\n== Pauses > {:.0}s (cache survival across gaps) ==",
         DEFAULT_TTL_SECONDS
