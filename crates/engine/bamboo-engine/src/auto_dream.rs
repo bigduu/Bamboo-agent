@@ -11,9 +11,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use bamboo_agent_core::{Message, SessionKind};
+use bamboo_agent_core::{Message, Role, Session, SessionKind};
 use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::CompressionEventKind;
 use bamboo_llm::Config;
 use bamboo_llm::ProviderRegistry;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
@@ -30,7 +31,9 @@ use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LE
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore, MAX_MEMORY_TITLE_LEN,
 };
-use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
+use bamboo_storage::{
+    search_index::session_history_search_artifact_ids, SessionIndexEntry, SessionStoreV2,
+};
 
 use crate::auto_dream_privacy::{
     durable_candidate_is_secret_safe, extraction_sources_are_secret_safe,
@@ -52,8 +55,14 @@ const EXTRACTION_MAX_CANDIDATES: usize = 8;
 const EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH: usize = 32;
 const EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH: usize =
     EXTRACTION_MAX_CANDIDATES * EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH;
+const RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS: usize = EXTRACTION_MAX_CANDIDATES;
+const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
+const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
+const RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS: usize = 128;
+const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_536;
 const EXTRACTION_CHECKPOINT_VERSION: u32 = 3;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v3";
+const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 1;
 
 fn provider_session_alias(index: usize) -> String {
     format!("source-session-{:04}", index + 1)
@@ -171,6 +180,7 @@ struct CandidateSessionContext {
     session_id: String,
     project_key: Option<String>,
     topics: Vec<(String, String)>,
+    retrieval_event_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +312,407 @@ fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool
         && entry.id != DREAM_RUNTIME_SESSION_ID
 }
 
+fn session_extraction_sources(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+    retrieval_source_acknowledged: bool,
+) -> Vec<Option<String>> {
+    if let Some(summary) = session.conversation_summary.as_ref() {
+        return vec![Some(sanitize_extraction_source(&summary.content))];
+    }
+    if session
+        .compression_events
+        .iter()
+        .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
+    {
+        let batches = build_retrieval_window_extraction_batches(
+            session,
+            extraction_watermark,
+            retrieval_source_acknowledged,
+        );
+        return if batches.is_empty() {
+            vec![None]
+        } else {
+            batches.into_iter().map(Some).collect()
+        };
+    }
+    vec![derive_sanitized_session_outline(session)]
+}
+
+#[derive(Debug, Clone)]
+struct RetrievalExtractionSourceItem {
+    source_item_ordinal: usize,
+    session_message_ordinal: usize,
+    role: &'static str,
+    retrieval_event_ordinal: Option<usize>,
+    content_segment_ordinal: usize,
+    content_segment_count: usize,
+    content: String,
+}
+
+fn split_retrieval_extraction_content(content: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for character in content.chars() {
+        if current_chars == RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(character);
+        current_chars += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn render_retrieval_extraction_item(item: &RetrievalExtractionSourceItem) -> String {
+    let content =
+        serde_json::to_string(&item.content).expect("serializing a String as JSON cannot fail");
+    format!(
+        "\n### Source item {}\n- session_message_ordinal: {}\n- role: {}\n- retrieval_event_ordinal: {}\n- content_segment: {}/{}\n- content: {}\n",
+        item.source_item_ordinal,
+        item.session_message_ordinal,
+        item.role,
+        item.retrieval_event_ordinal
+            .map(|ordinal| ordinal.to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        item.content_segment_ordinal,
+        item.content_segment_count,
+        content,
+    )
+}
+
+fn trailing_chars(content: &str, max_chars: usize) -> String {
+    let mut suffix = content.chars().rev().take(max_chars).collect::<Vec<_>>();
+    suffix.reverse();
+    suffix.into_iter().collect()
+}
+
+fn render_retrieval_extraction_overlap(item: &RetrievalExtractionSourceItem) -> String {
+    let suffix = trailing_chars(
+        &item.content,
+        RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS,
+    );
+    let suffix = serde_json::to_string(&suffix).expect("serializing a String as JSON cannot fail");
+    format!(
+        "\n## Continuation overlap (context only; duplicated from prior batch)\n- continuation_overlap_source_item_ordinal: {}\n- continuation_overlap_session_message_ordinal: {}\n- continuation_overlap_content_segment: {}/{}\n- continuation_overlap_content_suffix: {}\n",
+        item.source_item_ordinal,
+        item.session_message_ordinal,
+        item.content_segment_ordinal,
+        item.content_segment_count,
+        suffix,
+    )
+}
+
+fn session_note_tool_call_ids(session: &Session) -> HashSet<&str> {
+    session
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| bamboo_domain::canonical_tool_name(&call.function.name) == "session_note")
+        .map(|call| call.id.as_str())
+        .collect()
+}
+
+/// Session-note bodies are already supplied through Jiandu Session topics.
+/// Tool results may echo arbitrary content, so retrieval extraction retains
+/// only fixed non-content acknowledgement fields from a proven session_note
+/// call. Every other tool result is excluded.
+fn sanitized_session_note_result(
+    message: &Message,
+    session_note_call_ids: &HashSet<&str>,
+) -> Option<String> {
+    let call_id = message.tool_call_id.as_deref()?;
+    if !session_note_call_ids.contains(call_id) {
+        return None;
+    }
+    let source = serde_json::from_str::<serde_json::Value>(&message.content)
+        .ok()?
+        .as_object()?
+        .clone();
+    let action = source.get("action")?.as_str()?;
+    if !matches!(
+        action,
+        "read" | "append" | "replace" | "clear" | "list_topics"
+    ) {
+        return None;
+    }
+    let mut safe = serde_json::Map::new();
+    safe.insert(
+        "tool".to_string(),
+        serde_json::Value::String("session_note".to_string()),
+    );
+    safe.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
+    for field in ["exists", "deleted", "body_truncated"] {
+        if let Some(value) = source.get(field).and_then(serde_json::Value::as_bool) {
+            safe.insert(field.to_string(), serde_json::Value::Bool(value));
+        }
+    }
+    for field in ["length_chars", "max_chars", "count"] {
+        if let Some(value) = source.get(field).and_then(serde_json::Value::as_u64) {
+            safe.insert(field.to_string(), serde_json::Value::Number(value.into()));
+        }
+    }
+    Some(serde_json::Value::Object(safe).to_string())
+}
+
+fn sanitize_retrieval_extraction_sources(
+    eligible_messages: &mut [(usize, &Message, &'static str, String)],
+) {
+    let selected_sources = eligible_messages
+        .iter()
+        .map(|(_, _, _, content)| content.as_str())
+        .collect::<Vec<_>>();
+    if extraction_sources_are_secret_safe(&selected_sources) {
+        for (_, _, _, content) in eligible_messages {
+            *content = sanitize_extraction_source(content);
+        }
+        return;
+    }
+
+    // Localize common structured credentials without allowing a split secret
+    // to escape. Individual fields and adjacent groups of up to four fields
+    // cover a value paired with either a complete label or the privacy
+    // predicate's two-/three-fragment labels. If removing those groups does
+    // not make the complete source safe, fail closed and redact everything.
+    let mut unsafe_indexes = HashSet::new();
+    for index in 0..selected_sources.len() {
+        if !extraction_sources_are_secret_safe(&selected_sources[index..=index]) {
+            unsafe_indexes.insert(index);
+        }
+    }
+    let individually_redacted = selected_sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            if unsafe_indexes.contains(&index) {
+                ""
+            } else {
+                source
+            }
+        })
+        .collect::<Vec<_>>();
+    if !extraction_sources_are_secret_safe(&individually_redacted) {
+        for width in 2..=4 {
+            if width > selected_sources.len() {
+                break;
+            }
+            for start in 0..=selected_sources.len() - width {
+                let end = start + width;
+                if (start..end).any(|index| unsafe_indexes.contains(&index)) {
+                    continue;
+                }
+                if !extraction_sources_are_secret_safe(&selected_sources[start..end]) {
+                    unsafe_indexes.extend(start..end);
+                }
+            }
+        }
+    }
+
+    let localized = selected_sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            if unsafe_indexes.contains(&index) {
+                ""
+            } else {
+                source
+            }
+        })
+        .collect::<Vec<_>>();
+    let can_localize = !unsafe_indexes.is_empty() && extraction_sources_are_secret_safe(&localized);
+    for (index, (_, _, _, content)) in eligible_messages.iter_mut().enumerate() {
+        *content = if can_localize && !unsafe_indexes.contains(&index) {
+            sanitize_extraction_source(content)
+        } else {
+            REDACTED_EXTRACTION_SOURCE.to_string()
+        };
+    }
+}
+
+fn build_retrieval_window_extraction_batches(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+    retrieval_source_acknowledged: bool,
+) -> Vec<String> {
+    let mut retrieval_events = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
+        .collect::<Vec<_>>();
+    if retrieval_events.is_empty() {
+        return Vec::new();
+    }
+    retrieval_events.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let eligible_event_ids = retrieval_events
+        .iter()
+        .filter(|event| extraction_watermark.is_none_or(|watermark| event.created_at > watermark))
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let retrieval_event_ordinals = retrieval_events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.id.as_str(), index + 1))
+        .collect::<HashMap<_, _>>();
+    let history_artifact_ids = session_history_search_artifact_ids(session);
+    let session_note_call_ids = session_note_tool_call_ids(session);
+    let mut eligible_messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(message_index, message)| {
+            if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
+                return None;
+            }
+            let created_after_watermark =
+                extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
+            let linked_to_new_retrieval_event = message
+                .compressed_by_event_id
+                .as_deref()
+                .is_some_and(|event_id| eligible_event_ids.contains(event_id));
+            // A legacy ordinary-outline watermark never proved coverage of the
+            // full transcript. The first retrieval transition therefore reads
+            // every canonical non-system content item once. Afterwards, select
+            // both messages created after the watermark and older messages
+            // newly archived by a later retrieval event.
+            if retrieval_source_acknowledged
+                && !created_after_watermark
+                && !linked_to_new_retrieval_event
+            {
+                return None;
+            }
+            let (role, content) = match message.role {
+                Role::User => ("user", message.content.clone()),
+                Role::Assistant => ("assistant", message.content.clone()),
+                Role::Tool => (
+                    "tool",
+                    sanitized_session_note_result(message, &session_note_call_ids)?,
+                ),
+                Role::System => return None,
+            };
+            (!content.trim().is_empty()).then_some((message_index, message, role, content))
+        })
+        .collect::<Vec<_>>();
+    if eligible_messages.is_empty() {
+        return Vec::new();
+    }
+
+    // Apply the shared privacy predicate across complete source fields before
+    // any splitting or truncation. Unsafe fields are localized where that can
+    // be proven safe; ambiguous multi-field cases fail closed for the batch.
+    sanitize_retrieval_extraction_sources(&mut eligible_messages);
+
+    let mut source_items = Vec::new();
+    for (message_index, message, role, extraction_content) in &eligible_messages {
+        let segments = split_retrieval_extraction_content(extraction_content);
+        let segment_count = segments.len();
+        let retrieval_event_ordinal = message
+            .compressed_by_event_id
+            .as_deref()
+            .filter(|event_id| eligible_event_ids.contains(event_id))
+            .and_then(|event_id| retrieval_event_ordinals.get(event_id))
+            .copied();
+        for (segment_index, content) in segments.into_iter().enumerate() {
+            source_items.push(RetrievalExtractionSourceItem {
+                source_item_ordinal: source_items.len() + 1,
+                session_message_ordinal: *message_index + 1,
+                role,
+                retrieval_event_ordinal,
+                content_segment_ordinal: segment_index + 1,
+                content_segment_count: segment_count,
+                content,
+            });
+        }
+    }
+
+    let max_body_chars =
+        RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS);
+    let mut item_batches: Vec<Vec<(RetrievalExtractionSourceItem, String)>> = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_chars = 0usize;
+    for item in source_items {
+        let rendered = render_retrieval_extraction_item(&item);
+        let rendered_chars = rendered.chars().count();
+        debug_assert!(rendered_chars <= max_body_chars);
+        if !current_batch.is_empty()
+            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS
+                || current_chars.saturating_add(rendered_chars) > max_body_chars)
+        {
+            item_batches.push(std::mem::take(&mut current_batch));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(rendered_chars);
+        current_batch.push((item, rendered));
+    }
+    if !current_batch.is_empty() {
+        item_batches.push(current_batch);
+    }
+
+    let batch_count = item_batches.len();
+    let mut previous_tail = None;
+    item_batches
+        .into_iter()
+        .enumerate()
+        .map(|(batch_index, items)| {
+            let continuation_overlap = previous_tail
+                .as_ref()
+                .map(render_retrieval_extraction_overlap);
+            previous_tail = items.last().map(|(item, _)| item.clone());
+            let distinct_message_count = items
+                .iter()
+                .map(|(item, _)| item.session_message_ordinal)
+                .collect::<HashSet<_>>()
+                .len();
+            let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
+            rendered.push_str(&format!(
+                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_source_items_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
+                extraction_watermark
+                    .map(|watermark| watermark.to_rfc3339())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                batch_index + 1,
+                batch_count,
+                eligible_event_ids.len(),
+                eligible_messages.len(),
+                items.len(),
+                distinct_message_count,
+                usize::from(continuation_overlap.is_some()),
+                RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS,
+                RETRIEVAL_EXTRACTION_MAX_CHARS,
+                if batch_index + 1 < batch_count {
+                    "continues_in_next_batch"
+                } else {
+                    "final_batch"
+                },
+            ));
+            if let Some(overlap) = continuation_overlap {
+                rendered.push_str(&overlap);
+            }
+            rendered.push_str("\n## Source items (canonical Session order)\n");
+            for (_, item) in items {
+                rendered.push_str(&item);
+            }
+            if batch_index + 1 < batch_count {
+                rendered.push_str("\n[retrieval_delta_continues_in_next_batch]\n");
+            } else {
+                rendered.push_str("\n[retrieval_delta_final_batch]\n");
+            }
+            debug_assert!(rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
+            rendered
+        })
+        .collect()
+}
+
 async fn collect_candidate_sessions(
     ctx: &AutoDreamContext,
     since: DateTime<Utc>,
@@ -371,13 +782,13 @@ async fn collect_candidate_session_contexts_from_sessions(
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 ) -> Vec<CandidateSessionContext> {
     let mut out = Vec::new();
-    for (entry, summary) in sessions {
-        let already_extracted = match memory.read_session_state(&entry.id).await {
+    for (entry, _) in sessions {
+        let extraction_watermark = match memory.read_session_state(&entry.id).await {
             Ok(state) => state
                 .last_extracted_at
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .is_some_and(|extracted_at| extracted_at >= entry.updated_at),
+                .map(|timestamp| timestamp.with_timezone(&Utc)),
             Err(error) => {
                 tracing::warn!(
                     target: DREAM_TRACING_TARGET,
@@ -385,46 +796,134 @@ async fn collect_candidate_session_contexts_from_sessions(
                     session_id = %entry.id,
                     "Could not read Jiandu session extraction state; keeping the session retryable: {error}"
                 );
-                false
+                None
             }
         };
-        if already_extracted {
-            continue;
-        }
-        let project_key = resolve_session_project_id(ctx, &entry.id)
-            .await
-            .map(bamboo_domain::ProjectId::into_string);
-        let topics = memory
-            .read_session_topics_with_content(&entry.id)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .take(EXTRACTION_MAX_TOPICS_PER_SESSION)
-            .map(|(topic, content)| {
-                // Detect against the complete topic before truncation for the
-                // same reason as message outlines above.
-                let (topic, content) = sanitize_extraction_source_pair(&topic, &content);
-                (topic, truncate_chars(&content, EXTRACTION_MAX_TOPIC_CHARS))
-            })
-            .collect::<Vec<_>>();
-        if topics.is_empty()
-            && summary
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty()
+        let session = match ctx.storage.load_session(&entry.id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "session_extraction_source_load_failed",
+                    session_id = %entry.id,
+                    "Could not load the canonical Session after reading its Jiandu extraction watermark; keeping the source retryable: {error}"
+                );
+                continue;
+            }
+        };
+        let is_retrieval_window = session.conversation_summary.is_none()
+            && session
+                .compression_events
+                .iter()
+                .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+        let retrieval_event_key = is_retrieval_window
+            .then(|| first_retrieval_event_key(&session))
+            .flatten();
+        let retrieval_source_acknowledged = if is_retrieval_window {
+            match retrieval_source_is_acknowledged(ctx, &session, extraction_watermark).await {
+                Ok(acknowledged) => acknowledged,
+                Err(error) => {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "retrieval_source_state_read_failed",
+                        session_id = %entry.id,
+                        "Could not verify retrieval-complete source state; replaying the one-time transition: {error}"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if extraction_watermark.is_some_and(|watermark| watermark >= entry.updated_at)
+            && (!is_retrieval_window || retrieval_source_acknowledged)
         {
             continue;
         }
-        out.push(CandidateSessionContext {
-            session_id: entry.id.clone(),
-            project_key,
-            entry,
-            summary,
-            topics,
-        });
+        let summaries = session_extraction_sources(
+            &session,
+            extraction_watermark,
+            retrieval_source_acknowledged,
+        );
+        let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
+            .map(bamboo_domain::ProjectId::into_string);
+        let topics = match memory.read_session_topics_with_content(&entry.id).await {
+            Ok(topics) => sanitized_session_topics(topics),
+            Err(error) => {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "session_extraction_topics_read_failed",
+                    session_id = %entry.id,
+                    "Could not load Jiandu Session topics; keeping the source retryable: {error}"
+                );
+                continue;
+            }
+        };
+        if topics.is_empty()
+            && summaries.iter().all(|summary| {
+                summary
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+        {
+            continue;
+        }
+        if is_retrieval_window {
+            // Each bounded transcript batch receives its own candidate budget.
+            // Session topics are a separate source unit so they cannot consume
+            // the eight-candidate allowance for a transcript batch.
+            for summary in summaries.into_iter().filter(|summary| {
+                summary
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+            }) {
+                out.push(CandidateSessionContext {
+                    session_id: entry.id.clone(),
+                    project_key: project_key.clone(),
+                    entry: entry.clone(),
+                    summary,
+                    topics: Vec::new(),
+                    retrieval_event_key: retrieval_event_key.clone(),
+                });
+            }
+            if !topics.is_empty() {
+                out.push(CandidateSessionContext {
+                    session_id: entry.id.clone(),
+                    project_key,
+                    entry,
+                    summary: None,
+                    topics,
+                    retrieval_event_key,
+                });
+            }
+        } else {
+            out.push(CandidateSessionContext {
+                session_id: entry.id.clone(),
+                project_key,
+                entry,
+                summary: summaries.into_iter().next().flatten(),
+                topics,
+                retrieval_event_key: None,
+            });
+        }
     }
     out
+}
+
+fn sanitized_session_topics(topics: Vec<(String, String)>) -> Vec<(String, String)> {
+    topics
+        .into_iter()
+        .take(EXTRACTION_MAX_TOPICS_PER_SESSION)
+        .map(|(topic, content)| {
+            // Check the complete pair before truncation so a credential that
+            // crosses the bounded provider view cannot leak a prefix.
+            let (topic, content) = sanitize_extraction_source_pair(&topic, &content);
+            (topic, truncate_chars(&content, EXTRACTION_MAX_TOPIC_CHARS))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -468,7 +967,17 @@ struct ExtractionCheckpoint {
     transaction_id: String,
     batch_index: usize,
     batch_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topics_fingerprint: Option<String>,
     extracted: ExtractedCandidateBatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrievalSourceState {
+    version: u32,
+    session_key: String,
+    first_retrieval_event_key: String,
+    source_updated_at: String,
 }
 
 #[derive(Debug)]
@@ -485,6 +994,7 @@ struct PendingExtractionBatch {
     transaction_id: String,
     batch_index: usize,
     batch_count: usize,
+    topics_fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -492,6 +1002,47 @@ struct StoredExtractionTransaction {
     source_updated_at: String,
     transaction_id: String,
     batches: Vec<ExtractionCheckpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayedExtractionSource {
+    watermark: DateTime<Utc>,
+    topics_fingerprint: Option<String>,
+}
+
+#[derive(Debug)]
+struct RebuiltRetrievalContexts {
+    contexts: Vec<CandidateSessionContext>,
+}
+
+fn extraction_topics_fingerprint(topics: &[(String, String)]) -> String {
+    let mut topics = topics.to_vec();
+    topics.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-session-topics-v1\0");
+    for (topic, content) in topics {
+        digest.update((topic.len() as u64).to_le_bytes());
+        digest.update(topic.as_bytes());
+        digest.update((content.len() as u64).to_le_bytes());
+        digest.update(content.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn extraction_topics_fingerprints_by_session(
+    sessions: &[CandidateSessionContext],
+) -> HashMap<String, String> {
+    let mut topics_by_session: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for session in sessions {
+        topics_by_session
+            .entry(session.session_id.clone())
+            .or_default()
+            .extend(session.topics.iter().cloned());
+    }
+    topics_by_session
+        .into_iter()
+        .map(|(session_id, topics)| (session_id, extraction_topics_fingerprint(&topics)))
+        .collect()
 }
 
 fn extraction_prompt(session: &CandidateSessionContext) -> String {
@@ -512,6 +1063,24 @@ fn extraction_checkpoint_session_key(session_id: &str) -> String {
     digest.update(b"bamboo-auto-dream-extraction-session-v1\0");
     digest.update(session_id.as_bytes());
     hex::encode(digest.finalize())
+}
+
+fn first_retrieval_event_key(session: &Session) -> Option<String> {
+    let event = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
+        .min_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })?;
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-first-retrieval-event-v1\0");
+    digest.update(event.id.as_bytes());
+    digest.update(b"\0");
+    digest.update(event.created_at.to_rfc3339().as_bytes());
+    Some(hex::encode(digest.finalize()))
 }
 
 fn extraction_checkpoint_id(
@@ -553,6 +1122,7 @@ fn build_pending_extraction_batches(
     model: &str,
     sessions: &[CandidateSessionContext],
 ) -> Vec<PendingExtractionBatch> {
+    let topics_fingerprints = extraction_topics_fingerprints_by_session(sessions);
     sessions
         .iter()
         .enumerate()
@@ -571,6 +1141,10 @@ fn build_pending_extraction_batches(
                 transaction_id: String::new(),
                 batch_index: 0,
                 batch_count: 0,
+                topics_fingerprint: topics_fingerprints
+                    .get(session.session_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| extraction_topics_fingerprint(&[])),
             }
         })
         .collect()
@@ -621,6 +1195,10 @@ fn checkpoint_matches_pending_batch(
         && checkpoint.batch_id == pending.checkpoint_id
         && checkpoint.batch_index == pending.batch_index
         && checkpoint.batch_count == pending.batch_count
+        && checkpoint
+            .topics_fingerprint
+            .as_deref()
+            .is_none_or(|fingerprint| fingerprint == pending.topics_fingerprint)
 }
 
 fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -> PathBuf {
@@ -628,6 +1206,112 @@ fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -
         .bamboo_home_dir()
         .join(EXTRACTION_CHECKPOINT_DIR)
         .join(extraction_checkpoint_session_key(session_id))
+}
+
+fn retrieval_source_state_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    first_retrieval_event_key: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!(
+        "retrieval-source-v{RETRIEVAL_SOURCE_STATE_VERSION}-{first_retrieval_event_key}.json"
+    ))
+}
+
+async fn retrieval_source_is_acknowledged(
+    ctx: &AutoDreamContext,
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Result<bool, String> {
+    let Some(event_key) = first_retrieval_event_key(session) else {
+        return Ok(false);
+    };
+    let path = retrieval_source_state_path(ctx, &session.id, &event_key);
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "failed to read AutoDream retrieval source state: {error}"
+            ));
+        }
+    };
+    let state = serde_json::from_slice::<RetrievalSourceState>(&raw)
+        .map_err(|error| format!("failed to parse AutoDream retrieval source state: {error}"))?;
+    let source_updated_at = DateTime::parse_from_rfc3339(&state.source_updated_at)
+        .map_err(|error| format!("invalid AutoDream retrieval source timestamp: {error}"))?
+        .with_timezone(&Utc);
+    if state.version != RETRIEVAL_SOURCE_STATE_VERSION
+        || state.session_key != extraction_checkpoint_session_key(&session.id)
+        || state.first_retrieval_event_key != event_key
+        || source_updated_at > session.updated_at
+    {
+        return Err("AutoDream retrieval source state identity mismatch".to_string());
+    }
+    Ok(extraction_watermark.is_some_and(|watermark| watermark >= source_updated_at))
+}
+
+async fn write_retrieval_source_state(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    first_retrieval_event_key: &str,
+    source_updated_at: &str,
+) -> Result<(), String> {
+    let state = RetrievalSourceState {
+        version: RETRIEVAL_SOURCE_STATE_VERSION,
+        session_key: extraction_checkpoint_session_key(session_id),
+        first_retrieval_event_key: first_retrieval_event_key.to_string(),
+        source_updated_at: source_updated_at.to_string(),
+    };
+    DateTime::parse_from_rfc3339(source_updated_at)
+        .map_err(|error| format!("invalid retrieval source watermark: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("failed to serialize retrieval source state: {error}"))?;
+    let path = retrieval_source_state_path(ctx, session_id, first_retrieval_event_key);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "AutoDream retrieval source state has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create retrieval source state directory: {error}"))?;
+    let temporary_path = parent.join(format!(".retrieval-source.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::hard_link(&temporary_path, &path).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temporary_path).await;
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("failed to reread retrieval source state: {error}"))?;
+            let existing =
+                serde_json::from_slice::<RetrievalSourceState>(&existing).map_err(|error| {
+                    format!("failed to parse existing retrieval source state: {error}")
+                })?;
+            if existing.version != state.version
+                || existing.session_key != state.session_key
+                || existing.first_retrieval_event_key != state.first_retrieval_event_key
+                || DateTime::parse_from_rfc3339(&existing.source_updated_at).is_err()
+            {
+                return Err("existing AutoDream retrieval source state mismatch".to_string());
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "failed to persist AutoDream retrieval source state: {error}"
+        )),
+    }
 }
 
 fn extraction_checkpoint_path(
@@ -814,6 +1498,7 @@ async fn load_extraction_checkpoint_transactions(
             batch.transaction_id != transaction_id
                 || batch.source_updated_at != first.source_updated_at
                 || batch.batch_count != first.batch_count
+                || batch.topics_fingerprint != first.topics_fingerprint
         }) {
             return Err("AutoDream extraction transaction metadata mismatch".to_string());
         }
@@ -895,6 +1580,87 @@ async fn remove_superseded_extraction_checkpoints(
     Ok(())
 }
 
+async fn rebuild_retrieval_contexts_after_checkpoint_replay(
+    ctx: &AutoDreamContext,
+    template: &CandidateSessionContext,
+    acknowledged_watermark: DateTime<Utc>,
+    acknowledged_topics_fingerprint: Option<&str>,
+) -> Result<RebuiltRetrievalContexts, String> {
+    let session = ctx
+        .storage
+        .load_session(&template.session_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to reload retrieval source after checkpoint replay for {}: {error}",
+                template.session_id
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "retrieval source disappeared after checkpoint replay for {}",
+                template.session_id
+            )
+        })?;
+    if session.conversation_summary.is_some()
+        || !session
+            .compression_events
+            .iter()
+            .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
+    {
+        return Err(format!(
+            "retrieval source mode changed during checkpoint replay for {}",
+            template.session_id
+        ));
+    }
+    let retrieval_event_key = first_retrieval_event_key(&session)
+        .ok_or_else(|| "retrieval source lost its first boundary identity".to_string())?;
+    let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
+        .map(bamboo_domain::ProjectId::into_string);
+    let topics = sanitized_session_topics(
+        ctx.memory
+            .read_session_topics_with_content(&template.session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to reload retrieval Session topics after checkpoint replay for {}: {error}",
+                    template.session_id
+                )
+            })?,
+    );
+    let current_topics_fingerprint = extraction_topics_fingerprint(&topics);
+    let topics_changed = acknowledged_topics_fingerprint
+        .is_none_or(|fingerprint| fingerprint != current_topics_fingerprint);
+    let mut entry = template.entry.clone();
+    entry.title.clone_from(&session.title);
+    entry.updated_at = session.updated_at;
+
+    let mut contexts =
+        build_retrieval_window_extraction_batches(&session, Some(acknowledged_watermark), true)
+            .into_iter()
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| CandidateSessionContext {
+                entry: entry.clone(),
+                summary: Some(summary),
+                session_id: template.session_id.clone(),
+                project_key: project_key.clone(),
+                topics: Vec::new(),
+                retrieval_event_key: Some(retrieval_event_key.clone()),
+            })
+            .collect::<Vec<_>>();
+    if topics_changed && !topics.is_empty() {
+        contexts.push(CandidateSessionContext {
+            entry,
+            summary: None,
+            session_id: template.session_id.clone(),
+            project_key,
+            topics,
+            retrieval_event_key: Some(retrieval_event_key),
+        });
+    }
+    Ok(RebuiltRetrievalContexts { contexts })
+}
+
 #[cfg(test)]
 async fn extract_and_persist_durable_candidates(
     ctx: &AutoDreamContext,
@@ -925,11 +1691,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
-    let extraction_sessions = sessions.to_vec();
+    let mut extraction_sessions = sessions.to_vec();
     let mut pending_batches = build_pending_extraction_batches(model, &extraction_sessions);
-    let pending_indexes_by_session =
+    let mut pending_indexes_by_session =
         assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
-    let source_updated_at_by_session = extraction_sessions
+    let mut source_updated_at_by_session = extraction_sessions
         .iter()
         .map(|session| {
             (
@@ -941,6 +1707,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     let mut total_writes = ExtractionWrites::default();
     let mut completed_transactions = HashSet::new();
     let mut replayed_watermarks = HashMap::new();
+    let mut replayed_sources_by_session = HashMap::new();
 
     // Replay complete candidate-only checkpoints before asking the provider for
     // a newer source. A later sink or watermark failure therefore never asks
@@ -989,6 +1756,10 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 .iter()
                 .map(|batch| batch.batch_id.clone())
                 .collect::<Vec<_>>();
+            let transaction_topics_fingerprint = transaction
+                .batches
+                .first()
+                .and_then(|batch| batch.topics_fingerprint.clone());
             if acknowledged_watermark.is_none_or(|watermark| watermark < source_watermark) {
                 for checkpoint in transaction.batches {
                     let writes = persist_durable_candidate_batch_with_project_resolver(
@@ -1004,6 +1775,19 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     total_writes.memory = total_writes.memory.saturating_add(writes.memory);
                     total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
                 }
+                if let Some(event_key) = extraction_sessions
+                    .iter()
+                    .filter(|session| session.session_id.as_str() == session_id.as_str())
+                    .find_map(|session| session.retrieval_event_key.as_deref())
+                {
+                    write_retrieval_source_state(
+                        ctx,
+                        session_id,
+                        event_key,
+                        &transaction.source_updated_at,
+                    )
+                    .await?;
+                }
                 memory
                     .mark_session_extracted(session_id, &transaction.source_updated_at)
                     .await
@@ -1014,6 +1798,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     })?;
                 acknowledged_watermark = Some(source_watermark);
                 replayed_watermarks.insert(session_id.clone(), source_watermark);
+                replayed_sources_by_session.insert(
+                    session_id.clone(),
+                    ReplayedExtractionSource {
+                        watermark: source_watermark,
+                        topics_fingerprint: transaction_topics_fingerprint,
+                    },
+                );
             }
             completed_transactions.insert((session_id.clone(), transaction.transaction_id));
             for checkpoint_id in checkpoint_ids {
@@ -1021,6 +1812,72 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             }
         }
         remove_superseded_extraction_checkpoints(ctx, session_id, &retained).await?;
+    }
+
+    // The current contexts were collected before an older checkpoint replay
+    // advanced Jiandu's watermark. Rebuild retrieval deltas against that exact
+    // acknowledged boundary so intervening turns remain eligible without
+    // asking the model to restate the completed prefix.
+    let retrieval_sessions_to_rebuild = replayed_sources_by_session
+        .keys()
+        .filter(|session_id| {
+            extraction_sessions.iter().any(|session| {
+                session.session_id.as_str() == session_id.as_str()
+                    && session.retrieval_event_key.is_some()
+            })
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !retrieval_sessions_to_rebuild.is_empty() {
+        let templates = retrieval_sessions_to_rebuild
+            .iter()
+            .map(|session_id| {
+                extraction_sessions
+                    .iter()
+                    .find(|session| session.session_id == *session_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "missing retrieval context after checkpoint replay for {session_id}"
+                        )
+                    })
+                    .map(|template| (session_id.clone(), template))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        extraction_sessions
+            .retain(|session| !retrieval_sessions_to_rebuild.contains(session.session_id.as_str()));
+        for (session_id, template) in templates {
+            let replayed = replayed_sources_by_session
+                .get(&session_id)
+                .expect("rebuild Session came from replayed source map");
+            let rebuilt = rebuild_retrieval_contexts_after_checkpoint_replay(
+                ctx,
+                &template,
+                replayed.watermark,
+                replayed.topics_fingerprint.as_deref(),
+            )
+            .await?;
+            extraction_sessions.extend(rebuilt.contexts);
+        }
+        pending_batches = build_pending_extraction_batches(model, &extraction_sessions);
+        pending_indexes_by_session =
+            assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+        source_updated_at_by_session = extraction_sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.session_id.clone(),
+                    session.entry.updated_at.to_rfc3339(),
+                )
+            })
+            .collect();
+        for (session_id, pending_indexes) in &pending_indexes_by_session {
+            let retained = pending_indexes
+                .iter()
+                .map(|index| pending_batches[*index].checkpoint_id.clone())
+                .collect::<HashSet<_>>();
+            remove_superseded_extraction_checkpoints(ctx, session_id, &retained).await?;
+        }
     }
 
     pending_batches.retain(|pending| {
@@ -1087,6 +1944,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     transaction_id: pending.transaction_id.clone(),
                     batch_index: pending.batch_index,
                     batch_count: pending.batch_count,
+                    topics_fingerprint: Some(pending.topics_fingerprint.clone()),
                     extracted: extracted.clone(),
                 };
                 if write_extraction_checkpoint(&checkpoint_path, &checkpoint).await? {
@@ -1136,6 +1994,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         let source_updated_at = source_updated_at_by_session
             .get(&session_id)
             .expect("every checkpointed Session has a source watermark");
+        if let Some(event_key) = extraction_sessions
+            .iter()
+            .filter(|session| session.session_id.as_str() == session_id.as_str())
+            .find_map(|session| session.retrieval_event_key.as_deref())
+        {
+            write_retrieval_source_state(ctx, &session_id, event_key, source_updated_at).await?;
+        }
         memory
             .mark_session_extracted(&session_id, source_updated_at)
             .await
@@ -2091,6 +2956,9 @@ mod tests {
     use futures::stream;
 
     use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{
+        CompressionEvent, CompressionTriggerType, FunctionCall, ImageUrlRef, MessagePart, ToolCall,
+    };
     use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
     use bamboo_llm::{LLMError, LLMStream};
 
@@ -2200,6 +3068,34 @@ mod tests {
 
     fn test_registry() -> Arc<ProviderRegistry> {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
+    }
+
+    fn test_time(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).expect("valid test timestamp")
+    }
+
+    fn retrieval_event(id: &str, created_at: DateTime<Utc>) -> CompressionEvent {
+        let mut event = CompressionEvent::new(
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            CompressionTriggerType::Auto,
+            1.0,
+            None,
+            0,
+        );
+        event.id = id.to_string();
+        event.created_at = created_at;
+        event.kind = CompressionEventKind::RetrievalWindow;
+        event
+    }
+
+    fn message_at(mut message: Message, id: &str, created_at: DateTime<Utc>) -> Message {
+        message.id = id.to_string();
+        message.created_at = created_at;
+        message
     }
 
     #[derive(Clone)]
@@ -2496,6 +3392,505 @@ mod tests {
         let outline = derive_sanitized_session_outline(&session).expect("safe task outline");
         assert_ne!(outline, REDACTED_EXTRACTION_SOURCE);
         assert!(outline.contains("Complete ordinary work item"));
+    }
+
+    #[test]
+    fn retrieval_delta_keeps_archived_content_beyond_the_recent_outline() {
+        let mut session = Session::new("retrieval-delta-old", "model");
+        session.messages.push(message_at(
+            Message::system("SYSTEM_POLICY_MUST_NOT_APPEAR"),
+            "system",
+            test_time(1),
+        ));
+        session
+            .compression_events
+            .push(retrieval_event("event-old", test_time(20)));
+        let mut archived = message_at(
+            Message::user("ARCHIVED_IDENTIFIER_ALPHA_947"),
+            "archived-old",
+            test_time(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-old".to_string());
+        session.messages.push(archived);
+        for index in 0..8 {
+            session.messages.push(message_at(
+                Message::assistant(format!("recent message {index}"), None),
+                &format!("recent-{index}"),
+                test_time(30 + index),
+            ));
+        }
+
+        let recent_outline = derive_session_outline(&session).expect("recent outline");
+        assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
+        let sources = session_extraction_sources(&session, None, false);
+        assert_eq!(sources.len(), 2);
+        let delta = sources
+            .iter()
+            .filter_map(Option::as_deref)
+            .collect::<String>();
+        assert!(delta.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
+        assert!(!delta.contains("SYSTEM_POLICY_MUST_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn retrieval_delta_applies_strict_message_watermarks_after_migration() {
+        let mut session = Session::new("retrieval-delta-watermark", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event-new", test_time(30)));
+        session
+            .compression_events
+            .push(retrieval_event("event-old", test_time(10)));
+        for (id, content, created_at, event_id) in [
+            ("old-archived", "OLD_ARCHIVED", 2, Some("event-old")),
+            (
+                "old-message-new-event",
+                "ARCHIVED_BY_NEW_EVENT",
+                3,
+                Some("event-new"),
+            ),
+            ("old-active", "OLD_ACTIVE", 19, None),
+            ("equal-active", "EQUAL_ACTIVE", 20, None),
+            ("new-archived", "NEW_ARCHIVED", 21, Some("event-new")),
+            ("new-active", "NEW_ACTIVE", 22, None),
+        ] {
+            let mut message = message_at(Message::user(content), id, test_time(created_at));
+            if let Some(event_id) = event_id {
+                message.compressed = true;
+                message.compressed_by_event_id = Some(event_id.to_string());
+            }
+            session.messages.push(message);
+        }
+
+        let batches =
+            build_retrieval_window_extraction_batches(&session, Some(test_time(20)), true);
+        assert_eq!(batches.len(), 1);
+        let delta = &batches[0];
+        assert!(delta.contains("ARCHIVED_BY_NEW_EVENT"));
+        assert!(delta.contains("NEW_ARCHIVED"));
+        assert!(delta.contains("NEW_ACTIVE"));
+        assert!(!delta.contains("OLD_ARCHIVED"));
+        assert!(!delta.contains("OLD_ACTIVE"));
+        assert!(!delta.contains("EQUAL_ACTIVE"));
+        assert!(delta.contains("eligible_retrieval_events: 1"));
+        assert!(
+            delta.find("NEW_ARCHIVED").expect("archived position")
+                < delta.find("NEW_ACTIVE").expect("active position")
+        );
+    }
+
+    #[test]
+    fn first_retrieval_transition_includes_old_retained_messages() {
+        let mut session = Session::new("retrieval-first-transition", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event-first", test_time(30)));
+        let mut archived = message_at(
+            Message::user("OLD_NEWLY_ARCHIVED"),
+            "old-archived",
+            test_time(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-first".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("OLD_RETAINED_ACTIVE", None),
+            "old-retained",
+            test_time(3),
+        ));
+        session.messages.push(message_at(
+            Message::user("NEW_ACTIVE"),
+            "new-active",
+            test_time(21),
+        ));
+
+        let batches =
+            build_retrieval_window_extraction_batches(&session, Some(test_time(20)), false);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].contains("OLD_NEWLY_ARCHIVED"));
+        assert!(batches[0].contains("OLD_RETAINED_ACTIVE"));
+        assert!(batches[0].contains("NEW_ACTIVE"));
+    }
+
+    #[test]
+    fn retrieval_delta_excludes_private_and_self_history_payloads() {
+        let mut session = Session::new("retrieval-delta-private-fields", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", test_time(10)));
+        session.messages.push(message_at(
+            Message::system("SYSTEM_SECRET"),
+            "system",
+            test_time(11),
+        ));
+
+        let mut ordinary = message_at(
+            Message::assistant("SAFE_VISIBLE_CONTENT", None),
+            "ordinary",
+            test_time(12),
+        );
+        ordinary.reasoning = Some("REASONING_SECRET".to_string());
+        ordinary.reasoning_signature = Some("SIGNATURE_SECRET".to_string());
+        ordinary.content_parts = Some(vec![MessagePart::ImageUrl {
+            image_url: ImageUrlRef {
+                url: "data:image/png;base64,IMAGE_BYTES_SECRET".to_string(),
+                detail: None,
+            },
+        }]);
+        session.messages.push(ordinary);
+        session.messages.push(message_at(
+            Message::user("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"),
+            "credential-user",
+            test_time(13),
+        ));
+
+        let history_call_id = "history-call";
+        session.messages.push(message_at(
+            Message::assistant(
+                "SEARCH_QUERY_SECRET",
+                Some(vec![ToolCall {
+                    id: history_call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "session_history_current".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "search_current",
+                            "query": "SEARCH_QUERY_ARGUMENT_SECRET"
+                        })
+                        .to_string(),
+                    },
+                }]),
+            ),
+            "history-call-message",
+            test_time(14),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result(history_call_id, "SEARCH_RESULT_SECRET"),
+            "history-result-message",
+            test_time(15),
+        ));
+
+        let note_call_id = "session-note-call";
+        session.messages.push(message_at(
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: note_call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "session_note".to_string(),
+                        arguments: serde_json::json!({"action": "read"}).to_string(),
+                    },
+                }]),
+            ),
+            "session-note-call-message",
+            test_time(16),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result(
+                note_call_id,
+                serde_json::json!({
+                    "action": "read",
+                    "exists": true,
+                    "content": "SESSION_NOTE_CREDENTIAL_SECRET",
+                    "path": "/sensitive/session/note/path",
+                    "length_chars": 30,
+                    "body_truncated": false,
+                    "max_chars": 12000
+                })
+                .to_string(),
+            ),
+            "session-note-result",
+            test_time(17),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result("untrusted-tool-call", "TOOL_CREDENTIAL_SECRET"),
+            "untrusted-tool-result",
+            test_time(18),
+        ));
+
+        let batches = build_retrieval_window_extraction_batches(&session, None, false);
+        assert_eq!(batches.len(), 1);
+        let delta = &batches[0];
+        assert!(delta.contains("SAFE_VISIBLE_CONTENT"));
+        assert!(delta.contains("session_note"));
+        assert!(delta.contains("length_chars"));
+        assert!(delta.contains(REDACTED_EXTRACTION_SOURCE));
+        for excluded in [
+            "SYSTEM_SECRET",
+            "REASONING_SECRET",
+            "SIGNATURE_SECRET",
+            "IMAGE_BYTES_SECRET",
+            "SEARCH_QUERY_SECRET",
+            "SEARCH_QUERY_ARGUMENT_SECRET",
+            "SEARCH_RESULT_SECRET",
+            "SESSION_NOTE_CREDENTIAL_SECRET",
+            "/sensitive/session/note/path",
+            "TOOL_CREDENTIAL_SECRET",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert!(
+                !delta.contains(excluded),
+                "unexpected private field: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn retrieval_delta_ordering_caps_and_restart_are_deterministic() {
+        let mut session = Session::new("retrieval-delta-caps", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", test_time(1)));
+        for index in 0..66 {
+            session.messages.push(message_at(
+                Message::user(format!("ORDER_{index:03}")),
+                &format!("message-{index:03}"),
+                test_time(10 + index),
+            ));
+        }
+
+        let batches = build_retrieval_window_extraction_batches(&session, None, false);
+        assert_eq!(batches.len(), 9);
+        assert!(batches[0].contains("batch: 1/9"));
+        assert!(batches[0].contains("source_items_in_batch: 8"));
+        assert!(batches[1].contains("continuation_overlap_content_suffix: \"ORDER_007\""));
+        assert!(batches[8].contains("batch: 9/9"));
+        assert!(batches[8].contains("source_items_in_batch: 2"));
+        assert!(batches.iter().all(|batch| {
+            batch.contains("eligible_messages: 66")
+                && batch.contains("truncated: false")
+                && batch.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS
+        }));
+        let all_batches = batches.concat();
+        for index in 0..66 {
+            assert!(all_batches.contains(&format!("ORDER_{index:03}")));
+        }
+
+        let restored: Session = serde_json::from_slice(
+            &serde_json::to_vec(&session).expect("serialize retrieval Session"),
+        )
+        .expect("restore retrieval Session");
+        assert_eq!(
+            build_retrieval_window_extraction_batches(&restored, None, false),
+            build_retrieval_window_extraction_batches(&session, None, false)
+        );
+        assert!(
+            build_retrieval_window_extraction_batches(&restored, Some(test_time(100)), true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extraction_source_preserves_summary_first_and_outline_fallback() {
+        let mut summary_session = Session::new("summary-first", "model");
+        summary_session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "EXACT_SUMMARY_SOURCE",
+            1,
+            10,
+        ));
+        summary_session
+            .compression_events
+            .push(retrieval_event("event", test_time(10)));
+        summary_session
+            .messages
+            .push(Message::user("retrieval content must not override summary"));
+        assert_eq!(
+            session_extraction_sources(&summary_session, None, false),
+            vec![Some("EXACT_SUMMARY_SOURCE".to_string())]
+        );
+
+        let mut ordinary = Session::new("ordinary-outline", "model");
+        ordinary
+            .messages
+            .push(Message::user("ORDINARY_RECENT_OUTLINE"));
+        let sources = session_extraction_sources(&ordinary, None, false);
+        assert_eq!(sources.len(), 1);
+        let source = sources[0].as_deref().expect("outline");
+        assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
+        assert!(!source.contains("Retrieval-window extraction delta"));
+    }
+
+    #[tokio::test]
+    async fn candidate_collection_keeps_retrieval_delta_and_topics_separate() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::seconds(20);
+        let mut session = Session::new("retrieval-collection", "model");
+        session.title = "Retrieval collection".to_string();
+        session.compression_events.push(retrieval_event(
+            "event-new",
+            now - chrono::Duration::seconds(10),
+        ));
+        let mut archived = message_at(
+            Message::user("ARCHIVED_AFTER_WATERMARK_EVENT"),
+            "archived",
+            now - chrono::Duration::hours(1),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-new".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("ACTIVE_BEFORE_WATERMARK", None),
+            "old-active",
+            watermark - chrono::Duration::seconds(1),
+        ));
+        session.updated_at = now;
+        storage
+            .save_session(&session)
+            .await
+            .expect("save retrieval Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted("retrieval-collection", &watermark.to_rfc3339())
+            .await
+            .expect("write extraction watermark");
+        memory
+            .write_session_topic(
+                "retrieval-collection",
+                "continuity",
+                "SESSION_TOPIC_REMAINS_SEPARATE",
+            )
+            .await
+            .expect("write Session topic");
+        memory
+            .write_session_topic(
+                "retrieval-collection",
+                "provider-auth",
+                "OPENAI_API_KEY=sk-proj-topicsecretabcdefghijkl",
+            )
+            .await
+            .expect("write sensitive Session topic");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            now - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 2);
+        let source = contexts[0].summary.as_deref().expect("retrieval source");
+        assert!(source.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
+        assert!(source.contains("ACTIVE_BEFORE_WATERMARK"));
+        assert!(contexts[0].topics.is_empty());
+        assert!(contexts[1].summary.is_none());
+        assert_eq!(
+            contexts[1].topics,
+            vec![
+                (
+                    "continuity".to_string(),
+                    "SESSION_TOPIC_REMAINS_SEPARATE".to_string()
+                ),
+                (
+                    REDACTED_EXTRACTION_SOURCE.to_string(),
+                    REDACTED_EXTRACTION_SOURCE.to_string()
+                )
+            ]
+        );
+        assert!(!extraction_prompt(&contexts[0]).contains("SESSION_TOPIC_REMAINS_SEPARATE"));
+        assert!(extraction_prompt(&contexts[1]).contains("SESSION_TOPIC_REMAINS_SEPARATE"));
+        assert!(!extraction_prompt(&contexts[1]).contains("sk-proj-topicsecretabcdefghijkl"));
+    }
+
+    #[tokio::test]
+    async fn legacy_retrieval_watermark_requires_one_explicit_source_migration() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let mut session = Session::new("retrieval-marker-migration", "model");
+        session.title = "Retrieval marker migration".to_string();
+        session.compression_events.push(retrieval_event(
+            "legacy-event",
+            now - chrono::Duration::minutes(5),
+        ));
+        let mut archived = message_at(
+            Message::user("LEGACY_ARCHIVED_SOURCE"),
+            "legacy-archived",
+            now - chrono::Duration::hours(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("legacy-event".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("LEGACY_RETAINED_SOURCE", None),
+            "legacy-retained",
+            now - chrono::Duration::hours(1),
+        ));
+        session.updated_at = now;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted(&session.id, &now.to_rfc3339())
+            .await
+            .expect("seed legacy outline watermark");
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = now - chrono::Duration::hours(24);
+
+        let contexts = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(contexts.len(), 1, "missing marker must force migration");
+        let source = contexts[0].summary.as_deref().expect("migration source");
+        assert!(source.contains("LEGACY_ARCHIVED_SOURCE"));
+        assert!(source.contains("LEGACY_RETAINED_SOURCE"));
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &LedgerStore::new(temp_dir.path()),
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("migration extraction");
+        assert_eq!(sequence_provider.recorded_prompts().len(), 1);
+        assert!(
+            retrieval_source_is_acknowledged(&context, &session, Some(now))
+                .await
+                .expect("read retrieval source marker")
+        );
+        assert!(
+            collect_candidate_session_contexts(&context, &memory, since)
+                .await
+                .is_empty(),
+            "the explicit marker must make migration one-shot"
+        );
     }
 
     #[tokio::test]
@@ -3030,6 +4425,7 @@ mod tests {
             transaction_id: "b".repeat(64),
             batch_index: 0,
             batch_count: 1,
+            topics_fingerprint: None,
             extracted: ExtractedCandidateBatch {
                 memory: vec![DurableExtractionCandidate {
                     title: "Credential".to_string(),
