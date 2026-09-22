@@ -202,7 +202,7 @@ pub struct HeadlessArgs {
     /// envelope. Nothing else is written to stdout (logs go to stderr), so
     /// the stream is pipe-safe.
     pub stream_json: bool,
-    /// Per-run reasoning effort override (`low`/`medium`/`high`/`xhigh`/`max`).
+    /// Per-run reasoning effort override (`none`/`low`/`medium`/`high`/`xhigh`/`max`).
     /// `None` keeps the active provider/config default.
     pub reasoning_effort: Option<String>,
     /// Per-run skill mode (e.g. `code`, `ask`). `None` keeps the session/config
@@ -442,7 +442,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         Some(raw) => Some(
             bamboo_domain::reasoning::ReasoningEffort::parse(raw).ok_or_else(|| {
                 format!(
-                    "invalid --reasoning-effort '{raw}' (expected: low | medium | high | xhigh | max)"
+                    "invalid --reasoning-effort '{raw}' (expected: none | low | medium | high | xhigh | max)"
                 )
             })?,
         ),

@@ -3344,6 +3344,7 @@ impl ModelPicker {
         }
         let choices = [
             None,
+            Some(ReasoningEffort::Disabled),
             Some(ReasoningEffort::Low),
             Some(ReasoningEffort::Medium),
             Some(ReasoningEffort::High),
@@ -18255,7 +18256,7 @@ mod question_tests {
                 4_091_854_584_326_177_690,
                 16_229_128_572_274_018_012,
                 10_493_202_686_479_633_261,
-                10_935_873_232_087_006_812,
+                2_569_267_084_889_163_122,
                 8_710_182_394_295_884_107,
                 3_584_340_785_452_026_141,
                 199_111_197_660_670_885,
@@ -24549,6 +24550,7 @@ mod question_tests {
         )]));
 
         let expected = [
+            Some(ReasoningEffort::Disabled),
             Some(ReasoningEffort::Low),
             Some(ReasoningEffort::Medium),
             Some(ReasoningEffort::High),
@@ -24576,6 +24578,7 @@ mod question_tests {
             Some(ReasoningEffort::High),
             Some(ReasoningEffort::Medium),
             Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Disabled),
             None,
         ] {
             app.handle_model_picker_key(key(KeyCode::Left))
