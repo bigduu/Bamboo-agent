@@ -23,14 +23,17 @@ pub const DEFAULT_MODEL_PATTERN: &str = "default";
 /// range across frontier models (Claude 3.5, GPT-4o, Gemini 1.5, etc.).
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 1_000_000;
 
-/// Global default maximum output tokens.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128_000;
+/// Global default per-request output allowance.
+///
+/// Keep this below the largest theoretical model output so ordinary agent
+/// turns do not reserve half of a smaller context window before compression.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 /// Default safety margin for token counting errors (floor; scales with context
 /// window via [`ModelLimit::get_safety_margin`]).
 pub const DEFAULT_SAFETY_MARGIN: u32 = 1000;
 
-/// Build the single global default limit (`1M` context / `128K` output).
+/// Build the single global default limit (`1M` context / `32K` output).
 pub fn default_model_limit() -> ModelLimit {
     builtin_limit(
         DEFAULT_MODEL_PATTERN,
@@ -84,7 +87,7 @@ impl ModelLimit {
     /// capped at the global [`DEFAULT_MAX_OUTPUT_TOKENS`]. The cap tracks the
     /// global default rather than a hard-coded `4096`, so a user override like
     /// `ModelLimit::new("gpt-4o", 128_000)` (no explicit `max_output_tokens`)
-    /// resolves to `min(32_000, 128_000) = 32_000` instead of collapsing to
+    /// resolves to `min(32_000, 32_000) = 32_000` instead of collapsing to
     /// `4096` — see issue #20, bug 4.
     pub fn get_max_output_tokens(&self) -> u32 {
         self.max_output_tokens
@@ -334,11 +337,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limit_is_1m_128k() {
+    fn default_limit_is_1m_32k() {
         let limit = default_model_limit();
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(limit.max_context_tokens, 1_000_000);
-        assert_eq!(limit.get_max_output_tokens(), 128_000);
+        assert_eq!(limit.get_max_output_tokens(), 32_000);
     }
 
     #[test]
@@ -377,7 +380,7 @@ mod tests {
         let limit = registry.get_or_default("unknown-model-xyz");
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(limit.max_context_tokens, 1_000_000);
-        assert_eq!(limit.get_max_output_tokens(), 128_000);
+        assert_eq!(limit.get_max_output_tokens(), 32_000);
     }
 
     #[test]
@@ -408,7 +411,7 @@ mod tests {
     fn model_limit_calculates_default_output_tokens() {
         let limit = ModelLimit::new("test", 100_000);
         // Default is min(max_context / 4, DEFAULT_MAX_OUTPUT_TOKENS)
-        //        = min(25_000, 128_000) = 25_000 (no longer capped at 4096, #20 bug 4)
+        //        = min(25_000, 32_000) = 25_000 (no longer capped at 4096, #20 bug 4)
         assert_eq!(limit.get_max_output_tokens(), 25_000);
     }
 
@@ -536,7 +539,7 @@ mod tests {
         let unknown = registry.get_or_default("brand-new-frontier-model");
         assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(unknown.max_context_tokens, 1_000_000);
-        assert_eq!(unknown.get_max_output_tokens(), 128_000);
+        assert_eq!(unknown.get_max_output_tokens(), 32_000);
     }
 
     #[tokio::test]
@@ -689,7 +692,20 @@ mod tests {
             &registry,
         );
         assert_eq!(budget.max_context_tokens, 1_000_000);
-        assert_eq!(budget.max_output_tokens, 128_000);
+        assert_eq!(budget.max_output_tokens, 32_000);
+    }
+
+    #[test]
+    fn default_output_allowance_keeps_258k_context_until_fixed_reserve_trigger() {
+        let mut registry = ModelLimitsRegistry::new();
+        registry.add_limit(ModelLimit::new("gpt-5.6-sol", 258_000));
+
+        let budget =
+            create_budget_for_model("gpt-5.6-sol", crate::BudgetStrategy::default(), &registry);
+
+        assert_eq!(budget.max_output_tokens, 32_000);
+        assert_eq!(budget.max_request_input_tokens(), 223_420);
+        assert_eq!(budget.compression_trigger_context_tokens(), 208_000);
     }
 
     #[test]
