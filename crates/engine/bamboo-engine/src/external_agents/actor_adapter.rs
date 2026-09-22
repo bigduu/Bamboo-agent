@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::poison::PoisonRecover;
 use bamboo_domain::SessionInboxClaim;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -532,10 +533,16 @@ pub struct ActorChildRunner {
     fabric_dir: PathBuf,
     executor: ExecutorSpec,
     /// Per-provider credentials snapshotted from the parent config at build
-    /// time; the spec carries only the ONE the child's provider needs.
+    /// time; the spec carries only the ONE the child's provider needs. Server
+    /// runtimes install `live_provider_config` below so a provider hot reload
+    /// cannot strand this fallback snapshot for the rest of the process.
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
+    /// Live server configuration used to resolve provider credentials at child
+    /// activation time. This is deliberately limited to provider provisioning:
+    /// executor/placement policy remains the immutable runner configuration.
+    live_provider_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// The mailbox bus to run local children over (the unified transport). Local
     /// sub-agents require it; `None` only when no broker could be embedded.
     bus: Option<bamboo_subagent::BusEndpoint>,
@@ -692,6 +699,7 @@ impl ActorChildRunner {
             executor,
             credentials,
             default_provider,
+            live_provider_config: None,
             bus: None,
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -708,6 +716,17 @@ impl ActorChildRunner {
             codex_run_tokens: None,
             session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Bind the AppState-owned live configuration. Child activations read this
+    /// after a successful provider reload, so newly added/rotated provider
+    /// credentials take effect without restarting Bamboo.
+    pub fn with_live_provider_config(
+        mut self,
+        config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    ) -> Self {
+        self.live_provider_config = Some(config);
+        self
     }
 
     pub fn with_approval_registry(
@@ -782,7 +801,8 @@ impl ActorChildRunner {
     }
 
     /// Reuse fingerprint: two children are interchangeable on one warm worker iff
-    /// they share role, provider, model, workspace, disabled-tool set, AND every
+    /// they share role, provider, model, provider-credential revision,
+    /// workspace, disabled-tool set, AND every
     /// capability the worker BAKES at provision time (`BambooRuntimeExecutor`
     /// stamps these once and reuses them across runs): nesting depth, nested-spawn
     /// stack, requested/effective permission modes, legacy bypass/auto flags,
@@ -809,11 +829,22 @@ impl ActorChildRunner {
         let mut tools = spec.disabled_tools.clone().unwrap_or_default();
         tools.sort();
         let caps = &spec.capabilities;
+        // Provider credentials are baked into a worker at provision time. Hash
+        // the scoped envelope so a hot-reloaded key/base URL cannot reuse a
+        // worker provisioned with stale authority. The key itself never enters
+        // the pool key or logs.
+        let credential_revision = if spec.secrets.provider_credentials.is_empty() {
+            "none".to_string()
+        } else {
+            let serialized = serde_json::to_vec(&spec.secrets.provider_credentials)
+                .expect("scoped provider credentials are serializable");
+            hex::encode(Sha256::digest(serialized))
+        };
         // The worker constructs its executor exactly once. In particular,
         // Codex exec and app-server workers are not interchangeable.
         let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}ro={}\u{1}gro={}\u{1}executor={executor}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}cred={credential_revision}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}ro={}\u{1}gro={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
@@ -968,8 +999,15 @@ impl ActorChildRunner {
         pool.entry(key.to_string()).or_default().push(worker);
     }
 
-    /// Assemble the parent-resolved provisioning document for this child.
-    fn build_spec(&self, session: &Session, job: &SpawnJob) -> ProvisionSpec {
+    /// Assemble the parent-resolved provisioning document for this child using
+    /// one coherent provider snapshot.
+    fn build_spec_with_provider_config(
+        &self,
+        session: &Session,
+        job: &SpawnJob,
+        credentials: &[ScopedCredential],
+        default_provider: &str,
+    ) -> ProvisionSpec {
         let mut spec = ProvisionSpec::new(
             ChildIdentity {
                 child_id: job.child_session_id.clone(),
@@ -1015,7 +1053,7 @@ impl ActorChildRunner {
             .or_else(|| {
                 let m = job.model.trim();
                 (!m.is_empty()).then(|| ModelRefSpec {
-                    provider: self.default_provider.clone(),
+                    provider: default_provider.to_string(),
                     model: m.to_string(),
                 })
             });
@@ -1033,7 +1071,7 @@ impl ActorChildRunner {
             } => {
                 if auth_mode.as_deref() == Some("custom") {
                     if let Some(reference) = provider_key_ref {
-                        if let Some(credential) = self.credentials.iter().find(|credential| {
+                        if let Some(credential) = credentials.iter().find(|credential| {
                             credential.credential_ref.as_deref() == Some(reference)
                         }) {
                             spec.secrets.provider_credentials.push(credential.clone());
@@ -1060,9 +1098,8 @@ impl ActorChildRunner {
                     .as_ref()
                     .map(|model| model.provider.as_str())
                     .filter(|provider| !provider.trim().is_empty())
-                    .unwrap_or(&self.default_provider);
-                if let Some(credential) = self
-                    .credentials
+                    .unwrap_or(default_provider);
+                if let Some(credential) = credentials
                     .iter()
                     .find(|credential| credential.provider == provider)
                 {
@@ -1229,6 +1266,32 @@ impl ActorChildRunner {
         spec
     }
 
+    /// Assemble from the startup snapshot. Kept synchronous for focused unit
+    /// tests and non-server callers that do not install a live config source.
+    fn build_spec(&self, session: &Session, job: &SpawnJob) -> ProvisionSpec {
+        self.build_spec_with_provider_config(
+            session,
+            job,
+            &self.credentials,
+            &self.default_provider,
+        )
+    }
+
+    /// Assemble from the latest AppState config when available. Taking the
+    /// async read lock here gives every new activation a post-reload credential
+    /// view without copying secrets into a second independently refreshed
+    /// runtime store.
+    async fn build_live_spec(&self, session: &Session, job: &SpawnJob) -> ProvisionSpec {
+        let Some(config) = self.live_provider_config.as_ref() else {
+            return self.build_spec(session, job);
+        };
+
+        let config = config.read().await;
+        let credentials = super::runtime::extract_provider_credentials(&config);
+        let default_provider = config.effective_default_provider().to_string();
+        self.build_spec_with_provider_config(session, job, &credentials, &default_provider)
+    }
+
     /// The `metadata["placement"]` JSON to stamp on a child from its resolved
     /// placement, preferring the matching cluster node's `host_label` (its
     /// operator label/host) over the raw endpoint/pool. `None` for a Local child
@@ -1353,7 +1416,7 @@ impl ExternalChildRunner for ActorChildRunner {
         let escalation = self.escalation_bridge.lock().recover_poison().clone();
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let assignment = extract_assignment(session);
-        let mut spec = self.build_spec(session, job);
+        let mut spec = self.build_live_spec(session, job).await;
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
         // orphaned. Warm bus workers are pooled per fingerprint and reused.
         spec.reusable = true;
@@ -4441,6 +4504,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn live_provider_config_refreshes_credentials_and_default_per_activation() {
+        fn provider_instance(
+            provider_type: &str,
+            api_key: &str,
+        ) -> bamboo_config::ProviderInstanceConfig {
+            bamboo_config::ProviderInstanceConfig {
+                provider_type: provider_type.to_string(),
+                label: None,
+                api_key: api_key.to_string(),
+                api_key_encrypted: None,
+                credential_ref: None,
+                base_url: None,
+                model: None,
+                fast_model: None,
+                vision_model: None,
+                reasoning_effort: None,
+                responses_only_models: Vec::new(),
+                request_overrides: None,
+                enabled: true,
+                extra: Default::default(),
+            }
+        }
+
+        let mut initial = bamboo_llm::Config::default();
+        initial.provider_instances.insert(
+            "old-provider".to_string(),
+            provider_instance("openai", "old-key"),
+        );
+        initial.default_provider_instance = Some("old-provider".to_string());
+        let live = Arc::new(tokio::sync::RwLock::new(initial));
+
+        let runner = ActorChildRunner::new(
+            "echo-live-config-test".to_string(),
+            PathBuf::from("/bin/false"),
+            Vec::new(),
+            std::env::temp_dir().join("bamboo-echo-live-config"),
+            ExecutorSpec::Echo,
+            Vec::new(),
+            "stale-provider".to_string(),
+            1,
+        )
+        .with_live_provider_config(live.clone());
+        let job = crate::runtime::execution::SpawnJob {
+            parent_session_id: "parent".to_string(),
+            child_session_id: "child".to_string(),
+            model: "model".to_string(),
+            disabled_tools: None,
+        };
+
+        let first = runner
+            .build_live_spec(&Session::new("child", "model"), &job)
+            .await;
+        assert_eq!(
+            first.model.as_ref().map(|model| model.provider.as_str()),
+            Some("old-provider")
+        );
+        assert_eq!(first.secrets.provider_credentials.len(), 1);
+        assert_eq!(first.secrets.provider_credentials[0].api_key, "old-key");
+
+        let mut reloaded = bamboo_llm::Config::default();
+        reloaded.provider_instances.insert(
+            "new-provider".to_string(),
+            provider_instance("openai", "new-key"),
+        );
+        reloaded.default_provider_instance = Some("new-provider".to_string());
+        *live.write().await = reloaded;
+
+        let second = runner
+            .build_live_spec(&Session::new("child", "model"), &job)
+            .await;
+        assert_eq!(
+            second.model.as_ref().map(|model| model.provider.as_str()),
+            Some("new-provider")
+        );
+        assert_eq!(second.secrets.provider_credentials.len(), 1);
+        assert_eq!(second.secrets.provider_credentials[0].api_key, "new-key");
+    }
+
     #[test]
     fn custom_codex_provisioning_scopes_only_the_referenced_credential() {
         let mut executor = codex_executor(Some("custom"), None);
@@ -4640,6 +4782,26 @@ mod tests {
                 Some(vec!["Bash"])
             ))
         );
+    }
+
+    #[test]
+    fn fingerprint_splits_rotated_provider_credentials_without_exposing_them() {
+        let mut before = spec_with("explorer", "provider", "model", Some("/ws"), None);
+        before.secrets.provider_credentials.push(ScopedCredential {
+            provider: "provider".to_string(),
+            api_key: "old-secret-key".to_string(),
+            base_url: Some("https://provider.example/v1".to_string()),
+            provider_type: Some("openai".to_string()),
+            credential_ref: None,
+        });
+        let mut after = before.clone();
+        after.secrets.provider_credentials[0].api_key = "new-secret-key".to_string();
+
+        let before_fingerprint = ActorChildRunner::fingerprint(&before);
+        let after_fingerprint = ActorChildRunner::fingerprint(&after);
+        assert_ne!(before_fingerprint, after_fingerprint);
+        assert!(!before_fingerprint.contains("old-secret-key"));
+        assert!(!after_fingerprint.contains("new-secret-key"));
     }
 
     #[test]

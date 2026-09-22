@@ -762,8 +762,9 @@ impl AppState {
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_codex_tokens(
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_live_config_and_codex_tokens(
                 &config_snapshot,
+                config.clone(),
                 Some(approval_registry.clone()),
                 Some(parent_approval_reviewer),
                 permission_checker.permission_config(),

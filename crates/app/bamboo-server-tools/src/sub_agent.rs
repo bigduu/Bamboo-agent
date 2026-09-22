@@ -119,6 +119,10 @@ enum SubAgentArgs {
         reset_after_update: Option<bool>,
         #[serde(default)]
         auto_run: Option<bool>,
+        /// Optional explicit model for the existing child session. Accepts the
+        /// same `provider:model` or bare model id form as create.
+        #[serde(default)]
+        model: Option<String>,
         /// Optional reasoning effort to apply to the existing child session.
         /// `Some(level)` overrides the current value; `None` (the default)
         /// leaves it unchanged.
@@ -345,7 +349,8 @@ impl SubAgentTool {
     }
 }
 
-/// Parse an explicit `create.model` spec into a `ProviderModelRef`.
+/// Parse an explicit `create.model` or `update.model` spec into a
+/// `ProviderModelRef`.
 ///
 /// `"provider:model"` is explicit; a bare model id falls back to the parent
 /// session's provider, then the catalog's default provider.
@@ -487,7 +492,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "model": {
                 "type": "string",
-                "description": "For create: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. Takes precedence over per-subagent_type model routing. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available; omit to use the configured default for the given subagent_type label."
+                "description": "For create/update: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. On create it takes precedence over per-subagent_type model routing; on update it changes that existing child session in place. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available."
             },
             "lifecycle": {
                 "type": "string",
@@ -847,6 +852,7 @@ impl Tool for SubAgentTool {
                                 Some(prompt.clone()),
                                 Some(subagent_type.clone()),
                                 Some(true),
+                                None,
                                 reasoning_effort,
                                 assignment_background,
                             )
@@ -1103,8 +1109,17 @@ impl Tool for SubAgentTool {
                 subagent_type,
                 reset_after_update,
                 auto_run,
+                model,
                 reasoning_effort,
             } => {
+                let model_ref_override = match model.as_deref() {
+                    Some(spec) => Some(parse_model_spec(
+                        spec,
+                        &parent,
+                        self.catalog.as_ref().map(|catalog| catalog.default_provider()),
+                    )?),
+                    None => None,
+                };
                 let result = child_session::update_child_action(
                     self.sessions.as_ref(),
                     &parent.id,
@@ -1114,6 +1129,7 @@ impl Tool for SubAgentTool {
                     prompt,
                     subagent_type,
                     reset_after_update,
+                    model_ref_override,
                     reasoning_effort,
                 )
                 .await
@@ -1373,6 +1389,27 @@ mod tests {
             "workspace",
         ]);
         assert_eq!(actual, expected);
+        assert!(schema["properties"]["model"]["description"]
+            .as_str()
+            .expect("model description")
+            .contains("create/update"));
+    }
+
+    #[test]
+    fn update_deserializes_explicit_model() {
+        let parsed: SubAgentArgs = serde_json::from_value(json!({
+            "action": "update",
+            "child_session_id": "child-1",
+            "model": "easycli:gpt-5.6-luna"
+        }))
+        .expect("valid update args");
+
+        match parsed {
+            SubAgentArgs::Update { model, .. } => {
+                assert_eq!(model.as_deref(), Some("easycli:gpt-5.6-luna"));
+            }
+            other => panic!("expected update args, got {other:?}"),
+        }
     }
 
     #[test]

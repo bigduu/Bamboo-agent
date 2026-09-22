@@ -463,6 +463,7 @@ pub async fn update_child_action(
     prompt: Option<String>,
     subagent_type: Option<String>,
     reset_after_update: Option<bool>,
+    model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 ) -> Result<serde_json::Value, ChildSessionError> {
     update_child_action_with_background(
@@ -474,6 +475,7 @@ pub async fn update_child_action(
         prompt,
         subagent_type,
         reset_after_update,
+        model_ref_override,
         reasoning_effort,
         None,
     )
@@ -493,6 +495,7 @@ pub async fn update_child_action_with_background(
     prompt: Option<String>,
     subagent_type: Option<String>,
     reset_after_update: Option<bool>,
+    model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
     assignment_background: Option<String>,
 ) -> Result<serde_json::Value, ChildSessionError> {
@@ -508,11 +511,19 @@ pub async fn update_child_action_with_background(
     let should_refresh_assignment =
         responsibility.is_some() || prompt.is_some() || subagent_type.is_some();
 
-    if title.is_none() && !should_refresh_assignment && reasoning_effort.is_none() {
+    if title.is_none()
+        && !should_refresh_assignment
+        && model_ref_override.is_none()
+        && reasoning_effort.is_none()
+    {
         return Err(ChildSessionError::InvalidArguments(
-            "update requires at least one field: title/responsibility/prompt/subagent_type/reasoning_effort"
+            "update requires at least one field: title/responsibility/prompt/subagent_type/model/reasoning_effort"
                 .to_string(),
         ));
+    }
+
+    if let Some(model_ref) = model_ref_override {
+        apply_model_ref_override(&mut child, model_ref)?;
     }
 
     if let Some(effort) = reasoning_effort {
@@ -572,10 +583,35 @@ pub async fn update_child_action_with_background(
     Ok(json!({
         "child_session_id": child.id,
         "title": child.title,
+        "model": child.model,
+        "model_ref": child.model_ref,
+        "reasoning_effort": child.reasoning_effort.map(|effort| effort.as_str()),
         "messages_removed": messages_removed,
         "last_run_status": metadata_text(&child, "last_run_status"),
         "note": "Child session updated in place. Use action=run to execute the same child session.",
     }))
+}
+
+fn apply_model_ref_override(
+    child: &mut Session,
+    model_ref: bamboo_domain::ProviderModelRef,
+) -> Result<(), ChildSessionError> {
+    let provider = model_ref.provider.trim();
+    let model = model_ref.model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "model provider and id must both be non-empty".to_string(),
+        ));
+    }
+    let model_ref = bamboo_domain::ProviderModelRef {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        reasoning_effort: model_ref.reasoning_effort,
+    };
+    child.model = model_ref.model.clone();
+    child.set_provider_name(model_ref.provider.clone());
+    child.model_ref = Some(model_ref);
+    Ok(())
 }
 
 pub async fn run_child_action(
@@ -856,6 +892,52 @@ mod tree_tests {
         let a2 = &b.children[0];
         assert_eq!(a2.session_id, "a");
         assert!(a2.children.is_empty(), "cycle must terminate as a leaf");
+    }
+}
+
+#[cfg(test)]
+mod update_model_tests {
+    use super::apply_model_ref_override;
+
+    #[test]
+    fn model_override_updates_all_session_model_authority() {
+        let mut child = bamboo_domain::Session::new("child", "old-model");
+        child.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+            "old-provider",
+            "old-model",
+        ));
+        child.set_provider_name("old-provider");
+
+        apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new(" new-provider ", " new-model "),
+        )
+        .expect("valid model override");
+
+        assert_eq!(child.model, "new-model");
+        assert_eq!(child.provider_name().as_deref(), Some("new-provider"));
+        assert_eq!(
+            child
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.to_pair()),
+            Some(("new-provider", "new-model"))
+        );
+    }
+
+    #[test]
+    fn model_override_rejects_empty_provider_or_model() {
+        let mut child = bamboo_domain::Session::new("child", "old-model");
+        assert!(apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new("", "new-model")
+        )
+        .is_err());
+        assert!(apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new("provider", "  ")
+        )
+        .is_err());
     }
 }
 
