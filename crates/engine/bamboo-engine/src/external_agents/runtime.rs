@@ -181,6 +181,45 @@ pub fn build_external_child_runner_with_codex_tokens(
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
 ) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_internal(
+        config,
+        None,
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+        codex_run_tokens,
+    )
+}
+
+/// Full server wiring with an AppState-owned live config source. Provider
+/// credentials and the default provider are resolved for each new child
+/// activation, so provider reloads do not require rebuilding the actor runner.
+pub fn build_external_child_runner_with_live_config_and_codex_tokens(
+    config: &Config,
+    live_provider_config: Arc<tokio::sync::RwLock<Config>>,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_internal(
+        config,
+        Some(live_provider_config),
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+        codex_run_tokens,
+    )
+}
+
+fn build_external_child_runner_internal(
+    config: &Config,
+    live_provider_config: Option<Arc<tokio::sync::RwLock<Config>>>,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
@@ -194,6 +233,7 @@ pub fn build_external_child_runner_with_codex_tokens(
         approval_reviewer.clone(),
         permission_config.clone(),
         codex_run_tokens.clone(),
+        live_provider_config.clone(),
     ) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
@@ -290,6 +330,9 @@ pub fn build_external_child_runner_with_codex_tokens(
             if let Some(config) = permission_config.clone() {
                 runner = runner.with_permission_config(config);
             }
+            if let Some(config) = live_provider_config.clone() {
+                runner = runner.with_live_provider_config(config);
+            }
             runner = runner.with_codex_run_tokens(codex_run_tokens.clone());
             runners.push(Arc::new(runner));
             continue;
@@ -360,6 +403,7 @@ fn build_local_actor_runner(
     approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    live_provider_config: Option<Arc<tokio::sync::RwLock<Config>>>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = config.subagents();
 
@@ -418,6 +462,9 @@ fn build_local_actor_runner(
     }
     if let Some(config) = permission_config {
         runner = runner.with_permission_config(config);
+    }
+    if let Some(config) = live_provider_config {
+        runner = runner.with_live_provider_config(config);
     }
     Ok(Arc::new(runner))
 }
