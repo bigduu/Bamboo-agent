@@ -75,7 +75,7 @@ struct Cli {
     permission_mode: Option<String>,
 
     /// With -p: reasoning effort override for this run. One of:
-    /// low | medium | high | xhigh | max. Defaults to the active provider/config value.
+    /// none | low | medium | high | xhigh | max. Defaults to the active provider/config value.
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
 

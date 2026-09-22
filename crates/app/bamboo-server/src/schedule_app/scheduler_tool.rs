@@ -300,7 +300,7 @@ impl Tool for ScheduleTasksTool {
                         },
                         "reasoning_effort": {
                             "type": "string",
-                            "enum": ["low", "medium", "high", "xhigh", "max"]
+                            "enum": ["none", "low", "medium", "high", "xhigh", "max"]
                         },
                         "workspace_path": { "type": "string" },
                         "enhance_prompt": { "type": "string" },

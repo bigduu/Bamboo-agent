@@ -487,8 +487,8 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "reasoning_effort": {
                 "type": "string",
-                "enum": ["low", "medium", "high", "xhigh", "max"],
-                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, \"xhigh\"/\"max\" for deep reasoning tasks. Omit to use the selected sub-agent model preference, then the provider default; the child does NOT inherit the parent's reasoning_effort."
+                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
+                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"none\" to explicitly disable reasoning on models that support it, \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, and \"xhigh\"/\"max\" for deep reasoning tasks. Omit to use the selected sub-agent model preference, then the provider default; the child does NOT inherit the parent's reasoning_effort."
             },
             "model": {
                 "type": "string",

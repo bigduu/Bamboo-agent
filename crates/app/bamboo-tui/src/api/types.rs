@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn every_reasoning_effort_uses_the_canonical_wire_value() {
-        let values = ["low", "medium", "high", "xhigh", "max"];
+        let values = ["none", "low", "medium", "high", "xhigh", "max"];
         for (effort, expected) in ReasoningEffort::ALL.into_iter().zip(values) {
             assert_eq!(
                 serde_json::to_string(&effort).unwrap(),

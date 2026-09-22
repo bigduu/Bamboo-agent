@@ -2839,6 +2839,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
 
         let choices = [
             ("default", None),
+            ("none", Some(ReasoningEffort::Disabled)),
             ("low", Some(ReasoningEffort::Low)),
             ("medium", Some(ReasoningEffort::Medium)),
             ("high", Some(ReasoningEffort::High)),

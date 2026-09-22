@@ -2955,6 +2955,22 @@ mod tests {
     }
 
     #[test]
+    fn build_responses_body_sends_explicit_none_reasoning_effort() {
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            Some(32_000),
+            Some(ReasoningEffort::Disabled),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
     fn build_responses_body_keeps_legacy_models_on_xhigh() {
         let body = build_responses_body(
             "gpt-4o",
