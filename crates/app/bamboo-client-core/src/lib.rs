@@ -19,6 +19,8 @@ fn default_allow_custom() -> bool {
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    Disabled,
     Low,
     Medium,
     High,
@@ -27,10 +29,18 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+    pub const ALL: [Self; 6] = [
+        Self::Disabled,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Disabled => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",

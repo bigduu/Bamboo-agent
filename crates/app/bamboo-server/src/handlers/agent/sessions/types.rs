@@ -498,6 +498,17 @@ mod tests {
     }
 
     #[test]
+    fn test_session_requests_accept_explicit_none_reasoning() {
+        let create: CreateSessionRequest =
+            serde_json::from_str(r#"{"reasoning_effort":"none"}"#).unwrap();
+        let patch: PatchSessionRequest =
+            serde_json::from_str(r#"{"reasoning_effort":"none"}"#).unwrap();
+
+        assert_eq!(create.reasoning_effort, Some(ReasoningEffort::Disabled));
+        assert_eq!(patch.reasoning_effort, Some(ReasoningEffort::Disabled));
+    }
+
+    #[test]
     fn test_create_session_request_debug() {
         let req = CreateSessionRequest {
             project_id: None,
