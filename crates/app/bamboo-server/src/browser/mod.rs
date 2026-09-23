@@ -983,6 +983,81 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires the Playwright Chromium runtime"]
+    async fn slow_pointer_action_returns_before_host_deadline_without_restarting_session() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let length = socket.read(&mut request).await.unwrap_or(0);
+                    let slow = request[..length].starts_with(b"GET /slow ");
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(19)).await;
+                    }
+                    let body: &[u8] = if slow {
+                        b"<main>slow destination</main>"
+                    } else {
+                        br#"<script>setTimeout(() => {
+                            const button = document.createElement('button');
+                            button.id = 'late-hover'; button.hidden = true;
+                            button.onpointerenter = () => { location.href = '/slow' };
+                            document.body.append(button);
+                            setTimeout(() => { button.hidden = false }, 8000);
+                        }, 8000)</script>"#
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let browser = BrowserManager::default();
+        let opened = browser.open("slow-pointer-chat").await.unwrap();
+        let ready = browser
+            .command(
+                "slow-pointer-chat",
+                "navigate",
+                json!({"url": url, "expected_epoch": opened["page_epoch"]}),
+            )
+            .await
+            .unwrap();
+        let original = browser.sessions.lock().await["slow-pointer-chat"].clone();
+        let started = Instant::now();
+        let result = browser
+            .command(
+                "slow-pointer-chat",
+                "hover_selector",
+                json!({"selector": "#late-hover", "expected_epoch": ready["page_epoch"]}),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(BrowserError::Failed(message)) if message.contains("browser pointer action timed out")),
+            "pointer action should report its own budget before Rust retires the host: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(28));
+        let current = browser.sessions.lock().await["slow-pointer-chat"].clone();
+        assert!(Arc::ptr_eq(&original, &current));
+        assert!(current.alive.load(Ordering::Acquire));
+        assert!(current.child.lock().unwrap().try_wait().unwrap().is_none());
+        let state = browser.state("slow-pointer-chat").await.unwrap();
+        assert_eq!(state["active_tab_id"], ready["active_tab_id"]);
+        browser.close("slow-pointer-chat").await.unwrap();
+        fixture.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
     async fn renderer_hang_retires_chromium_and_reopens_chat_with_new_epoch() {
         use tokio::io::AsyncReadExt as _;
 

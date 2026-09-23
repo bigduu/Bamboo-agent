@@ -251,6 +251,13 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
 
 test('hover and straight drag change the shared page and reject stale coordinates', async () => {
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/very-slow-hover') {
+      setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end('<main>Very slow hover destination</main>');
+      }, 19_000);
+      return;
+    }
     if (request.url?.startsWith('/slow-')) {
       setTimeout(() => {
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -261,6 +268,10 @@ test('hover and straight drag change the shared page and reject stale coordinate
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     if (request.url === '/hover-navigate') {
       response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="location.href=\'/slow-hover\'">Hover to navigate</button>');
+      return;
+    }
+    if (request.url === '/deadline-hover') {
+      response.end('<script>setTimeout(() => { const button = document.createElement("button"); button.id = "late-hover"; button.hidden = true; button.textContent = "Late hover"; button.onpointerenter = () => { location.href = "/very-slow-hover" }; document.body.append(button); setTimeout(() => { button.hidden = false }, 8000) }, 8000)</script>');
       return;
     }
     if (request.url === '/hover-popup') {
@@ -595,6 +606,24 @@ test('hover and straight drag change the shared page and reject stale coordinate
     });
     assert.equal(longDrag.ok, true);
     assert.match((await call('dom')).result.html, /<output>long<\/output>/);
+
+    // Target discovery and actionability consume the same budget as the slow
+    // navigation they trigger. Rust would retire this host at 30 seconds.
+    const deadlineReady = await call('navigate', {
+      url: url + 'deadline-hover', expected_epoch: (await call('state')).result.page_epoch,
+    });
+    const originalTabId = deadlineReady.result.active_tab_id;
+    const deadlineStarted = Date.now();
+    const boundedHover = await call('hover_selector', {
+      selector: '#late-hover', expected_epoch: deadlineReady.result.page_epoch,
+    });
+    const elapsed = Date.now() - deadlineStarted;
+    assert.equal(boundedHover.code, 'navigation_timeout', JSON.stringify(boundedHover));
+    assert.ok(elapsed >= 20_000 && elapsed < 28_000, `pointer action took ${elapsed}ms`);
+    assert.equal(host.exitCode, null);
+    const surviving = await call('state');
+    assert.equal(surviving.ok, true);
+    assert.equal(surviving.result.active_tab_id, originalTabId);
   } finally {
     host.stdin.end();
     host.kill();

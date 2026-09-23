@@ -8,6 +8,8 @@ const readline = require('node:readline');
 const MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_HTML_CHARS = 100_000;
 const MAX_TABS = 8;
+// Rust retires this host after 30 seconds. Leave time for state() and stdio.
+const POINTER_ACTION_BUDGET_MS = 22_000;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -186,6 +188,15 @@ function targetError(code, message) {
   return error;
 }
 
+function pointerTimeout(deadlineAt) {
+  if (deadlineAt === undefined) return 10_000;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    throw targetError('navigation_timeout', 'browser pointer action timed out');
+  }
+  return Math.min(10_000, remaining);
+}
+
 function semanticString(target, name, maximum, required = false) {
   const value = target[name];
   if (value === undefined && !required) return undefined;
@@ -207,16 +218,17 @@ function selectOptionArgs(args) {
   return args.values;
 }
 
-async function waitForTarget(locator, missingMessage) {
+async function waitForTarget(locator, missingMessage, deadlineAt) {
   try {
-    await locator.first().waitFor({ state: 'attached', timeout: 10_000 });
+    await locator.first().waitFor({ state: 'attached', timeout: pointerTimeout(deadlineAt) });
   } catch (error) {
     if (error.name !== 'TimeoutError') throw error;
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
     throw targetError('target_not_found', missingMessage);
   }
 }
 
-async function targetLocator(args, page) {
+async function targetLocator(args, page, deadlineAt) {
   let locator;
   if (args.target === undefined) {
     if (typeof args.selector !== 'string' || !args.selector.trim()) {
@@ -245,7 +257,7 @@ async function targetLocator(args, page) {
     let scope = page;
     if (frameSelector) {
       const owner = page.frameLocator(frameSelector).owner();
-      await waitForTarget(owner, 'browser target iframe not found');
+      await waitForTarget(owner, 'browser target iframe not found', deadlineAt);
       const count = await owner.count();
       if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
       if (count !== 1) {
@@ -268,7 +280,7 @@ async function targetLocator(args, page) {
         : scope.getByText(value, { exact });
     }
   }
-  await waitForTarget(locator, 'browser target not found');
+  await waitForTarget(locator, 'browser target not found', deadlineAt);
   const count = await locator.count();
   if (count === 0) throw targetError('target_not_found', 'browser target not found');
   if (count !== 1) {
@@ -277,13 +289,13 @@ async function targetLocator(args, page) {
   return locator;
 }
 
-async function withPinnedTarget(args, act) {
+async function withPinnedTarget(args, act, deadlineAt) {
   const page = requireActiveTab().page;
-  const locator = await targetLocator(args, page);
+  const locator = await targetLocator(args, page, deadlineAt);
   checkEpoch(args);
   // A Locator may re-resolve after navigation while waiting for an old
   // disabled element. An ElementHandle stays bound to its document.
-  const handle = await locator.elementHandle({ timeout: 10_000 });
+  const handle = await locator.elementHandle({ timeout: pointerTimeout(deadlineAt) });
   if (!handle) throw targetError('target_not_found', 'browser target not found');
   try {
     const count = await locator.count();
@@ -326,7 +338,7 @@ function pointerButton(value) {
   return button;
 }
 
-async function observeActionNavigation(page) {
+async function observeActionNavigation(page, deadlineAt) {
   let started = false;
   let committed = false;
   let failed = false;
@@ -428,7 +440,10 @@ async function observeActionNavigation(page) {
       // A newly committed document can immediately request another navigation.
       // Each request invalidates the prior commit; return only after the latest
       // request commits and navigation events have settled for one short turn.
-      const deadline = Date.now() + 20_000;
+      const deadline = Math.min(deadlineAt ?? Infinity, Date.now() + 20_000);
+      if (Date.now() >= deadline) {
+        throw targetError('navigation_timeout', 'browser pointer action timed out');
+      }
       let observedRevision = revision;
       while (Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 50));
@@ -439,6 +454,7 @@ async function observeActionNavigation(page) {
         if (failed) break;
         if (!pendingPopupOpens && (!started || committed)) return;
       }
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
       if (!failed && (pendingPopupOpens || (started && !committed))) {
         throw targetError('navigation_timeout', 'browser navigation did not complete');
       }
@@ -458,8 +474,9 @@ async function observeActionNavigation(page) {
   };
 }
 
-async function hoverWithNavigation(page, expectedEpoch, hover) {
-  const navigation = await observeActionNavigation(page);
+async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
+  pointerTimeout(deadlineAt);
+  const navigation = await observeActionNavigation(page, deadlineAt);
   try {
     try { await hover(); } catch (error) {
       if (!navigation.started && expectedEpoch === epoch) throw error;
@@ -470,16 +487,19 @@ async function hoverWithNavigation(page, expectedEpoch, hover) {
   }
 }
 
-async function dragBetween(page, source, destination, expectedEpoch, button = 'left') {
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt) {
   if (expectedEpoch !== epoch) throw staleEpochError();
-  const navigation = await observeActionNavigation(page);
+  pointerTimeout(deadlineAt);
+  const navigation = await observeActionNavigation(page, deadlineAt);
   const interrupted = () => expectedEpoch !== epoch || navigation.started;
   let downAttempted = false;
   let failure;
   try {
     try {
+      pointerTimeout(deadlineAt);
       await page.mouse.move(source.x, source.y);
       if (!interrupted()) {
+        pointerTimeout(deadlineAt);
         downAttempted = true;
         await page.mouse.down({ button });
         let current = source;
@@ -489,12 +509,14 @@ async function dragBetween(page, source, destination, expectedEpoch, button = 'l
             x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
             y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
           };
+          pointerTimeout(deadlineAt);
           await page.mouse.move(current.x, current.y);
           if (!interrupted()) destination = await destination();
         }
         if (!interrupted()) {
           for (let step = 1; step <= 12; step++) {
             if (interrupted()) break;
+            pointerTimeout(deadlineAt);
             await page.mouse.move(
               current.x + (destination.x - current.x) * step / 12,
               current.y + (destination.y - current.y) * step / 12,
@@ -713,28 +735,34 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
-    case 'hover_selector':
+    case 'hover_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);
       page = requireActiveTab().page;
       await hoverWithNavigation(page, args.expected_epoch,
-        () => withPinnedTarget(args, handle => handle.hover({ timeout: 10_000 })));
+        () => withPinnedTarget(args,
+          handle => handle.hover({ timeout: pointerTimeout(deadlineAt) }), deadlineAt), deadlineAt);
       return state();
-    case 'hover_at':
+    }
+    case 'hover_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);
       page = requireActiveTab().page;
-      var hoverPoint = pointerPoint(args, 'x', 'y', page);
+      const hoverPoint = pointerPoint(args, 'x', 'y', page);
       checkEpoch(args);
       await hoverWithNavigation(page, args.expected_epoch,
-        () => page.mouse.move(hoverPoint.x, hoverPoint.y));
+        () => page.mouse.move(hoverPoint.x, hoverPoint.y), deadlineAt);
       return state();
-    case 'drag_selector':
+    }
+    case 'drag_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);
       page = requireActiveTab().page;
-      var sourceSelector = pointerSelector(args.source_selector);
-      var targetSelector = pointerSelector(args.target_selector);
+      const sourceSelector = pointerSelector(args.source_selector);
+      const targetSelector = pointerSelector(args.target_selector);
       await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
         await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
-          await source.scrollIntoViewIfNeeded({ timeout: 10_000 });
+          await source.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
           checkEpoch(args);
           const from = await source.boundingBox();
           const to = await destination.boundingBox();
@@ -750,25 +778,28 @@ async function command(action, args = {}) {
             : async () => {
               // Begin the drag on the visible source before scrolling a distant
               // destination into view; both elements need not fit together.
-              await destination.scrollIntoViewIfNeeded({ timeout: 10_000 });
+              await destination.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
               const box = await destination.boundingBox();
               if (!box) throw targetError('target_not_found', 'browser drag target is detached');
               return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
             };
           checkEpoch(args);
-          await dragBetween(page, start, end, args.expected_epoch);
-        });
-      });
+          await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt);
+        }, deadlineAt);
+      }, deadlineAt);
       return state();
-    case 'drag_at':
+    }
+    case 'drag_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);
       page = requireActiveTab().page;
-      var from = pointerPoint(args, 'x', 'y', page);
-      var to = pointerPoint(args, 'to_x', 'to_y', page);
-      var button = pointerButton(args.button);
+      const from = pointerPoint(args, 'x', 'y', page);
+      const to = pointerPoint(args, 'to_x', 'to_y', page);
+      const button = pointerButton(args.button);
       checkEpoch(args);
-      await dragBetween(page, from, to, args.expected_epoch, button);
+      await dragBetween(page, from, to, args.expected_epoch, button, deadlineAt);
       return state();
+    }
     case 'screenshot': {
       return stableRead(async tab => {
         const page = tab.page;
