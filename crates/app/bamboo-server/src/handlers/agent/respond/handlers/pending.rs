@@ -332,6 +332,13 @@ fn pending_tool_arguments_for_display(
     if bamboo_tools::permission::is_native_browser_select("browser", &parsed) {
         return Some((serde_json::json!({"action":"select_option"}), false, false));
     }
+    if bamboo_tools::permission::is_private_browser_file_input("browser", &parsed) {
+        return Some((
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"}),
+            false,
+            false,
+        ));
+    }
     Some((parsed, false, false))
 }
 
@@ -426,6 +433,17 @@ pub async fn get_pending_question(
             let native_browser_select = tool_arguments.as_ref().is_some_and(|arguments| {
                 bamboo_tools::permission::is_native_browser_select("browser", arguments)
             });
+            let private_browser_file_input = tool_arguments.as_ref().is_some_and(|arguments| {
+                bamboo_tools::permission::is_private_browser_file_input("browser", arguments)
+            }) || interaction
+                .permission_request
+                .as_ref()
+                .is_some_and(|request| {
+                    PermissionRequest::is_private_browser_file_resource(
+                        &request.tool_name,
+                        &request.resource,
+                    )
+                });
             let dialog_response = tool_arguments
                 .as_ref()
                 .and_then(|arguments| arguments.get("action").and_then(serde_json::Value::as_str))
@@ -439,6 +457,7 @@ pub async fn get_pending_question(
                 interaction.permission_request.map(|mut request| {
                     if request.has_private_browser_resource()
                         || native_browser_select
+                        || private_browser_file_input
                         || dialog_response
                         || browser_eval
                         || browser_arguments_unavailable
@@ -448,6 +467,8 @@ pub async fn get_pending_question(
                         request.resource = "[redacted]".to_string();
                         request.operation_summary = if dialog_response {
                             "Answer pending browser dialog"
+                        } else if private_browser_file_input {
+                            "Set one in-memory browser file input"
                         } else if browser_eval {
                             "Execute browser page JavaScript"
                         } else if native_browser_select {
@@ -472,6 +493,8 @@ pub async fn get_pending_question(
                     "Approve focused browser input?"
                 } else if native_browser_select {
                     "Approve native browser selection?"
+                } else if private_browser_file_input {
+                    "Approve in-memory browser file input?"
                 } else if browser_eval {
                     "Approve browser page JavaScript on the active page?"
                 } else {
@@ -858,6 +881,81 @@ mod http_tests {
             serde_json::json!([])
         );
         for private in [private_value, private_selector, "private-fingerprint"] {
+            assert!(!body.to_string().contains(private));
+        }
+        assert_eq!(
+            pending_tool_arguments_exact(&session, tool_call_id).unwrap(),
+            args
+        );
+    }
+
+    #[actix_web::test]
+    async fn pending_browser_file_input_keeps_original_call_but_redacts_http_display() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "file-input-private-display";
+        let tool_call_id = "file-input-call";
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#private-upload",
+            "filename":"private.txt","mime_type":"text/plain",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        let mut request = permission_request(session_id, tool_call_id);
+        request.tool_name = "browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = "browser:17:set_file_input:upload:private-fingerprint".to_string();
+        request.suggested_matchers[0].value = request.resource.clone();
+        let mut session = Session::new(session_id, "test-model");
+        session
+            .messages
+            .push(assistant_browser_call(tool_call_id, &args.to_string()));
+        session.messages.push(Message::tool_result(
+            tool_call_id,
+            serde_json::json!({
+                "status":"awaiting_permission_approval",
+                "question":"Approve private.txt?",
+                "permission_request":request,
+            })
+            .to_string(),
+        ));
+        session.set_pending_question_with_source(
+            tool_call_id.to_string(),
+            "browser".to_string(),
+            "Approve private.txt?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+            PendingQuestionSource::PauseTool,
+        );
+        state.save_and_cache_session(&mut session).await;
+        let response = get_pending_question(state, web::Path::from(session_id.to_string()))
+            .await
+            .expect("pending response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(body["question"], "Approve in-memory browser file input?");
+        assert_eq!(
+            body["tool_arguments"],
+            serde_json::json!({
+                "action":"set_file_input","file":"[redacted]",
+            })
+        );
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert_eq!(
+            body["permission_request"]["suggested_matchers"],
+            serde_json::json!([])
+        );
+        for private in [
+            "private-upload",
+            "private.txt",
+            "cHJpdmF0",
+            "private-fingerprint",
+        ] {
             assert!(!body.to_string().contains(private));
         }
         assert_eq!(

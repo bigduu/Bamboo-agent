@@ -349,14 +349,14 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","type","press","key","scroll","screenshot","dialog_respond"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","screenshot","dialog_respond"]},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
                 "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
@@ -365,11 +365,14 @@ impl Tool for BrowserTool {
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
+                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, set_file_input, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
                 "source_selector":{"type":"string","description":"CSS source selector for drag; pair with target_selector"},
                 "target_selector":{"type":"string","description":"CSS destination selector for drag; pair with source_selector"},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
                 "values":{"type":"array","description":"Native select option values for select_option, including the empty value","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":512}},
+                "filename":{"type":"string","description":"Basename only for set_file_input; no directory or path","maxLength":128},
+                "mime_type":{"type":"string","description":"Bounded MIME type for set_file_input, such as text/plain","maxLength":128},
+                "data_base64":{"type":"string","description":"Strict standard base64 contents of one in-memory file, decoded size at most 1 MiB","maxLength":1398104},
                 "key":{"type":"string","description":"Keyboard key for press or key, e.g. Enter"},
                 "x":{"type":"number","description":"CSS viewport x for click_at, scroll, coordinate hover, or coordinate drag"},
                 "y":{"type":"number","description":"CSS viewport y for click_at, scroll, coordinate hover, or coordinate drag"},
@@ -378,7 +381,7 @@ impl Tool for BrowserTool {
                 "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at or coordinate drag; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/type/press/key/scroll/dialog_respond: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/set_file_input/type/press/key/scroll/dialog_respond: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -420,6 +423,7 @@ impl Tool for BrowserTool {
                 | "drag"
                 | "fill"
                 | "select_option"
+                | "set_file_input"
                 | "type"
                 | "press"
                 | "key"
@@ -436,6 +440,13 @@ impl Tool for BrowserTool {
         }
         if action == "dialog_respond" {
             dialog_id_arg(&args)?;
+        }
+        if action == "set_file_input" {
+            // The model's bytes and path-shaped extras must be rejected before
+            // an invalid request can start a Chromium session.
+            bamboo_tools::permission::validate_browser_file_input(&args).map_err(|_| {
+                ToolError::InvalidArguments("invalid browser in-memory file input".into())
+            })?;
         }
         let state = self.browser.open(session_id).await.map_err(browser_error)?;
         let epoch = args
@@ -480,6 +491,13 @@ impl Tool for BrowserTool {
                 self.browser.command(session_id, "fill_selector", request).await.map_err(browser_error)?
             },
             "select_option" => self.browser.command(session_id, "select_option", select_option_request(&args, epoch)?).await.map_err(browser_error)?,
+            "set_file_input" => self.browser.command(session_id, "set_file_input", json!({
+                "selector":args["selector"],
+                "filename":args["filename"],
+                "mime_type":args["mime_type"],
+                "data_base64":args["data_base64"],
+                "expected_epoch":epoch,
+            })).await.map_err(browser_error)?,
             "press" => {
                 let mut request = locator_request(&args, epoch, true)?;
                 request["key"] = json!(text_arg(&args,"key")?);
@@ -533,6 +551,7 @@ mod tests {
             "type",
             "key",
             "dialog_respond",
+            "set_file_input",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
             assert_eq!(
@@ -607,6 +626,35 @@ mod tests {
         ] {
             assert!(select_option_request(&args, 17).is_err(), "{args}");
         }
+    }
+
+    #[tokio::test]
+    async fn in_memory_file_input_rejects_invalid_payload_before_browser_open() {
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        let mut ctx = ToolCtx::none("browser-test");
+        ctx.session_id = Some(Arc::from("current-chat"));
+        let base = json!({
+            "action":"set_file_input", "selector":"#upload", "filename":"sample.txt",
+            "mime_type":"text/plain", "data_base64":"YQ==", "expected_epoch":17,
+        });
+        for mut invalid in [
+            json!({"action":"set_file_input","selector":"#upload","filename":"sample.txt","mime_type":"text/plain","data_base64":"YQ=="}),
+            json!({"action":"set_file_input","selector":"#upload","filename":"../secret.txt","mime_type":"text/plain","data_base64":"YQ==","expected_epoch":17}),
+            json!({"action":"set_file_input","selector":"#upload","filename":"sample.txt","mime_type":"text/plain","data_base64":"YQ=","expected_epoch":17}),
+            base.clone(),
+        ] {
+            if invalid == base {
+                invalid["path"] = json!("/tmp/secret");
+            }
+            let error = tool.invoke(invalid, ctx.clone()).await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
+            assert!(!error.to_string().contains("secret"));
+        }
+        let error = tool.invoke(
+            json!({"action":"set_file_input","session_id":"other-chat","selector":"#upload","filename":"sample.txt","mime_type":"text/plain","data_base64":"YQ==","expected_epoch":17}),
+            ctx,
+        ).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
 
     #[test]
@@ -753,6 +801,10 @@ mod tests {
             ("drag", json!({"x":12,"y":20,"to_x":30,"to_y":40})),
             ("type", json!({"text":"Lotus"})),
             ("key", json!({"key":"Enter"})),
+            (
+                "set_file_input",
+                json!({"selector":"#upload","filename":"a.txt","mime_type":"text/plain","data_base64":"YQ=="}),
+            ),
             (
                 "dialog_respond",
                 json!({"dialog_id":"a".repeat(24),"accept":true}),
@@ -928,6 +980,111 @@ mod tests {
         assert_eq!(after_image["active_tab_id"], state["active_tab_id"]);
         assert!(after_image["data"].as_str().unwrap().len() > 1000);
         browser.close("shared-chat").await.unwrap();
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn model_file_input_updates_only_its_chat_page_and_current_epoch() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    let body = br#"<!doctype html><input id="upload" type="file" onchange="const file=this.files[0];const reader=new FileReader();reader.onload=()=>document.querySelector('#result').textContent=[file.name,file.type,file.size,reader.result].join('|');reader.readAsText(file)"><output id="result">No file</output>"#;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let browser = Arc::new(BrowserManager::default());
+        let tool = BrowserTool::new(browser.clone());
+        let mut ctx = ToolCtx::none("browser-test");
+        ctx.session_id = Some(Arc::from("file-chat"));
+        let opened = browser.open("file-chat").await.unwrap();
+        let navigated = browser
+            .command(
+                "file-chat",
+                "navigate",
+                json!({
+                    "url":url,"expected_epoch":opened["page_epoch"],
+                }),
+            )
+            .await
+            .unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        let args = json!({
+            "action":"set_file_input","selector":"#upload","filename":"sample.txt",
+            "mime_type":"text/plain","data_base64":"bWVtb3J5LW9ubHkgZmlsZQ==",
+            "expected_epoch":epoch,
+        });
+        let ToolOutcome::Completed(result) = tool.invoke(args.clone(), ctx.clone()).await.unwrap()
+        else {
+            panic!("file input must complete");
+        };
+        assert!(!result.result.contains("bWVtb3J5"));
+        let state: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(state["page_epoch"], epoch);
+        let mut dom = json!({});
+        for _ in 0..30 {
+            dom = browser
+                .command("file-chat", "dom", json!({}))
+                .await
+                .unwrap();
+            if dom["html"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sample.txt|text/plain|16|memory-only file")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(dom["html"]
+            .as_str()
+            .unwrap()
+            .contains("sample.txt|text/plain|16|memory-only file"));
+        assert_eq!(dom["page_epoch"], epoch);
+        let screenshot = browser
+            .command("file-chat", "screenshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(screenshot["page_epoch"], epoch);
+        assert!(screenshot["data"].as_str().unwrap().len() > 1000);
+
+        let other = browser.open("other-chat").await.unwrap();
+        let other = browser
+            .command(
+                "other-chat",
+                "navigate",
+                json!({
+                    "url":url,"expected_epoch":other["page_epoch"],
+                }),
+            )
+            .await
+            .unwrap();
+        let other_dom = browser
+            .command("other-chat", "dom", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(other_dom["page_epoch"], other["page_epoch"]);
+        assert!(other_dom["html"].as_str().unwrap().contains("No file"));
+        let mut stale_args = args;
+        stale_args["expected_epoch"] = opened["page_epoch"].clone();
+        assert!(tool.invoke(stale_args, ctx).await.is_err());
+        browser.close("other-chat").await.unwrap();
+        browser.close("file-chat").await.unwrap();
         fixture.abort();
     }
 }

@@ -2665,6 +2665,7 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         (Some("press"), Some("page")) => true,
         (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
         (Some("select_option"), Some(rest)) => rest.starts_with("options:"),
+        (Some("set_file_input"), Some(rest)) => rest.starts_with("upload:"),
         (Some("dialog_respond"), Some(rest)) => rest.split(':').next().is_some_and(|id| {
             id.len() == 24
                 && id
@@ -2691,7 +2692,7 @@ fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> O
     }
     let action = args.get("action")?.as_str()?;
     match action {
-        "type" | "key" | "dialog_respond" => Some(action),
+        "type" | "key" | "dialog_respond" | "set_file_input" => Some(action),
         "press" if !valid_browser_press_target(args) => Some(action),
         _ => None,
     }
@@ -16805,6 +16806,7 @@ mod question_tests {
             "browser:17:key:private-fingerprint",
             "browser:17:press:focused:key:private-fingerprint",
             "browser:17:select_option:options:private-fingerprint",
+            "browser:17:set_file_input:upload:private-fingerprint",
             "browser:17:dialog_respond:aaaaaaaaaaaaaaaaaaaaaaaa:accept:private-fingerprint",
         ] {
             permission.request.resource = focused_resource.to_string();
@@ -17075,6 +17077,42 @@ mod question_tests {
         }
         assert_eq!(args["values"][0], private_value);
         assert_eq!(result["selected_values"][0], private_value);
+    }
+
+    #[test]
+    fn browser_file_input_events_and_permission_inspector_hide_file_bytes() {
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#private-upload",
+            "filename":"private.txt","mime_type":"text/plain",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        for tool_name in ["browser", "default::browser"] {
+            let display = tool_arguments_for_display(tool_name, &args.to_string());
+            assert_eq!(
+                display,
+                r#"{"action":"set_file_input","input":"[redacted]"}"#
+            );
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "file-call".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "file-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: serde_json::json!({"page_epoch":17,"active_tab_id":"a"}).to_string(),
+                },
+            })
+            .unwrap();
+            let displayed = &app.chat.current_tool_calls[0];
+            for private in ["private-upload", "private.txt", "cHJpdmF0"] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+        }
     }
 
     #[test]
