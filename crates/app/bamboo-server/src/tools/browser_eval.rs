@@ -69,7 +69,7 @@ impl Tool for BrowserEvalTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bounded JavaScript expression or IIFE in the active browser page shared with this chat. This page-realm capability can read or change the DOM and is separate from ordinary browser controls. First use browser snapshot to get page_epoch and exact URL, then pass them as expected_epoch and expected_url. A navigation or tab switch invalidates the request. The code cannot access Bamboo's Node host, local files, Playwright page object, or CDP. Return only JSON-safe values."
+        "Execute a bounded JavaScript expression or IIFE in the active browser page shared with this chat. This page-realm capability can read or change the DOM and can send page data and requests to other websites. First use browser snapshot to get page_epoch and exact URL, then pass them as expected_epoch and expected_url. A navigation or tab switch invalidates the request. The code cannot access Bamboo's Node host, local files, Playwright page object, or CDP. Return only JSON-safe values."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -122,6 +122,9 @@ mod tests {
     fn eval_is_a_separate_mutating_tool_with_bounded_arguments() {
         let tool = BrowserEvalTool::new(Arc::new(BrowserManager::default()));
         assert_eq!(tool.name(), "browser_eval");
+        assert!(tool
+            .description()
+            .contains("can send page data and requests to other websites"));
         assert_eq!(tool.classify(&json!({})), ToolClass::MUTATING_SERIAL);
         let schema = tool.parameters_schema();
         assert_eq!(schema["properties"]["code"]["maxLength"], 8192);

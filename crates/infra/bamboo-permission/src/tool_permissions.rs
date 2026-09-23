@@ -664,7 +664,7 @@ pub fn check_permissions(
             Ok(Some(vec![PermissionContext::new(
                 PermissionType::BrowserInteraction,
                 format!("browser_eval:{epoch}:{fingerprint}"),
-                format!("Execute browser page JavaScript on {display_origin}"),
+                format!("Execute browser page JavaScript on {display_origin}; can send page data and requests to other websites"),
             )]))
         }
         "browser" => {
@@ -1230,7 +1230,7 @@ mod tests {
         assert_eq!(base, restarted);
         assert_eq!(
             base["description"],
-            "Execute browser page JavaScript on https://example.com"
+            "Execute browser page JavaScript on https://example.com; can send page data and requests to other websites"
         );
         for secret in ["#password", "secret-value", "private-query"] {
             assert!(!base.to_string().contains(secret));
