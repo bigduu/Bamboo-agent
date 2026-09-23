@@ -334,6 +334,7 @@ async function observeActionNavigation(page) {
   let revision = 0;
   let observedPage = page;
   let blankPopupExpected = false;
+  let pendingPopupOpens = 0;
   const listeners = [];
   const cdp = await tabByPage.get(page)?.cdp;
   if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
@@ -346,6 +347,7 @@ async function observeActionNavigation(page) {
     failed = false;
     currentRequest = null;
     blankPopupExpected = !event.url || event.url === 'about:blank';
+    pendingPopupOpens++;
     revision++;
   };
   cdp.on('Page.windowOpen', onWindowOpen);
@@ -366,7 +368,8 @@ async function observeActionNavigation(page) {
       revision++;
     }
     const onRequest = request => {
-      if (target !== observedPage || !mainRequest(target, request)) return;
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !mainRequest(target, request)) return;
       started = true;
       committed = false;
       failed = false;
@@ -374,13 +377,15 @@ async function observeActionNavigation(page) {
       revision++;
     };
     const onFailed = request => {
-      if (target !== observedPage || request !== currentRequest) return;
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          request !== currentRequest) return;
       failed = true;
       currentRequest = null;
       revision++;
     };
     const onFrame = frame => {
       if (target !== observedPage || frame !== target.mainFrame()) return;
+      if (target === page && pendingPopupOpens) return;
       if (target !== page && frame.url() === 'about:blank' && !blankPopupExpected) return;
       started = true;
       committed = true;
@@ -388,7 +393,7 @@ async function observeActionNavigation(page) {
       revision++;
     };
     const onClose = () => {
-      if (target !== observedPage) return;
+      if (target !== observedPage || (target === page && pendingPopupOpens)) return;
       failed = true;
       revision++;
     };
@@ -398,7 +403,10 @@ async function observeActionNavigation(page) {
     target.on('close', onClose);
     listeners.push({ page: target, onRequest, onFailed, onFrame, onClose });
   };
-  const onPopup = target => { watch(target, true); };
+  const onPopup = target => {
+    if (pendingPopupOpens) pendingPopupOpens--;
+    watch(target, true);
+  };
   watch(page);
   page.on('popup', onPopup);
   return {
@@ -416,9 +424,9 @@ async function observeActionNavigation(page) {
           continue;
         }
         if (failed) break;
-        if (!started || committed) return;
+        if (!pendingPopupOpens && (!started || committed)) return;
       }
-      if (!failed && started && !committed) {
+      if (!failed && (pendingPopupOpens || (started && !committed))) {
         throw targetError('navigation_timeout', 'browser navigation did not complete');
       }
       if (failed) throw targetError('navigation_failed', 'browser navigation failed');

@@ -267,6 +267,10 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="window.open(\'/slow-popup-hover\',\'_blank\')">Hover to open popup</button>');
       return;
     }
+    if (request.url === '/hover-popup-and-navigate') {
+      response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="window.open(\'/slow-popup-hover\',\'_blank\');location.href=\'/after-drop\'">Hover to open popup and navigate</button>');
+      return;
+    }
     if (request.url === '/chain-first') {
       response.end('<script>location.href="/slow-chain-second"</script><main>Intermediate page</main>');
       return;
@@ -510,6 +514,18 @@ test('hover and straight drag change the shared page and reject stale coordinate
     assert.notEqual(popupDragAt.result.active_tab_id, popupDragAtReady.result.active_tab_id);
     assert.equal((await waitForFrame(popupDragAt.result.active_tab_id, popupDragAt.result.page_epoch)).page_epoch,
       popupDragAt.result.page_epoch);
+
+    const dualReady = await call('navigate', {
+      url: url + 'hover-popup-and-navigate', expected_epoch: popupDragAt.result.page_epoch,
+    });
+    const dualStarted = Date.now();
+    const dual = await call('hover_selector', {
+      selector: '#hover', expected_epoch: dualReady.result.page_epoch,
+    });
+    assert.equal(dual.ok, true);
+    assert.ok(Date.now() - dualStarted >= 1_200);
+    assert.match(dual.result.url, /\/slow-popup-hover$/);
+    assert.notEqual(dual.result.active_tab_id, dualReady.result.active_tab_id);
 
     const longReady = await call('navigate', { url: url + 'long-drag', expected_epoch: (await call('state')).result.page_epoch });
     const longDrag = await call('drag_selector', {
