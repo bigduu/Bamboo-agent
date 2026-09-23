@@ -17,6 +17,7 @@ const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
   : 0;
 const MAX_EVAL_CODE_BYTES = 8 * 1024;
 const MAX_EVAL_JSON_BYTES = 64 * 1024;
+const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -155,10 +156,128 @@ function checkEvalArgs(args) {
   checkEpoch(args);
 }
 
+// Playwright installs this before document scripts in every page and frame.
+// The non-writable function keeps pristine intrinsics in its closure, so page
+// scripts cannot replace the bounded serializer before or during model eval.
+function installEvalHelper(key) {
+  const root = globalThis;
+  const nativeEval = root.eval;
+  const nativeError = Error;
+  const arrayCtor = Array;
+  const weakSetCtor = WeakSet;
+  const isArray = Array.isArray;
+  const isFiniteNumber = Number.isFinite;
+  const isSafeInteger = Number.isSafeInteger;
+  const getPrototypeOf = Object.getPrototypeOf;
+  const objectKeys = Object.keys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const create = Object.create;
+  const define = Object.defineProperty;
+  const setPrototypeOf = Object.setPrototypeOf;
+  const hasOwn = Object.hasOwn;
+  const stringify = JSON.stringify;
+  const apply = Reflect.apply;
+  const charCodeAt = String.prototype.charCodeAt;
+  const seenHas = WeakSet.prototype.has;
+  const seenAdd = WeakSet.prototype.add;
+  const seenDelete = WeakSet.prototype.delete;
+  const plainPrototype = Object.prototype;
+  const withinUtf8Bytes = (text, limit) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index++) {
+      const unit = apply(charCodeAt, text, [index]);
+      if (unit <= 0x7f) bytes++;
+      else if (unit <= 0x7ff) bytes += 2;
+      else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+        const next = apply(charCodeAt, text, [index + 1]);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index++; }
+        else bytes += 3;
+      } else bytes += 3;
+      if (bytes > limit) return false;
+    }
+    return true;
+  };
+
+  const run = async source => {
+    const value = await (0, nativeEval)(source);
+    const seen = new weakSetCtor();
+    let entries = 0;
+    let stringUnits = 0;
+    const safe = (item, depth) => {
+      if (++entries > 256 || depth > 8) throw new nativeError('browser_eval result exceeds depth or entry limit');
+      if (item === null || typeof item === 'boolean') return item;
+      if (typeof item === 'number' && isFiniteNumber(item)) return item;
+      if (typeof item === 'string') {
+        stringUnits += item.length;
+        if (stringUnits > 65536) throw new nativeError('browser_eval result exceeds string limit');
+        return item;
+      }
+      if (typeof item !== 'object' || apply(seenHas, seen, [item])) {
+        throw new nativeError('browser_eval result is not JSON-safe');
+      }
+      apply(seenAdd, seen, [item]);
+      let result;
+      if (isArray(item)) {
+        const length = item.length;
+        if (!isSafeInteger(length) || length < 0 || length > 64) {
+          throw new nativeError('browser_eval result exceeds array limit');
+        }
+        result = new arrayCtor(length);
+        for (let index = 0; index < length; index++) {
+          const descriptor = getDescriptor(item, index);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor or hole');
+          }
+          define(result, index, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+        // A hostile page may add Array.prototype.toJSON after eval. Keep the
+        // transfer value free of inherited serialization hooks.
+        setPrototypeOf(result, null);
+      } else {
+        const prototype = getPrototypeOf(item);
+        if (prototype !== plainPrototype && prototype !== null) {
+          throw new nativeError('browser_eval result must contain only plain objects');
+        }
+        const keys = objectKeys(item);
+        if (keys.length > 64) throw new nativeError('browser_eval result exceeds object entry limit');
+        result = create(null);
+        for (let index = 0; index < keys.length; index++) {
+          const property = keys[index];
+          if (property.length > 256) throw new nativeError('browser_eval result key is too long');
+          const descriptor = getDescriptor(item, property);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor');
+          }
+          define(result, property, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+      }
+      apply(seenDelete, seen, [item]);
+      return result;
+    };
+    const safeValue = safe(value, 0);
+    const valueJson = stringify(safeValue);
+    if (!withinUtf8Bytes(valueJson, 65536)) throw new nativeError('browser_eval result exceeds 64 KiB');
+    const response = create(null);
+    define(response, 'value', { value: safeValue, enumerable: true });
+    define(response, 'observed_url', { value: root.location.href, enumerable: true });
+    // Playwright's object transfer can use mutable page intrinsics. Return a
+    // bounded primitive and parse it with trusted Node intrinsics instead.
+    const serialized = stringify(response);
+    if (!withinUtf8Bytes(serialized, 75000)) throw new nativeError('browser_eval transfer exceeds limit');
+    return serialized;
+  };
+  define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
+}
+
 function validateEvalResult(value) {
-  // Playwright transfers the page-side bounded value across the process
-  // boundary. The page can replace its own JSON and object intrinsics, so
-  // validate the transferred shape again with trusted Node intrinsics.
+  // The pre-document helper transfers a bounded JSON primitive. Validate its
+  // parsed value again with trusted Node intrinsics before returning it.
   const stack = [[value, 0]];
   let entries = 0;
   let stringUnits = 0;
@@ -220,53 +339,21 @@ async function evalInActivePage(args) {
   if (!unchanged()) throw staleEpochError();
   let transferred;
   try {
-    // This callback and indirect eval run in the page realm. Only the source
-    // string crosses into Chromium; no Node, Playwright page object, or CDP
-    // handle is made available to evaluated code.
-    const evaluated = await page.evaluate(async source => {
-      const value = await (0, eval)(source);
-      const seen = new WeakSet();
-      let entries = 0;
-      let stringUnits = 0;
-      const safe = (item, depth) => {
-        if (++entries > 256 || depth > 8) throw new Error('browser_eval result exceeds depth or entry limit');
-        if (item === null || typeof item === 'boolean') return item;
-        if (typeof item === 'number' && Number.isFinite(item)) return item;
-        if (typeof item === 'string') {
-          stringUnits += item.length;
-          if (stringUnits > 65536) throw new Error('browser_eval result exceeds string limit');
-          return item;
-        }
-        if (typeof item !== 'object' || seen.has(item)) {
-          throw new Error('browser_eval result is not JSON-safe');
-        }
-        seen.add(item);
-        let result;
-        if (Array.isArray(item)) {
-          if (item.length > 64) throw new Error('browser_eval result exceeds array limit');
-          result = item.map(child => safe(child, depth + 1));
-        } else {
-          const prototype = Object.getPrototypeOf(item);
-          if (prototype !== Object.prototype && prototype !== null) {
-            throw new Error('browser_eval result must contain only plain objects');
-          }
-          const keys = Object.keys(item);
-          if (keys.length > 64) throw new Error('browser_eval result exceeds object entry limit');
-          result = Object.create(null);
-          for (const key of keys) {
-            if (key.length > 256) throw new Error('browser_eval result key is too long');
-            const descriptor = Object.getOwnPropertyDescriptor(item, key);
-            if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
-              throw new Error('browser_eval result contains an accessor');
-            }
-            result[key] = safe(descriptor.value, depth + 1);
-          }
-        }
-        seen.delete(item);
-        return result;
-      };
-      return { value: safe(value, 0), observed_url: location.href };
-    }, args.code);
+    // The pre-document helper holds pristine intrinsics in a closure. Only
+    // the source string crosses into Chromium; no Node or Playwright object
+    // is exposed to page code. The page can replace its global intrinsics,
+    // but cannot replace the helper or its captured functions.
+    const serialized = await page.evaluate(({ source, key }) => {
+      // `globalThis` is writable by page code; `window` is the WindowProxy's
+      // non-configurable self reference. The helper itself is non-writable.
+      const helper = window[key];
+      if (typeof helper !== 'function') throw new Error('browser_eval page helper unavailable');
+      return helper(source);
+    }, { source: args.code, key: EVAL_HELPER_KEY });
+    if (typeof serialized !== 'string' || Buffer.byteLength(serialized, 'utf8') > 75000) {
+      throw new Error('browser_eval transfer exceeds limit');
+    }
+    const evaluated = JSON.parse(serialized);
     if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
     // A synchronous location assignment may schedule the navigation after
     // evaluate resolves. Give the page one event-loop turn to commit it before
@@ -1135,6 +1222,7 @@ async function main() {
     acceptDownloads: false,
     serviceWorkers: 'block',
   });
+  await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
   await context.route('**/*', route => {
     const request = route.request();
     if (request.isNavigationRequest()) {
