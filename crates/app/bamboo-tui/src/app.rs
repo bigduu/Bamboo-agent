@@ -2612,10 +2612,18 @@ pub struct PermissionQuestion {
     pub global_scope_reviewed: bool,
 }
 
-/// Mirror the server's focused-browser resource boundary for presentation.
+/// Mirror the server's private browser resource boundary for presentation.
 /// TUI API types are intentionally independent of the server permission crate.
-fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+fn is_browser_display_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+}
+
+fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
+    if !is_browser_display_tool_name(tool_name) {
         return false;
     }
     let mut parts = resource.splitn(4, ':');
@@ -2630,12 +2638,13 @@ fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
         (Some("type" | "key"), Some(_)) => true,
         (Some("press"), Some("page")) => true,
         (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+        (Some("select_option"), Some(rest)) => rest.starts_with("options:"),
         _ => false,
     }
 }
 
 fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(tool_name) {
         return None;
     }
     let action = args.get("action")?.as_str()?;
@@ -2689,7 +2698,7 @@ fn valid_browser_press_target(args: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(tool_name) {
         return raw.to_string();
     }
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -2698,7 +2707,19 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     if let Some(action) = focused_browser_action(tool_name, &args) {
         return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
     }
+    if args.get("action").and_then(serde_json::Value::as_str) == Some("select_option") {
+        return serde_json::json!({"action":"select_option","selection":"[redacted]"}).to_string();
+    }
     raw.to_string()
+}
+
+fn has_select_result_key(raw: &str) -> bool {
+    if !raw.trim_start().starts_with('{') {
+        return false;
+    }
+    const KEY: &str = "\"selected_values\"";
+    raw.match_indices(KEY)
+        .any(|(start, _)| raw[start + KEY.len()..].trim_start().starts_with(':'))
 }
 
 pub(crate) fn tool_complete_result_for_display(
@@ -2706,7 +2727,7 @@ pub(crate) fn tool_complete_result_for_display(
     raw: &str,
     unknown_tool: bool,
 ) -> String {
-    let browser = tool_name.eq_ignore_ascii_case("browser");
+    let browser = is_browser_display_tool_name(tool_name);
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
         return if (raw.contains("awaiting_permission_approval")
             || raw.contains("permission_request"))
@@ -2718,6 +2739,10 @@ pub(crate) fn tool_complete_result_for_display(
                 "Tool awaiting permission approval"
             }
             .to_string()
+        } else if (browser || unknown_tool) && has_select_result_key(raw) {
+            // A dropped ToolStart leaves only the recognizable result field.
+            // Keep unrelated browser text visible.
+            "Browser result unavailable".to_string()
         } else {
             raw.to_string()
         };
@@ -2728,28 +2753,30 @@ pub(crate) fn tool_complete_result_for_display(
         request
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+            .is_some_and(is_browser_display_tool_name)
     });
     let approval_clue = pending_approval || payload.get("permission_request").is_some();
     if approval_clue && (browser || nested_browser) {
         "Browser input awaiting permission approval".to_string()
     } else if approval_clue && unknown_tool {
         "Tool awaiting permission approval".to_string()
+    } else if (browser || unknown_tool) && payload.get("selected_values").is_some() {
+        "Browser options selected".to_string()
     } else {
         raw.to_string()
     }
 }
 
 impl PermissionQuestion {
-    fn has_focused_browser_resource(&self) -> bool {
+    fn has_private_browser_resource(&self) -> bool {
         self.request.permission_type == PermissionType::BrowserInteraction
-            && self.request.tool_name.eq_ignore_ascii_case("browser")
+            && is_browser_display_tool_name(&self.request.tool_name)
             && (self.request.resource == "[redacted]"
-                || is_focused_browser_resource(&self.request.tool_name, &self.request.resource))
+                || is_private_browser_resource(&self.request.tool_name, &self.request.resource))
     }
 
     pub(crate) fn display_resource_label(&self) -> &str {
-        if self.has_focused_browser_resource() {
+        if self.has_private_browser_resource() {
             "resource (redacted)"
         } else {
             "exact resource"
@@ -2757,7 +2784,7 @@ impl PermissionQuestion {
     }
 
     pub(crate) fn display_resource(&self) -> &str {
-        if self.has_focused_browser_resource() {
+        if self.has_private_browser_resource() {
             "<redacted>"
         } else {
             &self.request.resource
@@ -2765,7 +2792,7 @@ impl PermissionQuestion {
     }
 
     pub(crate) fn display_matcher_value<'a>(&self, value: &'a str) -> &'a str {
-        if self.has_focused_browser_resource() {
+        if self.has_private_browser_resource() {
             "<redacted>"
         } else {
             value
@@ -2907,7 +2934,7 @@ pub struct ChildApprovalQuestion {
 
 impl ChildApprovalQuestion {
     pub(crate) fn display_resource_label(&self) -> &str {
-        if is_focused_browser_resource(&self.tool_name, &self.resource) {
+        if is_private_browser_resource(&self.tool_name, &self.resource) {
             "resource (redacted)"
         } else {
             "exact resource"
@@ -2915,7 +2942,7 @@ impl ChildApprovalQuestion {
     }
 
     pub(crate) fn display_resource(&self) -> &str {
-        if is_focused_browser_resource(&self.tool_name, &self.resource) {
+        if is_private_browser_resource(&self.tool_name, &self.resource) {
             "<redacted>"
         } else {
             &self.resource
@@ -16506,12 +16533,18 @@ mod question_tests {
         for focused_resource in [
             "browser:17:key:private-fingerprint",
             "browser:17:press:focused:key:private-fingerprint",
+            "browser:17:select_option:options:private-fingerprint",
         ] {
             permission.request.resource = focused_resource.to_string();
             permission.request.suggested_matchers[0].value = focused_resource.to_string();
             assert_eq!(permission.display_resource(), "<redacted>");
             assert!(!permission.inspector_text().contains("private-fingerprint"));
         }
+        permission.request.tool_name = "default::browser".to_string();
+        permission.request.resource =
+            "browser:17:select_option:options:private-fingerprint".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
 
         let child = ChildApprovalQuestion {
             parent_session_id: "parent".to_string(),
@@ -16527,6 +16560,23 @@ mod question_tests {
         assert_eq!(child.display_resource(), "<redacted>");
         assert!(!child.inspector_text().contains("private-fingerprint"));
         assert_eq!(child.resource, resource);
+
+        let select_child = ChildApprovalQuestion {
+            resource: "browser:17:select_option:options:private-fingerprint".to_string(),
+            ..child
+        };
+        assert_eq!(select_child.display_resource(), "<redacted>");
+        assert!(!select_child
+            .inspector_text()
+            .contains("private-fingerprint"));
+        let namespaced_child = ChildApprovalQuestion {
+            tool_name: "default::browser".to_string(),
+            ..select_child
+        };
+        assert_eq!(namespaced_child.display_resource(), "<redacted>");
+        assert!(!namespaced_child
+            .inspector_text()
+            .contains("private-fingerprint"));
     }
 
     #[test]
@@ -16680,6 +16730,103 @@ mod question_tests {
             Some("Tool awaiting permission approval")
         );
         assert!(!format!("{displayed:?}").contains("private input"));
+    }
+
+    #[test]
+    fn native_select_tool_events_hide_option_values_in_live_chat() {
+        let private_value = "private-option-value";
+        let private_selector = "select[data-private='account']";
+        let args = serde_json::json!({
+            "action":"select_option",
+            "selector":private_selector,
+            "values":[private_value],
+            "expected_epoch":17,
+        });
+        let result = serde_json::json!({
+            "page_epoch":17,
+            "selected_values":[private_value],
+        });
+        for tool_name in ["browser", "default::browser"] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "select-call".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "select-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: result.to_string(),
+                },
+            })
+            .unwrap();
+            let displayed = &app.chat.current_tool_calls[0];
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser options selected")
+            );
+            for private in [private_value, private_selector] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+        }
+        assert_eq!(args["values"][0], private_value);
+        assert_eq!(result["selected_values"][0], private_value);
+    }
+
+    #[test]
+    fn native_select_result_without_tool_start_or_valid_json_hides_values() {
+        let private_value = "private-option-value";
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "dropped-select-start".to_string(),
+            result: ToolResult {
+                success: true,
+                result: serde_json::json!({"selected_values":[private_value]}).to_string(),
+            },
+        })
+        .unwrap();
+        let displayed = &app.chat.current_tool_calls[0];
+        assert_eq!(
+            displayed.result.as_deref(),
+            Some("Browser options selected")
+        );
+        assert!(!format!("{displayed:?}").contains(private_value));
+
+        let malformed = format!("{{\"selected_values\":[\"{private_value}\"");
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "dropped-malformed-select-start".to_string(),
+            result: ToolResult {
+                success: false,
+                result: malformed.clone(),
+            },
+        })
+        .unwrap();
+        let displayed = &app.chat.current_tool_calls[1];
+        assert_eq!(
+            displayed.error.as_deref(),
+            Some("Browser result unavailable")
+        );
+        assert!(!format!("{displayed:?}").contains(private_value));
+
+        for tool_name in ["browser", "default::browser"] {
+            assert_eq!(
+                tool_complete_result_for_display(tool_name, &malformed, false),
+                "Browser result unavailable"
+            );
+            assert_eq!(
+                tool_complete_result_for_display("unknown", &malformed, true),
+                "Browser result unavailable"
+            );
+        }
+        let snapshot = "page_epoch: 17\n- paragraph '{\"selected_values\":[\"red\"]}'";
+        assert_eq!(
+            tool_complete_result_for_display("default::browser", snapshot, false),
+            snapshot
+        );
     }
 
     #[test]

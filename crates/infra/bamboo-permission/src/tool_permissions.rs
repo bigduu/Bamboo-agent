@@ -146,6 +146,18 @@ pub fn is_focused_browser_input(tool_name: &str, args: &Value) -> bool {
     }
 }
 
+/// The selected option values can encode private page data. Approval displays
+/// use this classifier to project only the action while execution keeps the
+/// exact values.
+pub fn is_native_browser_select(tool_name: &str, args: &Value) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+        && args.get("action").and_then(Value::as_str) == Some("select_option")
+}
+
 /// A semantic locator's grant identity is independent of JSON key order and
 /// never contains page text. The description remains readable at approval.
 fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, PermissionError> {
@@ -512,8 +524,8 @@ pub fn check_permissions(
                         format!("Navigate browser to {}", url.origin().ascii_serialization()),
                     )]))
                 }
-                "click" | "click_at" | "fill" | "type" | "press" | "key" | "scroll" | "history"
-                | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
+                "click" | "click_at" | "fill" | "select_option" | "type" | "press" | "key"
+                | "scroll" | "history" | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
                     let focused_input = is_focused_browser_input(tool_name, args);
                     // Bind remembered grants to the page generation. Navigation
                     // increments the epoch, so a selector approved on one site
@@ -539,6 +551,40 @@ pub fn check_permissions(
                             Some((identity, _)) => identity.clone(),
                             None => required_string_arg(args, "selector")?.to_string(),
                         },
+                        "select_option" => {
+                            if args.get("target").is_some_and(|value| !value.is_null()) {
+                                return Err(PermissionError::CheckFailed(
+                                    "browser select_option accepts only a CSS selector".into(),
+                                ));
+                            }
+                            let selector = required_string_arg(args, "selector")?;
+                            if selector.trim().is_empty() || selector.encode_utf16().count() > 512 {
+                                return Err(PermissionError::CheckFailed(
+                                    "browser select requires a bounded CSS selector".into(),
+                                ));
+                            }
+                            let values = args
+                                .get("values")
+                                .and_then(Value::as_array)
+                                .filter(|values| (1..=16).contains(&values.len()))
+                                .ok_or_else(|| {
+                                    PermissionError::CheckFailed(
+                                        "browser select requires 1..16 option values".into(),
+                                    )
+                                })?;
+                            if values
+                                .iter()
+                                .any(|value| value.as_str().is_none_or(|value| value.len() > 512))
+                            {
+                                return Err(PermissionError::CheckFailed(
+                                    "browser select option values must be bounded strings".into(),
+                                ));
+                            }
+                            let payload = serde_json::json!([selector, values]).to_string();
+                            let fingerprint =
+                                browser_persistent_fingerprint("select-option-v1", &payload)?;
+                            format!("options:{fingerprint}")
+                        }
                         "press" => match &semantic {
                             Some((identity, _)) => identity.clone(),
                             None => match args.get("selector") {
@@ -619,7 +665,9 @@ pub fn check_permissions(
                         }
                         _ => unreachable!(),
                     };
-                    let description = if action == "type" {
+                    let description = if action == "select_option" {
+                        "Select native browser options".to_string()
+                    } else if action == "type" {
                         "Type into focused browser element".to_string()
                     } else if focused_input && action == "key" {
                         "Send key to focused browser element".to_string()
@@ -1075,6 +1123,85 @@ mod tests {
             json!({"action":"activate_tab","tab_id":"short","expected_epoch":17}),
             json!({"action":"close_tab","tab_id":"AAAAAAAAAAAAAAAAAAAAAAAA","expected_epoch":17}),
             json!({"action":"activate_tab","tab_id":"a".repeat(10000),"expected_epoch":17}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_select_fingerprint_child_process() {
+        let Some(output_path) = std::env::var_os("BAMBOO_SELECT_TEST_OUTPUT") else {
+            return;
+        };
+        let cases = [
+            json!({"action":"select_option","selector":"#choice","values":["private-red"],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":["private-blue"],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#other","values":["private-red"],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":["private-red"],"expected_epoch":18}),
+        ];
+        let resources: Vec<String> = cases
+            .iter()
+            .map(|args| {
+                let mut contexts = check_permissions("browser", args).unwrap().unwrap();
+                let context = contexts.remove(0);
+                assert_eq!(context.permission_type, PermissionType::BrowserInteraction);
+                assert_eq!(
+                    context.operation_description,
+                    "Select native browser options"
+                );
+                context.resource
+            })
+            .collect();
+        fs::write(output_path, serde_json::to_vec(&resources).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_select_grants_bind_values_selector_and_epoch_without_plaintext() {
+        let select = json!({"action":"select_option","values":["private-red"]});
+        assert!(is_native_browser_select("browser", &select));
+        assert!(is_native_browser_select("default::browser", &select));
+        assert!(!is_native_browser_select("default::other", &select));
+        let data_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let run = |dir: &Path, output_path: &Path| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool_permissions::tests::browser_select_fingerprint_child_process",
+                ])
+                .env("BAMBOO_DATA_DIR", dir)
+                .env("BAMBOO_SELECT_TEST_OUTPUT", output_path)
+                .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "select fingerprint child process failed"
+            );
+            let bytes = fs::read(output_path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-red"));
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-blue"));
+            serde_json::from_slice::<Vec<String>>(&bytes).unwrap()
+        };
+        let first = run(data_dir.path(), &data_dir.path().join("first.json"));
+        let restarted = run(data_dir.path(), &data_dir.path().join("restarted.json"));
+        let other = run(other_dir.path(), &other_dir.path().join("other.json"));
+        assert_eq!(first, restarted, "same installation needs stable grants");
+        assert_ne!(first, other, "another installation needs separate grants");
+        assert_eq!(first.len(), 4);
+        assert!(first[0].starts_with("browser:17:select_option:options:"));
+        assert_ne!(first[0], first[1], "another value needs another grant");
+        assert_ne!(first[0], first[2], "another selector needs another grant");
+        assert_ne!(first[0], first[3], "another page epoch needs another grant");
+
+        for args in [
+            json!({"action":"select_option","selector":"#choice","values":["private-red"]}),
+            json!({"action":"select_option","selector":" ","values":["private-red"],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","target":{"kind":"role","role":"combobox"},"values":["private-red"],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":[],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":[7],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":["x".repeat(513)],"expected_epoch":17}),
+            json!({"action":"select_option","selector":"#choice","values":vec!["red"; 17],"expected_epoch":17}),
         ] {
             assert!(check_permissions("browser", &args).is_err());
         }

@@ -492,6 +492,51 @@ mod tests {
     }
 
     #[test]
+    fn resumed_native_select_hides_option_values_but_preserves_raw_history() {
+        let private_value = "private-option-value";
+        let private_selector = "select[data-private='account']";
+        let args = serde_json::json!({
+            "action":"select_option",
+            "selector":private_selector,
+            "values":[private_value],
+            "expected_epoch":17,
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "page_epoch":17,
+            "selected_values":[private_value],
+        })
+        .to_string();
+        for tool_name in ["browser", "default::browser"] {
+            let out = map_history(vec![
+                assistant("", vec![("select-call", tool_name, &args)]),
+                tool("select-call", &result, Some(true)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser options selected")
+            );
+            for private in [private_value, private_selector] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+            let malformed = format!("{{\"selected_values\":[\"{private_value}\"");
+            let out = map_history(vec![
+                assistant("", vec![("select-call", tool_name, &args)]),
+                tool("select-call", &malformed, Some(false)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.error.as_deref(),
+                Some("Browser result unavailable")
+            );
+            assert!(!format!("{displayed:?}").contains(private_value));
+        }
+        assert!(args.contains(private_value));
+        assert!(result.contains(private_value));
+    }
+
+    #[test]
     fn assistant_tool_call_without_result_remains_pending() {
         let out = map_history(vec![assistant("", vec![("pending", "Read", "{}")])]);
         let tool = &out[0].tool_calls[0];

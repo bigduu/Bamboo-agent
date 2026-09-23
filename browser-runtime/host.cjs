@@ -195,6 +195,18 @@ function semanticString(target, name, maximum, required = false) {
   return value;
 }
 
+function selectOptionArgs(args) {
+  if (typeof args.selector !== 'string' || !args.selector.trim() ||
+      args.selector.length > 512) {
+    throw targetError('invalid_target', 'browser select requires a bounded CSS selector');
+  }
+  if (!Array.isArray(args.values) || args.values.length < 1 || args.values.length > 16 ||
+      args.values.some(value => typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 512)) {
+    throw targetError('invalid_target', 'browser select requires 1..16 option values of at most 512 bytes each');
+  }
+  return args.values;
+}
+
 async function waitForTarget(locator, missingMessage) {
   try {
     await locator.first().waitFor({ state: 'attached', timeout: 10_000 });
@@ -456,6 +468,33 @@ async function command(action, args = {}) {
         await requireActiveTab().page.keyboard.press(args.key);
       }
       return state();
+    case 'select_option': {
+      checkEpoch(args);
+      const values = selectOptionArgs(args);
+      try {
+        const selectedValues = await withPinnedTarget(args, async handle => {
+          const identity = await handle.evaluate(element => ({
+            tag_name: element.tagName,
+            multiple: element.multiple,
+          }));
+          if (identity.tag_name !== 'SELECT') {
+            throw targetError('invalid_target', 'browser select target must be a native select element');
+          }
+          if (!identity.multiple && values.length > 1) {
+            throw targetError('invalid_target', 'single-select target accepts exactly one value');
+          }
+          return handle.selectOption(values, { timeout: 10_000 });
+        });
+        return { ...await state(), selected_values: selectedValues };
+      } catch (error) {
+        if (['invalid_target', 'target_not_found', 'ambiguous_target', 'stale_epoch'].includes(error?.code)) {
+          throw error;
+        }
+        // Playwright's call log can quote option values. Keep the failure
+        // actionable without copying page data into the tool error.
+        throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
+      }
+    }
     case 'screenshot': {
       return stableRead(async tab => {
         const page = tab.page;

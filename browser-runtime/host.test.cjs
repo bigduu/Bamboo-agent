@@ -13,7 +13,7 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
       'x-frame-options': 'DENY',
       'content-security-policy': "frame-ancestors 'none'",
     });
-    response.end('<button id="increment" onclick="const output=document.querySelector(\'output\');output.textContent=String(Number(output.textContent)+1)">Increment</button><input id="name" aria-label="Name"><output>0</output>');
+    response.end('<style>button,input,output,select{display:block}</style><button id="increment" onclick="const output=document.querySelector(\'output\');output.textContent=String(Number(output.textContent)+1)">Increment</button><input id="name" aria-label="Name"><output>0</output><select id="single" onchange="document.querySelector(\'#chosen\').textContent=\'Single \'+this.value"><option value="">None</option><option value="red">Red</option></select><select id="multi" multiple onchange="document.querySelector(\'#chosen\').textContent=\'Multi \'+Array.from(this.selectedOptions).map(option=>option.value).join(\',\')"><option value="green">Green</option><option value="blue">Blue</option><option value="yellow">Yellow</option></select><output id="chosen">No selection</output>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -55,9 +55,29 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
     assert.equal(uiClick.ok, true);
     const filled = await call('fill_selector', { selector: '#name', text: 'Lotus', expected_epoch: pageEpoch });
     assert.equal(filled.ok, true);
+    const single = await call('select_option', { selector: '#single', values: ['red'], expected_epoch: pageEpoch });
+    assert.equal(single.ok, true);
+    assert.deepEqual(single.result.selected_values, ['red']);
+    assert.equal(single.result.page_epoch, pageEpoch);
+    const cleared = await call('select_option', { selector: '#single', values: [''], expected_epoch: pageEpoch });
+    assert.equal(cleared.ok, true);
+    assert.deepEqual(cleared.result.selected_values, ['']);
+    const multiple = await call('select_option', { selector: '#multi', values: ['green', 'blue'], expected_epoch: pageEpoch });
+    assert.equal(multiple.ok, true);
+    assert.deepEqual(multiple.result.selected_values, ['green', 'blue']);
+    assert.equal((await call('select_option', { selector: 'select', values: ['red'], expected_epoch: pageEpoch })).code, 'ambiguous_target');
+    assert.equal((await call('select_option', { selector: '#name', values: ['red'], expected_epoch: pageEpoch })).code, 'invalid_target');
+    assert.equal((await call('select_option', { selector: '#single', values: ['red', 'blue'], expected_epoch: pageEpoch })).code, 'invalid_target');
+    assert.equal((await call('select_option', { selector: '#single', values: [], expected_epoch: pageEpoch })).code, 'invalid_target');
+    assert.equal((await call('select_option', { selector: '#single', values: Array(17).fill('red'), expected_epoch: pageEpoch })).code, 'invalid_target');
+    assert.equal((await call('select_option', { selector: '#single', values: ['x'.repeat(513)], expected_epoch: pageEpoch })).code, 'invalid_target');
+    const unavailable = await call('select_option', { selector: '#single', values: ['private-option-not-present'], expected_epoch: pageEpoch });
+    assert.equal(unavailable.code, 'selection_failed');
+    assert.doesNotMatch(unavailable.error, /private-option-not-present/);
     const after = await call('dom');
     assert.match(after.result.html, /<output>2<\/output>/);
     assert.match(after.result.snapshot, /Lotus/);
+    assert.match(after.result.html, /Multi green,blue/);
     const screenshot = await call('screenshot');
     assert.equal(screenshot.ok, true);
     assert.ok(Buffer.from(screenshot.result.data, 'base64').length > 1000);
@@ -71,6 +91,7 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
     assert.equal(stale.code, 'stale_epoch');
     const oldFrame = await call('input', { kind: 'click', x: 40, y: 20, expected_epoch: pageEpoch });
     assert.equal(oldFrame.code, 'stale_epoch');
+    assert.equal((await call('select_option', { selector: '#single', values: [''], expected_epoch: pageEpoch })).code, 'stale_epoch');
     const unsafe = await call('navigate', { url: 'file:///tmp/secret', expected_epoch: resized.result.page_epoch });
     assert.equal(unsafe.code, 'invalid_url');
   } finally {
