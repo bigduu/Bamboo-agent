@@ -319,6 +319,75 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires the Playwright Chromium runtime"]
+    async fn root_native_select_updates_the_shared_browser_dom_and_screenshot() {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
+
+        const PAGE: &str = r#"<!doctype html><title>Native select</title>
+<label for="color">Color</label><select id="color" onchange="document.querySelector('#chosen').textContent='Chosen '+this.value"><option value="">None</option><option value="red">Red</option></select>
+<output id="chosen">Chosen none</output>"#;
+        let (url, fixture) = browser_regression_fixture(&[("/", PAGE)]).await;
+        let (_temp, state) = make_state().await;
+        let chat = "browser-native-select";
+        let opened = state.browser.open(chat).await.unwrap();
+        let navigated = state
+            .browser
+            .command(
+                chat,
+                "navigate",
+                serde_json::json!({"url":url,"expected_epoch":opened["page_epoch"]}),
+            )
+            .await
+            .unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        let root = state.tools_for(ToolSurface::Root);
+        let call = ToolCall {
+            id: "browser-native-select-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "browser".into(),
+                arguments: serde_json::json!({
+                    "action":"select_option",
+                    "selector":"#color",
+                    "values":["red"],
+                    "expected_epoch":epoch
+                })
+                .to_string(),
+            },
+        };
+        let mut context = ToolExecutionContext::none(&call.id);
+        context.session_id = Some(chat);
+        context.bypass_permissions = true;
+        let selected: serde_json::Value = serde_json::from_str(
+            &root
+                .execute_with_context(&call, context)
+                .await
+                .unwrap()
+                .result,
+        )
+        .unwrap();
+        assert_eq!(selected["selected_values"], serde_json::json!(["red"]));
+        assert_eq!(selected["page_epoch"], epoch);
+        let dom = state
+            .browser
+            .command(chat, "dom", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(dom["page_epoch"], epoch);
+        assert!(dom["snapshot"].as_str().unwrap().contains("Chosen red"));
+        let screenshot = state
+            .browser
+            .command(chat, "screenshot", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(screenshot["page_epoch"], epoch);
+        assert_eq!(screenshot["active_tab_id"], selected["active_tab_id"]);
+        assert!(screenshot["data"].as_str().unwrap().len() > 1000);
+        state.browser.close(chat).await.unwrap();
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
     async fn root_browser_host_controls_change_the_same_page_as_the_workbench() {
         use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

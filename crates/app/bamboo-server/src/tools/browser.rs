@@ -124,6 +124,36 @@ fn locator_request(args: &Value, epoch: u64, allow_focused: bool) -> Result<Valu
     }
 }
 
+fn select_option_request(args: &Value, epoch: u64) -> Result<Value, ToolError> {
+    if args.get("target").is_some_and(|value| !value.is_null()) {
+        return Err(ToolError::InvalidArguments(
+            "browser select_option accepts only a CSS selector".into(),
+        ));
+    }
+    let selector = text_arg(args, "selector")?;
+    if selector.trim().is_empty() || selector.encode_utf16().count() > 512 {
+        return Err(ToolError::InvalidArguments(
+            "browser select requires a bounded CSS selector".into(),
+        ));
+    }
+    let values = args
+        .get("values")
+        .and_then(Value::as_array)
+        .filter(|values| (1..=16).contains(&values.len()))
+        .ok_or_else(|| {
+            ToolError::InvalidArguments("browser select requires 1..16 option values".into())
+        })?;
+    if values
+        .iter()
+        .any(|value| value.as_str().is_none_or(|value| value.len() > 512))
+    {
+        return Err(ToolError::InvalidArguments(
+            "browser select option values must be strings of at most 512 bytes".into(),
+        ));
+    }
+    Ok(json!({"selector":selector,"values":values,"expected_epoch":epoch}))
+}
+
 fn input_request(action: &str, args: &Value, epoch: u64) -> Result<Value, ToolError> {
     match action {
         "click_at" => {
@@ -167,29 +197,30 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, select native HTML options, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","fill","type","press","key","scroll","screenshot"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","fill","select_option","type","press","key","scroll","screenshot"]},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "url":{"type":"string","description":"HTTP(S) URL for navigate"},
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, or optional press; mutually exclusive with target"},
+                "selector":{"type":"string","description":"CSS selector for click, fill, select_option, or optional press; mutually exclusive with target","maxLength":512},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
                 "text":{"type":"string","description":"Text for fill or type; type inserts into the focused element"},
+                "values":{"type":"array","description":"Native select option values for select_option, including the empty value","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":512}},
                 "key":{"type":"string","description":"Keyboard key for press or key, e.g. Enter"},
                 "x":{"type":"number","description":"CSS viewport x for click_at or scroll; nonnegative for click_at"},
                 "y":{"type":"number","description":"CSS viewport y for click_at or scroll; nonnegative for click_at"},
                 "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/fill/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/fill/select_option/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -228,6 +259,7 @@ impl Tool for BrowserTool {
                 | "click"
                 | "click_at"
                 | "fill"
+                | "select_option"
                 | "type"
                 | "press"
                 | "key"
@@ -279,6 +311,7 @@ impl Tool for BrowserTool {
                 request["text"] = json!(args.get("text").and_then(Value::as_str).ok_or_else(|| ToolError::InvalidArguments("browser requires text for fill".into()))?);
                 self.browser.command(session_id, "fill_selector", request).await.map_err(browser_error)?
             },
+            "select_option" => self.browser.command(session_id, "select_option", select_option_request(&args, epoch)?).await.map_err(browser_error)?,
             "press" => {
                 let mut request = locator_request(&args, epoch, true)?;
                 request["key"] = json!(text_arg(&args,"key")?);
@@ -365,6 +398,36 @@ mod tests {
             json!({"x":12,"y":20,"button":"invalid"}),
         ] {
             assert!(input_request("click_at", &args, 17).is_err());
+        }
+    }
+
+    #[test]
+    fn native_select_action_requires_bounded_values_and_current_epoch() {
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        let actions = tool.parameters_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(actions.contains(&json!("select_option")));
+        assert_eq!(
+            tool.classify(&json!({"action":"select_option"})),
+            ToolClass::MUTATING_SERIAL
+        );
+        assert_eq!(
+            select_option_request(&json!({"selector":"#choices","values":["", "blue"]}), 17)
+                .unwrap(),
+            json!({"selector":"#choices","values":["", "blue"],"expected_epoch":17})
+        );
+        for args in [
+            json!({"selector":" ","values":["red"]}),
+            json!({"selector":"#choices","target":{"kind":"role","role":"combobox"},"values":["red"]}),
+            json!({"selector":"x".repeat(513),"values":["red"]}),
+            json!({"selector":"#choices","values":[]}),
+            json!({"selector":"#choices","values":[7]}),
+            json!({"selector":"#choices","values":["x".repeat(513)]}),
+            json!({"selector":"#choices","values":vec!["red"; 17]}),
+        ] {
+            assert!(select_option_request(&args, 17).is_err(), "{args}");
         }
     }
 
