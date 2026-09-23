@@ -421,12 +421,12 @@ async function evalInActivePage(args) {
     }
     const evaluated = JSON.parse(serialized);
     if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
-    // A synchronous location assignment may schedule the navigation after
-    // evaluate resolves. Give the page one event-loop turn to commit it before
-    // accepting the result from the old document.
-    const settledUrl = await page.evaluate(() =>
-      new Promise(resolve => setTimeout(() => resolve(location.href), 0)));
-    if (settledUrl !== args.expected_url) throw staleEpochError();
+    // A synchronous location assignment may schedule navigation after eval
+    // resolves. Give Chromium a turn to commit it, then recheck from the host.
+    // A second page.evaluate here would expose its Promise/timeout result to
+    // page-controlled globals before any transfer limit is enforced.
+    await new Promise(resolve => setTimeout(resolve, 25));
+    if (!unchanged()) throw staleEpochError();
     transferred = evaluated.value;
   } catch (error) {
     // Chromium may destroy the execution context before Playwright's frame
