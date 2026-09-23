@@ -14,6 +14,7 @@ mod gold;
 mod pipeline;
 mod startup;
 
+pub(in crate::runtime::runner) use pipeline::legacy_browser_needs_discovery;
 use pipeline::run_pipeline;
 use startup::{initialize_loop_state, LoopRunState};
 
