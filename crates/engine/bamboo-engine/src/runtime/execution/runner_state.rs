@@ -5,6 +5,7 @@
 //! orchestration layer across all background paths (HTTP execute, spawn, schedule).
 
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -62,7 +63,10 @@ pub enum AgentStatus {
 #[derive(Debug, Clone)]
 pub struct AgentRunner {
     /// Generation fence and activity clock shared only by this run's producers.
-    pub event_publication: std::sync::Arc<super::event_publication::EventPublication>,
+    pub event_publication: Arc<super::event_publication::EventPublication>,
+
+    /// Message-only visible-text replay and broadcast for this exact run.
+    pub visible_messages: Arc<super::visible_messages::VisibleMessageStream>,
     /// Broadcast sender for agent events.
     ///
     /// Allows multiple clients to subscribe to agent events
@@ -145,7 +149,8 @@ impl AgentRunner {
         let (event_sender, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
         Self {
             event_sender,
-            event_publication: std::sync::Arc::default(),
+            event_publication: Arc::default(),
+            visible_messages: Arc::default(),
             cancel_token: CancellationToken::new(),
             status: AgentStatus::Pending,
             started_at: Utc::now(),

@@ -14,6 +14,15 @@ use bamboo_agent_core::AgentEvent;
 
 use super::runner_state::AgentRunner;
 
+fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Complete { .. } => Some("complete"),
+        AgentEvent::Cancelled { .. } => Some("cancelled"),
+        AgentEvent::Error { .. } => Some("error"),
+        _ => None,
+    }
+}
+
 /// Inbox to the account-wide change feed: `(session_id, event)` before the
 /// writer assigns a seq. Threaded as `Option` so engine-internal callers that
 /// have no feed (tests, standalone embeddings) can pass `None`. Defined here so
@@ -331,7 +340,7 @@ pub fn create_event_forwarder_with_history_commit_barrier(
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
         };
-        let publication = {
+        let (publication, visible_messages) = {
             let runners = runners.read().await;
             let Some(runner) = runners
                 .get(&session_id)
@@ -341,10 +350,33 @@ pub fn create_event_forwarder_with_history_commit_barrier(
             };
             mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
             let _ = broadcast_tx.send(started_event);
-            runner.event_publication.clone()
+            (
+                runner.event_publication.clone(),
+                runner.visible_messages.clone(),
+            )
         };
 
         while let Some(event) = mpsc_rx.recv().await {
+            match &event {
+                AgentEvent::VisibleMessageStart {
+                    message_id,
+                    created_at,
+                } => {
+                    if !publication.publish(|| {
+                        visible_messages.start(message_id.clone(), created_at.to_owned())
+                    }) {
+                        return;
+                    }
+                    continue;
+                }
+                AgentEvent::VisibleMessageDiscard { message_id } => {
+                    if !publication.publish(|| visible_messages.discard(message_id)) {
+                        return;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let needs_runner_update = event.is_replayable_session_state()
                 || matches!(
                     &event,
@@ -356,9 +388,23 @@ pub fn create_event_forwarder_with_history_commit_barrier(
             if !needs_runner_update {
                 let is_history_commit =
                     matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+                let visible_token = match &event {
+                    AgentEvent::Token { content } => Some(content.clone()),
+                    _ => None,
+                };
+                let terminal_reason = visible_terminal_reason(&event);
                 if !publication.publish(|| {
+                    if let Some(content) = visible_token {
+                        visible_messages.append(content);
+                    }
                     mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
                     let _ = broadcast_tx.send(event);
+                    if let Some(reason) = terminal_reason {
+                        visible_messages.mark_terminal(reason);
+                    }
+                    if is_history_commit {
+                        visible_messages.history_committed();
+                    }
                 }) {
                     return;
                 }
@@ -406,6 +452,7 @@ pub fn create_event_forwarder_with_history_commit_barrier(
                 }
                 AgentEvent::RunnerProgress { round_count, .. } => {
                     runner.round_count = *round_count;
+                    runner.visible_messages.begin_round(*round_count);
                 }
                 _ => {}
             }

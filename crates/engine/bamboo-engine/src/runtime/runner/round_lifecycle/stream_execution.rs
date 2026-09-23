@@ -147,6 +147,9 @@ fn append_interrupted_assistant_output(
         None,
         (!partial.reasoning_content.is_empty()).then_some(partial.reasoning_content),
     );
+    if let Some(identity) = partial.visible_message {
+        message = identity.apply_to(message);
+    }
     message.phase = Some(MessagePhase::Commentary);
     message.reasoning_signature = None;
     message.metadata = Some(serde_json::json!({
@@ -164,23 +167,24 @@ fn append_interrupted_assistant_output(
 pub(crate) fn discard_latest_interrupted_assistant_output(
     session: &mut Session,
     attempt_tail_message_id: Option<&str>,
-) -> bool {
-    let interrupted = session.messages.last().is_some_and(|message| {
+) -> Option<String> {
+    let interrupted_message_id = session.messages.last().and_then(|message| {
         if Some(message.id.as_str()) == attempt_tail_message_id {
-            return false;
+            return None;
         }
-        message
+        (message
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("runtime_kind"))
             .and_then(serde_json::Value::as_str)
-            == Some(INTERRUPTED_ASSISTANT_OUTPUT_KIND)
+            == Some(INTERRUPTED_ASSISTANT_OUTPUT_KIND))
+        .then(|| message.id.clone())
     });
-    if interrupted {
+    if interrupted_message_id.is_some() {
         session.messages.pop();
         session.updated_at = chrono::Utc::now();
     }
-    interrupted
+    interrupted_message_id
 }
 
 fn session_previous_response_id(session: &Session) -> Option<&str> {

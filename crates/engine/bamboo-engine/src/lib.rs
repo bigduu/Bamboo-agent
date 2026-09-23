@@ -70,6 +70,10 @@ pub use runtime::config::{
     GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
 };
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
+pub use runtime::execution::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+    VisibleMessageStream,
+};
 pub use runtime::hooks::{
     test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
     LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,

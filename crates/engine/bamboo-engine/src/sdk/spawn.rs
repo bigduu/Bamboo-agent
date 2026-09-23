@@ -20,7 +20,7 @@ use bamboo_domain::{
     WaitingForChildrenState,
 };
 
-use crate::runtime::execution::event_forwarder::create_event_forwarder;
+use crate::runtime::execution::event_forwarder::create_event_forwarder_with_history_commit_barrier;
 use crate::runtime::execution::runner_lifecycle::{finalize_runner, try_reserve_runner};
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
@@ -426,13 +426,14 @@ async fn run_child_spawn_inner(
     }
 
     // Create mpsc channel for agent loop → session events sender.
-    let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
-        job.child_session_id.clone(),
-        run_id.clone(),
-        child_tx.clone(),
-        ctx.agent_runners.clone(),
-        ctx.account_feed_inbox.clone(),
-    );
+    let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
+        create_event_forwarder_with_history_commit_barrier(
+            job.child_session_id.clone(),
+            run_id.clone(),
+            child_tx.clone(),
+            ctx.agent_runners.clone(),
+            ctx.account_feed_inbox.clone(),
+        );
 
     // Child liveness is owned by the child runner. The parent wait state can
     // have a longer lease, but it should not poll or terminate children.
@@ -499,7 +500,7 @@ async fn run_child_spawn_inner(
                 match std::panic::AssertUnwindSafe(external_runner.execute_external_child(
                     &mut session,
                     &job,
-                    mpsc_tx,
+                    mpsc_tx.clone(),
                     cancel_token.clone(),
                 ))
                 .catch_unwind()
@@ -671,7 +672,25 @@ async fn run_child_spawn_inner(
                 .begin_finalization(&session_id_clone, &activation_run_id)
                 .await;
         }
-        let _ = agent.persistence().save_runtime_session(&mut session).await;
+        let saved = agent.persistence().save_runtime_session(&mut session).await;
+        let history_committed = saved.is_ok();
+        if let Err(error) = saved {
+            tracing::warn!(
+                session_id = %session_id_clone,
+                %error,
+                "failed to save final child session snapshot"
+            );
+        }
+        if history_committed
+            && !history_commit_barrier
+                .send_and_wait(&mpsc_tx, session_id_clone.clone())
+                .await
+        {
+            tracing::warn!(
+                session_id = %session_id_clone,
+                "child history commit barrier could not be published before runner finalization"
+            );
+        }
         // Flip the runner registry to a terminal status (which makes session
         // summaries report `is_running: false`) ONLY AFTER the final
         // `last_run_status` is persisted above. Doing it earlier opens a window
