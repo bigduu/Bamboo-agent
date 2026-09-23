@@ -640,6 +640,12 @@ pub fn check_permissions(
                                 "{target}:key:{}",
                                 browser_persistent_fingerprint("focused-press-v1", key)?
                             )
+                        } else if semantic.is_none() {
+                            // CSS selectors are arbitrary text. Prefix their
+                            // resource namespace so a selector literally
+                            // named `focused` cannot impersonate the private
+                            // focused-input marker after restart.
+                            format!("css:{target}:key:{}", browser_target_fingerprint(key))
                         } else {
                             format!("{target}:key:{}", browser_target_fingerprint(key))
                         }
@@ -1474,7 +1480,9 @@ mod tests {
         };
         let enter = context("#save", "Enter", 17);
         assert_eq!(enter.permission_type, PermissionType::BrowserInteraction);
-        assert!(enter.resource.starts_with("browser:17:press:#save:key:"));
+        assert!(enter
+            .resource
+            .starts_with("browser:17:press:css:#save:key:"));
         assert_eq!(enter.operation_description, "Browser press on #save");
         assert!(!enter.resource.contains("Enter"));
         assert_eq!(enter.resource, context("#save", "Enter", 17).resource);
@@ -1483,7 +1491,15 @@ mod tests {
         assert_ne!(enter.resource, context("#save", "Enter", 18).resource);
         assert!(context("page", "Enter", 17)
             .resource
-            .starts_with("browser:17:press:page:key:"));
+            .starts_with("browser:17:press:css:page:key:"));
+        let literal_focused = context("focused", "Enter", 17);
+        assert!(literal_focused
+            .resource
+            .starts_with("browser:17:press:css:focused:key:"));
+        assert!(!crate::PermissionRequest::is_focused_browser_resource(
+            "browser",
+            &literal_focused.resource
+        ));
 
         let semantic = check_permissions(
             "browser",
@@ -1505,7 +1521,7 @@ mod tests {
             PermissionEvaluation, PermissionOutcome, RiskLevel,
         };
 
-        let args = |key: &str| json!({"action":"press","selector":"#account","key":key,"expected_epoch":17});
+        let args = |key: &str| json!({"action":"press","selector":"focused","key":key,"expected_epoch":17});
         let enter_args = args("Enter");
         let control_args = args("Control+A");
         let enter = check_permissions("browser", &enter_args)
@@ -1516,6 +1532,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .remove(0);
+        assert!(!crate::PermissionRequest::is_focused_browser_resource(
+            "browser",
+            &enter.resource
+        ));
         let config = PermissionConfig::new();
         let matcher =
             crate::conservative_matchers(enter.permission_type, &enter.resource).remove(0);
