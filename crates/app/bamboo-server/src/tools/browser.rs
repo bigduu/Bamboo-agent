@@ -720,15 +720,26 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut request = [0u8; 2048];
-                    let _ = socket.read(&mut request).await;
-                    let body = br#"<!doctype html><style>
+                    let read = socket.read(&mut request).await.unwrap_or(0);
+                    let body: &[u8] = if request[..read].starts_with(b"GET /after-drop ") {
+                        b"<main>After model drag navigation</main>"
+                    } else if request[..read].starts_with(b"GET /navigate-on-drop ") {
+                        br#"<!doctype html><style>
+                        #source{position:absolute;left:20px;top:80px;width:80px;height:80px;background:blue}
+                        #drop{position:absolute;left:220px;top:80px;width:80px;height:80px;background:green}
+                    </style>
+                    <div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
+                    <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();location.href='/after-drop'">Drop</div>"#
+                    } else {
+                        br#"<!doctype html><style>
                         #source{position:absolute;left:20px;top:80px;width:80px;height:80px;background:blue}
                         #drop{position:absolute;left:220px;top:80px;width:80px;height:80px;background:green}
                     </style>
                     <button id="hover" onpointerenter="document.querySelector('#hovered').textContent='yes'">Hover</button>
                     <div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
                     <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#dropped').textContent=event.dataTransfer.getData('text/plain')">Drop</div>
-                    <output id="hovered">no</output><output id="dropped">no</output>"#;
+                    <output id="hovered">no</output><output id="dropped">no</output>"#
+                    };
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -788,6 +799,52 @@ mod tests {
             workbench_dom["active_tab_id"]
         );
         assert!(workbench_image["data"].as_str().unwrap().len() > 1000);
+
+        let navigation_url = format!("{url}navigate-on-drop");
+        let ready = browser
+            .command(
+                "shared-chat",
+                "navigate",
+                json!({"url":navigation_url,"expected_epoch":epoch}),
+            )
+            .await
+            .unwrap();
+        let ready_epoch = ready["page_epoch"].as_u64().unwrap();
+        let ToolOutcome::Completed(result) = tool
+            .invoke(
+                json!({
+                    "action":"drag",
+                    "source_selector":"#source",
+                    "target_selector":"#drop",
+                    "expected_epoch":ready_epoch
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("model drag navigation must complete");
+        };
+        let state: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(state["url"], format!("{url}after-drop"));
+        assert_ne!(state["page_epoch"], ready_epoch);
+        let after_dom = browser
+            .command("shared-chat", "dom", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(after_dom["page_epoch"], state["page_epoch"]);
+        assert_eq!(after_dom["active_tab_id"], state["active_tab_id"]);
+        assert!(after_dom["html"]
+            .as_str()
+            .unwrap()
+            .contains("After model drag navigation"));
+        let after_image = browser
+            .command("shared-chat", "screenshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(after_image["page_epoch"], state["page_epoch"]);
+        assert_eq!(after_image["active_tab_id"], state["active_tab_id"]);
+        assert!(after_image["data"].as_str().unwrap().len() > 1000);
         browser.close("shared-chat").await.unwrap();
         fixture.abort();
     }

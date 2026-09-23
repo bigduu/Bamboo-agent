@@ -328,22 +328,41 @@ function pointerButton(value) {
 
 async function dragBetween(page, source, destination, expectedEpoch, button = 'left') {
   if (expectedEpoch !== epoch) throw staleEpochError();
-  await page.mouse.move(source.x, source.y);
-  if (expectedEpoch !== epoch) throw staleEpochError();
-  await page.mouse.down({ button });
+  // A drop handler may begin navigation after mouse.up returns. Observe it
+  // before the first event so the returned state names the resulting page.
+  const navigation = page.waitForEvent('framenavigated', { timeout: 1_000 }).catch(() => null);
   try {
+    await page.mouse.move(source.x, source.y);
+  } catch (error) {
+    if (expectedEpoch === epoch) throw error;
+  }
+  // Moving onto the source may itself navigate. In that case the gesture has
+  // already started; return the new page state without pressing on that page.
+  if (expectedEpoch !== epoch) return;
+  let downAttempted = false;
+  try {
+    downAttempted = true;
+    await page.mouse.down({ button });
     for (let step = 1; step <= 12; step++) {
-      if (expectedEpoch !== epoch) throw staleEpochError();
+      // A handler may navigate on mousedown or pointermove. Stop before any
+      // subsequent gesture event; the caller will return the current state.
+      if (expectedEpoch !== epoch) break;
       await page.mouse.move(
         source.x + (destination.x - source.x) * step / 12,
         source.y + (destination.y - source.y) * step / 12,
       );
     }
+  } catch (error) {
+    if (expectedEpoch === epoch) throw error;
   } finally {
-    // Release the button even if a page handler navigates during the gesture.
-    await page.mouse.up({ button }).catch(() => {});
+    if (downAttempted) {
+      // Release outside the viewport if navigation changed the document. This
+      // clears mouse state without completing the old gesture on a new page.
+      if (expectedEpoch !== epoch) await page.mouse.move(-1, -1).catch(() => {});
+      await page.mouse.up({ button }).catch(() => {});
+    }
   }
-  if (expectedEpoch !== epoch) throw staleEpochError();
+  if (expectedEpoch === epoch) await navigation;
 }
 
 function activateTab(tab) {

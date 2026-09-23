@@ -250,8 +250,32 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
 });
 
 test('hover and straight drag change the shared page and reject stale coordinates', async () => {
-  const fixture = http.createServer((_request, response) => {
+  const fixture = http.createServer((request, response) => {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    if (request.url === '/after-drop') {
+      response.end('<main>After drop navigation</main>');
+      return;
+    }
+    if (request.url === '/after-down') {
+      response.end('<button id="probe" onclick="document.querySelector(\'output\').textContent=\'clicked\'">Probe</button><output>idle</output>');
+      return;
+    }
+    if (request.url === '/after-move') {
+      response.end('<main>After move navigation</main>');
+      return;
+    }
+    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move'].includes(request.url)) {
+      const onDown = request.url === '/navigate-on-down' ? 'onmousedown="location.href=\'/after-down\'"' : '';
+      const onMove = request.url === '/navigate-on-move' ? 'onpointermove="if(event.buttons)location.href=\'/after-move\'"' : '';
+      const onDrop = request.url === '/navigate-on-drop' ? 'location.href=\'/after-drop\'' : '';
+      response.end(`<!doctype html><style>
+        body { margin: 0; }
+        #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
+        #drop { position: absolute; left: 220px; top: 80px; width: 100px; height: 80px; background: green; }
+      </style><div id="source" draggable="true" ${onDown} ${onMove} ondragstart="event.dataTransfer.setData('text/plain','source')">Drag</div>
+      <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();${onDrop}">Drop</div>`);
+      return;
+    }
     response.end(`<!doctype html><style>
       body { margin: 0; }
       #hover { position: absolute; left: 20px; top: 20px; width: 80px; height: 30px; }
@@ -314,6 +338,40 @@ test('hover and straight drag change the shared page and reject stale coordinate
       x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: epoch,
     })).code, 'stale_epoch');
     assert.equal((await call('hover_selector', { selector: '#hover', expected_epoch: epoch })).code, 'stale_epoch');
+
+    const dropReady = await call('navigate', { url: url + 'navigate-on-drop', expected_epoch: resized.result.page_epoch });
+    assert.equal(dropReady.ok, true);
+    const dropNav = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: dropReady.result.page_epoch,
+    });
+    assert.equal(dropNav.ok, true);
+    assert.match(dropNav.result.url, /\/after-drop$/);
+    assert.notEqual(dropNav.result.page_epoch, dropReady.result.page_epoch);
+    assert.match((await call('dom')).result.html, /After drop navigation/);
+    assert.equal((await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: dropReady.result.page_epoch,
+    })).code, 'stale_epoch');
+
+    const downReady = await call('navigate', { url: url + 'navigate-on-down', expected_epoch: dropNav.result.page_epoch });
+    assert.equal(downReady.ok, true);
+    const downNav = await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: downReady.result.page_epoch,
+    });
+    assert.equal(downNav.ok, true);
+    assert.match(downNav.result.url, /\/after-down$/);
+    assert.notEqual(downNav.result.page_epoch, downReady.result.page_epoch);
+    assert.equal((await call('click_selector', { selector: '#probe', expected_epoch: downNav.result.page_epoch })).ok, true);
+    assert.match((await call('dom')).result.html, /<output>clicked<\/output>/);
+
+    const moveReady = await call('navigate', { url: url + 'navigate-on-move', expected_epoch: downNav.result.page_epoch });
+    assert.equal(moveReady.ok, true);
+    const moveNav = await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: moveReady.result.page_epoch,
+    });
+    assert.equal(moveNav.ok, true);
+    assert.match(moveNav.result.url, /\/after-move$/);
+    assert.notEqual(moveNav.result.page_epoch, moveReady.result.page_epoch);
+    assert.match((await call('dom')).result.html, /After move navigation/);
   } finally {
     host.stdin.end();
     host.kill();
