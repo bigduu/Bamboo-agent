@@ -2,7 +2,10 @@
 // One host process owns one isolated Chromium context and a bounded tab set. Bamboo is the
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
-const { randomBytes } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 
 const MAX_SNAPSHOT_CHARS = 80_000;
@@ -10,6 +13,12 @@ const MAX_HTML_CHARS = 100_000;
 const MAX_TABS = 8;
 // Rust retires this host after 30 seconds. Leave time for state() and stdio.
 const POINTER_ACTION_BUDGET_MS = 22_000;
+// Bound returned bytes, not OS disk usage: Chromium may buffer a chunk before
+// its next progress event lets us cancel an oversized transfer.
+const MAX_DOWNLOAD_BYTES = 256 * 1024;
+const DOWNLOAD_ACTION_BUDGET_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(20_000, Math.max(100, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS) || 20_000))
+  : 20_000;
 // The packaged host does not inherit NODE_ENV. Direct host tests can pause
 // observer setup to force a navigation between the first and final epoch checks.
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
@@ -45,6 +54,9 @@ let browserClosed = false;
 let pendingDialog;
 let inFlightAction;
 const dialogWaiters = new Set();
+let downloadCdp;
+let downloadDir;
+let activeDownloadAttempt;
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -619,6 +631,207 @@ function selectOptionArgs(args) {
   return args.values;
 }
 
+function downloadError(code, message) {
+  return targetError(code, message);
+}
+
+function downloadDeadline(promise, deadlineAt) {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(downloadError('download_timeout', 'browser download timed out'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(downloadError('download_timeout', 'browser download timed out')), remaining);
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+function cleanDownloadFilename(value) {
+  const basename = path.posix.basename(String(value || '').slice(0, 1024).replace(/\\/g, '/'))
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .trim();
+  if (!basename || basename === '.' || basename === '..') return 'download.bin';
+  let cleaned = '';
+  for (const character of basename) {
+    if (Buffer.byteLength(cleaned + character, 'utf8') > 180) break;
+    cleaned += character;
+  }
+  return cleaned || 'download.bin';
+}
+
+function cancelDownloadGuid(guid) {
+  return downloadCdp?.send('Browser.cancelDownload', { guid }).catch(() => {});
+}
+
+async function removeDownloadArtifacts(guid) {
+  // allowAndName uses the CDP guid for both the final file and its partial
+  // .crdownload file. Never use a browser-supplied path or suggested filename.
+  if (!downloadDir || !/^[a-zA-Z0-9_-]{1,128}$/.test(guid)) return;
+  await Promise.all([
+    fs.rm(path.join(downloadDir, guid), { force: true }),
+    fs.rm(path.join(downloadDir, `${guid}.crdownload`), { force: true }),
+  ]);
+}
+
+function onDownloadWillBegin(event) {
+  const attempt = activeDownloadAttempt;
+  if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId) {
+    cancelDownloadGuid(event.guid);
+    return;
+  }
+  attempt.guid = event.guid;
+  attempt.resolveGuid(event.guid);
+}
+
+function onDownloadProgress(event) {
+  const attempt = activeDownloadAttempt;
+  if (!attempt || event.guid !== attempt.guid) {
+    if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
+    else void removeDownloadArtifacts(event.guid).catch(() => {});
+    return;
+  }
+  if (event.state !== 'inProgress') {
+    attempt.terminal = true;
+    attempt.resolveTerminal();
+  }
+  if (event.receivedBytes > MAX_DOWNLOAD_BYTES) {
+    attempt.oversized = true;
+    cancelDownloadGuid(event.guid);
+    if (attempt.download) void attempt.download.cancel().catch(() => {});
+  }
+}
+
+function onPageDownload(page, download) {
+  const attempt = activeDownloadAttempt;
+  if (!attempt?.accepting || attempt.page !== page || attempt.download) {
+    void download.cancel().catch(() => {}).then(() => download.delete().catch(() => {}));
+    return;
+  }
+  attempt.download = download;
+  attempt.resolveDownload(download);
+  if (attempt.oversized) void download.cancel().catch(() => {});
+}
+
+async function boundedDownload(args) {
+  const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+  checkEpoch(args);
+  if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
+    throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
+  }
+  const tab = requireActiveTab();
+  const cdp = await tab.cdp;
+  if (!cdp || !downloadCdp) {
+    throw downloadError('download_failed', 'browser download observer unavailable');
+  }
+  const frameTree = await downloadDeadline(cdp.send('Page.getFrameTree'), deadlineAt);
+  checkEpoch(args);
+  let resolveDownload;
+  let resolveGuid;
+  let resolveTerminal;
+  const attempt = {
+    page: tab.page,
+    frameId: frameTree.frameTree.frame.id,
+    accepting: false,
+    download: null,
+    guid: null,
+    oversized: false,
+    terminal: false,
+    downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
+    guidPromise: new Promise(resolve => { resolveGuid = resolve; }),
+    terminalPromise: new Promise(resolve => { resolveTerminal = resolve; }),
+    resolveDownload: download => resolveDownload(download),
+    resolveGuid: guid => resolveGuid(guid),
+    resolveTerminal: () => resolveTerminal(),
+  };
+  activeDownloadAttempt = attempt;
+  try {
+    await downloadDeadline(withPinnedTarget(args, async handle => {
+      checkEpoch(args);
+      attempt.accepting = true;
+      await handle.click({ timeout: pointerTimeout(deadlineAt), noWaitAfter: true });
+    }, deadlineAt), deadlineAt);
+    const [download] = await downloadDeadline(
+      Promise.all([attempt.downloadPromise, attempt.guidPromise]), deadlineAt);
+    if (attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    let artifact;
+    try {
+      artifact = await downloadDeadline(download.path(), deadlineAt);
+    } catch (error) {
+      if (attempt.oversized) {
+        throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+      }
+      if (error?.code === 'download_timeout') throw error;
+      throw downloadError('download_failed', 'browser download failed');
+    }
+    const size = await downloadDeadline(fs.stat(artifact), deadlineAt);
+    if (size.size > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    const bytes = await downloadDeadline(fs.readFile(artifact), deadlineAt);
+    if (bytes.length > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    checkEpoch(args);
+    if (activeTabId !== tab.id || tab.page.isClosed()) throw staleEpochError();
+    const current = await downloadDeadline(state(), deadlineAt);
+    checkEpoch(args);
+    if (current.active_tab_id !== tab.id) throw staleEpochError();
+    return {
+      page_epoch: current.page_epoch,
+      active_tab_id: current.active_tab_id,
+      url: current.url,
+      filename: cleanDownloadFilename(download.suggestedFilename()),
+      byte_count: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      data_base64: bytes.toString('base64'),
+    };
+  } catch (error) {
+    if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
+      'download_timeout', 'download_too_large', 'download_failed'].includes(error?.code)) {
+      throw error;
+    }
+    // Playwright errors can quote a selected URL or filename. Never forward
+    // them through the host's generic error envelope.
+    throw downloadError('download_failed', 'browser download failed');
+  } finally {
+    attempt.accepting = false;
+    if (attempt.guid && !attempt.terminal) {
+      await cancelDownloadGuid(attempt.guid);
+    }
+    if (attempt.download) {
+      let cleanupTimer;
+      await Promise.race([
+        attempt.download.cancel().catch(() => {}).then(() => attempt.download.delete().catch(() => {})),
+        new Promise(resolve => { cleanupTimer = setTimeout(resolve, 2_000); }),
+      ]);
+      clearTimeout(cleanupTimer);
+    }
+    if (attempt.guid && !attempt.terminal) {
+      let terminalTimer;
+      await Promise.race([
+        attempt.terminalPromise,
+        new Promise(resolve => { terminalTimer = setTimeout(resolve, 2_000); }),
+      ]);
+      clearTimeout(terminalTimer);
+    }
+    let cleanupFailed = false;
+    if (attempt.guid) {
+      try {
+        await removeDownloadArtifacts(attempt.guid);
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
+    if (cleanupFailed) throw downloadError('download_failed', 'browser download cleanup failed');
+  }
+}
+
 async function waitForTarget(locator, missingMessage, deadlineAt) {
   try {
     await locator.first().waitFor({ state: 'attached', timeout: pointerTimeout(deadlineAt) });
@@ -1063,6 +1276,7 @@ function adoptPage(target) {
     if (kind) tab.navigationResponses.set(response.request(), kind);
   });
   target.on('requestfailed', request => tab.pendingNavigations.delete(request));
+  target.on('download', download => onPageDownload(target, download));
   target.on('requestfinished', request => {
     if (!tab.pendingNavigations.has(request)) return;
     const kind = tab.navigationResponses.get(request);
@@ -1358,6 +1572,8 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
+    case 'download':
+      return boundedDownload(args);
     case 'hover_selector': {
       const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);
@@ -1462,26 +1678,47 @@ async function command(action, args = {}) {
       return evalInActivePage(args);
     case 'close':
       shuttingDown = true;
-      await browser.close();
-      browserClosed = true;
+      await closeHost();
       return { closed: true };
     default:
       throw new Error(`unknown browser action: ${action}`);
   }
 }
 
+async function closeHost() {
+  if (browserClosed) return;
+  shuttingDown = true;
+  activeDownloadAttempt?.download?.cancel().catch(() => {});
+  await context?.close().catch(() => {});
+  await browser?.close().catch(() => {});
+  browserClosed = true;
+  downloadCdp = undefined;
+  if (downloadDir) {
+    await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    downloadDir = undefined;
+  }
+}
+
 async function main() {
+  downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bamboo-browser-download-'));
   browser = await chromium.launch({
     headless: true,
+    downloadsPath: downloadDir,
     ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
   });
   context = await browser.newContext({
     viewport: { width: 1000, height: 720 },
     deviceScaleFactor: 1,
-    acceptDownloads: false,
+    acceptDownloads: true,
     serviceWorkers: 'block',
   });
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
+  downloadCdp = await browser.newBrowserCDPSession();
+  downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
+  downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
+  await downloadCdp.send('Browser.setDownloadBehavior', {
+    behavior: 'allowAndName', downloadPath: downloadDir, eventsEnabled: true,
+  });
   await context.route('**/*', route => {
     const request = route.request();
     if (request.isNavigationRequest()) {
@@ -1513,10 +1750,11 @@ async function main() {
   shuttingDown = true;
   lines.close();
   process.stdin.pause();
-  if (!browserClosed) await browser.close().catch(() => {});
+  await closeHost();
 }
 
-main().catch(error => {
+main().catch(async error => {
+  await closeHost();
   process.stderr.write(`browser host failed: ${error.message || error}\n`);
   process.exitCode = 1;
 });

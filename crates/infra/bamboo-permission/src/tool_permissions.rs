@@ -764,6 +764,39 @@ pub fn check_permissions(
                         "Answer pending browser dialog",
                     )]))
                 }
+                "download" => {
+                    let epoch = args
+                        .get("expected_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            PermissionError::CheckFailed(
+                                "browser interaction requires expected_epoch from a snapshot"
+                                    .into(),
+                            )
+                        })?;
+                    let fields = args.as_object().ok_or_else(|| {
+                        PermissionError::CheckFailed(
+                            "browser download accepts only a CSS selector and expected_epoch"
+                                .into(),
+                        )
+                    })?;
+                    if fields.keys().any(|key| {
+                        !matches!(key.as_str(), "action" | "selector" | "expected_epoch")
+                    }) {
+                        return Err(PermissionError::CheckFailed(
+                            "browser download accepts only a CSS selector and expected_epoch"
+                                .into(),
+                        ));
+                    }
+                    let selector = browser_pointer_selector(args, "selector")?;
+                    let fingerprint =
+                        browser_persistent_fingerprint("download-selector-v1", selector)?;
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!("browser:{epoch}:download:css:{fingerprint}"),
+                        "Download from selected browser element",
+                    )]))
+                }
                 "click" | "click_at" | "fill" | "select_option" | "type" | "press" | "key"
                 | "scroll" | "history" | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
                     let focused_input = is_focused_browser_input(tool_name, args);
@@ -1669,6 +1702,78 @@ mod tests {
             json!({"action":"select_option","selector":"#choice","values":vec!["red"; 17],"expected_epoch":17}),
         ] {
             assert!(check_permissions("browser", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_download_fingerprint_child_process() {
+        let Some(output_path) = std::env::var_os("BAMBOO_DOWNLOAD_TEST_OUTPUT") else {
+            return;
+        };
+        let cases = [
+            json!({"action":"download","selector":"a[data-secret='private-a']","expected_epoch":17}),
+            json!({"action":"download","selector":"a[data-secret='private-b']","expected_epoch":17}),
+            json!({"action":"download","selector":"a[data-secret='private-a']","expected_epoch":18}),
+        ];
+        let resources: Vec<String> = cases
+            .iter()
+            .map(|args| {
+                let mut contexts = check_permissions("browser", args).unwrap().unwrap();
+                let context = contexts.remove(0);
+                assert_eq!(context.permission_type, PermissionType::BrowserInteraction);
+                assert_eq!(
+                    context.operation_description,
+                    "Download from selected browser element"
+                );
+                context.resource
+            })
+            .collect();
+        fs::write(output_path, serde_json::to_vec(&resources).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_download_grants_bind_selector_and_epoch_without_plaintext() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let run = |dir: &Path, output_path: &Path| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool_permissions::tests::browser_download_fingerprint_child_process",
+                ])
+                .env("BAMBOO_DATA_DIR", dir)
+                .env("BAMBOO_DOWNLOAD_TEST_OUTPUT", output_path)
+                .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "download fingerprint child process failed"
+            );
+            let bytes = fs::read(output_path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-a"));
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-b"));
+            serde_json::from_slice::<Vec<String>>(&bytes).unwrap()
+        };
+        let first = run(data_dir.path(), &data_dir.path().join("first.json"));
+        let restarted = run(data_dir.path(), &data_dir.path().join("restarted.json"));
+        let other = run(other_dir.path(), &other_dir.path().join("other.json"));
+        assert_eq!(first, restarted, "same installation needs stable grants");
+        assert_ne!(first, other, "another installation needs separate grants");
+        assert_eq!(first.len(), 3);
+        assert!(first[0].starts_with("browser:17:download:css:"));
+        assert_ne!(first[0], first[1], "another selector needs another grant");
+        assert_ne!(first[0], first[2], "another epoch needs another grant");
+
+        for args in [
+            json!({"action":"download","selector":"#file"}),
+            json!({"action":"download","selector":" ","expected_epoch":17}),
+            json!({"action":"download","selector":"x".repeat(513),"expected_epoch":17}),
+            json!({"action":"download","selector":"#file","url":"https://example.test/file","expected_epoch":17}),
+            json!({"action":"download","selector":"#file","path":"/tmp/file","expected_epoch":17}),
+            json!({"action":"download","selector":"#file","target":{"kind":"text","value":"Save"},"expected_epoch":17}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
         }
     }
 
