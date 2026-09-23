@@ -1415,6 +1415,29 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal(screenshot.active_tab_id, changed.result.active_tab_id);
     assert.ok(Buffer.from(screenshot.data, 'base64').length > 1000);
 
+    const scheduledDialog = await call('eval', {
+      ...expected,
+      code: 'setTimeout(() => alert("Pending eval dialog"), 120); "scheduled"',
+    });
+    assert.equal(scheduledDialog.ok, true, JSON.stringify(scheduledDialog));
+    let dialogState;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      dialogState = (await call('state')).result;
+      if (dialogState.pending_dialog) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal(dialogState.pending_dialog.message, 'Pending eval dialog');
+    const blockedEval = await call('eval', {
+      ...expected, code: 'document.querySelector("output").textContent = "not-run"',
+    });
+    assert.equal(blockedEval.code, 'dialog_pending', JSON.stringify(blockedEval));
+    assert.equal((await call('dialog_respond', {
+      dialog_id: dialogState.pending_dialog.dialog_id,
+      accept: false,
+      expected_epoch: expected.expected_epoch,
+    })).ok, true);
+    assert.match((await call('dom')).result.html, /<output>1<\/output>/);
+
     assert.equal((await call('eval', { ...expected, expected_url: `${url}wrong`, code: '1' })).code, 'stale_epoch');
     assert.equal((await call('eval', { ...expected, expected_epoch: initial.page_epoch, code: '1' })).code, 'stale_epoch');
     assert.equal((await call('eval', { ...expected, code: 'x'.repeat(8193) })).code, 'invalid_request');
