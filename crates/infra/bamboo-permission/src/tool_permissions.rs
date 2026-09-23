@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::bash_security;
 use crate::hierarchy::PermissionRuleSet;
@@ -10,6 +13,18 @@ const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd
 /// one proactive request. This matches the bounded replay ledger so every
 /// schema-valid request can eventually complete.
 pub const MAX_PROACTIVE_PERMISSION_BATCH: usize = 64;
+
+/// Keep a remembered `type` grant tied to the exact bytes without putting
+/// potentially sensitive browser input into permission resources or logs.
+/// Temporary grants are process-local, so the salt can be process-local too.
+fn browser_type_fingerprint(text: &str) -> String {
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
+}
 
 pub fn check_permissions(
     tool_name: &str,
@@ -357,8 +372,8 @@ pub fn check_permissions(
                             format!("{x},{y},{button}")
                         }
                         "type" => {
-                            required_string_arg(args, "text")?;
-                            "focused".to_string()
+                            let text = required_string_arg(args, "text")?;
+                            format!("focused:{}", browser_type_fingerprint(text))
                         }
                         "key" => {
                             let key = required_string_arg(args, "key")?;
@@ -371,10 +386,15 @@ pub fn check_permissions(
                         }
                         _ => unreachable!(),
                     };
+                    let description = if action == "type" {
+                        "Type into focused browser element".to_string()
+                    } else {
+                        format!("Browser {action} on {target}")
+                    };
                     Ok(Some(vec![PermissionContext::new(
                         PermissionType::BrowserInteraction,
                         format!("browser:{epoch}:{action}:{target}"),
-                        format!("Browser {action} on {target}"),
+                        description,
                     )]))
                 }
                 "snapshot" | "screenshot" => Ok(None),
@@ -689,10 +709,6 @@ mod tests {
                 "browser:17:click_at:12.5,20,right",
             ),
             (
-                json!({"action":"type","text":"Lotus","expected_epoch":17}),
-                "browser:17:type:focused",
-            ),
-            (
                 json!({"action":"key","key":"Shift+Tab","expected_epoch":17}),
                 "browser:17:key:Shift+Tab",
             ),
@@ -712,6 +728,53 @@ mod tests {
                 expected_resource
             );
         }
+    }
+
+    #[test]
+    fn browser_type_grant_is_bound_to_input_without_exposing_text() {
+        let context = |text: &str, epoch| {
+            check_permissions(
+                "browser",
+                &json!({"action":"type","text":text,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let original = context("private input", 17);
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original.resource.starts_with("browser:17:type:focused:"));
+        assert!(!original.resource.contains("private input"));
+        assert_eq!(
+            original.operation_description,
+            "Type into focused browser element"
+        );
+        assert_eq!(original.resource, context("private input", 17).resource);
+        let different_text = context("other input", 17);
+        assert_ne!(original.resource, different_text.resource);
+        assert_ne!(original.resource, context("private input", 18).resource);
+
+        let config = crate::PermissionConfig::default();
+        let matcher =
+            crate::conservative_matchers(PermissionType::BrowserInteraction, &original.resource)
+                .remove(0);
+        config
+            .grant_typed_scoped_session_permission(
+                "chat",
+                PermissionType::BrowserInteraction,
+                matcher,
+            )
+            .unwrap();
+        assert!(config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &original.resource
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &different_text.resource
+        ));
     }
 
     #[test]
