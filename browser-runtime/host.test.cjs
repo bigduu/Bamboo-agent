@@ -934,6 +934,21 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal(read.result.url, url);
     assert.equal(read.result.active_tab_id, navigated.active_tab_id);
     assert.equal((await call('eval', { ...expected, code: 'typeof process' })).result.value, 'undefined');
+    const duringOverride = await call('eval', {
+      ...expected,
+      code: '(() => { JSON.stringify = () => "\\\"spoofed\\\""; return {actual: 7}; })()',
+    });
+    assert.equal(duringOverride.ok, true);
+    assert.deepEqual(duringOverride.result.value, { actual: 7 });
+    const existingOverride = await call('eval', { ...expected, code: '({actual: 8})' });
+    assert.equal(existingOverride.ok, true);
+    assert.deepEqual(existingOverride.result.value, { actual: 8 });
+    const hugeOverride = await call('eval', {
+      ...expected,
+      code: '(() => { JSON.stringify = () => "x".repeat(1_000_000); return {actual: 9}; })()',
+    });
+    assert.equal(hugeOverride.ok, true);
+    assert.deepEqual(hugeOverride.result.value, { actual: 9 });
 
     const changed = await call('eval', {
       ...expected,
@@ -954,6 +969,7 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal((await call('eval', { ...expected, code: 'x'.repeat(8193) })).code, 'invalid_request');
     assert.equal((await call('eval', { ...expected, code: '(() => { const x = {}; x.self = x; return x; })()' })).code, 'browser_eval_error');
     assert.equal((await call('eval', { ...expected, code: '"x".repeat(70000)' })).code, 'browser_eval_error');
+    assert.equal((await call('eval', { ...expected, code: '"💥".repeat(20000)' })).code, 'browser_eval_error');
     const exception = await call('eval', { ...expected, code: 'throw new Error("E".repeat(5000))' });
     assert.equal(exception.code, 'browser_eval_error');
     assert.ok(exception.error.length <= 2048);

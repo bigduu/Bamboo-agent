@@ -155,17 +155,10 @@ function checkEvalArgs(args) {
   checkEpoch(args);
 }
 
-function parseEvalResult(encoded) {
-  let value;
-  try {
-    value = JSON.parse(encoded);
-  } catch {
-    const error = new Error('browser_eval result is not valid JSON');
-    error.code = 'browser_eval_error';
-    throw error;
-  }
-  // The page can replace JSON.stringify; recheck its output in trusted Node
-  // before forwarding it over the host protocol.
+function validateEvalResult(value) {
+  // Playwright transfers the page-side bounded value across the process
+  // boundary. The page can replace its own JSON and object intrinsics, so
+  // validate the transferred shape again with trusted Node intrinsics.
   const stack = [[value, 0]];
   let entries = 0;
   let stringUnits = 0;
@@ -183,14 +176,32 @@ function parseEvalResult(encoded) {
       if (stringUnits <= 65536) continue;
     } else if (Array.isArray(item)) {
       if (item.length <= 64) {
-        for (const child of item) stack.push([child, depth + 1]);
-        continue;
+        let valid = true;
+        for (let index = 0; index < item.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
       }
     } else if (typeof item === 'object') {
       const keys = Object.keys(item);
-      if (keys.length <= 64 && keys.every(key => key.length <= 256)) {
-        for (const key of keys) stack.push([item[key], depth + 1]);
-        continue;
+      const prototype = Object.getPrototypeOf(item);
+      if ((prototype === Object.prototype || prototype === null) &&
+          keys.length <= 64 && keys.every(key => key.length <= 256)) {
+        let valid = true;
+        for (const key of keys) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, key);
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
       }
     }
     const error = new Error('browser_eval result is not JSON-safe or exceeds limits');
@@ -207,7 +218,7 @@ async function evalInActivePage(args) {
   const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
     !page.isClosed() && page.url() === args.expected_url;
   if (!unchanged()) throw staleEpochError();
-  let encoded;
+  let transferred;
   try {
     // This callback and indirect eval run in the page realm. Only the source
     // string crosses into Chromium; no Node, Playwright page object, or CDP
@@ -254,7 +265,7 @@ async function evalInActivePage(args) {
         seen.delete(item);
         return result;
       };
-      return { encoded: JSON.stringify(safe(value, 0)), observed_url: location.href };
+      return { value: safe(value, 0), observed_url: location.href };
     }, args.code);
     if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
     // A synchronous location assignment may schedule the navigation after
@@ -263,7 +274,7 @@ async function evalInActivePage(args) {
     const settledUrl = await page.evaluate(() =>
       new Promise(resolve => setTimeout(() => resolve(location.href), 0)));
     if (settledUrl !== args.expected_url) throw staleEpochError();
-    encoded = evaluated.encoded;
+    transferred = evaluated.value;
   } catch (error) {
     // Chromium may destroy the execution context before Playwright's frame
     // navigation event advances our epoch. Never surface that result as a
@@ -277,16 +288,18 @@ async function evalInActivePage(args) {
     throw boundedError;
   }
   if (!unchanged()) throw staleEpochError();
-  if (typeof encoded !== 'string' || Buffer.byteLength(encoded, 'utf8') > MAX_EVAL_JSON_BYTES) {
+  const value = validateEvalResult(transferred);
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_EVAL_JSON_BYTES) {
     const error = new Error('browser_eval result exceeds 64 KiB');
     error.code = 'browser_eval_error';
     throw error;
   }
+  if (!unchanged()) throw staleEpochError();
   return {
     page_epoch: epoch,
     active_tab_id: tab.id,
     url: page.url(),
-    value: parseEvalResult(encoded),
+    value,
   };
 }
 
