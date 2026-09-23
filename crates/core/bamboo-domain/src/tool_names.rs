@@ -115,12 +115,13 @@ pub const SERVER_TOOL_NAMES: [&str; 12] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 18] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 19] = [
     "Plan",
     "SubAgent",
     "Project",
     "archive_context",
     "ask_agent",
+    "browser",
     "cluster",
     "compact_context",
     "deploy_agent",

@@ -525,6 +525,7 @@ pub fn conservative_matchers(
                 }
             }
         }
+        PermissionType::BrowserInteraction => {}
     }
 
     matchers.retain(|matcher| matcher.validate(permission_type).is_ok());

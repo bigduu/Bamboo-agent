@@ -263,6 +263,60 @@ pub fn check_permissions(
                 format!("Web fetch: {}", url),
             )]))
         }
+        "browser" => {
+            let action = required_string_arg(args, "action")?;
+            match action {
+                "navigate" => {
+                    let raw = required_string_arg(args, "url")?;
+                    let url = url::Url::parse(raw).map_err(|error| {
+                        PermissionError::CheckFailed(format!("invalid browser URL: {error}"))
+                    })?;
+                    if !matches!(url.scheme(), "http" | "https")
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                    {
+                        return Err(PermissionError::CheckFailed(
+                            "browser navigation requires an http(s) URL without credentials".into(),
+                        ));
+                    }
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::HttpRequest,
+                        url.as_str(),
+                        format!("Navigate browser to {}", url.origin().ascii_serialization()),
+                    )]))
+                }
+                "click" | "fill" | "press" | "scroll" => {
+                    // Bind remembered grants to the page generation. Navigation
+                    // increments the epoch, so a selector approved on one site
+                    // cannot silently carry authority to the next site.
+                    let epoch = args
+                        .get("expected_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            PermissionError::CheckFailed(
+                                "browser interaction requires expected_epoch from a snapshot"
+                                    .into(),
+                            )
+                        })?;
+                    let target = if matches!(action, "click" | "fill") {
+                        required_string_arg(args, "selector")?
+                    } else {
+                        args.get("selector")
+                            .and_then(Value::as_str)
+                            .unwrap_or("page")
+                    };
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!("browser:{epoch}:{action}:{target}"),
+                        format!("Browser {action} on {target}"),
+                    )]))
+                }
+                "snapshot" | "screenshot" => Ok(None),
+                _ => Err(PermissionError::CheckFailed(
+                    "unknown browser action".into(),
+                )),
+            }
+        }
         "WebSearch" => {
             let query = required_string_arg(args, "query")?;
             Ok(Some(vec![PermissionContext::new(
@@ -444,6 +498,7 @@ fn parse_requested_permission_type(value: &str) -> Option<PermissionType> {
         "http_request" | "HttpRequest" => Some(PermissionType::HttpRequest),
         "delete_operation" | "DeleteOperation" => Some(PermissionType::DeleteOperation),
         "terminal_session" | "TerminalSession" => Some(PermissionType::TerminalSession),
+        "browser_interaction" | "BrowserInteraction" => Some(PermissionType::BrowserInteraction),
         _ => None,
     }
 }
@@ -515,6 +570,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn browser_navigation_and_interaction_use_distinct_scoped_permissions() {
+        let navigation = check_permissions(
+            "browser",
+            &json!({"action":"navigate","url":"http://127.0.0.1:53495/"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(navigation[0].permission_type, PermissionType::HttpRequest);
+        assert_eq!(navigation[0].resource, "http://127.0.0.1:53495/");
+
+        let click = check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(click[0].permission_type, PermissionType::BrowserInteraction);
+        assert_eq!(click[0].resource, "browser:17:click:#increment");
+        let later = check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment","expected_epoch":18}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(click[0].resource, later[0].resource);
+        assert!(check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment"})
+        )
+        .is_err());
+        assert!(check_permissions("browser", &json!({"action":"snapshot"}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn browser_permission_rejects_unsafe_navigation_schemes_and_credentials() {
+        for url in [
+            "file:///tmp/a",
+            "javascript:alert(1)",
+            "http://user:pass@example.com/",
+        ] {
+            assert!(
+                check_permissions("browser", &json!({"action":"navigate","url":url})).is_err(),
+                "{url}"
+            );
+        }
+    }
 
     #[test]
     fn check_permissions_write() {

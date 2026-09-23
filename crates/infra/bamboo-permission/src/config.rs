@@ -43,6 +43,8 @@ pub enum PermissionType {
     DeleteOperation,
     /// Permission for terminal sessions (long-running interactive commands)
     TerminalSession,
+    /// Permission to change the current page through browser input.
+    BrowserInteraction,
 }
 
 impl PermissionType {
@@ -55,6 +57,7 @@ impl PermissionType {
             PermissionType::HttpRequest => "Make HTTP requests to external services",
             PermissionType::DeleteOperation => "Delete files or directories",
             PermissionType::TerminalSession => "Run interactive terminal sessions",
+            PermissionType::BrowserInteraction => "Interact with a browser page",
         }
     }
 
@@ -67,6 +70,7 @@ impl PermissionType {
             PermissionType::HttpRequest => RiskLevel::Medium,
             PermissionType::DeleteOperation => RiskLevel::High,
             PermissionType::TerminalSession => RiskLevel::High,
+            PermissionType::BrowserInteraction => RiskLevel::High,
         }
     }
 }

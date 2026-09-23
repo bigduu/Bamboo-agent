@@ -2,6 +2,88 @@ use actix_web::http::{header, StatusCode};
 use actix_web::{test, web, App};
 use tempfile::tempdir;
 
+#[actix_web::test]
+async fn browser_routes_require_access_and_an_existing_chat_session() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".into(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".into()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    for (method, uri) in [
+        ("PUT", "/api/v1/browser/sessions/missing"),
+        ("GET", "/api/v1/browser/sessions/missing"),
+        ("DELETE", "/api/v1/browser/sessions/missing"),
+        ("POST", "/api/v1/browser/sessions/missing/navigate"),
+        ("POST", "/api/v1/browser/sessions/missing/history"),
+        ("POST", "/api/v1/browser/sessions/missing/viewport"),
+        ("POST", "/api/v1/browser/sessions/missing/input"),
+        ("GET", "/api/v1/browser/sessions/missing/dom"),
+        ("GET", "/api/v1/browser/sessions/missing/frame"),
+        ("GET", "/api/v1/browser/sessions/missing/screenshot"),
+    ] {
+        let request = match method {
+            "PUT" => test::TestRequest::put(),
+            "POST" => test::TestRequest::post(),
+            "DELETE" => test::TestRequest::delete(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .peer_addr("198.51.100.7:3000".parse().unwrap())
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({}))
+        .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    // Reuse the same route tree with access disabled to check the handler's
+    // existing-session guard separately from the account access middleware.
+    app_state.config.write().await.access_control = None;
+
+    for uri in [
+        "/api/v1/browser/sessions/missing",
+        "/api/v1/browser/sessions/missing/dom",
+        "/api/v1/browser/sessions/missing/frame",
+        "/api/v1/browser/sessions/missing/screenshot",
+    ] {
+        let request = test::TestRequest::get().uri(uri).to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let open = test::TestRequest::put()
+        .uri("/api/v1/browser/sessions/missing")
+        .set_json(serde_json::json!({}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, open).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
 use super::{configure_routes, configure_routes_with_rate_limiting};
 use crate::AppState;
 use bamboo_config::AccessControlConfig;
