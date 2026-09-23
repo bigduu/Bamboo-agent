@@ -32,6 +32,20 @@ fn browser_target_fingerprint(target: &str) -> String {
     format!("{:x}", Sha256::digest(target.as_bytes()))
 }
 
+fn browser_press_key(args: &Value) -> Result<&str, PermissionError> {
+    let key = required_string_arg(args, "key")?;
+    if key.trim().is_empty()
+        || key.encode_utf16().count() > 128
+        || key.chars().any(char::is_control)
+    {
+        return Err(PermissionError::CheckFailed(
+            "browser press key must be nonempty and at most 128 UTF-16 code units without control characters"
+                .into(),
+        ));
+    }
+    Ok(key)
+}
+
 /// A semantic locator's grant identity is independent of JSON key order and
 /// never contains page text. The description remains readable at approval.
 fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, PermissionError> {
@@ -424,15 +438,21 @@ pub fn check_permissions(
                             Some((identity, _)) => identity.clone(),
                             None => required_string_arg(args, "selector")?.to_string(),
                         },
-                        "press" => semantic
-                            .as_ref()
-                            .map(|(identity, _)| identity.clone())
-                            .unwrap_or_else(|| {
-                                args.get("selector")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("page")
-                                    .to_string()
-                            }),
+                        "press" => match &semantic {
+                            Some((identity, _)) => identity.clone(),
+                            None => match args.get("selector") {
+                                None | Some(Value::Null) => "page".to_string(),
+                                Some(value) => value
+                                    .as_str()
+                                    .filter(|selector| !selector.trim().is_empty())
+                                    .ok_or_else(|| {
+                                        PermissionError::CheckFailed(
+                                            "browser press selector must be nonempty".into(),
+                                        )
+                                    })?
+                                    .to_string(),
+                            },
+                        },
                         "scroll" => args
                             .get("selector")
                             .and_then(Value::as_str)
@@ -503,30 +523,27 @@ pub fn check_permissions(
                         }
                         _ => unreachable!(),
                     };
+                    let description = if action == "type" {
+                        "Type into focused browser element".to_string()
+                    } else if let Some((_, semantic_description)) = &semantic {
+                        format!("Browser {action} on {semantic_description}")
+                    } else {
+                        format!("Browser {action} on {target}")
+                    };
                     let target = if action == "fill" && semantic.is_some() {
                         let text = required_string_arg(args, "text")?;
                         format!("{target}:text:{}", browser_type_fingerprint(text))
                     } else if action == "press" {
-                        let key = required_string_arg(args, "key")?;
-                        if key.is_empty() {
-                            return Err(PermissionError::CheckFailed(
-                                "browser key must be nonempty".into(),
-                            ));
-                        }
-                        if semantic.is_some() {
+                        let key = browser_press_key(args)?;
+                        if semantic.is_some()
+                            || args.get("selector").is_some_and(|value| !value.is_null())
+                        {
                             format!("{target}:key:{}", browser_target_fingerprint(key))
                         } else {
                             target
                         }
                     } else {
                         target
-                    };
-                    let description = if action == "type" {
-                        "Type into focused browser element".to_string()
-                    } else if let Some((_, semantic_description)) = semantic {
-                        format!("Browser {action} on {semantic_description}")
-                    } else {
-                        format!("Browser {action} on {target}")
                     };
                     Ok(Some(vec![PermissionContext::new(
                         PermissionType::BrowserInteraction,
@@ -1040,6 +1057,124 @@ mod tests {
             )
             .resource
         );
+    }
+
+    #[test]
+    fn browser_css_press_grants_bind_the_key_selector_and_epoch() {
+        let context = |selector: &str, key: &str, epoch: u64| {
+            check_permissions(
+                "browser",
+                &json!({"action":"press","selector":selector,"key":key,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let enter = context("#save", "Enter", 17);
+        assert_eq!(enter.permission_type, PermissionType::BrowserInteraction);
+        assert!(enter.resource.starts_with("browser:17:press:#save:key:"));
+        assert_eq!(enter.operation_description, "Browser press on #save");
+        assert!(!enter.resource.contains("Enter"));
+        assert_eq!(enter.resource, context("#save", "Enter", 17).resource);
+        assert_ne!(enter.resource, context("#save", "Control+A", 17).resource);
+        assert_ne!(enter.resource, context("#other", "Enter", 17).resource);
+        assert_ne!(enter.resource, context("#save", "Enter", 18).resource);
+        assert!(context("page", "Enter", 17)
+            .resource
+            .starts_with("browser:17:press:page:key:"));
+
+        let semantic = check_permissions(
+            "browser",
+            &json!({"action":"press","target":{"kind":"role","role":"button","name":"Save"},"key":"Enter","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap()
+        .remove(0);
+        let key_digest = enter.resource.rsplit(":key:").next().unwrap();
+        assert_eq!(key_digest.len(), 64);
+        assert!(semantic.resource.ends_with(key_digest));
+        assert!(semantic.resource.contains(":press:semantic:"));
+    }
+
+    #[test]
+    fn remembered_css_enter_approval_does_not_authorize_control_a() {
+        use crate::{
+            PermissionConfig, PermissionDecisionKind, PermissionDecisionSource,
+            PermissionEvaluation, PermissionOutcome, RiskLevel,
+        };
+
+        let args = |key: &str| json!({"action":"press","selector":"#account","key":key,"expected_epoch":17});
+        let enter_args = args("Enter");
+        let control_args = args("Control+A");
+        let enter = check_permissions("browser", &enter_args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let control = check_permissions("browser", &control_args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let config = PermissionConfig::new();
+        let matcher =
+            crate::conservative_matchers(enter.permission_type, &enter.resource).remove(0);
+        config
+            .grant_typed_scoped_session_permission("chat", enter.permission_type, matcher)
+            .unwrap();
+        let evaluation = |context: &PermissionContext, tool_args: Value| PermissionEvaluation {
+            request_id: "browser-press".into(),
+            session_id: "chat".into(),
+            workspace_path: None,
+            tool_name: "browser".into(),
+            tool_args,
+            permission_type: context.permission_type,
+            resource: context.resource.clone(),
+            operation_summary: context.operation_description.clone(),
+            risk_level: RiskLevel::High,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            platform_hard_deny: None,
+            consume_once: true,
+            supported_decisions: PermissionDecisionKind::all_supported(),
+        };
+        assert!(matches!(
+            config.evaluate(evaluation(&enter, enter_args)),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedSession,
+                ..
+            }
+        ));
+        assert!(matches!(
+            config.evaluate(evaluation(&control, control_args)),
+            PermissionOutcome::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn browser_press_rejects_invalid_keys_before_approval() {
+        for key in [
+            json!(null),
+            json!(7),
+            json!(""),
+            json!(" "),
+            json!("Control\nA"),
+            json!("a".repeat(129)),
+        ] {
+            assert!(
+                check_permissions(
+                    "browser",
+                    &json!({"action":"press","selector":"#save","key":key,"expected_epoch":17}),
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        for selector in [json!(""), json!(" "), json!(7)] {
+            assert!(check_permissions(
+                "browser",
+                &json!({"action":"press","selector":selector,"key":"Enter","expected_epoch":17}),
+            )
+            .is_err());
+        }
     }
 
     #[test]
