@@ -250,7 +250,13 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
 });
 
 test('hover and straight drag change the shared page and reject stale coordinates', async () => {
+  let wrongPagePointerEvents = 0;
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/bad-pointer') {
+      wrongPagePointerEvents++;
+      response.end('ok');
+      return;
+    }
     if (request.url === '/very-slow-hover') {
       setTimeout(() => {
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -314,6 +320,17 @@ test('hover and straight drag change the shared page and reject stale coordinate
       </style><div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','long')">Drag</div>
       <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('output').textContent=event.dataTransfer.getData('text/plain')">Drop</div>
       <output>idle</output>`);
+      return;
+    }
+    if (request.url === '/scroll-navigate') {
+      response.end(`<!doctype html><style>
+        body { margin: 0; min-height: 3000px; }
+        #source { position: absolute; left: 20px; top: 2200px; width: 80px; height: 80px; background: blue; }
+        #drop { position: absolute; left: 220px; top: 2320px; width: 100px; height: 80px; background: green; }
+      </style><div id="source" draggable="true">Drag</div><div id="drop">Drop</div>
+      <script>window.scrollTo(0,0);let armed=false,going=false;setTimeout(()=>armed=true,100);
+      addEventListener('scroll',()=>{if(armed&&!going){going=true;location.href='/slow-scroll-navigation'}});
+      addEventListener('mousedown',()=>fetch('/bad-pointer'))</script>`);
       return;
     }
     if (request.url === '/after-drop') {
@@ -606,6 +623,18 @@ test('hover and straight drag change the shared page and reject stale coordinate
     });
     assert.equal(longDrag.ok, true);
     assert.match((await call('dom')).result.html, /<output>long<\/output>/);
+
+    const scrollReady = await call('navigate', {
+      url: url + 'scroll-navigate', expected_epoch: (await call('state')).result.page_epoch,
+    });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const scrolled = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: scrollReady.result.page_epoch,
+    });
+    assert.equal(scrolled.ok, true, JSON.stringify(scrolled));
+    assert.match(scrolled.result.url, /\/slow-scroll-navigation$/);
+    assert.notEqual(scrolled.result.page_epoch, scrollReady.result.page_epoch);
+    assert.equal(wrongPagePointerEvents, 0, 'scroll-triggered navigation must prevent mouse down');
 
     // Target discovery and actionability consume the same budget as the slow
     // navigation they trigger. Rust would retire this host at 30 seconds.

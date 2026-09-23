@@ -488,8 +488,10 @@ async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
   const navigation = await observeActionNavigation(page, deadlineAt);
   try {
     if (expectedEpoch !== epoch) throw staleEpochError();
-    try { await hover(); } catch (error) {
-      if (!navigation.started && expectedEpoch === epoch) throw error;
+    if (!navigation.started) {
+      try { await hover(); } catch (error) {
+        if (!navigation.started && expectedEpoch === epoch) throw error;
+      }
     }
     await navigation.finish();
   } finally {
@@ -497,57 +499,60 @@ async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
   }
 }
 
-async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt) {
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt, existingNavigation) {
   if (expectedEpoch !== epoch) throw staleEpochError();
   pointerTimeout(deadlineAt);
-  const navigation = await observeActionNavigation(page, deadlineAt);
+  const navigation = existingNavigation ?? await observeActionNavigation(page, deadlineAt);
+  const ownsNavigation = !existingNavigation;
   const interrupted = () => expectedEpoch !== epoch || navigation.started;
   let downAttempted = false;
   let failure;
   try {
     if (expectedEpoch !== epoch) throw staleEpochError();
-    try {
-      pointerTimeout(deadlineAt);
-      await page.mouse.move(source.x, source.y);
-      if (!interrupted()) {
+    if (!navigation.started) {
+      try {
         pointerTimeout(deadlineAt);
-        downAttempted = true;
-        await page.mouse.down({ button });
-        let current = source;
-        if (!interrupted() && typeof destination === 'function') {
-          const viewport = page.viewportSize();
-          current = {
-            x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
-            y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
-          };
-          pointerTimeout(deadlineAt);
-          await page.mouse.move(current.x, current.y);
-          if (!interrupted()) destination = await destination();
-        }
+        await page.mouse.move(source.x, source.y);
         if (!interrupted()) {
-          for (let step = 1; step <= 12; step++) {
-            if (interrupted()) break;
+          pointerTimeout(deadlineAt);
+          downAttempted = true;
+          await page.mouse.down({ button });
+          let current = source;
+          if (!interrupted() && typeof destination === 'function') {
+            const viewport = page.viewportSize();
+            current = {
+              x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
+              y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
+            };
             pointerTimeout(deadlineAt);
-            await page.mouse.move(
-              current.x + (destination.x - current.x) * step / 12,
-              current.y + (destination.y - current.y) * step / 12,
-            );
+            await page.mouse.move(current.x, current.y);
+            if (!interrupted()) destination = await destination();
+          }
+          if (!interrupted()) {
+            for (let step = 1; step <= 12; step++) {
+              if (interrupted()) break;
+              pointerTimeout(deadlineAt);
+              await page.mouse.move(
+                current.x + (destination.x - current.x) * step / 12,
+                current.y + (destination.y - current.y) * step / 12,
+              );
+            }
           }
         }
-      }
-    } catch (error) {
-      if (!interrupted()) failure = error;
-    } finally {
-      if (downAttempted) {
-        // Clear button state without finishing the old gesture on a new page.
-        if (interrupted()) await page.mouse.move(-1, -1).catch(() => {});
-        await page.mouse.up({ button }).catch(() => {});
+      } catch (error) {
+        if (!interrupted()) failure = error;
+      } finally {
+        if (downAttempted) {
+          // Clear button state without finishing the old gesture on a new page.
+          if (interrupted()) await page.mouse.move(-1, -1).catch(() => {});
+          await page.mouse.up({ button }).catch(() => {});
+        }
       }
     }
-    await navigation.finish();
+    if (ownsNavigation) await navigation.finish();
     if (failure) throw failure;
   } finally {
-    navigation.dispose();
+    if (ownsNavigation) navigation.dispose();
   }
 }
 
@@ -771,34 +776,48 @@ async function command(action, args = {}) {
       page = requireActiveTab().page;
       const sourceSelector = pointerSelector(args.source_selector);
       const targetSelector = pointerSelector(args.target_selector);
-      await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
-        await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
-          await source.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
-          checkEpoch(args);
-          const from = await source.boundingBox();
-          const to = await destination.boundingBox();
-          if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
-          const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
-          const viewport = page.viewportSize();
-          const targetX = to.x + to.width / 2;
-          const targetY = to.y + to.height / 2;
-          const targetVisible = targetX >= 0 && targetY >= 0 &&
-            targetX < viewport.width && targetY < viewport.height;
-          const end = targetVisible
-            ? pointerPoint({ x: targetX, y: targetY }, 'x', 'y', page)
-            : async () => {
-              // Begin the drag on the visible source before scrolling a distant
-              // destination into view; both elements need not fit together.
-              await destination.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
-              const box = await destination.boundingBox();
-              if (!box) throw targetError('target_not_found', 'browser drag target is detached');
-              return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
-            };
-          checkEpoch(args);
-          await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt);
-        }, deadlineAt);
-      }, deadlineAt);
-      return state();
+      const navigation = await observeActionNavigation(page, deadlineAt);
+      try {
+        checkEpoch(args);
+        try {
+          await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
+            await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
+              await source.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+              // A page scroll handler can start navigation before the first
+              // mouse event, while the old document still owns the epoch.
+              await new Promise(resolve => setTimeout(resolve, 50));
+              if (navigation.started || args.expected_epoch !== epoch) return;
+              const from = await source.boundingBox();
+              const to = await destination.boundingBox();
+              if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
+              const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
+              const viewport = page.viewportSize();
+              const targetX = to.x + to.width / 2;
+              const targetY = to.y + to.height / 2;
+              const targetVisible = targetX >= 0 && targetY >= 0 &&
+                targetX < viewport.width && targetY < viewport.height;
+              const end = targetVisible
+                ? pointerPoint({ x: targetX, y: targetY }, 'x', 'y', page)
+                : async () => {
+                  // Begin the drag on the visible source before scrolling a distant
+                  // destination into view; both elements need not fit together.
+                  await destination.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+                  const box = await destination.boundingBox();
+                  if (!box) throw targetError('target_not_found', 'browser drag target is detached');
+                  return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
+                };
+              checkEpoch(args);
+              await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt, navigation);
+            }, deadlineAt);
+          }, deadlineAt);
+        } catch (error) {
+          if (!navigation.started && args.expected_epoch === epoch) throw error;
+        }
+        await navigation.finish();
+        return state();
+      } finally {
+        navigation.dispose();
+      }
     }
     case 'drag_at': {
       const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
