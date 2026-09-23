@@ -249,14 +249,43 @@ fn is_browser_display_tool_name(tool_name: &str) -> bool {
         .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
 }
 
+fn is_browser_eval_display_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser_eval"))
+}
+
 /// Return only a display copy. The original assistant arguments stay in the
-/// session for exact decision validation and approved replay, but focused
-/// browser input must not reach the TUI permission preview through this API.
+/// session for exact decision validation and approved replay, but private
+/// browser input and page script source must not reach permission previews.
 fn pending_tool_arguments_for_display(
     session: &Session,
     pending: &PendingQuestion,
     request: Option<&PermissionRequest>,
 ) -> Option<(serde_json::Value, bool, bool)> {
+    if is_browser_eval_display_tool_name(&pending.tool_name)
+        || request.is_some_and(|request| is_browser_eval_display_tool_name(&request.tool_name))
+    {
+        let raw = pending_tool_argument_text(session, pending.tool_call_id.as_str())?;
+        if raw.len() > MAX_PENDING_TOOL_ARGUMENT_BYTES {
+            return Some((serde_json::json!({"arguments":"[omitted]"}), true, false));
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(parsed) => parsed,
+            Err(_) => return Some((serde_json::json!({"arguments":"[omitted]"}), true, false)),
+        };
+        return Some((
+            serde_json::json!({
+                "code":"[redacted]",
+                "expected_url":"[redacted]",
+                "expected_epoch":parsed.get("expected_epoch").and_then(serde_json::Value::as_u64),
+            }),
+            false,
+            false,
+        ));
+    }
     if !is_browser_display_tool_name(&pending.tool_name) {
         return pending_tool_arguments(session, pending.tool_call_id.as_str())
             .map(|(args, truncated)| (args, truncated, false));
@@ -376,7 +405,11 @@ pub async fn get_pending_question(
             // cannot be inspected safely; it may quote private input.
             let browser_arguments_unavailable = interaction.kind
                 == PendingInteractionKind::Permission
-                && is_browser_display_tool_name(&pending.tool_name)
+                && (is_browser_display_tool_name(&pending.tool_name)
+                    || is_browser_eval_display_tool_name(&pending.tool_name)
+                    || interaction.permission_request.as_ref().is_some_and(|request| {
+                        is_browser_eval_display_tool_name(&request.tool_name)
+                    }))
                 && bounded_tool_arguments
                     .as_ref()
                     .is_none_or(|(_, truncated, _)| *truncated);
@@ -394,11 +427,16 @@ pub async fn get_pending_question(
                 .as_ref()
                 .and_then(|arguments| arguments.get("action").and_then(serde_json::Value::as_str))
                 == Some("dialog_respond");
+            let browser_eval = is_browser_eval_display_tool_name(&pending.tool_name)
+                || interaction.permission_request.as_ref().is_some_and(|request| {
+                    is_browser_eval_display_tool_name(&request.tool_name)
+                });
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
-                    if request.is_focused_browser_input()
+                    if request.has_private_browser_resource()
                         || native_browser_select
                         || dialog_response
+                        || browser_eval
                         || browser_arguments_unavailable
                     {
                         // Keep the exact request registered for receipt matching,
@@ -406,6 +444,8 @@ pub async fn get_pending_question(
                         request.resource = "[redacted]".to_string();
                         request.operation_summary = if dialog_response {
                             "Answer pending browser dialog"
+                        } else if browser_eval {
+                            "Execute browser page JavaScript"
                         } else if native_browser_select {
                             "Select native browser options"
                         } else {
@@ -428,6 +468,8 @@ pub async fn get_pending_question(
                     "Approve focused browser input?"
                 } else if native_browser_select {
                     "Approve native browser selection?"
+                } else if browser_eval {
+                    "Approve browser page JavaScript on the active page?"
                 } else {
                     pending.question.as_str()
                 },
@@ -517,6 +559,10 @@ mod http_tests {
         tool_name: &str,
         arguments: &str,
     ) -> Message {
+        assistant_named_tool_call(tool_name, tool_call_id, arguments)
+    }
+
+    fn assistant_named_tool_call(tool_name: &str, tool_call_id: &str, arguments: &str) -> Message {
         Message::assistant(
             "",
             Some(vec![ToolCall {
@@ -1030,6 +1076,102 @@ mod http_tests {
                 );
             }
         }
+    }
+
+    #[actix_web::test]
+    async fn get_pending_question_redacts_browser_eval_source_url_and_resource() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "browser-eval-pending-display";
+        let tool_call_id = "browser-eval-call";
+        let source = "document.querySelector('#password').value = 'private-source'";
+        let url = "https://example.com/account?token=private-query";
+        let original_args = serde_json::json!({
+            "code":source,
+            "expected_url":url,
+            "expected_epoch":17,
+        })
+        .to_string();
+        let mut request = permission_request(session_id, tool_call_id);
+        request.tool_name = "browser_eval".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = "browser_eval:17:private-fingerprint".to_string();
+        request.operation_summary = "Execute browser page JavaScript on https://example.com".into();
+        request.suggested_matchers[0].value = request.resource.clone();
+        let matcher_id = request.suggested_matchers[0].id.clone();
+        let mut session = Session::new(session_id, "test-model");
+        session.messages.push(assistant_named_tool_call(
+            "browser_eval",
+            tool_call_id,
+            &original_args,
+        ));
+        session.messages.push(Message::tool_result(
+            tool_call_id,
+            serde_json::json!({
+                "status":"awaiting_permission_approval",
+                "question":"Approve browser page JavaScript?",
+                "permission_request":request,
+            })
+            .to_string(),
+        ));
+        session.set_pending_question_with_source(
+            tool_call_id.to_string(),
+            "browser_eval".to_string(),
+            "Approve browser page JavaScript?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+            PendingQuestionSource::PauseTool,
+        );
+        state.save_and_cache_session(&mut session).await;
+
+        let response = get_pending_question(state, web::Path::from(session_id.to_string()))
+            .await
+            .expect("pending response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(
+            body["question"],
+            "Approve browser page JavaScript on the active page?"
+        );
+        assert_eq!(
+            body["tool_arguments"],
+            serde_json::json!({
+                "code":"[redacted]",
+                "expected_url":"[redacted]",
+                "expected_epoch":17,
+            })
+        );
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert_eq!(
+            body["permission_request"]["suggested_matchers"][0]["id"],
+            matcher_id
+        );
+        assert_eq!(
+            body["permission_request"]["suggested_matchers"][0]["value"],
+            "[redacted]"
+        );
+        for secret in [
+            "#password",
+            "private-source",
+            "private-query",
+            "private-fingerprint",
+        ] {
+            assert!(!body.to_string().contains(secret));
+        }
+        assert_eq!(
+            pending_tool_arguments_exact(&session, tool_call_id).unwrap()["code"],
+            source
+        );
+        assert_eq!(
+            pending_tool_arguments_exact(&session, tool_call_id).unwrap()["expected_url"],
+            url
+        );
     }
 
     #[actix_web::test]
