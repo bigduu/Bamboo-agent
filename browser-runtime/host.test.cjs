@@ -1214,11 +1214,24 @@ test('unanswered dialog expires and a pending dialog dismisses on host close', a
 
 test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
   let slowReloadRequests = 0;
+  let releaseSlowPopup;
+  const slowPopupGate = new Promise(resolve => { releaseSlowPopup = resolve; });
+  let markSlowPopupStarted;
+  const slowPopupStarted = new Promise(resolve => { markSlowPopupStarted = resolve; });
   let releaseSlowReload;
   const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve; });
   let markSlowReloadStarted;
   const slowReloadStarted = new Promise(resolve => { markSlowReloadStarted = resolve; });
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/slow-popup-eval') {
+      markSlowPopupStarted();
+      void slowPopupGate.then(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end('<title>Popup destination</title><main>New popup tab</main>');
+      });
+      return;
+    }
     if (request.url === '/slow-reload') {
       slowReloadRequests++;
       const sendPage = () => {
@@ -1484,8 +1497,43 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     const slowResult = await slowResultPromise;
     assert.equal(slowResult.code, 'stale_epoch', JSON.stringify(slowResult));
     assert.ok(slowReloadRequests >= 2);
+
+    let popupReady;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      popupReady = (await call('state')).result;
+      if (popupReady.page_epoch !== slowPage.page_epoch) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.notEqual(popupReady.page_epoch, slowPage.page_epoch, 'reload committed before popup eval');
+    const popupResult = await call('eval', {
+      expected_epoch: popupReady.page_epoch, expected_url: slowUrl,
+      code: '(() => { window.open("/slow-popup-eval", "_blank"); return "old-tab"; })()',
+    });
+    assert.equal(popupResult.code, 'stale_epoch', JSON.stringify(popupResult));
+    let popupTimer;
+    try {
+      await Promise.race([
+        slowPopupStarted,
+        new Promise((_, reject) => {
+          popupTimer = setTimeout(() => reject(new Error('slow eval popup did not start')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(popupTimer);
+    }
+    releaseSlowPopup();
+    let popupState;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      popupState = (await call('state')).result;
+      if (popupState.tabs.length === 2 && popupState.url.endsWith('/slow-popup-eval')) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(popupState.tabs.length, 2);
+    assert.match(popupState.url, /\/slow-popup-eval$/);
+    assert.notEqual(popupState.active_tab_id, popupReady.active_tab_id);
   } finally {
     releaseSlowReload();
+    releaseSlowPopup();
     await call('close').catch(() => {});
     host.stdin.end();
     host.kill();

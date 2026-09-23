@@ -411,8 +411,15 @@ async function evalInActivePage(args) {
   checkEvalArgs(args);
   const tab = requireActiveTab();
   const page = tab.page;
+  let popupStarted = false;
+  let cdp;
+  const onWindowOpen = () => { popupStarted = true; };
+  const onPopup = () => { popupStarted = true; };
   const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
     !page.isClosed() && page.url() === args.expected_url &&
+    // Playwright can adopt a popup after window.open returns if its destination
+    // response is slow. CDP reports the intent before the new tab is visible.
+    !popupStarted &&
     // A same-URL reload can keep the old URL/epoch until its slow response
     // commits. Never return a value from the document being replaced.
     tab.pendingNavigations.size === 0;
@@ -422,8 +429,12 @@ async function evalInActivePage(args) {
     // Playwright's page.evaluate compiles its callback through the page's
     // mutable window.eval. CDP compiles this fixed call independently while
     // the protected helper still evaluates the model source in the page realm.
-    const cdp = await tab.cdp;
+    cdp = await tab.cdp;
     if (!cdp) throw new Error('browser_eval page session unavailable');
+    page.on('popup', onPopup);
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (!unchanged()) throw staleEpochError();
     const expression = `window[${JSON.stringify(EVAL_HELPER_KEY)}](${JSON.stringify(args.code)})`;
     const reply = await cdp.send('Runtime.evaluate', {
       expression, awaitPromise: true, returnByValue: true,
@@ -454,6 +465,9 @@ async function evalInActivePage(args) {
     const boundedError = new Error(bounded(String(error?.message || error), 2048));
     boundedError.code = 'browser_eval_error';
     throw boundedError;
+  } finally {
+    page.off('popup', onPopup);
+    cdp?.off('Page.windowOpen', onWindowOpen);
   }
   if (!unchanged()) throw staleEpochError();
   const value = validateEvalResult(transferred);
