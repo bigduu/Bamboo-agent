@@ -250,6 +250,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_agent_advertises_browser_eval_only_for_current_chat() {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError, ToolExecutionContext};
+
+        let (_temp, state) = make_state().await;
+        let root = state.tools_for(ToolSurface::Root);
+        let schema = root
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "browser_eval")
+            .expect("root browser_eval schema");
+        assert!(schema.function.parameters["properties"]
+            .get("session_id")
+            .is_none());
+        assert!(!state
+            .tools_for(ToolSurface::Child)
+            .list_tools()
+            .iter()
+            .any(|schema| schema.function.name == "browser_eval"));
+
+        let call = ToolCall {
+            id: "browser-eval-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "browser_eval".into(),
+                arguments: serde_json::json!({
+                    "code":"1",
+                    "expected_epoch":17,
+                    "expected_url":"about:blank",
+                    "session_id":"other-chat"
+                })
+                .to_string(),
+            },
+        };
+        let mut context = ToolExecutionContext::none(&call.id);
+        context.session_id = Some("current-chat");
+        assert!(matches!(
+            root.execute_with_context(&call, context).await,
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn root_browser_eval_changes_the_same_page_as_dom_and_screenshot() {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
+
+        const PAGE: &str = r#"<!doctype html><title>Shared page</title>
+<button id="increment">Increment</button><output id="count">Count 0</output>"#;
+        let (url, fixture) = browser_regression_fixture(&[("/", PAGE)]).await;
+        let (_temp, state) = make_state().await;
+        let chat = "browser-eval-shared-chat";
+        let opened = state.browser.open(chat).await.unwrap();
+        let navigated = state
+            .browser
+            .command(
+                chat,
+                "navigate",
+                serde_json::json!({"url":url,"expected_epoch":opened["page_epoch"]}),
+            )
+            .await
+            .unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        let root = state.tools_for(ToolSurface::Root);
+        let dispatch = |code: &str, expected_epoch: u64, expected_url: &str| ToolCall {
+            id: "browser-eval-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "browser_eval".into(),
+                arguments: serde_json::json!({
+                    "code":code,
+                    "expected_epoch":expected_epoch,
+                    "expected_url":expected_url
+                })
+                .to_string(),
+            },
+        };
+        let call = dispatch(
+            "(() => { document.querySelector('#count').textContent = 'Count 7'; return {title:document.title,count:document.querySelector('#count').textContent}; })()",
+            epoch,
+            &url,
+        );
+        let mut context = ToolExecutionContext::none(&call.id);
+        context.session_id = Some(chat);
+        context.bypass_permissions = true;
+        let result: serde_json::Value = serde_json::from_str(
+            &root
+                .execute_with_context(&call, context)
+                .await
+                .unwrap()
+                .result,
+        )
+        .unwrap();
+        assert_eq!(result["page_epoch"], epoch);
+        assert_eq!(result["url"], url);
+        assert_eq!(
+            result["value"],
+            serde_json::json!({"title":"Shared page","count":"Count 7"})
+        );
+        let dom = state
+            .browser
+            .command(chat, "dom", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(dom["page_epoch"], epoch);
+        assert!(dom["snapshot"].as_str().unwrap().contains("Count 7"));
+        let screenshot = state
+            .browser
+            .command(chat, "screenshot", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(screenshot["page_epoch"], epoch);
+        assert_eq!(screenshot["active_tab_id"], result["active_tab_id"]);
+        assert!(screenshot["data"].as_str().unwrap().len() > 1000);
+
+        let other = "browser-eval-other-chat";
+        let other_state = state.browser.open(other).await.unwrap();
+        let cross_chat = dispatch("document.title", epoch, &url);
+        let mut other_context = ToolExecutionContext::none(&cross_chat.id);
+        other_context.session_id = Some(other);
+        other_context.bypass_permissions = true;
+        assert!(root
+            .execute_with_context(&cross_chat, other_context)
+            .await
+            .is_err());
+        assert_eq!(
+            state.browser.state(other).await.unwrap()["page_epoch"],
+            other_state["page_epoch"]
+        );
+        assert_eq!(
+            state.browser.state(other).await.unwrap()["url"],
+            "about:blank"
+        );
+
+        let stale_url = dispatch("document.title", epoch, &format!("{url}other"));
+        let mut context = ToolExecutionContext::none(&stale_url.id);
+        context.session_id = Some(chat);
+        context.bypass_permissions = true;
+        assert!(root
+            .execute_with_context(&stale_url, context)
+            .await
+            .is_err());
+        state.browser.close(chat).await.unwrap();
+        state.browser.close(other).await.unwrap();
+        fixture.abort();
+    }
+
+    #[tokio::test]
     #[ignore = "requires BAMBOO_BROWSER_TEST_URL and the Playwright Chromium runtime"]
     async fn root_agent_browser_actions_share_the_workbench_page() {
         use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};

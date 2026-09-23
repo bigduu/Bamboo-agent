@@ -17,6 +17,7 @@ use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 const BROWSER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const BROWSER_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BROWSER_COMMAND_DEADLINE: Duration = Duration::from_secs(30);
+const BROWSER_EVAL_DEADLINE: Duration = Duration::from_secs(5);
 const BROWSER_REAP_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
@@ -514,6 +515,7 @@ mod tests {
             "tab_create",
             "tab_activate",
             "tab_close",
+            "eval",
             "future_action",
         ] {
             assert!(action_may_mutate_browser(action), "{action}");
@@ -1162,6 +1164,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn browser_eval_deadline_retires_sync_loop_and_unsettled_promise() {
+        let browser = BrowserManager::default();
+        let unaffected = browser.open("unaffected-chat").await.unwrap();
+        let mut previous_epoch = None;
+
+        for code in ["for (;;) {}", "new Promise(() => {})"] {
+            let opened = browser.open("eval-hung-chat").await.unwrap();
+            let epoch = opened["page_epoch"].as_u64().unwrap();
+            if let Some(previous_epoch) = previous_epoch {
+                assert_ne!(epoch, previous_epoch);
+            }
+            let old_host = browser.sessions.lock().await["eval-hung-chat"].clone();
+            let started = std::time::Instant::now();
+            let result = browser
+                .eval(
+                    "eval-hung-chat",
+                    json!({
+                        "code":code,
+                        "expected_epoch":epoch,
+                        "expected_url":"about:blank"
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(BrowserError::Failed(message)) if message.contains("timed out")),
+                "script should time out: {result:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(8));
+            assert!(!browser.sessions.lock().await.contains_key("eval-hung-chat"));
+            assert!(old_host.child.lock().unwrap().try_wait().unwrap().is_some());
+            assert_eq!(
+                browser.state("unaffected-chat").await.unwrap()["page_epoch"],
+                unaffected["page_epoch"]
+            );
+            previous_epoch = Some(epoch);
+        }
+
+        let reopened = browser.open("eval-hung-chat").await.unwrap();
+        assert_ne!(
+            reopened["page_epoch"].as_u64().unwrap(),
+            previous_epoch.unwrap()
+        );
+        browser.close("eval-hung-chat").await.unwrap();
+        browser.close("unaffected-chat").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn browser_host_environment_drops_parent_secrets() {
         let mut command = Command::new("/usr/bin/env");
         command.env("OPENAI_API_KEY", "sentinel-do-not-inherit");
@@ -1382,6 +1433,13 @@ impl BrowserManager {
         args: Value,
     ) -> Result<Value, BrowserError> {
         self.command_with_deadline(session_id, action, args, BROWSER_COMMAND_DEADLINE)
+            .await
+    }
+
+    /// Page-realm scripting is a separate, mutating capability with a shorter
+    /// total stdin/write/response deadline. #1220 retires a timed-out host.
+    pub async fn eval(&self, session_id: &str, args: Value) -> Result<Value, BrowserError> {
+        self.command_with_deadline(session_id, "eval", args, BROWSER_EVAL_DEADLINE)
             .await
     }
 

@@ -891,3 +891,82 @@ test('navigation during observer setup rejects stale hover and drag before point
     await once(fixture, 'close');
   }
 });
+
+test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
+  const fixture = http.createServer((request, response) => {
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': "script-src 'self'",
+    });
+    response.end(request.url === '/next'
+      ? '<title>Next</title><main>New page</main>'
+      : '<title>Eval</title><output>0</output>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const url = `http://127.0.0.1:${fixture.address().port}/`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 30_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const navigated = (await call('navigate', { url, expected_epoch: initial.page_epoch })).result;
+    const expected = { expected_epoch: navigated.page_epoch, expected_url: url };
+    const read = await call('eval', { ...expected, code: 'document.querySelector("output").textContent' });
+    assert.equal(read.ok, true);
+    assert.equal(read.result.value, '0');
+    assert.equal(read.result.url, url);
+    assert.equal(read.result.active_tab_id, navigated.active_tab_id);
+    assert.equal((await call('eval', { ...expected, code: 'typeof process' })).result.value, 'undefined');
+
+    const changed = await call('eval', {
+      ...expected,
+      code: '(() => { const output = document.querySelector("output"); output.textContent = "1"; return {count: 1, ok: true}; })()',
+    });
+    assert.equal(changed.ok, true);
+    assert.deepEqual(changed.result.value, { count: 1, ok: true });
+    const dom = (await call('dom')).result;
+    const screenshot = (await call('screenshot')).result;
+    assert.match(dom.html, /<output>1<\/output>/);
+    assert.equal(dom.page_epoch, changed.result.page_epoch);
+    assert.equal(screenshot.page_epoch, changed.result.page_epoch);
+    assert.equal(screenshot.active_tab_id, changed.result.active_tab_id);
+    assert.ok(Buffer.from(screenshot.data, 'base64').length > 1000);
+
+    assert.equal((await call('eval', { ...expected, expected_url: `${url}wrong`, code: '1' })).code, 'stale_epoch');
+    assert.equal((await call('eval', { ...expected, expected_epoch: initial.page_epoch, code: '1' })).code, 'stale_epoch');
+    assert.equal((await call('eval', { ...expected, code: 'x'.repeat(8193) })).code, 'invalid_request');
+    assert.equal((await call('eval', { ...expected, code: '(() => { const x = {}; x.self = x; return x; })()' })).code, 'browser_eval_error');
+    assert.equal((await call('eval', { ...expected, code: '"x".repeat(70000)' })).code, 'browser_eval_error');
+    const exception = await call('eval', { ...expected, code: 'throw new Error("E".repeat(5000))' });
+    assert.equal(exception.code, 'browser_eval_error');
+    assert.ok(exception.error.length <= 2048);
+    const navigation = await call('eval', {
+      ...expected,
+      code: '(() => { location.href = "/next"; return new Promise(resolve => setTimeout(() => resolve("old"), 200)); })()',
+    });
+    assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
+    assert.match((await call('dom')).result.html, /New page/);
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});

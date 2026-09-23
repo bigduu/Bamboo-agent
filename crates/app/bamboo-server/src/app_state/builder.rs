@@ -973,6 +973,11 @@ impl AppState {
                 tools,
                 Arc::new(crate::tools::BrowserTool::new(browser.clone())),
             ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(crate::tools::BrowserEvalTool::new(browser.clone())),
+            ));
 
         child_completion_coordinator
             .set_root_tools(tools.clone())

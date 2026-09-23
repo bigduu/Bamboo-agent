@@ -610,6 +610,59 @@ pub fn check_permissions(
                 format!("Web fetch: {}", url),
             )]))
         }
+        "browser_eval" => {
+            if args.get("session_id").is_some() {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval session is bound to the current chat".into(),
+                ));
+            }
+            let code = required_string_arg(args, "code")?;
+            if code.trim().is_empty() || code.len() > 8 * 1024 {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval code must be nonempty and at most 8 KiB".into(),
+                ));
+            }
+            let epoch = args
+                .get("expected_epoch")
+                .and_then(Value::as_u64)
+                .filter(|epoch| *epoch < (1_u64 << 53))
+                .ok_or_else(|| {
+                    PermissionError::CheckFailed(
+                        "browser_eval requires a safe expected_epoch".into(),
+                    )
+                })?;
+            let expected_url = required_string_arg(args, "expected_url")?;
+            if expected_url.len() > 8 * 1024 {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval expected_url exceeds 8 KiB".into(),
+                ));
+            }
+            let display_origin = if expected_url == "about:blank" {
+                "about:blank".to_string()
+            } else {
+                let parsed = url::Url::parse(expected_url).map_err(|error| {
+                    PermissionError::CheckFailed(format!("invalid browser_eval URL: {error}"))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
+                    return Err(PermissionError::CheckFailed(
+                        "browser_eval requires an http(s) URL without credentials or about:blank"
+                            .into(),
+                    ));
+                }
+                parsed.origin().ascii_serialization()
+            };
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::BrowserInteraction,
+                format!(
+                    "browser_eval:{epoch}:{}",
+                    browser_eval_fingerprint(expected_url, code)
+                ),
+                format!("Execute browser page JavaScript on {display_origin}"),
+            )]))
+        }
         "browser" => {
             let action = required_string_arg(args, "action")?;
             match action {
@@ -1105,6 +1158,72 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn browser_eval_grants_bind_exact_code_url_and_epoch_without_exposing_source() {
+        let args = json!({
+            "code":"document.querySelector('#password').value = 'secret-value'",
+            "expected_epoch":17,
+            "expected_url":"https://example.com/account?token=private-query"
+        });
+        let context = check_permissions("browser_eval", &args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert_eq!(context.permission_type, PermissionType::BrowserInteraction);
+        assert!(context.resource.starts_with("browser_eval:17:"));
+        assert_eq!(
+            context.operation_description,
+            "Execute browser page JavaScript on https://example.com"
+        );
+        for secret in ["#password", "secret-value", "private-query"] {
+            assert!(!context.resource.contains(secret));
+            assert!(!context.operation_description.contains(secret));
+        }
+        assert_eq!(
+            context.resource,
+            check_permissions("browser_eval", &args).unwrap().unwrap()[0].resource
+        );
+        for changed in [
+            json!({"code":"document.title","expected_epoch":17,"expected_url":"https://example.com/account?token=private-query"}),
+            json!({"code":"document.querySelector('#password').value = 'secret-value'","expected_epoch":18,"expected_url":"https://example.com/account?token=private-query"}),
+            json!({"code":"document.querySelector('#password').value = 'secret-value'","expected_epoch":17,"expected_url":"https://example.com/other"}),
+        ] {
+            assert_ne!(
+                context.resource,
+                check_permissions("browser_eval", &changed)
+                    .unwrap()
+                    .unwrap()[0]
+                    .resource
+            );
+        }
+        assert_eq!(
+            check_permissions(
+                "browser_eval",
+                &json!({
+                    "code":"1","expected_epoch":17,"expected_url":"about:blank"
+                })
+            )
+            .unwrap()
+            .unwrap()[0]
+                .permission_type,
+            PermissionType::BrowserInteraction
+        );
+    }
+
+    #[test]
+    fn browser_eval_rejects_unbounded_or_unsafe_requests_before_approval() {
+        for args in [
+            json!({"code":" ","expected_epoch":17,"expected_url":"about:blank"}),
+            json!({"code":"x".repeat(8193),"expected_epoch":17,"expected_url":"about:blank"}),
+            json!({"code":"1","expected_url":"about:blank"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"file:///secret"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"https://user:password@example.com/"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"about:blank","session_id":"other"}),
+        ] {
+            assert!(check_permissions("browser_eval", &args).is_err(), "{args}");
+        }
+    }
 
     #[test]
     fn browser_navigation_and_interaction_use_distinct_scoped_permissions() {
