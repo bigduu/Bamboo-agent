@@ -343,6 +343,31 @@ function pointerButton(value) {
   return button;
 }
 
+async function assertDragPoint(handle, point, deadlineAt, trial) {
+  const hitsTarget = () => handle.evaluate((element, { x, y }) => {
+    let hit = element.ownerDocument.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (let node = hit; node; node = node.parentNode ?? node.getRootNode()?.host) {
+      if (node === element) return true;
+    }
+    return false;
+  }, point);
+  pointerTimeout(deadlineAt);
+  try {
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+    // Trial performs Playwright's receives-events checks before mouse-down.
+    // During an active drag, use the exact hit test without altering mouse state.
+    if (trial) await handle.click({ trial: true, scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+  } catch {
+    throw targetError('target_not_actionable', 'browser drag target is obscured or detached');
+  }
+}
+
 async function observeActionNavigation(page, deadlineAt) {
   let started = false;
   let committed = false;
@@ -509,21 +534,24 @@ async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
   }
 }
 
-async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt, existingNavigation) {
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt, existingNavigation, validateTarget) {
   if (expectedEpoch !== epoch) throw staleEpochError();
   pointerTimeout(deadlineAt);
   const navigation = existingNavigation ?? await observeActionNavigation(page, deadlineAt);
   const ownsNavigation = !existingNavigation;
   const interrupted = () => expectedEpoch !== epoch || navigation.started;
   let downAttempted = false;
+  let safeDrop = false;
   let failure;
   try {
     if (expectedEpoch !== epoch) throw staleEpochError();
     if (!navigation.started) {
       try {
+        if (validateTarget) await validateTarget('source', source);
         pointerTimeout(deadlineAt);
         await page.mouse.move(source.x, source.y);
         if (!interrupted()) {
+          if (validateTarget) await validateTarget('source', source);
           pointerTimeout(deadlineAt);
           downAttempted = true;
           await page.mouse.down({ button });
@@ -539,6 +567,7 @@ async function dragBetween(page, source, destination, expectedEpoch, button = 'l
             if (!interrupted()) destination = await destination();
           }
           if (!interrupted()) {
+            if (validateTarget) await validateTarget('destination', destination);
             for (let step = 1; step <= 12; step++) {
               if (interrupted()) break;
               pointerTimeout(deadlineAt);
@@ -547,14 +576,19 @@ async function dragBetween(page, source, destination, expectedEpoch, button = 'l
                 current.y + (destination.y - current.y) * step / 12,
               );
             }
+            if (!interrupted()) {
+              if (validateTarget) await validateTarget('destination', destination);
+              safeDrop = true;
+            }
           }
         }
       } catch (error) {
         if (!interrupted()) failure = error;
       } finally {
         if (downAttempted) {
-          // Clear button state without finishing the old gesture on a new page.
-          if (interrupted()) await page.mouse.move(-1, -1).catch(() => {});
+          // Clear button state without finishing a rejected gesture over an
+          // unrelated overlay or on a new page.
+          if (interrupted() || !safeDrop) await page.mouse.move(-1, -1).catch(() => {});
           await page.mouse.up({ button }).catch(() => {});
         }
       }
@@ -817,7 +851,9 @@ async function command(action, args = {}) {
                   return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
                 };
               checkEpoch(args);
-              await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt, navigation);
+              await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt, navigation,
+                (kind, point) => assertDragPoint(kind === 'source' ? source : destination, point, deadlineAt,
+                  kind === 'source'));
             }, deadlineAt);
           }, deadlineAt);
         } catch (error) {

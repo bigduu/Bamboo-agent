@@ -333,6 +333,22 @@ test('hover and straight drag change the shared page and reject stale coordinate
       addEventListener('mousedown',()=>fetch('/bad-pointer'))</script>`);
       return;
     }
+    if (request.url?.startsWith('/covered-drag?')) {
+      const covered = new URL(request.url, 'http://fixture').searchParams.get('at');
+      const left = covered === 'source' ? 20 : 220;
+      const width = covered === 'source' ? 80 : 100;
+      response.end(`<!doctype html><style>
+        body { margin: 0; }
+        #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; }
+        #drop { position: absolute; left: 220px; top: 80px; width: 100px; height: 80px; }
+        #cover { position: fixed; left: ${left}px; top: 80px; width: ${width}px; height: 80px; z-index: 9; }
+      </style><div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','source')">Drag</div>
+      <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#dropped').textContent='yes'">Drop</div>
+      <div id="cover" onmousedown="markOverlay()" onmouseup="markOverlay()" ondrop="markOverlay()"></div>
+      <output id="overlay-events">0</output><output id="dropped">idle</output>
+      <script>function markOverlay(){const out=document.querySelector('#overlay-events');out.textContent=String(Number(out.textContent)+1)}</script>`);
+      return;
+    }
     if (request.url === '/after-drop') {
       response.end('<main>After drop navigation</main>');
       return;
@@ -635,6 +651,20 @@ test('hover and straight drag change the shared page and reject stale coordinate
     assert.match(scrolled.result.url, /\/slow-scroll-navigation$/);
     assert.notEqual(scrolled.result.page_epoch, scrollReady.result.page_epoch);
     assert.equal(wrongPagePointerEvents, 0, 'scroll-triggered navigation must prevent mouse down');
+
+    for (const covered of ['source', 'destination']) {
+      const ready = await call('navigate', {
+        url: url + `covered-drag?at=${covered}`, expected_epoch: (await call('state')).result.page_epoch,
+      });
+      assert.equal(ready.ok, true);
+      const rejected = await call('drag_selector', {
+        source_selector: '#source', target_selector: '#drop', expected_epoch: ready.result.page_epoch,
+      });
+      assert.equal(rejected.code, 'target_not_actionable', `${covered}: ${JSON.stringify(rejected)}`);
+      const html = (await call('dom')).result.html;
+      assert.match(html, /<output id="overlay-events">0<\/output>/, covered);
+      assert.match(html, /<output id="dropped">idle<\/output>/, covered);
+    }
 
     // Target discovery and actionability consume the same budget as the slow
     // navigation they trigger. Rust would retire this host at 30 seconds.
