@@ -43,7 +43,7 @@ fn parse_warning_log_details<'a>(
     args_raw: &str,
     warning: &'a str,
 ) -> (String, &'a str) {
-    if execution_name.eq_ignore_ascii_case("browser") {
+    if canonical_tool_name(execution_name).eq_ignore_ascii_case("browser") {
         // A repaired JSON warning embeds its own preview, so both strings
         // must be hidden when browser input may contain focused typed text.
         ("[redacted]".to_string(), "[redacted]")
@@ -1069,6 +1069,10 @@ mod tests {
         let (preview, logged_warning) = parse_warning_log_details("browser", raw, &warning);
         assert_eq!(preview, "[redacted]");
         assert_eq!(logged_warning, "[redacted]");
+        let (preview, logged_warning) =
+            parse_warning_log_details("default::browser", raw, &warning);
+        assert_eq!(preview, "[redacted]");
+        assert_eq!(logged_warning, "[redacted]");
         let (ordinary_preview, ordinary_warning) =
             parse_warning_log_details("Write", raw, &warning);
         assert!(ordinary_preview.contains("private browser input"));
@@ -1089,6 +1093,10 @@ mod tests {
         let original = args.clone();
         let display = approval_parameters_for_display("browser", &args);
         assert_eq!(display, json!({"action":"select_option"}));
+        assert_eq!(
+            approval_parameters_for_display("default::browser", &args),
+            json!({"action":"select_option"})
+        );
         assert_eq!(args, original);
         assert!(!display.to_string().contains("private-option-value"));
         assert!(!display.to_string().contains("data-private"));

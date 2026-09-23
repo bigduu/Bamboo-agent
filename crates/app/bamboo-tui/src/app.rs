@@ -2614,8 +2614,16 @@ pub struct PermissionQuestion {
 
 /// Mirror the server's private browser resource boundary for presentation.
 /// TUI API types are intentionally independent of the server permission crate.
+fn is_browser_display_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+}
+
 fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(tool_name) {
         return false;
     }
     let mut parts = resource.splitn(4, ':');
@@ -2636,7 +2644,7 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
 }
 
 fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(tool_name) {
         return None;
     }
     let action = args.get("action")?.as_str()?;
@@ -2690,7 +2698,7 @@ fn valid_browser_press_target(args: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
-    if !tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(tool_name) {
         return raw.to_string();
     }
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -2705,12 +2713,18 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     raw.to_string()
 }
 
+fn has_select_result_key(raw: &str) -> bool {
+    const KEY: &str = "\"selected_values\"";
+    raw.match_indices(KEY)
+        .any(|(start, _)| raw[start + KEY.len()..].trim_start().starts_with(':'))
+}
+
 pub(crate) fn tool_complete_result_for_display(
     tool_name: &str,
     raw: &str,
     unknown_tool: bool,
 ) -> String {
-    let browser = tool_name.eq_ignore_ascii_case("browser");
+    let browser = is_browser_display_tool_name(tool_name);
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
         return if (raw.contains("awaiting_permission_approval")
             || raw.contains("permission_request"))
@@ -2722,6 +2736,10 @@ pub(crate) fn tool_complete_result_for_display(
                 "Tool awaiting permission approval"
             }
             .to_string()
+        } else if (browser || unknown_tool) && has_select_result_key(raw) {
+            // A dropped ToolStart leaves only the recognizable result field.
+            // Keep unrelated browser text visible.
+            "Browser result unavailable".to_string()
         } else {
             raw.to_string()
         };
@@ -2732,14 +2750,14 @@ pub(crate) fn tool_complete_result_for_display(
         request
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+            .is_some_and(is_browser_display_tool_name)
     });
     let approval_clue = pending_approval || payload.get("permission_request").is_some();
     if approval_clue && (browser || nested_browser) {
         "Browser input awaiting permission approval".to_string()
     } else if approval_clue && unknown_tool {
         "Tool awaiting permission approval".to_string()
-    } else if browser && payload.get("selected_values").is_some() {
+    } else if (browser || unknown_tool) && payload.get("selected_values").is_some() {
         "Browser options selected".to_string()
     } else {
         raw.to_string()
@@ -2749,7 +2767,7 @@ pub(crate) fn tool_complete_result_for_display(
 impl PermissionQuestion {
     fn has_private_browser_resource(&self) -> bool {
         self.request.permission_type == PermissionType::BrowserInteraction
-            && self.request.tool_name.eq_ignore_ascii_case("browser")
+            && is_browser_display_tool_name(&self.request.tool_name)
             && (self.request.resource == "[redacted]"
                 || is_private_browser_resource(&self.request.tool_name, &self.request.resource))
     }
@@ -16519,6 +16537,11 @@ mod question_tests {
             assert_eq!(permission.display_resource(), "<redacted>");
             assert!(!permission.inspector_text().contains("private-fingerprint"));
         }
+        permission.request.tool_name = "default::browser".to_string();
+        permission.request.resource =
+            "browser:17:select_option:options:private-fingerprint".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
 
         let child = ChildApprovalQuestion {
             parent_session_id: "parent".to_string(),
@@ -16541,6 +16564,14 @@ mod question_tests {
         };
         assert_eq!(select_child.display_resource(), "<redacted>");
         assert!(!select_child
+            .inspector_text()
+            .contains("private-fingerprint"));
+        let namespaced_child = ChildApprovalQuestion {
+            tool_name: "default::browser".to_string(),
+            ..select_child
+        };
+        assert_eq!(namespaced_child.display_resource(), "<redacted>");
+        assert!(!namespaced_child
             .inspector_text()
             .contains("private-fingerprint"));
     }
@@ -16712,19 +16743,46 @@ mod question_tests {
             "page_epoch":17,
             "selected_values":[private_value],
         });
+        for tool_name in ["browser", "default::browser"] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "select-call".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "select-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: result.to_string(),
+                },
+            })
+            .unwrap();
+            let displayed = &app.chat.current_tool_calls[0];
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser options selected")
+            );
+            for private in [private_value, private_selector] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+        }
+        assert_eq!(args["values"][0], private_value);
+        assert_eq!(result["selected_values"][0], private_value);
+    }
+
+    #[test]
+    fn native_select_result_without_tool_start_or_valid_json_hides_values() {
+        let private_value = "private-option-value";
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
-        app.handle_sse_event(AgentEvent::ToolStart {
-            tool_call_id: "select-call".to_string(),
-            tool_name: "browser".to_string(),
-            arguments: args.clone(),
-        })
-        .unwrap();
         app.handle_sse_event(AgentEvent::ToolComplete {
-            tool_call_id: "select-call".to_string(),
+            tool_call_id: "dropped-select-start".to_string(),
             result: ToolResult {
                 success: true,
-                result: result.to_string(),
+                result: serde_json::json!({"selected_values":[private_value]}).to_string(),
             },
         })
         .unwrap();
@@ -16733,11 +16791,39 @@ mod question_tests {
             displayed.result.as_deref(),
             Some("Browser options selected")
         );
-        for private in [private_value, private_selector] {
-            assert!(!format!("{displayed:?}").contains(private));
+        assert!(!format!("{displayed:?}").contains(private_value));
+
+        let malformed = format!("{{\"selected_values\":[\"{private_value}\"");
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "dropped-malformed-select-start".to_string(),
+            result: ToolResult {
+                success: false,
+                result: malformed.clone(),
+            },
+        })
+        .unwrap();
+        let displayed = &app.chat.current_tool_calls[1];
+        assert_eq!(
+            displayed.error.as_deref(),
+            Some("Browser result unavailable")
+        );
+        assert!(!format!("{displayed:?}").contains(private_value));
+
+        for tool_name in ["browser", "default::browser"] {
+            assert_eq!(
+                tool_complete_result_for_display(tool_name, &malformed, false),
+                "Browser result unavailable"
+            );
+            assert_eq!(
+                tool_complete_result_for_display("unknown", &malformed, true),
+                "Browser result unavailable"
+            );
         }
-        assert_eq!(args["values"][0], private_value);
-        assert_eq!(result["selected_values"][0], private_value);
+        let snapshot = "- heading \"Public page with selected_values text\"";
+        assert_eq!(
+            tool_complete_result_for_display("default::browser", snapshot, false),
+            snapshot
+        );
     }
 
     #[test]

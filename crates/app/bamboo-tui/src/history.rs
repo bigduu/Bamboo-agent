@@ -507,17 +507,30 @@ mod tests {
             "selected_values":[private_value],
         })
         .to_string();
-        let out = map_history(vec![
-            assistant("", vec![("select-call", "browser", &args)]),
-            tool("select-call", &result, Some(true)),
-        ]);
-        let displayed = &out[0].tool_calls[0];
-        assert_eq!(
-            displayed.result.as_deref(),
-            Some("Browser options selected")
-        );
-        for private in [private_value, private_selector] {
-            assert!(!format!("{displayed:?}").contains(private));
+        for tool_name in ["browser", "default::browser"] {
+            let out = map_history(vec![
+                assistant("", vec![("select-call", tool_name, &args)]),
+                tool("select-call", &result, Some(true)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser options selected")
+            );
+            for private in [private_value, private_selector] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+            let malformed = format!("{{\"selected_values\":[\"{private_value}\"");
+            let out = map_history(vec![
+                assistant("", vec![("select-call", tool_name, &args)]),
+                tool("select-call", &malformed, Some(false)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.error.as_deref(),
+                Some("Browser result unavailable")
+            );
+            assert!(!format!("{displayed:?}").contains(private_value));
         }
         assert!(args.contains(private_value));
         assert!(result.contains(private_value));

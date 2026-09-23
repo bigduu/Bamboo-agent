@@ -241,6 +241,14 @@ fn pending_tool_arguments(
     Some((serde_json::Value::String(preview), true))
 }
 
+fn is_browser_display_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+}
+
 /// Return only a display copy. The original assistant arguments stay in the
 /// session for exact decision validation and approved replay, but focused
 /// browser input must not reach the TUI permission preview through this API.
@@ -249,7 +257,7 @@ fn pending_tool_arguments_for_display(
     pending: &PendingQuestion,
     request: Option<&PermissionRequest>,
 ) -> Option<(serde_json::Value, bool, bool)> {
-    if !pending.tool_name.eq_ignore_ascii_case("browser") {
+    if !is_browser_display_tool_name(&pending.tool_name) {
         return pending_tool_arguments(session, pending.tool_call_id.as_str())
             .map(|(args, truncated)| (args, truncated, false));
     }
@@ -362,7 +370,7 @@ pub async fn get_pending_question(
             // cannot be inspected safely; it may quote private input.
             let browser_arguments_unavailable = interaction.kind
                 == PendingInteractionKind::Permission
-                && pending.tool_name.eq_ignore_ascii_case("browser")
+                && is_browser_display_tool_name(&pending.tool_name)
                 && bounded_tool_arguments
                     .as_ref()
                     .is_none_or(|(_, truncated, _)| *truncated);
@@ -486,13 +494,21 @@ mod http_tests {
     }
 
     fn assistant_browser_call(tool_call_id: &str, arguments: &str) -> Message {
+        assistant_named_browser_call(tool_call_id, "browser", arguments)
+    }
+
+    fn assistant_named_browser_call(
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Message {
         Message::assistant(
             "",
             Some(vec![ToolCall {
                 id: tool_call_id.to_string(),
                 tool_type: "function".to_string(),
                 function: FunctionCall {
-                    name: "browser".to_string(),
+                    name: tool_name.to_string(),
                     arguments: arguments.to_string(),
                 },
             }]),
@@ -782,6 +798,80 @@ mod http_tests {
         assert_eq!(
             pending_tool_arguments_exact(&session, tool_call_id).unwrap(),
             args
+        );
+    }
+
+    #[actix_web::test]
+    async fn namespaced_native_select_pending_projection_hides_values_and_resource() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "namespaced-native-select";
+        let tool_call_id = "namespaced-select-call";
+        let args = serde_json::json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":17,
+            "extra":{"secret":"private-extra"},
+        });
+        let mut request = permission_request(session_id, tool_call_id);
+        request.tool_name = "default::browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = "browser:17:select_option:options:private-fingerprint".to_string();
+        request.suggested_matchers[0].value = request.resource.clone();
+        let mut session = Session::new(session_id, "test-model");
+        session.messages.push(assistant_named_browser_call(
+            tool_call_id,
+            "default::browser",
+            &args.to_string(),
+        ));
+        session.messages.push(Message::tool_result(
+            tool_call_id,
+            serde_json::json!({
+                "status":"awaiting_permission_approval",
+                "question":"Approve private-option-value?",
+                "permission_request":request,
+            })
+            .to_string(),
+        ));
+        session.set_pending_question_with_source(
+            tool_call_id.to_string(),
+            "default::browser".to_string(),
+            "Approve private-option-value?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+            PendingQuestionSource::PauseTool,
+        );
+        state.save_and_cache_session(&mut session).await;
+
+        let response = get_pending_question(state, web::Path::from(session_id.to_string()))
+            .await
+            .expect("pending response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(
+            body["tool_arguments"],
+            serde_json::json!({"action":"select_option"})
+        );
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert_eq!(body["question"], "Approve native browser selection?");
+        for private in [
+            "private-option-value",
+            "data-private",
+            "private-extra",
+            "private-fingerprint",
+        ] {
+            assert!(!body.to_string().contains(private));
+        }
+        assert_eq!(
+            pending_tool_arguments_exact(&session, tool_call_id),
+            Some(args)
         );
     }
 

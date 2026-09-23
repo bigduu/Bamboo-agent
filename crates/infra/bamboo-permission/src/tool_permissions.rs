@@ -150,7 +150,11 @@ pub fn is_focused_browser_input(tool_name: &str, args: &Value) -> bool {
 /// use this classifier to project only the action while execution keeps the
 /// exact values.
 pub fn is_native_browser_select(tool_name: &str, args: &Value) -> bool {
-    tool_name.eq_ignore_ascii_case("browser")
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
         && args.get("action").and_then(Value::as_str) == Some("select_option")
 }
 
@@ -1153,6 +1157,10 @@ mod tests {
 
     #[test]
     fn browser_select_grants_bind_values_selector_and_epoch_without_plaintext() {
+        let select = json!({"action":"select_option","values":["private-red"]});
+        assert!(is_native_browser_select("browser", &select));
+        assert!(is_native_browser_select("default::browser", &select));
+        assert!(!is_native_browser_select("default::other", &select));
         let data_dir = tempfile::tempdir().unwrap();
         let other_dir = tempfile::tempdir().unwrap();
         let run = |dir: &Path, output_path: &Path| {
