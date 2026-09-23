@@ -891,3 +891,311 @@ test('navigation during observer setup rejects stale hover and drag before point
     await once(fixture, 'close');
   }
 });
+test('JavaScript dialogs return pending state, accept or dismiss by identity, and keep the host responsive', async () => {
+  const fixture = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    if (request.url === '/passive') {
+      response.end('<script>setTimeout(() => alert("Passive dialog"), 100)</script><main>Passive page</main>');
+      return;
+    }
+    if (request.url === '/background') {
+      response.end('<button id="schedule" onclick="setTimeout(() => { alert(\'Background dialog\'); document.querySelector(\'output\').textContent=\'background answered\' }, 1000)">Schedule</button><output>idle</output>');
+      return;
+    }
+    response.end(`<!doctype html>
+      <style>#drag-source{position:absolute;left:20px;top:160px;width:80px;height:80px;background:blue}#drag-drop{position:absolute;left:220px;top:160px;width:80px;height:80px;background:green}</style>
+      <button id="plain" onclick="document.querySelector('#result').textContent='plain'">Plain</button>
+      <button id="alert" onclick="alert('Private alert message');document.querySelector('#result').textContent='alert done'">Alert</button>
+      <button id="hover-dialog" onpointerenter="alert('Hover dialog');document.querySelector('#result').textContent='hover answered'">Hover dialog</button>
+      <button id="confirm" onclick="document.querySelector('#result').textContent=confirm('Private confirm message')?'yes':'no'">Confirm</button>
+      <button id="prompt" onclick="document.querySelector('#result').textContent=prompt('Private prompt message','default text')">Prompt</button>
+      <button id="chain" onclick="alert('First dialog');document.querySelector('#result').textContent=confirm('Second dialog')?'chain yes':'chain no'">Chain</button>
+      <button id="timer-chain" onclick="alert('Timer first');setTimeout(() => { alert('Timer second');document.querySelector('#result').textContent='timer answered' }, 30)">Timer chain</button>
+      <button id="schedule-read-dialog" onclick="setTimeout(() => alert('Read dialog'), 300)">Schedule read dialog</button>
+      <button id="long" onclick="prompt('m'.repeat(5000),'d'.repeat(5000))">Long</button>
+      <button id="unicode-boundary" onclick="prompt('m'.repeat(4095)+String.fromCodePoint(0x1F600),'d'.repeat(4095)+String.fromCodePoint(0x1F600))">Unicode boundary</button>
+      <button id="lone-surrogate" onclick="prompt('message'+String.fromCharCode(0xD800)+'end','default'+String.fromCharCode(0xDC00)+'end')">Lone surrogate</button>
+      <div id="drag-source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
+      <div id="drag-drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#result').textContent=confirm('Drag dialog')?event.dataTransfer.getData('text/plain'):'dismissed'">Drop</div>
+      <output id="result">idle</output>`);
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const url = `http://127.0.0.1:${fixture.address().port}/`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: { ...process.env, NODE_ENV: 'test', BAMBOO_BROWSER_TEST_DIALOG_STATE_DELAY_MS: '250', BAMBOO_BROWSER_TEST_DIALOG_READ_DELAY_MS: '750' },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  readline.createInterface({ input: host.stdout }).on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 10_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const navigated = (await call('navigate', { url, expected_epoch: initial.page_epoch })).result;
+    const epoch = navigated.page_epoch;
+    assert.equal((await call('click_selector', { selector: '#plain', expected_epoch: epoch })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">plain<\/output>/);
+
+    const alert = await call('click_selector', { selector: '#alert', expected_epoch: epoch });
+    assert.equal(alert.ok, true);
+    assert.equal(alert.result.pending_dialog.type, 'alert');
+    assert.equal(alert.result.pending_dialog.message, 'Private alert message');
+    assert.equal(alert.result.pending_dialog.page_epoch, epoch);
+    assert.equal(alert.result.pending_dialog.url, url);
+    const alertId = alert.result.pending_dialog.dialog_id;
+    assert.match(alertId, /^[0-9a-f]{24}$/);
+    const pendingState = await call('state');
+    assert.equal(pendingState.result.pending_dialog.dialog_id, alertId);
+    for (const [action, args] of [
+      ['click_selector', { selector: '#plain' }],
+      ['hover_selector', { selector: '#hover-dialog' }],
+      ['drag_selector', { source_selector: '#drag-source', target_selector: '#drag-drop' }],
+      ['select_option', { selector: '#plain', values: ['private'] }],
+    ]) {
+      assert.equal((await call(action, { ...args, expected_epoch: epoch })).code, 'dialog_pending', action);
+    }
+    assert.equal((await call('dialog_respond', { dialog_id: '0'.repeat(24), accept: true, expected_epoch: epoch })).code, 'stale_dialog');
+    assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, expected_epoch: epoch - 1 })).code, 'stale_epoch');
+    assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, text: 'invalid', expected_epoch: epoch })).code, 'invalid_request');
+    const accepted = await call('dialog_respond', {
+      dialog_id: alertId, accept: true, text: null, expected_epoch: epoch,
+    });
+    assert.equal(accepted.ok, true);
+    assert.equal(accepted.result.pending_dialog, undefined);
+    assert.match((await call('dom')).result.html, /<output id="result">alert done<\/output>/);
+    assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, expected_epoch: epoch })).code, 'stale_dialog');
+
+    for (const [action, args, message, result] of [
+      ['hover_selector', { selector: '#hover-dialog' }, 'Hover dialog', 'hover answered'],
+      ['drag_selector', { source_selector: '#drag-source', target_selector: '#drag-drop' }, 'Drag dialog', 'moved'],
+    ]) {
+      const gesture = await call(action, { ...args, expected_epoch: epoch });
+      assert.equal(gesture.ok, true, `${action}: ${JSON.stringify(gesture)}`);
+      assert.equal(gesture.result.pending_dialog.message, message);
+      const answered = await call('dialog_respond', {
+        dialog_id: gesture.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+      });
+      assert.equal(answered.ok, true, `${action}: ${JSON.stringify(answered)}`);
+      assert.equal(answered.result.pending_dialog, undefined);
+      assert.match((await call('dom')).result.html, new RegExp(`<output id="result">${result}<\\/output>`));
+    }
+
+    const confirm = await call('click_selector', { selector: '#confirm', expected_epoch: epoch });
+    assert.equal(confirm.result.pending_dialog.type, 'confirm');
+    const dismissed = await call('dialog_respond', {
+      dialog_id: confirm.result.pending_dialog.dialog_id, accept: false, text: null, expected_epoch: epoch,
+    });
+    assert.equal(dismissed.ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">no<\/output>/);
+
+    const prompt = await call('click_selector', { selector: '#prompt', expected_epoch: epoch });
+    assert.equal(prompt.result.pending_dialog.type, 'prompt');
+    assert.equal(prompt.result.pending_dialog.default_value, 'default text');
+    const answer = await call('dialog_respond', {
+      dialog_id: prompt.result.pending_dialog.dialog_id,
+      accept: true, text: 'approved value', expected_epoch: epoch,
+    });
+    assert.equal(answer.ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">approved value<\/output>/);
+    const defaultPrompt = await call('click_selector', { selector: '#prompt', expected_epoch: epoch });
+    assert.equal((await call('dialog_respond', {
+      dialog_id: defaultPrompt.result.pending_dialog.dialog_id,
+      accept: true, text: null, expected_epoch: epoch,
+    })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">default text<\/output>/);
+    const chain = await call('click_selector', { selector: '#chain', expected_epoch: epoch });
+    assert.equal(chain.result.pending_dialog.message, 'First dialog');
+    const secondDialog = await call('dialog_respond', {
+      dialog_id: chain.result.pending_dialog.dialog_id, accept: true, text: null, expected_epoch: epoch,
+    });
+    assert.equal(secondDialog.ok, true);
+    assert.equal(secondDialog.result.pending_dialog.message, 'Second dialog');
+    assert.notEqual(secondDialog.result.pending_dialog.dialog_id, chain.result.pending_dialog.dialog_id);
+    const chainDone = await call('dialog_respond', {
+      dialog_id: secondDialog.result.pending_dialog.dialog_id, accept: false, text: null, expected_epoch: epoch,
+    });
+    assert.equal(chainDone.ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">chain no<\/output>/);
+    const timerChain = await call('click_selector', { selector: '#timer-chain', expected_epoch: epoch });
+    assert.equal(timerChain.result.pending_dialog.message, 'Timer first');
+    const timerSecond = await call('dialog_respond', {
+      dialog_id: timerChain.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+    });
+    assert.equal(timerSecond.result.pending_dialog.message, 'Timer second');
+    assert.notEqual(timerSecond.result.pending_dialog.dialog_id, timerChain.result.pending_dialog.dialog_id);
+    const timerDone = await call('dialog_respond', {
+      dialog_id: timerSecond.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+    });
+    assert.equal(timerDone.ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">timer answered<\/output>/);
+    for (const readAction of ['dom', 'screenshot']) {
+      assert.equal((await call('click_selector', { selector: '#schedule-read-dialog', expected_epoch: epoch })).ok, true);
+      const interrupted = await call(readAction);
+      assert.equal(interrupted.code, 'dialog_pending', readAction);
+      const pendingRead = (await call('state')).result.pending_dialog;
+      assert.equal(pendingRead.message, 'Read dialog');
+      assert.equal((await call('dialog_respond', {
+        dialog_id: pendingRead.dialog_id, accept: false, expected_epoch: epoch,
+      })).ok, true);
+    }
+    const long = await call('click_selector', { selector: '#long', expected_epoch: epoch });
+    assert.equal(long.result.pending_dialog.message.length, 4096);
+    assert.equal(long.result.pending_dialog.default_value.length, 4096);
+    assert.equal(long.result.pending_dialog.message_truncated, true);
+    assert.equal(long.result.pending_dialog.default_value_truncated, true);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: long.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
+    })).ok, true);
+    const boundary = await call('click_selector', { selector: '#unicode-boundary', expected_epoch: epoch });
+    assert.equal(boundary.result.pending_dialog.message, 'm'.repeat(4095));
+    assert.equal(boundary.result.pending_dialog.default_value, 'd'.repeat(4095));
+    assert.equal(boundary.result.pending_dialog.message_truncated, true);
+    assert.equal(boundary.result.pending_dialog.default_value_truncated, true);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: boundary.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
+    })).ok, true);
+    const lone = await call('click_selector', { selector: '#lone-surrogate', expected_epoch: epoch });
+    assert.equal(lone.result.pending_dialog.message, 'message\uFFFDend');
+    assert.equal(lone.result.pending_dialog.default_value, 'default\uFFFDend');
+    assert.equal(lone.result.pending_dialog.message_truncated, false);
+    assert.equal(lone.result.pending_dialog.default_value_truncated, false);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: lone.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
+    })).ok, true);
+    const screenshot = await call('screenshot');
+    assert.equal(screenshot.result.page_epoch, epoch);
+    assert.ok(Buffer.from(screenshot.result.data, 'base64').length > 1000);
+
+    const passiveNavigation = await call('navigate', { url: `${url}passive`, expected_epoch: epoch });
+    assert.equal(passiveNavigation.ok, true);
+    let passive = passiveNavigation.result;
+    for (let attempt = 0; !passive.pending_dialog && attempt < 30; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      passive = (await call('state')).result;
+    }
+    assert.equal(passive.pending_dialog.message, 'Passive dialog');
+    assert.equal(passive.pending_dialog.page_epoch, passive.page_epoch);
+    const passiveAccepted = await call('dialog_respond', {
+      dialog_id: passive.pending_dialog.dialog_id,
+      accept: true, text: null, expected_epoch: passive.page_epoch,
+    });
+    assert.equal(passiveAccepted.ok, true);
+    assert.equal(passiveAccepted.result.pending_dialog, undefined);
+
+    const foregroundTabId = navigated.active_tab_id;
+    const created = await call('tab_create', { expected_epoch: passiveAccepted.result.page_epoch });
+    assert.equal(created.ok, true);
+    const backgroundTabId = created.result.active_tab_id;
+    const background = await call('navigate', {
+      url: `${url}background`, expected_epoch: created.result.page_epoch,
+    });
+    assert.equal(background.ok, true);
+    const scheduled = await call('click_selector', {
+      selector: '#schedule', expected_epoch: background.result.page_epoch,
+    });
+    assert.equal(scheduled.ok, true);
+    const foreground = await call('tab_activate', {
+      tab_id: foregroundTabId, expected_epoch: scheduled.result.page_epoch,
+    });
+    assert.equal(foreground.ok, true);
+    let backgroundPending;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      backgroundPending = (await call('state')).result;
+      if (backgroundPending.pending_dialog) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(backgroundPending.active_tab_id, foregroundTabId);
+    assert.equal(backgroundPending.pending_dialog.tab_id, backgroundTabId);
+    assert.equal(backgroundPending.pending_dialog.page_epoch, backgroundPending.page_epoch);
+    assert.equal(backgroundPending.pending_dialog.url, `${url}background`);
+    const answeredBackground = await call('dialog_respond', {
+      dialog_id: backgroundPending.pending_dialog.dialog_id,
+      accept: true, expected_epoch: backgroundPending.page_epoch,
+    });
+    assert.equal(answeredBackground.ok, true);
+    assert.equal(answeredBackground.result.active_tab_id, foregroundTabId);
+    const restored = await call('tab_activate', {
+      tab_id: backgroundTabId, expected_epoch: answeredBackground.result.page_epoch,
+    });
+    assert.equal(restored.ok, true);
+    assert.match((await call('dom')).result.html, /<output>background answered<\/output>/);
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});
+
+test('unanswered dialog expires and a pending dialog dismisses on host close', async () => {
+  const fixture = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end('<button id="ask" onclick="document.querySelector(\'output\').textContent=confirm(\'private dialog\')?\'yes\':\'no\'">Ask</button><output>idle</output>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const url = `http://127.0.0.1:${fixture.address().port}/`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: { ...process.env, BAMBOO_BROWSER_DIALOG_TIMEOUT_MS: '150' },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  readline.createInterface({ input: host.stdout }).on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 5_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const navigated = (await call('navigate', { url, expected_epoch: initial.page_epoch })).result;
+    const epoch = navigated.page_epoch;
+    const first = (await call('click_selector', { selector: '#ask', expected_epoch: epoch })).result;
+    assert.equal(first.pending_dialog.status, 'pending');
+    let state;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      state = (await call('state')).result;
+      if (!state.pending_dialog) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal(state.pending_dialog, undefined);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: first.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+    })).code, 'stale_dialog');
+    assert.match((await call('dom')).result.html, /<output>no<\/output>/);
+
+    const second = (await call('click_selector', { selector: '#ask', expected_epoch: epoch })).result;
+    assert.notEqual(second.pending_dialog.dialog_id, first.pending_dialog.dialog_id);
+    const closed = await call('close');
+    assert.equal(closed.result.closed, true);
+    if (host.exitCode === null) {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('host did not exit')), 5_000);
+        host.once('exit', () => { clearTimeout(timeout); resolve(); });
+      });
+    }
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});

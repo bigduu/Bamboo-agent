@@ -41,6 +41,44 @@ fn tab_id_arg(args: &Value) -> Result<&str, ToolError> {
     Ok(tab_id)
 }
 
+fn dialog_id_arg(args: &Value) -> Result<&str, ToolError> {
+    let dialog_id = text_arg(args, "dialog_id")?;
+    if dialog_id.len() != 24
+        || !dialog_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ToolError::InvalidArguments(
+            "browser dialog_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    Ok(dialog_id)
+}
+
+fn dialog_response_args(args: &Value, epoch: u64) -> Result<Value, ToolError> {
+    let accept = args
+        .get("accept")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ToolError::InvalidArguments("browser dialog requires accept".into()))?;
+    let text = match args.get("text") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|text| text.encode_utf16().count() <= 4096)
+                .ok_or_else(|| ToolError::InvalidArguments("invalid browser dialog text".into()))?,
+        ),
+    };
+    if !accept && text.is_some() {
+        return Err(ToolError::InvalidArguments(
+            "dismissed browser dialog cannot include text".into(),
+        ));
+    }
+    Ok(json!({
+        "dialog_id":dialog_id_arg(args)?,"accept":accept,"text":text,"expected_epoch":epoch
+    }))
+}
+
 fn number_arg(args: &Value, name: &str) -> Result<f64, ToolError> {
     args.get(name)
         .and_then(Value::as_f64)
@@ -311,15 +349,18 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","type","press","key","scroll","screenshot"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","type","press","key","scroll","screenshot","dialog_respond"]},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
+                "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
+                "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
+                "text":{"type":"string","description":"Text for fill or type, or for an accepted prompt dialog. Omit prompt text to use pending_dialog.default_value; prompt text is private"},
                 "url":{"type":"string","description":"HTTP(S) URL for navigate"},
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
@@ -328,7 +369,6 @@ impl Tool for BrowserTool {
                 "source_selector":{"type":"string","description":"CSS source selector for drag; pair with target_selector"},
                 "target_selector":{"type":"string","description":"CSS destination selector for drag; pair with source_selector"},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
-                "text":{"type":"string","description":"Text for fill or type; type inserts into the focused element"},
                 "values":{"type":"array","description":"Native select option values for select_option, including the empty value","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":512}},
                 "key":{"type":"string","description":"Keyboard key for press or key, e.g. Enter"},
                 "x":{"type":"number","description":"CSS viewport x for click_at, scroll, coordinate hover, or coordinate drag"},
@@ -338,7 +378,7 @@ impl Tool for BrowserTool {
                 "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at or coordinate drag; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/type/press/key/scroll/dialog_respond: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -384,6 +424,7 @@ impl Tool for BrowserTool {
                 | "press"
                 | "key"
                 | "scroll"
+                | "dialog_respond"
         ) && args.get("expected_epoch").and_then(Value::as_u64).is_none()
         {
             return Err(ToolError::InvalidArguments(
@@ -392,6 +433,9 @@ impl Tool for BrowserTool {
         }
         if matches!(action, "activate_tab" | "close_tab") {
             tab_id_arg(&args)?;
+        }
+        if action == "dialog_respond" {
+            dialog_id_arg(&args)?;
         }
         let state = self.browser.open(session_id).await.map_err(browser_error)?;
         let epoch = args
@@ -442,6 +486,7 @@ impl Tool for BrowserTool {
                 self.browser.command(session_id, "press_selector", request).await.map_err(browser_error)?
             },
             "scroll" => self.browser.command(session_id, "input", json!({"kind":"scroll","x":args.get("x").and_then(Value::as_f64).unwrap_or(500.0),"y":args.get("y").and_then(Value::as_f64).unwrap_or(360.0),"delta_x":args.get("delta_x").and_then(Value::as_f64).unwrap_or(0.0),"delta_y":args.get("delta_y").and_then(Value::as_f64).unwrap_or(500.0),"expected_epoch":epoch})).await.map_err(browser_error)?,
+            "dialog_respond" => self.browser.command(session_id, "dialog_respond", dialog_response_args(&args, epoch)?).await.map_err(browser_error)?,
             "snapshot" => {
                 let dom = self.browser.command(session_id, "dom", json!({})).await.map_err(browser_error)?;
                 let mut text = format!("page_epoch: {}\nactive_tab_id: {}\nurl: {}\ntitle: {}\n\n{}", dom["page_epoch"], dom["active_tab_id"].as_str().unwrap_or(""), dom["url"].as_str().unwrap_or(""), dom["title"].as_str().unwrap_or(""), dom["snapshot"].as_str().unwrap_or(""));
@@ -480,7 +525,14 @@ mod tests {
         let schema = tool.parameters_schema();
         let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
         for action in [
-            "history", "viewport", "click_at", "hover", "drag", "type", "key",
+            "history",
+            "viewport",
+            "click_at",
+            "hover",
+            "drag",
+            "type",
+            "key",
+            "dialog_respond",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
             assert_eq!(
@@ -622,6 +674,32 @@ mod tests {
     }
 
     #[test]
+    fn dialog_response_is_bound_to_an_opaque_id_epoch_and_optional_prompt_text() {
+        let dialog_id = "a".repeat(24);
+        assert_eq!(
+            dialog_response_args(
+                &json!({"dialog_id":dialog_id,"accept":true,"text":"answer"}),
+                17,
+            )
+            .unwrap(),
+            json!({"dialog_id":dialog_id,"accept":true,"text":"answer","expected_epoch":17})
+        );
+        assert_eq!(
+            dialog_response_args(&json!({"dialog_id":dialog_id,"accept":false}), 17).unwrap()
+                ["text"],
+            Value::Null
+        );
+        for args in [
+            json!({"dialog_id":"short","accept":true}),
+            json!({"dialog_id":dialog_id}),
+            json!({"dialog_id":dialog_id,"accept":false,"text":"answer"}),
+            json!({"dialog_id":dialog_id,"accept":true,"text":"x".repeat(4097)}),
+        ] {
+            assert!(dialog_response_args(&args, 17).is_err(), "{args}");
+        }
+    }
+
+    #[test]
     fn semantic_locator_arguments_are_bounded_and_exclusive_with_css() {
         let role =
             json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"});
@@ -675,6 +753,10 @@ mod tests {
             ("drag", json!({"x":12,"y":20,"to_x":30,"to_y":40})),
             ("type", json!({"text":"Lotus"})),
             ("key", json!({"key":"Enter"})),
+            (
+                "dialog_respond",
+                json!({"dialog_id":"a".repeat(24),"accept":true}),
+            ),
         ] {
             let mut args = args;
             args["action"] = json!(action);

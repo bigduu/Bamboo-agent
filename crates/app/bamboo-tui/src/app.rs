@@ -2665,6 +2665,12 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         (Some("press"), Some("page")) => true,
         (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
         (Some("select_option"), Some(rest)) => rest.starts_with("options:"),
+        (Some("dialog_respond"), Some(rest)) => rest.split(':').next().is_some_and(|id| {
+            id.len() == 24
+                && id
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }),
         _ => false,
     }
 }
@@ -2685,7 +2691,7 @@ fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> O
     }
     let action = args.get("action")?.as_str()?;
     match action {
-        "type" | "key" => Some(action),
+        "type" | "key" | "dialog_respond" => Some(action),
         "press" if !valid_browser_press_target(args) => Some(action),
         _ => None,
     }
@@ -2783,18 +2789,28 @@ pub(crate) fn tool_complete_result_for_display(
     }
     if unknown_tool {
         // A dropped ToolStart provides no authority for showing arbitrary
-        // result bytes. Recognizable select results can use a fixed label,
-        // while every other unknown payload remains hidden.
+        // result bytes. Recognizable browser states receive fixed labels.
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) {
+            if payload
+                .get("pending_dialog")
+                .is_some_and(|dialog| !dialog.is_null())
+            {
+                return "Browser JavaScript dialog pending".to_string();
+            }
+            if payload.get("status").and_then(serde_json::Value::as_str)
+                == Some("awaiting_permission_approval")
+                || payload.get("permission_request").is_some()
+            {
+                return "Tool awaiting permission approval".to_string();
+            }
+            if payload.get("selected_values").is_some() {
+                return "Browser options selected".to_string();
+            }
+        }
         if raw.contains("awaiting_permission_approval") || raw.contains("permission_request") {
             return "Tool awaiting permission approval".to_string();
         }
-        if serde_json::from_str::<serde_json::Value>(raw)
-            .ok()
-            .is_some_and(|payload| payload.get("selected_values").is_some())
-        {
-            return "Browser options selected".to_string();
-        }
-        if has_select_result_key(raw) {
+        if raw.contains("pending_dialog") || has_select_result_key(raw) {
             return "Browser result unavailable".to_string();
         }
         return "Tool result hidden".to_string();
@@ -2805,7 +2821,7 @@ pub(crate) fn tool_complete_result_for_display(
             && (raw.contains("awaiting_permission_approval") || raw.contains("permission_request"))
         {
             "Browser input awaiting permission approval".to_string()
-        } else if browser && has_select_result_key(raw) {
+        } else if browser && (raw.contains("pending_dialog") || has_select_result_key(raw)) {
             "Browser result unavailable".to_string()
         } else {
             raw.to_string()
@@ -2820,7 +2836,13 @@ pub(crate) fn tool_complete_result_for_display(
             .is_some_and(is_browser_display_tool_name)
     });
     let approval_clue = pending_approval || payload.get("permission_request").is_some();
-    if approval_clue && (browser || nested_browser) {
+    if browser
+        && payload
+            .get("pending_dialog")
+            .is_some_and(|dialog| !dialog.is_null())
+    {
+        "Browser JavaScript dialog pending".to_string()
+    } else if approval_clue && (browser || nested_browser) {
         "Browser input awaiting permission approval".to_string()
     } else if browser && payload.get("selected_values").is_some() {
         "Browser options selected".to_string()
@@ -16783,6 +16805,7 @@ mod question_tests {
             "browser:17:key:private-fingerprint",
             "browser:17:press:focused:key:private-fingerprint",
             "browser:17:select_option:options:private-fingerprint",
+            "browser:17:dialog_respond:aaaaaaaaaaaaaaaaaaaaaaaa:accept:private-fingerprint",
         ] {
             permission.request.resource = focused_resource.to_string();
             permission.request.suggested_matchers[0].value = focused_resource.to_string();
@@ -16834,11 +16857,20 @@ mod question_tests {
             ("type", "text", "browser:17:type:focused:opaque"),
             ("key", "key", "browser:17:key:opaque"),
             ("press", "key", "browser:17:press:focused:key:opaque"),
+            (
+                "dialog_respond",
+                "text",
+                "browser:17:dialog_respond:aaaaaaaaaaaaaaaaaaaaaaaa:accept:opaque",
+            ),
         ] {
             let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
             app.chat.streaming = true;
             let mut args = serde_json::json!({"action":action,"expected_epoch":17});
             args[field] = serde_json::json!("private input");
+            if action == "dialog_respond" {
+                args["dialog_id"] = serde_json::json!("a".repeat(24));
+                args["accept"] = serde_json::json!(true);
+            }
             app.handle_sse_event(AgentEvent::ToolStart {
                 tool_call_id: "browser-call".to_string(),
                 tool_name: "browser".to_string(),
@@ -16908,6 +16940,26 @@ mod question_tests {
             tool_complete_result_for_display("browser", "ordinary result", false),
             "ordinary result"
         );
+        let dialog_result = r#"{"page_epoch":17,"pending_dialog":{"dialog_id":"aaaaaaaaaaaaaaaaaaaaaaaa","message":"private prompt","default_value":"private default"}}"#;
+        assert_eq!(
+            tool_complete_result_for_display("browser", dialog_result, false),
+            "Browser JavaScript dialog pending"
+        );
+        assert_eq!(
+            tool_complete_result_for_display("browser-call", dialog_result, true),
+            "Browser JavaScript dialog pending"
+        );
+        let malformed_dialog = r#"{"pending_dialog":{"message":"private dialog text""#;
+        for (tool, unknown) in [
+            ("browser", false),
+            ("default::browser", false),
+            ("browser-call", true),
+        ] {
+            assert_eq!(
+                tool_complete_result_for_display(tool, malformed_dialog, unknown),
+                "Browser result unavailable"
+            );
+        }
         let other_tool_approval = r#"{"status":"awaiting_permission_approval","permission_request":{"tool_name":"Bash","resource":"cargo test"}}"#;
         assert_eq!(
             tool_complete_result_for_display("Bash", other_tool_approval, false),

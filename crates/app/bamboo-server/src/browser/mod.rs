@@ -27,6 +27,10 @@ pub enum BrowserError {
     NotOpen,
     #[error("browser page changed; refresh state and retry")]
     StaleEpoch,
+    #[error("browser dialog is no longer pending")]
+    StaleDialog,
+    #[error("answer the pending browser dialog first; use browser tabs to read its dialog_id and page_epoch")]
+    DialogPending,
     #[error("invalid browser request: {0}")]
     Invalid(String),
     #[error("browser action failed: {0}")]
@@ -274,6 +278,8 @@ impl BrowserSession {
                         .unwrap_or("unknown error");
                     Err(match message.get("code").and_then(Value::as_str) {
                         Some("stale_epoch") => BrowserError::StaleEpoch,
+                        Some("stale_dialog") => BrowserError::StaleDialog,
+                        Some("dialog_pending") => BrowserError::DialogPending,
                         Some("invalid_url" | "invalid_request") => {
                             BrowserError::Invalid(error.to_string())
                         }
@@ -511,6 +517,7 @@ mod tests {
             "drag_at",
             "fill_selector",
             "press_selector",
+            "dialog_respond",
             "tab_create",
             "tab_activate",
             "tab_close",
