@@ -2612,7 +2612,58 @@ pub struct PermissionQuestion {
     pub global_scope_reviewed: bool,
 }
 
+/// Mirror the server's focused-browser resource boundary for presentation.
+/// TUI API types are intentionally independent of the server permission crate.
+fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
+    if !tool_name.eq_ignore_ascii_case("browser") {
+        return false;
+    }
+    let mut parts = resource.splitn(4, ':');
+    if parts.next() != Some("browser")
+        || !parts
+            .next()
+            .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+    {
+        return false;
+    }
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("type" | "key"), Some(_)) | (Some("press"), Some("page"))
+    )
+}
+
 impl PermissionQuestion {
+    fn has_focused_browser_resource(&self) -> bool {
+        self.request.permission_type == PermissionType::BrowserInteraction
+            && self.request.tool_name.eq_ignore_ascii_case("browser")
+            && (self.request.resource == "[redacted]"
+                || is_focused_browser_resource(&self.request.tool_name, &self.request.resource))
+    }
+
+    pub(crate) fn display_resource_label(&self) -> &str {
+        if self.has_focused_browser_resource() {
+            "resource (redacted)"
+        } else {
+            "exact resource"
+        }
+    }
+
+    pub(crate) fn display_resource(&self) -> &str {
+        if self.has_focused_browser_resource() {
+            "<redacted>"
+        } else {
+            &self.request.resource
+        }
+    }
+
+    pub(crate) fn display_matcher_value<'a>(&self, value: &'a str) -> &'a str {
+        if self.has_focused_browser_resource() {
+            "<redacted>"
+        } else {
+            value
+        }
+    }
+
     pub fn inspector_title(&self) -> &'static str {
         match self.inspect_target {
             Some(PermissionInspectTarget::Request) | None => "Permission request inspector",
@@ -2634,7 +2685,11 @@ impl PermissionQuestion {
             format!("tool: {}", request.tool_name),
             format!("permission type: {}", request.permission_type.label()),
             format!("operation summary: {}", request.operation_summary),
-            format!("exact resource: {}", request.resource),
+            format!(
+                "{}: {}",
+                self.display_resource_label(),
+                self.display_resource()
+            ),
             format!(
                 "tool arguments{}:\n{}",
                 if self.tool_arguments_truncated {
@@ -2697,7 +2752,10 @@ impl PermissionQuestion {
                 Some(matcher) => {
                     lines.push(format!("matcher id: {}", matcher.id));
                     lines.push(format!("matcher kind: {}", matcher.kind.label()));
-                    lines.push(format!("matcher exact value: {}", matcher.value));
+                    lines.push(format!(
+                        "matcher exact value: {}",
+                        self.display_matcher_value(&matcher.value)
+                    ));
                 }
                 None => lines.push("matcher: <missing - submission disabled>".to_string()),
             }
@@ -2740,6 +2798,22 @@ pub struct ChildApprovalQuestion {
 }
 
 impl ChildApprovalQuestion {
+    pub(crate) fn display_resource_label(&self) -> &str {
+        if is_focused_browser_resource(&self.tool_name, &self.resource) {
+            "resource (redacted)"
+        } else {
+            "exact resource"
+        }
+    }
+
+    pub(crate) fn display_resource(&self) -> &str {
+        if is_focused_browser_resource(&self.tool_name, &self.resource) {
+            "<redacted>"
+        } else {
+            &self.resource
+        }
+    }
+
     pub fn inspector_text(&self) -> String {
         [
             format!("parent session id: {}", self.parent_session_id),
@@ -2749,7 +2823,11 @@ impl ChildApprovalQuestion {
             format!("request id: {}", self.request_id),
             format!("tool: {}", self.tool_name),
             format!("permission: {}", self.permission),
-            format!("exact resource: {}", self.resource),
+            format!(
+                "{}: {}",
+                self.display_resource_label(),
+                self.display_resource()
+            ),
         ]
         .join("\n")
     }
@@ -16256,6 +16334,81 @@ mod question_tests {
             text.contains("matched rule source: User"),
             "typed contract tail was unreachable: {text}"
         );
+    }
+
+    #[test]
+    fn focused_browser_approval_hides_resource_in_modal_and_inspectors() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        assert_eq!(
+            serde_json::from_str::<PermissionType>(r#""browser_interaction""#).unwrap(),
+            PermissionType::BrowserInteraction
+        );
+        let mut app = app_with_permission(vec![
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        let resource = "browser:17:type:focused:private-fingerprint";
+        permission.request.tool_name = "browser".to_string();
+        permission.request.permission_type = PermissionType::BrowserInteraction;
+        permission.request.resource = resource.to_string();
+        permission.request.operation_summary = "Type into focused browser element".to_string();
+        permission.request.suggested_matchers[0].value = resource.to_string();
+        permission.tool_arguments_preview =
+            "{\"action\":\"type\",\"text\":\"[redacted]\"}".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert_eq!(permission.request.resource, resource);
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
+        permission.inspect_target = Some(PermissionInspectTarget::Matcher {
+            decision: PermissionDecisionKind::AllowSession,
+            matcher_index: 0,
+        });
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
+        permission.inspect_target = Some(PermissionInspectTarget::Request);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("private-fingerprint"));
+        assert!(rendered.contains("<redacted>"));
+
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.resource = "[redacted]".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert_eq!(permission.display_resource_label(), "resource (redacted)");
+
+        let child = ChildApprovalQuestion {
+            parent_session_id: "parent".to_string(),
+            child_session_id: "child".to_string(),
+            child_attempt: 0,
+            request_id: "child-request".to_string(),
+            version: 1,
+            tool_name: "browser".to_string(),
+            permission: "browser_interaction".to_string(),
+            resource: resource.to_string(),
+            exact_reviewed: false,
+        };
+        assert_eq!(child.display_resource(), "<redacted>");
+        assert!(!child.inspector_text().contains("private-fingerprint"));
+        assert_eq!(child.resource, resource);
     }
 
     #[test]

@@ -451,6 +451,7 @@ pub enum PermissionType {
     HttpRequest,
     DeleteOperation,
     TerminalSession,
+    BrowserInteraction,
 }
 
 impl PermissionType {
@@ -462,6 +463,7 @@ impl PermissionType {
             Self::HttpRequest => "http_request",
             Self::DeleteOperation => "delete_operation",
             Self::TerminalSession => "terminal_session",
+            Self::BrowserInteraction => "browser_interaction",
         }
     }
 }

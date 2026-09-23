@@ -773,6 +773,111 @@ mod tests {
         }
     }
 
+    #[actix_web::test]
+    async fn restarted_focused_browser_approval_uses_original_resource_after_redacted_preview() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_id = "focused-browser-redacted-restart";
+        let request_id = "focused-browser-redacted-call";
+        let original_resource = "browser:17:type:focused:private-fingerprint";
+        let mut request = test_permission_request(
+            session_id,
+            request_id,
+            0,
+            PermissionRequest::forced_decisions(),
+        );
+        request.tool_name = "browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = original_resource.to_string();
+        request.operation_summary = "Type into focused browser element".to_string();
+        request.suggested_matchers[0].value = original_resource.to_string();
+        let mut session = parked_permission_session(&request);
+        session.messages.insert(
+            0,
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: request_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "browser".to_string(),
+                        arguments: serde_json::json!({
+                            "action":"type",
+                            "text":"private input",
+                            "expected_epoch":17,
+                        })
+                        .to_string(),
+                    },
+                }]),
+            ),
+        );
+        let initial = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("initial app state"),
+        );
+        initial.save_and_cache_session(&mut session).await;
+        drop(initial);
+
+        let restarted = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("restarted app state"),
+        );
+        let preview = super::super::pending::get_pending_question(
+            restarted.clone(),
+            web::Path::from(session_id.to_string()),
+        )
+        .await
+        .expect("pending preview after restart");
+        assert_eq!(preview.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(preview.into_body())
+            .await
+            .expect("preview body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("preview JSON");
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert_eq!(body["tool_arguments"]["text"], "[redacted]");
+        assert!(!body.to_string().contains("private-fingerprint"));
+        assert_eq!(
+            restarted
+                .permission_checker
+                .permission_config()
+                .expect("permission config")
+                .pending_request(session_id, request_id)
+                .expect("original request remains registered")
+                .resource,
+            original_resource
+        );
+
+        let response = submit_permission_decision(
+            restarted.clone(),
+            web::Path::from(session_id.to_string()),
+            web::Json(PermissionDecision {
+                request_id: body["permission_request"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                request_generation: body["permission_request"]["request_generation"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                decision: PermissionDecisionKind::AllowOnce,
+                matcher_id: None,
+                expected_policy_revision: Some(0),
+                confirm_global: false,
+            }),
+        )
+        .await
+        .expect("redacted preview still permits the exact parked approval");
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("approval body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("approval JSON");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["replayed"], false);
+        assert_eq!(body["receipt"]["decision"]["decision"], "allow_once");
+    }
+
     fn unrelated_rule() -> DurablePermissionRule {
         DurablePermissionRule {
             id: "unrelated-rule".to_string(),

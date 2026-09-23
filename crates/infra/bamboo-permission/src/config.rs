@@ -2032,6 +2032,15 @@ impl PermissionConfig {
             .into_iter()
             .filter(|decision| input.supported_decisions.contains(decision))
             .collect();
+        let suggested_matchers = if input.permission_type == PermissionType::BrowserInteraction
+            && PermissionRequest::is_focused_browser_resource(&input.tool_name, &input.resource)
+        {
+            // Focus-bound input can only be decided once. No remembered scope
+            // is offered, so do not copy its private resource into matchers.
+            Vec::new()
+        } else {
+            conservative_matchers(input.permission_type, &input.resource)
+        };
         PermissionRequest {
             request_id: input.request_id.clone(),
             request_generation: PermissionRequest::fresh_generation(),
@@ -2049,7 +2058,7 @@ impl PermissionConfig {
             policy_revision: self.policy_revision(),
             matched_rule,
             allowed_decisions,
-            suggested_matchers: conservative_matchers(input.permission_type, &input.resource),
+            suggested_matchers,
         }
     }
 
@@ -3748,6 +3757,7 @@ mod integration_tests {
                 PermissionRequest::forced_decisions()
             );
             assert!(request.is_focused_browser_input());
+            assert!(request.suggested_matchers.is_empty());
             assert!(!request.operation_summary.contains("private text"));
 
             config.grant_once(
@@ -3853,6 +3863,7 @@ mod integration_tests {
                 other => panic!("targeted interaction should initially ask: {other:?}"),
             };
             assert!(!initial_request.is_focused_browser_input());
+            assert!(!initial_request.suggested_matchers.is_empty());
             let matcher = crate::conservative_matchers(
                 PermissionType::BrowserInteraction,
                 &evaluation.resource,

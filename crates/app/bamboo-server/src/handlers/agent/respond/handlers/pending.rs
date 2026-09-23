@@ -337,6 +337,16 @@ pub async fn get_pending_question(
             let tool_arguments_truncated = bounded_tool_arguments
                 .as_ref()
                 .is_some_and(|(_, truncated)| *truncated);
+            let permission_request_for_display =
+                interaction.permission_request.map(|mut request| {
+                    if request.is_focused_browser_input() {
+                        // Keep the exact request registered for receipt matching,
+                        // but do not send its private resource to approval UIs.
+                        request.resource = "[redacted]".to_string();
+                        request.suggested_matchers.clear();
+                    }
+                    request
+                });
 
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "has_pending_question": true,
@@ -347,7 +357,7 @@ pub async fn get_pending_question(
                 "tool_name": pending.tool_name,
                 "source": pending.source,
                 "interaction_kind": interaction.kind.as_str(),
-                "permission_request": interaction.permission_request,
+                "permission_request": permission_request_for_display,
                 "tool_arguments": tool_arguments,
                 "tool_arguments_truncated": tool_arguments_truncated,
             })))
@@ -558,7 +568,7 @@ mod http_tests {
         request.permission_type = PermissionType::BrowserInteraction;
         request.resource = "browser:17:type:focused:opaque".to_string();
         request.operation_summary = "Type into focused browser element".to_string();
-        request.suggested_matchers.clear();
+        request.suggested_matchers[0].value = request.resource.clone();
         let mut session = Session::new(session_id, "test-model");
         session
             .messages
@@ -598,7 +608,12 @@ mod http_tests {
             })
         );
         assert_eq!(body["tool_arguments_truncated"], false);
+        assert_eq!(body["permission_request"]["resource"], "[redacted]");
+        assert!(body["permission_request"]["suggested_matchers"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
         assert!(!body.to_string().contains(private_text));
+        assert!(!body.to_string().contains("opaque"));
         assert_eq!(
             pending_tool_arguments_exact(&session, tool_call_id).unwrap()["text"],
             private_text,

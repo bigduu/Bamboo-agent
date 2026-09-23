@@ -1441,8 +1441,8 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
         one_line("operation", &request.operation_summary),
     ];
     details.extend(labelled_preview(
-        "exact resource",
-        &request.resource,
+        permission.display_resource_label(),
+        permission.display_resource(),
         text_width,
         2,
     ));
@@ -1556,7 +1556,10 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
                         " {} {} = {}",
                         if is_selected { '›' } else { ' ' },
                         matcher.kind.label(),
-                        ellipsize(&matcher.value, text_width.saturating_sub(20))
+                        ellipsize(
+                            permission.display_matcher_value(&matcher.value),
+                            text_width.saturating_sub(20)
+                        )
                     ),
                     if is_selected {
                         Style::default()
@@ -1583,7 +1586,13 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
             interactive.push(one_line(
                 "global matcher",
                 &matcher
-                    .map(|matcher| format!("{} = {}", matcher.kind.label(), matcher.value))
+                    .map(|matcher| {
+                        format!(
+                            "{} = {}",
+                            matcher.kind.label(),
+                            permission.display_matcher_value(&matcher.value)
+                        )
+                    })
                     .unwrap_or_else(|| "missing; go back".to_string()),
             ));
         }
@@ -1713,7 +1722,7 @@ fn render_child_approval_question(f: &mut Frame, app: &App, q: &ActiveQuestion) 
         line("request", &child.request_id),
         line("tool", &child.tool_name),
         line("permission", &child.permission),
-        line("exact resource", &child.resource),
+        line(child.display_resource_label(), child.display_resource()),
     ];
     let mut interactive = vec![Line::from(Span::styled(
         " Allowed child decisions:",

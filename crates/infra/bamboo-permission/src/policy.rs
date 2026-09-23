@@ -443,12 +443,20 @@ impl PermissionRequest {
     /// Recover the focus-bound keyboard boundary from the server-generated
     /// resource when validating a persisted approval request after restart.
     pub fn is_focused_browser_input(&self) -> bool {
-        if !self.tool_name.eq_ignore_ascii_case("browser")
-            || self.permission_type != PermissionType::BrowserInteraction
-        {
+        if self.permission_type != PermissionType::BrowserInteraction {
             return false;
         }
-        let mut parts = self.resource.splitn(4, ':');
+        Self::is_focused_browser_resource(&self.tool_name, &self.resource)
+    }
+
+    /// Child approval snapshots carry a tool name and resource, but not a
+    /// typed permission request. Use the same focused-input boundary when
+    /// presenting either approval surface.
+    pub fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
+        if !tool_name.eq_ignore_ascii_case("browser") {
+            return false;
+        }
+        let mut parts = resource.splitn(4, ':');
         if parts.next() != Some("browser")
             || !parts
                 .next()
