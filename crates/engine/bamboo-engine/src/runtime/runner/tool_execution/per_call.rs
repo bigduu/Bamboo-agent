@@ -300,8 +300,15 @@ async fn execute_tool_call_only_with_execution_name(
                 );
                 if ctx.session_flags.auto_approve_permissions {
                     permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
-                } else if let Some(outcome) =
-                    hook_ask_outcome(ctx.tool_call, ctx.config, session, runtime_state, &args).await
+                } else if let Some(outcome) = hook_ask_outcome(
+                    ctx.tool_call,
+                    execution_name,
+                    ctx.config,
+                    session,
+                    runtime_state,
+                    &args,
+                )
+                .await
                 {
                     let end_event = match &outcome.result {
                         Ok(_) => emitter
@@ -436,6 +443,7 @@ async fn execute_tool_call_only_with_execution_name(
 /// clarification/approval flow.
 async fn hook_ask_outcome(
     tool_call: &ToolCall,
+    execution_name: &str,
     config: &AgentLoopConfig,
     session: &Session,
     runtime_state: &AgentRuntimeState,
@@ -443,13 +451,22 @@ async fn hook_ask_outcome(
 ) -> Option<ToolExecutionOutcome> {
     let tool_name = tool_call.function.name.trim().to_string();
     let focused_browser_input =
-        bamboo_tools::permission::is_focused_browser_input(&tool_name, args);
-    let permission_context = match bamboo_tools::permission::check_permissions(&tool_name, args) {
+        bamboo_tools::permission::is_focused_browser_input(execution_name, args);
+    let native_browser_select =
+        bamboo_tools::permission::is_native_browser_select(execution_name, args);
+    let private_browser_input = focused_browser_input || native_browser_select;
+    let private_check_error = if native_browser_select {
+        "Browser selection permission check failed"
+    } else {
+        "Focused browser input permission check failed"
+    };
+    let permission_context = match bamboo_tools::permission::check_permissions(execution_name, args)
+    {
         Ok(contexts) => contexts.and_then(|contexts| contexts.into_iter().next()),
-        Err(_) if focused_browser_input => {
+        Err(_) if private_browser_input => {
             return Some(ToolExecutionOutcome {
                 permission_replay_origin: None,
-                result: Err("Focused browser input permission check failed".to_string()),
+                result: Err(private_check_error.to_string()),
                 needs_human: None,
                 post_tool_hook_eligible: false,
                 tool_duration: std::time::Duration::ZERO,
@@ -457,10 +474,10 @@ async fn hook_ask_outcome(
         }
         Err(_) => None,
     };
-    if focused_browser_input && permission_context.is_none() {
+    if private_browser_input && permission_context.is_none() {
         return Some(ToolExecutionOutcome {
             permission_replay_origin: None,
-            result: Err("Focused browser input permission check failed".to_string()),
+            result: Err(private_check_error.to_string()),
             needs_human: None,
             post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::ZERO,
@@ -490,7 +507,7 @@ async fn hook_ask_outcome(
         requested_mode,
         config.permission_mode.unwrap_or_default(),
     );
-    let approval_resource = if focused_browser_input {
+    let approval_resource = if private_browser_input {
         "[redacted]".to_string()
     } else {
         resource.clone()
@@ -512,7 +529,7 @@ async fn hook_ask_outcome(
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
-        suggested_matchers: if focused_browser_input {
+        suggested_matchers: if private_browser_input {
             Vec::new()
         } else {
             bamboo_tools::permission::conservative_matchers(permission_type, &resource)
@@ -1787,7 +1804,14 @@ mod hook_tests {
         };
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy.clone()),
-            hook_ask_outcome(&key_call, &config, &session, &runtime_state, &key_args),
+            hook_ask_outcome(
+                &key_call,
+                "browser",
+                &config,
+                &session,
+                &runtime_state,
+                &key_args,
+            ),
         )
         .await
         .expect("denied parent review returns a tool outcome");
@@ -1821,6 +1845,7 @@ mod hook_tests {
             Some(reviewer_proxy),
             hook_ask_outcome(
                 &invalid_type_call,
+                "browser",
                 &config,
                 &session,
                 &runtime_state,
@@ -1832,6 +1857,124 @@ mod hook_tests {
         assert!(
             matches!(outcome.result, Err(ref error) if error == "Focused browser input permission check failed")
         );
+        assert_eq!(
+            reviewer
+                .0
+                .lock()
+                .expect("browser approval record lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn namespaced_browser_select_hook_ask_redacts_parent_request() {
+        let data_dir = tempfile::tempdir().expect("isolated Bamboo data dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("namespaced_browser_select_hook_ask_child")
+            .env("BAMBOO_DATA_DIR", data_dir.path())
+            .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+            .env("BAMBOO_SELECT_HOOK_ASK_TEST", "1")
+            .output()
+            .expect("run hook Ask child test");
+        assert!(output.status.success(), "isolated hook Ask test failed");
+    }
+
+    #[tokio::test]
+    async fn namespaced_browser_select_hook_ask_child() {
+        if std::env::var_os("BAMBOO_SELECT_HOOK_ASK_TEST").is_none() {
+            return;
+        }
+        let config = AgentLoopConfig::default();
+        let session = Session::new("browser-select-hook-ask", "model");
+        let runtime_state = AgentRuntimeState::new(&session.id);
+        let reviewer = Arc::new(BrowserApprovalRecorder::default());
+        let reviewer_proxy: Arc<dyn bamboo_tools::ApprovalProxy> = reviewer.clone();
+        let args = serde_json::json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":17,
+        });
+        let call = ToolCall {
+            id: "select-hook-ask".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: args.to_string(),
+            },
+        };
+        let callable_set =
+            effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let execution_name = callable_set
+            .resolve_callable_reference(&call.function.name)
+            .expect("namespaced browser resolves to the registered tool");
+        assert_eq!(execution_name, "browser");
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &args,
+            ),
+        )
+        .await
+        .expect("parent review returns an outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].tool_name, "default::browser");
+        assert_eq!(asks[0].resource, "[redacted]");
+        let request = asks[0]
+            .permission_request
+            .as_ref()
+            .expect("typed review request");
+        assert_eq!(
+            request.permission_type,
+            bamboo_tools::permission::PermissionType::BrowserInteraction
+        );
+        assert_eq!(request.resource, "[redacted]");
+        assert_eq!(request.operation_summary, "Select native browser options");
+        assert!(request.suggested_matchers.is_empty());
+        for private in ["private-option-value", "data-private", "options:"] {
+            assert!(!format!("{:?}", asks[0]).contains(private));
+        }
+        drop(asks);
+
+        let invalid_args = serde_json::json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":"invalid",
+        });
+        let invalid_call = ToolCall {
+            id: "select-hook-ask-invalid".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: invalid_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &invalid_call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &invalid_args,
+            ),
+        )
+        .await
+        .expect("invalid request fails closed");
+        assert!(matches!(
+            outcome.result,
+            Err(ref error) if error == "Browser selection permission check failed"
+        ));
         assert_eq!(
             reviewer
                 .0
