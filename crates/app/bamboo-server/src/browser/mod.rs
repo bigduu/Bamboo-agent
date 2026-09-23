@@ -16,6 +16,8 @@ use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
 const BROWSER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const BROWSER_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const BROWSER_COMMAND_DEADLINE: Duration = Duration::from_secs(30);
+const BROWSER_REAP_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -51,10 +53,15 @@ pub struct BrowserManager {
 
 struct BrowserSession {
     child: Mutex<Child>,
+    #[cfg(unix)]
+    process_group: Option<i32>,
     stdin: AsyncMutex<ChildStdin>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>,
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
+    shutdown: watch::Sender<bool>,
+    termination: AsyncMutex<()>,
+    reaped: AtomicBool,
     frame_epoch: AtomicU64,
     active_tab_id: Mutex<Option<String>>,
     alive: AtomicBool,
@@ -63,10 +70,25 @@ struct BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        // `kill_on_drop` also covers a Bamboo shutdown while a request is idle.
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.start_kill();
+        if !self.reaped.load(Ordering::Acquire) {
+            #[cfg(unix)]
+            if let Some(group) = self.process_group {
+                kill_browser_process_group(group);
+            }
+            // `kill_on_drop` also covers a Bamboo shutdown while a request is idle.
+            if let Ok(mut child) = self.child.lock() {
+                let _ = child.start_kill();
+            }
         }
+    }
+}
+
+#[cfg(unix)]
+fn kill_browser_process_group(group: i32) {
+    // A browser host starts in its own process group. Never signal Bamboo's
+    // group if a platform unexpectedly failed to apply that setting.
+    if group > 0 && group != unsafe { libc::getpgrp() } {
+        let _ = unsafe { libc::killpg(group, libc::SIGKILL) };
     }
 }
 
@@ -106,14 +128,27 @@ impl BrowserSession {
         let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         restrict_host_environment(&mut command);
-        let mut child = command
+        command
             .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command
             .spawn()
             .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
+        let session = Self::from_child(child)?;
+        // The first state request doubles as a readiness probe. A missing
+        // Playwright package or Chromium binary fails here, not on first click.
+        session.call("state", json!({})).await?;
+        Ok(session)
+    }
+
+    fn from_child(mut child: Child) -> Result<Arc<Self>, BrowserError> {
+        #[cfg(unix)]
+        let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child
             .stdin
             .take()
@@ -123,12 +158,18 @@ impl BrowserSession {
             .take()
             .ok_or_else(|| BrowserError::Unavailable("browser host stdout not available".into()))?;
         let (frames, _) = watch::channel(None);
+        let (shutdown, _) = watch::channel(false);
         let session = Arc::new(Self {
             child: Mutex::new(child),
+            #[cfg(unix)]
+            process_group,
             stdin: AsyncMutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
+            shutdown,
+            termination: AsyncMutex::new(()),
+            reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
             alive: AtomicBool::new(true),
@@ -136,9 +177,6 @@ impl BrowserSession {
         });
         let weak = Arc::downgrade(&session);
         tokio::spawn(async move { Self::read_messages(weak, stdout).await });
-        // The first state request doubles as a readiness probe. A missing
-        // Playwright package or Chromium binary fails here, not on first click.
-        session.call("state", json!({})).await?;
         Ok(session)
     }
 
@@ -146,6 +184,9 @@ impl BrowserSession {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Some(session) = weak.upgrade() else { break };
+            if !session.alive.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 tracing::warn!("browser host sent malformed JSON");
                 continue;
@@ -182,17 +223,14 @@ impl BrowserSession {
             }
         }
         if let Some(session) = weak.upgrade() {
-            session.alive.store(false, Ordering::Release);
-            session.frames.send_replace(None);
-            *session.active_tab_id.lock().unwrap() = None;
-            let pending = std::mem::take(&mut *session.pending.lock().unwrap());
-            for (_, sender) in pending {
-                let _ = sender.send(Err(BrowserError::Unavailable("browser host exited".into())));
-            }
+            session.terminate("browser host exited").await;
         }
     }
 
     fn accept_frame(&self, value: &Value) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
         let Some(tab_id) = value.get("active_tab_id").and_then(Value::as_str) else {
             return;
         };
@@ -238,6 +276,9 @@ impl BrowserSession {
     }
 
     fn accept_frame_reset(&self, value: &Value) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
         let Some(page_epoch) = value.get("page_epoch").and_then(Value::as_u64) else {
             return;
         };
@@ -261,27 +302,121 @@ impl BrowserSession {
         self.last_used.lock().unwrap().elapsed() >= ttl
     }
 
+    fn mark_dead(&self, reason: &'static str) {
+        if !self.alive.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.shutdown.send_replace(true);
+        self.frames.send_replace(None);
+        *self.active_tab_id.lock().unwrap() = None;
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for (_, sender) in pending {
+            let _ = sender.send(Err(BrowserError::Unavailable(reason.into())));
+        }
+    }
+
+    async fn terminate(&self, reason: &'static str) {
+        self.mark_dead(reason);
+        let _guard = self.termination.lock().await;
+        if self.reaped.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            kill_browser_process_group(group);
+        }
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+        }
+        let reaped = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
+            loop {
+                let status = self.child.lock().unwrap().try_wait();
+                match status {
+                    Ok(Some(_)) => return true,
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reap browser host");
+                        return false;
+                    }
+                }
+            }
+        })
+        .await;
+        if reaped == Ok(true) {
+            self.reaped.store(true, Ordering::Release);
+        } else {
+            tracing::warn!("browser host did not exit after process termination");
+        }
+    }
+
     async fn call(&self, action: &str, args: Value) -> Result<Value, BrowserError> {
+        self.call_with_deadline(action, args, BROWSER_COMMAND_DEADLINE)
+            .await
+    }
+
+    async fn call_with_deadline(
+        &self,
+        action: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<Value, BrowserError> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable("browser host exited".into()));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, sender);
         let line = serde_json::to_vec(&json!({"id": id, "action": action, "args": args}))
             .map_err(|error| BrowserError::Invalid(error.to_string()))?;
-        let write = async {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(&line).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await
-        };
-        if let Err(error) = write.await {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(BrowserError::Unavailable(error.to_string()));
+        let (sender, receiver) = oneshot::channel();
+        let mut shutdown = self.shutdown.subscribe();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if !self.alive.load(Ordering::Acquire) {
+                return Err(BrowserError::Unavailable("browser host exited".into()));
+            }
+            pending.insert(id, sender);
         }
-        match tokio::time::timeout(Duration::from_secs(30), receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(BrowserError::Unavailable("browser host exited".into())),
-            Err(_) => {
+        let exchange = async {
+            let mut stdin = self.stdin.lock().await;
+            if !self.alive.load(Ordering::Acquire) {
+                return Err(BrowserError::Unavailable("browser host exited".into()));
+            }
+            stdin
+                .write_all(&line)
+                .await
+                .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
+            drop(stdin);
+            receiver
+                .await
+                .map_err(|_| BrowserError::Unavailable("browser host exited".into()))?
+        };
+        let result = tokio::select! {
+            biased;
+            outcome = tokio::time::timeout(deadline, exchange) => outcome,
+            _ = shutdown.changed() => {
                 self.pending.lock().unwrap().remove(&id);
+                return Err(BrowserError::Unavailable("browser host exited".into()));
+            }
+        };
+        self.pending.lock().unwrap().remove(&id);
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                if matches!(error, BrowserError::Unavailable(_)) {
+                    self.terminate("browser host unavailable").await;
+                }
+                Err(error)
+            }
+            Err(_) => {
+                self.mark_dead("browser host timed out");
+                self.terminate("browser host timed out").await;
                 Err(BrowserError::Failed("browser action timed out".into()))
             }
         }
@@ -294,26 +429,339 @@ mod tests {
 
     #[cfg(unix)]
     fn stub_session(idle_for: Duration, alive: bool) -> Arc<BrowserSession> {
-        let mut child = Command::new("/bin/sleep")
+        let mut command = Command::new("/bin/sleep");
+        command
             .arg("60")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child.stdin.take().unwrap();
         let (frames, _) = watch::channel(None);
+        let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
             child: Mutex::new(child),
+            process_group,
             stdin: AsyncMutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
+            shutdown,
+            termination: AsyncMutex::new(()),
+            reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
             alive: AtomicBool::new(alive),
             last_used: Mutex::new(Instant::now() - idle_for),
         })
+    }
+
+    #[cfg(unix)]
+    fn fake_host(script: &str, paths: &[(&str, &std::path::Path)]) -> Arc<BrowserSession> {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        for (name, path) in paths {
+            command.env(name, path);
+        }
+        command.process_group(0);
+        BrowserSession::from_child(command.spawn().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_covers_stdin_wait_and_wakes_pending_without_blocking_other_chat() {
+        let browser = BrowserManager::default();
+        let hung = fake_host("IFS= read -r request; sleep 60", &[]);
+        let other = fake_host(
+            r#"IFS= read -r request; printf '%s\n' '{"id":1,"ok":true,"result":{"page_epoch":7}}'; sleep 60"#,
+            &[],
+        );
+        {
+            let mut sessions = browser.sessions.lock().await;
+            sessions.insert("hung-chat".into(), hung.clone());
+            sessions.insert("other-chat".into(), other.clone());
+        }
+        let stdin_guard = hung.stdin.lock().await;
+        let first = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "hung-chat",
+                        "state",
+                        json!({}),
+                        Duration::from_millis(150),
+                    )
+                    .await
+            })
+        };
+        let second = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline("hung-chat", "dom", json!({}), Duration::from_secs(5))
+                    .await
+            })
+        };
+        let other_state = tokio::time::timeout(
+            Duration::from_secs(1),
+            browser.command("other-chat", "state", json!({})),
+        )
+        .await
+        .expect("one hung chat must not block another chat")
+        .unwrap();
+        assert_eq!(other_state["page_epoch"], 7);
+        assert!(
+            matches!(first.await.unwrap(), Err(BrowserError::Failed(message)) if message.contains("timed out"))
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(BrowserError::Unavailable(_))
+        ));
+        drop(stdin_guard);
+        assert!(!browser.sessions.lock().await.contains_key("hung-chat"));
+        assert!(hung.pending.lock().unwrap().is_empty());
+        assert!(hung.child.lock().unwrap().try_wait().unwrap().is_some());
+        browser.close("other-chat").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_covers_a_blocked_stdin_write() {
+        let browser = BrowserManager::default();
+        let session = fake_host("sleep 60", &[]);
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("blocked-write".into(), session.clone());
+        // The fake host never reads stdin. This request exceeds the pipe
+        // capacity, so write_all itself must be inside the command deadline.
+        let result = browser
+            .command_with_deadline(
+                "blocked-write",
+                "input",
+                json!({"text": "x".repeat(2 * 1024 * 1024)}),
+                Duration::from_millis(150),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::Failed(message)) if message.contains("timed out"))
+        );
+        assert!(!browser.sessions.lock().await.contains_key("blocked-write"));
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_reaps_host_descendant_and_discards_queued_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let child_pid = directory.path().join("descendant.pid");
+        let late_marker = directory.path().join("late-action");
+        let session = fake_host(
+            r#"sleep 60 & echo "$!" > "$CHILD_PID_FILE"; IFS= read -r first; sleep 60; IFS= read -r second; : > "$LATE_MARKER_FILE""#,
+            &[
+                ("CHILD_PID_FILE", &child_pid),
+                ("LATE_MARKER_FILE", &late_marker),
+            ],
+        );
+        let browser = BrowserManager::default();
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("hung-chat".into(), session.clone());
+        let first = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "hung-chat",
+                        "state",
+                        json!({}),
+                        Duration::from_millis(300),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !child_pid.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake host should start a descendant");
+        let second = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline("hung-chat", "queued", json!({}), Duration::from_secs(5))
+                    .await
+            })
+        };
+        assert!(
+            matches!(first.await.unwrap(), Err(BrowserError::Failed(message)) if message.contains("timed out"))
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(BrowserError::Unavailable(_))
+        ));
+        assert!(!browser.sessions.lock().await.contains_key("hung-chat"));
+        assert!(session.pending.lock().unwrap().is_empty());
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+
+        let pid: u32 = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .await
+                    .unwrap();
+                let status = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || status.trim().is_empty()
+                    || status.trim().starts_with('Z')
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("host descendant should no longer run");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !late_marker.exists(),
+            "retired host executed a queued action"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_cancels_an_already_cloned_command_waiting_for_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        let late_marker = directory.path().join("late-action");
+        let session = fake_host(
+            r#"IFS= read -r request; : > "$LATE_MARKER_FILE"; sleep 60"#,
+            &[("LATE_MARKER_FILE", &late_marker)],
+        );
+        let browser = BrowserManager::default();
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("deleted-chat".into(), session.clone());
+        let stdin_guard = session.stdin.lock().await;
+        let queued = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "deleted-chat",
+                        "click_selector",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.pending.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("command should hold a cloned session before retirement");
+        browser.retire("deleted-chat").await.unwrap();
+        drop(stdin_guard);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), queued)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(BrowserError::Unavailable(_))
+        ));
+        assert!(session.pending.lock().unwrap().is_empty());
+        assert!(!late_marker.exists());
+        assert!(matches!(
+            browser.open("deleted-chat").await,
+            Err(BrowserError::NotOpen)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn renderer_hang_retires_chromium_and_reopens_chat_with_new_epoch() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let body = b"<!doctype html><title>stalled</title><script>for (;;) {}</script>";
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let browser = BrowserManager::default();
+        let opened = browser.open("hung-chat").await.unwrap();
+        let initial_epoch = opened["page_epoch"].as_u64().unwrap();
+        let old_host = browser.sessions.lock().await["hung-chat"].clone();
+        let result = browser
+            .command_with_deadline(
+                "hung-chat",
+                "navigate",
+                json!({"url": format!("http://{address}/"), "expected_epoch": initial_epoch}),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BrowserError::Failed(message)) if message.contains("timed out"))
+        );
+        assert!(!browser.sessions.lock().await.contains_key("hung-chat"));
+        assert!(old_host.child.lock().unwrap().try_wait().unwrap().is_some());
+
+        let reopened = browser.open("hung-chat").await.unwrap();
+        let new_epoch = reopened["page_epoch"].as_u64().unwrap();
+        assert_ne!(new_epoch, initial_epoch);
+        let last_old_epoch = old_host.frame_epoch.load(Ordering::Acquire);
+        if last_old_epoch != 0 {
+            assert_ne!(new_epoch, last_old_epoch);
+        }
+        browser.close("hung-chat").await.unwrap();
+        fixture.abort();
     }
 
     #[cfg(unix)]
@@ -486,7 +934,12 @@ impl BrowserManager {
         };
         if let Some(session) = existing {
             if session.alive.load(Ordering::Acquire) {
-                match session.call("state", json!({})).await {
+                let result = session.call("state", json!({})).await;
+                if !session.alive.load(Ordering::Acquire) {
+                    session.terminate("browser host unavailable").await;
+                    self.remove_if_same(session_id, &session).await;
+                }
+                match result {
                     Ok(state) => {
                         session.touch();
                         self.start_idle_cleanup();
@@ -496,7 +949,8 @@ impl BrowserManager {
                     Err(error) => return Err(error),
                 }
             }
-            self.sessions.lock().await.remove(session_id);
+            session.terminate("browser host unavailable").await;
+            self.remove_if_same(session_id, &session).await;
         }
         let session = BrowserSession::spawn().await?;
         let state = session.call("state", json!({})).await?;
@@ -519,6 +973,17 @@ impl BrowserManager {
         action: &str,
         args: Value,
     ) -> Result<Value, BrowserError> {
+        self.command_with_deadline(session_id, action, args, BROWSER_COMMAND_DEADLINE)
+            .await
+    }
+
+    async fn command_with_deadline(
+        &self,
+        session_id: &str,
+        action: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<Value, BrowserError> {
         let session = {
             let sessions = self.sessions.lock().await;
             let session = sessions
@@ -528,9 +993,26 @@ impl BrowserManager {
             session.touch();
             session
         };
-        let result = session.call(action, args).await;
-        session.touch();
+        let result = session.call_with_deadline(action, args, deadline).await;
+        if session.alive.load(Ordering::Acquire) {
+            session.touch();
+        } else {
+            session.terminate("browser host unavailable").await;
+            // A timed-out call retires exactly the host it used. A concurrent
+            // reopen must never be removed by the old call's completion.
+            self.remove_if_same(session_id, &session).await;
+        }
         result
+    }
+
+    async fn remove_if_same(&self, session_id: &str, candidate: &Arc<BrowserSession>) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        {
+            sessions.remove(session_id);
+        }
     }
 
     pub async fn command_or_open(
@@ -559,7 +1041,14 @@ impl BrowserManager {
     }
 
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
-        let session = self.sessions.lock().await.remove(session_id);
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions.remove(session_id);
+            if let Some(session) = &session {
+                session.mark_dead("browser session closed");
+            }
+            session
+        };
         if let Some(session) = session {
             Self::stop_session(session).await;
         }
@@ -567,13 +1056,10 @@ impl BrowserManager {
     }
 
     async fn stop_session(session: Arc<BrowserSession>) {
-        if session.alive.load(Ordering::Acquire) {
-            let _ = tokio::time::timeout(Duration::from_secs(2), session.call("close", json!({})))
-                .await;
-        }
-        if let Ok(mut child) = session.child.lock() {
-            let _ = child.start_kill();
-        }
+        // The map entry is already gone. Do not enqueue a graceful `close`
+        // behind an in-flight command: callers that hold this Arc must be
+        // stopped before they can write another action to the retired page.
+        session.terminate("browser session closed").await;
     }
 
     async fn sweep_idle(&self, ttl: Duration) -> usize {
@@ -598,7 +1084,11 @@ impl BrowserManager {
                     .get(&session_id)
                     .is_some_and(|session| session.idle_for(ttl))
                 {
-                    sessions.remove(&session_id)
+                    let session = sessions.remove(&session_id);
+                    if let Some(session) = &session {
+                        session.mark_dead("browser session idle");
+                    }
+                    session
                 } else {
                     None
                 }
