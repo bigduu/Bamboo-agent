@@ -1859,7 +1859,14 @@ mod hook_tests {
         };
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy.clone()),
-            hook_ask_outcome(&eval_call, &config, &session, &runtime_state, &eval_args),
+            hook_ask_outcome(
+                &eval_call,
+                "browser_eval",
+                &config,
+                &session,
+                &runtime_state,
+                &eval_args,
+            ),
         )
         .await
         .expect("denied eval review returns a tool outcome");
@@ -1960,7 +1967,7 @@ mod hook_tests {
                     .lock()
                     .expect("browser approval record lock")
                     .len(),
-                1
+                2
             );
         }
 
@@ -1992,16 +1999,16 @@ mod hook_tests {
         .expect("read-only browser hook Ask reaches parent");
         assert!(outcome.result.is_err());
         let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 2);
-        assert_eq!(asks[1].resource, "[redacted]");
-        let request = asks[1]
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[2].resource, "[redacted]");
+        let request = asks[2]
             .permission_request
             .as_ref()
             .expect("typed read-only review request");
         assert_eq!(request.resource, "[redacted]");
         assert!(request.suggested_matchers.is_empty());
         for private in ["private-option-value", "data-private"] {
-            assert!(!format!("{:?}", asks[1]).contains(private));
+            assert!(!format!("{:?}", asks[2]).contains(private));
         }
     }
 

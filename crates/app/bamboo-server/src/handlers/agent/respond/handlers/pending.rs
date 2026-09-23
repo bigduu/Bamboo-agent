@@ -401,9 +401,12 @@ pub async fn get_pending_question(
                 == PendingInteractionKind::Permission
                 && (is_browser_display_tool_name(&pending.tool_name)
                     || is_browser_eval_display_tool_name(&pending.tool_name)
-                    || interaction.permission_request.as_ref().is_some_and(|request| {
-                        is_browser_eval_display_tool_name(&request.tool_name)
-                    }))
+                    || interaction
+                        .permission_request
+                        .as_ref()
+                        .is_some_and(|request| {
+                            is_browser_eval_display_tool_name(&request.tool_name)
+                        }))
                 && bounded_tool_arguments
                     .as_ref()
                     .is_none_or(|(_, truncated, _)| *truncated);
@@ -418,9 +421,10 @@ pub async fn get_pending_question(
                 bamboo_tools::permission::is_native_browser_select("browser", arguments)
             });
             let browser_eval = is_browser_eval_display_tool_name(&pending.tool_name)
-                || interaction.permission_request.as_ref().is_some_and(|request| {
-                    is_browser_eval_display_tool_name(&request.tool_name)
-                });
+                || interaction
+                    .permission_request
+                    .as_ref()
+                    .is_some_and(|request| is_browser_eval_display_tool_name(&request.tool_name));
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
                     if request.has_private_browser_resource()
@@ -993,92 +997,96 @@ mod http_tests {
                 .await
                 .expect("app state"),
         );
-        let session_id = "browser-eval-pending-display";
-        let tool_call_id = "browser-eval-call";
-        let source = "document.querySelector('#password').value = 'private-source'";
-        let url = "https://example.com/account?token=private-query";
-        let original_args = serde_json::json!({
-            "code":source,
-            "expected_url":url,
-            "expected_epoch":17,
-        })
-        .to_string();
-        let mut request = permission_request(session_id, tool_call_id);
-        request.tool_name = "browser_eval".to_string();
-        request.permission_type = PermissionType::BrowserInteraction;
-        request.resource = "browser_eval:17:private-fingerprint".to_string();
-        request.operation_summary = "Execute browser page JavaScript on https://example.com".into();
-        request.suggested_matchers[0].value = request.resource.clone();
-        let matcher_id = request.suggested_matchers[0].id.clone();
-        let mut session = Session::new(session_id, "test-model");
-        session.messages.push(assistant_named_tool_call(
-            "browser_eval",
-            tool_call_id,
-            &original_args,
-        ));
-        session.messages.push(Message::tool_result(
-            tool_call_id,
-            serde_json::json!({
-                "status":"awaiting_permission_approval",
-                "question":"Approve browser page JavaScript?",
-                "permission_request":request,
-            })
-            .to_string(),
-        ));
-        session.set_pending_question_with_source(
-            tool_call_id.to_string(),
-            "browser_eval".to_string(),
-            "Approve browser page JavaScript?".to_string(),
-            vec!["Approve".to_string(), "Deny".to_string()],
-            false,
-            PendingQuestionSource::PauseTool,
-        );
-        state.save_and_cache_session(&mut session).await;
-
-        let response = get_pending_question(state, web::Path::from(session_id.to_string()))
-            .await
-            .expect("pending response");
-        let body = actix_web::body::to_bytes(response.into_body())
-            .await
-            .expect("response body");
-        let body: Value = serde_json::from_slice(&body).expect("response JSON");
-        assert_eq!(
-            body["question"],
-            "Approve browser page JavaScript on the active page?"
-        );
-        assert_eq!(
-            body["tool_arguments"],
-            serde_json::json!({
-                "code":"[redacted]",
-                "expected_url":"[redacted]",
+        for (tool_name, session_id) in [
+            ("browser_eval", "browser-eval-pending-display"),
+            (
+                "default::browser_eval",
+                "namespaced-browser-eval-pending-display",
+            ),
+        ] {
+            let tool_call_id = "browser-eval-call";
+            let source = "document.querySelector('#password').value = 'private-source'";
+            let url = "https://example.com/account?token=private-query";
+            let original_args = serde_json::json!({
+                "code":source,
+                "expected_url":url,
                 "expected_epoch":17,
             })
-        );
-        assert_eq!(body["permission_request"]["resource"], "[redacted]");
-        assert_eq!(
-            body["permission_request"]["suggested_matchers"][0]["id"],
-            matcher_id
-        );
-        assert_eq!(
-            body["permission_request"]["suggested_matchers"][0]["value"],
-            "[redacted]"
-        );
-        for secret in [
-            "#password",
-            "private-source",
-            "private-query",
-            "private-fingerprint",
-        ] {
-            assert!(!body.to_string().contains(secret));
+            .to_string();
+            let mut request = permission_request(session_id, tool_call_id);
+            request.tool_name = tool_name.to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser_eval:17:private-fingerprint".to_string();
+            request.operation_summary =
+                "Execute browser page JavaScript on https://example.com".into();
+            request.suggested_matchers[0].value = request.resource.clone();
+            let mut session = Session::new(session_id, "test-model");
+            session.messages.push(assistant_named_tool_call(
+                tool_name,
+                tool_call_id,
+                &original_args,
+            ));
+            session.messages.push(Message::tool_result(
+                tool_call_id,
+                serde_json::json!({
+                    "status":"awaiting_permission_approval",
+                    "question":"Approve browser page JavaScript?",
+                    "permission_request":request,
+                })
+                .to_string(),
+            ));
+            session.set_pending_question_with_source(
+                tool_call_id.to_string(),
+                tool_name.to_string(),
+                "Approve browser page JavaScript?".to_string(),
+                vec!["Approve".to_string(), "Deny".to_string()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
+            state.save_and_cache_session(&mut session).await;
+
+            let response =
+                get_pending_question(state.clone(), web::Path::from(session_id.to_string()))
+                    .await
+                    .expect("pending response");
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("response body");
+            let body: Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(
+                body["question"],
+                "Approve browser page JavaScript on the active page?"
+            );
+            assert_eq!(
+                body["tool_arguments"],
+                serde_json::json!({
+                    "code":"[redacted]",
+                    "expected_url":"[redacted]",
+                    "expected_epoch":17,
+                })
+            );
+            assert_eq!(body["permission_request"]["resource"], "[redacted]");
+            assert_eq!(
+                body["permission_request"]["suggested_matchers"],
+                serde_json::json!([])
+            );
+            for secret in [
+                "#password",
+                "private-source",
+                "private-query",
+                "private-fingerprint",
+            ] {
+                assert!(!body.to_string().contains(secret));
+            }
+            assert_eq!(
+                pending_tool_arguments_exact(&session, tool_call_id).unwrap()["code"],
+                source
+            );
+            assert_eq!(
+                pending_tool_arguments_exact(&session, tool_call_id).unwrap()["expected_url"],
+                url
+            );
         }
-        assert_eq!(
-            pending_tool_arguments_exact(&session, tool_call_id).unwrap()["code"],
-            source
-        );
-        assert_eq!(
-            pending_tool_arguments_exact(&session, tool_call_id).unwrap()["expected_url"],
-            url
-        );
     }
 
     #[actix_web::test]
