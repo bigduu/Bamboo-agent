@@ -251,7 +251,28 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
 
 test('hover and straight drag change the shared page and reject stale coordinates', async () => {
   const fixture = http.createServer((request, response) => {
+    if (request.url?.startsWith('/slow-')) {
+      setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end(`<main>${request.url}</main>`);
+      }, 1_400);
+      return;
+    }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    if (request.url === '/hover-navigate') {
+      response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="location.href=\'/slow-hover\'">Hover to navigate</button>');
+      return;
+    }
+    if (request.url === '/long-drag') {
+      response.end(`<!doctype html><style>
+        body { margin: 0; min-height: 3000px; }
+        #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
+        #drop { position: absolute; left: 220px; top: 2200px; width: 100px; height: 80px; background: green; }
+      </style><div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','long')">Drag</div>
+      <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('output').textContent=event.dataTransfer.getData('text/plain')">Drop</div>
+      <output>idle</output>`);
+      return;
+    }
     if (request.url === '/after-drop') {
       response.end('<main>After drop navigation</main>');
       return;
@@ -264,10 +285,11 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<main>After move navigation</main>');
       return;
     }
-    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move'].includes(request.url)) {
+    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move', '/navigate-on-slow-drop'].includes(request.url)) {
       const onDown = request.url === '/navigate-on-down' ? 'onmousedown="location.href=\'/after-down\'"' : '';
       const onMove = request.url === '/navigate-on-move' ? 'onpointermove="if(event.buttons)location.href=\'/after-move\'"' : '';
-      const onDrop = request.url === '/navigate-on-drop' ? 'location.href=\'/after-drop\'' : '';
+      const onDrop = request.url === '/navigate-on-drop' ? 'location.href=\'/after-drop\'' :
+        request.url === '/navigate-on-slow-drop' ? 'location.href=\'/slow-drop\'' : '';
       response.end(`<!doctype html><style>
         body { margin: 0; }
         #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
@@ -372,6 +394,35 @@ test('hover and straight drag change the shared page and reject stale coordinate
     assert.match(moveNav.result.url, /\/after-move$/);
     assert.notEqual(moveNav.result.page_epoch, moveReady.result.page_epoch);
     assert.match((await call('dom')).result.html, /After move navigation/);
+
+    const slowReady = await call('navigate', { url: url + 'navigate-on-slow-drop', expected_epoch: moveNav.result.page_epoch });
+    const dragStarted = Date.now();
+    const slowDrop = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: slowReady.result.page_epoch,
+    });
+    assert.equal(slowDrop.ok, true);
+    assert.ok(Date.now() - dragStarted >= 1_200);
+    assert.match(slowDrop.result.url, /\/slow-drop$/);
+    assert.notEqual(slowDrop.result.page_epoch, slowReady.result.page_epoch);
+
+    for (const action of ['hover_selector', 'hover_at']) {
+      const ready = await call('navigate', { url: url + 'hover-navigate', expected_epoch: (await call('state')).result.page_epoch });
+      const hoverStarted = Date.now();
+      const hovered = await call(action, action === 'hover_at'
+        ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
+        : { selector: '#hover', expected_epoch: ready.result.page_epoch });
+      assert.equal(hovered.ok, true, action);
+      assert.ok(Date.now() - hoverStarted >= 1_200, action);
+      assert.match(hovered.result.url, /\/slow-hover$/, action);
+      assert.notEqual(hovered.result.page_epoch, ready.result.page_epoch, action);
+    }
+
+    const longReady = await call('navigate', { url: url + 'long-drag', expected_epoch: (await call('state')).result.page_epoch });
+    const longDrag = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: longReady.result.page_epoch,
+    });
+    assert.equal(longDrag.ok, true);
+    assert.match((await call('dom')).result.html, /<output>long<\/output>/);
   } finally {
     host.stdin.end();
     host.kill();

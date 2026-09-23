@@ -326,43 +326,117 @@ function pointerButton(value) {
   return button;
 }
 
+function observeActionNavigation(page) {
+  let started = false;
+  let committed = false;
+  let failed = false;
+  let wake;
+  const settled = new Promise(resolve => { wake = resolve; });
+  const mainRequest = request => {
+    if (!request.isNavigationRequest()) return false;
+    try { return request.frame() === page.mainFrame(); } catch { return false; }
+  };
+  const onRequest = request => { if (mainRequest(request)) started = true; };
+  const onFailed = request => {
+    if (mainRequest(request)) { started = true; failed = true; wake(); }
+  };
+  const onFrame = frame => {
+    if (frame === page.mainFrame()) { started = true; committed = true; wake(); }
+  };
+  const onClose = () => { failed = true; wake(); };
+  page.on('request', onRequest);
+  page.on('requestfailed', onFailed);
+  page.on('framenavigated', onFrame);
+  page.on('close', onClose);
+  return {
+    get started() { return started; },
+    async finish() {
+      // Page handlers dispatch navigation requests asynchronously after the
+      // pointer call returns. Give that dispatch one short turn, then wait for
+      // an observed request to commit even when its response is slow.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      if (started && !committed && !failed) {
+        let timer;
+        try {
+          await Promise.race([
+            settled,
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(targetError('navigation_timeout', 'browser navigation did not complete')), 20_000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (started && !committed) throw targetError('navigation_failed', 'browser navigation failed');
+    },
+    dispose() {
+      page.off('request', onRequest);
+      page.off('requestfailed', onFailed);
+      page.off('framenavigated', onFrame);
+      page.off('close', onClose);
+    },
+  };
+}
+
+async function hoverWithNavigation(page, expectedEpoch, hover) {
+  const navigation = observeActionNavigation(page);
+  try {
+    try { await hover(); } catch (error) {
+      if (!navigation.started && expectedEpoch === epoch) throw error;
+    }
+    await navigation.finish();
+  } finally {
+    navigation.dispose();
+  }
+}
+
 async function dragBetween(page, source, destination, expectedEpoch, button = 'left') {
   if (expectedEpoch !== epoch) throw staleEpochError();
-  // A drop handler may begin navigation after mouse.up returns. Observe it
-  // before the first event so the returned state names the resulting page.
-  const navigation = page.waitForEvent('framenavigated', { timeout: 1_000 }).catch(() => null);
-  try {
-    await page.mouse.move(source.x, source.y);
-  } catch (error) {
-    if (expectedEpoch === epoch) throw error;
-  }
-  // Moving onto the source may itself navigate. In that case the gesture has
-  // already started; return the new page state without pressing on that page.
-  if (expectedEpoch !== epoch) return;
+  const navigation = observeActionNavigation(page);
+  const interrupted = () => expectedEpoch !== epoch || navigation.started;
   let downAttempted = false;
+  let failure;
   try {
-    downAttempted = true;
-    await page.mouse.down({ button });
-    for (let step = 1; step <= 12; step++) {
-      // A handler may navigate on mousedown or pointermove. Stop before any
-      // subsequent gesture event; the caller will return the current state.
-      if (expectedEpoch !== epoch) break;
-      await page.mouse.move(
-        source.x + (destination.x - source.x) * step / 12,
-        source.y + (destination.y - source.y) * step / 12,
-      );
+    try {
+      await page.mouse.move(source.x, source.y);
+      if (!interrupted()) {
+        downAttempted = true;
+        await page.mouse.down({ button });
+        let current = source;
+        if (!interrupted() && typeof destination === 'function') {
+          const viewport = page.viewportSize();
+          current = {
+            x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
+            y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
+          };
+          await page.mouse.move(current.x, current.y);
+          if (!interrupted()) destination = await destination();
+        }
+        if (!interrupted()) {
+          for (let step = 1; step <= 12; step++) {
+            if (interrupted()) break;
+            await page.mouse.move(
+              current.x + (destination.x - current.x) * step / 12,
+              current.y + (destination.y - current.y) * step / 12,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      if (!interrupted()) failure = error;
+    } finally {
+      if (downAttempted) {
+        // Clear button state without finishing the old gesture on a new page.
+        if (interrupted()) await page.mouse.move(-1, -1).catch(() => {});
+        await page.mouse.up({ button }).catch(() => {});
+      }
     }
-  } catch (error) {
-    if (expectedEpoch === epoch) throw error;
+    await navigation.finish();
+    if (failure) throw failure;
   } finally {
-    if (downAttempted) {
-      // Release outside the viewport if navigation changed the document. This
-      // clears mouse state without completing the old gesture on a new page.
-      if (expectedEpoch !== epoch) await page.mouse.move(-1, -1).catch(() => {});
-      await page.mouse.up({ button }).catch(() => {});
-    }
+    navigation.dispose();
   }
-  if (expectedEpoch === epoch) await navigation;
 }
 
 function activateTab(tab) {
@@ -562,14 +636,17 @@ async function command(action, args = {}) {
     }
     case 'hover_selector':
       checkEpoch(args);
-      await withPinnedTarget(args, handle => handle.hover({ timeout: 10_000 }));
+      page = requireActiveTab().page;
+      await hoverWithNavigation(page, args.expected_epoch,
+        () => withPinnedTarget(args, handle => handle.hover({ timeout: 10_000 })));
       return state();
     case 'hover_at':
       checkEpoch(args);
       page = requireActiveTab().page;
       var hoverPoint = pointerPoint(args, 'x', 'y', page);
       checkEpoch(args);
-      await page.mouse.move(hoverPoint.x, hoverPoint.y);
+      await hoverWithNavigation(page, args.expected_epoch,
+        () => page.mouse.move(hoverPoint.x, hoverPoint.y));
       return state();
     case 'drag_selector':
       checkEpoch(args);
@@ -580,13 +657,25 @@ async function command(action, args = {}) {
         await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
           await source.scrollIntoViewIfNeeded({ timeout: 10_000 });
           checkEpoch(args);
-          await destination.scrollIntoViewIfNeeded({ timeout: 10_000 });
-          checkEpoch(args);
           const from = await source.boundingBox();
           const to = await destination.boundingBox();
           if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
           const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
-          const end = pointerPoint({ x: to.x + to.width / 2, y: to.y + to.height / 2 }, 'x', 'y', page);
+          const viewport = page.viewportSize();
+          const targetX = to.x + to.width / 2;
+          const targetY = to.y + to.height / 2;
+          const targetVisible = targetX >= 0 && targetY >= 0 &&
+            targetX < viewport.width && targetY < viewport.height;
+          const end = targetVisible
+            ? pointerPoint({ x: targetX, y: targetY }, 'x', 'y', page)
+            : async () => {
+              // Begin the drag on the visible source before scrolling a distant
+              // destination into view; both elements need not fit together.
+              await destination.scrollIntoViewIfNeeded({ timeout: 10_000 });
+              const box = await destination.boundingBox();
+              if (!box) throw targetError('target_not_found', 'browser drag target is detached');
+              return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
+            };
           checkEpoch(args);
           await dragBetween(page, start, end, args.expected_epoch);
         });
