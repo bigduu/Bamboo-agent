@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::bash_security;
 use crate::hierarchy::PermissionRuleSet;
@@ -10,6 +13,130 @@ const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd
 /// one proactive request. This matches the bounded replay ledger so every
 /// schema-valid request can eventually complete.
 pub const MAX_PROACTIVE_PERMISSION_BATCH: usize = 64;
+
+/// Keep a remembered `type` grant tied to the exact bytes without putting
+/// potentially sensitive browser input into permission resources or logs.
+/// Temporary grants are process-local, so the salt can be process-local too.
+fn browser_type_fingerprint(text: &str) -> String {
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Stable across restarts so a durable approval for the same visible target
+/// continues to match. Input text uses the separate salted fingerprint above.
+fn browser_target_fingerprint(target: &str) -> String {
+    format!("{:x}", Sha256::digest(target.as_bytes()))
+}
+
+fn browser_press_key(args: &Value) -> Result<&str, PermissionError> {
+    let key = required_string_arg(args, "key")?;
+    if key.trim().is_empty()
+        || key.encode_utf16().count() > 128
+        || key.chars().any(char::is_control)
+    {
+        return Err(PermissionError::CheckFailed(
+            "browser press key must be nonempty and at most 128 UTF-16 code units without control characters"
+                .into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// A semantic locator's grant identity is independent of JSON key order and
+/// never contains page text. The description remains readable at approval.
+fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, PermissionError> {
+    let selector = args.get("selector").filter(|value| !value.is_null());
+    let Some(target) = args.get("target").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let invalid = || PermissionError::CheckFailed("invalid browser semantic target".into());
+    if selector.is_some() {
+        return Err(PermissionError::CheckFailed(
+            "browser selector and target are mutually exclusive".into(),
+        ));
+    }
+    let object = target.as_object().ok_or_else(invalid)?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let string = |name: &str, maximum: usize| -> Result<Option<&str>, PermissionError> {
+        match object.get(name) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && value.encode_utf16().count() <= maximum)
+                .map(Some)
+                .ok_or_else(invalid),
+        }
+    };
+    let frame = string("frame_selector", 512)?;
+    let exact = match object.get("exact") {
+        None => true,
+        Some(value) => value.as_bool().ok_or_else(invalid)?,
+    };
+    let (role, name, value, description, allowed): (
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        String,
+        &[&str],
+    ) = match kind {
+        "role" => {
+            let role = string("role", 64)?.ok_or_else(invalid)?;
+            if !role
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '-')
+            {
+                return Err(invalid());
+            }
+            let name = string("name", 256)?;
+            let description = match name {
+                Some(name) => format!("role {role} named {name:?}"),
+                None => format!("role {role}"),
+            };
+            (
+                Some(role),
+                name,
+                None,
+                description,
+                &["kind", "role", "name", "exact", "frame_selector"],
+            )
+        }
+        "label" | "text" => {
+            let value = string("value", 256)?.ok_or_else(invalid)?;
+            (
+                None,
+                None,
+                Some(value),
+                format!("{kind} {value:?}"),
+                &["kind", "value", "exact", "frame_selector"],
+            )
+        }
+        _ => return Err(invalid()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid());
+    }
+    let canonical = serde_json::json!([
+        kind,
+        role.unwrap_or(""),
+        name.unwrap_or(""),
+        value.unwrap_or(""),
+        exact,
+        frame.unwrap_or("")
+    ]);
+    let identity = browser_target_fingerprint(&canonical.to_string());
+    let description = match frame {
+        Some(frame) => format!("{description} in iframe {frame:?}"),
+        None => description,
+    };
+    Ok(Some((format!("semantic:{identity}"), description)))
+}
 
 pub fn check_permissions(
     tool_name: &str,
@@ -263,6 +390,173 @@ pub fn check_permissions(
                 format!("Web fetch: {}", url),
             )]))
         }
+        "browser" => {
+            let action = required_string_arg(args, "action")?;
+            match action {
+                "navigate" => {
+                    let raw = required_string_arg(args, "url")?;
+                    let url = url::Url::parse(raw).map_err(|error| {
+                        PermissionError::CheckFailed(format!("invalid browser URL: {error}"))
+                    })?;
+                    if !matches!(url.scheme(), "http" | "https")
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                    {
+                        return Err(PermissionError::CheckFailed(
+                            "browser navigation requires an http(s) URL without credentials".into(),
+                        ));
+                    }
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::HttpRequest,
+                        url.as_str(),
+                        format!("Navigate browser to {}", url.origin().ascii_serialization()),
+                    )]))
+                }
+                "click" | "click_at" | "fill" | "type" | "press" | "key" | "scroll" | "history"
+                | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
+                    // Bind remembered grants to the page generation. Navigation
+                    // increments the epoch, so a selector approved on one site
+                    // cannot silently carry authority to the next site.
+                    let epoch = args
+                        .get("expected_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            PermissionError::CheckFailed(
+                                "browser interaction requires expected_epoch from a snapshot"
+                                    .into(),
+                            )
+                        })?;
+                    let semantic = if matches!(action, "click" | "fill" | "press") {
+                        browser_semantic_target(args)?
+                    } else {
+                        None
+                    };
+                    let target = match action {
+                        "new_tab" => "new".to_string(),
+                        "activate_tab" | "close_tab" => browser_tab_id_arg(args)?.to_string(),
+                        "click" | "fill" => match &semantic {
+                            Some((identity, _)) => identity.clone(),
+                            None => required_string_arg(args, "selector")?.to_string(),
+                        },
+                        "press" => match &semantic {
+                            Some((identity, _)) => identity.clone(),
+                            None => match args.get("selector") {
+                                None | Some(Value::Null) => "page".to_string(),
+                                Some(value) => value
+                                    .as_str()
+                                    .filter(|selector| !selector.trim().is_empty())
+                                    .ok_or_else(|| {
+                                        PermissionError::CheckFailed(
+                                            "browser press selector must be nonempty".into(),
+                                        )
+                                    })?
+                                    .to_string(),
+                            },
+                        },
+                        "scroll" => args
+                            .get("selector")
+                            .and_then(Value::as_str)
+                            .unwrap_or("page")
+                            .to_string(),
+                        "history" => {
+                            let direction = required_string_arg(args, "direction")?;
+                            if !matches!(direction, "back" | "forward" | "reload") {
+                                return Err(PermissionError::CheckFailed(
+                                    "invalid browser history direction".into(),
+                                ));
+                            }
+                            direction.to_string()
+                        }
+                        "viewport" => {
+                            let width = args.get("width").and_then(Value::as_u64);
+                            let height = args.get("height").and_then(Value::as_u64);
+                            match (width, height) {
+                                (Some(width @ 320..=1200), Some(height @ 240..=1000)) => {
+                                    format!("{width}x{height}")
+                                }
+                                _ => {
+                                    return Err(PermissionError::CheckFailed(
+                                        "browser viewport must be within 320..1200 by 240..1000"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                        "click_at" => {
+                            let coordinate = |name| {
+                                args.get(name)
+                                    .and_then(Value::as_f64)
+                                    .filter(|value| value.is_finite() && *value >= 0.0)
+                                    .ok_or_else(|| {
+                                        PermissionError::CheckFailed(format!(
+                                            "browser requires nonnegative {name}"
+                                        ))
+                                    })
+                            };
+                            let x = coordinate("x")?;
+                            let y = coordinate("y")?;
+                            let button = match args.get("button") {
+                                None => "left",
+                                Some(value) => value.as_str().ok_or_else(|| {
+                                    PermissionError::CheckFailed("invalid browser button".into())
+                                })?,
+                            };
+                            if !matches!(button, "left" | "right" | "middle") {
+                                return Err(PermissionError::CheckFailed(
+                                    "invalid browser button".into(),
+                                ));
+                            }
+                            format!("{x},{y},{button}")
+                        }
+                        "type" => {
+                            let text = required_string_arg(args, "text")?;
+                            format!("focused:{}", browser_type_fingerprint(text))
+                        }
+                        "key" => {
+                            let key = required_string_arg(args, "key")?;
+                            if key.is_empty() {
+                                return Err(PermissionError::CheckFailed(
+                                    "browser key must be nonempty".into(),
+                                ));
+                            }
+                            key.to_string()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let description = if action == "type" {
+                        "Type into focused browser element".to_string()
+                    } else if let Some((_, semantic_description)) = &semantic {
+                        format!("Browser {action} on {semantic_description}")
+                    } else {
+                        format!("Browser {action} on {target}")
+                    };
+                    let target = if action == "fill" && semantic.is_some() {
+                        let text = required_string_arg(args, "text")?;
+                        format!("{target}:text:{}", browser_type_fingerprint(text))
+                    } else if action == "press" {
+                        let key = browser_press_key(args)?;
+                        if semantic.is_some()
+                            || args.get("selector").is_some_and(|value| !value.is_null())
+                        {
+                            format!("{target}:key:{}", browser_target_fingerprint(key))
+                        } else {
+                            target
+                        }
+                    } else {
+                        target
+                    };
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!("browser:{epoch}:{action}:{target}"),
+                        description,
+                    )]))
+                }
+                "tabs" | "snapshot" | "screenshot" => Ok(None),
+                _ => Err(PermissionError::CheckFailed(
+                    "unknown browser action".into(),
+                )),
+            }
+        }
         "WebSearch" => {
             let query = required_string_arg(args, "query")?;
             Ok(Some(vec![PermissionContext::new(
@@ -444,6 +738,7 @@ fn parse_requested_permission_type(value: &str) -> Option<PermissionType> {
         "http_request" | "HttpRequest" => Some(PermissionType::HttpRequest),
         "delete_operation" | "DeleteOperation" => Some(PermissionType::DeleteOperation),
         "terminal_session" | "TerminalSession" => Some(PermissionType::TerminalSession),
+        "browser_interaction" | "BrowserInteraction" => Some(PermissionType::BrowserInteraction),
         _ => None,
     }
 }
@@ -481,6 +776,20 @@ fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, Permis
         })
 }
 
+fn browser_tab_id_arg(args: &Value) -> Result<&str, PermissionError> {
+    let tab_id = required_string_arg(args, "tab_id")?;
+    if tab_id.len() != 24
+        || !tab_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(PermissionError::CheckFailed(
+            "browser tab_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    Ok(tab_id)
+}
+
 fn first_present_string_arg<'a>(
     args: &'a Value,
     keys: &[&str],
@@ -515,6 +824,412 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn browser_navigation_and_interaction_use_distinct_scoped_permissions() {
+        let navigation = check_permissions(
+            "browser",
+            &json!({"action":"navigate","url":"http://127.0.0.1:53495/"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(navigation[0].permission_type, PermissionType::HttpRequest);
+        assert_eq!(navigation[0].resource, "http://127.0.0.1:53495/");
+
+        let click = check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(click[0].permission_type, PermissionType::BrowserInteraction);
+        assert_eq!(click[0].resource, "browser:17:click:#increment");
+        let later = check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment","expected_epoch":18}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(click[0].resource, later[0].resource);
+        assert!(check_permissions(
+            "browser",
+            &json!({"action":"click","selector":"#increment"})
+        )
+        .is_err());
+        assert!(check_permissions("browser", &json!({"action":"snapshot"}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn browser_host_controls_use_action_specific_epoch_scoped_interaction_permissions() {
+        let cases = [
+            (
+                json!({"action":"history","direction":"back","expected_epoch":17}),
+                "browser:17:history:back",
+            ),
+            (
+                json!({"action":"viewport","width":640,"height":480,"expected_epoch":17}),
+                "browser:17:viewport:640x480",
+            ),
+            (
+                json!({"action":"click_at","x":12.5,"y":20,"button":"right","expected_epoch":17}),
+                "browser:17:click_at:12.5,20,right",
+            ),
+            (
+                json!({"action":"key","key":"Shift+Tab","expected_epoch":17}),
+                "browser:17:key:Shift+Tab",
+            ),
+        ];
+        for (args, expected_resource) in cases {
+            let context = check_permissions("browser", &args).unwrap().unwrap();
+            assert_eq!(context.len(), 1);
+            assert_eq!(
+                context[0].permission_type,
+                PermissionType::BrowserInteraction
+            );
+            assert_eq!(context[0].resource, expected_resource);
+            let mut later = args;
+            later["expected_epoch"] = json!(18);
+            assert_ne!(
+                check_permissions("browser", &later).unwrap().unwrap()[0].resource,
+                expected_resource
+            );
+        }
+    }
+
+    #[test]
+    fn browser_tab_mutations_bind_grants_to_epoch_and_opaque_tab_id() {
+        assert!(check_permissions("browser", &json!({"action":"tabs"}))
+            .unwrap()
+            .is_none());
+        for (args, resource) in [
+            (
+                json!({"action":"new_tab","expected_epoch":17}),
+                "browser:17:new_tab:new",
+            ),
+            (
+                json!({"action":"activate_tab","tab_id":"aaaaaaaaaaaaaaaaaaaaaaaa","expected_epoch":17}),
+                "browser:17:activate_tab:aaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                json!({"action":"close_tab","tab_id":"aaaaaaaaaaaaaaaaaaaaaaaa","expected_epoch":17}),
+                "browser:17:close_tab:aaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            let context = check_permissions("browser", &args).unwrap().unwrap();
+            assert_eq!(
+                context[0].permission_type,
+                PermissionType::BrowserInteraction
+            );
+            assert_eq!(context[0].resource, resource);
+            let mut stale = args;
+            stale["expected_epoch"] = json!(18);
+            assert_ne!(
+                check_permissions("browser", &stale).unwrap().unwrap()[0].resource,
+                resource
+            );
+        }
+        for args in [
+            json!({"action":"new_tab"}),
+            json!({"action":"activate_tab","expected_epoch":17}),
+            json!({"action":"close_tab","expected_epoch":17}),
+            json!({"action":"activate_tab","tab_id":"short","expected_epoch":17}),
+            json!({"action":"close_tab","tab_id":"AAAAAAAAAAAAAAAAAAAAAAAA","expected_epoch":17}),
+            json!({"action":"activate_tab","tab_id":"a".repeat(10000),"expected_epoch":17}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_type_grant_is_bound_to_input_without_exposing_text() {
+        let context = |text: &str, epoch| {
+            check_permissions(
+                "browser",
+                &json!({"action":"type","text":text,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let original = context("private input", 17);
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original.resource.starts_with("browser:17:type:focused:"));
+        assert!(!original.resource.contains("private input"));
+        assert_eq!(
+            original.operation_description,
+            "Type into focused browser element"
+        );
+        assert_eq!(original.resource, context("private input", 17).resource);
+        let different_text = context("other input", 17);
+        assert_ne!(original.resource, different_text.resource);
+        assert_ne!(original.resource, context("private input", 18).resource);
+
+        let config = crate::PermissionConfig::default();
+        let matcher =
+            crate::conservative_matchers(PermissionType::BrowserInteraction, &original.resource)
+                .remove(0);
+        config
+            .grant_typed_scoped_session_permission(
+                "chat",
+                PermissionType::BrowserInteraction,
+                matcher,
+            )
+            .unwrap();
+        assert!(config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &original.resource
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &different_text.resource
+        ));
+    }
+
+    #[test]
+    fn browser_semantic_grants_bind_target_frame_epoch_and_fill_text() {
+        let context = |action: &str, target: Value, epoch: u64, text: &str| {
+            check_permissions(
+                "browser",
+                &json!({"action":action,"target":target,"expected_epoch":epoch,"text":text,"key":"Enter"}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let role =
+            json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"});
+        let original = context("click", role.clone(), 17, "");
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original.resource.starts_with("browser:17:click:semantic:"));
+        assert!(!original.resource.contains("Save"));
+        assert_eq!(
+            original.resource,
+            "browser:17:click:semantic:164a3f6e8b4b57fc37043624be24dc835d53ed605c301b27aa9d7ca9c0fe031e"
+        );
+        assert!(original
+            .operation_description
+            .contains("role button named \"Save\""));
+        assert!(original.operation_description.contains("iframe#checkout"));
+        assert_eq!(
+            original.resource,
+            context("click", json!({"frame_selector":"iframe#checkout","name":"Save","role":"button","kind":"role","exact":true}), 17, "").resource
+        );
+        assert_ne!(
+            original.resource,
+            context("click", role.clone(), 18, "").resource
+        );
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#other"}), 17, "").resource);
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Cancel","frame_selector":"iframe#checkout"}), 17, "").resource);
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout","exact":false}), 17, "").resource);
+        assert_ne!(original.resource, context("press", role, 17, "").resource);
+        let press = |key: &str| {
+            check_permissions(
+                "browser",
+                &json!({"action":"press","target":{"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"},"key":key,"expected_epoch":17}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        assert_ne!(press("Tab").resource, press("Enter").resource);
+        assert_eq!(press("Tab").resource, press("Tab").resource);
+        assert!(!press("Control+A").resource.contains("Control+A"));
+
+        let label = json!({"kind":"label","value":"Secret field"});
+        let first_fill = context("fill", label.clone(), 17, "private value");
+        let second_fill = context("fill", label, 17, "other value");
+        assert_ne!(first_fill.resource, second_fill.resource);
+        assert!(!first_fill.resource.contains("Secret field"));
+        assert!(!first_fill.resource.contains("private value"));
+        assert!(first_fill.operation_description.contains("Secret field"));
+        assert!(!first_fill.operation_description.contains("private value"));
+        assert_ne!(
+            first_fill.resource,
+            context(
+                "fill",
+                json!({"kind":"label","value":"Secret field"}),
+                17,
+                ""
+            )
+            .resource
+        );
+    }
+
+    #[test]
+    fn browser_css_press_grants_bind_the_key_selector_and_epoch() {
+        let context = |selector: &str, key: &str, epoch: u64| {
+            check_permissions(
+                "browser",
+                &json!({"action":"press","selector":selector,"key":key,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let enter = context("#save", "Enter", 17);
+        assert_eq!(enter.permission_type, PermissionType::BrowserInteraction);
+        assert!(enter.resource.starts_with("browser:17:press:#save:key:"));
+        assert_eq!(enter.operation_description, "Browser press on #save");
+        assert!(!enter.resource.contains("Enter"));
+        assert_eq!(enter.resource, context("#save", "Enter", 17).resource);
+        assert_ne!(enter.resource, context("#save", "Control+A", 17).resource);
+        assert_ne!(enter.resource, context("#other", "Enter", 17).resource);
+        assert_ne!(enter.resource, context("#save", "Enter", 18).resource);
+        assert!(context("page", "Enter", 17)
+            .resource
+            .starts_with("browser:17:press:page:key:"));
+
+        let semantic = check_permissions(
+            "browser",
+            &json!({"action":"press","target":{"kind":"role","role":"button","name":"Save"},"key":"Enter","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap()
+        .remove(0);
+        let key_digest = enter.resource.rsplit(":key:").next().unwrap();
+        assert_eq!(key_digest.len(), 64);
+        assert!(semantic.resource.ends_with(key_digest));
+        assert!(semantic.resource.contains(":press:semantic:"));
+    }
+
+    #[test]
+    fn remembered_css_enter_approval_does_not_authorize_control_a() {
+        use crate::{
+            PermissionConfig, PermissionDecisionKind, PermissionDecisionSource,
+            PermissionEvaluation, PermissionOutcome, RiskLevel,
+        };
+
+        let args = |key: &str| json!({"action":"press","selector":"#account","key":key,"expected_epoch":17});
+        let enter_args = args("Enter");
+        let control_args = args("Control+A");
+        let enter = check_permissions("browser", &enter_args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let control = check_permissions("browser", &control_args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let config = PermissionConfig::new();
+        let matcher =
+            crate::conservative_matchers(enter.permission_type, &enter.resource).remove(0);
+        config
+            .grant_typed_scoped_session_permission("chat", enter.permission_type, matcher)
+            .unwrap();
+        let evaluation = |context: &PermissionContext, tool_args: Value| PermissionEvaluation {
+            request_id: "browser-press".into(),
+            session_id: "chat".into(),
+            workspace_path: None,
+            tool_name: "browser".into(),
+            tool_args,
+            permission_type: context.permission_type,
+            resource: context.resource.clone(),
+            operation_summary: context.operation_description.clone(),
+            risk_level: RiskLevel::High,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            platform_hard_deny: None,
+            consume_once: true,
+            supported_decisions: PermissionDecisionKind::all_supported(),
+        };
+        assert!(matches!(
+            config.evaluate(evaluation(&enter, enter_args)),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::RememberedSession,
+                ..
+            }
+        ));
+        assert!(matches!(
+            config.evaluate(evaluation(&control, control_args)),
+            PermissionOutcome::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn browser_press_rejects_invalid_keys_before_approval() {
+        for key in [
+            json!(null),
+            json!(7),
+            json!(""),
+            json!(" "),
+            json!("Control\nA"),
+            json!("a".repeat(129)),
+        ] {
+            assert!(
+                check_permissions(
+                    "browser",
+                    &json!({"action":"press","selector":"#save","key":key,"expected_epoch":17}),
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        for selector in [json!(""), json!(" "), json!(7)] {
+            assert!(check_permissions(
+                "browser",
+                &json!({"action":"press","selector":selector,"key":"Enter","expected_epoch":17}),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn browser_semantic_targets_reject_invalid_approval_requests() {
+        for args in [
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"role","role":"button"},"selector":"#save"}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"label"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"text","value":"Save","exact":"yes"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"role","role":"BUTTON"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"text","value":"Save","frame_selector":" "}}),
+            json!({"action":"click","expected_epoch":17}),
+            json!({"action":"press","expected_epoch":17,"target":{"kind":"text","value":"Save"}}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn browser_host_controls_reject_missing_epoch_and_invalid_arguments_before_approval() {
+        let valid_without_epoch = [
+            json!({"action":"history","direction":"back"}),
+            json!({"action":"viewport","width":640,"height":480}),
+            json!({"action":"click_at","x":12,"y":20}),
+            json!({"action":"type","text":"Lotus"}),
+            json!({"action":"key","key":"Enter"}),
+        ];
+        for args in valid_without_epoch {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
+        let invalid = [
+            json!({"action":"history","direction":"sideways","expected_epoch":17}),
+            json!({"action":"viewport","width":319,"height":480,"expected_epoch":17}),
+            json!({"action":"click_at","x":-1,"y":20,"expected_epoch":17}),
+            json!({"action":"click_at","x":12,"y":20,"button":"invalid","expected_epoch":17}),
+            json!({"action":"type","expected_epoch":17}),
+            json!({"action":"key","key":"","expected_epoch":17}),
+        ];
+        for args in invalid {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn browser_permission_rejects_unsafe_navigation_schemes_and_credentials() {
+        for url in [
+            "file:///tmp/a",
+            "javascript:alert(1)",
+            "http://user:pass@example.com/",
+        ] {
+            assert!(
+                check_permissions("browser", &json!({"action":"navigate","url":url})).is_err(),
+                "{url}"
+            );
+        }
+    }
 
     #[test]
     fn check_permissions_write() {

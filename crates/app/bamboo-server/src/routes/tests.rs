@@ -2,6 +2,265 @@ use actix_web::http::{header, StatusCode};
 use actix_web::{test, web, App};
 use tempfile::tempdir;
 
+#[actix_web::test]
+async fn browser_routes_require_access_and_an_existing_chat_session() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".into(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".into()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    for (method, uri) in [
+        ("PUT", "/api/v1/browser/sessions/missing"),
+        ("GET", "/api/v1/browser/sessions/missing"),
+        ("DELETE", "/api/v1/browser/sessions/missing"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/activate"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/close"),
+        ("POST", "/api/v1/browser/sessions/missing/navigate"),
+        ("POST", "/api/v1/browser/sessions/missing/history"),
+        ("POST", "/api/v1/browser/sessions/missing/viewport"),
+        ("POST", "/api/v1/browser/sessions/missing/input"),
+        ("GET", "/api/v1/browser/sessions/missing/dom"),
+        ("GET", "/api/v1/browser/sessions/missing/frame"),
+        ("GET", "/api/v1/browser/sessions/missing/screenshot"),
+    ] {
+        let request = match method {
+            "PUT" => test::TestRequest::put(),
+            "POST" => test::TestRequest::post(),
+            "DELETE" => test::TestRequest::delete(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .peer_addr("198.51.100.7:3000".parse().unwrap())
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({}))
+        .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    // Reuse the same route tree with access disabled to check the handler's
+    // existing-session guard separately from the account access middleware.
+    app_state.config.write().await.access_control = None;
+
+    for uri in [
+        "/api/v1/browser/sessions/missing",
+        "/api/v1/browser/sessions/missing/dom",
+        "/api/v1/browser/sessions/missing/frame",
+        "/api/v1/browser/sessions/missing/screenshot",
+    ] {
+        let request = test::TestRequest::get().uri(uri).to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let open = test::TestRequest::put()
+        .uri("/api/v1/browser/sessions/missing")
+        .set_json(serde_json::json!({}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, open).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    for uri in [
+        "/api/v1/browser/sessions/missing/tabs",
+        "/api/v1/browser/sessions/missing/tabs/activate",
+        "/api/v1/browser/sessions/missing/tabs/close",
+    ] {
+        let body = if uri.ends_with("/tabs") {
+            serde_json::json!({"expected_epoch":1})
+        } else {
+            serde_json::json!({"expected_epoch":1,"tab_id":"missing"})
+        };
+        let request = test::TestRequest::post()
+            .uri(uri)
+            .set_json(body)
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+
+    // Reject malformed opaque IDs before dispatching to a browser host. This
+    // also bounds IDs that enter request logs and permission resources.
+    let mut session = bamboo_agent_core::Session::new("known-browser-chat", "test-model");
+    app_state.save_and_cache_session(&mut session).await;
+    for path in ["activate", "close"] {
+        for tab_id in [
+            "short".to_string(),
+            "AAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "a".repeat(10_000),
+        ] {
+            let uri = format!("/api/v1/browser/sessions/known-browser-chat/tabs/{path}");
+            let request = test::TestRequest::post()
+                .uri(&uri)
+                .set_json(serde_json::json!({"tab_id":tab_id,"expected_epoch":1}))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+    }
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-tab-route-integration";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let first_tab = opened["active_tab_id"].as_str().unwrap().to_string();
+    assert_eq!(opened["tabs"].as_array().unwrap().len(), 1);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let second_tab = created["active_tab_id"].as_str().unwrap().to_string();
+    let created_epoch = created["page_epoch"].to_string();
+    assert_ne!(first_tab, second_tab);
+    assert_eq!(created["tabs"].as_array().unwrap().len(), 2);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], second_tab);
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(
+        screenshot.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        screenshot
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(screenshot).await.len() > 1000);
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(
+        frame.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        frame
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(frame).await.len() > 1000);
+
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":first_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let activated: Value = test::read_body_json(activated).await;
+    assert_eq!(activated["active_tab_id"], first_tab);
+    assert_ne!(activated["page_epoch"], created["page_epoch"]);
+
+    let stale = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/close"))
+            .set_json(json!({"tab_id":second_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
 use super::{configure_routes, configure_routes_with_rate_limiting};
 use crate::AppState;
 use bamboo_config::AccessControlConfig;
