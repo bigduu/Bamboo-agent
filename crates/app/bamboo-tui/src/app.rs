@@ -2634,6 +2634,62 @@ fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
     }
 }
 
+fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+    if !tool_name.eq_ignore_ascii_case("browser") {
+        return None;
+    }
+    let action = args.get("action")?.as_str()?;
+    match action {
+        "type" | "key" => Some(action),
+        "press"
+            if args.get("selector").is_none_or(serde_json::Value::is_null)
+                && args.get("target").is_none_or(serde_json::Value::is_null) =>
+        {
+            Some(action)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
+    if !tool_name.eq_ignore_ascii_case("browser") {
+        return raw.to_string();
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "[browser arguments unavailable]".to_string();
+    };
+    if let Some(action) = focused_browser_action(tool_name, &args) {
+        return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
+    }
+    raw.to_string()
+}
+
+pub(crate) fn tool_complete_result_for_display(tool_name: &str, raw: &str) -> String {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return if tool_name.eq_ignore_ascii_case("browser")
+            && raw.contains("awaiting_permission_approval")
+        {
+            "Browser input awaiting permission approval".to_string()
+        } else {
+            raw.to_string()
+        };
+    };
+    let approval = payload.get("status").and_then(serde_json::Value::as_str)
+        == Some("awaiting_permission_approval")
+        && (tool_name.eq_ignore_ascii_case("browser")
+            || payload.get("permission_request").is_some_and(|request| {
+                request
+                    .get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+            }));
+    if approval {
+        "Browser input awaiting permission approval".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 impl PermissionQuestion {
     fn has_focused_browser_resource(&self) -> bool {
         self.request.permission_type == PermissionType::BrowserInteraction
@@ -11451,7 +11507,7 @@ impl App {
                         .child_start_intents
                         .insert(tool_call_id.clone(), intent);
                 }
-                let arguments = serde_json::to_string(&arguments).unwrap_or_default();
+                let arguments = tool_arguments_for_display(&tool_name, &arguments.to_string());
                 if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                     // A ToolToken can race ahead of ToolStart. Hydrate that
                     // placeholder in place so its stable block id/output and
@@ -11483,7 +11539,6 @@ impl App {
                 result,
             } => {
                 let success = result.success;
-                let result = result.result;
                 let activity_name = self
                     .chat
                     .run_status
@@ -11492,6 +11547,7 @@ impl App {
                     .find(|tool| tool.id == tool_call_id)
                     .map(|tool| tool.name.clone())
                     .unwrap_or_else(|| tool_call_id.clone());
+                let result = tool_complete_result_for_display(&activity_name, &result.result);
                 let typed_known = self
                     .chat
                     .run_status
@@ -16420,6 +16476,72 @@ mod question_tests {
         assert_eq!(child.display_resource(), "<redacted>");
         assert!(!child.inspector_text().contains("private-fingerprint"));
         assert_eq!(child.resource, resource);
+    }
+
+    #[test]
+    fn focused_browser_tool_events_keep_private_input_out_of_chat_display() {
+        for (action, field, resource) in [
+            ("type", "text", "browser:17:type:focused:opaque"),
+            ("key", "key", "browser:17:key:opaque"),
+            ("press", "key", "browser:17:press:focused:key:opaque"),
+        ] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            let mut args = serde_json::json!({"action":action,"expected_epoch":17});
+            args[field] = serde_json::json!("private input");
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "browser-call".to_string(),
+                tool_name: "browser".to_string(),
+                arguments: args,
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "browser-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: serde_json::json!({
+                        "status":"awaiting_permission_approval",
+                        "question":"Approve private input?",
+                        "permission_request":{"tool_name":"browser","resource":resource},
+                    })
+                    .to_string(),
+                },
+            })
+            .unwrap();
+            let displayed = &app.chat.current_tool_calls[0];
+            assert!(!displayed.arguments.contains("private input"));
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser input awaiting permission approval")
+            );
+            assert!(!format!("{displayed:?}").contains("opaque"));
+        }
+
+        let args = serde_json::json!({
+            "action":"press","selector":"#field","key":"[redacted]","expected_epoch":17,
+        });
+        assert_eq!(
+            tool_arguments_for_display("browser", &args.to_string()),
+            args.to_string()
+        );
+        assert_eq!(
+            tool_complete_result_for_display("browser", "ordinary result"),
+            "ordinary result"
+        );
+        assert_eq!(
+            tool_complete_result_for_display(
+                "browser",
+                r#"{"status":"awaiting_permission_approval","permission_request":"invalid"}"#,
+            ),
+            "Browser input awaiting permission approval"
+        );
+        assert_eq!(
+            tool_complete_result_for_display(
+                "browser",
+                r#"{"status":"awaiting_permission_approval","question":"private input""#,
+            ),
+            "Browser input awaiting permission approval"
+        );
     }
 
     #[test]

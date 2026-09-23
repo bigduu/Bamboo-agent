@@ -5,7 +5,10 @@
 //! `HistoryMessage` fixtures without spinning up an `App`.
 
 use crate::api::types::HistoryMessage;
-use crate::app::{ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay};
+use crate::app::{
+    tool_arguments_for_display, tool_complete_result_for_display, ChatMessage, MessageRole,
+    SubAgentDisplay, ToolCallDisplay,
+};
 
 /// Map a session's raw history (`GET /api/v1/history/{id}`) into the chat
 /// transcript the Chat tab renders.
@@ -54,18 +57,24 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
-                    .map(|(tool_index, tc)| ToolCallDisplay {
-                        id: if tc.id.is_empty() {
-                            format!("{message_id}:tool:{tool_index}")
-                        } else {
-                            tc.id
-                        },
-                        tool_name: tc.function.name,
-                        arguments: tc.function.arguments,
-                        result: None,
-                        stream_output: String::new(),
-                        error: None,
-                        phase: "pending".to_string(),
+                    .map(|(tool_index, tc)| {
+                        let tool_name = tc.function.name;
+                        ToolCallDisplay {
+                            id: if tc.id.is_empty() {
+                                format!("{message_id}:tool:{tool_index}")
+                            } else {
+                                tc.id
+                            },
+                            arguments: tool_arguments_for_display(
+                                &tool_name,
+                                &tc.function.arguments,
+                            ),
+                            tool_name,
+                            result: None,
+                            stream_output: String::new(),
+                            error: None,
+                            phase: "pending".to_string(),
+                        }
                     })
                     .collect();
                 let reasoning = msg.reasoning.filter(|r| !r.is_empty());
@@ -119,12 +128,14 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         .iter_mut()
                         .find(|tool| tool.id == tool_call_id)
                         .expect("parent index was selected by this tool id");
+                    let display_content =
+                        tool_complete_result_for_display(&tc.tool_name, &msg.content);
                     if msg.tool_success == Some(false) {
                         tc.phase = "error".to_string();
-                        tc.error = Some(msg.content);
+                        tc.error = Some(display_content);
                     } else {
                         tc.phase = "complete".to_string();
-                        tc.result = Some(msg.content);
+                        tc.result = Some(display_content);
                     }
                 }
                 for child in children {
@@ -447,6 +458,27 @@ mod tests {
         assert_eq!(tc.result.as_deref(), Some("file contents"));
         assert!(tc.error.is_none());
         assert_eq!(tc.phase, "complete");
+    }
+
+    #[test]
+    fn resumed_focused_browser_approval_keeps_private_input_out_of_chat() {
+        let args = serde_json::json!({"action":"key","key":"private input","expected_epoch":17});
+        let result = serde_json::json!({
+            "status":"awaiting_permission_approval",
+            "question":"Approve private input?",
+            "permission_request":{"tool_name":"browser","resource":"browser:17:key:opaque"},
+        });
+        let out = map_history(vec![
+            assistant("", vec![("browser-call", "browser", &args.to_string())]),
+            tool("browser-call", &result.to_string(), Some(true)),
+        ]);
+        let displayed = &out[0].tool_calls[0];
+        assert!(!displayed.arguments.contains("private input"));
+        assert_eq!(
+            displayed.result.as_deref(),
+            Some("Browser input awaiting permission approval")
+        );
+        assert!(!format!("{displayed:?}").contains("opaque"));
     }
 
     #[test]
