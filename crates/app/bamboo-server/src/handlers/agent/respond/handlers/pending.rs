@@ -354,6 +354,15 @@ pub async fn get_pending_question(
             let tool_arguments_truncated = bounded_tool_arguments
                 .as_ref()
                 .is_some_and(|(_, truncated, _)| *truncated);
+            // A parked browser approval may outlive a missing or undecodable
+            // request. Never reuse its original question when the action
+            // cannot be inspected safely; it may quote private input.
+            let browser_arguments_unavailable = interaction.kind
+                == PendingInteractionKind::Permission
+                && pending.tool_name.eq_ignore_ascii_case("browser")
+                && bounded_tool_arguments
+                    .as_ref()
+                    .is_none_or(|(_, truncated, _)| *truncated);
             let focused_browser_input = interaction
                 .permission_request
                 .as_ref()
@@ -363,7 +372,7 @@ pub async fn get_pending_question(
                     .is_some_and(|(_, _, focused)| *focused);
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
-                    if request.is_focused_browser_input() {
+                    if request.is_focused_browser_input() || browser_arguments_unavailable {
                         // Keep the exact request registered for receipt matching,
                         // but do not send its private resource to approval UIs.
                         request.resource = "[redacted]".to_string();
@@ -376,7 +385,9 @@ pub async fn get_pending_question(
 
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "has_pending_question": true,
-                "question": if focused_browser_input {
+                "question": if browser_arguments_unavailable {
+                    "Approve browser action?"
+                } else if focused_browser_input {
                     "Approve focused browser input?"
                 } else {
                     pending.question.as_str()
@@ -678,6 +689,70 @@ mod http_tests {
                 input,
                 "presentation redaction must preserve the parked invocation"
             );
+        }
+    }
+
+    #[actix_web::test]
+    async fn browser_permission_without_decodable_arguments_uses_safe_question() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for (case, raw_arguments) in [
+            ("malformed", Some("{private input".to_string())),
+            (
+                "oversized",
+                Some(format!(
+                    "private{}",
+                    "x".repeat(MAX_PENDING_TOOL_ARGUMENT_BYTES)
+                )),
+            ),
+            ("missing", None),
+        ] {
+            let session_id = format!("browser-{case}-without-request");
+            let tool_call_id = format!("browser-{case}-call");
+            let mut session = Session::new(session_id.as_str(), "test-model");
+            if let Some(raw_arguments) = raw_arguments {
+                session.messages.push(assistant_browser_call(
+                    tool_call_id.as_str(),
+                    raw_arguments.as_str(),
+                ));
+            }
+            session.messages.push(Message::tool_result(
+                tool_call_id.as_str(),
+                serde_json::json!({"status":"awaiting_permission_approval"}).to_string(),
+            ));
+            session.set_pending_question_with_source(
+                tool_call_id.clone(),
+                "browser".to_string(),
+                "Approve private input?".to_string(),
+                vec!["Approve".to_string(), "Deny".to_string()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
+            state.save_and_cache_session(&mut session).await;
+
+            let response = get_pending_question(state.clone(), web::Path::from(session_id))
+                .await
+                .expect("pending response");
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("response body");
+            let body: Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["interaction_kind"], "permission");
+            assert_eq!(body["question"], "Approve browser action?");
+            assert!(body["permission_request"].is_null());
+            assert!(!body.to_string().contains("private input"));
+            if case == "missing" {
+                assert!(body["tool_arguments"].is_null());
+            } else {
+                assert_eq!(
+                    body["tool_arguments"],
+                    serde_json::json!({"arguments":"[omitted]"})
+                );
+            }
         }
     }
 
