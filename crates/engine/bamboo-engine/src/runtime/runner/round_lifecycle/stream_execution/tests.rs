@@ -4723,6 +4723,25 @@ async fn legacy_browser_usage_projection_counts_compact_provider_history() {
             .await
             .unwrap();
     assert_eq!(disabled.prepared_message_input_tokens, unprojected);
+    let non_browser = provider_visible_schema(
+        "ReadArchive",
+        "Read archived repository files",
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    );
+    let non_browser_projected = super::project_request_usage(
+        &session,
+        &prepared,
+        &config,
+        &[non_browser],
+        "test-model",
+        &provider,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        non_browser_projected.prepared_message_input_tokens,
+        unprojected
+    );
 }
 
 #[tokio::test]
