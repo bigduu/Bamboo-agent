@@ -248,21 +248,31 @@ fn pending_tool_arguments_for_display(
     session: &Session,
     pending: &PendingQuestion,
     request: Option<&PermissionRequest>,
-) -> Option<(serde_json::Value, bool)> {
+) -> Option<(serde_json::Value, bool, bool)> {
     if !pending.tool_name.eq_ignore_ascii_case("browser") {
-        return pending_tool_arguments(session, pending.tool_call_id.as_str());
+        return pending_tool_arguments(session, pending.tool_call_id.as_str())
+            .map(|(args, truncated)| (args, truncated, false));
     }
     let raw = pending_tool_argument_text(session, pending.tool_call_id.as_str())?;
+    let parked_focused = request.is_some_and(PermissionRequest::is_focused_browser_input);
     if raw.len() > MAX_PENDING_TOOL_ARGUMENT_BYTES {
-        return Some((serde_json::json!({"arguments":"[omitted]"}), true));
+        return Some((
+            serde_json::json!({"arguments":"[omitted]"}),
+            true,
+            parked_focused,
+        ));
     }
     let parsed: serde_json::Value = match serde_json::from_str(raw) {
         Ok(parsed) => parsed,
-        Err(_) => return Some((serde_json::json!({"arguments":"[omitted]"}), true)),
+        Err(_) => {
+            return Some((
+                serde_json::json!({"arguments":"[omitted]"}),
+                true,
+                parked_focused,
+            ));
+        }
     };
-    if request.is_some_and(PermissionRequest::is_focused_browser_input)
-        || bamboo_tools::permission::is_focused_browser_input("browser", &parsed)
-    {
+    if parked_focused || bamboo_tools::permission::is_focused_browser_input("browser", &parsed) {
         return Some((
             match parsed.get("action").and_then(serde_json::Value::as_str) {
                 Some("type") => serde_json::json!({"action":"type","text":"[redacted]"}),
@@ -273,9 +283,10 @@ fn pending_tool_arguments_for_display(
                 _ => serde_json::json!({"arguments":"[omitted]"}),
             },
             false,
+            true,
         ));
     }
-    Some((parsed, false))
+    Some((parsed, false, false))
 }
 
 /// Get the pending question for a session (if any).
@@ -339,18 +350,17 @@ pub async fn get_pending_question(
                 .flatten();
             let tool_arguments = bounded_tool_arguments
                 .as_ref()
-                .map(|(arguments, _)| arguments.clone());
+                .map(|(arguments, _, _)| arguments.clone());
             let tool_arguments_truncated = bounded_tool_arguments
                 .as_ref()
-                .is_some_and(|(_, truncated)| *truncated);
+                .is_some_and(|(_, truncated, _)| *truncated);
             let focused_browser_input = interaction
                 .permission_request
                 .as_ref()
                 .is_some_and(PermissionRequest::is_focused_browser_input)
-                || bounded_tool_arguments.as_ref().is_some_and(|(args, _)| {
-                    args.get("text").and_then(serde_json::Value::as_str) == Some("[redacted]")
-                        || args.get("key").and_then(serde_json::Value::as_str) == Some("[redacted]")
-                });
+                || bounded_tool_arguments
+                    .as_ref()
+                    .is_some_and(|(_, _, focused)| *focused);
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
                     if request.is_focused_browser_input() {
@@ -567,7 +577,7 @@ mod http_tests {
     }
 
     #[actix_web::test]
-    async fn get_pending_question_redacts_focused_type_key_and_press() {
+    async fn get_pending_question_redacts_focused_input_and_preserves_selector_literal() {
         let temp_dir = tempdir().expect("tempdir");
         let state = web::Data::new(
             AppState::new(temp_dir.path().to_path_buf())
@@ -575,21 +585,33 @@ mod http_tests {
                 .expect("app state"),
         );
         let private_input = "private browser input";
-        for (action, argument, resource) in [
-            ("type", "text", "browser:17:type:focused:opaque"),
-            ("key", "key", "browser:17:key:opaque"),
-            ("press", "key", "browser:17:press:focused:key:opaque"),
+        for (action, argument, resource, selector) in [
+            ("type", "text", "browser:17:type:focused:opaque", None),
+            ("key", "key", "browser:17:key:opaque", None),
+            ("press", "key", "browser:17:press:focused:key:opaque", None),
+            ("fill", "text", "browser:17:fill:#account", Some("#account")),
+            (
+                "press",
+                "key",
+                "browser:17:press:#account:key:opaque",
+                Some("#account"),
+            ),
         ] {
-            let session_id = format!("focused-browser-{action}-display");
-            let tool_call_id = format!("focused-browser-{action}-call");
+            let focused = selector.is_none();
+            let input = if focused { private_input } else { "[redacted]" };
+            let session_id = format!("browser-{action}-{focused}-display");
+            let tool_call_id = format!("browser-{action}-{focused}-call");
             let mut args = serde_json::json!({"action":action,"expected_epoch":17});
-            args[argument] = serde_json::json!(private_input);
+            args[argument] = serde_json::json!(input);
+            if let Some(selector) = selector {
+                args["selector"] = serde_json::json!(selector);
+            }
             let original_args = args.to_string();
             let mut request = permission_request(&session_id, &tool_call_id);
             request.tool_name = "browser".to_string();
             request.permission_type = PermissionType::BrowserInteraction;
             request.resource = resource.to_string();
-            request.operation_summary = format!("Send {private_input} to focused element");
+            request.operation_summary = format!("Send {input} to browser element");
             request.suggested_matchers[0].value = resource.to_string();
             let mut session = Session::new(session_id.as_str(), "test-model");
             session.messages.push(assistant_browser_call(
@@ -600,7 +622,7 @@ mod http_tests {
                 tool_call_id.as_str(),
                 serde_json::json!({
                     "status":"awaiting_permission_approval",
-                    "question":format!("Approve {private_input}?"),
+                    "question":format!("Approve {input}?"),
                     "permission_request":request,
                 })
                 .to_string(),
@@ -608,7 +630,7 @@ mod http_tests {
             session.set_pending_question_with_source(
                 tool_call_id.clone(),
                 "browser".to_string(),
-                format!("Approve {private_input}?"),
+                format!("Approve {input}?"),
                 vec!["Approve".to_string(), "Deny".to_string()],
                 false,
                 PendingQuestionSource::PauseTool,
@@ -622,23 +644,38 @@ mod http_tests {
                 .await
                 .expect("response body");
             let body: Value = serde_json::from_slice(&body).expect("response JSON");
-            assert_eq!(body["question"], "Approve focused browser input?");
+            assert_eq!(
+                body["question"],
+                if focused {
+                    "Approve focused browser input?".to_string()
+                } else {
+                    format!("Approve {input}?")
+                }
+            );
             let mut expected = serde_json::json!({"action":action});
             expected[argument] = serde_json::json!("[redacted]");
+            if let Some(selector) = selector {
+                expected["selector"] = serde_json::json!(selector);
+                expected["expected_epoch"] = serde_json::json!(17);
+            }
             assert_eq!(body["tool_arguments"], expected);
-            assert_eq!(body["permission_request"]["resource"], "[redacted]");
-            assert_eq!(
-                body["permission_request"]["operation_summary"],
-                "Focused browser input"
-            );
-            assert!(body["permission_request"]["suggested_matchers"]
-                .as_array()
-                .is_some_and(Vec::is_empty));
-            assert!(!body.to_string().contains(private_input));
-            assert!(!body.to_string().contains("opaque"));
+            if focused {
+                assert_eq!(body["permission_request"]["resource"], "[redacted]");
+                assert_eq!(
+                    body["permission_request"]["operation_summary"],
+                    "Focused browser input"
+                );
+                assert!(body["permission_request"]["suggested_matchers"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty));
+                assert!(!body.to_string().contains(private_input));
+                assert!(!body.to_string().contains("opaque"));
+            } else {
+                assert_eq!(body["permission_request"]["resource"], resource);
+            }
             assert_eq!(
                 pending_tool_arguments_exact(&session, &tool_call_id).unwrap()[argument],
-                private_input,
+                input,
                 "presentation redaction must preserve the parked invocation"
             );
         }
@@ -915,17 +952,18 @@ mod http_tests {
             "text":format!("private{}", "x".repeat(MAX_PENDING_TOOL_ARGUMENT_BYTES)),
         })
         .to_string();
-        let (preview, truncated) = display(&oversized);
+        let (preview, truncated, _) = display(&oversized);
         assert_eq!(preview, serde_json::json!({"arguments":"[omitted]"}));
         assert!(truncated);
-        let (preview, truncated) = display(r#"{"action":"type","text":"private"#);
+        let (preview, truncated, _) = display(r#"{"action":"type","text":"private"#);
         assert_eq!(preview, serde_json::json!({"arguments":"[omitted]"}));
         assert!(truncated);
-        let (preview, truncated) = display(r##"{"action":"click","selector":"#save"}"##);
+        let (preview, truncated, focused) = display(r##"{"action":"click","selector":"#save"}"##);
         assert_eq!(
             preview,
             serde_json::json!({"action":"click","selector":"#save"})
         );
         assert!(!truncated);
+        assert!(!focused);
     }
 }
