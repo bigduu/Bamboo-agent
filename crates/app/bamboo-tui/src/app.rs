@@ -16577,6 +16577,7 @@ mod question_tests {
         );
         for target in [
             serde_json::json!({"selector":"#field"}),
+            serde_json::json!({"selector":"focused"}),
             serde_json::json!({"target":{"kind":"role","role":"button","name":"Save"}}),
             serde_json::json!({"target":{"kind":"label","value":"Password"}}),
             serde_json::json!({"target":{"kind":"text","value":"Confirm"}}),
@@ -16607,6 +16608,11 @@ mod question_tests {
         assert_eq!(
             tool_complete_result_for_display("browser", "ordinary result", false),
             "ordinary result"
+        );
+        let other_tool_approval = r#"{"status":"awaiting_permission_approval","permission_request":{"tool_name":"Bash","resource":"cargo test"}}"#;
+        assert_eq!(
+            tool_complete_result_for_display("Bash", other_tool_approval, false),
+            other_tool_approval
         );
         assert_eq!(
             tool_complete_result_for_display(
