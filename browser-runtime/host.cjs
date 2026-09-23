@@ -264,7 +264,7 @@ function installEvalHelper(key) {
     return true;
   };
 
-  const run = async source => {
+  const execute = async source => {
     const value = await (0, nativeEval)(source);
     const seen = new weakSetCtor();
     let entries = 0;
@@ -330,6 +330,7 @@ function installEvalHelper(key) {
     const valueJson = stringify(safeValue);
     if (!withinUtf8Bytes(valueJson, 65536)) throw new nativeError('browser_eval result exceeds 64 KiB');
     const response = create(null);
+    define(response, 'ok', { value: true, enumerable: true });
     define(response, 'value', { value: safeValue, enumerable: true });
     define(response, 'observed_url', { value: root.location.href, enumerable: true });
     // Playwright's object transfer can use mutable page intrinsics. Return a
@@ -337,6 +338,16 @@ function installEvalHelper(key) {
     const serialized = stringify(response);
     if (!withinUtf8Bytes(serialized, 75000)) throw new nativeError('browser_eval transfer exceeds limit');
     return serialized;
+  };
+  const run = async source => {
+    try {
+      return await execute(source);
+    } catch {
+      // Never inspect or stringify a thrown page value. Error.message and
+      // toString can be hostile getters, and Playwright would transfer an
+      // unbounded rejection if this helper let it escape.
+      return '{"ok":false}';
+    }
   };
   define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
 }
@@ -405,21 +416,22 @@ async function evalInActivePage(args) {
   if (!unchanged()) throw staleEpochError();
   let transferred;
   try {
-    // The pre-document helper holds pristine intrinsics in a closure. Only
-    // the source string crosses into Chromium; no Node or Playwright object
-    // is exposed to page code. The page can replace its global intrinsics,
-    // but cannot replace the helper or its captured functions.
-    const serialized = await page.evaluate(({ source, key }) => {
-      // `globalThis` is writable by page code; `window` is the WindowProxy's
-      // non-configurable self reference. The helper itself is non-writable.
-      const helper = window[key];
-      if (typeof helper !== 'function') throw new Error('browser_eval page helper unavailable');
-      return helper(source);
-    }, { source: args.code, key: EVAL_HELPER_KEY });
+    // Playwright's page.evaluate compiles its callback through the page's
+    // mutable window.eval. CDP compiles this fixed call independently while
+    // the protected helper still evaluates the model source in the page realm.
+    const cdp = await tab.cdp;
+    if (!cdp) throw new Error('browser_eval page session unavailable');
+    const expression = `window[${JSON.stringify(EVAL_HELPER_KEY)}](${JSON.stringify(args.code)})`;
+    const reply = await cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    });
+    if (reply.exceptionDetails) throw new Error('browser_eval page helper unavailable');
+    const serialized = reply.result?.value;
     if (typeof serialized !== 'string' || Buffer.byteLength(serialized, 'utf8') > 75000) {
       throw new Error('browser_eval transfer exceeds limit');
     }
     const evaluated = JSON.parse(serialized);
+    if (evaluated?.ok !== true) throw new Error('browser_eval JavaScript failed');
     if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
     // A synchronous location assignment may schedule navigation after eval
     // resolves. Give Chromium a turn to commit it, then recheck from the host.

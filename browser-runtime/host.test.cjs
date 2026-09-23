@@ -1232,6 +1232,7 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
         Array.prototype.map = () => ['spoof'];
         Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
         Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        window.eval = () => () => 'x'.repeat(1_000_000);
       `);
       return;
     }
@@ -1306,9 +1307,8 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
       expected_epoch: lexicalGlobal.page_epoch, expected_url: lexicalGlobalUrl,
       code: '({actual: 16})',
     });
-    assert.ok(lexicalGlobalResult.ok || lexicalGlobalResult.code === 'browser_eval_error', JSON.stringify(lexicalGlobalResult));
-    if (lexicalGlobalResult.ok) assert.deepEqual(lexicalGlobalResult.result.value, { actual: 16 });
-    else assert.ok(lexicalGlobalResult.error.length <= 2048);
+    assert.equal(lexicalGlobalResult.ok, true, JSON.stringify(lexicalGlobalResult));
+    assert.deepEqual(lexicalGlobalResult.result.value, { actual: 16 });
     const navigated = (await call('navigate', { url, expected_epoch: lexicalGlobal.page_epoch })).result;
     const expected = { expected_epoch: navigated.page_epoch, expected_url: url };
     const read = await call('eval', { ...expected, code: 'document.querySelector("output").textContent' });
@@ -1343,6 +1343,7 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
         Array.prototype.map = () => ['spoof'];
         Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
         Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        window.eval = () => () => 'x'.repeat(1_000_000);
         return { actual: 12 };
       })()`,
     });
@@ -1386,13 +1387,27 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal((await call('eval', { ...expected, code: '"x".repeat(70000)' })).code, 'browser_eval_error');
     const multibyte = await call('eval', { ...expected, code: '"汉".repeat(30000)' });
     assert.equal(multibyte.code, 'browser_eval_error');
-    assert.match(multibyte.error, /64 KiB/);
+    assert.equal(multibyte.error, 'browser_eval JavaScript failed');
     const emoji = await call('eval', { ...expected, code: '"💥".repeat(20000)' });
     assert.equal(emoji.code, 'browser_eval_error');
-    assert.match(emoji.error, /64 KiB/);
+    assert.equal(emoji.error, 'browser_eval JavaScript failed');
     const exception = await call('eval', { ...expected, code: 'throw new Error("E".repeat(5000))' });
     assert.equal(exception.code, 'browser_eval_error');
-    assert.ok(exception.error.length <= 2048);
+    assert.equal(exception.error, 'browser_eval JavaScript failed');
+    const hugeString = await call('eval', { ...expected, code: 'throw "S".repeat(1_000_000)' });
+    assert.equal(hugeString.code, 'browser_eval_error');
+    assert.equal(hugeString.error, 'browser_eval JavaScript failed');
+    const hugeRejection = await call('eval', {
+      ...expected, code: 'Promise.reject(new Error("R".repeat(1_000_000)))',
+    });
+    assert.equal(hugeRejection.code, 'browser_eval_error');
+    assert.equal(hugeRejection.error, 'browser_eval JavaScript failed');
+    const hostileError = await call('eval', {
+      ...expected,
+      code: `throw new Proxy({}, { get() { throw new Error('hostile error property'); } });`,
+    });
+    assert.equal(hostileError.code, 'browser_eval_error');
+    assert.equal(hostileError.error, 'browser_eval JavaScript failed');
     const navigation = await call('eval', {
       ...expected,
       code: '(() => { location.href = "/next"; return "old"; })()',
@@ -1418,9 +1433,8 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
         return { actual: 13 };
       })()`,
     });
-    assert.ok(identityOverride.ok || identityOverride.code === 'browser_eval_error', JSON.stringify(identityOverride));
-    if (identityOverride.ok) assert.deepEqual(identityOverride.result.value, { actual: 13 });
-    else assert.ok(identityOverride.error.length <= 2048);
+    assert.equal(identityOverride.ok, true, JSON.stringify(identityOverride));
+    assert.deepEqual(identityOverride.result.value, { actual: 13 });
   } finally {
     await call('close').catch(() => {});
     host.stdin.end();
