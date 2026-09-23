@@ -2750,6 +2750,9 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
         return "[browser arguments unavailable]".to_string();
     };
+    if args.get("data_base64").is_some() {
+        return serde_json::json!({"action":"set_file_input","input":"[redacted]"}).to_string();
+    }
     if let Some(action) = focused_browser_action(tool_name, &args) {
         return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
     }
@@ -17091,6 +17094,12 @@ mod question_tests {
             assert_eq!(
                 display,
                 r#"{"action":"set_file_input","input":"[redacted]"}"#
+            );
+            let invalid =
+                serde_json::json!({"action":"unknown","data_base64":"cHJpdmF0ZSBieXRlcw=="});
+            assert_eq!(
+                tool_arguments_for_display(tool_name, &invalid.to_string()),
+                display
             );
             let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
             app.chat.streaming = true;
