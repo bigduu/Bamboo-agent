@@ -318,7 +318,11 @@ pub struct LoggingPermissionChecker<T: PermissionChecker> {
 
 fn is_private_browser_resource(permission_type: PermissionType, resource: &str) -> bool {
     permission_type == PermissionType::BrowserInteraction
-        && super::policy::PermissionRequest::is_focused_browser_resource("browser", resource)
+        && (super::policy::PermissionRequest::is_focused_browser_resource("browser", resource)
+            || super::policy::PermissionRequest::is_private_browser_resource(
+                "browser_eval",
+                resource,
+            ))
 }
 
 fn permission_log_resource(permission_type: PermissionType, resource: &str) -> &str {
@@ -1345,10 +1349,32 @@ mod tests {
             Err(PermissionError::ConfirmationRequired { .. })
         ));
         checker.grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
+        let eval_resource = "browser_eval:17:private-eval-fingerprint";
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::BrowserInteraction, eval_resource)
+                .await
+        );
+        let eval_result = checker
+            .request_confirmation(PermissionContext::new(
+                PermissionType::BrowserInteraction,
+                eval_resource,
+                "Execute browser page JavaScript",
+            ))
+            .await;
+        assert!(matches!(
+            eval_result,
+            Err(PermissionError::ConfirmationRequired { .. })
+        ));
+        checker.grant_session_permission(
+            PermissionType::BrowserInteraction,
+            eval_resource.to_string(),
+        );
         let logged =
             String::from_utf8(bytes.lock().expect("log buffer lock").clone()).expect("UTF-8 logs");
         assert!(logged.contains("[redacted]"));
         assert!(!logged.contains("private-fingerprint"));
+        assert!(!logged.contains("private-eval-fingerprint"));
     }
 
     #[tokio::test]

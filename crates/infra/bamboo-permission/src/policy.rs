@@ -440,6 +440,20 @@ pub struct PermissionDecisionReceipt {
 }
 
 impl PermissionRequest {
+    /// Display surfaces must hide the private keyed identity of page scripts.
+    /// This is separate from focused input's one-shot approval policy: eval
+    /// keeps the configured BrowserInteraction decision scopes.
+    pub fn has_private_browser_resource(&self) -> bool {
+        self.permission_type == PermissionType::BrowserInteraction
+            && Self::is_private_browser_resource(&self.tool_name, &self.resource)
+    }
+
+    pub fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
+        Self::is_focused_browser_resource(tool_name, resource)
+            || (tool_name.eq_ignore_ascii_case("browser_eval")
+                && resource.starts_with("browser_eval:"))
+    }
+
     /// Recover the focus-bound keyboard boundary from the server-generated
     /// resource when validating a persisted approval request after restart.
     pub fn is_focused_browser_input(&self) -> bool {
