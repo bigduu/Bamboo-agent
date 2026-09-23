@@ -6,6 +6,7 @@
 
 use crate::api::types::HistoryMessage;
 use crate::app::{
+    browser_download_result_for_display, is_browser_download_display_call,
     is_browser_eval_tool_name, tool_arguments_for_display, tool_complete_result_for_display,
     ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay,
 };
@@ -132,6 +133,11 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         && is_browser_eval_tool_name(&tc.tool_name)
                     {
                         "Browser page JavaScript failed".to_string()
+                    } else if is_browser_download_display_call(&tc.tool_name, &tc.arguments) {
+                        browser_download_result_for_display(
+                            &msg.content,
+                            msg.tool_success != Some(false),
+                        )
                     } else {
                         tool_complete_result_for_display(
                             &tc.tool_name,
@@ -540,6 +546,58 @@ mod tests {
         }
         assert!(args.contains(private_value));
         assert!(result.contains(private_value));
+    }
+
+    #[test]
+    fn resumed_browser_download_hides_selector_base64_and_error_text() {
+        let args = serde_json::json!({
+            "action":"download",
+            "selector":"a[data-secret='private-selector']",
+            "expected_epoch":17,
+            "extra":{"secret":"private-extra"},
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "filename":"private-filename.bin",
+            "byte_count":12,
+            "sha256":"private-digest",
+            "data_base64":"private-base64",
+        })
+        .to_string();
+        for tool_name in ["browser", "default::browser"] {
+            let out = map_history(vec![
+                assistant("", vec![("download-call", tool_name, &args)]),
+                tool("download-call", &result, Some(true)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.arguments,
+                serde_json::json!({"action":"download","expected_epoch":17}).to_string()
+            );
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser download completed")
+            );
+            for private in [
+                "private-selector",
+                "private-extra",
+                "private-filename",
+                "private-digest",
+                "private-base64",
+            ] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+
+            let out = map_history(vec![
+                assistant("", vec![("download-call", tool_name, &args)]),
+                tool("download-call", "private-error", Some(false)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(displayed.error.as_deref(), Some("Browser download failed"));
+            assert!(!format!("{displayed:?}").contains("private-error"));
+        }
+        assert!(args.contains("private-selector"));
+        assert!(result.contains("private-base64"));
     }
 
     #[test]

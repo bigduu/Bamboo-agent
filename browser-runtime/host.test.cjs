@@ -5,6 +5,9 @@ const readline = require('node:readline');
 const { once } = require('node:events');
 const { test } = require('node:test');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const { createHash } = require('node:crypto');
 
 test('one isolated page supplies DOM, screenshot, and interactive changes without an iframe', async () => {
   const fixture = http.createServer((_request, response) => {
@@ -99,6 +102,185 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
     host.kill();
     fixture.close();
     await once(fixture, 'close');
+  }
+});
+
+test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
+  const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
+  const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const temporaryFilesIn = directory => fs.readdirSync(directory, { withFileTypes: true })
+    .flatMap(entry => entry.isDirectory()
+      ? temporaryFilesIn(path.join(directory, entry.name))
+      : [path.join(directory, entry.name)]);
+  const temporaryDownloadFiles = () => fs.readdirSync(tempRoot)
+    .filter(name => name.startsWith('bamboo-browser-download-'))
+    .flatMap(name => temporaryFilesIn(path.join(tempRoot, name)));
+  let oversizedChunks = 0;
+  let unsolicitedRequests = 0;
+  let hangingClosed = 0;
+  const fixture = http.createServer((request, response) => {
+    if (request.url === '/small' || request.url === '/unsolicited') {
+      if (request.url === '/unsolicited') unsolicitedRequests++;
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="../private.bin"',
+      });
+      response.end(bytes);
+      return;
+    }
+    if (request.url === '/exact-limit' || request.url === '/over-limit') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="boundary.bin"',
+      });
+      response.end(request.url === '/exact-limit'
+        ? maximumBytes : Buffer.concat([maximumBytes, Buffer.from([0])]));
+      return;
+    }
+    if (request.url === '/oversized') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="large.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      const timer = setInterval(() => {
+        if (response.destroyed || oversizedChunks >= 64) {
+          clearInterval(timer);
+          response.end();
+          return;
+        }
+        response.write(Buffer.alloc(64 * 1024, oversizedChunks));
+        oversizedChunks++;
+      }, 60);
+      response.on('close', () => clearInterval(timer));
+      return;
+    }
+    if (request.url === '/hanging') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="hanging.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      response.flushHeaders();
+      response.write(Buffer.alloc(1024));
+      response.on('close', () => { hangingClosed++; });
+      return;
+    }
+    if (request.url === '/failed') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="failed.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      response.flushHeaders();
+      response.write(Buffer.alloc(1024));
+      setTimeout(() => response.destroy(), 100);
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    if (request.url === '/unsolicited-page') {
+      response.end('<main>Unsolicited page</main><script>setTimeout(() => { const link = document.createElement("a"); link.href = "/unsolicited"; document.body.append(link); link.click(); }, 100)</script>');
+      return;
+    }
+    response.end('<a id="small" href="/small">Small</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><output>Page remains open</output>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const base = `http://127.0.0.1:${fixture.address().port}`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+      TMPDIR: tempRoot,
+    },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`${action} host response timed out`));
+    }, 30_000);
+    pending.set(id, message => { clearTimeout(timer); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
+    const epoch = ready.page_epoch;
+    const first = await call('download', { selector: '#small', expected_epoch: epoch });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.result.page_epoch, epoch);
+    assert.equal(first.result.active_tab_id, ready.active_tab_id);
+    assert.equal(first.result.url, base + '/');
+    assert.match(first.result.filename, /private\.bin$/);
+    assert.doesNotMatch(first.result.filename, /[\\/]|\.\./);
+    assert.equal(first.result.byte_count, bytes.length);
+    assert.equal(first.result.sha256, createHash('sha256').update(bytes).digest('hex'));
+    assert.deepEqual(Buffer.from(first.result.data_base64, 'base64'), bytes);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'successful download artifact was deleted');
+    assert.equal((await call('download', { selector: '#small', expected_epoch: initial.page_epoch })).code, 'stale_epoch');
+
+    const exactLimit = await call('download', { selector: '#exact-limit', expected_epoch: epoch });
+    assert.equal(exactLimit.ok, true, JSON.stringify(exactLimit));
+    assert.equal(exactLimit.result.byte_count, maximumBytes.length);
+    assert.equal(exactLimit.result.sha256, createHash('sha256').update(maximumBytes).digest('hex'));
+    assert.deepEqual(Buffer.from(exactLimit.result.data_base64, 'base64'), maximumBytes);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'exact-limit download artifact was deleted');
+    const overLimit = await call('download', { selector: '#over-limit', expected_epoch: epoch });
+    assert.equal(overLimit.code, 'download_too_large', JSON.stringify(overLimit));
+    assert.equal(overLimit.result, undefined);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'over-limit download artifact was deleted');
+
+    const oversized = await call('download', { selector: '#oversized', expected_epoch: epoch });
+    assert.equal(oversized.code, 'download_too_large', JSON.stringify(oversized));
+    assert.equal(oversized.result, undefined);
+    assert.ok(oversizedChunks < 64, `oversized stream sent ${oversizedChunks} chunks`);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'oversized download artifact was deleted');
+
+    const timedOut = await call('download', { selector: '#hanging', expected_epoch: epoch });
+    assert.equal(timedOut.code, 'download_timeout', JSON.stringify(timedOut));
+    assert.equal(timedOut.result, undefined);
+    for (let attempt = 0; hangingClosed === 0 && attempt < 40; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(hangingClosed, 1, 'timed-out transfer was cancelled');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'timed-out download artifact was deleted');
+    const failed = await call('download', { selector: '#failed', expected_epoch: epoch });
+    assert.equal(failed.code, 'download_failed', JSON.stringify(failed));
+    assert.equal(failed.result, undefined);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'failed download artifact was deleted');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
+    assert.equal((await call('screenshot')).ok, true);
+
+    const unsolicited = (await call('navigate', {
+      url: base + '/unsolicited-page', expected_epoch: epoch,
+    })).result;
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(unsolicitedRequests, 1);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'unsolicited download artifact was deleted');
+    assert.equal((await call('state')).result.page_epoch, unsolicited.page_epoch);
+    assert.equal((await call('close')).result.closed, true);
+    if (host.exitCode === null) await once(host, 'exit');
+    assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.closeAllConnections();
+    fixture.close();
+    await once(fixture, 'close');
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 

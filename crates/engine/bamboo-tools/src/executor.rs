@@ -52,7 +52,26 @@ fn parse_warning_log_details<'a>(
     }
 }
 
+fn is_browser_download_action(tool_name: &str, args: &serde_json::Value) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
+}
+
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if is_browser_download_action(tool_name, args) {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = args
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        return display;
+    }
     if crate::permission::is_native_browser_select(tool_name, args) {
         // The display event is emitted before all schema paths necessarily
         // reject extra fields. Only the action is safe to expose here.
@@ -618,7 +637,9 @@ impl ToolExecutor for BuiltinToolExecutor {
                     crate::permission::is_focused_browser_input(&tool_name, &args);
                 let native_browser_select =
                     crate::permission::is_native_browser_select(&tool_name, &args);
-                let private_browser_display = focused_browser_input || native_browser_select;
+                let browser_download = is_browser_download_action(&tool_name, &args);
+                let private_browser_display =
+                    focused_browser_input || native_browser_select || browser_download;
                 let approval_display_resource = if private_browser_display {
                     operation_summary.clone()
                 } else {
@@ -680,6 +701,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 "Browser input denied by policy".to_string()
                             } else if native_browser_select {
                                 "Browser selection denied by policy".to_string()
+                            } else if browser_download {
+                                "Browser download denied by policy".to_string()
                             } else {
                                 reason.message
                             }));
@@ -710,6 +733,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                             "Browser input denied by policy".to_string()
                         } else if native_browser_select {
                             "Browser selection denied by policy".to_string()
+                        } else if browser_download {
+                            "Browser download denied by policy".to_string()
                         } else {
                             reason
                         }));
@@ -790,6 +815,10 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 ToolError::Execution(
                                     "Browser selection permission check failed".to_string(),
                                 )
+                            } else if browser_download {
+                                ToolError::Execution(
+                                    "Browser download permission check failed".to_string(),
+                                )
                             } else {
                                 permission_error_to_tool_error(other)
                             });
@@ -804,6 +833,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                     let mut display_request = request.clone();
                     if private_browser_display {
                         display_request.resource = "[redacted]".to_string();
+                        display_request.matched_rule = None;
                         display_request.suggested_matchers.clear();
                     }
                     let approved = proxy
@@ -1103,6 +1133,158 @@ mod tests {
         assert!(!display.to_string().contains("private-query"));
         assert!(!display.to_string().contains("private-nested"));
         assert_eq!(approval_parameters_for_display("Write", &args), args);
+    }
+
+    #[test]
+    fn browser_download_approval_event_hides_selector_and_extra_fields() {
+        let args = json!({
+            "action":"download",
+            "selector":"a[data-secret='private-selector']",
+            "expected_epoch":17,
+            "url":"https://example.test/private-url",
+            "extra":{"secret":"private-extra"},
+        });
+        let original = args.clone();
+        for name in ["browser", "default::browser"] {
+            assert_eq!(
+                approval_parameters_for_display(name, &args),
+                json!({"action":"download","expected_epoch":17})
+            );
+        }
+        assert_eq!(
+            args, original,
+            "display projection must not change execution args"
+        );
+        let malformed_epoch = json!({
+            "action":"download",
+            "selector":"private-selector",
+            "expected_epoch":"private-epoch",
+        });
+        assert_eq!(
+            approval_parameters_for_display("browser", &malformed_epoch),
+            json!({"action":"download"})
+        );
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
+    }
+
+    #[tokio::test]
+    async fn browser_download_approval_projects_display_but_retains_exact_request() {
+        struct CaptureApprovalProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureApprovalProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        for tool_name in ["browser", "default::browser"] {
+            let args = json!({
+                "action":"download",
+                "selector":"a[data-secret='private-selector']",
+                "expected_epoch":17,
+            });
+            let resource = crate::permission::check_permissions("browser", &args)
+                .expect("valid browser permission")
+                .expect("download requires approval")
+                .remove(0)
+                .resource;
+            let config = Arc::new(crate::permission::PermissionConfig::new());
+            let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(
+                config.clone(),
+            ));
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_tool(ExactRoutingTool {
+                    name: "browser",
+                    label: "should-not-run",
+                    args_sensitive: false,
+                })
+                .expect("register browser stub")
+                .with_permission_checker(checker)
+                .build();
+            let call = make_tool_call(tool_name, args);
+            let (tx, mut rx) = mpsc::channel(4);
+            let context = ToolExecutionContext {
+                session_id: Some("browser-download-approval"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = executor
+                .execute_with_context(&call, context)
+                .await
+                .expect("download must pause for approval");
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.result).expect("approval payload");
+            let display = payload.to_string();
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["resource"],
+                "Download from selected browser element"
+            );
+            assert!(payload["question"]
+                .as_str()
+                .unwrap()
+                .contains("Download from selected browser element"));
+            assert!(!payload["question"].as_str().unwrap().contains(&resource));
+            assert!(!payload["question"]
+                .as_str()
+                .unwrap()
+                .contains("private-selector"));
+            assert_eq!(payload["permission_request"]["resource"], resource);
+            assert!(!display.contains("private-selector"));
+            assert_eq!(
+                config
+                    .pending_request("browser-download-approval", &call.id)
+                    .expect("authoritative pending request")
+                    .resource,
+                resource
+            );
+            assert!(matches!(
+                rx.recv().await.expect("approval event"),
+                AgentEvent::ToolApprovalRequested { parameters, .. }
+                    if parameters == json!({"action":"download","expected_epoch":17})
+            ));
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+                Arc::new(CaptureApprovalProxy(Arc::clone(&captured)));
+            let relay_call = make_tool_call(
+                tool_name,
+                json!({
+                    "action":"download",
+                    "selector":"a[data-secret='private-selector']",
+                    "expected_epoch":17,
+                }),
+            );
+            let relay_context = ToolExecutionContext {
+                session_id: Some("browser-download-relay"),
+                ..ToolExecutionContext::none(&relay_call.id)
+            };
+            let denied = crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&relay_call, relay_context),
+            )
+            .await
+            .expect_err("host denied download");
+            assert!(matches!(&denied, ToolError::Execution(_)));
+            assert!(!denied.to_string().contains(&resource));
+            let ask = captured
+                .lock()
+                .expect("captured proxy")
+                .clone()
+                .expect("host saw approval request");
+            assert_eq!(ask.resource, "Download from selected browser element");
+            assert_eq!(
+                ask.permission_request.as_ref().unwrap().resource,
+                "[redacted]"
+            );
+            assert!(ask
+                .permission_request
+                .unwrap()
+                .suggested_matchers
+                .is_empty());
+        }
     }
 
     #[tokio::test]
@@ -2239,7 +2421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focused_browser_type_errors_hide_exact_resource_in_both_checker_paths() {
+    async fn private_browser_errors_hide_exact_resource_in_both_checker_paths() {
         enum Failure {
             Denied,
             Error,
@@ -2293,49 +2475,61 @@ mod tests {
             }
         }
 
-        let args = json!({"action":"type","text":"private browser text","expected_epoch":17});
-        let private_resource = crate::permission::check_permissions("browser", &args)
-            .expect("valid browser permission")
-            .expect("browser interaction needs approval")
-            .remove(0)
-            .resource;
-        for (label, failure, config) in [
-            ("configless-denied", Failure::Denied, None),
-            ("configless-error", Failure::Error, None),
-            ("configless-hard-deny", Failure::HardDeny, None),
+        for (operation, args, private_value) in [
             (
-                "config-backed-hard-deny",
-                Failure::HardDeny,
-                Some(Arc::new(crate::permission::PermissionConfig::new())),
+                "focused",
+                json!({"action":"type","text":"private browser text","expected_epoch":17}),
+                "private browser text",
+            ),
+            (
+                "download",
+                json!({"action":"download","selector":"a[data-secret='private-selector']","expected_epoch":17}),
+                "private-selector",
             ),
         ] {
-            let executor = BuiltinToolExecutorBuilder::new()
-                .with_tool(ExactRoutingTool {
-                    name: "browser",
-                    label: "browser-was-invoked",
-                    args_sensitive: false,
-                })
-                .expect("register browser stub")
-                .with_permission_checker(Arc::new(FailingChecker { failure, config }))
-                .build();
-            let call = make_tool_call_with_id(label, "browser", args.clone());
-            let ctx = ToolExecutionContext {
-                session_id: Some("focused-error"),
-                ..ToolExecutionContext::none(&call.id)
-            };
-            let error = executor
-                .execute_with_context(&call, ctx)
-                .await
-                .expect_err(label);
-            let displayed = error.to_string();
-            assert!(
-                !displayed.contains(&private_resource),
-                "{label}: {displayed}"
-            );
-            assert!(
-                !displayed.contains("private browser text"),
-                "{label}: {displayed}"
-            );
+            let private_resource = crate::permission::check_permissions("browser", &args)
+                .expect("valid browser permission")
+                .expect("browser interaction needs approval")
+                .remove(0)
+                .resource;
+            for (label, failure, config) in [
+                ("configless-denied", Failure::Denied, None),
+                ("configless-error", Failure::Error, None),
+                ("configless-hard-deny", Failure::HardDeny, None),
+                (
+                    "config-backed-hard-deny",
+                    Failure::HardDeny,
+                    Some(Arc::new(crate::permission::PermissionConfig::new())),
+                ),
+            ] {
+                let executor = BuiltinToolExecutorBuilder::new()
+                    .with_tool(ExactRoutingTool {
+                        name: "browser",
+                        label: "browser-was-invoked",
+                        args_sensitive: false,
+                    })
+                    .expect("register browser stub")
+                    .with_permission_checker(Arc::new(FailingChecker { failure, config }))
+                    .build();
+                let call = make_tool_call_with_id(label, "browser", args.clone());
+                let ctx = ToolExecutionContext {
+                    session_id: Some("private-browser-error"),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let error = executor
+                    .execute_with_context(&call, ctx)
+                    .await
+                    .expect_err(label);
+                let displayed = error.to_string();
+                assert!(
+                    !displayed.contains(&private_resource),
+                    "{operation}/{label}: {displayed}"
+                );
+                assert!(
+                    !displayed.contains(private_value),
+                    "{operation}/{label}: {displayed}"
+                );
+            }
         }
     }
 

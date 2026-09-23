@@ -318,7 +318,27 @@ pub struct LoggingPermissionChecker<T: PermissionChecker> {
 
 fn is_private_browser_resource(permission_type: PermissionType, resource: &str) -> bool {
     permission_type == PermissionType::BrowserInteraction
-        && super::policy::PermissionRequest::is_focused_browser_resource("browser", resource)
+        && (super::policy::PermissionRequest::is_focused_browser_resource("browser", resource)
+            || is_private_browser_download_resource(resource))
+}
+
+fn is_private_browser_download_resource(resource: &str) -> bool {
+    let mut parts = resource.split(':');
+    if parts.next() != Some("browser")
+        || !parts
+            .next()
+            .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+        || parts.next() != Some("download")
+        || parts.next() != Some("css")
+    {
+        return false;
+    }
+    parts.next().is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) && parts.next().is_none()
 }
 
 fn permission_log_resource(permission_type: PermissionType, resource: &str) -> &str {
@@ -1277,7 +1297,7 @@ mod tests {
     use crate::PermissionRule;
 
     #[tokio::test]
-    async fn logging_checker_hides_focused_browser_resources_and_error_details() {
+    async fn logging_checker_hides_private_browser_resources_and_error_details() {
         #[derive(Clone)]
         struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -1327,28 +1347,47 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let checker = LoggingPermissionChecker::new(PromptChecker);
-        let resource = "browser:17:type:focused:private-fingerprint";
-        assert!(
+        let download_fingerprint = "a".repeat(64);
+        let download_resource = format!("browser:17:download:css:{download_fingerprint}");
+        for resource in [
+            "browser:17:type:focused:private-fingerprint",
+            download_resource.as_str(),
+        ] {
+            assert!(
+                checker
+                    .needs_confirmation(PermissionType::BrowserInteraction, resource)
+                    .await
+            );
+            let result = checker
+                .request_confirmation(PermissionContext::new(
+                    PermissionType::BrowserInteraction,
+                    resource,
+                    "Browser operation",
+                ))
+                .await;
+            assert!(matches!(
+                result,
+                Err(PermissionError::ConfirmationRequired { .. })
+            ));
             checker
-                .needs_confirmation(PermissionType::BrowserInteraction, resource)
-                .await
-        );
-        let result = checker
-            .request_confirmation(PermissionContext::new(
-                PermissionType::BrowserInteraction,
-                resource,
-                "Type into focused browser element",
-            ))
-            .await;
-        assert!(matches!(
-            result,
-            Err(PermissionError::ConfirmationRequired { .. })
-        ));
-        checker.grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
+                .grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
+        }
         let logged =
             String::from_utf8(bytes.lock().expect("log buffer lock").clone()).expect("UTF-8 logs");
         assert!(logged.contains("[redacted]"));
         assert!(!logged.contains("private-fingerprint"));
+        assert!(!logged.contains(&download_fingerprint));
+        assert_eq!(
+            permission_log_resource(PermissionType::BrowserInteraction, &download_resource),
+            "[redacted]"
+        );
+        assert_eq!(
+            permission_log_resource(PermissionType::WriteFile, &download_resource),
+            download_resource
+        );
+        assert!(!is_private_browser_download_resource(&format!(
+            "{download_resource}:unexpected"
+        )));
     }
 
     #[tokio::test]

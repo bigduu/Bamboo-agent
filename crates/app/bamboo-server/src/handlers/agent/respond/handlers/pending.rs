@@ -297,6 +297,16 @@ fn pending_tool_arguments_for_display(
     if bamboo_tools::permission::is_native_browser_select("browser", &parsed) {
         return Some((serde_json::json!({"action":"select_option"}), false, false));
     }
+    if parsed.get("action").and_then(serde_json::Value::as_str) == Some("download") {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = parsed
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        return Some((display, false, false));
+    }
     Some((parsed, false, false))
 }
 
@@ -384,10 +394,15 @@ pub async fn get_pending_question(
             let native_browser_select = tool_arguments.as_ref().is_some_and(|arguments| {
                 bamboo_tools::permission::is_native_browser_select("browser", arguments)
             });
+            let browser_download = is_browser_display_tool_name(&pending.tool_name)
+                && tool_arguments.as_ref().is_some_and(|arguments| {
+                    arguments.get("action").and_then(serde_json::Value::as_str) == Some("download")
+                });
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
                     if request.is_focused_browser_input()
                         || native_browser_select
+                        || browser_download
                         || browser_arguments_unavailable
                     {
                         // Keep the exact request registered for receipt matching,
@@ -395,6 +410,8 @@ pub async fn get_pending_question(
                         request.resource = "[redacted]".to_string();
                         request.operation_summary = if native_browser_select {
                             "Select native browser options"
+                        } else if browser_download {
+                            "Download from selected browser element"
                         } else {
                             "Focused browser input"
                         }
@@ -413,6 +430,8 @@ pub async fn get_pending_question(
                     "Approve focused browser input?"
                 } else if native_browser_select {
                     "Approve native browser selection?"
+                } else if browser_download {
+                    "Approve browser download?"
                 } else {
                     pending.question.as_str()
                 },
@@ -873,6 +892,91 @@ mod http_tests {
             pending_tool_arguments_exact(&session, tool_call_id),
             Some(args)
         );
+    }
+
+    #[actix_web::test]
+    async fn browser_download_pending_projection_hides_selector_and_extra_fields() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for (index, tool_name) in ["browser", "default::browser"].into_iter().enumerate() {
+            let session_id = format!("download-private-display-{index}");
+            let tool_call_id = format!("download-private-call-{index}");
+            let args = serde_json::json!({
+                "action":"download",
+                "selector":"a[data-secret='private-selector']",
+                "expected_epoch":17,
+                "extra":{"secret":"private-extra"},
+            });
+            let mut request = permission_request(&session_id, &tool_call_id);
+            request.tool_name = tool_name.to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser:17:download:css:private-fingerprint".to_string();
+            request.operation_summary = "Download private-summary".to_string();
+            request.suggested_matchers[0].value = request.resource.clone();
+            let mut session = Session::new(&session_id, "test-model");
+            session.messages.push(assistant_named_browser_call(
+                &tool_call_id,
+                tool_name,
+                &args.to_string(),
+            ));
+            session.messages.push(Message::tool_result(
+                &tool_call_id,
+                serde_json::json!({
+                    "status":"awaiting_permission_approval",
+                    "question":"Approve private-question?",
+                    "permission_request":request,
+                })
+                .to_string(),
+            ));
+            session.set_pending_question_with_source(
+                tool_call_id.clone(),
+                tool_name.to_string(),
+                "Approve private-question?".to_string(),
+                vec!["Approve".to_string(), "Deny".to_string()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
+            state.save_and_cache_session(&mut session).await;
+
+            let response = get_pending_question(state.clone(), web::Path::from(session_id.clone()))
+                .await
+                .expect("pending response");
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("response body");
+            let body: Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["question"], "Approve browser download?");
+            assert_eq!(
+                body["tool_arguments"],
+                serde_json::json!({"action":"download","expected_epoch":17})
+            );
+            assert_eq!(body["permission_request"]["resource"], "[redacted]");
+            assert_eq!(
+                body["permission_request"]["operation_summary"],
+                "Download from selected browser element"
+            );
+            assert_eq!(
+                body["permission_request"]["suggested_matchers"],
+                serde_json::json!([])
+            );
+            for private in [
+                "private-selector",
+                "private-extra",
+                "private-summary",
+                "private-question",
+                "private-fingerprint",
+            ] {
+                assert!(!body.to_string().contains(private));
+            }
+            assert_eq!(
+                pending_tool_arguments_exact(&session, &tool_call_id),
+                Some(args)
+            );
+        }
     }
 
     #[actix_web::test]
