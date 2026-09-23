@@ -1438,7 +1438,7 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
                 request.permission_type.label()
             ),
         ),
-        one_line("operation", &request.operation_summary),
+        one_line("operation", permission.display_operation_summary()),
     ];
     details.extend(labelled_preview(
         permission.display_resource_label(),

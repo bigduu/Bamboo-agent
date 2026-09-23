@@ -6,8 +6,8 @@
 
 use crate::api::types::HistoryMessage;
 use crate::app::{
-    tool_arguments_for_display, tool_complete_result_for_display, ChatMessage, MessageRole,
-    SubAgentDisplay, ToolCallDisplay,
+    is_browser_eval_tool_name, tool_arguments_for_display, tool_complete_result_for_display,
+    ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay,
 };
 
 /// Map a session's raw history (`GET /api/v1/history/{id}`) into the chat
@@ -128,11 +128,17 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         .iter_mut()
                         .find(|tool| tool.id == tool_call_id)
                         .expect("parent index was selected by this tool id");
-                    let display_content = tool_complete_result_for_display(
-                        &tc.tool_name,
-                        &msg.content,
-                        tc.tool_name.is_empty(),
-                    );
+                    let display_content = if msg.tool_success == Some(false)
+                        && is_browser_eval_tool_name(&tc.tool_name)
+                    {
+                        "Browser page JavaScript failed".to_string()
+                    } else {
+                        tool_complete_result_for_display(
+                            &tc.tool_name,
+                            &msg.content,
+                            tc.tool_name.is_empty(),
+                        )
+                    };
                     if msg.tool_success == Some(false) {
                         tc.phase = "error".to_string();
                         tc.error = Some(display_content);
@@ -534,6 +540,63 @@ mod tests {
         }
         assert!(args.contains(private_value));
         assert!(result.contains(private_value));
+    }
+
+    #[test]
+    fn resumed_browser_eval_hides_code_url_and_page_result() {
+        let code = "document.querySelector('#password').value";
+        let url = "https://example.com/account?token=private-query";
+        let page_value = "private-page-value";
+        let args = serde_json::json!({
+            "code":code,
+            "expected_url":url,
+            "expected_epoch":17,
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "page_epoch":17,
+            "active_tab_id":"tab-1",
+            "url":url,
+            "value":page_value,
+        })
+        .to_string();
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            let out = map_history(vec![
+                assistant("", vec![("eval-call", tool_name, &args)]),
+                tool("eval-call", &result, Some(true)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser page JavaScript result hidden")
+            );
+            for private in [code, "private-query", page_value] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+        }
+        assert!(args.contains(code));
+        assert!(result.contains(page_value));
+    }
+
+    #[test]
+    fn resumed_browser_eval_failure_uses_fixed_failure_label() {
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            let out = map_history(vec![
+                assistant(
+                    "",
+                    vec![("eval-call", tool_name, "{\"code\":\"private source\"}")],
+                ),
+                tool("eval-call", "private page error", Some(false)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(displayed.phase, "error");
+            assert_eq!(
+                displayed.error.as_deref(),
+                Some("Browser page JavaScript failed")
+            );
+            assert!(!format!("{displayed:?}").contains("private source"));
+            assert!(!format!("{displayed:?}").contains("private page error"));
+        }
     }
 
     #[test]

@@ -1171,6 +1171,17 @@ pub struct ChatState {
     /// events update those authoritative rows instead of creating duplicate
     /// `unknown` live blocks.
     replay_tool_ids: HashSet<String>,
+    /// Names established by ToolStart in the currently observed model round.
+    /// A browser_eval Lifecycle may also narrow a name to private display.
+    /// An unfinished card or run-status entry can outlive its round when a
+    /// terminal event is missed, so neither authorizes a later reused ID.
+    live_tool_names: HashMap<String, String>,
+    /// ToolToken can precede ToolStart. Keep those bytes out of every display
+    /// surface until a named tool establishes whether they are safe to show.
+    unclassified_tool_tokens: HashMap<String, String>,
+    /// RunnerProgress is emitted at the start of each model round, including
+    /// rounds that produce no text token before their tool call.
+    last_runner_round_count: Option<u32>,
     replay_child_ids: HashSet<String>,
     /// SubAgent tool calls that can legitimately begin a new lifecycle for an
     /// existing child id. The tool-call key makes the authorization single-use
@@ -1251,6 +1262,9 @@ impl ChatState {
             #[cfg(test)]
             inspector_cache_builds: Cell::new(0),
             replay_tool_ids: HashSet::new(),
+            live_tool_names: HashMap::new(),
+            unclassified_tool_tokens: HashMap::new(),
+            last_runner_round_count: None,
             replay_child_ids: HashSet::new(),
             child_start_intents: HashMap::new(),
             replay_expected_child_ids: HashSet::new(),
@@ -1369,6 +1383,9 @@ impl ChatState {
     }
 
     fn prepare_replay_reconciliation(&mut self) {
+        self.live_tool_names.clear();
+        self.unclassified_tool_tokens.clear();
+        self.last_runner_round_count = None;
         // Only the transcript suffix owned by the latest user turn can still
         // receive lifecycle replay. Older unresolved-looking rows are display
         // history and provider IDs may be reused by the active turn.
@@ -1518,6 +1535,9 @@ impl ChatState {
 
     fn clear_replay_reconciliation(&mut self) {
         self.replay_tool_ids.clear();
+        self.live_tool_names.clear();
+        self.unclassified_tool_tokens.clear();
+        self.last_runner_round_count = None;
         self.replay_child_ids.clear();
         self.child_start_intents.clear();
         self.replay_expected_child_ids.clear();
@@ -2601,6 +2621,9 @@ pub struct PermissionQuestion {
     /// rendering must never repeatedly pretty-print an attacker-sized value.
     pub tool_arguments_preview: String,
     pub tool_arguments_truncated: bool,
+    /// Presentation only. The server-owned request and parked invocation stay
+    /// unchanged for the decision receipt.
+    private_eval_display: bool,
     pub(crate) proposed_file_change: Option<Arc<crate::file_change::FileChangeView>>,
     pub stage: PermissionStage,
     pub matcher_selected: usize,
@@ -2623,6 +2646,9 @@ fn is_browser_display_tool_name(tool_name: &str) -> bool {
 }
 
 fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
+    if is_browser_eval_tool_name(tool_name) {
+        return resource.starts_with("browser_eval:");
+    }
     if !is_browser_display_tool_name(tool_name) {
         return false;
     }
@@ -2641,6 +2667,16 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         (Some("select_option"), Some(rest)) => rest.starts_with("options:"),
         _ => false,
     }
+}
+
+/// Legacy provider tool calls may retain a namespace such as `default::` in
+/// live events and stored history. The executable name is the final segment.
+pub(crate) fn is_browser_eval_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser_eval"))
 }
 
 fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
@@ -2698,6 +2734,9 @@ fn valid_browser_press_target(args: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
+    if is_browser_eval_tool_name(tool_name) {
+        return serde_json::json!({"tool":"browser_eval","source":"[redacted]"}).to_string();
+    }
     if !is_browser_display_tool_name(tool_name) {
         return raw.to_string();
     }
@@ -2727,21 +2766,46 @@ pub(crate) fn tool_complete_result_for_display(
     raw: &str,
     unknown_tool: bool,
 ) -> String {
+    if is_browser_eval_tool_name(tool_name) {
+        let pending = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .is_some_and(|payload| {
+                payload.get("status").and_then(serde_json::Value::as_str)
+                    == Some("awaiting_permission_approval")
+                    || payload.get("permission_request").is_some()
+            });
+        return if pending {
+            "Browser page JavaScript awaiting permission approval"
+        } else {
+            "Browser page JavaScript result hidden"
+        }
+        .to_string();
+    }
+    if unknown_tool {
+        // A dropped ToolStart provides no authority for showing arbitrary
+        // result bytes. Recognizable select results can use a fixed label,
+        // while every other unknown payload remains hidden.
+        if raw.contains("awaiting_permission_approval") || raw.contains("permission_request") {
+            return "Tool awaiting permission approval".to_string();
+        }
+        if serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .is_some_and(|payload| payload.get("selected_values").is_some())
+        {
+            return "Browser options selected".to_string();
+        }
+        if has_select_result_key(raw) {
+            return "Browser result unavailable".to_string();
+        }
+        return "Tool result hidden".to_string();
+    }
     let browser = is_browser_display_tool_name(tool_name);
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return if (raw.contains("awaiting_permission_approval")
-            || raw.contains("permission_request"))
-            && (browser || unknown_tool)
+        return if browser
+            && (raw.contains("awaiting_permission_approval") || raw.contains("permission_request"))
         {
-            if browser {
-                "Browser input awaiting permission approval"
-            } else {
-                "Tool awaiting permission approval"
-            }
-            .to_string()
-        } else if (browser || unknown_tool) && has_select_result_key(raw) {
-            // A dropped ToolStart leaves only the recognizable result field.
-            // Keep unrelated browser text visible.
+            "Browser input awaiting permission approval".to_string()
+        } else if browser && has_select_result_key(raw) {
             "Browser result unavailable".to_string()
         } else {
             raw.to_string()
@@ -2758,9 +2822,7 @@ pub(crate) fn tool_complete_result_for_display(
     let approval_clue = pending_approval || payload.get("permission_request").is_some();
     if approval_clue && (browser || nested_browser) {
         "Browser input awaiting permission approval".to_string()
-    } else if approval_clue && unknown_tool {
-        "Tool awaiting permission approval".to_string()
-    } else if (browser || unknown_tool) && payload.get("selected_values").is_some() {
+    } else if browser && payload.get("selected_values").is_some() {
         "Browser options selected".to_string()
     } else {
         raw.to_string()
@@ -2770,9 +2832,22 @@ pub(crate) fn tool_complete_result_for_display(
 impl PermissionQuestion {
     fn has_private_browser_resource(&self) -> bool {
         self.request.permission_type == PermissionType::BrowserInteraction
-            && is_browser_display_tool_name(&self.request.tool_name)
-            && (self.request.resource == "[redacted]"
-                || is_private_browser_resource(&self.request.tool_name, &self.request.resource))
+            && (self.private_eval_display
+                || is_browser_eval_tool_name(&self.request.tool_name)
+                || (is_browser_display_tool_name(&self.request.tool_name)
+                    && (self.request.resource == "[redacted]"
+                        || is_private_browser_resource(
+                            &self.request.tool_name,
+                            &self.request.resource,
+                        ))))
+    }
+
+    pub(crate) fn display_operation_summary(&self) -> &str {
+        if self.private_eval_display || is_browser_eval_tool_name(&self.request.tool_name) {
+            "Run browser page JavaScript"
+        } else {
+            &self.request.operation_summary
+        }
     }
 
     pub(crate) fn display_resource_label(&self) -> &str {
@@ -2819,7 +2894,7 @@ impl PermissionQuestion {
             ),
             format!("tool: {}", request.tool_name),
             format!("permission type: {}", request.permission_type.label()),
-            format!("operation summary: {}", request.operation_summary),
+            format!("operation summary: {}", self.display_operation_summary()),
             format!(
                 "{}: {}",
                 self.display_resource_label(),
@@ -3141,13 +3216,24 @@ impl ActiveQuestion {
                 && !request.request_generation.trim().is_empty()
                 && pending.tool_call_id.as_deref() == Some(request.request_id.as_str())
         });
+        let private_eval_display = pending
+            .tool_name
+            .as_deref()
+            .is_some_and(is_browser_eval_tool_name)
+            || typed_permission
+                .as_ref()
+                .is_some_and(|request| is_browser_eval_tool_name(&request.tool_name));
         let kind = match (pending.interaction_kind, typed_permission) {
             (Some(PendingInteractionKind::Permission), Some(request)) => {
-                let mut preview = pending
-                    .tool_arguments
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string_pretty(value).ok())
-                    .unwrap_or_else(|| "not supplied".to_string());
+                let mut preview = if private_eval_display {
+                    tool_arguments_for_display("browser_eval", "")
+                } else {
+                    pending
+                        .tool_arguments
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string_pretty(value).ok())
+                        .unwrap_or_else(|| "not supplied".to_string())
+                };
                 const MAX_PREVIEW_CHARS: usize = 16 * 1024;
                 let locally_truncated = preview.chars().count() > MAX_PREVIEW_CHARS;
                 if locally_truncated {
@@ -3169,6 +3255,7 @@ impl ActiveQuestion {
                     tool_arguments_preview: preview,
                     tool_arguments_truncated: pending.tool_arguments_truncated
                         || locally_truncated,
+                    private_eval_display,
                     proposed_file_change,
                     stage: PermissionStage::Decision,
                     matcher_selected: 0,
@@ -3201,12 +3288,12 @@ impl ActiveQuestion {
             &kind,
             ActiveQuestionKind::Permission(_) | ActiveQuestionKind::PermissionUnavailable { .. }
         );
-        let options = if is_permission {
+        let options = if is_permission || private_eval_display {
             Vec::new()
         } else {
             pending.options.clone().unwrap_or_default()
         };
-        let allow_custom = !is_permission && pending.allow_custom;
+        let allow_custom = !is_permission && !private_eval_display && pending.allow_custom;
         let custom = if options.is_empty() && allow_custom {
             Some(draft.clone())
         } else {
@@ -3219,7 +3306,11 @@ impl ActiveQuestion {
             tool_name: pending.tool_name.clone(),
             source: pending.source.clone(),
             kind,
-            question: pending.question.clone(),
+            question: if private_eval_display {
+                "Allow browser page JavaScript?".to_string()
+            } else {
+                pending.question.clone()
+            },
             options,
             selected: 0,
             allow_custom,
@@ -6510,9 +6601,9 @@ impl App {
                         }
 
                         if let Some(pending) = &opened.pending {
-                            self.status_message =
-                                format!("Question: {} (answer in the dialog)", pending.question);
                             let question = self.question_from_pending(session_id.clone(), pending);
+                            self.status_message =
+                                format!("Question: {} (answer in the dialog)", question.question);
                             self.pending_question = Some(question);
                         }
                         self.refresh_task_plan_snapshot(session_id.clone());
@@ -10432,6 +10523,9 @@ impl App {
         // lifecycle replay, but only children started in this turn may hold its
         // parent terminal open.
         self.chat.replay_tool_ids.clear();
+        self.chat.live_tool_names.clear();
+        self.chat.unclassified_tool_tokens.clear();
+        self.chat.last_runner_round_count = None;
         self.chat.child_start_intents.clear();
         self.chat.replay_expected_child_ids.clear();
         self.chat.active_child_ids.clear();
@@ -10911,6 +11005,14 @@ impl App {
     /// that parallel tool calls (multiple in-flight at once) each get their
     /// own Complete/Error/Lifecycle update instead of clobbering whichever
     /// entry happens to be last in the list.
+    fn terminal_tool_name(&self, tool_call_id: &str) -> Option<&str> {
+        self.chat
+            .live_tool_names
+            .get(tool_call_id)
+            .map(String::as_str)
+            .filter(|name| *name != "unknown")
+    }
+
     fn find_tool_mut(
         &mut self,
         tool_call_id: &str,
@@ -10971,6 +11073,16 @@ impl App {
         {
             self.flush_streaming_output();
         }
+    }
+
+    fn begin_next_model_round_after_tools(&mut self) {
+        // A model token after a tool-bearing round is a successor round even
+        // if a previous ToolComplete was lost and its card remains running.
+        // An old provider ID must not authorize a later terminal payload.
+        self.chat.live_tool_names.clear();
+        self.chat.unclassified_tool_tokens.clear();
+        self.chat.replay_tool_ids.clear();
+        self.begin_next_round_after_tools();
     }
 
     /// Produce the one structured rendering shape used by both history and
@@ -11490,7 +11602,7 @@ impl App {
                     return Ok(());
                 }
                 self.chat.run_status.mark_running();
-                self.begin_next_round_after_tools();
+                self.begin_next_model_round_after_tools();
                 self.chat.ensure_current_turn_id();
                 self.chat.current_response.push_str(&content);
                 self.chat.note_update();
@@ -11500,12 +11612,18 @@ impl App {
                 session_id,
                 started_at,
             } => {
+                let prior_generation = self.chat.run_status.generation;
                 if !self
                     .chat
                     .run_status
                     .begin_server(run_id.clone(), started_at)
                 {
                     return Ok(());
+                }
+                if self.chat.run_status.generation != prior_generation {
+                    self.chat.live_tool_names.clear();
+                    self.chat.unclassified_tool_tokens.clear();
+                    self.chat.last_runner_round_count = None;
                 }
                 self.record_activity(
                     ActivityKind::Run,
@@ -11544,6 +11662,12 @@ impl App {
                 if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
                     return Ok(());
                 }
+                if self.chat.last_runner_round_count != Some(round_count) {
+                    self.chat.live_tool_names.clear();
+                    self.chat.unclassified_tool_tokens.clear();
+                    self.chat.replay_tool_ids.clear();
+                }
+                self.chat.last_runner_round_count = Some(round_count);
                 if let Some(tree) = self
                     .subagent_tree
                     .as_mut()
@@ -11557,7 +11681,7 @@ impl App {
                     return Ok(());
                 }
                 self.chat.run_status.mark_running();
-                self.begin_next_round_after_tools();
+                self.begin_next_model_round_after_tools();
                 let turn_id = self.chat.ensure_current_turn_id();
                 self.chat.register_block(format!("{turn_id}:reasoning"));
                 self.chat.current_reasoning.push_str(&content);
@@ -11574,6 +11698,15 @@ impl App {
                 self.chat
                     .run_status
                     .tool_started(tool_call_id.clone(), tool_name.clone());
+                self.chat
+                    .live_tool_names
+                    .insert(tool_call_id.clone(), tool_name.clone());
+                let buffered_tokens = self
+                    .chat
+                    .unclassified_tool_tokens
+                    .remove(&tool_call_id)
+                    .unwrap_or_default();
+                let private_eval = is_browser_eval_tool_name(&tool_name);
                 self.record_activity(
                     ActivityKind::Tool,
                     NoticeLevel::Info,
@@ -11591,6 +11724,11 @@ impl App {
                     // independent UI state survive the reordering.
                     tool.tool_name = tool_name;
                     tool.arguments = arguments;
+                    if private_eval {
+                        tool.stream_output.clear();
+                    } else {
+                        tool.stream_output.push_str(&buffered_tokens);
+                    }
                     if tool.phase != "complete" && tool.phase != "error" {
                         tool.phase = "running".to_string();
                     }
@@ -11604,7 +11742,11 @@ impl App {
                         tool_name,
                         arguments,
                         result: None,
-                        stream_output: String::new(),
+                        stream_output: if private_eval {
+                            String::new()
+                        } else {
+                            buffered_tokens
+                        },
                         error: None,
                         phase: "running".to_string(),
                     });
@@ -11615,14 +11757,11 @@ impl App {
                 tool_call_id,
                 result,
             } => {
+                self.chat.unclassified_tool_tokens.remove(&tool_call_id);
                 let success = result.success;
                 let activity_name = self
-                    .chat
-                    .run_status
-                    .tools
-                    .iter()
-                    .find(|tool| tool.id == tool_call_id)
-                    .map(|tool| tool.name.clone())
+                    .terminal_tool_name(&tool_call_id)
+                    .map(str::to_string)
                     .unwrap_or_else(|| tool_call_id.clone());
                 let typed_known = self
                     .chat
@@ -11630,8 +11769,27 @@ impl App {
                     .tools
                     .iter()
                     .any(|tool| tool.id == tool_call_id);
-                let result =
-                    tool_complete_result_for_display(&activity_name, &result.result, !typed_known);
+                let result = if !success && is_browser_eval_tool_name(&activity_name) {
+                    "Browser page JavaScript failed".to_string()
+                } else if !success && activity_name == tool_call_id {
+                    match tool_complete_result_for_display(&activity_name, &result.result, true)
+                        .as_str()
+                    {
+                        "Browser options selected" | "Browser result unavailable" => {
+                            "Browser result unavailable".to_string()
+                        }
+                        "Tool awaiting permission approval" => {
+                            "Tool awaiting permission approval".to_string()
+                        }
+                        _ => "Tool failed".to_string(),
+                    }
+                } else {
+                    tool_complete_result_for_display(
+                        &activity_name,
+                        &result.result,
+                        activity_name == tool_call_id,
+                    )
+                };
                 if self.chat.run_status.phase.is_terminal() && !typed_known {
                     return Ok(());
                 }
@@ -11656,7 +11814,12 @@ impl App {
                 }
                 match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
-                        if success {
+                        if matches!(tc.phase.as_str(), "complete" | "error") {
+                            // A lifecycle error has already projected its
+                            // diagnostic. The next terminal event may also
+                            // reuse an old provider ID, so never copy its
+                            // new payload into a terminal card.
+                        } else if success {
                             tc.result = Some(result);
                             tc.error = None;
                             tc.phase = "complete".to_string();
@@ -11692,6 +11855,7 @@ impl App {
                 // represents. Providers may reuse the same id in a later LLM
                 // round, which must create a distinct current-turn block.
                 self.chat.replay_tool_ids.remove(&tool_call_id);
+                self.chat.live_tool_names.remove(&tool_call_id);
                 self.chat.child_start_intents.remove(&tool_call_id);
                 self.chat.note_update();
             }
@@ -11699,13 +11863,10 @@ impl App {
                 tool_call_id,
                 error,
             } => {
+                self.chat.unclassified_tool_tokens.remove(&tool_call_id);
                 let activity_name = self
-                    .chat
-                    .run_status
-                    .tools
-                    .iter()
-                    .find(|tool| tool.id == tool_call_id)
-                    .map(|tool| tool.name.clone())
+                    .terminal_tool_name(&tool_call_id)
+                    .map(str::to_string)
                     .unwrap_or_else(|| tool_call_id.clone());
                 let typed_known = self
                     .chat
@@ -11716,6 +11877,13 @@ impl App {
                 if self.chat.run_status.phase.is_terminal() && !typed_known {
                     return Ok(());
                 }
+                let error = if is_browser_eval_tool_name(&activity_name) {
+                    "Browser page JavaScript failed".to_string()
+                } else if activity_name == tool_call_id {
+                    "Tool failed".to_string()
+                } else {
+                    error
+                };
                 if self.chat.run_status.tool_finished(
                     tool_call_id.clone(),
                     false,
@@ -11729,8 +11897,10 @@ impl App {
                 }
                 match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
-                        tc.error = Some(error);
-                        tc.phase = "error".to_string();
+                        if !matches!(tc.phase.as_str(), "complete" | "error") {
+                            tc.error = Some(error);
+                            tc.phase = "error".to_string();
+                        }
                     }
                     None => {
                         let turn_id = self.chat.ensure_current_turn_id();
@@ -11748,6 +11918,7 @@ impl App {
                     }
                 }
                 self.chat.replay_tool_ids.remove(&tool_call_id);
+                self.chat.live_tool_names.remove(&tool_call_id);
                 self.chat.child_start_intents.remove(&tool_call_id);
                 self.chat.note_update();
             }
@@ -11761,6 +11932,14 @@ impl App {
                 summary,
                 error,
             } => {
+                let (summary, error) = if is_browser_eval_tool_name(&tool_name) {
+                    (
+                        summary.map(|_| "Browser page JavaScript activity".to_string()),
+                        error.map(|_| "Browser page JavaScript failed".to_string()),
+                    )
+                } else {
+                    (summary, error)
+                };
                 if !self.chat.run_status.tool_lifecycle(
                     tool_call_id.clone(),
                     tool_name.clone(),
@@ -11773,6 +11952,27 @@ impl App {
                 ) {
                     return Ok(());
                 }
+                if is_browser_eval_tool_name(&tool_name) {
+                    // This identity only narrows display to fixed eval text.
+                    // An ordinary Lifecycle without ToolStart does not grant
+                    // authority to show a later terminal payload verbatim.
+                    self.chat
+                        .live_tool_names
+                        .insert(tool_call_id.clone(), tool_name.clone());
+                } else if self
+                    .chat
+                    .live_tool_names
+                    .get(&tool_call_id)
+                    .is_some_and(|known| known != &tool_name)
+                {
+                    self.chat.live_tool_names.remove(&tool_call_id);
+                }
+                let buffered_tokens = self
+                    .chat
+                    .unclassified_tool_tokens
+                    .remove(&tool_call_id)
+                    .unwrap_or_default();
+                let private_eval = is_browser_eval_tool_name(&tool_name);
                 let detail = elapsed_ms
                     .map(|elapsed| format!(" ({elapsed}ms)"))
                     .unwrap_or_default();
@@ -11797,6 +11997,14 @@ impl App {
                 // is keyed on those exact strings).
                 if let Some(tc) = self.find_tool_mut(&tool_call_id, true) {
                     if tc.phase != "complete" && tc.phase != "error" {
+                        if tc.tool_name == "unknown" {
+                            tc.tool_name = tool_name;
+                        }
+                        if private_eval {
+                            tc.stream_output.clear();
+                        } else {
+                            tc.stream_output.push_str(&buffered_tokens);
+                        }
                         tc.phase = phase;
                         if let Some(s) = summary {
                             tc.result = Some(s);
@@ -11805,6 +12013,10 @@ impl App {
                             tc.error = Some(e);
                         }
                     }
+                } else if !private_eval && !buffered_tokens.is_empty() {
+                    self.chat
+                        .unclassified_tool_tokens
+                        .insert(tool_call_id.clone(), buffered_tokens);
                 }
                 self.chat.note_update();
                 // No matching entry: a Lifecycle event with no known Start is
@@ -12037,10 +12249,16 @@ impl App {
                     return Ok(());
                 }
                 self.chat.run_status.wait_for(RunPhase::WaitingForInput);
+                let display_question =
+                    if tool_name.as_deref().is_some_and(is_browser_eval_tool_name) {
+                        "Allow browser page JavaScript?"
+                    } else {
+                        &question
+                    };
                 self.record_activity(
                     ActivityKind::Input,
                     NoticeLevel::Warn,
-                    format!("Input required: {question}"),
+                    format!("Input required: {display_question}"),
                 );
                 let Some(session_id) = self.chat.session_id.clone() else {
                     self.notify(
@@ -12262,17 +12480,42 @@ impl App {
                     return Ok(());
                 }
                 self.chat.run_status.tool_token(tool_call_id.clone());
-                if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
-                    tool.stream_output.push_str(&content);
+                let known_name = self.terminal_tool_name(&tool_call_id).map(str::to_string);
+                let known_ordinary = known_name
+                    .as_deref()
+                    .is_some_and(|name| !is_browser_eval_tool_name(name));
+                if known_name.as_deref().is_some_and(is_browser_eval_tool_name) {
+                    self.chat.unclassified_tool_tokens.remove(&tool_call_id);
+                    if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
+                        tool.stream_output.clear();
+                    }
+                } else if known_name.is_some() {
+                    if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
+                        tool.stream_output.push_str(&content);
+                    }
                 } else {
+                    // A token with no current-round name may belong to a
+                    // browser_eval whose ToolStart was delayed or lost. Keep
+                    // it outside all rendered cards until a name arrives.
+                    self.chat
+                        .unclassified_tool_tokens
+                        .entry(tool_call_id.clone())
+                        .or_default()
+                        .push_str(&content);
+                }
+                if self.find_tool_mut(&tool_call_id, false).is_none() {
                     self.begin_next_round_after_tools();
                     let turn_id = self.chat.ensure_current_turn_id();
                     self.chat.current_tool_calls.push(ToolCallDisplay {
                         id: tool_call_id.clone(),
-                        tool_name: "unknown".to_string(),
+                        tool_name: known_name.unwrap_or_else(|| "unknown".to_string()),
                         arguments: String::new(),
                         result: None,
-                        stream_output: content,
+                        stream_output: if known_ordinary {
+                            content
+                        } else {
+                            String::new()
+                        },
                         error: None,
                         phase: "streaming".to_string(),
                     });
@@ -16827,6 +17070,1034 @@ mod question_tests {
             tool_complete_result_for_display("default::browser", snapshot, false),
             snapshot
         );
+    }
+
+    #[test]
+    fn browser_eval_approval_hides_fingerprint_in_modal_and_child_inspectors() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let resource = "browser_eval:17:private-fingerprint";
+        let mut app = app_with_permission(vec![PermissionDecisionKind::AllowOnce]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.tool_name = "browser_eval".to_string();
+        permission.request.permission_type = PermissionType::BrowserInteraction;
+        permission.request.resource = resource.to_string();
+        permission.request.suggested_matchers[0].value = resource.to_string();
+        permission.tool_arguments_preview =
+            "{\"code\":\"[redacted]\",\"expected_url\":\"[redacted]\"}".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
+        permission.inspect_target = Some(PermissionInspectTarget::Matcher {
+            decision: PermissionDecisionKind::AllowSession,
+            matcher_index: 0,
+        });
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
+        permission.inspect_target = Some(PermissionInspectTarget::Request);
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("private-fingerprint"));
+
+        let child = ChildApprovalQuestion {
+            parent_session_id: "parent".to_string(),
+            child_session_id: "child".to_string(),
+            child_attempt: 0,
+            request_id: "child-request".to_string(),
+            version: 1,
+            tool_name: "browser_eval".to_string(),
+            permission: "browser_interaction".to_string(),
+            resource: resource.to_string(),
+            exact_reviewed: false,
+        };
+        assert_eq!(child.display_resource(), "<redacted>");
+        assert!(!child.inspector_text().contains("private-fingerprint"));
+    }
+
+    #[test]
+    fn browser_eval_pending_modal_and_inspector_project_raw_arguments() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let code = "document.querySelector('#private-code').value";
+        let url = "https://example.com/account?token=private-query";
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            let mut request = sample_permission_request(
+                "permission-session",
+                "eval-call",
+                vec![PermissionDecisionKind::AllowOnce],
+            );
+            request.tool_name = tool_name.to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser_eval:17:private-fingerprint".to_string();
+            request.operation_summary = format!("Execute {code} on {url}");
+            request.suggested_matchers[0].value = request.resource.clone();
+            let pending = PendingQuestion {
+                has_pending_question: true,
+                question: format!("Approve {code} on {url}?"),
+                tool_call_id: Some("eval-call".to_string()),
+                tool_name: Some(tool_name.to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: Some(request),
+                tool_arguments: Some(serde_json::json!({
+                    "code":code,
+                    "expected_url":url,
+                    "expected_epoch":17,
+                })),
+                ..PendingQuestion::default()
+            };
+            let original_arguments = pending.tool_arguments.clone();
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.session_id = Some("permission-session".to_string());
+            app.pending_question = Some(ActiveQuestion::from_pending(
+                "test:eval-approval".to_string(),
+                "permission-session".to_string(),
+                &pending,
+                String::new(),
+            ));
+            let question = app.pending_question.as_ref().unwrap();
+            assert_eq!(question.question, "Allow browser page JavaScript?");
+            let ActiveQuestionKind::Permission(permission) = &question.kind else {
+                panic!("typed permission")
+            };
+            assert_eq!(
+                permission.tool_arguments_preview,
+                serde_json::json!({"tool":"browser_eval","source":"[redacted]"}).to_string()
+            );
+            assert_eq!(
+                permission.display_operation_summary(),
+                "Run browser page JavaScript"
+            );
+            let inspector = permission.inspector_text();
+            let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for private in [code, url, "private-fingerprint", "private-query"] {
+                assert!(!inspector.contains(private));
+                assert!(!rendered.contains(private));
+            }
+            assert_eq!(pending.tool_arguments, original_arguments);
+            assert_eq!(
+                pending.permission_request.as_ref().unwrap().resource,
+                "browser_eval:17:private-fingerprint"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_eval_clarification_event_hides_resource_before_pending_refresh() {
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.session_id = Some("eval-clarification".to_string());
+            app.chat.streaming = true;
+            app.handle_sse_event(AgentEvent::NeedClarification {
+                question: "Approve browser_eval:17:private-fingerprint?".to_string(),
+                options: Some(vec!["private-option".to_string()]),
+                tool_call_id: Some("eval-call".to_string()),
+                tool_name: Some(tool_name.to_string()),
+                allow_custom: true,
+                source: Some("pause_tool".to_string()),
+            })
+            .unwrap();
+            let question = app.pending_question.as_ref().expect("pre-hydration modal");
+            assert!(question.identity_syncing);
+            assert_eq!(question.question, "Allow browser page JavaScript?");
+            assert!(question.options.is_empty());
+            assert!(!question.allow_custom);
+            for private in ["private-fingerprint", "private-option"] {
+                assert!(!format!(
+                    "{}{:?}{}",
+                    question.question, app.notifications, app.status_message
+                )
+                .contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_eval_live_tool_events_hide_code_url_and_page_result() {
+        let code = "document.querySelector('#password').value";
+        let url = "https://example.com/account?token=private-query";
+        let page_value = "private-page-value";
+        let args = serde_json::json!({
+            "code":code,
+            "expected_url":url,
+            "expected_epoch":17,
+        });
+        let result = serde_json::json!({
+            "page_epoch":17,
+            "active_tab_id":"tab-1",
+            "url":url,
+            "value":page_value,
+        })
+        .to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "eval-call".to_string(),
+            tool_name: "browser_eval".to_string(),
+            arguments: args.clone(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "eval-call".to_string(),
+            result: ToolResult {
+                success: true,
+                result: result.clone(),
+            },
+        })
+        .unwrap();
+        let displayed = &app.chat.current_tool_calls[0];
+        assert_eq!(
+            displayed.result.as_deref(),
+            Some("Browser page JavaScript result hidden")
+        );
+        for private in [code, "private-query", page_value] {
+            assert!(!format!("{displayed:?}").contains(private));
+        }
+
+        let mut dropped_start = App::new(BambooClient::new("http://127.0.0.1:0"));
+        dropped_start.chat.streaming = true;
+        dropped_start
+            .handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "eval-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: result.clone(),
+                },
+            })
+            .unwrap();
+        let fallback = &dropped_start.chat.current_tool_calls[0];
+        assert_eq!(fallback.result.as_deref(), Some("Tool result hidden"));
+        assert!(!format!("{fallback:?}").contains(page_value));
+
+        let mut error_app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        error_app.chat.streaming = true;
+        error_app
+            .handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "eval-error".to_string(),
+                tool_name: "browser_eval".to_string(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+        error_app
+            .handle_sse_event(AgentEvent::ToolLifecycle {
+                tool_call_id: "eval-error".to_string(),
+                tool_name: "browser_eval".to_string(),
+                phase: "error".to_string(),
+                elapsed_ms: Some(7),
+                is_mutating: true,
+                auto_approved: false,
+                summary: Some(code.to_string()),
+                error: Some(page_value.to_string()),
+            })
+            .unwrap();
+        error_app
+            .handle_sse_event(AgentEvent::ToolError {
+                tool_call_id: "eval-error".to_string(),
+                error: page_value.to_string(),
+            })
+            .unwrap();
+        let error_display = &error_app.chat.current_tool_calls[0];
+        assert_eq!(
+            error_display.error.as_deref(),
+            Some("Browser page JavaScript failed")
+        );
+        assert!(!format!("{error_display:?}").contains(page_value));
+        assert!(!format!("{:?}", error_app.notifications).contains(page_value));
+        assert!(!format!("{:?}", error_app.notifications).contains(code));
+        assert_eq!(args["code"], code);
+        assert!(result.contains(page_value));
+    }
+
+    #[test]
+    fn browser_eval_tool_tokens_never_enter_rendered_output() {
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            for token_before_start in [false, true] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.chat.streaming = true;
+                let prestart = "private page token before start";
+                if token_before_start {
+                    app.handle_sse_event(AgentEvent::ToolToken {
+                        tool_call_id: "eval-token".to_string(),
+                        content: prestart.to_string(),
+                    })
+                    .unwrap();
+                    assert!(app.chat.current_tool_calls[0].display_output().is_empty());
+                    assert!(!format!("{:?}", app.chat.current_tool_calls).contains(prestart));
+                }
+                app.handle_sse_event(AgentEvent::ToolStart {
+                    tool_call_id: "eval-token".to_string(),
+                    tool_name: tool_name.to_string(),
+                    arguments: serde_json::json!({
+                        "code":"document.body.innerText",
+                        "expected_url":"https://example.com/?secret=private-query"
+                    }),
+                })
+                .unwrap();
+                app.handle_sse_event(AgentEvent::ToolToken {
+                    tool_call_id: "eval-token".to_string(),
+                    content: "private page token after start".to_string(),
+                })
+                .unwrap();
+                app.handle_sse_event(AgentEvent::ToolError {
+                    tool_call_id: "eval-token".to_string(),
+                    error: "private page error".to_string(),
+                })
+                .unwrap();
+                let tool = &app.chat.current_tool_calls[0];
+                assert!(tool.stream_output.is_empty());
+                assert_eq!(
+                    tool.error.as_deref(),
+                    Some("Browser page JavaScript failed")
+                );
+                let displayed = format!("{tool:?}{:?}", app.notifications);
+                for private in [
+                    prestart,
+                    "private page token after start",
+                    "private page error",
+                    "private-query",
+                ] {
+                    assert!(!displayed.contains(private));
+                }
+                assert!(app.chat.unclassified_tool_tokens.is_empty());
+            }
+
+            let mut replay = App::new(BambooClient::new("http://127.0.0.1:0"));
+            let mut pending = asst_msg("");
+            pending.tool_calls.push(ToolCallDisplay {
+                id: "replay-token".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: "[redacted]".to_string(),
+                result: None,
+                stream_output: String::new(),
+                error: None,
+                phase: "pending".to_string(),
+            });
+            replay.chat.messages.push(pending);
+            replay.chat.prepare_replay_reconciliation();
+            replay.chat.streaming = true;
+            replay
+                .handle_sse_event(AgentEvent::ToolToken {
+                    tool_call_id: "replay-token".to_string(),
+                    content: "private replay page token".to_string(),
+                })
+                .unwrap();
+            assert!(replay.chat.current_tool_calls.is_empty());
+            assert!(replay.chat.messages[0].tool_calls[0]
+                .stream_output
+                .is_empty());
+        }
+
+        let mut ordinary = App::new(BambooClient::new("http://127.0.0.1:0"));
+        ordinary.chat.streaming = true;
+        ordinary
+            .handle_sse_event(AgentEvent::ToolToken {
+                tool_call_id: "read-token".to_string(),
+                content: "before".to_string(),
+            })
+            .unwrap();
+        assert!(ordinary.chat.current_tool_calls[0]
+            .display_output()
+            .is_empty());
+        ordinary
+            .handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "read-token".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        ordinary
+            .handle_sse_event(AgentEvent::ToolToken {
+                tool_call_id: "read-token".to_string(),
+                content: "after".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            ordinary.chat.current_tool_calls[0].stream_output,
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn namespaced_browser_eval_hides_live_result_error_and_approval_resource() {
+        let tool_name = "default::browser_eval";
+        let args = serde_json::json!({
+            "code":"private page source",
+            "expected_url":"https://example.com/?token=private-query",
+            "expected_epoch":17,
+        });
+        let result = serde_json::json!({
+            "page_epoch":17,
+            "active_tab_id":"tab-1",
+            "url":args["expected_url"],
+            "value":"private-page-value",
+        })
+        .to_string();
+        assert_eq!(
+            tool_arguments_for_display("DEFAULT::BROWSER_EVAL", &args.to_string()),
+            serde_json::json!({"tool":"browser_eval","source":"[redacted]"}).to_string()
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "eval-call".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: args.clone(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "eval-call".to_string(),
+            result: ToolResult {
+                success: true,
+                result: result.clone(),
+            },
+        })
+        .unwrap();
+        let displayed = &app.chat.current_tool_calls[0];
+        assert_eq!(
+            displayed.result.as_deref(),
+            Some("Browser page JavaScript result hidden")
+        );
+        for private in ["private page source", "private-query", "private-page-value"] {
+            assert!(!format!("{displayed:?}").contains(private));
+        }
+
+        let mut failed = App::new(BambooClient::new("http://127.0.0.1:0"));
+        failed.chat.streaming = true;
+        failed
+            .handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "eval-error".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args,
+            })
+            .unwrap();
+        failed
+            .handle_sse_event(AgentEvent::ToolLifecycle {
+                tool_call_id: "eval-error".to_string(),
+                tool_name: tool_name.to_string(),
+                phase: "error".to_string(),
+                elapsed_ms: Some(1),
+                is_mutating: true,
+                auto_approved: false,
+                summary: Some("private page source".to_string()),
+                error: Some("private-page-value".to_string()),
+            })
+            .unwrap();
+        failed
+            .handle_sse_event(AgentEvent::ToolError {
+                tool_call_id: "eval-error".to_string(),
+                error: "private-page-value".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            failed.chat.current_tool_calls[0].error.as_deref(),
+            Some("Browser page JavaScript failed")
+        );
+        assert!(!format!("{:?}", failed.notifications).contains("private-page-value"));
+
+        let mut permission_app = app_with_permission(vec![PermissionDecisionKind::AllowOnce]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut permission_app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.tool_name = tool_name.to_string();
+        permission.request.permission_type = PermissionType::BrowserInteraction;
+        permission.request.resource = "browser_eval:17:private-fingerprint".to_string();
+        permission.request.suggested_matchers[0].value = permission.request.resource.clone();
+        permission.tool_arguments_preview = "[redacted]".to_string();
+        assert_eq!(permission.display_resource(), "<redacted>");
+        assert!(!permission.inspector_text().contains("private-fingerprint"));
+        let child = ChildApprovalQuestion {
+            parent_session_id: "parent".to_string(),
+            child_session_id: "child".to_string(),
+            child_attempt: 0,
+            request_id: "child-request".to_string(),
+            version: 1,
+            tool_name: tool_name.to_string(),
+            permission: "browser_interaction".to_string(),
+            resource: "browser_eval:17:private-fingerprint".to_string(),
+            exact_reviewed: false,
+        };
+        assert_eq!(child.display_resource(), "<redacted>");
+        assert!(!child.inspector_text().contains("private-fingerprint"));
+    }
+
+    #[test]
+    fn replayed_browser_eval_terminal_errors_hide_payload_without_live_identity() {
+        let private_error = "private-page-value from source";
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            for complete_event in [false, true] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                let mut message = asst_msg("");
+                message.tool_calls.push(ToolCallDisplay {
+                    id: "eval-replay-call".to_string(),
+                    tool_name: tool_name.to_string(),
+                    arguments: "[redacted]".to_string(),
+                    result: None,
+                    stream_output: String::new(),
+                    error: None,
+                    phase: "pending".to_string(),
+                });
+                app.chat.messages.push(message);
+                app.chat.prepare_replay_reconciliation();
+                app.chat.run_status.restore_summary(false, true, None);
+                app.chat.streaming = true;
+                if complete_event {
+                    app.handle_sse_event(AgentEvent::ToolComplete {
+                        tool_call_id: "eval-replay-call".to_string(),
+                        result: ToolResult {
+                            success: false,
+                            result: private_error.to_string(),
+                        },
+                    })
+                    .unwrap();
+                } else {
+                    app.handle_sse_event(AgentEvent::ToolError {
+                        tool_call_id: "eval-replay-call".to_string(),
+                        error: private_error.to_string(),
+                    })
+                    .unwrap();
+                }
+                let displayed = &app.chat.messages[0].tool_calls[0];
+                assert_eq!(displayed.error.as_deref(), Some("Tool failed"));
+                assert!(!format!("{displayed:?}{:?}", app.notifications).contains(private_error));
+            }
+        }
+
+        let mut unknown = App::new(BambooClient::new("http://127.0.0.1:0"));
+        unknown.chat.run_status.restore_summary(false, true, None);
+        unknown
+            .handle_sse_event(AgentEvent::ToolError {
+                tool_call_id: "missing-start".to_string(),
+                error: private_error.to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            unknown.chat.current_tool_calls[0].error.as_deref(),
+            Some("Tool failed")
+        );
+        assert!(!format!("{:?}", unknown.notifications).contains(private_error));
+    }
+
+    #[test]
+    fn first_progress_after_attach_retires_unfinished_replay_identity() {
+        for success in [false, true] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.session_id = Some("resumed-session".to_string());
+            let mut old = asst_msg("");
+            old.tool_calls.push(ToolCallDisplay {
+                id: "reused-id".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: "{}".to_string(),
+                result: None,
+                stream_output: String::new(),
+                error: None,
+                phase: "pending".to_string(),
+            });
+            app.chat.messages.push(old);
+            app.chat.prepare_replay_reconciliation();
+            app.chat.streaming = true;
+            assert!(app.chat.replay_tool_ids.contains("reused-id"));
+            // Attach can miss the earlier round marker. Its first progress
+            // event may already identify a successor round with a reused id.
+            app.handle_sse_event(AgentEvent::RunnerProgress {
+                session_id: "resumed-session".to_string(),
+                round_count: 4,
+            })
+            .unwrap();
+            assert!(!app.chat.replay_tool_ids.contains("reused-id"));
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "reused-id".to_string(),
+                result: ToolResult {
+                    success,
+                    result: "private browser_eval page bytes".to_string(),
+                },
+            })
+            .unwrap();
+            assert_eq!(app.chat.messages[0].tool_calls[0].phase, "pending");
+            let latest = &app.chat.current_tool_calls[0];
+            assert_eq!(latest.tool_name, "unknown");
+            assert_eq!(
+                latest.result.as_deref().or(latest.error.as_deref()),
+                Some(if success {
+                    "Tool result hidden"
+                } else {
+                    "Tool failed"
+                })
+            );
+            assert!(!format!("{latest:?}{:?}", app.notifications)
+                .contains("private browser_eval page bytes"));
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_browser_eval_reused_id_hides_terminal_error_without_live_identity() {
+        let private_error = "private-page-value from source";
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            for complete_event in [false, true] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                let session_id = "replayed-eval-session";
+                app.chat.session_id = Some(session_id.to_string());
+                let mut old = asst_msg("");
+                old.tool_calls.push(ToolCallDisplay {
+                    id: "reused-id".to_string(),
+                    tool_name: "Read".to_string(),
+                    arguments: "{}".to_string(),
+                    result: None,
+                    stream_output: String::new(),
+                    error: Some(private_error.to_string()),
+                    phase: "error".to_string(),
+                });
+                let mut user = asst_msg("new turn");
+                user.role = MessageRole::User;
+                let mut pending = asst_msg("");
+                pending.tool_calls.push(ToolCallDisplay {
+                    id: "reused-id".to_string(),
+                    tool_name: tool_name.to_string(),
+                    arguments: "[redacted]".to_string(),
+                    result: None,
+                    stream_output: String::new(),
+                    error: None,
+                    phase: "pending".to_string(),
+                });
+                app.chat
+                    .run_status
+                    .tool_started("reused-id".to_string(), "Read".to_string());
+                app.chat.run_status.tool_finished(
+                    "reused-id".to_string(),
+                    false,
+                    Some(private_error.to_string()),
+                );
+                app.opening_session_id = Some(session_id.to_string());
+                app.handle_event(AppEvent::SessionOpened {
+                    session_id: session_id.to_string(),
+                    epoch: 0,
+                    result: Ok(OpenedSession {
+                        is_running: true,
+                        ..opened(vec![old, user, pending])
+                    }),
+                })
+                .await
+                .unwrap();
+                assert!(app.chat.current_tool_calls.is_empty());
+                assert_eq!(app.chat.run_status.tools[0].name, "Read");
+                assert!(app.chat.replay_tool_ids.contains("reused-id"));
+
+                if complete_event {
+                    app.handle_sse_event(AgentEvent::ToolComplete {
+                        tool_call_id: "reused-id".to_string(),
+                        result: ToolResult {
+                            success: false,
+                            result: private_error.to_string(),
+                        },
+                    })
+                    .unwrap();
+                } else {
+                    app.handle_sse_event(AgentEvent::ToolError {
+                        tool_call_id: "reused-id".to_string(),
+                        error: private_error.to_string(),
+                    })
+                    .unwrap();
+                }
+                let displayed = &app.chat.messages[2].tool_calls[0];
+                assert_eq!(displayed.error.as_deref(), Some("Tool failed"));
+                assert_eq!(
+                    app.chat.messages[0].tool_calls[0].error.as_deref(),
+                    Some(private_error)
+                );
+                assert!(!format!("{displayed:?}{:?}", app.notifications).contains(private_error));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_tool_lifecycle_error_keeps_detail_for_terminal_event() {
+        for tool_name in ["Read", "Bash"] {
+            for (lifecycle_error, final_error) in [
+                ("ordinary error detail", "ordinary error detail"),
+                (
+                    "hook deny detail",
+                    "Tool execution denied by hook: hook deny detail",
+                ),
+            ] {
+                for complete_event in [false, true] {
+                    let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                    app.chat.streaming = true;
+                    app.handle_sse_event(AgentEvent::ToolStart {
+                        tool_call_id: "ordinary-call".to_string(),
+                        tool_name: tool_name.to_string(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .unwrap();
+                    app.handle_sse_event(AgentEvent::ToolLifecycle {
+                        tool_call_id: "ordinary-call".to_string(),
+                        tool_name: tool_name.to_string(),
+                        phase: "error".to_string(),
+                        elapsed_ms: Some(1),
+                        is_mutating: false,
+                        auto_approved: false,
+                        summary: None,
+                        error: Some(lifecycle_error.to_string()),
+                    })
+                    .unwrap();
+                    if complete_event {
+                        app.handle_sse_event(AgentEvent::ToolComplete {
+                            tool_call_id: "ordinary-call".to_string(),
+                            result: ToolResult {
+                                success: false,
+                                result: final_error.to_string(),
+                            },
+                        })
+                        .unwrap();
+                    } else {
+                        app.handle_sse_event(AgentEvent::ToolError {
+                            tool_call_id: "ordinary-call".to_string(),
+                            error: final_error.to_string(),
+                        })
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        app.chat.current_tool_calls[0].error.as_deref(),
+                        Some(lifecycle_error)
+                    );
+                    assert_eq!(app.chat.current_tool_calls[0].tool_name, tool_name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_read_card_keeps_projected_error_on_unmatched_reused_event() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "reused-id".to_string(),
+            tool_name: "Read".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolLifecycle {
+            tool_call_id: "reused-id".to_string(),
+            tool_name: "Read".to_string(),
+            phase: "error".to_string(),
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: None,
+            error: Some("old read error".to_string()),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolError {
+            tool_call_id: "reused-id".to_string(),
+            error: "private eval page error".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.current_tool_calls[0].error.as_deref(),
+            Some("old read error")
+        );
+        assert!(!format!("{:?}", app.notifications).contains("private eval page error"));
+    }
+
+    #[test]
+    fn terminal_read_card_does_not_reemit_equal_error_from_dropped_start() {
+        for complete_event in [false, true] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            let detail = "same text as a later private page error";
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "reused-id".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolLifecycle {
+                tool_call_id: "reused-id".to_string(),
+                tool_name: "Read".to_string(),
+                phase: "error".to_string(),
+                elapsed_ms: None,
+                is_mutating: false,
+                auto_approved: false,
+                summary: None,
+                error: Some(detail.to_string()),
+            })
+            .unwrap();
+            let prior_activity_count = app.notifications.len();
+            // The next browser_eval ToolStart was dropped and the provider
+            // reused the ID. Its raw error is equal to the old Read error, so
+            // text equality cannot establish the new tool's identity.
+            if complete_event {
+                app.handle_sse_event(AgentEvent::ToolComplete {
+                    tool_call_id: "reused-id".to_string(),
+                    result: ToolResult {
+                        success: false,
+                        result: detail.to_string(),
+                    },
+                })
+                .unwrap();
+            } else {
+                app.handle_sse_event(AgentEvent::ToolError {
+                    tool_call_id: "reused-id".to_string(),
+                    error: detail.to_string(),
+                })
+                .unwrap();
+            }
+            assert_eq!(app.notifications.len(), prior_activity_count);
+            assert_eq!(app.chat.current_tool_calls[0].tool_name, "Read");
+            assert_eq!(
+                app.chat.current_tool_calls[0].error.as_deref(),
+                Some(detail)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_run_status_does_not_expose_identityless_success_result() {
+        let url = "https://example.com/account?token=private-query";
+        let valid = serde_json::json!({
+            "page_epoch":17,
+            "active_tab_id":"tab-1",
+            "url":url,
+            "value":"private-page-value",
+        })
+        .to_string();
+        let malformed = format!(
+            "{{\"active_tab_id\":\"tab-1\",\"page_epoch\":17,\"url\":\"{url}\",\"value\":\"private-page-value\""
+        );
+        for raw in [valid, malformed] {
+            for old_card in [false, true] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.chat.streaming = true;
+                app.chat
+                    .run_status
+                    .tool_started("reused-id".to_string(), "Read".to_string());
+                app.chat
+                    .run_status
+                    .tool_finished("reused-id".to_string(), true, None);
+                if old_card {
+                    app.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: "reused-id".to_string(),
+                        tool_name: "Read".to_string(),
+                        arguments: "{}".to_string(),
+                        result: Some("old result".to_string()),
+                        stream_output: String::new(),
+                        error: None,
+                        phase: "complete".to_string(),
+                    });
+                }
+                // The next browser_eval ToolStart (bare or namespaced) is absent.
+                // The stale Read ID in run_status cannot establish current identity.
+                app.handle_sse_event(AgentEvent::ToolComplete {
+                    tool_call_id: "reused-id".to_string(),
+                    result: ToolResult {
+                        success: true,
+                        result: raw.clone(),
+                    },
+                })
+                .unwrap();
+                let displayed = &app.chat.current_tool_calls[0];
+                assert_eq!(
+                    displayed.result.as_deref(),
+                    Some(if old_card {
+                        "old result"
+                    } else {
+                        "Tool result hidden"
+                    })
+                );
+                assert_eq!(displayed.phase, "complete");
+                assert!(!format!("{displayed:?}{:?}", app.notifications).contains("private-query"));
+                assert!(
+                    !format!("{displayed:?}{:?}", app.notifications).contains("private-page-value")
+                );
+            }
+        }
+
+        let mut ordinary = App::new(BambooClient::new("http://127.0.0.1:0"));
+        ordinary.chat.streaming = true;
+        ordinary
+            .handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "active-read".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        ordinary
+            .handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "active-read".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: "ordinary result".to_string(),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            ordinary.chat.current_tool_calls[0].result.as_deref(),
+            Some("ordinary result")
+        );
+    }
+
+    #[test]
+    fn unfinished_prior_round_tool_cannot_identify_reused_terminal_payload() {
+        for token_boundary in [false, true] {
+            for success in [false, true] {
+                for complete_event in [false, true] {
+                    if !complete_event && success {
+                        continue;
+                    }
+                    let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                    app.chat.streaming = true;
+                    app.chat.session_id = Some("same-session".to_string());
+                    if !token_boundary {
+                        app.handle_sse_event(AgentEvent::RunnerProgress {
+                            session_id: "same-session".to_string(),
+                            round_count: 0,
+                        })
+                        .unwrap();
+                    }
+                    app.handle_sse_event(AgentEvent::ToolStart {
+                        tool_call_id: "reused-id".to_string(),
+                        tool_name: "Read".to_string(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .unwrap();
+                    // The old Read terminal event was lost. The next round may
+                    // emit a model token or only RunnerProgress before the new
+                    // browser_eval ToolStart is also lost.
+                    if token_boundary {
+                        app.handle_sse_event(AgentEvent::Token {
+                            content: "next round".to_string(),
+                        })
+                        .unwrap();
+                    } else {
+                        app.handle_sse_event(AgentEvent::RunnerProgress {
+                            session_id: "same-session".to_string(),
+                            round_count: 1,
+                        })
+                        .unwrap();
+                    }
+                    assert!(app.chat.live_tool_names.is_empty());
+                    assert_eq!(app.chat.run_status.tools[0].name, "Read");
+                    let private_payload = "private browser_eval page result and URL query";
+                    if complete_event {
+                        app.handle_sse_event(AgentEvent::ToolComplete {
+                            tool_call_id: "reused-id".to_string(),
+                            result: ToolResult {
+                                success,
+                                result: private_payload.to_string(),
+                            },
+                        })
+                        .unwrap();
+                    } else {
+                        app.handle_sse_event(AgentEvent::ToolError {
+                            tool_call_id: "reused-id".to_string(),
+                            error: private_payload.to_string(),
+                        })
+                        .unwrap();
+                    }
+                    let displayed = &app.chat.current_tool_calls[0];
+                    assert_eq!(
+                        displayed.result.as_deref().or(displayed.error.as_deref()),
+                        Some(if success {
+                            "Tool result hidden"
+                        } else {
+                            "Tool failed"
+                        })
+                    );
+                    assert!(
+                        !format!("{displayed:?}{:?}", app.notifications).contains(private_payload)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reused_tool_id_uses_current_browser_eval_identity_for_errors() {
+        let private_error = "private-page-value from source";
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            for complete_event in [false, true] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.chat.streaming = true;
+                app.chat.current_turn_id = Some("turn:first-round".to_string());
+                app.handle_sse_event(AgentEvent::ToolStart {
+                    tool_call_id: "reused-id".to_string(),
+                    tool_name: "Read".to_string(),
+                    arguments: serde_json::json!({"path":"old"}),
+                })
+                .unwrap();
+                app.handle_sse_event(AgentEvent::ToolComplete {
+                    tool_call_id: "reused-id".to_string(),
+                    result: ToolResult {
+                        success: true,
+                        result: "old result".to_string(),
+                    },
+                })
+                .unwrap();
+                app.handle_sse_event(AgentEvent::ToolToken {
+                    tool_call_id: "reused-id".to_string(),
+                    content: "new partial".to_string(),
+                })
+                .unwrap();
+                app.handle_sse_event(AgentEvent::ToolStart {
+                    tool_call_id: "reused-id".to_string(),
+                    tool_name: tool_name.to_string(),
+                    arguments: serde_json::json!({
+                        "code":"document.title",
+                        "expected_url":"https://example.com/?token=private-query",
+                    }),
+                })
+                .unwrap();
+                assert_eq!(app.chat.current_tool_calls[0].tool_name, tool_name);
+                if complete_event {
+                    app.handle_sse_event(AgentEvent::ToolComplete {
+                        tool_call_id: "reused-id".to_string(),
+                        result: ToolResult {
+                            success: false,
+                            result: private_error.to_string(),
+                        },
+                    })
+                    .unwrap();
+                } else {
+                    app.handle_sse_event(AgentEvent::ToolError {
+                        tool_call_id: "reused-id".to_string(),
+                        error: private_error.to_string(),
+                    })
+                    .unwrap();
+                }
+                let displayed = &app.chat.current_tool_calls[0];
+                assert_eq!(
+                    displayed.error.as_deref(),
+                    Some("Browser page JavaScript failed")
+                );
+                assert!(!format!("{displayed:?}{:?}", app.notifications).contains(private_error));
+                assert_eq!(
+                    app.chat.messages[0].tool_calls[0].result.as_deref(),
+                    Some("old result")
+                );
+            }
+        }
     }
 
     #[test]
@@ -21641,6 +22912,12 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
         let output = "界".repeat(120);
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "visual".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
         app.handle_sse_event(AgentEvent::ToolToken {
             tool_call_id: "visual".into(),
             content: output.clone(),
@@ -21881,8 +23158,8 @@ mod question_tests {
         assert_eq!(app.chat.textarea.lines(), &["草"]);
     }
 
-    /// A `ToolComplete`/`ToolError` for an id with no matching `ToolStart` is
-    /// surfaced defensively (not silently dropped).
+    /// A `ToolComplete` for an id with no matching `ToolStart` is surfaced as
+    /// a fixed placeholder because its result has no verified tool identity.
     #[tokio::test]
     async fn tool_complete_for_unknown_id_inserts_defensively() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
@@ -21900,7 +23177,7 @@ mod question_tests {
         let tc = &app.chat.current_tool_calls[0];
         assert_eq!(tc.id, "ghost");
         assert_eq!(tc.tool_name, "unknown");
-        assert_eq!(tc.result.as_deref(), Some("surprise"));
+        assert_eq!(tc.result.as_deref(), Some("Tool result hidden"));
         assert_eq!(tc.phase, "complete");
     }
 
@@ -22141,6 +23418,55 @@ mod question_tests {
             pending: None,
             truncated: false,
             total_message_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_browser_eval_pending_status_uses_projected_question() {
+        let code = "document.querySelector('#private-code').value";
+        let url = "https://example.com/account?token=private-query";
+        for tool_name in ["browser_eval", "default::browser_eval"] {
+            let session_id = "permission-session";
+            let request_id = "eval-call";
+            let mut request = sample_permission_request(
+                session_id,
+                request_id,
+                vec![PermissionDecisionKind::AllowOnce],
+            );
+            request.tool_name = tool_name.to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser_eval:17:private-fingerprint".to_string();
+            let pending = PendingQuestion {
+                has_pending_question: true,
+                question: format!("Approve {code} on {url}?"),
+                tool_call_id: Some(request_id.to_string()),
+                tool_name: Some(tool_name.to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: Some(request),
+                tool_arguments: Some(serde_json::json!({"code":code,"expected_url":url})),
+                ..PendingQuestion::default()
+            };
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.opening_session_id = Some(session_id.to_string());
+            app.handle_event(AppEvent::SessionOpened {
+                session_id: session_id.to_string(),
+                epoch: 0,
+                result: Ok(OpenedSession {
+                    pending: Some(pending),
+                    ..opened(Vec::new())
+                }),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                app.status_message,
+                "Question: Allow browser page JavaScript? (answer in the dialog)"
+            );
+            let question = app.pending_question.as_ref().expect("pending modal");
+            assert_eq!(question.question, "Allow browser page JavaScript?");
+            for private in [code, url, "private-query"] {
+                assert!(!app.status_message.contains(private));
+            }
         }
     }
 
