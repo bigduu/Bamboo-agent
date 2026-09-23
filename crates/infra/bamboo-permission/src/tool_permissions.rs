@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::bash_security;
 use crate::hierarchy::PermissionRuleSet;
@@ -10,6 +13,18 @@ const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd
 /// one proactive request. This matches the bounded replay ledger so every
 /// schema-valid request can eventually complete.
 pub const MAX_PROACTIVE_PERMISSION_BATCH: usize = 64;
+
+/// Keep a remembered `type` grant tied to the exact bytes without putting
+/// potentially sensitive browser input into permission resources or logs.
+/// Temporary grants are process-local, so the salt can be process-local too.
+fn browser_type_fingerprint(text: &str) -> String {
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
+}
 
 pub fn check_permissions(
     tool_name: &str,
@@ -285,7 +300,8 @@ pub fn check_permissions(
                         format!("Navigate browser to {}", url.origin().ascii_serialization()),
                     )]))
                 }
-                "click" | "fill" | "press" | "scroll" => {
+                "click" | "click_at" | "fill" | "type" | "press" | "key" | "scroll" | "history"
+                | "viewport" => {
                     // Bind remembered grants to the page generation. Navigation
                     // increments the epoch, so a selector approved on one site
                     // cannot silently carry authority to the next site.
@@ -298,17 +314,87 @@ pub fn check_permissions(
                                     .into(),
                             )
                         })?;
-                    let target = if matches!(action, "click" | "fill") {
-                        required_string_arg(args, "selector")?
-                    } else {
-                        args.get("selector")
+                    let target = match action {
+                        "click" | "fill" => required_string_arg(args, "selector")?.to_string(),
+                        "press" | "scroll" => args
+                            .get("selector")
                             .and_then(Value::as_str)
                             .unwrap_or("page")
+                            .to_string(),
+                        "history" => {
+                            let direction = required_string_arg(args, "direction")?;
+                            if !matches!(direction, "back" | "forward" | "reload") {
+                                return Err(PermissionError::CheckFailed(
+                                    "invalid browser history direction".into(),
+                                ));
+                            }
+                            direction.to_string()
+                        }
+                        "viewport" => {
+                            let width = args.get("width").and_then(Value::as_u64);
+                            let height = args.get("height").and_then(Value::as_u64);
+                            match (width, height) {
+                                (Some(width @ 320..=1200), Some(height @ 240..=1000)) => {
+                                    format!("{width}x{height}")
+                                }
+                                _ => {
+                                    return Err(PermissionError::CheckFailed(
+                                        "browser viewport must be within 320..1200 by 240..1000"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                        "click_at" => {
+                            let coordinate = |name| {
+                                args.get(name)
+                                    .and_then(Value::as_f64)
+                                    .filter(|value| value.is_finite() && *value >= 0.0)
+                                    .ok_or_else(|| {
+                                        PermissionError::CheckFailed(format!(
+                                            "browser requires nonnegative {name}"
+                                        ))
+                                    })
+                            };
+                            let x = coordinate("x")?;
+                            let y = coordinate("y")?;
+                            let button = match args.get("button") {
+                                None => "left",
+                                Some(value) => value.as_str().ok_or_else(|| {
+                                    PermissionError::CheckFailed("invalid browser button".into())
+                                })?,
+                            };
+                            if !matches!(button, "left" | "right" | "middle") {
+                                return Err(PermissionError::CheckFailed(
+                                    "invalid browser button".into(),
+                                ));
+                            }
+                            format!("{x},{y},{button}")
+                        }
+                        "type" => {
+                            let text = required_string_arg(args, "text")?;
+                            format!("focused:{}", browser_type_fingerprint(text))
+                        }
+                        "key" => {
+                            let key = required_string_arg(args, "key")?;
+                            if key.is_empty() {
+                                return Err(PermissionError::CheckFailed(
+                                    "browser key must be nonempty".into(),
+                                ));
+                            }
+                            key.to_string()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let description = if action == "type" {
+                        "Type into focused browser element".to_string()
+                    } else {
+                        format!("Browser {action} on {target}")
                     };
                     Ok(Some(vec![PermissionContext::new(
                         PermissionType::BrowserInteraction,
                         format!("browser:{epoch}:{action}:{target}"),
-                        format!("Browser {action} on {target}"),
+                        description,
                     )]))
                 }
                 "snapshot" | "screenshot" => Ok(None),
@@ -605,6 +691,115 @@ mod tests {
         assert!(check_permissions("browser", &json!({"action":"snapshot"}))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn browser_host_controls_use_action_specific_epoch_scoped_interaction_permissions() {
+        let cases = [
+            (
+                json!({"action":"history","direction":"back","expected_epoch":17}),
+                "browser:17:history:back",
+            ),
+            (
+                json!({"action":"viewport","width":640,"height":480,"expected_epoch":17}),
+                "browser:17:viewport:640x480",
+            ),
+            (
+                json!({"action":"click_at","x":12.5,"y":20,"button":"right","expected_epoch":17}),
+                "browser:17:click_at:12.5,20,right",
+            ),
+            (
+                json!({"action":"key","key":"Shift+Tab","expected_epoch":17}),
+                "browser:17:key:Shift+Tab",
+            ),
+        ];
+        for (args, expected_resource) in cases {
+            let context = check_permissions("browser", &args).unwrap().unwrap();
+            assert_eq!(context.len(), 1);
+            assert_eq!(
+                context[0].permission_type,
+                PermissionType::BrowserInteraction
+            );
+            assert_eq!(context[0].resource, expected_resource);
+            let mut later = args;
+            later["expected_epoch"] = json!(18);
+            assert_ne!(
+                check_permissions("browser", &later).unwrap().unwrap()[0].resource,
+                expected_resource
+            );
+        }
+    }
+
+    #[test]
+    fn browser_type_grant_is_bound_to_input_without_exposing_text() {
+        let context = |text: &str, epoch| {
+            check_permissions(
+                "browser",
+                &json!({"action":"type","text":text,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let original = context("private input", 17);
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original.resource.starts_with("browser:17:type:focused:"));
+        assert!(!original.resource.contains("private input"));
+        assert_eq!(
+            original.operation_description,
+            "Type into focused browser element"
+        );
+        assert_eq!(original.resource, context("private input", 17).resource);
+        let different_text = context("other input", 17);
+        assert_ne!(original.resource, different_text.resource);
+        assert_ne!(original.resource, context("private input", 18).resource);
+
+        let config = crate::PermissionConfig::default();
+        let matcher =
+            crate::conservative_matchers(PermissionType::BrowserInteraction, &original.resource)
+                .remove(0);
+        config
+            .grant_typed_scoped_session_permission(
+                "chat",
+                PermissionType::BrowserInteraction,
+                matcher,
+            )
+            .unwrap();
+        assert!(config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &original.resource
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "chat",
+            PermissionType::BrowserInteraction,
+            &different_text.resource
+        ));
+    }
+
+    #[test]
+    fn browser_host_controls_reject_missing_epoch_and_invalid_arguments_before_approval() {
+        let valid_without_epoch = [
+            json!({"action":"history","direction":"back"}),
+            json!({"action":"viewport","width":640,"height":480}),
+            json!({"action":"click_at","x":12,"y":20}),
+            json!({"action":"type","text":"Lotus"}),
+            json!({"action":"key","key":"Enter"}),
+        ];
+        for args in valid_without_epoch {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
+        let invalid = [
+            json!({"action":"history","direction":"sideways","expected_epoch":17}),
+            json!({"action":"viewport","width":319,"height":480,"expected_epoch":17}),
+            json!({"action":"click_at","x":-1,"y":20,"expected_epoch":17}),
+            json!({"action":"click_at","x":12,"y":20,"button":"invalid","expected_epoch":17}),
+            json!({"action":"type","expected_epoch":17}),
+            json!({"action":"key","key":"","expected_epoch":17}),
+        ];
+        for args in invalid {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
     }
 
     #[test]
