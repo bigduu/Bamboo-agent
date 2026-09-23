@@ -43,6 +43,73 @@ fn viewport_arg(args: &Value, name: &str, min: u64, max: u64) -> Result<u64, Too
         })
 }
 
+fn semantic_target(target: &Value) -> Result<(), ToolError> {
+    let invalid = || ToolError::InvalidArguments("invalid browser semantic target".into());
+    let object = target.as_object().ok_or_else(invalid)?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let string = |name: &str, maximum: usize| -> Result<Option<&str>, ToolError> {
+        match object.get(name) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && value.encode_utf16().count() <= maximum)
+                .map(Some)
+                .ok_or_else(invalid),
+        }
+    };
+    let _ = string("frame_selector", 512)?;
+    if object.get("exact").is_some_and(|value| !value.is_boolean()) {
+        return Err(invalid());
+    }
+    let allowed: &[&str] = match kind {
+        "role" => {
+            let role = string("role", 64)?.ok_or_else(invalid)?;
+            if !role
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '-')
+            {
+                return Err(invalid());
+            }
+            let _ = string("name", 256)?;
+            &["kind", "role", "name", "exact", "frame_selector"]
+        }
+        "label" | "text" => {
+            string("value", 256)?.ok_or_else(invalid)?;
+            &["kind", "value", "exact", "frame_selector"]
+        }
+        _ => return Err(invalid()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn locator_request(args: &Value, epoch: u64, allow_focused: bool) -> Result<Value, ToolError> {
+    let selector = args.get("selector").filter(|value| !value.is_null());
+    let target = args.get("target").filter(|value| !value.is_null());
+    match (selector, target) {
+        (Some(_), Some(_)) => Err(ToolError::InvalidArguments(
+            "browser selector and target are mutually exclusive".into(),
+        )),
+        (Some(_), None) => Ok(json!({
+            "selector":text_arg(args, "selector")?,
+            "expected_epoch":epoch,
+        })),
+        (None, Some(target)) => {
+            semantic_target(target)?;
+            Ok(json!({"target":target,"expected_epoch":epoch}))
+        }
+        (None, None) if allow_focused => Ok(json!({"expected_epoch":epoch})),
+        (None, None) => Err(ToolError::InvalidArguments(
+            "browser requires selector or target".into(),
+        )),
+    }
+}
+
 fn input_request(action: &str, args: &Value, epoch: u64) -> Result<Value, ToolError> {
     match action {
         "click_at" => {
@@ -86,7 +153,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser page shared with this chat's right workbench. Read its DOM snapshot or screenshot; navigate, use history, resize the viewport, click a selector or coordinate, fill a selector, type into the focused element, press a key, or scroll. The page belongs to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen page."
+        "Operate the browser page shared with this chat's right workbench. Read its DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The page belongs to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen page."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -98,7 +165,8 @@ impl Tool for BrowserTool {
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, or optional press"},
+                "selector":{"type":"string","description":"CSS selector for click, fill, or optional press; mutually exclusive with target"},
+                "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
                 "text":{"type":"string","description":"Text for fill or type; type inserts into the focused element"},
                 "key":{"type":"string","description":"Keyboard key for press or key, e.g. Enter"},
                 "x":{"type":"number","description":"CSS viewport x for click_at or scroll; nonnegative for click_at"},
@@ -179,10 +247,18 @@ impl Tool for BrowserTool {
                 "height":viewport_arg(&args,"height",240,1000)?,
                 "expected_epoch":epoch,
             })).await.map_err(browser_error)?,
-            "click" => self.browser.command(session_id, "click_selector", json!({"selector":text_arg(&args,"selector")?,"expected_epoch":epoch})).await.map_err(browser_error)?,
+            "click" => self.browser.command(session_id, "click_selector", locator_request(&args, epoch, false)?).await.map_err(browser_error)?,
             "click_at" | "type" | "key" => self.browser.command(session_id, "input", input_request(action, &args, epoch)?).await.map_err(browser_error)?,
-            "fill" => self.browser.command(session_id, "fill_selector", json!({"selector":text_arg(&args,"selector")?,"text":args.get("text").and_then(Value::as_str).ok_or_else(|| ToolError::InvalidArguments("browser requires text for fill".into()))?,"expected_epoch":epoch})).await.map_err(browser_error)?,
-            "press" => self.browser.command(session_id, "press_selector", json!({"selector":args.get("selector"),"key":text_arg(&args,"key")?,"expected_epoch":epoch})).await.map_err(browser_error)?,
+            "fill" => {
+                let mut request = locator_request(&args, epoch, false)?;
+                request["text"] = json!(args.get("text").and_then(Value::as_str).ok_or_else(|| ToolError::InvalidArguments("browser requires text for fill".into()))?);
+                self.browser.command(session_id, "fill_selector", request).await.map_err(browser_error)?
+            },
+            "press" => {
+                let mut request = locator_request(&args, epoch, true)?;
+                request["key"] = json!(text_arg(&args,"key")?);
+                self.browser.command(session_id, "press_selector", request).await.map_err(browser_error)?
+            },
             "scroll" => self.browser.command(session_id, "input", json!({"kind":"scroll","x":args.get("x").and_then(Value::as_f64).unwrap_or(500.0),"y":args.get("y").and_then(Value::as_f64).unwrap_or(360.0),"delta_x":args.get("delta_x").and_then(Value::as_f64).unwrap_or(0.0),"delta_y":args.get("delta_y").and_then(Value::as_f64).unwrap_or(500.0),"expected_epoch":epoch})).await.map_err(browser_error)?,
             "snapshot" => {
                 let dom = self.browser.command(session_id, "dom", json!({})).await.map_err(browser_error)?;
@@ -253,6 +329,44 @@ mod tests {
         ] {
             assert!(input_request("click_at", &args, 17).is_err());
         }
+    }
+
+    #[test]
+    fn semantic_locator_arguments_are_bounded_and_exclusive_with_css() {
+        let role =
+            json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"});
+        assert_eq!(
+            locator_request(&json!({"target":role}), 17, false).unwrap(),
+            json!({"target":role,"expected_epoch":17})
+        );
+        assert_eq!(
+            locator_request(&json!({"selector":"#save"}), 17, false).unwrap(),
+            json!({"selector":"#save","expected_epoch":17})
+        );
+        assert_eq!(
+            locator_request(&json!({}), 17, true).unwrap(),
+            json!({"expected_epoch":17})
+        );
+        for args in [
+            json!({}),
+            json!({"selector":"#save","target":role}),
+            json!({"target":{"kind":"role","role":"button","value":"Save"}}),
+            json!({"target":{"kind":"label"}}),
+            json!({"target":{"kind":"text","value":" "}}),
+            json!({"target":{"kind":"text","value":"Save","exact":"yes"}}),
+            json!({"target":{"kind":"text","value":"Save","frame_selector":" "}}),
+            json!({"target":{"kind":"role","role":"BUTTON"}}),
+        ] {
+            assert!(locator_request(&args, 17, false).is_err(), "{args}");
+        }
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        assert!(tool
+            .description()
+            .contains("[ref=e...] markers are not stable"));
+        assert_eq!(
+            tool.parameters_schema()["properties"]["target"]["type"],
+            "object"
+        );
     }
 
     #[tokio::test]

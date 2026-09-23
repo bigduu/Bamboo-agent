@@ -26,6 +26,104 @@ fn browser_type_fingerprint(text: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// Stable across restarts so a durable approval for the same visible target
+/// continues to match. Input text uses the separate salted fingerprint above.
+fn browser_target_fingerprint(target: &str) -> String {
+    format!("{:x}", Sha256::digest(target.as_bytes()))
+}
+
+/// A semantic locator's grant identity is independent of JSON key order and
+/// never contains page text. The description remains readable at approval.
+fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, PermissionError> {
+    let selector = args.get("selector").filter(|value| !value.is_null());
+    let Some(target) = args.get("target").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let invalid = || PermissionError::CheckFailed("invalid browser semantic target".into());
+    if selector.is_some() {
+        return Err(PermissionError::CheckFailed(
+            "browser selector and target are mutually exclusive".into(),
+        ));
+    }
+    let object = target.as_object().ok_or_else(invalid)?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let string = |name: &str, maximum: usize| -> Result<Option<&str>, PermissionError> {
+        match object.get(name) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && value.encode_utf16().count() <= maximum)
+                .map(Some)
+                .ok_or_else(invalid),
+        }
+    };
+    let frame = string("frame_selector", 512)?;
+    let exact = match object.get("exact") {
+        None => true,
+        Some(value) => value.as_bool().ok_or_else(invalid)?,
+    };
+    let (role, name, value, description, allowed): (
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        String,
+        &[&str],
+    ) = match kind {
+        "role" => {
+            let role = string("role", 64)?.ok_or_else(invalid)?;
+            if !role
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '-')
+            {
+                return Err(invalid());
+            }
+            let name = string("name", 256)?;
+            let description = match name {
+                Some(name) => format!("role {role} named {name:?}"),
+                None => format!("role {role}"),
+            };
+            (
+                Some(role),
+                name,
+                None,
+                description,
+                &["kind", "role", "name", "exact", "frame_selector"],
+            )
+        }
+        "label" | "text" => {
+            let value = string("value", 256)?.ok_or_else(invalid)?;
+            (
+                None,
+                None,
+                Some(value),
+                format!("{kind} {value:?}"),
+                &["kind", "value", "exact", "frame_selector"],
+            )
+        }
+        _ => return Err(invalid()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid());
+    }
+    let canonical = serde_json::json!([
+        kind,
+        role.unwrap_or(""),
+        name.unwrap_or(""),
+        value.unwrap_or(""),
+        exact,
+        frame.unwrap_or("")
+    ]);
+    let identity = browser_target_fingerprint(&canonical.to_string());
+    let description = match frame {
+        Some(frame) => format!("{description} in iframe {frame:?}"),
+        None => description,
+    };
+    Ok(Some((format!("semantic:{identity}"), description)))
+}
+
 pub fn check_permissions(
     tool_name: &str,
     args: &Value,
@@ -314,9 +412,26 @@ pub fn check_permissions(
                                     .into(),
                             )
                         })?;
+                    let semantic = if matches!(action, "click" | "fill" | "press") {
+                        browser_semantic_target(args)?
+                    } else {
+                        None
+                    };
                     let target = match action {
-                        "click" | "fill" => required_string_arg(args, "selector")?.to_string(),
-                        "press" | "scroll" => args
+                        "click" | "fill" => match &semantic {
+                            Some((identity, _)) => identity.clone(),
+                            None => required_string_arg(args, "selector")?.to_string(),
+                        },
+                        "press" => semantic
+                            .as_ref()
+                            .map(|(identity, _)| identity.clone())
+                            .unwrap_or_else(|| {
+                                args.get("selector")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("page")
+                                    .to_string()
+                            }),
+                        "scroll" => args
                             .get("selector")
                             .and_then(Value::as_str)
                             .unwrap_or("page")
@@ -386,8 +501,28 @@ pub fn check_permissions(
                         }
                         _ => unreachable!(),
                     };
+                    let target = if action == "fill" && semantic.is_some() {
+                        let text = required_string_arg(args, "text")?;
+                        format!("{target}:text:{}", browser_type_fingerprint(text))
+                    } else if action == "press" {
+                        let key = required_string_arg(args, "key")?;
+                        if key.is_empty() {
+                            return Err(PermissionError::CheckFailed(
+                                "browser key must be nonempty".into(),
+                            ));
+                        }
+                        if semantic.is_some() {
+                            format!("{target}:key:{}", browser_target_fingerprint(key))
+                        } else {
+                            target
+                        }
+                    } else {
+                        target
+                    };
                     let description = if action == "type" {
                         "Type into focused browser element".to_string()
+                    } else if let Some((_, semantic_description)) = semantic {
+                        format!("Browser {action} on {semantic_description}")
                     } else {
                         format!("Browser {action} on {target}")
                     };
@@ -775,6 +910,91 @@ mod tests {
             PermissionType::BrowserInteraction,
             &different_text.resource
         ));
+    }
+
+    #[test]
+    fn browser_semantic_grants_bind_target_frame_epoch_and_fill_text() {
+        let context = |action: &str, target: Value, epoch: u64, text: &str| {
+            check_permissions(
+                "browser",
+                &json!({"action":action,"target":target,"expected_epoch":epoch,"text":text,"key":"Enter"}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let role =
+            json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"});
+        let original = context("click", role.clone(), 17, "");
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original.resource.starts_with("browser:17:click:semantic:"));
+        assert!(!original.resource.contains("Save"));
+        assert_eq!(
+            original.resource,
+            "browser:17:click:semantic:164a3f6e8b4b57fc37043624be24dc835d53ed605c301b27aa9d7ca9c0fe031e"
+        );
+        assert!(original
+            .operation_description
+            .contains("role button named \"Save\""));
+        assert!(original.operation_description.contains("iframe#checkout"));
+        assert_eq!(
+            original.resource,
+            context("click", json!({"frame_selector":"iframe#checkout","name":"Save","role":"button","kind":"role","exact":true}), 17, "").resource
+        );
+        assert_ne!(
+            original.resource,
+            context("click", role.clone(), 18, "").resource
+        );
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#other"}), 17, "").resource);
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Cancel","frame_selector":"iframe#checkout"}), 17, "").resource);
+        assert_ne!(original.resource, context("click", json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout","exact":false}), 17, "").resource);
+        assert_ne!(original.resource, context("press", role, 17, "").resource);
+        let press = |key: &str| {
+            check_permissions(
+                "browser",
+                &json!({"action":"press","target":{"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"},"key":key,"expected_epoch":17}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        assert_ne!(press("Tab").resource, press("Enter").resource);
+        assert_eq!(press("Tab").resource, press("Tab").resource);
+        assert!(!press("Control+A").resource.contains("Control+A"));
+
+        let label = json!({"kind":"label","value":"Secret field"});
+        let first_fill = context("fill", label.clone(), 17, "private value");
+        let second_fill = context("fill", label, 17, "other value");
+        assert_ne!(first_fill.resource, second_fill.resource);
+        assert!(!first_fill.resource.contains("Secret field"));
+        assert!(!first_fill.resource.contains("private value"));
+        assert!(first_fill.operation_description.contains("Secret field"));
+        assert!(!first_fill.operation_description.contains("private value"));
+        assert_ne!(
+            first_fill.resource,
+            context(
+                "fill",
+                json!({"kind":"label","value":"Secret field"}),
+                17,
+                ""
+            )
+            .resource
+        );
+    }
+
+    #[test]
+    fn browser_semantic_targets_reject_invalid_approval_requests() {
+        for args in [
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"role","role":"button"},"selector":"#save"}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"label"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"text","value":"Save","exact":"yes"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"role","role":"BUTTON"}}),
+            json!({"action":"click","expected_epoch":17,"target":{"kind":"text","value":"Save","frame_selector":" "}}),
+            json!({"action":"click","expected_epoch":17}),
+            json!({"action":"press","expected_epoch":17,"target":{"kind":"text","value":"Save"}}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
     }
 
     #[test]
