@@ -17101,6 +17101,13 @@ mod question_tests {
                 tool_arguments_for_display(tool_name, &invalid.to_string()),
                 display
             );
+            assert_eq!(
+                tool_arguments_for_display(
+                    tool_name,
+                    r#"{"action":"set_file_input","data_base64":"cHJpdmF0ZSBieXRlcw==""#,
+                ),
+                "[browser arguments unavailable]"
+            );
             let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
             app.chat.streaming = true;
             app.handle_sse_event(AgentEvent::ToolStart {
