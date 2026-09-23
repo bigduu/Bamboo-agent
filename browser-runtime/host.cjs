@@ -326,42 +326,81 @@ function pointerButton(value) {
   return button;
 }
 
-function observeActionNavigation(page) {
+async function observeActionNavigation(page) {
   let started = false;
   let committed = false;
   let failed = false;
   let currentRequest = null;
   let revision = 0;
-  const mainRequest = request => {
-    if (!request.isNavigationRequest()) return false;
-    try { return request.frame() === page.mainFrame(); } catch { return false; }
-  };
-  const onRequest = request => {
-    if (!mainRequest(request)) return;
+  let observedPage = page;
+  let blankPopupExpected = false;
+  const listeners = [];
+  const cdp = await tabByPage.get(page)?.cdp;
+  if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
+  await cdp.send('Page.enable');
+  const onWindowOpen = event => {
+    // Playwright's popup/page events can be delayed until a slow destination
+    // response starts. CDP reports window.open at the triggering gesture.
     started = true;
     committed = false;
     failed = false;
-    currentRequest = request;
-    revision++;
-  };
-  const onFailed = request => {
-    if (request !== currentRequest) return;
-    failed = true;
     currentRequest = null;
+    blankPopupExpected = !event.url || event.url === 'about:blank';
     revision++;
   };
-  const onFrame = frame => {
-    if (frame !== page.mainFrame()) return;
-    started = true;
-    committed = true;
-    currentRequest = null;
-    revision++;
+  cdp.on('Page.windowOpen', onWindowOpen);
+  const mainRequest = (target, request) => {
+    if (!request.isNavigationRequest()) return false;
+    try { return request.frame() === target.mainFrame(); } catch { return false; }
   };
-  const onClose = () => { failed = true; revision++; };
-  page.on('request', onRequest);
-  page.on('requestfailed', onFailed);
-  page.on('framenavigated', onFrame);
-  page.on('close', onClose);
+  const watch = (target, popup = false) => {
+    if (listeners.some(item => item.page === target)) return;
+    if (popup) {
+      // adoptPage activates popups before their navigation commits. An initial
+      // about:blank page is not the destination of window.open(url).
+      observedPage = target;
+      started = true;
+      committed = target.url() !== 'about:blank' || blankPopupExpected;
+      failed = false;
+      currentRequest = null;
+      revision++;
+    }
+    const onRequest = request => {
+      if (target !== observedPage || !mainRequest(target, request)) return;
+      started = true;
+      committed = false;
+      failed = false;
+      currentRequest = request;
+      revision++;
+    };
+    const onFailed = request => {
+      if (target !== observedPage || request !== currentRequest) return;
+      failed = true;
+      currentRequest = null;
+      revision++;
+    };
+    const onFrame = frame => {
+      if (target !== observedPage || frame !== target.mainFrame()) return;
+      if (target !== page && frame.url() === 'about:blank' && !blankPopupExpected) return;
+      started = true;
+      committed = true;
+      currentRequest = null;
+      revision++;
+    };
+    const onClose = () => {
+      if (target !== observedPage) return;
+      failed = true;
+      revision++;
+    };
+    target.on('request', onRequest);
+    target.on('requestfailed', onFailed);
+    target.on('framenavigated', onFrame);
+    target.on('close', onClose);
+    listeners.push({ page: target, onRequest, onFailed, onFrame, onClose });
+  };
+  const onPopup = target => { watch(target, true); };
+  watch(page);
+  page.on('popup', onPopup);
   return {
     get started() { return started; },
     async finish() {
@@ -385,16 +424,20 @@ function observeActionNavigation(page) {
       if (failed) throw targetError('navigation_failed', 'browser navigation failed');
     },
     dispose() {
-      page.off('request', onRequest);
-      page.off('requestfailed', onFailed);
-      page.off('framenavigated', onFrame);
-      page.off('close', onClose);
+      cdp.off('Page.windowOpen', onWindowOpen);
+      page.off('popup', onPopup);
+      for (const { page: target, onRequest, onFailed, onFrame, onClose } of listeners) {
+        target.off('request', onRequest);
+        target.off('requestfailed', onFailed);
+        target.off('framenavigated', onFrame);
+        target.off('close', onClose);
+      }
     },
   };
 }
 
 async function hoverWithNavigation(page, expectedEpoch, hover) {
-  const navigation = observeActionNavigation(page);
+  const navigation = await observeActionNavigation(page);
   try {
     try { await hover(); } catch (error) {
       if (!navigation.started && expectedEpoch === epoch) throw error;
@@ -407,7 +450,7 @@ async function hoverWithNavigation(page, expectedEpoch, hover) {
 
 async function dragBetween(page, source, destination, expectedEpoch, button = 'left') {
   if (expectedEpoch !== epoch) throw staleEpochError();
-  const navigation = observeActionNavigation(page);
+  const navigation = await observeActionNavigation(page);
   const interrupted = () => expectedEpoch !== epoch || navigation.started;
   let downAttempted = false;
   let failure;

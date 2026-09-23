@@ -263,6 +263,10 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="location.href=\'/slow-hover\'">Hover to navigate</button>');
       return;
     }
+    if (request.url === '/hover-popup') {
+      response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="window.open(\'/slow-popup-hover\',\'_blank\')">Hover to open popup</button>');
+      return;
+    }
     if (request.url === '/chain-first') {
       response.end('<script>location.href="/slow-chain-second"</script><main>Intermediate page</main>');
       return;
@@ -289,12 +293,13 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<main>After move navigation</main>');
       return;
     }
-    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move', '/navigate-on-slow-drop', '/navigate-on-chain-drop'].includes(request.url)) {
+    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move', '/navigate-on-slow-drop', '/navigate-on-chain-drop', '/navigate-on-popup-drop'].includes(request.url)) {
       const onDown = request.url === '/navigate-on-down' ? 'onmousedown="location.href=\'/after-down\'"' : '';
       const onMove = request.url === '/navigate-on-move' ? 'onpointermove="if(event.buttons)location.href=\'/after-move\'"' : '';
       const onDrop = request.url === '/navigate-on-drop' ? 'location.href=\'/after-drop\'' :
         request.url === '/navigate-on-slow-drop' ? 'location.href=\'/slow-drop\'' :
-          request.url === '/navigate-on-chain-drop' ? 'location.href=\'/chain-first\'' : '';
+          request.url === '/navigate-on-chain-drop' ? 'location.href=\'/chain-first\'' :
+            request.url === '/navigate-on-popup-drop' ? 'window.open(\'/slow-popup-drop\',\'_blank\')' : '';
       response.end(`<!doctype html><style>
         body { margin: 0; }
         #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
@@ -322,10 +327,12 @@ test('hover and straight drag change the shared page and reject stale coordinate
     stdio: ['pipe', 'pipe', 'inherit'],
   });
   const pending = new Map();
+  const frames = [];
   let nextId = 1;
   const lines = readline.createInterface({ input: host.stdout });
   lines.on('line', line => {
     const message = JSON.parse(line);
+    if (message.event === 'frame') { frames.push(message); return; }
     const resolve = pending.get(message.id);
     if (resolve) { pending.delete(message.id); resolve(message); }
   });
@@ -335,6 +342,14 @@ test('hover and straight drag change the shared page and reject stale coordinate
     pending.set(id, message => { clearTimeout(timeout); resolve(message); });
     host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
   });
+  const waitForFrame = async (tabId, pageEpoch) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const frame = frames.find(frame => frame.active_tab_id === tabId && frame.page_epoch === pageEpoch);
+      if (frame) return frame;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('no current popup frame');
+  };
   try {
     const initial = (await call('state')).result;
     const navigated = await call('navigate', { url, expected_epoch: initial.page_epoch });
@@ -434,6 +449,67 @@ test('hover and straight drag change the shared page and reject stale coordinate
       assert.match(hovered.result.url, /\/slow-hover$/, action);
       assert.notEqual(hovered.result.page_epoch, ready.result.page_epoch, action);
     }
+
+    const popupHoverReady = await call('navigate', {
+      url: url + 'hover-popup', expected_epoch: (await call('state')).result.page_epoch,
+    });
+    const popupHoverStarted = Date.now();
+    const popupHover = await call('hover_selector', {
+      selector: '#hover', expected_epoch: popupHoverReady.result.page_epoch,
+    });
+    assert.equal(popupHover.ok, true);
+    assert.ok(Date.now() - popupHoverStarted >= 1_200,
+      JSON.stringify({ elapsed: Date.now() - popupHoverStarted, state: popupHover.result }));
+    assert.match(popupHover.result.url, /\/slow-popup-hover$/);
+    assert.notEqual(popupHover.result.active_tab_id, popupHoverReady.result.active_tab_id);
+    assert.match((await call('dom')).result.html, /slow-popup-hover/);
+    assert.equal((await call('screenshot')).result.active_tab_id, popupHover.result.active_tab_id);
+    assert.equal((await waitForFrame(popupHover.result.active_tab_id, popupHover.result.page_epoch)).page_epoch,
+      popupHover.result.page_epoch);
+    assert.equal((await call('hover_at', {
+      x: 60, y: 35, expected_epoch: popupHoverReady.result.page_epoch,
+    })).code, 'stale_epoch');
+
+    const popupDropReady = await call('navigate', {
+      url: url + 'navigate-on-popup-drop', expected_epoch: popupHover.result.page_epoch,
+    });
+    const popupDropStarted = Date.now();
+    const popupDrop = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: popupDropReady.result.page_epoch,
+    });
+    assert.equal(popupDrop.ok, true);
+    assert.ok(Date.now() - popupDropStarted >= 1_200);
+    assert.match(popupDrop.result.url, /\/slow-popup-drop$/);
+    assert.notEqual(popupDrop.result.active_tab_id, popupDropReady.result.active_tab_id);
+    assert.match((await call('dom')).result.html, /slow-popup-drop/);
+    assert.equal((await waitForFrame(popupDrop.result.active_tab_id, popupDrop.result.page_epoch)).page_epoch,
+      popupDrop.result.page_epoch);
+
+    const popupHoverAtReady = await call('navigate', {
+      url: url + 'hover-popup', expected_epoch: popupDrop.result.page_epoch,
+    });
+    const popupHoverAtStarted = Date.now();
+    const popupHoverAt = await call('hover_at', {
+      x: 60, y: 35, expected_epoch: popupHoverAtReady.result.page_epoch,
+    });
+    assert.equal(popupHoverAt.ok, true);
+    assert.ok(Date.now() - popupHoverAtStarted >= 1_200);
+    assert.match(popupHoverAt.result.url, /\/slow-popup-hover$/);
+    assert.notEqual(popupHoverAt.result.active_tab_id, popupHoverAtReady.result.active_tab_id);
+
+    const popupDragAtReady = await call('navigate', {
+      url: url + 'navigate-on-popup-drop', expected_epoch: popupHoverAt.result.page_epoch,
+    });
+    const popupDragAtStarted = Date.now();
+    const popupDragAt = await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: popupDragAtReady.result.page_epoch,
+    });
+    assert.equal(popupDragAt.ok, true);
+    assert.ok(Date.now() - popupDragAtStarted >= 1_200);
+    assert.match(popupDragAt.result.url, /\/slow-popup-drop$/);
+    assert.notEqual(popupDragAt.result.active_tab_id, popupDragAtReady.result.active_tab_id);
+    assert.equal((await waitForFrame(popupDragAt.result.active_tab_id, popupDragAt.result.page_epoch)).page_epoch,
+      popupDragAt.result.page_epoch);
 
     const longReady = await call('navigate', { url: url + 'long-drag', expected_epoch: (await call('state')).result.page_epoch });
     const longDrag = await call('drag_selector', {
