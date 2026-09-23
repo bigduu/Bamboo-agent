@@ -906,6 +906,13 @@ test('navigation during observer setup rejects stale hover and drag before point
 
 test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/lexical-window.js' || request.url === '/lexical-global.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+      response.end(request.url === '/lexical-window.js'
+        ? "let window = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });"
+        : "let globalThis = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });");
+      return;
+    }
     if (request.url === '/prepatch.js') {
       response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
       response.end(`
@@ -928,6 +935,8 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
       ? '<title>Next</title><main>New page</main>'
       : request.url === '/prepatched'
         ? '<title>Prepatched</title><script src="/prepatch.js"></script><output>0</output>'
+        : request.url === '/lexical-window' || request.url === '/lexical-global'
+          ? `<title>Lexical</title><script src="/${request.url.slice(1)}.js"></script><output>0</output>`
         : '<title>Eval</title><output>0</output>');
   });
   fixture.listen(0, '127.0.0.1');
@@ -971,7 +980,28 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     });
     assert.equal(prepatchedArray.ok, true, JSON.stringify(prepatchedArray));
     assert.deepEqual(prepatchedArray.result.value, [3]);
-    const navigated = (await call('navigate', { url, expected_epoch: prepatched.page_epoch })).result;
+    const lexicalWindowUrl = `${url}lexical-window`;
+    const lexicalWindow = (await call('navigate', {
+      url: lexicalWindowUrl, expected_epoch: prepatched.page_epoch,
+    })).result;
+    const lexicalWindowResult = await call('eval', {
+      expected_epoch: lexicalWindow.page_epoch, expected_url: lexicalWindowUrl,
+      code: '({actual: 15})',
+    });
+    assert.equal(lexicalWindowResult.ok, true, JSON.stringify(lexicalWindowResult));
+    assert.deepEqual(lexicalWindowResult.result.value, { actual: 15 });
+    const lexicalGlobalUrl = `${url}lexical-global`;
+    const lexicalGlobal = (await call('navigate', {
+      url: lexicalGlobalUrl, expected_epoch: lexicalWindow.page_epoch,
+    })).result;
+    const lexicalGlobalResult = await call('eval', {
+      expected_epoch: lexicalGlobal.page_epoch, expected_url: lexicalGlobalUrl,
+      code: '({actual: 16})',
+    });
+    assert.ok(lexicalGlobalResult.ok || lexicalGlobalResult.code === 'browser_eval_error', JSON.stringify(lexicalGlobalResult));
+    if (lexicalGlobalResult.ok) assert.deepEqual(lexicalGlobalResult.result.value, { actual: 16 });
+    else assert.ok(lexicalGlobalResult.error.length <= 2048);
+    const navigated = (await call('navigate', { url, expected_epoch: lexicalGlobal.page_epoch })).result;
     const expected = { expected_epoch: navigated.page_epoch, expected_url: url };
     const read = await call('eval', { ...expected, code: 'document.querySelector("output").textContent' });
     assert.equal(read.ok, true);
