@@ -581,6 +581,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let operation_summary = context.operation_description.clone();
                 let risk_level = context.risk_level();
                 let permission_type = context.permission_type;
+                let focused_browser_type = tool_name.eq_ignore_ascii_case("browser")
+                    && args.get("action").and_then(serde_json::Value::as_str) == Some("type");
+                let approval_display_resource = if focused_browser_type {
+                    operation_summary.clone()
+                } else {
+                    resource.clone()
+                };
                 let platform_hard_deny = permission_checker.hard_deny_reason(&context);
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
@@ -729,7 +736,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         .request_approval(crate::approval::ApprovalAsk {
                             tool_name: tool_name.clone(),
                             permission: permission_type.description().to_string(),
-                            resource: resource.clone(),
+                            resource: approval_display_resource.clone(),
                             permission_request: Some(request.clone()),
                         })
                         .await;
@@ -738,18 +745,24 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }
                     return Err(ToolError::Execution(format!(
                         "Permission denied by host for: {}",
-                        resource
+                        approval_display_resource
                     )));
                 }
 
                 // Interactive sessions pause through the legacy question shape
                 // while carrying the complete typed request alongside it.
                 if let Some(tx) = ctx.event_tx {
+                    let mut approval_parameters = args.clone();
+                    if focused_browser_type {
+                        if let Some(parameters) = approval_parameters.as_object_mut() {
+                            parameters.remove("text");
+                        }
+                    }
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
                             tool_name: tool_name.clone(),
-                            parameters: args.clone(),
+                            parameters: approval_parameters,
                         })
                         .await;
 
@@ -757,7 +770,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
                         tool_name,
                         permission_type.description(),
-                        resource
+                        approval_display_resource
                     );
                     if let Some(config) = config {
                         config.register_pending_request(request.clone());
@@ -766,7 +779,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         "status": "awaiting_permission_approval",
                         "question": question,
                         "permission_type": permission_type,
-                        "resource": resource,
+                        "resource": approval_display_resource,
                         "options": ["Approve", "Deny"],
                         "allow_custom": false,
                         "permission_request": request,
@@ -781,7 +794,7 @@ impl ToolExecutor for BuiltinToolExecutor {
 
                 return Err(ToolError::Execution(format!(
                     "Permission approval required for: {}",
-                    resource
+                    approval_display_resource
                 )));
             }
         }
@@ -1848,6 +1861,148 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn focused_browser_type_approval_redacts_display_and_ignores_hook_allow() {
+        struct NeverInvokeBrowser;
+
+        #[async_trait]
+        impl Tool for NeverInvokeBrowser {
+            fn name(&self) -> &str {
+                "browser"
+            }
+
+            fn description(&self) -> &str {
+                "test browser approval boundary"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                panic!("focused browser input must pause before invocation")
+            }
+        }
+
+        struct CaptureApprovalProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureApprovalProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        let args = json!({"action":"type","text":"private browser text","expected_epoch":17});
+        let context = crate::permission::check_permissions("browser", &args)
+            .expect("valid browser permission")
+            .expect("browser interaction needs approval")
+            .remove(0);
+        let private_resource = context.resource.clone();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config
+            .grant_typed_scoped_session_permission(
+                "browser-redaction",
+                context.permission_type,
+                crate::permission::conservative_matchers(
+                    context.permission_type,
+                    &private_resource,
+                )
+                .remove(0),
+            )
+            .expect("remembered grant");
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(NeverInvokeBrowser)
+            .expect("register browser stub")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call("browser", args);
+        let (tx, mut rx) = mpsc::channel(4);
+        let interactive = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            executor.execute_with_context(&call, interactive),
+        )
+        .await
+        .expect("focused input must pause even under hook allow and bypass");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("approval payload");
+        let question = payload["question"].as_str().expect("visible question");
+        assert_eq!(payload["resource"], "Type into focused browser element");
+        assert!(!question.contains("private browser text"));
+        assert!(!question.contains(&private_resource));
+        assert_eq!(
+            payload["permission_request"]["resource"], private_resource,
+            "the typed request still binds the exact parked invocation"
+        );
+        assert_eq!(
+            payload["permission_request"]["allowed_decisions"],
+            json!(["allow_once", "deny_once"])
+        );
+        let event = rx.recv().await.expect("approval event");
+        assert!(matches!(
+            event,
+            AgentEvent::ToolApprovalRequested { parameters, .. }
+                if parameters.get("text").is_none()
+        ));
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(CaptureApprovalProxy(Arc::clone(&captured)));
+        let delegated = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let denied = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&call, delegated),
+            ),
+        )
+        .await;
+        assert!(matches!(denied, Err(ToolError::Execution(_))));
+        let ask = captured
+            .lock()
+            .expect("captured proxy")
+            .clone()
+            .expect("host saw approval request");
+        assert_eq!(ask.resource, "Type into focused browser element");
+        assert!(!ask.resource.contains("private browser text"));
+        assert!(!ask.resource.contains(&private_resource));
     }
 
     #[tokio::test]

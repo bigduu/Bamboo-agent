@@ -46,6 +46,22 @@ fn browser_press_key(args: &Value) -> Result<&str, PermissionError> {
     Ok(key)
 }
 
+/// Focus is mutable without a page navigation or epoch change. A remembered
+/// resource grant cannot safely authorize another focused keyboard invocation.
+pub fn is_focused_browser_input(tool_name: &str, args: &Value) -> bool {
+    if !tool_name.eq_ignore_ascii_case("browser") {
+        return false;
+    }
+    match args.get("action").and_then(Value::as_str) {
+        Some("type" | "key") => true,
+        Some("press") => {
+            matches!(args.get("target"), None | Some(Value::Null))
+                && matches!(args.get("selector"), None | Some(Value::Null))
+        }
+        _ => false,
+    }
+}
+
 /// A semantic locator's grant identity is independent of JSON key order and
 /// never contains page text. The description remains readable at approval.
 fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, PermissionError> {
@@ -940,6 +956,35 @@ mod tests {
         ] {
             assert!(check_permissions("browser", &args).is_err());
         }
+    }
+
+    #[test]
+    fn focused_browser_input_classifier_distinguishes_missing_and_explicit_selectors() {
+        for args in [
+            json!({"action":"type","text":"secret"}),
+            json!({"action":"key","key":"Tab"}),
+            json!({"action":"press","key":"Enter"}),
+            json!({"action":"press","selector":null,"key":"Enter"}),
+        ] {
+            assert!(is_focused_browser_input("browser", &args), "{args}");
+        }
+        for args in [
+            json!({"action":"press","selector":"","key":"Enter"}),
+            json!({"action":"press","selector":"page","key":"Enter"}),
+            json!({"action":"press","target":{"kind":"role","role":"button","name":"Save"},"key":"Enter"}),
+            json!({"action":"fill","selector":"#name","text":"secret"}),
+        ] {
+            assert!(!is_focused_browser_input("browser", &args), "{args}");
+        }
+        assert!(!is_focused_browser_input(
+            "request_permissions",
+            &json!({"action":"type","text":"secret"})
+        ));
+        assert!(check_permissions(
+            "browser",
+            &json!({"action":"press","selector":"","key":"Enter","expected_epoch":17})
+        )
+        .is_err());
     }
 
     #[test]

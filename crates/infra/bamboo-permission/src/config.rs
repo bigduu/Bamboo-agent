@@ -1166,8 +1166,12 @@ impl PermissionConfig {
     /// - the command is a super-dangerous archetype the verdict downgrades to
     ///   `Allow`/`Safe` — privilege escalation, raw-device write, recursive
     ///   force-delete of a protected root, or remote pipe-to-shell, or
+    /// - browser keyboard input targets the mutable focused element, or
     /// - it matches a configured "always ask" rule.
     pub fn requires_forced_confirmation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        if crate::is_focused_browser_input(tool_name, args) {
+            return true;
+        }
         // Built-in backstop: hard-dangerous shell commands always ask.
         if tool_name.eq_ignore_ascii_case("Bash") {
             if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
@@ -1205,6 +1209,9 @@ impl PermissionConfig {
     /// Whether the forced confirmation came from Bamboo's non-configurable
     /// hard-dangerous backstop rather than a user configured ask rule.
     pub fn is_hard_dangerous(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        if crate::is_focused_browser_input(tool_name, args) {
+            return true;
+        }
         if tool_name.eq_ignore_ascii_case("js_repl") {
             return true;
         }
@@ -3664,6 +3671,208 @@ mod integration_tests {
             platform_hard_deny: None,
             consume_once: true,
             supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
+        }
+    }
+
+    fn browser_evaluation(request_id: &str, args: serde_json::Value) -> PermissionEvaluation {
+        let context = crate::check_permissions("browser", &args)
+            .expect("valid browser permission")
+            .expect("browser interaction requires permission")
+            .remove(0);
+        let risk_level = context.risk_level();
+        PermissionEvaluation {
+            request_id: request_id.to_string(),
+            session_id: "browser-chat".to_string(),
+            workspace_path: Some("/workspace".to_string()),
+            tool_name: "browser".to_string(),
+            tool_args: args,
+            permission_type: context.permission_type,
+            resource: context.resource,
+            operation_summary: context.operation_description,
+            risk_level,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            platform_hard_deny: None,
+            consume_once: true,
+            supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
+        }
+    }
+
+    #[test]
+    fn focused_browser_keyboard_input_requires_one_shot_even_with_remembered_allow() {
+        for args in [
+            serde_json::json!({"action":"type","text":"private text","expected_epoch":17}),
+            serde_json::json!({"action":"key","key":"Tab","expected_epoch":17}),
+            serde_json::json!({"action":"press","key":"Enter","expected_epoch":17}),
+            serde_json::json!({"action":"press","selector":null,"key":"Enter","expected_epoch":17}),
+        ] {
+            let config = PermissionConfig::new();
+            let evaluation = browser_evaluation("first", args.clone());
+            let resource = evaluation.resource.clone();
+            let matcher =
+                crate::conservative_matchers(PermissionType::BrowserInteraction, &resource)
+                    .remove(0);
+            config
+                .grant_typed_scoped_session_permission(
+                    "browser-chat",
+                    PermissionType::BrowserInteraction,
+                    matcher.clone(),
+                )
+                .expect("session grant");
+            config
+                .add_durable_rule(DurablePermissionRule {
+                    id: "proactive-browser-allow".into(),
+                    permission_type: PermissionType::BrowserInteraction,
+                    effect: PermissionRuleEffect::Allow,
+                    scope: PermissionRuleScope::Global,
+                    workspace_path: None,
+                    matcher,
+                    source: PermissionRuleSource::User,
+                    expires_at: None,
+                })
+                .expect("durable grant");
+            config.add_rule(PermissionRule::new(
+                PermissionType::BrowserInteraction,
+                resource.clone(),
+                true,
+            ));
+
+            assert!(config.requires_forced_confirmation("browser", &args));
+            let request = match config.evaluate(evaluation.clone()) {
+                PermissionOutcome::Ask(request) => request,
+                other => panic!("focused input must ask after remembered grants: {other:?}"),
+            };
+            assert_eq!(request.reason_code, PermissionReasonCode::HardDangerous);
+            assert_eq!(
+                request.allowed_decisions,
+                PermissionRequest::forced_decisions()
+            );
+            assert!(request.is_focused_browser_input());
+            assert!(!request.operation_summary.contains("private text"));
+
+            config.grant_once(
+                "browser-chat",
+                "first",
+                PermissionType::BrowserInteraction,
+                resource,
+            );
+            assert!(matches!(
+                config.evaluate(evaluation),
+                PermissionOutcome::Allow {
+                    source: PermissionDecisionSource::OneShot,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                config.evaluate(browser_evaluation("second", args)),
+                PermissionOutcome::Ask(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn focused_browser_input_honors_deny_plan_auto_and_bypass_precedence() {
+        let args = serde_json::json!({"action":"key","key":"Tab","expected_epoch":17});
+        let config = PermissionConfig::new();
+        let mut evaluation = browser_evaluation("focused", args);
+
+        evaluation.bypass_requested = true;
+        assert!(matches!(
+            config.evaluate(evaluation.clone()),
+            PermissionOutcome::Ask(PermissionRequest {
+                reason_code: PermissionReasonCode::HardDangerous,
+                effective_mode: PermissionMode::BypassPermissions,
+                ..
+            })
+        ));
+
+        evaluation.bypass_requested = false;
+        evaluation.auto_approve_requested = true;
+        assert!(matches!(
+            config.evaluate(evaluation.clone()),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                ..
+            }
+        ));
+
+        evaluation.auto_approve_requested = false;
+        config.set_mode(PermissionMode::Auto);
+        assert!(matches!(
+            config.evaluate(evaluation.clone()),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                ..
+            }
+        ));
+
+        config.set_mode(PermissionMode::Plan);
+        assert!(matches!(
+            config.evaluate(evaluation.clone()),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ModeDenied,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        config.set_mode(PermissionMode::Default);
+        config.add_rule(PermissionRule::new(
+            PermissionType::BrowserInteraction,
+            evaluation.resource.clone(),
+            false,
+        ));
+        evaluation.auto_approve_requested = true;
+        assert!(matches!(
+            config.evaluate(evaluation),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ExplicitDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn selector_targeted_browser_press_keeps_remembered_grant_policy() {
+        for args in [
+            serde_json::json!({"action":"press","selector":"#save","key":"Enter","expected_epoch":17}),
+            serde_json::json!({"action":"press","selector":"page","key":"Enter","expected_epoch":17}),
+            serde_json::json!({"action":"press","target":{"kind":"role","role":"button","name":"Save"},"key":"Enter","expected_epoch":17}),
+            serde_json::json!({"action":"fill","selector":"#name","text":"private text","expected_epoch":17}),
+            serde_json::json!({"action":"click","selector":"#save","expected_epoch":17}),
+        ] {
+            let config = PermissionConfig::new();
+            let evaluation = browser_evaluation("targeted", args.clone());
+            let initial_request = match config.evaluate(evaluation.clone()) {
+                PermissionOutcome::Ask(request) => request,
+                other => panic!("targeted interaction should initially ask: {other:?}"),
+            };
+            assert!(!initial_request.is_focused_browser_input());
+            let matcher = crate::conservative_matchers(
+                PermissionType::BrowserInteraction,
+                &evaluation.resource,
+            )
+            .remove(0);
+            config
+                .grant_typed_scoped_session_permission(
+                    "browser-chat",
+                    PermissionType::BrowserInteraction,
+                    matcher,
+                )
+                .expect("session grant");
+            assert!(!config.requires_forced_confirmation("browser", &args));
+            assert!(matches!(
+                config.evaluate(evaluation),
+                PermissionOutcome::Allow {
+                    source: PermissionDecisionSource::RememberedSession,
+                    ..
+                }
+            ));
         }
     }
 

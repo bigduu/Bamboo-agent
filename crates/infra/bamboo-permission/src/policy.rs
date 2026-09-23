@@ -440,6 +440,28 @@ pub struct PermissionDecisionReceipt {
 }
 
 impl PermissionRequest {
+    /// Recover the focus-bound keyboard boundary from the server-generated
+    /// resource when validating a persisted approval request after restart.
+    pub fn is_focused_browser_input(&self) -> bool {
+        if !self.tool_name.eq_ignore_ascii_case("browser")
+            || self.permission_type != PermissionType::BrowserInteraction
+        {
+            return false;
+        }
+        let mut parts = self.resource.splitn(4, ':');
+        if parts.next() != Some("browser")
+            || !parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+        {
+            return false;
+        }
+        matches!(
+            (parts.next(), parts.next()),
+            (Some("type" | "key"), Some(_)) | (Some("press"), Some("page"))
+        )
+    }
+
     pub fn fresh_generation() -> String {
         uuid::Uuid::new_v4().to_string()
     }
