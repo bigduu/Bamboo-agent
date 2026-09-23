@@ -1062,6 +1062,16 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
     assert.match((await call('dom')).result.html, /New page/);
     const finalState = (await call('state')).result;
+    const promiseOverride = await call('eval', {
+      expected_epoch: finalState.page_epoch, expected_url: `${url}next`,
+      code: `(() => {
+        window.Promise = function () { throw new Error('page Promise invoked'); };
+        window.setTimeout = function () { throw new Error('page timeout invoked'); };
+        return { actual: 14 };
+      })()`,
+    });
+    assert.equal(promiseOverride.ok, true, JSON.stringify(promiseOverride));
+    assert.deepEqual(promiseOverride.result.value, { actual: 14 });
     const identityOverride = await call('eval', {
       expected_epoch: finalState.page_epoch, expected_url: `${url}next`,
       code: `(() => {
