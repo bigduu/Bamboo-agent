@@ -14,8 +14,10 @@ mod gold;
 mod pipeline;
 mod startup;
 
-pub(in crate::runtime::runner) use pipeline::legacy_browser_needs_discovery;
 use pipeline::run_pipeline;
+pub(in crate::runtime::runner) use pipeline::{
+    legacy_browser_loaded_result_content, legacy_browser_needs_discovery,
+};
 use startup::{initialize_loop_state, LoopRunState};
 
 /// Runs the agent loop with a custom configuration.

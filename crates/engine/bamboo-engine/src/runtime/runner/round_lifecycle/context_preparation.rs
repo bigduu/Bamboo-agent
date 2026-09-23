@@ -2415,7 +2415,7 @@ pub(super) async fn prepare_round_context(
         }
 
         let deficit_tokens = projected.input_tokens.saturating_sub(request_input_limit);
-        let prepared_message_tokens = counter.count_messages(&prepared_context.messages);
+        let prepared_message_tokens = projected.prepared_message_input_tokens;
         // The projection is the transformed messages plus provider-visible
         // material outside that vector. Subtract the messages directly to get
         // the exact fixed reservation. Deriving it via unused input-window space

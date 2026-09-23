@@ -5,7 +5,7 @@
 //!
 //! "Round" is kept only as a counter for metrics compatibility.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -495,6 +495,32 @@ fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String>
         }
     }
     loaded
+}
+
+/// Return only canonical, browser-only discovery results. The full result in
+/// Session history remains the authority for admission; callers may replace a
+/// matching provider-visible copy when the browser schema is already present
+/// in that request's top-level tool catalog.
+pub(in crate::runtime::runner) fn legacy_browser_loaded_result_content(
+    session: &Session,
+) -> BTreeMap<String, String> {
+    validated_sticky_fallback_results(session)
+        .into_iter()
+        .filter(|message| {
+            let canonical_browser_only = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata["canonical_new_names"].as_array())
+                .is_some_and(|names| names.len() == 1 && names[0].as_str() == Some("browser"));
+            let browser_definition_only =
+                sticky_result_definition_values(message).is_some_and(|definitions| {
+                    definitions.len() == 1
+                        && sticky_definition_name(&definitions[0]) == Some("browser")
+                });
+            canonical_browser_only && browser_definition_only
+        })
+        .map(|message| (message.id.clone(), message.content.clone()))
+        .collect()
 }
 
 pub(in crate::runtime::runner) fn legacy_browser_needs_discovery(
