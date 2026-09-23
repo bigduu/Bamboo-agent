@@ -2664,27 +2664,36 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     raw.to_string()
 }
 
-pub(crate) fn tool_complete_result_for_display(tool_name: &str, raw: &str) -> String {
+pub(crate) fn tool_complete_result_for_display(
+    tool_name: &str,
+    raw: &str,
+    unknown_tool: bool,
+) -> String {
+    let browser = tool_name.eq_ignore_ascii_case("browser");
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return if tool_name.eq_ignore_ascii_case("browser")
-            && raw.contains("awaiting_permission_approval")
-        {
-            "Browser input awaiting permission approval".to_string()
+        return if raw.contains("awaiting_permission_approval") && (browser || unknown_tool) {
+            if browser {
+                "Browser input awaiting permission approval"
+            } else {
+                "Tool awaiting permission approval"
+            }
+            .to_string()
         } else {
             raw.to_string()
         };
     };
-    let approval = payload.get("status").and_then(serde_json::Value::as_str)
-        == Some("awaiting_permission_approval")
-        && (tool_name.eq_ignore_ascii_case("browser")
-            || payload.get("permission_request").is_some_and(|request| {
-                request
-                    .get("tool_name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
-            }));
-    if approval {
+    let pending_approval = payload.get("status").and_then(serde_json::Value::as_str)
+        == Some("awaiting_permission_approval");
+    let nested_browser = payload.get("permission_request").is_some_and(|request| {
+        request
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+    });
+    if pending_approval && (browser || nested_browser) {
         "Browser input awaiting permission approval".to_string()
+    } else if pending_approval && unknown_tool {
+        "Tool awaiting permission approval".to_string()
     } else {
         raw.to_string()
     }
@@ -11547,13 +11556,14 @@ impl App {
                     .find(|tool| tool.id == tool_call_id)
                     .map(|tool| tool.name.clone())
                     .unwrap_or_else(|| tool_call_id.clone());
-                let result = tool_complete_result_for_display(&activity_name, &result.result);
                 let typed_known = self
                     .chat
                     .run_status
                     .tools
                     .iter()
                     .any(|tool| tool.id == tool_call_id);
+                let result =
+                    tool_complete_result_for_display(&activity_name, &result.result, !typed_known);
                 if self.chat.run_status.phase.is_terminal() && !typed_known {
                     return Ok(());
                 }
@@ -16525,13 +16535,14 @@ mod question_tests {
             args.to_string()
         );
         assert_eq!(
-            tool_complete_result_for_display("browser", "ordinary result"),
+            tool_complete_result_for_display("browser", "ordinary result", false),
             "ordinary result"
         );
         assert_eq!(
             tool_complete_result_for_display(
                 "browser",
                 r#"{"status":"awaiting_permission_approval","permission_request":"invalid"}"#,
+                false,
             ),
             "Browser input awaiting permission approval"
         );
@@ -16539,9 +16550,36 @@ mod question_tests {
             tool_complete_result_for_display(
                 "browser",
                 r#"{"status":"awaiting_permission_approval","question":"private input""#,
+                false,
             ),
             "Browser input awaiting permission approval"
         );
+        assert_eq!(
+            tool_complete_result_for_display(
+                "browser-call",
+                r#"{"status":"awaiting_permission_approval","permission_request":"invalid","question":"private input"}"#,
+                true,
+            ),
+            "Tool awaiting permission approval"
+        );
+
+        let mut dropped_start = App::new(BambooClient::new("http://127.0.0.1:0"));
+        dropped_start.chat.streaming = true;
+        dropped_start
+            .handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "browser-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: r#"{"status":"awaiting_permission_approval","permission_request":"invalid","question":"private input"}"#.to_string(),
+                },
+            })
+            .unwrap();
+        let displayed = &dropped_start.chat.current_tool_calls[0];
+        assert_eq!(
+            displayed.result.as_deref(),
+            Some("Tool awaiting permission approval")
+        );
+        assert!(!format!("{displayed:?}").contains("private input"));
     }
 
     #[test]

@@ -128,8 +128,11 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         .iter_mut()
                         .find(|tool| tool.id == tool_call_id)
                         .expect("parent index was selected by this tool id");
-                    let display_content =
-                        tool_complete_result_for_display(&tc.tool_name, &msg.content);
+                    let display_content = tool_complete_result_for_display(
+                        &tc.tool_name,
+                        &msg.content,
+                        tc.tool_name.is_empty(),
+                    );
                     if msg.tool_success == Some(false) {
                         tc.phase = "error".to_string();
                         tc.error = Some(display_content);
