@@ -94,6 +94,24 @@ struct BrowserCallAbortGuard {
     armed: bool,
 }
 
+/// Read-only UI polls may be cancelled as a panel hides without retiring the
+/// shared page. An unknown action remains guarded until explicitly classified.
+fn action_may_mutate_browser(action: &str) -> bool {
+    !matches!(action, "state" | "tab_list" | "dom" | "screenshot")
+}
+
+/// A cancelled read must not leave a sender in the host's pending map.
+struct BrowserPendingCallGuard<'a> {
+    session: &'a BrowserSession,
+    id: u64,
+}
+
+impl Drop for BrowserPendingCallGuard<'_> {
+    fn drop(&mut self) {
+        self.session.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 impl BrowserCallAbortGuard {
     fn new(session: Arc<BrowserSession>, managed: Option<(BrowserManager, String)>) -> Self {
         Self {
@@ -427,6 +445,7 @@ impl BrowserSession {
             }
             pending.insert(id, sender);
         }
+        let _pending_guard = BrowserPendingCallGuard { session: self, id };
         let exchange = async {
             let mut stdin = self.stdin.lock().await;
             if !self.alive.load(Ordering::Acquire) {
@@ -452,12 +471,8 @@ impl BrowserSession {
         let result = tokio::select! {
             biased;
             outcome = tokio::time::timeout(deadline, exchange) => outcome,
-            _ = shutdown.changed() => {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(BrowserError::Unavailable("browser host exited".into()));
-            }
+            _ = shutdown.changed() => return Err(BrowserError::Unavailable("browser host exited".into())),
         };
-        self.pending.lock().unwrap().remove(&id);
         match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => {
@@ -478,6 +493,28 @@ impl BrowserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_known_read_actions_survive_caller_cancellation() {
+        for action in ["state", "tab_list", "dom", "screenshot"] {
+            assert!(!action_may_mutate_browser(action), "{action}");
+        }
+        for action in [
+            "navigate",
+            "history",
+            "viewport",
+            "input",
+            "click_selector",
+            "fill_selector",
+            "press_selector",
+            "tab_create",
+            "tab_activate",
+            "tab_close",
+            "future_action",
+        ] {
+            assert!(action_may_mutate_browser(action), "{action}");
+        }
+    }
 
     #[cfg(unix)]
     fn stub_session(idle_for: Duration, alive: bool) -> Arc<BrowserSession> {
@@ -526,6 +563,56 @@ mod tests {
         }
         command.process_group(0);
         BrowserSession::from_child(command.spawn().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_read_discards_its_pending_reply_but_preserves_the_shared_host() {
+        for via_open in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let read_marker = directory.path().join("first-read");
+            let session = fake_host(
+                r#"IFS= read -r first; : > "$READ_MARKER_FILE"; IFS= read -r second; printf '%s\n' '{"id":2,"ok":true,"result":{"page_epoch":7}}'; sleep 60"#,
+                &[("READ_MARKER_FILE", &read_marker)],
+            );
+            let browser = BrowserManager::default();
+            browser
+                .sessions
+                .lock()
+                .await
+                .insert("shared-chat".into(), session.clone());
+            let cancelled = {
+                let browser = browser.clone();
+                tokio::spawn(async move {
+                    if via_open {
+                        browser.open("shared-chat").await
+                    } else {
+                        browser.state("shared-chat").await
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !read_marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the read should reach the host before cancellation");
+            cancelled.abort();
+            assert!(cancelled.await.unwrap_err().is_cancelled());
+            assert!(session.alive.load(Ordering::Acquire));
+            assert!(session.pending.lock().unwrap().is_empty());
+            assert!(Arc::ptr_eq(
+                browser.sessions.lock().await.get("shared-chat").unwrap(),
+                &session
+            ));
+            let state = tokio::time::timeout(Duration::from_secs(1), browser.state("shared-chat"))
+                .await
+                .expect("a subsequent read should complete on the same host")
+                .unwrap();
+            assert_eq!(state["page_epoch"], 7);
+            browser.close("shared-chat").await.unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -786,7 +873,7 @@ mod tests {
                 browser
                     .command_with_deadline(
                         "cancelled-chat",
-                        "dom",
+                        "navigate",
                         json!({}),
                         Duration::from_secs(5),
                     )
@@ -839,6 +926,54 @@ mod tests {
         assert!(session.pending.lock().unwrap().is_empty());
         assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
         assert!(!late_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_input_retires_the_host_before_it_can_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let read_marker = directory.path().join("input-read");
+        let session = fake_host(
+            r#"IFS= read -r first; : > "$READ_MARKER_FILE"; sleep 60"#,
+            &[("READ_MARKER_FILE", &read_marker)],
+        );
+        let browser = BrowserManager::default();
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("input-chat".into(), session.clone());
+        let input = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "input-chat",
+                        "input",
+                        json!({"kind":"type","text":"hello"}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !read_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("input should reach the host before cancellation");
+        input.abort();
+        assert!(input.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while browser.sessions.lock().await.contains_key("input-chat") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled input host should be retired");
+        assert!(!session.alive.load(Ordering::Acquire));
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]
@@ -1115,10 +1250,6 @@ impl BrowserManager {
             session
         };
         if let Some(session) = existing {
-            let mut abort_guard = BrowserCallAbortGuard::new(
-                session.clone(),
-                Some((self.clone(), session_id.to_string())),
-            );
             if session.alive.load(Ordering::Acquire) {
                 let result = session.call("state", json!({})).await;
                 if !session.alive.load(Ordering::Acquire) {
@@ -1129,19 +1260,14 @@ impl BrowserManager {
                     Ok(state) => {
                         session.touch();
                         self.start_idle_cleanup();
-                        abort_guard.disarm();
                         return Ok(state);
                     }
                     Err(BrowserError::Unavailable(_)) => {}
-                    Err(error) => {
-                        abort_guard.disarm();
-                        return Err(error);
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             session.terminate("browser host unavailable").await;
             self.remove_if_same(session_id, &session).await;
-            abort_guard.disarm();
         }
         let session = BrowserSession::spawn().await?;
         let mut abort_guard = BrowserCallAbortGuard::new(
@@ -1196,10 +1322,12 @@ impl BrowserManager {
             session.touch();
             session
         };
-        let mut abort_guard = BrowserCallAbortGuard::new(
-            session.clone(),
-            Some((self.clone(), session_id.to_string())),
-        );
+        let mut abort_guard = action_may_mutate_browser(action).then(|| {
+            BrowserCallAbortGuard::new(
+                session.clone(),
+                Some((self.clone(), session_id.to_string())),
+            )
+        });
         let result = session.call_with_deadline(action, args, deadline).await;
         if session.alive.load(Ordering::Acquire) {
             session.touch();
@@ -1209,7 +1337,9 @@ impl BrowserManager {
             // reopen must never be removed by the old call's completion.
             self.remove_if_same(session_id, &session).await;
         }
-        abort_guard.disarm();
+        if let Some(guard) = abort_guard.as_mut() {
+            guard.disarm();
+        }
         result
     }
 
