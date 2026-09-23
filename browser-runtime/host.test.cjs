@@ -664,6 +664,7 @@ test('hover and straight drag change the shared page and reject stale coordinate
 test('navigation during observer setup rejects stale hover and drag before pointer events', async () => {
   let releaseNavigation = false;
   let wrongPagePointerEvents = 0;
+  const slowNavigationWaiters = [];
   const fixture = http.createServer((request, response) => {
     response.setHeader('cache-control', 'no-store');
     if (request.url === '/go') {
@@ -674,6 +675,12 @@ test('navigation during observer setup rejects stale hover and drag before point
     } else if (request.url === '/race') {
       response.setHeader('content-type', 'text/html; charset=utf-8');
       response.end('<script>setInterval(async () => { if (window.going) return; if (await fetch("/go", {cache:"no-store"}).then(r => r.text()) === "yes") { window.going = true; location.href = "/new" } }, 20)</script><main>Old document</main>');
+    } else if (request.url === '/slow-race') {
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      response.end('<script>setInterval(async () => { if (window.going) return; if (await fetch("/go", {cache:"no-store"}).then(r => r.text()) === "yes") { window.going = true; location.href = "/slow-new" } }, 20)</script><main style="position:absolute;inset:0" onpointermove="fetch(\'/bad-pointer\')" onmousedown="fetch(\'/bad-pointer\')">Navigating old document</main>');
+    } else if (request.url === '/slow-new') {
+      slowNavigationWaiters.shift()?.();
+      setTimeout(() => response.end('<main>Slow new document</main>'), 3000);
     } else if (request.url === '/new') {
       response.setHeader('content-type', 'text/html; charset=utf-8');
       response.end('<div style="position:absolute;inset:0" onpointermove="fetch(\'/bad-pointer\')" onmousedown="fetch(\'/bad-pointer\')">New document</div>');
@@ -692,6 +699,7 @@ test('navigation during observer setup rejects stale hover and drag before point
   const pending = new Map();
   const observerWaiters = [];
   const epochWaiters = [];
+  let latestFrameEpoch;
   let nextId = 1;
   const lines = readline.createInterface({ input: host.stdout });
   lines.on('line', line => {
@@ -701,6 +709,7 @@ test('navigation during observer setup rejects stale hover and drag before point
       return;
     }
     if (message.event === 'frame_reset') {
+      latestFrameEpoch = message.page_epoch;
       const waiter = epochWaiters.find(waiter => waiter.before !== message.page_epoch);
       if (waiter) {
         epochWaiters.splice(epochWaiters.indexOf(waiter), 1);
@@ -735,7 +744,10 @@ test('navigation during observer setup rejects stale hover and drag before point
       const responsePromise = call(action, action === 'hover_at'
         ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
         : { x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: ready.result.page_epoch });
-      await within(observing, `${action} observer setup`);
+      await Promise.race([
+        within(observing, `${action} observer setup`),
+        responsePromise.then(response => { throw new Error(`${action} ended before observer setup: ${JSON.stringify(response)}`); }),
+      ]);
       const changedEpoch = new Promise(resolve => epochWaiters.push({ before: ready.result.page_epoch, resolve }));
       releaseNavigation = true;
       await within(changedEpoch, `${action} page navigation`);
@@ -744,6 +756,28 @@ test('navigation during observer setup rejects stale hover and drag before point
       await new Promise(resolve => setTimeout(resolve, 100));
       assert.equal(wrongPagePointerEvents, 0, action);
       assert.match((await call('state')).result.url, /\/new$/, action);
+    }
+    for (const action of ['hover_at', 'drag_at']) {
+      releaseNavigation = false;
+      const previous = (await call('state')).result;
+      const ready = await call('navigate', { url: base + '/slow-race', expected_epoch: previous.page_epoch });
+      assert.equal(ready.ok, true);
+      const observing = new Promise(resolve => observerWaiters.push(resolve));
+      const responsePromise = call(action, action === 'hover_at'
+        ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
+        : { x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: ready.result.page_epoch });
+      await within(observing, `${action} observer setup before slow navigation`);
+      const requestStarted = new Promise(resolve => slowNavigationWaiters.push(resolve));
+      releaseNavigation = true;
+      await within(requestStarted, `${action} slow navigation request`);
+      await new Promise(resolve => setTimeout(resolve, 1700));
+      assert.equal(latestFrameEpoch, ready.result.page_epoch, `${action} request is still uncommitted`);
+      assert.equal(wrongPagePointerEvents, 0, `${action} must not act while navigation is in flight`);
+      const response = await responsePromise;
+      assert.equal(response.ok, true, `${action}: ${JSON.stringify(response)}`);
+      assert.match(response.result.url, /\/slow-new$/, action);
+      assert.notEqual(response.result.page_epoch, ready.result.page_epoch);
+      assert.equal(wrongPagePointerEvents, 0, `${action} must not move or press on the navigating document`);
     }
   } finally {
     host.stdin.end();

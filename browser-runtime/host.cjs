@@ -353,13 +353,7 @@ async function observeActionNavigation(page, deadlineAt) {
   let blankPopupExpected = false;
   let pendingPopupOpens = 0;
   const listeners = [];
-  const cdp = await tabByPage.get(page)?.cdp;
-  if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
-  await cdp.send('Page.enable');
-  if (TEST_OBSERVER_SETUP_DELAY_MS) {
-    emit({ event: 'test_observer_setup_waiting' });
-    await new Promise(resolve => setTimeout(resolve, TEST_OBSERVER_SETUP_DELAY_MS));
-  }
+  let cdp;
   const onWindowOpen = event => {
     // Playwright's popup/page events can be delayed until a slow destination
     // response starts. CDP reports window.open at the triggering gesture.
@@ -371,7 +365,6 @@ async function observeActionNavigation(page, deadlineAt) {
     pendingPopupOpens++;
     revision++;
   };
-  cdp.on('Page.windowOpen', onWindowOpen);
   const watch = (target, popup = false) => {
     if (listeners.some(item => item.page === target)) return;
     if (popup) {
@@ -441,8 +434,35 @@ async function observeActionNavigation(page, deadlineAt) {
     if (pendingPopupOpens) pendingPopupOpens--;
     watch(target, true);
   };
+  const dispose = () => {
+    cdp?.off('Page.windowOpen', onWindowOpen);
+    page.off('popup', onPopup);
+    for (const { page: target, onRequest, onFailed, onFinished, onFrame, onClose } of listeners) {
+      target.off('request', onRequest);
+      target.off('requestfailed', onFailed);
+      target.off('requestfinished', onFinished);
+      target.off('framenavigated', onFrame);
+      target.off('close', onClose);
+    }
+  };
+  // A navigation request can start before CDP setup finishes while the old
+  // document still owns the epoch. Observe Playwright events first so a
+  // pointer action cannot run into that in-flight navigation.
   watch(page);
   page.on('popup', onPopup);
+  try {
+    cdp = await tabByPage.get(page)?.cdp;
+    if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (TEST_OBSERVER_SETUP_DELAY_MS) {
+      emit({ event: 'test_observer_setup_waiting' });
+      await new Promise(resolve => setTimeout(resolve, TEST_OBSERVER_SETUP_DELAY_MS));
+    }
+  } catch (error) {
+    dispose();
+    throw error;
+  }
   return {
     get started() { return started; },
     async finish() {
@@ -469,17 +489,7 @@ async function observeActionNavigation(page, deadlineAt) {
       }
       if (failed) throw targetError('navigation_failed', 'browser navigation failed');
     },
-    dispose() {
-      cdp.off('Page.windowOpen', onWindowOpen);
-      page.off('popup', onPopup);
-      for (const { page: target, onRequest, onFailed, onFinished, onFrame, onClose } of listeners) {
-        target.off('request', onRequest);
-        target.off('requestfailed', onFailed);
-        target.off('requestfinished', onFinished);
-        target.off('framenavigated', onFrame);
-        target.off('close', onClose);
-      }
-    },
+    dispose,
   };
 }
 
