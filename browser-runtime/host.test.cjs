@@ -325,9 +325,11 @@ test('hover and straight drag change the shared page and reject stale coordinate
     if (request.url === '/scroll-navigate') {
       response.end(`<!doctype html><style>
         body { margin: 0; min-height: 3000px; }
+        #hover { position: absolute; left: 120px; top: 2200px; width: 80px; height: 80px; }
         #source { position: absolute; left: 20px; top: 2200px; width: 80px; height: 80px; background: blue; }
         #drop { position: absolute; left: 220px; top: 2320px; width: 100px; height: 80px; background: green; }
-      </style><div id="source" draggable="true">Drag</div><div id="drop">Drop</div>
+      </style><button id="hover" onpointerenter="fetch('/bad-pointer')">Hover</button>
+      <div id="source" draggable="true">Drag</div><div id="drop">Drop</div>
       <script>window.scrollTo(0,0);let armed=false,going=false;setTimeout(()=>armed=true,100);
       addEventListener('scroll',()=>{if(armed&&!going){going=true;location.href='/slow-scroll-navigation'}});
       addEventListener('mousedown',()=>fetch('/bad-pointer'))</script>`);
@@ -639,6 +641,18 @@ test('hover and straight drag change the shared page and reject stale coordinate
     });
     assert.equal(longDrag.ok, true);
     assert.match((await call('dom')).result.html, /<output>long<\/output>/);
+
+    const hoverScrollReady = await call('navigate', {
+      url: url + 'scroll-navigate', expected_epoch: (await call('state')).result.page_epoch,
+    });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const hoverScrolled = await call('hover_selector', {
+      selector: '#hover', expected_epoch: hoverScrollReady.result.page_epoch,
+    });
+    assert.equal(hoverScrolled.ok, true, JSON.stringify(hoverScrolled));
+    assert.match(hoverScrolled.result.url, /\/slow-scroll-navigation$/);
+    assert.notEqual(hoverScrolled.result.page_epoch, hoverScrollReady.result.page_epoch);
+    assert.equal(wrongPagePointerEvents, 0, 'scroll-triggered navigation must prevent hover pointer');
 
     const scrollReady = await call('navigate', {
       url: url + 'scroll-navigate', expected_epoch: (await call('state')).result.page_epoch,

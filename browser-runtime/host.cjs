@@ -524,7 +524,7 @@ async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
   try {
     if (expectedEpoch !== epoch) throw staleEpochError();
     if (!navigation.started) {
-      try { await hover(); } catch (error) {
+      try { await hover(navigation); } catch (error) {
         if (!navigation.started && expectedEpoch === epoch) throw error;
       }
     }
@@ -800,8 +800,16 @@ async function command(action, args = {}) {
       checkEpoch(args);
       page = requireActiveTab().page;
       await hoverWithNavigation(page, args.expected_epoch,
-        () => withPinnedTarget(args,
-          handle => handle.hover({ timeout: pointerTimeout(deadlineAt) }), deadlineAt), deadlineAt);
+        navigation => withPinnedTarget(args, async handle => {
+          if (navigation.started) return;
+          await handle.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+          // The scroll handler may start a navigation while the old document
+          // still owns the epoch. Never let hover's own scrolling hide that gap.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          if (navigation.started) return;
+          if (args.expected_epoch !== epoch) throw staleEpochError();
+          await handle.hover({ scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+        }, deadlineAt), deadlineAt);
       return state();
     }
     case 'hover_at': {
