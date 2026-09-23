@@ -8,6 +8,15 @@ use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
+fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Complete { .. } => Some("complete"),
+        AgentEvent::Cancelled { .. } => Some("cancelled"),
+        AgentEvent::Error { .. } => Some("error"),
+        _ => None,
+    }
+}
+
 /// Returns true for events that carry critical state a late subscriber must see.
 ///
 /// These are cached on the runner and replayed when an SSE client connects
@@ -52,7 +61,7 @@ pub(crate) fn spawn_event_forwarder(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
-            let publication = {
+            let (publication, visible_messages) = {
                 let runners = state.agent_runners.read().await;
                 let Some(runner) = runners
                     .get(&session_id)
@@ -62,10 +71,33 @@ pub(crate) fn spawn_event_forwarder(
                 };
                 state.account_sink.record(Some(&session_id), &started_event);
                 let _ = session_tx.send(started_event);
-                runner.event_publication.clone()
+                (
+                    runner.event_publication.clone(),
+                    runner.visible_messages.clone(),
+                )
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
             while let Some(event) = mpsc_rx.recv().await {
+                match &event {
+                    AgentEvent::VisibleMessageStart {
+                        message_id,
+                        created_at,
+                    } => {
+                        if !publication.publish(|| {
+                            visible_messages.start(message_id.clone(), created_at.to_owned())
+                        }) {
+                            return;
+                        }
+                        continue;
+                    }
+                    AgentEvent::VisibleMessageDiscard { message_id } => {
+                        if !publication.publish(|| visible_messages.discard(message_id)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 let lifecycle_id = match &event {
                     AgentEvent::WorkflowActivated { event_id, .. }
                     | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
@@ -120,10 +152,31 @@ pub(crate) fn spawn_event_forwarder(
                 } else {
                     let is_history_commit =
                         matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+                    let visible_token = match &event {
+                        AgentEvent::Token { content } => Some(content.clone()),
+                        _ => None,
+                    };
+                    let round_count = match &event {
+                        AgentEvent::RunnerProgress { round_count, .. } => Some(*round_count),
+                        _ => None,
+                    };
+                    let terminal_reason = visible_terminal_reason(&event);
                     if !publication.publish(|| {
+                        if let Some(round_count) = round_count {
+                            visible_messages.begin_round(round_count);
+                        }
+                        if let Some(content) = visible_token {
+                            visible_messages.append(content);
+                        }
                         let route_session_id = event.session_id().unwrap_or(&session_id);
                         state.account_sink.record(Some(route_session_id), &event);
                         let _ = session_tx.send(event);
+                        if let Some(reason) = terminal_reason {
+                            visible_messages.mark_terminal(reason);
+                        }
+                        if is_history_commit {
+                            visible_messages.history_committed();
+                        }
                     }) {
                         return;
                     }
