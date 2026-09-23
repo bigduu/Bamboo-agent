@@ -263,6 +263,10 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="location.href=\'/slow-hover\'">Hover to navigate</button>');
       return;
     }
+    if (request.url === '/chain-first') {
+      response.end('<script>location.href="/slow-chain-second"</script><main>Intermediate page</main>');
+      return;
+    }
     if (request.url === '/long-drag') {
       response.end(`<!doctype html><style>
         body { margin: 0; min-height: 3000px; }
@@ -285,11 +289,12 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<main>After move navigation</main>');
       return;
     }
-    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move', '/navigate-on-slow-drop'].includes(request.url)) {
+    if (['/navigate-on-drop', '/navigate-on-down', '/navigate-on-move', '/navigate-on-slow-drop', '/navigate-on-chain-drop'].includes(request.url)) {
       const onDown = request.url === '/navigate-on-down' ? 'onmousedown="location.href=\'/after-down\'"' : '';
       const onMove = request.url === '/navigate-on-move' ? 'onpointermove="if(event.buttons)location.href=\'/after-move\'"' : '';
       const onDrop = request.url === '/navigate-on-drop' ? 'location.href=\'/after-drop\'' :
-        request.url === '/navigate-on-slow-drop' ? 'location.href=\'/slow-drop\'' : '';
+        request.url === '/navigate-on-slow-drop' ? 'location.href=\'/slow-drop\'' :
+          request.url === '/navigate-on-chain-drop' ? 'location.href=\'/chain-first\'' : '';
       response.end(`<!doctype html><style>
         body { margin: 0; }
         #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
@@ -404,6 +409,19 @@ test('hover and straight drag change the shared page and reject stale coordinate
     assert.ok(Date.now() - dragStarted >= 1_200);
     assert.match(slowDrop.result.url, /\/slow-drop$/);
     assert.notEqual(slowDrop.result.page_epoch, slowReady.result.page_epoch);
+
+    const chainReady = await call('navigate', {
+      url: url + 'navigate-on-chain-drop', expected_epoch: slowDrop.result.page_epoch,
+    });
+    const chainStarted = Date.now();
+    const chainedDrop = await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: chainReady.result.page_epoch,
+    });
+    assert.equal(chainedDrop.ok, true);
+    assert.ok(Date.now() - chainStarted >= 1_200);
+    assert.match(chainedDrop.result.url, /\/slow-chain-second$/);
+    assert.notEqual(chainedDrop.result.page_epoch, chainReady.result.page_epoch);
+    assert.match((await call('dom')).result.html, /slow-chain-second/);
 
     for (const action of ['hover_selector', 'hover_at']) {
       const ready = await call('navigate', { url: url + 'hover-navigate', expected_epoch: (await call('state')).result.page_epoch });

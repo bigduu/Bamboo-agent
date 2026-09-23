@@ -330,20 +330,34 @@ function observeActionNavigation(page) {
   let started = false;
   let committed = false;
   let failed = false;
-  let wake;
-  const settled = new Promise(resolve => { wake = resolve; });
+  let currentRequest = null;
+  let revision = 0;
   const mainRequest = request => {
     if (!request.isNavigationRequest()) return false;
     try { return request.frame() === page.mainFrame(); } catch { return false; }
   };
-  const onRequest = request => { if (mainRequest(request)) started = true; };
+  const onRequest = request => {
+    if (!mainRequest(request)) return;
+    started = true;
+    committed = false;
+    failed = false;
+    currentRequest = request;
+    revision++;
+  };
   const onFailed = request => {
-    if (mainRequest(request)) { started = true; failed = true; wake(); }
+    if (request !== currentRequest) return;
+    failed = true;
+    currentRequest = null;
+    revision++;
   };
   const onFrame = frame => {
-    if (frame === page.mainFrame()) { started = true; committed = true; wake(); }
+    if (frame !== page.mainFrame()) return;
+    started = true;
+    committed = true;
+    currentRequest = null;
+    revision++;
   };
-  const onClose = () => { failed = true; wake(); };
+  const onClose = () => { failed = true; revision++; };
   page.on('request', onRequest);
   page.on('requestfailed', onFailed);
   page.on('framenavigated', onFrame);
@@ -351,24 +365,24 @@ function observeActionNavigation(page) {
   return {
     get started() { return started; },
     async finish() {
-      // Page handlers dispatch navigation requests asynchronously after the
-      // pointer call returns. Give that dispatch one short turn, then wait for
-      // an observed request to commit even when its response is slow.
-      await new Promise(resolve => setTimeout(resolve, 50));
-      if (started && !committed && !failed) {
-        let timer;
-        try {
-          await Promise.race([
-            settled,
-            new Promise((_, reject) => {
-              timer = setTimeout(() => reject(targetError('navigation_timeout', 'browser navigation did not complete')), 20_000);
-            }),
-          ]);
-        } finally {
-          clearTimeout(timer);
+      // A newly committed document can immediately request another navigation.
+      // Each request invalidates the prior commit; return only after the latest
+      // request commits and navigation events have settled for one short turn.
+      const deadline = Date.now() + 20_000;
+      let observedRevision = revision;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        if (observedRevision !== revision) {
+          observedRevision = revision;
+          continue;
         }
+        if (failed) break;
+        if (!started || committed) return;
       }
-      if (started && !committed) throw targetError('navigation_failed', 'browser navigation failed');
+      if (!failed && started && !committed) {
+        throw targetError('navigation_timeout', 'browser navigation did not complete');
+      }
+      if (failed) throw targetError('navigation_failed', 'browser navigation failed');
     },
     dispose() {
       page.off('request', onRequest);
