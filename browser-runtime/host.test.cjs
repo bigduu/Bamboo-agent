@@ -271,6 +271,26 @@ test('hover and straight drag change the shared page and reject stale coordinate
       response.end('<style>#hover{position:absolute;left:20px;top:20px;width:80px;height:30px}</style><button id="hover" onpointerenter="window.open(\'/slow-popup-hover\',\'_blank\');location.href=\'/after-drop\'">Hover to open popup and navigate</button>');
       return;
     }
+    if (request.url === '/frame-start') {
+      response.end('<main>Initial iframe</main>');
+      return;
+    }
+    if (request.url === '/hover-iframe' || request.url === '/drag-iframe') {
+      const hover = request.url === '/hover-iframe'
+        ? 'onpointerenter="document.querySelector(\'#child\').src=\'/slow-iframe\'"' : '';
+      const drop = request.url === '/drag-iframe'
+        ? 'document.querySelector(\'#child\').src=\'/slow-iframe\'' : '';
+      response.end(`<!doctype html><style>
+        #hover { position: absolute; left: 20px; top: 20px; width: 80px; height: 30px; }
+        #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; }
+        #drop { position: absolute; left: 220px; top: 80px; width: 100px; height: 80px; }
+      </style><button id="hover" ${hover}>Hover</button>
+      <div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','source')">Drag</div>
+      <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();${drop}">Drop</div>
+      <iframe id="child" hidden src="/frame-start" onload="document.querySelector('#frame-status').textContent=this.contentWindow.location.pathname"></iframe>
+      <output id="frame-status">idle</output>`);
+      return;
+    }
     if (request.url === '/chain-first') {
       response.end('<script>location.href="/slow-chain-second"</script><main>Intermediate page</main>');
       return;
@@ -452,6 +472,48 @@ test('hover and straight drag change the shared page and reject stale coordinate
       assert.ok(Date.now() - hoverStarted >= 1_200, action);
       assert.match(hovered.result.url, /\/slow-hover$/, action);
       assert.notEqual(hovered.result.page_epoch, ready.result.page_epoch, action);
+    }
+
+    for (const action of ['hover_selector', 'hover_at', 'drag_selector', 'drag_at']) {
+      const hover = action.startsWith('hover');
+      const opened = await call('navigate', {
+        url: url + (hover ? 'hover-iframe' : 'drag-iframe'),
+        expected_epoch: (await call('state')).result.page_epoch,
+      });
+      assert.equal(opened.ok, true, action);
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const dom = await call('dom');
+        if (dom.ok && dom.result.html.includes('>/frame-start</output>')) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.match((await call('dom')).result.html,
+        /<output id="frame-status">\/frame-start<\/output>/, action);
+      const ready = await call('state');
+      assert.equal(ready.ok, true, action);
+      if (hover) {
+        assert.equal((await call('hover_at', {
+          x: 150, y: 35, expected_epoch: ready.result.page_epoch,
+        })).ok, true, action);
+      }
+      const started = Date.now();
+      const response = await call(action, action === 'hover_selector'
+        ? { selector: '#hover', expected_epoch: ready.result.page_epoch }
+        : action === 'hover_at'
+          ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
+          : action === 'drag_selector'
+            ? { source_selector: '#source', target_selector: '#drop', expected_epoch: ready.result.page_epoch }
+            : { x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: ready.result.page_epoch });
+      assert.equal(response.ok, true, `${action}: ${JSON.stringify(response)}`);
+      assert.ok(Date.now() - started >= 1_200, action);
+      assert.notEqual(response.result.page_epoch, ready.result.page_epoch, action);
+      const dom = await call('dom');
+      assert.equal(dom.result.page_epoch, response.result.page_epoch, action);
+      assert.match(dom.result.html, /<output id="frame-status">\/slow-iframe<\/output>/, action);
+      assert.equal((await waitForFrame(response.result.active_tab_id, response.result.page_epoch)).page_epoch,
+        response.result.page_epoch, action);
+      assert.equal((await call('hover_at', {
+        x: 150, y: 35, expected_epoch: ready.result.page_epoch,
+      })).code, 'stale_epoch', action);
     }
 
     const popupHoverReady = await call('navigate', {

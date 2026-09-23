@@ -330,7 +330,7 @@ async function observeActionNavigation(page) {
   let started = false;
   let committed = false;
   let failed = false;
-  let currentRequest = null;
+  const pendingRequests = new Map();
   let revision = 0;
   let observedPage = page;
   let blankPopupExpected = false;
@@ -345,16 +345,12 @@ async function observeActionNavigation(page) {
     started = true;
     committed = false;
     failed = false;
-    currentRequest = null;
+    pendingRequests.clear();
     blankPopupExpected = !event.url || event.url === 'about:blank';
     pendingPopupOpens++;
     revision++;
   };
   cdp.on('Page.windowOpen', onWindowOpen);
-  const mainRequest = (target, request) => {
-    if (!request.isNavigationRequest()) return false;
-    try { return request.frame() === target.mainFrame(); } catch { return false; }
-  };
   const watch = (target, popup = false) => {
     if (listeners.some(item => item.page === target)) return;
     if (popup) {
@@ -364,32 +360,48 @@ async function observeActionNavigation(page) {
       started = true;
       committed = target.url() !== 'about:blank' || blankPopupExpected;
       failed = false;
-      currentRequest = null;
+      pendingRequests.clear();
       revision++;
     }
     const onRequest = request => {
       if (target !== observedPage || (target === page && pendingPopupOpens) ||
-          !mainRequest(target, request)) return;
+          !request.isNavigationRequest()) return;
       started = true;
       committed = false;
       failed = false;
-      currentRequest = request;
+      let frame = null;
+      try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+      pendingRequests.set(request, frame);
       revision++;
     };
     const onFailed = request => {
       if (target !== observedPage || (target === page && pendingPopupOpens) ||
-          request !== currentRequest) return;
-      failed = true;
-      currentRequest = null;
+          !pendingRequests.has(request)) return;
+      const frame = pendingRequests.get(request);
+      pendingRequests.delete(request);
+      // A newer request for the same frame supersedes this failure.
+      if (![...pendingRequests.values()].includes(frame)) failed = true;
+      revision++;
+    };
+    const onFinished = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !pendingRequests.has(request) || pendingRequests.get(request) !== null) return;
+      // Playwright cannot always expose a newly-created frame at request time.
+      // Its finished navigation is the fallback completion signal.
+      pendingRequests.delete(request);
+      committed = pendingRequests.size === 0;
       revision++;
     };
     const onFrame = frame => {
-      if (target !== observedPage || frame !== target.mainFrame()) return;
+      if (target !== observedPage) return;
       if (target === page && pendingPopupOpens) return;
-      if (target !== page && frame.url() === 'about:blank' && !blankPopupExpected) return;
+      if (target !== page && frame === target.mainFrame() &&
+          frame.url() === 'about:blank' && !blankPopupExpected) return;
+      for (const [request, requestedFrame] of pendingRequests) {
+        if (requestedFrame === frame) pendingRequests.delete(request);
+      }
       started = true;
-      committed = true;
-      currentRequest = null;
+      committed = pendingRequests.size === 0;
       revision++;
     };
     const onClose = () => {
@@ -399,9 +411,10 @@ async function observeActionNavigation(page) {
     };
     target.on('request', onRequest);
     target.on('requestfailed', onFailed);
+    target.on('requestfinished', onFinished);
     target.on('framenavigated', onFrame);
     target.on('close', onClose);
-    listeners.push({ page: target, onRequest, onFailed, onFrame, onClose });
+    listeners.push({ page: target, onRequest, onFailed, onFinished, onFrame, onClose });
   };
   const onPopup = target => {
     if (pendingPopupOpens) pendingPopupOpens--;
@@ -434,9 +447,10 @@ async function observeActionNavigation(page) {
     dispose() {
       cdp.off('Page.windowOpen', onWindowOpen);
       page.off('popup', onPopup);
-      for (const { page: target, onRequest, onFailed, onFrame, onClose } of listeners) {
+      for (const { page: target, onRequest, onFailed, onFinished, onFrame, onClose } of listeners) {
         target.off('request', onRequest);
         target.off('requestfailed', onFailed);
+        target.off('requestfinished', onFinished);
         target.off('framenavigated', onFrame);
         target.off('close', onClose);
       }
