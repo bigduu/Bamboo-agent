@@ -44,6 +44,18 @@ function bounded(value, maximum) {
   return value.length > maximum ? value.slice(0, maximum) : value;
 }
 
+function boundedDialogText(value) {
+  let text = '';
+  let consumed = 0;
+  for (const character of value) {
+    if (consumed + character.length > MAX_DIALOG_CHARS) break;
+    const codePoint = character.codePointAt(0);
+    text += codePoint >= 0xD800 && codePoint <= 0xDFFF ? '\uFFFD' : character;
+    consumed += character.length;
+  }
+  return { text, truncated: consumed < value.length };
+}
+
 function staleEpochError() {
   const error = new Error('browser page changed; refresh state and retry');
   error.code = 'stale_epoch';
@@ -78,6 +90,8 @@ function dialogError(code, message) {
 function dialogState() {
   const tab = requireActiveTab();
   const pending = pendingDialog;
+  const message = pending && boundedDialogText(pending.message);
+  const defaultValue = pending && boundedDialogText(pending.defaultValue);
   return {
     page_epoch: epoch,
     active_tab_id: tab.id,
@@ -94,10 +108,10 @@ function dialogState() {
       page_epoch: pending.pageEpoch,
       url: pending.url,
       type: pending.type,
-      message: bounded(pending.message, MAX_DIALOG_CHARS),
-      message_truncated: pending.message.length > MAX_DIALOG_CHARS,
-      default_value: bounded(pending.defaultValue, MAX_DIALOG_CHARS),
-      default_value_truncated: pending.defaultValue.length > MAX_DIALOG_CHARS,
+      message: message.text,
+      message_truncated: message.truncated,
+      default_value: defaultValue.text,
+      default_value_truncated: defaultValue.truncated,
       expires_at_ms: pending.expiresAt,
       status: pending.expired ? 'expired' : 'pending',
     } : null,

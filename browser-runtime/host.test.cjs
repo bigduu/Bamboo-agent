@@ -911,6 +911,8 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
       <button id="prompt" onclick="document.querySelector('#result').textContent=prompt('Private prompt message','default text')">Prompt</button>
       <button id="chain" onclick="alert('First dialog');document.querySelector('#result').textContent=confirm('Second dialog')?'chain yes':'chain no'">Chain</button>
       <button id="long" onclick="prompt('m'.repeat(5000),'d'.repeat(5000))">Long</button>
+      <button id="unicode-boundary" onclick="prompt('m'.repeat(4095)+String.fromCodePoint(0x1F600),'d'.repeat(4095)+String.fromCodePoint(0x1F600))">Unicode boundary</button>
+      <button id="lone-surrogate" onclick="prompt('message'+String.fromCharCode(0xD800)+'end','default'+String.fromCharCode(0xDC00)+'end')">Lone surrogate</button>
       <div id="drag-source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
       <div id="drag-drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#result').textContent=confirm('Drag dialog')?event.dataTransfer.getData('text/plain'):'dismissed'">Drop</div>
       <output id="result">idle</output>`);
@@ -1030,6 +1032,22 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
     assert.equal(long.result.pending_dialog.default_value_truncated, true);
     assert.equal((await call('dialog_respond', {
       dialog_id: long.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
+    })).ok, true);
+    const boundary = await call('click_selector', { selector: '#unicode-boundary', expected_epoch: epoch });
+    assert.equal(boundary.result.pending_dialog.message, 'm'.repeat(4095));
+    assert.equal(boundary.result.pending_dialog.default_value, 'd'.repeat(4095));
+    assert.equal(boundary.result.pending_dialog.message_truncated, true);
+    assert.equal(boundary.result.pending_dialog.default_value_truncated, true);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: boundary.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
+    })).ok, true);
+    const lone = await call('click_selector', { selector: '#lone-surrogate', expected_epoch: epoch });
+    assert.equal(lone.result.pending_dialog.message, 'message\uFFFDend');
+    assert.equal(lone.result.pending_dialog.default_value, 'default\uFFFDend');
+    assert.equal(lone.result.pending_dialog.message_truncated, false);
+    assert.equal(lone.result.pending_dialog.default_value_truncated, false);
+    assert.equal((await call('dialog_respond', {
+      dialog_id: lone.result.pending_dialog.dialog_id, accept: false, expected_epoch: epoch,
     })).ok, true);
     const screenshot = await call('screenshot');
     assert.equal(screenshot.result.page_epoch, epoch);
