@@ -440,6 +440,38 @@ pub struct PermissionDecisionReceipt {
 }
 
 impl PermissionRequest {
+    /// Recover the focus-bound keyboard boundary from the server-generated
+    /// resource when validating a persisted approval request after restart.
+    pub fn is_focused_browser_input(&self) -> bool {
+        if self.permission_type != PermissionType::BrowserInteraction {
+            return false;
+        }
+        Self::is_focused_browser_resource(&self.tool_name, &self.resource)
+    }
+
+    /// Child approval snapshots carry a tool name and resource, but not a
+    /// typed permission request. Use the same focused-input boundary when
+    /// presenting either approval surface.
+    pub fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
+        if !tool_name.eq_ignore_ascii_case("browser") {
+            return false;
+        }
+        let mut parts = resource.splitn(4, ':');
+        if parts.next() != Some("browser")
+            || !parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+        {
+            return false;
+        }
+        match (parts.next(), parts.next()) {
+            (Some("type" | "key"), Some(_)) => true,
+            (Some("press"), Some("page")) => true,
+            (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+            _ => false,
+        }
+    }
+
     pub fn fresh_generation() -> String {
         uuid::Uuid::new_v4().to_string()
     }

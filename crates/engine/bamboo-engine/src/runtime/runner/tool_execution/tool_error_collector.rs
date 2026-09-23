@@ -57,6 +57,16 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn error_preview(tool_name: &str, value: &str) -> String {
+    if tool_name.eq_ignore_ascii_case("browser") {
+        // Browser input and failure text can contain typed content or page
+        // data. Keep call metadata for correlation, not those payloads.
+        "[redacted]".to_string()
+    } else {
+        truncate(value, PREVIEW_MAX_CHARS)
+    }
+}
+
 /// Returns the path `${BAMBOO_DATA_DIR}/tool_errors.jsonl`.
 fn error_log_path() -> PathBuf {
     bamboo_config::paths::bamboo_dir().join("tool_errors.jsonl")
@@ -112,9 +122,9 @@ pub(crate) fn hard_error_record(
         round,
         tool_name: tool_name.to_string(),
         tool_call_id: tool_call_id.to_string(),
-        args_preview: truncate(arguments, PREVIEW_MAX_CHARS),
+        args_preview: error_preview(tool_name, arguments),
         error_kind: ToolErrorKind::Hard,
-        error_message: error_message.to_string(),
+        error_message: error_preview(tool_name, error_message),
         result_snippet: None,
     }
 }
@@ -134,9 +144,34 @@ pub(crate) fn soft_failure_record(
         round,
         tool_name: tool_name.to_string(),
         tool_call_id: tool_call_id.to_string(),
-        args_preview: truncate(arguments, PREVIEW_MAX_CHARS),
+        args_preview: error_preview(tool_name, arguments),
         error_kind: ToolErrorKind::Soft,
-        error_message: truncate(result_text, PREVIEW_MAX_CHARS),
-        result_snippet: Some(truncate(result_text, PREVIEW_MAX_CHARS)),
+        error_message: error_preview(tool_name, result_text),
+        result_snippet: Some(error_preview(tool_name, result_text)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_hard_and_soft_errors_keep_metadata_without_input_or_result_text() {
+        let args = r#"{"action":"type","text":"private input"}"#;
+        let hard = hard_error_record("session", 3, "browser", "call", args, "private failure");
+        let soft = soft_failure_record("session", 3, "browser", "call", args, "private result");
+        assert_eq!(soft.result_snippet.as_deref(), Some("[redacted]"));
+        for record in [hard, soft] {
+            let serialized = serde_json::to_string(&record).expect("JSON record");
+            assert_eq!(record.tool_name, "browser");
+            assert_eq!(record.tool_call_id, "call");
+            assert_eq!(record.args_preview, "[redacted]");
+            assert_eq!(record.error_message, "[redacted]");
+            assert!(!serialized.contains("private"));
+        }
+        let ordinary = soft_failure_record("session", 3, "Bash", "call", "echo ok", "failed");
+        assert_eq!(ordinary.args_preview, "echo ok");
+        assert_eq!(ordinary.error_message, "failed");
+        assert_eq!(ordinary.result_snippet.as_deref(), Some("failed"));
     }
 }

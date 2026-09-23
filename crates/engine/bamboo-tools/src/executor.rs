@@ -38,6 +38,20 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
     preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
+fn parse_warning_log_details<'a>(
+    execution_name: &str,
+    args_raw: &str,
+    warning: &'a str,
+) -> (String, &'a str) {
+    if execution_name.eq_ignore_ascii_case("browser") {
+        // A repaired JSON warning embeds its own preview, so both strings
+        // must be hidden when browser input may contain focused typed text.
+        ("[redacted]".to_string(), "[redacted]")
+    } else {
+        (preview_for_log(args_raw, 180), warning)
+    }
+}
+
 fn copy_legacy_arg_if_missing(
     args: &mut serde_json::Map<String, serde_json::Value>,
     from: &str,
@@ -351,6 +365,7 @@ impl BuiltinToolExecutor {
     fn parse_execution_args(
         &self,
         call: &ToolCall,
+        execution_name: &str,
         ctx: &ToolExecutionContext<'_>,
     ) -> serde_json::Value {
         if let Some(pre_parsed) = ctx.pre_parsed_args {
@@ -359,13 +374,15 @@ impl BuiltinToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
+            let (args_preview, warning) =
+                parse_warning_log_details(execution_name, args_raw, &warning);
             tracing::warn!(
                 "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
                 ctx.session_id,
                 call.id,
                 call.function.name,
                 args_raw.len(),
-                preview_for_log(args_raw, 180),
+                args_preview,
                 warning
             );
         }
@@ -383,7 +400,7 @@ impl BuiltinToolExecutor {
             .get(execution_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
         check_raw_tool_input(execution_name, &call.function.arguments)?;
-        let mut args = self.parse_execution_args(call, &ctx);
+        let mut args = self.parse_execution_args(call, execution_name, &ctx);
         check_parsed_tool_input(execution_name, &args)?;
         self.normalize_registered_builtin_args(
             &call.function.name,
@@ -581,6 +598,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let operation_summary = context.operation_description.clone();
                 let risk_level = context.risk_level();
                 let permission_type = context.permission_type;
+                let focused_browser_input =
+                    crate::permission::is_focused_browser_input(&tool_name, &args);
+                let approval_display_resource = if focused_browser_input {
+                    operation_summary.clone()
+                } else {
+                    resource.clone()
+                };
                 let platform_hard_deny = permission_checker.hard_deny_reason(&context);
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
@@ -633,7 +657,11 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }) {
                         crate::permission::PermissionOutcome::Allow { .. } => continue,
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
-                            return Err(ToolError::Execution(reason.message));
+                            return Err(ToolError::Execution(if focused_browser_input {
+                                "Browser input denied by policy".to_string()
+                            } else {
+                                reason.message
+                            }));
                         }
                         crate::permission::PermissionOutcome::Ask(request)
                             if matches!(
@@ -657,10 +685,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     // Compatibility path for custom checkers that do not expose a
                     // typed config. It remains one-shot only and fail-closed.
                     if let Some(reason) = platform_hard_deny {
-                        return Err(ToolError::Execution(reason));
+                        return Err(ToolError::Execution(if focused_browser_input {
+                            "Browser input denied by policy".to_string()
+                        } else {
+                            reason
+                        }));
                     }
-                    let force_ask =
-                        permission_checker.requires_forced_confirmation(&tool_name, &args);
+                    let force_ask = focused_browser_input
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
@@ -670,7 +702,12 @@ impl ToolExecutor for BuiltinToolExecutor {
                     {
                         continue;
                     }
-                    let decision = if force_ask {
+                    let decision = if focused_browser_input {
+                        // Configless checkers may have cached grants, and the
+                        // trait's default forced path checks that cache first.
+                        // A focused action must ask again for this occurrence.
+                        permission_checker.request_confirmation(context).await
+                    } else if force_ask {
                         permission_checker.check_or_request_forced(context).await
                     } else if let Some(session_id) = ctx.session_id {
                         permission_checker
@@ -684,7 +721,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         Ok(false) => {
                             return Err(ToolError::Execution(format!(
                                 "Permission denied for: {}",
-                                resource
+                                approval_display_resource
                             )));
                         }
                         Err(PermissionError::ConfirmationRequired { .. }) => {
@@ -711,13 +748,25 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 matched_rule: None,
                                 allowed_decisions:
                                     crate::permission::PermissionRequest::forced_decisions(),
-                                suggested_matchers: crate::permission::conservative_matchers(
-                                    permission_type,
-                                    &resource,
-                                ),
+                                suggested_matchers: if focused_browser_input {
+                                    Vec::new()
+                                } else {
+                                    crate::permission::conservative_matchers(
+                                        permission_type,
+                                        &resource,
+                                    )
+                                },
                             }
                         }
-                        Err(other) => return Err(permission_error_to_tool_error(other)),
+                        Err(other) => {
+                            return Err(if focused_browser_input {
+                                ToolError::Execution(
+                                    "Browser input permission check failed".to_string(),
+                                )
+                            } else {
+                                permission_error_to_tool_error(other)
+                            });
+                        }
                     }
                 };
 
@@ -725,12 +774,17 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // one-shot decisions are advertised until its protocol supports
                 // a stronger scope. No boolean downgrade can create a grant.
                 if let Some(proxy) = proxy {
+                    let mut display_request = request.clone();
+                    if focused_browser_input {
+                        display_request.resource = "[redacted]".to_string();
+                        display_request.suggested_matchers.clear();
+                    }
                     let approved = proxy
                         .request_approval(crate::approval::ApprovalAsk {
                             tool_name: tool_name.clone(),
                             permission: permission_type.description().to_string(),
-                            resource: resource.clone(),
-                            permission_request: Some(request.clone()),
+                            resource: approval_display_resource.clone(),
+                            permission_request: Some(display_request),
                         })
                         .await;
                     if approved {
@@ -738,18 +792,25 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }
                     return Err(ToolError::Execution(format!(
                         "Permission denied by host for: {}",
-                        resource
+                        approval_display_resource
                     )));
                 }
 
                 // Interactive sessions pause through the legacy question shape
                 // while carrying the complete typed request alongside it.
                 if let Some(tx) = ctx.event_tx {
+                    let mut approval_parameters = args.clone();
+                    if focused_browser_input {
+                        if let Some(parameters) = approval_parameters.as_object_mut() {
+                            parameters.remove("text");
+                            parameters.remove("key");
+                        }
+                    }
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
                             tool_name: tool_name.clone(),
-                            parameters: args.clone(),
+                            parameters: approval_parameters,
                         })
                         .await;
 
@@ -757,7 +818,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
                         tool_name,
                         permission_type.description(),
-                        resource
+                        approval_display_resource
                     );
                     if let Some(config) = config {
                         config.register_pending_request(request.clone());
@@ -766,7 +827,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                         "status": "awaiting_permission_approval",
                         "question": question,
                         "permission_type": permission_type,
-                        "resource": resource,
+                        "resource": approval_display_resource,
                         "options": ["Approve", "Deny"],
                         "allow_custom": false,
                         "permission_request": request,
@@ -781,7 +842,7 @@ impl ToolExecutor for BuiltinToolExecutor {
 
                 return Err(ToolError::Execution(format!(
                     "Permission approval required for: {}",
-                    resource
+                    approval_display_resource
                 )));
             }
         }
@@ -976,6 +1037,21 @@ mod tests {
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         make_tool_call_with_id("call_1", name, args)
+    }
+
+    #[test]
+    fn malformed_browser_arguments_redact_both_log_previews() {
+        let raw = r#"{"action":"type","text":"private browser input"#;
+        let (_, warning) = parse_tool_args_best_effort(raw);
+        let warning = warning.expect("malformed JSON must have a warning");
+        assert!(warning.contains("private browser input"));
+        let (preview, logged_warning) = parse_warning_log_details("browser", raw, &warning);
+        assert_eq!(preview, "[redacted]");
+        assert_eq!(logged_warning, "[redacted]");
+        let (ordinary_preview, ordinary_warning) =
+            parse_warning_log_details("Write", raw, &warning);
+        assert!(ordinary_preview.contains("private browser input"));
+        assert_eq!(ordinary_warning, warning);
     }
 
     #[tokio::test]
@@ -1848,6 +1924,368 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn configless_checker_still_asks_for_focused_browser_input_under_bypass_and_hook_allow() {
+        struct ConfiglessPromptChecker(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for ConfiglessPromptChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                // Simulate a preexisting cached grant. Focused input must
+                // still call request_confirmation for each occurrence.
+                false
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    context,
+                ))
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "browser",
+                label: "browser-was-invoked",
+                args_sensitive: false,
+            })
+            .expect("register browser stub")
+            .with_permission_checker(Arc::new(ConfiglessPromptChecker(Arc::clone(&requests))))
+            .build();
+
+        for (index, args) in [
+            json!({"action":"type","text":"private text","expected_epoch":17}),
+            json!({"action":"key","key":"private-key","expected_epoch":17}),
+            json!({"action":"press","key":"private-key","expected_epoch":17}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = make_tool_call_with_id(&format!("focused-{index}"), "browser", args);
+            let (event_tx, mut event_rx) = mpsc::channel(4);
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("configless-browser"),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: Some(&event_tx),
+                available_tool_schemas: None,
+                bypass_permissions: true,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            let result = crate::with_hook_permission_override(
+                Some(crate::HookPermissionOverride::Allow),
+                &call.id,
+                executor.execute_with_context(&call, ctx),
+            )
+            .await
+            .expect("focused browser input must pause for approval");
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.result).expect("approval payload");
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["permission_request"]["allowed_decisions"],
+                json!(["allow_once", "deny_once"])
+            );
+            assert_eq!(
+                payload["permission_request"]["suggested_matchers"],
+                json!([])
+            );
+            let displayed = payload.to_string();
+            assert!(!displayed.contains("private-key"));
+            assert!(!displayed.contains("private text"));
+            let event = event_rx.recv().await.expect("approval event");
+            assert!(matches!(
+                event,
+                AgentEvent::ToolApprovalRequested { parameters, .. }
+                    if parameters.get("text").is_none() && parameters.get("key").is_none()
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), index + 1);
+        }
+
+        let selector_call = make_tool_call(
+            "browser",
+            json!({"action":"press","selector":"#save","key":"Enter","expected_epoch":17}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("configless-browser"),
+            bypass_permissions: true,
+            ..ToolExecutionContext::none(&selector_call.id)
+        };
+        let result = executor
+            .execute_with_context(&selector_call, ctx)
+            .await
+            .expect("selector-bound press keeps compatibility bypass");
+        assert!(result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn focused_browser_type_approval_redacts_display_and_ignores_hook_allow() {
+        struct NeverInvokeBrowser;
+
+        #[async_trait]
+        impl Tool for NeverInvokeBrowser {
+            fn name(&self) -> &str {
+                "browser"
+            }
+
+            fn description(&self) -> &str {
+                "test browser approval boundary"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                panic!("focused browser input must pause before invocation")
+            }
+        }
+
+        struct CaptureApprovalProxy(Arc<std::sync::Mutex<Option<crate::approval::ApprovalAsk>>>);
+
+        #[async_trait]
+        impl crate::approval::ApprovalProxy for CaptureApprovalProxy {
+            async fn request_approval(&self, ask: crate::approval::ApprovalAsk) -> bool {
+                *self.0.lock().expect("capture approval") = Some(ask);
+                false
+            }
+        }
+
+        let args = json!({"action":"type","text":"private browser text","expected_epoch":17});
+        let context = crate::permission::check_permissions("browser", &args)
+            .expect("valid browser permission")
+            .expect("browser interaction needs approval")
+            .remove(0);
+        let private_resource = context.resource.clone();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config
+            .grant_typed_scoped_session_permission(
+                "browser-redaction",
+                context.permission_type,
+                crate::permission::conservative_matchers(
+                    context.permission_type,
+                    &private_resource,
+                )
+                .remove(0),
+            )
+            .expect("remembered grant");
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(NeverInvokeBrowser)
+            .expect("register browser stub")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call("browser", args);
+        let (tx, mut rx) = mpsc::channel(4);
+        let interactive = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            executor.execute_with_context(&call, interactive),
+        )
+        .await
+        .expect("focused input must pause even under hook allow and bypass");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.result).expect("approval payload");
+        let question = payload["question"].as_str().expect("visible question");
+        assert_eq!(payload["resource"], "Type into focused browser element");
+        assert!(!question.contains("private browser text"));
+        assert!(!question.contains(&private_resource));
+        assert_eq!(
+            payload["permission_request"]["resource"], private_resource,
+            "the typed request still binds the exact parked invocation"
+        );
+        assert_eq!(
+            payload["permission_request"]["allowed_decisions"],
+            json!(["allow_once", "deny_once"])
+        );
+        let event = rx.recv().await.expect("approval event");
+        assert!(matches!(
+            event,
+            AgentEvent::ToolApprovalRequested { parameters, .. }
+                if parameters.get("text").is_none()
+        ));
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(CaptureApprovalProxy(Arc::clone(&captured)));
+        let delegated = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("browser-redaction"),
+            root_session_id: None,
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let denied = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&call, delegated),
+            ),
+        )
+        .await;
+        assert!(matches!(denied, Err(ToolError::Execution(_))));
+        let ask = captured
+            .lock()
+            .expect("captured proxy")
+            .clone()
+            .expect("host saw approval request");
+        assert_eq!(ask.resource, "Type into focused browser element");
+        assert!(!ask.resource.contains("private browser text"));
+        assert!(!ask.resource.contains(&private_resource));
+        let delegated_request = ask.permission_request.expect("delegated typed request");
+        assert_eq!(delegated_request.resource, "[redacted]");
+        assert!(delegated_request.suggested_matchers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn focused_browser_type_errors_hide_exact_resource_in_both_checker_paths() {
+        enum Failure {
+            Denied,
+            Error,
+            HardDeny,
+        }
+
+        struct FailingChecker {
+            failure: Failure,
+            config: Option<Arc<crate::permission::PermissionConfig>>,
+        }
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for FailingChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                true
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                match self.failure {
+                    Failure::Denied => Ok(false),
+                    Failure::Error => Err(crate::permission::PermissionError::CheckFailed(
+                        context.resource,
+                    )),
+                    Failure::HardDeny => panic!("hard deny must stop before confirmation"),
+                }
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+
+            fn permission_config(&self) -> Option<Arc<crate::permission::PermissionConfig>> {
+                self.config.clone()
+            }
+
+            fn hard_deny_reason(
+                &self,
+                context: &crate::permission::PermissionContext,
+            ) -> Option<String> {
+                matches!(self.failure, Failure::HardDeny).then(|| context.resource.clone())
+            }
+        }
+
+        let args = json!({"action":"type","text":"private browser text","expected_epoch":17});
+        let private_resource = crate::permission::check_permissions("browser", &args)
+            .expect("valid browser permission")
+            .expect("browser interaction needs approval")
+            .remove(0)
+            .resource;
+        for (label, failure, config) in [
+            ("configless-denied", Failure::Denied, None),
+            ("configless-error", Failure::Error, None),
+            ("configless-hard-deny", Failure::HardDeny, None),
+            (
+                "config-backed-hard-deny",
+                Failure::HardDeny,
+                Some(Arc::new(crate::permission::PermissionConfig::new())),
+            ),
+        ] {
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_tool(ExactRoutingTool {
+                    name: "browser",
+                    label: "browser-was-invoked",
+                    args_sensitive: false,
+                })
+                .expect("register browser stub")
+                .with_permission_checker(Arc::new(FailingChecker { failure, config }))
+                .build();
+            let call = make_tool_call_with_id(label, "browser", args.clone());
+            let ctx = ToolExecutionContext {
+                session_id: Some("focused-error"),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err(label);
+            let displayed = error.to_string();
+            assert!(
+                !displayed.contains(&private_resource),
+                "{label}: {displayed}"
+            );
+            assert!(
+                !displayed.contains("private browser text"),
+                "{label}: {displayed}"
+            );
+        }
     }
 
     #[tokio::test]

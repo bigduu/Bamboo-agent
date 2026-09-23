@@ -316,6 +316,33 @@ pub struct LoggingPermissionChecker<T: PermissionChecker> {
     inner: T,
 }
 
+fn is_private_browser_resource(permission_type: PermissionType, resource: &str) -> bool {
+    permission_type == PermissionType::BrowserInteraction
+        && super::policy::PermissionRequest::is_focused_browser_resource("browser", resource)
+}
+
+fn permission_log_resource(permission_type: PermissionType, resource: &str) -> &str {
+    if is_private_browser_resource(permission_type, resource) {
+        "[redacted]"
+    } else {
+        resource
+    }
+}
+
+fn confirmation_result_for_log(
+    private_browser_resource: bool,
+    result: &Result<bool, PermissionError>,
+) -> String {
+    if private_browser_resource {
+        match result {
+            Ok(allowed) => format!("Ok({allowed})"),
+            Err(_) => "Err([redacted])".to_string(),
+        }
+    } else {
+        format!("{result:?}")
+    }
+}
+
 impl<T: PermissionChecker> LoggingPermissionChecker<T> {
     /// Create a new logging permission checker
     pub fn new(inner: T) -> Self {
@@ -330,7 +357,7 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
         tracing::debug!(
             "Permission check: {:?} for '{}' - needs_confirmation: {}",
             perm_type,
-            resource,
+            permission_log_resource(perm_type, resource),
             needs
         );
         needs
@@ -340,10 +367,15 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
         tracing::info!(
             "Requesting user confirmation: {:?} for '{}'",
             ctx.permission_type,
-            ctx.resource
+            permission_log_resource(ctx.permission_type, &ctx.resource)
         );
+        let private_browser_resource =
+            is_private_browser_resource(ctx.permission_type, &ctx.resource);
         let result = self.inner.request_confirmation(ctx).await;
-        tracing::debug!("User confirmation result: {:?}", result);
+        tracing::debug!(
+            "User confirmation result: {}",
+            confirmation_result_for_log(private_browser_resource, &result)
+        );
         result
     }
 
@@ -351,7 +383,7 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
         tracing::info!(
             "Granting session permission: {:?} for '{}'",
             perm_type,
-            resource
+            permission_log_resource(perm_type, &resource)
         );
         self.inner.grant_session_permission(perm_type, resource);
     }
@@ -1243,6 +1275,81 @@ impl<T: PermissionChecker + ?Sized> PermissionCheckerExt for T {}
 mod tests {
     use super::*;
     use crate::PermissionRule;
+
+    #[tokio::test]
+    async fn logging_checker_hides_focused_browser_resources_and_error_details() {
+        #[derive(Clone)]
+        struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for BufferWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct PromptChecker;
+
+        #[async_trait]
+        impl PermissionChecker for PromptChecker {
+            async fn needs_confirmation(
+                &self,
+                _perm_type: PermissionType,
+                _resource: &str,
+            ) -> bool {
+                true
+            }
+
+            async fn request_confirmation(
+                &self,
+                ctx: PermissionContext,
+            ) -> Result<bool, PermissionError> {
+                Err(PermissionError::confirmation_required(ctx))
+            }
+
+            fn grant_session_permission(&self, _perm_type: PermissionType, _resource: String) {}
+        }
+
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = BufferWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let checker = LoggingPermissionChecker::new(PromptChecker);
+        let resource = "browser:17:type:focused:private-fingerprint";
+        assert!(
+            checker
+                .needs_confirmation(PermissionType::BrowserInteraction, resource)
+                .await
+        );
+        let result = checker
+            .request_confirmation(PermissionContext::new(
+                PermissionType::BrowserInteraction,
+                resource,
+                "Type into focused browser element",
+            ))
+            .await;
+        assert!(matches!(
+            result,
+            Err(PermissionError::ConfirmationRequired { .. })
+        ));
+        checker.grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
+        let logged =
+            String::from_utf8(bytes.lock().expect("log buffer lock").clone()).expect("UTF-8 logs");
+        assert!(logged.contains("[redacted]"));
+        assert!(!logged.contains("private-fingerprint"));
+    }
 
     #[tokio::test]
     async fn test_allow_all_checker() {
