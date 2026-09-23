@@ -765,6 +765,13 @@ async function boundedDownload(args) {
   };
   activeDownloadAttempt = attempt;
   try {
+    // Freeze page timers and handlers before resolving the selected link.
+    // Otherwise a getter invoked during target inspection could schedule a
+    // same-URL download in the gap before the native click.
+    scriptsDisabled = true;
+    await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+      workDeadlineAt);
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
     await downloadDeadline(withPinnedTarget(args, async handle => {
       checkEpoch(args);
       const href = await handle.evaluate(element => {
@@ -785,12 +792,6 @@ async function boundedDownload(args) {
         throw downloadError('download_unverifiable', 'browser download has a competing request');
       }
       attempt.expectedUrl = href;
-      // Suspend page scripts during the native link click. A page timer or
-      // onclick handler must not race the approved selector for the one result.
-      scriptsDisabled = true;
-      await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
-        workDeadlineAt);
-      await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
       checkEpoch(args);
       if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
         await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),

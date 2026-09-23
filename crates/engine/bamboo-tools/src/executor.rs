@@ -648,8 +648,10 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let browser_eval =
                     canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
                 let browser_download = is_browser_download_action(&tool_name, &args);
-                let private_browser_display =
-                    focused_browser_input || native_browser_select || browser_eval || browser_download;
+                let private_browser_display = focused_browser_input
+                    || native_browser_select
+                    || browser_eval
+                    || browser_download;
                 let denied_message = if browser_eval {
                     "Browser page script denied by policy"
                 } else if native_browser_select {

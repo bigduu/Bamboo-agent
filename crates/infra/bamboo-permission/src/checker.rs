@@ -1373,10 +1373,8 @@ mod tests {
                 result,
                 Err(PermissionError::ConfirmationRequired { .. })
             ));
-            checker.grant_session_permission(
-                PermissionType::BrowserInteraction,
-                resource.to_string(),
-            );
+            checker
+                .grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
         }
         let eval_resource = "browser_eval:17:private-eval-fingerprint";
         assert!(
