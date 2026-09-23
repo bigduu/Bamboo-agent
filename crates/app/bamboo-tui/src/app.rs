@@ -2626,10 +2626,12 @@ fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
     {
         return false;
     }
-    matches!(
-        (parts.next(), parts.next()),
-        (Some("type" | "key"), Some(_)) | (Some("press"), Some("page"))
-    )
+    match (parts.next(), parts.next()) {
+        (Some("type" | "key"), Some(_)) => true,
+        (Some("press"), Some("page")) => true,
+        (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+        _ => false,
+    }
 }
 
 impl PermissionQuestion {
@@ -16394,6 +16396,15 @@ mod question_tests {
         permission.request.resource = "[redacted]".to_string();
         assert_eq!(permission.display_resource(), "<redacted>");
         assert_eq!(permission.display_resource_label(), "resource (redacted)");
+        for focused_resource in [
+            "browser:17:key:private-fingerprint",
+            "browser:17:press:focused:key:private-fingerprint",
+        ] {
+            permission.request.resource = focused_resource.to_string();
+            permission.request.suggested_matchers[0].value = focused_resource.to_string();
+            assert_eq!(permission.display_resource(), "<redacted>");
+            assert!(!permission.inspector_text().contains("private-fingerprint"));
+        }
 
         let child = ChildApprovalQuestion {
             parent_session_id: "parent".to_string(),

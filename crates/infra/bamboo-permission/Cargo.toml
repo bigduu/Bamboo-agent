@@ -34,3 +34,4 @@ tree-sitter-bash = "0.25"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = "0.3"

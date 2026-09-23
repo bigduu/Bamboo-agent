@@ -514,6 +514,7 @@ pub fn check_permissions(
                 }
                 "click" | "click_at" | "fill" | "type" | "press" | "key" | "scroll" | "history"
                 | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
+                    let focused_input = is_focused_browser_input(tool_name, args);
                     // Bind remembered grants to the page generation. Navigation
                     // increments the epoch, so a selector approved on one site
                     // cannot silently carry authority to the next site.
@@ -541,7 +542,7 @@ pub fn check_permissions(
                         "press" => match &semantic {
                             Some((identity, _)) => identity.clone(),
                             None => match args.get("selector") {
-                                None | Some(Value::Null) => "page".to_string(),
+                                None | Some(Value::Null) => "focused".to_string(),
                                 Some(value) => value
                                     .as_str()
                                     .filter(|selector| !selector.trim().is_empty())
@@ -613,18 +614,17 @@ pub fn check_permissions(
                             format!("focused:{}", browser_focused_type_fingerprint(text)?)
                         }
                         "key" => {
-                            let key = required_string_arg(args, "key")?;
-                            if key.is_empty() {
-                                return Err(PermissionError::CheckFailed(
-                                    "browser key must be nonempty".into(),
-                                ));
-                            }
-                            key.to_string()
+                            let key = browser_press_key(args)?;
+                            browser_persistent_fingerprint("focused-key-v1", key)?
                         }
                         _ => unreachable!(),
                     };
                     let description = if action == "type" {
                         "Type into focused browser element".to_string()
+                    } else if focused_input && action == "key" {
+                        "Send key to focused browser element".to_string()
+                    } else if focused_input && action == "press" {
+                        "Press key on focused browser element".to_string()
                     } else if let Some((_, semantic_description)) = &semantic {
                         format!("Browser {action} on {semantic_description}")
                     } else {
@@ -635,12 +635,13 @@ pub fn check_permissions(
                         format!("{target}:text:{}", browser_type_fingerprint(text))
                     } else if action == "press" {
                         let key = browser_press_key(args)?;
-                        if semantic.is_some()
-                            || args.get("selector").is_some_and(|value| !value.is_null())
-                        {
-                            format!("{target}:key:{}", browser_target_fingerprint(key))
+                        if focused_input {
+                            format!(
+                                "{target}:key:{}",
+                                browser_persistent_fingerprint("focused-press-v1", key)?
+                            )
                         } else {
-                            target
+                            format!("{target}:key:{}", browser_target_fingerprint(key))
                         }
                     } else {
                         target
@@ -977,10 +978,6 @@ mod tests {
                 json!({"action":"click_at","x":12.5,"y":20,"button":"right","expected_epoch":17}),
                 "browser:17:click_at:12.5,20,right",
             ),
-            (
-                json!({"action":"key","key":"Shift+Tab","expected_epoch":17}),
-                "browser:17:key:Shift+Tab",
-            ),
         ];
         for (args, expected_resource) in cases {
             let context = check_permissions("browser", &args).unwrap().unwrap();
@@ -997,6 +994,40 @@ mod tests {
                 expected_resource
             );
         }
+    }
+
+    #[test]
+    fn focused_key_and_press_use_stable_private_exact_resources() {
+        let context = |action: &str, key: &str, epoch: u64| {
+            check_permissions(
+                "browser",
+                &json!({"action":action,"key":key,"expected_epoch":epoch}),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        for (action, prefix) in [
+            ("key", "browser:17:key:"),
+            ("press", "browser:17:press:focused:key:"),
+        ] {
+            let first = context(action, "private-key", 17);
+            assert!(first.resource.starts_with(prefix));
+            assert!(!first.resource.contains("private-key"));
+            assert!(!first.operation_description.contains("private-key"));
+            assert_eq!(first.resource, context(action, "private-key", 17).resource);
+            assert_ne!(first.resource, context(action, "other-key", 17).resource);
+            assert_ne!(first.resource, context(action, "private-key", 18).resource);
+            assert!(crate::PermissionRequest::is_focused_browser_resource(
+                "browser",
+                &first.resource
+            ));
+        }
+        assert!(check_permissions(
+            "browser",
+            &json!({"action":"key","key":"x".repeat(129),"expected_epoch":17})
+        )
+        .is_err());
     }
 
     #[test]
@@ -1073,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_type_key_must_be_persistent_and_is_scoped_to_data_dir() {
+    fn focused_browser_key_must_be_persistent_and_is_scoped_to_data_dir() {
         let first_dir = tempfile::tempdir().unwrap();
         let second_dir = tempfile::tempdir().unwrap();
         let key = [7u8; 32];
@@ -1142,6 +1173,22 @@ mod tests {
                 first_dir.path()
             )
         );
+        for purpose in ["focused-key-v1", "focused-press-v1"] {
+            let before_restart = browser_persistent_fingerprint_with_key(
+                purpose,
+                "fixture input",
+                &key,
+                first_dir.path(),
+            );
+            let after_restart = browser_persistent_fingerprint_with_key(
+                purpose,
+                "fixture input",
+                &key,
+                first_dir.path(),
+            );
+            assert_eq!(before_restart, after_restart);
+            assert_ne!(before_restart, original);
+        }
 
         let css_fill = check_permissions(
             "browser",

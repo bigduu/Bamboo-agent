@@ -35,6 +35,18 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
     preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
+fn parse_warning_log_details<'a>(
+    execution_name: &str,
+    raw_arguments: &str,
+    warning: &'a str,
+) -> (String, &'a str) {
+    if execution_name.eq_ignore_ascii_case("browser") {
+        ("[redacted]".to_string(), "[redacted]")
+    } else {
+        (preview_for_log(raw_arguments, 180), warning)
+    }
+}
+
 pub(super) struct ToolExecutionOnlyContext<'a> {
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
@@ -176,6 +188,8 @@ async fn execute_tool_call_only_with_execution_name(
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
+        let (args_preview, warning) =
+            parse_warning_log_details(execution_name, raw_arguments, &warning);
         tracing::warn!(
             "[{}][round:{}] Tool call arguments required fallback before ToolStart: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
             ctx.session_id,
@@ -183,7 +197,7 @@ async fn execute_tool_call_only_with_execution_name(
             ctx.tool_call.id,
             ctx.tool_call.function.name,
             raw_arguments.len(),
-            preview_for_log(raw_arguments, 180),
+            args_preview,
             warning
         );
     }
@@ -428,10 +442,30 @@ async fn hook_ask_outcome(
     args: &serde_json::Value,
 ) -> Option<ToolExecutionOutcome> {
     let tool_name = tool_call.function.name.trim().to_string();
-    let permission_context = bamboo_tools::permission::check_permissions(&tool_name, args)
-        .ok()
-        .flatten()
-        .and_then(|contexts| contexts.into_iter().next());
+    let focused_browser_input =
+        bamboo_tools::permission::is_focused_browser_input(&tool_name, args);
+    let permission_context = match bamboo_tools::permission::check_permissions(&tool_name, args) {
+        Ok(contexts) => contexts.and_then(|contexts| contexts.into_iter().next()),
+        Err(_) if focused_browser_input => {
+            return Some(ToolExecutionOutcome {
+                permission_replay_origin: None,
+                result: Err("Focused browser input permission check failed".to_string()),
+                needs_human: None,
+                post_tool_hook_eligible: false,
+                tool_duration: std::time::Duration::ZERO,
+            });
+        }
+        Err(_) => None,
+    };
+    if focused_browser_input && permission_context.is_none() {
+        return Some(ToolExecutionOutcome {
+            permission_replay_origin: None,
+            result: Err("Focused browser input permission check failed".to_string()),
+            needs_human: None,
+            post_tool_hook_eligible: false,
+            tool_duration: std::time::Duration::ZERO,
+        });
+    }
     let (permission_type, resource, operation_summary, risk_level) =
         if let Some(permission) = permission_context {
             let risk_level = permission.risk_level();
@@ -456,6 +490,11 @@ async fn hook_ask_outcome(
         requested_mode,
         config.permission_mode.unwrap_or_default(),
     );
+    let approval_resource = if focused_browser_input {
+        "[redacted]".to_string()
+    } else {
+        resource.clone()
+    };
     let request = bamboo_tools::permission::PermissionRequest {
         request_id: tool_call.id.clone(),
         request_generation: bamboo_tools::permission::PermissionRequest::fresh_generation(),
@@ -463,7 +502,7 @@ async fn hook_ask_outcome(
         workspace_path: session.workspace_path_meta(),
         tool_name: tool_name.clone(),
         permission_type,
-        resource: resource.clone(),
+        resource: approval_resource.clone(),
         operation_summary,
         risk_level,
         reason_code: bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk,
@@ -473,10 +512,11 @@ async fn hook_ask_outcome(
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
-        suggested_matchers: bamboo_tools::permission::conservative_matchers(
-            permission_type,
-            &resource,
-        ),
+        suggested_matchers: if focused_browser_input {
+            Vec::new()
+        } else {
+            bamboo_tools::permission::conservative_matchers(permission_type, &resource)
+        },
     };
 
     if let Some(proxy) = bamboo_tools::current_approval_proxy() {
@@ -484,7 +524,7 @@ async fn hook_ask_outcome(
             .request_approval(bamboo_tools::ApprovalAsk {
                 tool_name,
                 permission: permission_type.description().to_string(),
-                resource,
+                resource: approval_resource,
                 permission_request: Some(request),
             })
             .await;
@@ -915,6 +955,20 @@ mod hook_tests {
     struct RecordingParentReviewer {
         seen: AtomicBool,
         approve: bool,
+    }
+
+    #[derive(Default)]
+    struct BrowserApprovalRecorder(Mutex<Vec<bamboo_tools::ApprovalAsk>>);
+
+    #[async_trait]
+    impl bamboo_tools::ApprovalProxy for BrowserApprovalRecorder {
+        async fn request_approval(&self, ask: bamboo_tools::ApprovalAsk) -> bool {
+            self.0
+                .lock()
+                .expect("browser approval record lock")
+                .push(ask);
+            false
+        }
     }
 
     #[async_trait]
@@ -1709,6 +1763,98 @@ mod hook_tests {
         assert!(outcome.result.is_ok());
         assert!(reviewer.seen.load(Ordering::SeqCst));
         assert!(tools.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn hook_ask_hides_focused_browser_resource_and_fails_closed_on_check_error() {
+        let config = AgentLoopConfig::default();
+        let session = Session::new("browser-hook-ask", "model");
+        let runtime_state = AgentRuntimeState::new(&session.id);
+        let reviewer = Arc::new(BrowserApprovalRecorder::default());
+        let reviewer_proxy: Arc<dyn bamboo_tools::ApprovalProxy> = reviewer.clone();
+        let key_args = serde_json::json!({
+            "action":"key",
+            "key":"private-key",
+            "expected_epoch":17,
+        });
+        let key_call = ToolCall {
+            id: "focused-key".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser".to_string(),
+                arguments: key_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(&key_call, &config, &session, &runtime_state, &key_args),
+        )
+        .await
+        .expect("denied parent review returns a tool outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].resource, "[redacted]");
+        let request = asks[0]
+            .permission_request
+            .as_ref()
+            .expect("typed review request");
+        assert_eq!(request.resource, "[redacted]");
+        assert!(request.suggested_matchers.is_empty());
+        assert!(!format!("{:?}", asks[0]).contains("private-key"));
+        drop(asks);
+
+        let invalid_type_args = serde_json::json!({
+            "action":"type",
+            "text":"private browser input",
+            "expected_epoch":"invalid",
+        });
+        let invalid_type_call = ToolCall {
+            id: "focused-type-invalid".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser".to_string(),
+                arguments: invalid_type_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &invalid_type_call,
+                &config,
+                &session,
+                &runtime_state,
+                &invalid_type_args,
+            ),
+        )
+        .await
+        .expect("invalid focused request fails closed");
+        assert!(
+            matches!(outcome.result, Err(ref error) if error == "Focused browser input permission check failed")
+        );
+        assert_eq!(
+            reviewer
+                .0
+                .lock()
+                .expect("browser approval record lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_browser_tool_warning_hides_raw_preview_and_repair_message() {
+        let raw = r#"{"action":"type","text":"private browser input"#;
+        let (_, warning) = parse_tool_args_best_effort(raw);
+        let warning = warning.expect("malformed JSON warning");
+        assert!(warning.contains("private browser input"));
+        let (preview, logged_warning) = parse_warning_log_details("browser", raw, &warning);
+        assert_eq!(preview, "[redacted]");
+        assert_eq!(logged_warning, "[redacted]");
+        let (ordinary_preview, ordinary_warning) =
+            parse_warning_log_details("probe", raw, &warning);
+        assert!(ordinary_preview.contains("private browser input"));
+        assert_eq!(ordinary_warning, warning);
     }
 
     #[tokio::test]

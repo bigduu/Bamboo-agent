@@ -464,10 +464,12 @@ impl PermissionRequest {
         {
             return false;
         }
-        matches!(
-            (parts.next(), parts.next()),
-            (Some("type" | "key"), Some(_)) | (Some("press"), Some("page"))
-        )
+        match (parts.next(), parts.next()) {
+            (Some("type" | "key"), Some(_)) => true,
+            (Some("press"), Some("page")) => true,
+            (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+            _ => false,
+        }
     }
 
     pub fn fresh_generation() -> String {
