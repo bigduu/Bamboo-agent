@@ -11076,12 +11076,18 @@ impl App {
     }
 
     fn begin_next_model_round_after_tools(&mut self) {
-        // A model token after a tool-bearing round is a successor round even
-        // if a previous ToolComplete was lost and its card remains running.
-        // An old provider ID must not authorize a later terminal payload.
-        self.chat.live_tool_names.clear();
-        self.chat.unclassified_tool_tokens.clear();
-        self.chat.replay_tool_ids.clear();
+        // RunnerProgress is emitted before every model round on the ordered
+        // SSE stream. A model token can also be interleaved with live tool
+        // events, so it is not by itself proof that their round ended. A
+        // changed RunnerProgress retires those identities. After reconnect,
+        // prepare_replay_reconciliation sets the count to None: without an
+        // observed round marker, remain fail-closed even if an old ToolStart
+        // and a later token share a provider call ID.
+        if self.chat.last_runner_round_count.is_none() {
+            self.chat.live_tool_names.clear();
+            self.chat.unclassified_tool_tokens.clear();
+            self.chat.replay_tool_ids.clear();
+        }
         self.begin_next_round_after_tools();
     }
 
@@ -18031,6 +18037,64 @@ mod question_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn interleaved_model_tokens_keep_verified_same_round_tool_identities() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.session_id = Some("same-session".to_string());
+        // Bamboo emits RunnerProgress before each round on an ordered SSE
+        // stream. Tokens within this observed round do not retire live tools.
+        app.handle_sse_event(AgentEvent::RunnerProgress {
+            session_id: "same-session".to_string(),
+            round_count: 0,
+        })
+        .unwrap();
+        for (id, name) in [("read", "Read"), ("shell", "Shell")] {
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        }
+        app.handle_sse_event(AgentEvent::Token {
+            content: "interleaved answer".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ReasoningToken {
+            content: "interleaved reasoning".to_string(),
+        })
+        .unwrap();
+        assert_eq!(app.chat.live_tool_names.len(), 2);
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "read".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "ordinary file contents".to_string(),
+            },
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolError {
+            tool_call_id: "shell".to_string(),
+            error: "ordinary exit diagnostic".to_string(),
+        })
+        .unwrap();
+        let read = app
+            .chat
+            .current_tool_calls
+            .iter()
+            .find(|tool| tool.id == "read")
+            .unwrap();
+        let shell = app
+            .chat
+            .current_tool_calls
+            .iter()
+            .find(|tool| tool.id == "shell")
+            .unwrap();
+        assert_eq!(read.result.as_deref(), Some("ordinary file contents"));
+        assert_eq!(shell.error.as_deref(), Some("ordinary exit diagnostic"));
     }
 
     #[test]
