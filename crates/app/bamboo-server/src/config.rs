@@ -274,7 +274,7 @@ const DEFAULT_CSP: &str = concat!(
     "frame-ancestors 'none'; ",
     "script-src 'self'; ",
     "style-src 'self' 'unsafe-inline'; ",
-    "img-src 'self' data: https:; ",
+    "img-src 'self' data: blob: https:; ",
     "font-src 'self' data:; ",
     "connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:* http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
     "form-action 'self';"
@@ -760,9 +760,16 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             .max_age(3600)
     };
 
-    // Session metadata mutations use the response ETag as their If-Match CAS
-    // token, so cross-origin browser/Tauri clients must be able to read it.
-    cors.expose_headers([header::ETAG])
+    // Session metadata mutations use ETag as their If-Match CAS token. The
+    // browser workbench also needs frame sequence, epoch, and geometry headers
+    // when its frontend and Bamboo use different local origins.
+    cors.expose_headers([
+        header::ETAG,
+        header::HeaderName::from_static("x-frame-seq"),
+        header::HeaderName::from_static("x-page-epoch"),
+        header::HeaderName::from_static("x-viewport-width"),
+        header::HeaderName::from_static("x-viewport-height"),
+    ])
 }
 
 /// Apply the Governor (rate limiter) + CORS middleware pair to `app`, IN THE
@@ -1139,8 +1146,8 @@ mod tests {
         }};
     }
 
-    /// A browser can only read the session CAS token when CORS explicitly
-    /// exposes `ETag`. Exercise the real session route behind the production
+    /// A browser can only read the session CAS token and frame metadata when
+    /// CORS explicitly exposes their headers. Exercise the real session route behind the production
     /// CORS middleware for every bind-mode branch, while keeping the existing
     /// permissive request-header policy available to `If-Match` preflights.
     #[actix_web::test]
@@ -1209,10 +1216,21 @@ mod tests {
                     .any(|value| value.eq_ignore_ascii_case("etag")),
                 "ETag must be browser-readable for bind {bind_addr}; exposed={exposed:?}"
             );
+            for name in [
+                "x-frame-seq",
+                "x-page-epoch",
+                "x-viewport-width",
+                "x-viewport-height",
+            ] {
+                assert!(
+                    exposed.iter().any(|value| value.eq_ignore_ascii_case(name)),
+                    "{name} must be browser-readable for bind {bind_addr}; exposed={exposed:?}"
+                );
+            }
             assert_eq!(
                 exposed.len(),
-                1,
-                "do not broadly expose unrelated response headers for bind {bind_addr}"
+                5,
+                "only the CAS and browser frame headers are exposed for bind {bind_addr}"
             );
 
             let preflight = test::call_service(
@@ -1379,9 +1397,10 @@ mod tests {
     }
 
     #[test]
-    fn default_csp_keeps_scripts_strict_but_allows_inline_styles() {
+    fn default_csp_allows_browser_frames_without_relaxing_scripts() {
         assert!(DEFAULT_CSP.contains("script-src 'self'"));
         assert!(DEFAULT_CSP.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(DEFAULT_CSP.contains("img-src 'self' data: blob: https:;"));
         assert!(!DEFAULT_CSP.contains("unsafe-eval"));
     }
 

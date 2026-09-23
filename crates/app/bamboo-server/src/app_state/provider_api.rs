@@ -213,6 +213,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_agent_advertises_browser_and_dispatches_it_with_session_context() {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError, ToolExecutionContext};
+
+        let (_temp, state) = make_state().await;
+        let root = state.tools_for(ToolSurface::Root);
+        let browser = root
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "browser")
+            .expect("root agent browser schema");
+        assert!(browser.function.parameters["properties"]
+            .get("session_id")
+            .is_none());
+        assert!(!state
+            .tools_for(ToolSurface::Child)
+            .list_tools()
+            .iter()
+            .any(|schema| schema.function.name == "browser"));
+
+        let call = ToolCall {
+            id: "browser-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "browser".into(),
+                arguments: serde_json::json!({"action":"snapshot","session_id":"other"})
+                    .to_string(),
+            },
+        };
+        let mut context = ToolExecutionContext::none(&call.id);
+        context.session_id = Some("current-chat");
+        assert!(matches!(
+            root.execute_with_context(&call, context).await,
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BAMBOO_BROWSER_TEST_URL and the Playwright Chromium runtime"]
+    async fn root_agent_browser_actions_share_the_workbench_page() {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
+
+        let url = std::env::var("BAMBOO_BROWSER_TEST_URL").expect("fixture URL");
+        let (_temp, state) = make_state().await;
+        let session_id = "browser-tool-integration";
+        let opened = state.browser.open(session_id).await.unwrap();
+        let navigated = state
+            .browser
+            .command(
+                session_id,
+                "navigate",
+                serde_json::json!({"url": url, "expected_epoch": opened["page_epoch"]}),
+            )
+            .await
+            .unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        let root = state.tools_for(ToolSurface::Root);
+
+        let dispatch = |action: serde_json::Value| ToolCall {
+            id: "browser-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "browser".into(),
+                arguments: action.to_string(),
+            },
+        };
+        let click = dispatch(serde_json::json!({
+            "action": "click",
+            "selector": "#increment",
+            "expected_epoch": epoch
+        }));
+        let mut context = ToolExecutionContext::none(&click.id);
+        context.session_id = Some(session_id);
+        context.bypass_permissions = true;
+        assert!(
+            root.execute_with_context(&click, context)
+                .await
+                .unwrap()
+                .success
+        );
+
+        let dom = state
+            .browser
+            .command(session_id, "dom", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(dom["snapshot"].as_str().unwrap().contains("Count 1"));
+        let snapshot = dispatch(serde_json::json!({"action":"snapshot"}));
+        assert!(root
+            .execute_with_context(&snapshot, context)
+            .await
+            .unwrap()
+            .result
+            .contains("Count 1"));
+        let screenshot = dispatch(serde_json::json!({"action":"screenshot"}));
+        let result = root
+            .execute_with_context(&screenshot, context)
+            .await
+            .unwrap();
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].mime_type, "image/jpeg");
+        assert!(result.images[0].data.len() > 1000);
+        state.browser.close(session_id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn workflow_run_tool_is_root_only_and_cannot_recursively_dispatch_itself() {
         let (_temp, state) = make_state().await;
         let names = |surface| {

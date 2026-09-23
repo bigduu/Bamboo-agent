@@ -85,6 +85,46 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             settings::enforce_access_password_middleware,
         ))
         .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .route(
+            "/browser/sessions/{session_id}",
+            web::put().to(agent::browser::open),
+        )
+        .route(
+            "/browser/sessions/{session_id}",
+            web::get().to(agent::browser::state),
+        )
+        .route(
+            "/browser/sessions/{session_id}",
+            web::delete().to(agent::browser::close),
+        )
+        .route(
+            "/browser/sessions/{session_id}/navigate",
+            web::post().to(agent::browser::navigate),
+        )
+        .route(
+            "/browser/sessions/{session_id}/history",
+            web::post().to(agent::browser::history),
+        )
+        .route(
+            "/browser/sessions/{session_id}/viewport",
+            web::post().to(agent::browser::viewport),
+        )
+        .route(
+            "/browser/sessions/{session_id}/input",
+            web::post().to(agent::browser::input),
+        )
+        .route(
+            "/browser/sessions/{session_id}/dom",
+            web::get().to(agent::browser::dom),
+        )
+        .route(
+            "/browser/sessions/{session_id}/frame",
+            web::get().to(agent::browser::frame),
+        )
+        .route(
+            "/browser/sessions/{session_id}/screenshot",
+            web::get().to(agent::browser::screenshot),
+        )
         .route("/chat", web::post().to(agent::chat::handler))
         .route(
             "/prompt-presets",
