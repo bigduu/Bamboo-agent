@@ -27,6 +27,20 @@ fn text_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, ToolError> {
         .ok_or_else(|| ToolError::InvalidArguments(format!("browser requires nonempty {name}")))
 }
 
+fn tab_id_arg(args: &Value) -> Result<&str, ToolError> {
+    let tab_id = text_arg(args, "tab_id")?;
+    if tab_id.len() != 24
+        || !tab_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ToolError::InvalidArguments(
+            "browser tab_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    Ok(tab_id)
+}
+
 fn number_arg(args: &Value, name: &str) -> Result<f64, ToolError> {
     args.get(name)
         .and_then(Value::as_f64)
@@ -153,14 +167,15 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser page shared with this chat's right workbench. Read its DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The page belongs to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen page."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["navigate","history","viewport","snapshot","click","click_at","fill","type","press","key","scroll","screenshot"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","fill","type","press","key","scroll","screenshot"]},
+                "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "url":{"type":"string","description":"HTTP(S) URL for navigate"},
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
@@ -174,7 +189,7 @@ impl Tool for BrowserTool {
                 "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for history/viewport/click/click_at/fill/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/fill/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -185,7 +200,7 @@ impl Tool for BrowserTool {
     fn classify(&self, args: &Value) -> ToolClass {
         if matches!(
             args.get("action").and_then(Value::as_str),
-            Some("snapshot" | "screenshot")
+            Some("tabs" | "snapshot" | "screenshot")
         ) {
             ToolClass::READONLY_PARALLEL
         } else {
@@ -205,7 +220,10 @@ impl Tool for BrowserTool {
         let action = text_arg(&args, "action")?;
         if matches!(
             action,
-            "history"
+            "new_tab"
+                | "activate_tab"
+                | "close_tab"
+                | "history"
                 | "viewport"
                 | "click"
                 | "click_at"
@@ -220,6 +238,9 @@ impl Tool for BrowserTool {
                 "browser interaction requires expected_epoch from a snapshot".into(),
             ));
         }
+        if matches!(action, "activate_tab" | "close_tab") {
+            tab_id_arg(&args)?;
+        }
         let state = self.browser.open(session_id).await.map_err(browser_error)?;
         let epoch = args
             .get("expected_epoch")
@@ -227,6 +248,10 @@ impl Tool for BrowserTool {
             .or_else(|| state.get("page_epoch").and_then(Value::as_u64))
             .ok_or_else(|| ToolError::Execution("browser page epoch missing".into()))?;
         let result = match action {
+            "tabs" => state,
+            "new_tab" => self.browser.command(session_id, "tab_create", json!({"expected_epoch":epoch})).await.map_err(browser_error)?,
+            "activate_tab" => self.browser.command(session_id, "tab_activate", json!({"tab_id":tab_id_arg(&args)?,"expected_epoch":epoch})).await.map_err(browser_error)?,
+            "close_tab" => self.browser.command(session_id, "tab_close", json!({"tab_id":tab_id_arg(&args)?,"expected_epoch":epoch})).await.map_err(browser_error)?,
             "navigate" => {
                 let url = text_arg(&args, "url")?;
                 let parsed = url::Url::parse(url).map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
@@ -262,7 +287,7 @@ impl Tool for BrowserTool {
             "scroll" => self.browser.command(session_id, "input", json!({"kind":"scroll","x":args.get("x").and_then(Value::as_f64).unwrap_or(500.0),"y":args.get("y").and_then(Value::as_f64).unwrap_or(360.0),"delta_x":args.get("delta_x").and_then(Value::as_f64).unwrap_or(0.0),"delta_y":args.get("delta_y").and_then(Value::as_f64).unwrap_or(500.0),"expected_epoch":epoch})).await.map_err(browser_error)?,
             "snapshot" => {
                 let dom = self.browser.command(session_id, "dom", json!({})).await.map_err(browser_error)?;
-                let mut text = format!("page_epoch: {}\nurl: {}\ntitle: {}\n\n{}", dom["page_epoch"], dom["url"].as_str().unwrap_or(""), dom["title"].as_str().unwrap_or(""), dom["snapshot"].as_str().unwrap_or(""));
+                let mut text = format!("page_epoch: {}\nactive_tab_id: {}\nurl: {}\ntitle: {}\n\n{}", dom["page_epoch"], dom["active_tab_id"].as_str().unwrap_or(""), dom["url"].as_str().unwrap_or(""), dom["title"].as_str().unwrap_or(""), dom["snapshot"].as_str().unwrap_or(""));
                 if args.get("include_html").and_then(Value::as_bool) == Some(true) {
                     text.push_str("\n\nHTML:\n");
                     text.push_str(dom["html"].as_str().unwrap_or(""));
@@ -274,7 +299,7 @@ impl Tool for BrowserTool {
                 let data = image.get("data").and_then(Value::as_str).ok_or_else(|| ToolError::Execution("browser screenshot missing data".into()))?;
                 return Ok(ToolOutcome::Completed(ToolResult {
                     success: true,
-                    result: format!("Screenshot of {} (page_epoch {})", image["url"].as_str().unwrap_or(""), image["page_epoch"]),
+                    result: format!("Screenshot of {} (tab {}, page_epoch {})", image["url"].as_str().unwrap_or(""), image["active_tab_id"].as_str().unwrap_or(""), image["page_epoch"]),
                     display_preference: None,
                     images: vec![ToolResultImage { mime_type: "image/jpeg".into(), data: data.into() }],
                 }));
@@ -306,6 +331,18 @@ mod tests {
         }
         assert_eq!(schema["properties"]["width"]["minimum"], 320);
         assert_eq!(schema["properties"]["height"]["maximum"], 1000);
+        for action in ["new_tab", "activate_tab", "close_tab"] {
+            assert!(actions.contains(&json!(action)), "missing {action}");
+            assert_eq!(
+                tool.classify(&json!({"action":action})),
+                ToolClass::MUTATING_SERIAL
+            );
+        }
+        assert_eq!(
+            tool.classify(&json!({"action":"tabs"})),
+            ToolClass::READONLY_PARALLEL
+        );
+        assert_eq!(schema["properties"]["tab_id"]["type"], "string");
     }
 
     #[test]
@@ -375,6 +412,9 @@ mod tests {
         let mut ctx = ToolCtx::none("browser-test");
         ctx.session_id = Some(Arc::from("current-chat"));
         for (action, args) in [
+            ("new_tab", json!({})),
+            ("activate_tab", json!({"tab_id":"other"})),
+            ("close_tab", json!({"tab_id":"other"})),
             ("history", json!({"direction":"back"})),
             ("viewport", json!({"width":640,"height":480})),
             ("click_at", json!({"x":12,"y":20})),
@@ -385,6 +425,17 @@ mod tests {
             args["action"] = json!(action);
             let error = tool.invoke(args, ctx.clone()).await.unwrap_err();
             assert!(matches!(error, ToolError::InvalidArguments(_)), "{action}");
+        }
+        let oversized = "a".repeat(10000);
+        for tab_id in ["short", "AAAAAAAAAAAAAAAAAAAAAAAA", oversized.as_str()] {
+            let error = tool
+                .invoke(
+                    json!({"action":"activate_tab","tab_id":tab_id,"expected_epoch":17}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
         }
     }
 

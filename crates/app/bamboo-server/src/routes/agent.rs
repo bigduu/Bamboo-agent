@@ -98,6 +98,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::delete().to(agent::browser::close),
         )
         .route(
+            "/browser/sessions/{session_id}/tabs",
+            web::post().to(agent::browser::tab_create),
+        )
+        .route(
+            "/browser/sessions/{session_id}/tabs/activate",
+            web::post().to(agent::browser::tab_activate),
+        )
+        .route(
+            "/browser/sessions/{session_id}/tabs/close",
+            web::post().to(agent::browser::tab_close),
+        )
+        .route(
             "/browser/sessions/{session_id}/navigate",
             web::post().to(agent::browser::navigate),
         )

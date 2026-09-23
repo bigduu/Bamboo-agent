@@ -41,6 +41,13 @@ fn missing_session() -> HttpResponse {
     HttpResponse::NotFound().json(json!({"error":{"message":"Session not found","type":"not_found","code":"session_not_found"}}))
 }
 
+fn valid_tab_id(tab_id: &str) -> bool {
+    tab_id.len() == 24
+        && tab_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 pub async fn open(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let session_id = path.into_inner();
     if !known_session(&state, &session_id).await {
@@ -70,6 +77,98 @@ pub async fn close(state: web::Data<AppState>, path: web::Path<String>) -> HttpR
     }
     match state.browser.close(&session_id).await {
         Ok(()) => HttpResponse::NoContent().finish(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabCreateRequest {
+    expected_epoch: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabTargetRequest {
+    tab_id: String,
+    expected_epoch: u64,
+}
+
+pub async fn tab_create(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<TabCreateRequest>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+    if !known_session(&state, &session_id).await {
+        return missing_session();
+    }
+    match state
+        .browser
+        .command(
+            &session_id,
+            "tab_create",
+            json!({"expected_epoch":body.expected_epoch}),
+        )
+        .await
+    {
+        Ok(value) => HttpResponse::Ok().json(value),
+        Err(error) => error_response(error),
+    }
+}
+
+pub async fn tab_activate(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<TabTargetRequest>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+    if !known_session(&state, &session_id).await {
+        return missing_session();
+    }
+    if !valid_tab_id(&body.tab_id) {
+        return error_response(BrowserError::Invalid(
+            "tab_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    match state
+        .browser
+        .command(
+            &session_id,
+            "tab_activate",
+            json!({"tab_id":body.tab_id,"expected_epoch":body.expected_epoch}),
+        )
+        .await
+    {
+        Ok(value) => HttpResponse::Ok().json(value),
+        Err(error) => error_response(error),
+    }
+}
+
+pub async fn tab_close(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<TabTargetRequest>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+    if !known_session(&state, &session_id).await {
+        return missing_session();
+    }
+    if !valid_tab_id(&body.tab_id) {
+        return error_response(BrowserError::Invalid(
+            "tab_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    match state
+        .browser
+        .command(
+            &session_id,
+            "tab_close",
+            json!({"tab_id":body.tab_id,"expected_epoch":body.expected_epoch}),
+        )
+        .await
+    {
+        Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
     }
 }
@@ -304,6 +403,7 @@ pub async fn frame(
             .insert_header(("Content-Type", "image/jpeg"))
             .insert_header(("Cache-Control", "no-store"))
             .insert_header(("X-Frame-Seq", frame.frame_seq.to_string()))
+            .insert_header(("X-Tab-Id", frame.tab_id.clone()))
             .insert_header(("X-Page-Epoch", frame.page_epoch.to_string()))
             .insert_header(("X-Viewport-Width", frame.viewport_width.to_string()))
             .insert_header(("X-Viewport-Height", frame.viewport_height.to_string()))
@@ -329,12 +429,16 @@ pub async fn screenshot(state: web::Data<AppState>, path: web::Path<String>) -> 
             let Some(data) = value.get("data").and_then(Value::as_str) else {
                 return error_response(BrowserError::Failed("screenshot data missing".into()));
             };
+            let Some(tab_id) = value.get("active_tab_id").and_then(Value::as_str) else {
+                return error_response(BrowserError::Failed("screenshot tab missing".into()));
+            };
             let Ok(jpeg) = base64::engine::general_purpose::STANDARD.decode(data) else {
                 return error_response(BrowserError::Failed("screenshot data invalid".into()));
             };
             HttpResponse::Ok()
                 .insert_header(("Content-Type", "image/jpeg"))
                 .insert_header(("Cache-Control", "no-store"))
+                .insert_header(("X-Tab-Id", tab_id))
                 .insert_header(("X-Page-Epoch", value["page_epoch"].to_string()))
                 .insert_header(("X-Viewport-Width", value["viewport"]["width"].to_string()))
                 .insert_header(("X-Viewport-Height", value["viewport"]["height"].to_string()))
