@@ -450,6 +450,7 @@ async fn hook_ask_outcome(
     args: &serde_json::Value,
 ) -> Option<ToolExecutionOutcome> {
     let tool_name = tool_call.function.name.trim().to_string();
+    let browser_execution = execution_name.trim().eq_ignore_ascii_case("browser");
     let focused_browser_input =
         bamboo_tools::permission::is_focused_browser_input(execution_name, args);
     let native_browser_select =
@@ -457,13 +458,15 @@ async fn hook_ask_outcome(
     let private_browser_input = focused_browser_input || native_browser_select;
     let private_check_error = if native_browser_select {
         "Browser selection permission check failed"
-    } else {
+    } else if focused_browser_input {
         "Focused browser input permission check failed"
+    } else {
+        "Browser permission check failed"
     };
     let permission_context = match bamboo_tools::permission::check_permissions(execution_name, args)
     {
         Ok(contexts) => contexts.and_then(|contexts| contexts.into_iter().next()),
-        Err(_) if private_browser_input => {
+        Err(_) if browser_execution || private_browser_input => {
             return Some(ToolExecutionOutcome {
                 permission_replay_origin: None,
                 result: Err(private_check_error.to_string()),
@@ -483,6 +486,10 @@ async fn hook_ask_outcome(
             tool_duration: std::time::Duration::ZERO,
         });
     }
+    // Read-only browser actions can legitimately have no permission context.
+    // A hook Ask for those actions still reaches the parent, but arbitrary
+    // extra fields must never become its fallback approval resource.
+    let browser_without_context = browser_execution && permission_context.is_none();
     let (permission_type, resource, operation_summary, risk_level) =
         if let Some(permission) = permission_context {
             let risk_level = permission.risk_level();
@@ -496,7 +503,11 @@ async fn hook_ask_outcome(
             let permission_type = bamboo_tools::permission::PermissionType::ExecuteCommand;
             (
                 permission_type,
-                args.to_string(),
+                if browser_without_context {
+                    "[redacted]".to_string()
+                } else {
+                    args.to_string()
+                },
                 format!("Hook-requested review for {tool_name}"),
                 permission_type.risk_level(),
             )
@@ -507,7 +518,7 @@ async fn hook_ask_outcome(
         requested_mode,
         config.permission_mode.unwrap_or_default(),
     );
-    let approval_resource = if private_browser_input {
+    let approval_resource = if private_browser_input || browser_without_context {
         "[redacted]".to_string()
     } else {
         resource.clone()
@@ -529,7 +540,7 @@ async fn hook_ask_outcome(
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
-        suggested_matchers: if private_browser_input {
+        suggested_matchers: if private_browser_input || browser_without_context {
             Vec::new()
         } else {
             bamboo_tools::permission::conservative_matchers(permission_type, &resource)
@@ -1842,7 +1853,7 @@ mod hook_tests {
             },
         };
         let outcome = bamboo_tools::with_approval_proxy(
-            Some(reviewer_proxy),
+            Some(reviewer_proxy.clone()),
             hook_ask_outcome(
                 &invalid_type_call,
                 "browser",
@@ -1865,6 +1876,97 @@ mod hook_tests {
                 .len(),
             1
         );
+
+        // A namespaced model call resolves to canonical `browser` before hook
+        // Ask. Even malformed actions with private-looking fields must not
+        // fall back to a raw-arguments approval resource.
+        let execution_name = "browser";
+        for malformed_args in [
+            serde_json::json!({
+                "action":"select_options",
+                "selector":"select[data-private='account']",
+                "values":["private-option-value"],
+            }),
+            serde_json::json!({
+                "action":null,
+                "selector":"select[data-private='account']",
+                "values":["private-option-value"],
+            }),
+        ] {
+            let malformed_call = ToolCall {
+                id: "select-hook-ask-malformed".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "default::browser".to_string(),
+                    arguments: malformed_args.to_string(),
+                },
+            };
+            let outcome = bamboo_tools::with_approval_proxy(
+                Some(reviewer_proxy.clone()),
+                hook_ask_outcome(
+                    &malformed_call,
+                    &execution_name,
+                    &config,
+                    &session,
+                    &runtime_state,
+                    &malformed_args,
+                ),
+            )
+            .await
+            .expect("malformed browser action fails closed");
+            assert!(matches!(
+                outcome.result,
+                Err(ref error) if error == "Browser permission check failed"
+            ));
+            assert_eq!(
+                reviewer
+                    .0
+                    .lock()
+                    .expect("browser approval record lock")
+                    .len(),
+                1
+            );
+        }
+
+        let read_only_args = serde_json::json!({
+            "action":"snapshot",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+        });
+        let read_only_call = ToolCall {
+            id: "browser-hook-ask-read-only".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: read_only_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &read_only_call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &read_only_args,
+            ),
+        )
+        .await
+        .expect("read-only browser hook Ask reaches parent");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 2);
+        assert_eq!(asks[1].resource, "[redacted]");
+        let request = asks[1]
+            .permission_request
+            .as_ref()
+            .expect("typed read-only review request");
+        assert_eq!(request.resource, "[redacted]");
+        assert!(request.suggested_matchers.is_empty());
+        for private in ["private-option-value", "data-private"] {
+            assert!(!format!("{:?}", asks[1]).contains(private));
+        }
     }
 
     #[test]
