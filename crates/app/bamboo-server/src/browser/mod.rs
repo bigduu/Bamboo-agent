@@ -54,6 +54,7 @@ struct BrowserSession {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>,
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
+    frame_epoch: AtomicU64,
     alive: AtomicBool,
     last_used: Mutex<Instant>,
 }
@@ -126,6 +127,7 @@ impl BrowserSession {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
+            frame_epoch: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             last_used: Mutex::new(Instant::now()),
         });
@@ -147,6 +149,10 @@ impl BrowserSession {
             };
             if message.get("event").and_then(Value::as_str) == Some("frame") {
                 session.accept_frame(&message);
+                continue;
+            }
+            if message.get("event").and_then(Value::as_str) == Some("frame_reset") {
+                session.accept_frame_reset(&message);
                 continue;
             }
             let Some(id) = message.get("id").and_then(Value::as_u64) else {
@@ -190,6 +196,9 @@ impl BrowserSession {
         let Some(page_epoch) = value.get("page_epoch").and_then(Value::as_u64) else {
             return;
         };
+        if page_epoch < self.frame_epoch.load(Ordering::Acquire) {
+            return;
+        }
         let Some(frame_seq) = value.get("frame_seq").and_then(Value::as_u64) else {
             return;
         };
@@ -205,6 +214,7 @@ impl BrowserSession {
         let Ok(viewport_height) = u32::try_from(viewport_height) else {
             return;
         };
+        self.frame_epoch.store(page_epoch, Ordering::Release);
         self.frames.send_replace(Some(Arc::new(BrowserFrame {
             page_epoch,
             frame_seq,
@@ -212,6 +222,17 @@ impl BrowserSession {
             viewport_height,
             jpeg: jpeg.into(),
         })));
+    }
+
+    fn accept_frame_reset(&self, value: &Value) {
+        let Some(page_epoch) = value.get("page_epoch").and_then(Value::as_u64) else {
+            return;
+        };
+        if page_epoch < self.frame_epoch.load(Ordering::Acquire) {
+            return;
+        }
+        self.frame_epoch.store(page_epoch, Ordering::Release);
+        self.frames.send_replace(None);
     }
 
     fn touch(&self) {
@@ -270,6 +291,7 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
+            frame_epoch: AtomicU64::new(0),
             alive: AtomicBool::new(alive),
             last_used: Mutex::new(Instant::now() - idle_for),
         })
@@ -286,6 +308,29 @@ mod tests {
         let environment = String::from_utf8(output.stdout).unwrap();
         assert!(!environment.contains("OPENAI_API_KEY"));
         assert!(!environment.contains("sentinel-do-not-inherit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frame_reset_discards_old_epoch_jpeg_and_late_frames() {
+        let session = stub_session(Duration::ZERO, true);
+        let frame = |page_epoch, frame_seq| {
+            json!({
+                "page_epoch":page_epoch,
+                "frame_seq":frame_seq,
+                "viewport_width":640,
+                "viewport_height":480,
+                "data":base64::engine::general_purpose::STANDARD.encode([1, 2, 3]),
+            })
+        };
+        session.accept_frame(&frame(17, 1));
+        assert_eq!(session.frames.borrow().as_ref().unwrap().page_epoch, 17);
+        session.accept_frame_reset(&json!({"page_epoch":18}));
+        assert!(session.frames.borrow().is_none());
+        session.accept_frame(&frame(17, 2));
+        assert!(session.frames.borrow().is_none());
+        session.accept_frame(&frame(18, 3));
+        assert_eq!(session.frames.borrow().as_ref().unwrap().page_epoch, 18);
     }
 
     #[tokio::test]

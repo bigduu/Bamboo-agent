@@ -14,6 +14,8 @@ let page;
 let cdp;
 let frameSeq = 0;
 let lastFrameAt = 0;
+let captureGeneration = 0;
+let captureTask = Promise.resolve();
 let closing = false;
 
 function emit(message) {
@@ -84,6 +86,39 @@ function checkUrl(raw) {
   return value.href;
 }
 
+function scheduleCapture() {
+  const generation = ++captureGeneration;
+  captureTask = captureTask.catch(() => {}).then(async () => {
+    if (generation !== captureGeneration || closing || page.isClosed()) return;
+    await page.screencast.stop().catch(() => {});
+    if (generation !== captureGeneration || closing || page.isClosed()) return;
+    await page.screencast.start({
+      quality: 75,
+      size: { width: 1200, height: 1000 },
+      onFrame: ({ data, viewportWidth, viewportHeight }) => {
+        if (generation !== captureGeneration || closing || page.isClosed()) return;
+        const now = Date.now();
+        if (now - lastFrameAt < 100) return;
+        lastFrameAt = now;
+        emit({ event: 'frame', page_epoch: epoch, frame_seq: ++frameSeq,
+          viewport_width: viewportWidth, viewport_height: viewportHeight,
+          data: data.toString('base64') });
+      },
+    });
+  });
+  return captureTask;
+}
+
+function advanceEpoch() {
+  epoch++;
+  lastFrameAt = 0;
+  // Drop an old JPEG before returning a state for the new frame document.
+  emit({ event: 'frame_reset', page_epoch: epoch });
+  // Restarting screencast produces a current-epoch first frame even when a
+  // hidden iframe changes without repainting the visible page.
+  void scheduleCapture();
+}
+
 function targetError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -109,63 +144,87 @@ async function waitForTarget(locator, missingMessage) {
 }
 
 async function targetLocator(args) {
+  let locator;
   if (args.target === undefined) {
     if (typeof args.selector !== 'string' || !args.selector.trim()) {
       throw targetError('invalid_target', 'browser action requires a selector or target');
     }
-    return page.locator(args.selector);
-  }
-  if (args.selector !== undefined && args.selector !== null) {
-    throw targetError('invalid_target', 'selector and target are mutually exclusive');
-  }
-  const target = args.target;
-  if (!target || typeof target !== 'object' || Array.isArray(target)) {
-    throw targetError('invalid_target', 'invalid browser semantic target');
-  }
-  const kind = target.kind;
-  const allowed = kind === 'role'
-    ? ['kind', 'role', 'name', 'exact', 'frame_selector']
-    : kind === 'label' || kind === 'text'
-      ? ['kind', 'value', 'exact', 'frame_selector']
-      : null;
-  if (!allowed || Object.keys(target).some(key => !allowed.includes(key)) ||
-      (target.exact !== undefined && typeof target.exact !== 'boolean')) {
-    throw targetError('invalid_target', 'invalid browser semantic target');
-  }
-  const frameSelector = semanticString(target, 'frame_selector', 512);
-  let scope = page;
-  if (frameSelector) {
-    const owner = page.frameLocator(frameSelector).owner();
-    await waitForTarget(owner, 'browser target iframe not found');
-    const count = await owner.count();
-    if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
-    if (count !== 1) {
-      throw targetError('ambiguous_target', `browser target iframe matched ${count} elements`);
-    }
-    scope = page.frameLocator(frameSelector);
-  }
-  const exact = target.exact ?? true;
-  let locator;
-  if (kind === 'role') {
-    const role = semanticString(target, 'role', 64, true);
-    if (!/^[a-z-]+$/.test(role)) {
-      throw targetError('invalid_target', 'invalid browser target role');
-    }
-    const name = semanticString(target, 'name', 256);
-    locator = scope.getByRole(role, name === undefined ? {} : { name, exact });
+    locator = page.locator(args.selector);
   } else {
-    const value = semanticString(target, 'value', 256, true);
-    locator = kind === 'label'
-      ? scope.getByLabel(value, { exact })
-      : scope.getByText(value, { exact });
+    if (args.selector !== undefined && args.selector !== null) {
+      throw targetError('invalid_target', 'selector and target are mutually exclusive');
+    }
+    const target = args.target;
+    if (!target || typeof target !== 'object' || Array.isArray(target)) {
+      throw targetError('invalid_target', 'invalid browser semantic target');
+    }
+    const kind = target.kind;
+    const allowed = kind === 'role'
+      ? ['kind', 'role', 'name', 'exact', 'frame_selector']
+      : kind === 'label' || kind === 'text'
+        ? ['kind', 'value', 'exact', 'frame_selector']
+        : null;
+    if (!allowed || Object.keys(target).some(key => !allowed.includes(key)) ||
+        (target.exact !== undefined && typeof target.exact !== 'boolean')) {
+      throw targetError('invalid_target', 'invalid browser semantic target');
+    }
+    const frameSelector = semanticString(target, 'frame_selector', 512);
+    let scope = page;
+    if (frameSelector) {
+      const owner = page.frameLocator(frameSelector).owner();
+      await waitForTarget(owner, 'browser target iframe not found');
+      const count = await owner.count();
+      if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
+      if (count !== 1) {
+        throw targetError('ambiguous_target', `browser target iframe matched ${count} elements`);
+      }
+      scope = page.frameLocator(frameSelector);
+    }
+    const exact = target.exact ?? true;
+    if (kind === 'role') {
+      const role = semanticString(target, 'role', 64, true);
+      if (!/^[a-z-]+$/.test(role)) {
+        throw targetError('invalid_target', 'invalid browser target role');
+      }
+      const name = semanticString(target, 'name', 256);
+      locator = scope.getByRole(role, name === undefined ? {} : { name, exact });
+    } else {
+      const value = semanticString(target, 'value', 256, true);
+      locator = kind === 'label'
+        ? scope.getByLabel(value, { exact })
+        : scope.getByText(value, { exact });
+    }
   }
-  await waitForTarget(locator, 'browser semantic target not found');
+  await waitForTarget(locator, 'browser target not found');
   const count = await locator.count();
-  if (count === 0) throw targetError('target_not_found', 'browser semantic target not found');
+  if (count === 0) throw targetError('target_not_found', 'browser target not found');
   if (count !== 1) {
-    throw targetError('ambiguous_target', `browser semantic target matched ${count} elements`);
+    throw targetError('ambiguous_target', `browser target matched ${count} elements`);
   }
   return locator;
+}
+
+async function withPinnedTarget(args, act) {
+  const locator = await targetLocator(args);
+  checkEpoch(args);
+  // Locator actions can silently re-resolve on a new document while waiting
+  // for an old disabled element. A handle is bound to the resolved document;
+  // navigation detaches it instead of retargeting the action.
+  const handle = await locator.elementHandle({ timeout: 10_000 });
+  if (!handle) throw targetError('target_not_found', 'browser target not found');
+  try {
+    const count = await locator.count();
+    if (count !== 1) {
+      throw targetError(
+        count === 0 ? 'target_not_found' : 'ambiguous_target',
+        `browser target matched ${count} elements`,
+      );
+    }
+    checkEpoch(args);
+    return await act(handle);
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
 }
 
 async function command(action, args = {}) {
@@ -193,7 +252,7 @@ async function command(action, args = {}) {
         await page.setViewportSize({ width: args.width, height: args.height });
         // Frame coordinates from the prior viewport must not be applied to
         // the resized page, even if its URL has not changed.
-        epoch++;
+        advanceEpoch();
       }
       return state();
     case 'input':
@@ -226,26 +285,16 @@ async function command(action, args = {}) {
     }
     case 'click_selector':
       checkEpoch(args);
-      {
-        const locator = await targetLocator(args);
-        checkEpoch(args);
-        await locator.click({ timeout: 10_000 });
-      }
+      await withPinnedTarget(args, handle => handle.click({ timeout: 10_000 }));
       return state();
     case 'fill_selector':
       checkEpoch(args);
-      {
-        const locator = await targetLocator(args);
-        checkEpoch(args);
-        await locator.fill(args.text, { timeout: 10_000 });
-      }
+      await withPinnedTarget(args, handle => handle.fill(args.text, { timeout: 10_000 }));
       return state();
     case 'press_selector':
       checkEpoch(args);
       if (args.selector || args.target !== undefined) {
-        const locator = await targetLocator(args);
-        checkEpoch(args);
-        await locator.press(args.key, { timeout: 10_000 });
+        await withPinnedTarget(args, handle => handle.press(args.key, { timeout: 10_000 }));
       }
       else await page.keyboard.press(args.key);
       return state();
@@ -291,8 +340,7 @@ async function main() {
     // A remembered iframe target belongs to the old frame document, even if
     // the top-level URL is unchanged. Invalidate its epoch on every document
     // navigation and let the next screencast frame use the new generation.
-    epoch++;
-    lastFrameAt = 0;
+    advanceEpoch();
     if (frame === page.mainFrame()) {
       const url = frame.url();
       if (url !== 'about:blank') {
@@ -305,18 +353,7 @@ async function main() {
   });
   page.setDefaultTimeout(10_000);
   cdp = await context.newCDPSession(page);
-  await page.screencast.start({
-    quality: 75,
-    size: { width: 1200, height: 1000 },
-    onFrame: ({ data, viewportWidth, viewportHeight }) => {
-      const now = Date.now();
-      if (now - lastFrameAt < 100) return;
-      lastFrameAt = now;
-      emit({ event: 'frame', page_epoch: epoch, frame_seq: ++frameSeq,
-        viewport_width: viewportWidth, viewport_height: viewportHeight,
-        data: data.toString('base64') });
-    },
-  });
+  await scheduleCapture();
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of lines) {
