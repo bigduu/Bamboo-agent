@@ -48,6 +48,120 @@ fn number_arg(args: &Value, name: &str) -> Result<f64, ToolError> {
         .ok_or_else(|| ToolError::InvalidArguments(format!("browser requires nonnegative {name}")))
 }
 
+fn pointer_coordinate(args: &Value, name: &str, maximum: f64) -> Result<f64, ToolError> {
+    number_arg(args, name).and_then(|value| {
+        (value < maximum).then_some(value).ok_or_else(|| {
+            ToolError::InvalidArguments(format!("browser {name} must be within the viewport"))
+        })
+    })
+}
+
+fn pointer_selector<'a>(args: &'a Value, name: &str) -> Result<&'a str, ToolError> {
+    let selector = text_arg(args, name)?;
+    if selector.trim().is_empty() || selector.encode_utf16().count() > 512 {
+        return Err(ToolError::InvalidArguments(format!(
+            "browser {name} must be 1..512 UTF-16 code units"
+        )));
+    }
+    Ok(selector)
+}
+
+fn pointer_button(args: &Value) -> Result<&str, ToolError> {
+    let button = match args.get("button") {
+        None => "left",
+        Some(value) => value.as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("browser button must be left, right, or middle".into())
+        })?,
+    };
+    if !matches!(button, "left" | "right" | "middle") {
+        return Err(ToolError::InvalidArguments(
+            "browser button must be left, right, or middle".into(),
+        ));
+    }
+    Ok(button)
+}
+
+fn pointer_request(
+    action: &str,
+    args: &Value,
+    epoch: u64,
+) -> Result<(&'static str, Value), ToolError> {
+    let invalid =
+        || ToolError::InvalidArguments("browser pointer target is ambiguous or incomplete".into());
+    match action {
+        "hover" => {
+            if args.get("target").is_some_and(|value| !value.is_null())
+                || args.get("button").is_some()
+                || args.get("source_selector").is_some()
+                || args.get("target_selector").is_some()
+                || args.get("to_x").is_some()
+                || args.get("to_y").is_some()
+            {
+                return Err(invalid());
+            }
+            if args.get("selector").is_some_and(|value| !value.is_null()) {
+                if args.get("x").is_some() || args.get("y").is_some() {
+                    return Err(invalid());
+                }
+                Ok((
+                    "hover_selector",
+                    json!({"selector":pointer_selector(args,"selector")?,"expected_epoch":epoch}),
+                ))
+            } else {
+                Ok((
+                    "hover_at",
+                    json!({
+                        "x":pointer_coordinate(args,"x",1200.0)?,
+                        "y":pointer_coordinate(args,"y",1000.0)?,
+                        "expected_epoch":epoch,
+                    }),
+                ))
+            }
+        }
+        "drag" => {
+            if args.get("target").is_some_and(|value| !value.is_null())
+                || args.get("selector").is_some()
+            {
+                return Err(invalid());
+            }
+            let button = pointer_button(args)?;
+            if args.get("source_selector").is_some() || args.get("target_selector").is_some() {
+                if args.get("x").is_some()
+                    || args.get("y").is_some()
+                    || args.get("to_x").is_some()
+                    || args.get("to_y").is_some()
+                    || button != "left"
+                {
+                    return Err(invalid());
+                }
+                Ok((
+                    "drag_selector",
+                    json!({
+                        "source_selector":pointer_selector(args,"source_selector")?,
+                        "target_selector":pointer_selector(args,"target_selector")?,
+                        "expected_epoch":epoch,
+                    }),
+                ))
+            } else {
+                Ok((
+                    "drag_at",
+                    json!({
+                        "x":pointer_coordinate(args,"x",1200.0)?,
+                        "y":pointer_coordinate(args,"y",1000.0)?,
+                        "to_x":pointer_coordinate(args,"to_x",1200.0)?,
+                        "to_y":pointer_coordinate(args,"to_y",1000.0)?,
+                        "button":button,
+                        "expected_epoch":epoch,
+                    }),
+                ))
+            }
+        }
+        _ => Err(ToolError::InvalidArguments(
+            "unknown browser pointer action".into(),
+        )),
+    }
+}
+
 fn viewport_arg(args: &Value, name: &str, min: u64, max: u64) -> Result<u64, ToolError> {
     args.get(name)
         .and_then(Value::as_u64)
@@ -197,30 +311,34 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click a CSS selector, semantic role/name, label, text, or coordinate, fill or press a target, select native HTML options, type into the focused element, or scroll. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","fill","select_option","type","press","key","scroll","screenshot"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","type","press","key","scroll","screenshot"]},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "url":{"type":"string","description":"HTTP(S) URL for navigate"},
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, select_option, or optional press; mutually exclusive with target","maxLength":512},
+                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
+                "source_selector":{"type":"string","description":"CSS source selector for drag; pair with target_selector"},
+                "target_selector":{"type":"string","description":"CSS destination selector for drag; pair with source_selector"},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
                 "text":{"type":"string","description":"Text for fill or type; type inserts into the focused element"},
                 "values":{"type":"array","description":"Native select option values for select_option, including the empty value","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":512}},
                 "key":{"type":"string","description":"Keyboard key for press or key, e.g. Enter"},
-                "x":{"type":"number","description":"CSS viewport x for click_at or scroll; nonnegative for click_at"},
-                "y":{"type":"number","description":"CSS viewport y for click_at or scroll; nonnegative for click_at"},
-                "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at; defaults to left"},
+                "x":{"type":"number","description":"CSS viewport x for click_at, scroll, coordinate hover, or coordinate drag"},
+                "y":{"type":"number","description":"CSS viewport y for click_at, scroll, coordinate hover, or coordinate drag"},
+                "to_x":{"type":"number","description":"CSS viewport destination x for coordinate drag"},
+                "to_y":{"type":"number","description":"CSS viewport destination y for coordinate drag"},
+                "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at or coordinate drag; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/fill/select_option/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/type/press/key/scroll: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -258,6 +376,8 @@ impl Tool for BrowserTool {
                 | "viewport"
                 | "click"
                 | "click_at"
+                | "hover"
+                | "drag"
                 | "fill"
                 | "select_option"
                 | "type"
@@ -306,6 +426,10 @@ impl Tool for BrowserTool {
             })).await.map_err(browser_error)?,
             "click" => self.browser.command(session_id, "click_selector", locator_request(&args, epoch, false)?).await.map_err(browser_error)?,
             "click_at" | "type" | "key" => self.browser.command(session_id, "input", input_request(action, &args, epoch)?).await.map_err(browser_error)?,
+            "hover" | "drag" => {
+                let (command, request) = pointer_request(action, &args, epoch)?;
+                self.browser.command(session_id, command, request).await.map_err(browser_error)?
+            },
             "fill" => {
                 let mut request = locator_request(&args, epoch, false)?;
                 request["text"] = json!(args.get("text").and_then(Value::as_str).ok_or_else(|| ToolError::InvalidArguments("browser requires text for fill".into()))?);
@@ -355,7 +479,9 @@ mod tests {
         let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
         let schema = tool.parameters_schema();
         let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
-        for action in ["history", "viewport", "click_at", "type", "key"] {
+        for action in [
+            "history", "viewport", "click_at", "hover", "drag", "type", "key",
+        ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
             assert_eq!(
                 tool.classify(&json!({"action":action})),
@@ -432,6 +558,70 @@ mod tests {
     }
 
     #[test]
+    fn hover_and_drag_requests_are_bounded_and_unambiguous() {
+        assert_eq!(
+            pointer_request("hover", &json!({"selector":"#tip"}), 17).unwrap(),
+            (
+                "hover_selector",
+                json!({"selector":"#tip","expected_epoch":17})
+            )
+        );
+        assert_eq!(
+            pointer_request("hover", &json!({"x":12.5,"y":20}), 17).unwrap(),
+            ("hover_at", json!({"x":12.5,"y":20.0,"expected_epoch":17}))
+        );
+        assert_eq!(
+            pointer_request(
+                "drag",
+                &json!({"source_selector":"#source","target_selector":"#drop"}),
+                17
+            )
+            .unwrap(),
+            (
+                "drag_selector",
+                json!({"source_selector":"#source","target_selector":"#drop","expected_epoch":17})
+            )
+        );
+        assert_eq!(
+            pointer_request(
+                "drag",
+                &json!({"x":10,"y":20,"to_x":30,"to_y":40,"button":"right"}),
+                17
+            )
+            .unwrap(),
+            (
+                "drag_at",
+                json!({"x":10.0,"y":20.0,"to_x":30.0,"to_y":40.0,"button":"right","expected_epoch":17})
+            )
+        );
+        for (action, args) in [
+            ("hover", json!({"selector":"#tip","x":10,"y":20})),
+            ("hover", json!({"selector":" "})),
+            ("hover", json!({"x":1200,"y":20})),
+            ("hover", json!({"x":10,"y":1000})),
+            ("drag", json!({"source_selector":"#source"})),
+            (
+                "drag",
+                json!({"source_selector":"#source","target_selector":"#drop","x":10}),
+            ),
+            (
+                "drag",
+                json!({"source_selector":"#source","target_selector":"#drop","button":"right"}),
+            ),
+            ("drag", json!({"x":10,"y":20,"to_x":1200,"to_y":40})),
+            (
+                "drag",
+                json!({"x":10,"y":20,"to_x":30,"to_y":40,"button":"invalid"}),
+            ),
+        ] {
+            assert!(
+                pointer_request(action, &args, 17).is_err(),
+                "{action}: {args}"
+            );
+        }
+    }
+
+    #[test]
     fn semantic_locator_arguments_are_bounded_and_exclusive_with_css() {
         let role =
             json!({"kind":"role","role":"button","name":"Save","frame_selector":"iframe#checkout"});
@@ -481,6 +671,8 @@ mod tests {
             ("history", json!({"direction":"back"})),
             ("viewport", json!({"width":640,"height":480})),
             ("click_at", json!({"x":12,"y":20})),
+            ("hover", json!({"x":12,"y":20})),
+            ("drag", json!({"x":12,"y":20,"to_x":30,"to_y":40})),
             ("type", json!({"text":"Lotus"})),
             ("key", json!({"key":"Enter"})),
         ] {
@@ -512,5 +704,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn model_hover_and_drag_share_the_workbench_dom_and_screenshot() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let body = br#"<!doctype html><style>
+                        #source{position:absolute;left:20px;top:80px;width:80px;height:80px;background:blue}
+                        #drop{position:absolute;left:220px;top:80px;width:80px;height:80px;background:green}
+                    </style>
+                    <button id="hover" onpointerenter="document.querySelector('#hovered').textContent='yes'">Hover</button>
+                    <div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
+                    <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#dropped').textContent=event.dataTransfer.getData('text/plain')">Drop</div>
+                    <output id="hovered">no</output><output id="dropped">no</output>"#;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let browser = Arc::new(BrowserManager::default());
+        let tool = BrowserTool::new(browser.clone());
+        let mut ctx = ToolCtx::none("browser-test");
+        ctx.session_id = Some(Arc::from("shared-chat"));
+        let opened = browser.open("shared-chat").await.unwrap();
+        let navigated = browser
+            .command(
+                "shared-chat",
+                "navigate",
+                json!({"url":url,"expected_epoch":opened["page_epoch"]}),
+            )
+            .await
+            .unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        for args in [
+            json!({"action":"hover","selector":"#hover","expected_epoch":epoch}),
+            json!({"action":"drag","source_selector":"#source","target_selector":"#drop","expected_epoch":epoch}),
+        ] {
+            let ToolOutcome::Completed(result) = tool.invoke(args, ctx.clone()).await.unwrap()
+            else {
+                panic!("browser action must complete");
+            };
+            let state: Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(state["page_epoch"], epoch);
+            assert_eq!(state["url"], url);
+        }
+        let workbench_dom = browser
+            .command("shared-chat", "dom", json!({}))
+            .await
+            .unwrap();
+        assert!(workbench_dom["html"]
+            .as_str()
+            .unwrap()
+            .contains("id=\"hovered\">yes"));
+        assert!(workbench_dom["html"]
+            .as_str()
+            .unwrap()
+            .contains("id=\"dropped\">moved"));
+        assert_eq!(workbench_dom["page_epoch"], epoch);
+        let workbench_image = browser
+            .command("shared-chat", "screenshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(workbench_image["page_epoch"], epoch);
+        assert_eq!(
+            workbench_image["active_tab_id"],
+            workbench_dom["active_tab_id"]
+        );
+        assert!(workbench_image["data"].as_str().unwrap().len() > 1000);
+        browser.close("shared-chat").await.unwrap();
+        fixture.abort();
     }
 }

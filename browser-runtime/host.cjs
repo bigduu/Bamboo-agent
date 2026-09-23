@@ -300,6 +300,52 @@ async function withPinnedTarget(args, act) {
   }
 }
 
+function pointerPoint(args, xName, yName, page) {
+  const viewport = page.viewportSize();
+  const x = args[xName];
+  const y = args[yName];
+  if (!Number.isFinite(x) || !Number.isFinite(y) ||
+      x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+    throw targetError('invalid_request', 'browser pointer coordinate is outside the viewport');
+  }
+  return { x, y };
+}
+
+function pointerSelector(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 512) {
+    throw targetError('invalid_request', 'invalid browser pointer selector');
+  }
+  return value;
+}
+
+function pointerButton(value) {
+  const button = value ?? 'left';
+  if (!['left', 'right', 'middle'].includes(button)) {
+    throw targetError('invalid_request', 'invalid browser pointer button');
+  }
+  return button;
+}
+
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left') {
+  if (expectedEpoch !== epoch) throw staleEpochError();
+  await page.mouse.move(source.x, source.y);
+  if (expectedEpoch !== epoch) throw staleEpochError();
+  await page.mouse.down({ button });
+  try {
+    for (let step = 1; step <= 12; step++) {
+      if (expectedEpoch !== epoch) throw staleEpochError();
+      await page.mouse.move(
+        source.x + (destination.x - source.x) * step / 12,
+        source.y + (destination.y - source.y) * step / 12,
+      );
+    }
+  } finally {
+    // Release the button even if a page handler navigates during the gesture.
+    await page.mouse.up({ button }).catch(() => {});
+  }
+  if (expectedEpoch !== epoch) throw staleEpochError();
+}
+
 function activateTab(tab) {
   if (activeTabId === tab.id) return;
   activeTabId = tab.id;
@@ -495,6 +541,47 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
+    case 'hover_selector':
+      checkEpoch(args);
+      await withPinnedTarget(args, handle => handle.hover({ timeout: 10_000 }));
+      return state();
+    case 'hover_at':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      var hoverPoint = pointerPoint(args, 'x', 'y', page);
+      checkEpoch(args);
+      await page.mouse.move(hoverPoint.x, hoverPoint.y);
+      return state();
+    case 'drag_selector':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      var sourceSelector = pointerSelector(args.source_selector);
+      var targetSelector = pointerSelector(args.target_selector);
+      await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
+        await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
+          await source.scrollIntoViewIfNeeded({ timeout: 10_000 });
+          checkEpoch(args);
+          await destination.scrollIntoViewIfNeeded({ timeout: 10_000 });
+          checkEpoch(args);
+          const from = await source.boundingBox();
+          const to = await destination.boundingBox();
+          if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
+          const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
+          const end = pointerPoint({ x: to.x + to.width / 2, y: to.y + to.height / 2 }, 'x', 'y', page);
+          checkEpoch(args);
+          await dragBetween(page, start, end, args.expected_epoch);
+        });
+      });
+      return state();
+    case 'drag_at':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      var from = pointerPoint(args, 'x', 'y', page);
+      var to = pointerPoint(args, 'to_x', 'to_y', page);
+      var button = pointerButton(args.button);
+      checkEpoch(args);
+      await dragBetween(page, from, to, args.expected_epoch, button);
+      return state();
     case 'screenshot': {
       return stableRead(async tab => {
         const page = tab.page;

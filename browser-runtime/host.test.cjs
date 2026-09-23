@@ -248,3 +248,76 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     await once(fixture, 'close');
   }
 });
+
+test('hover and straight drag change the shared page and reject stale coordinates', async () => {
+  const fixture = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end(`<!doctype html><style>
+      body { margin: 0; }
+      #hover { position: absolute; left: 20px; top: 20px; width: 80px; height: 30px; }
+      #source { position: absolute; left: 20px; top: 80px; width: 80px; height: 80px; background: blue; }
+      #drop { position: absolute; left: 220px; top: 80px; width: 100px; height: 80px; background: green; }
+    </style>
+    <button id="hover" onpointerenter="const out=document.querySelector('#hovered');out.textContent=String(Number(out.textContent)+1)">Hover</button>
+    <div id="source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','source')">Drag</div>
+    <div id="drop" ondragover="event.preventDefault()" ondrop="event.preventDefault(); document.querySelector('#dropped').textContent=event.dataTransfer.getData('text/plain')+'-'+(++window.dropCount)">Drop</div>
+    <output id="hovered">0</output><output id="dropped">idle</output><script>window.dropCount=0</script>`);
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const url = `http://127.0.0.1:${fixture.address().port}/`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 30_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const navigated = await call('navigate', { url, expected_epoch: initial.page_epoch });
+    assert.equal(navigated.ok, true);
+    const epoch = navigated.result.page_epoch;
+    assert.equal((await call('hover_selector', { selector: '#hover', expected_epoch: epoch })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="hovered">1<\/output>/);
+    assert.equal((await call('hover_at', { x: 150, y: 35, expected_epoch: epoch })).ok, true);
+    assert.equal((await call('hover_at', { x: 60, y: 35, expected_epoch: epoch })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="hovered">2<\/output>/);
+    assert.equal((await call('drag_selector', {
+      source_selector: '#source', target_selector: '#drop', expected_epoch: epoch,
+    })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="dropped">source-1<\/output>/);
+    assert.equal((await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: epoch,
+    })).ok, true);
+    assert.match((await call('dom')).result.html, /<output id="dropped">source-2<\/output>/);
+    const image = await call('screenshot');
+    assert.equal(image.ok, true);
+    assert.equal(image.result.page_epoch, epoch);
+    assert.equal(image.result.active_tab_id, navigated.result.active_tab_id);
+    assert.ok(Buffer.from(image.result.data, 'base64').length > 1000);
+    assert.equal((await call('hover_at', { x: 1500, y: 20, expected_epoch: epoch })).code, 'invalid_request');
+    const resized = await call('viewport', { width: 640, height: 480, expected_epoch: epoch });
+    assert.equal(resized.ok, true);
+    assert.equal((await call('drag_at', {
+      x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: epoch,
+    })).code, 'stale_epoch');
+    assert.equal((await call('hover_selector', { selector: '#hover', expected_epoch: epoch })).code, 'stale_epoch');
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});
