@@ -41,12 +41,20 @@ impl OverlayToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
+            // A repaired JSON warning contains a preview of the arguments.
+            // browser_eval may carry page source and URL query secrets, including
+            // when a namespaced call resolves to this overlay during replay.
+            let warning_for_log = if self.overlay.name().eq_ignore_ascii_case("browser_eval") {
+                "[redacted]"
+            } else {
+                warning.as_str()
+            };
             tracing::warn!(
                 "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
                 call.id,
                 call.function.name,
                 args_raw.len(),
-                warning
+                warning_for_log
             );
         }
         args
@@ -947,13 +955,14 @@ mod tests {
     /// a test can prove WHICH value the overlay passed through: the threaded
     /// pre-parsed value, or a re-parse of the raw string.
     struct ArgsRecordingOverlayTool {
+        name: &'static str,
         seen: std::sync::Arc<StdMutex<Option<serde_json::Value>>>,
     }
 
     #[async_trait]
     impl Tool for ArgsRecordingOverlayTool {
         fn name(&self) -> &str {
-            "memory"
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -985,6 +994,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct WarnCounter {
         warns: std::sync::Arc<AtomicUsize>,
+        events: std::sync::Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct EventFields(String);
+
+    impl tracing::field::Visit for EventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
     }
 
     impl tracing::Subscriber for WarnCounter {
@@ -999,6 +1018,9 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             if *event.metadata().level() == tracing::Level::WARN {
                 self.warns.fetch_add(1, Ordering::SeqCst);
+                let mut fields = EventFields::default();
+                event.record(&mut fields);
+                self.events.lock().unwrap().push(fields.0);
             }
         }
         fn enter(&self, _s: &tracing::span::Id) {}
@@ -1014,7 +1036,10 @@ mod tests {
         let seen = std::sync::Arc::new(StdMutex::new(None));
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "memory",
+                seen: seen.clone(),
+            }),
         );
 
         // Distinctive parsed value; raw args are deliberately broken so a re-parse
@@ -1054,7 +1079,10 @@ mod tests {
         let seen = std::sync::Arc::new(StdMutex::new(None));
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "memory",
+                seen: seen.clone(),
+            }),
         );
 
         let call = make_call_with_args("memory", "{ this is not valid json");
@@ -1080,5 +1108,38 @@ mod tests {
             1,
             "the malformed-args fallback must warn exactly once when it actually parses"
         );
+    }
+
+    #[tokio::test]
+    async fn browser_eval_overlay_reparse_warning_hides_page_source_and_url() {
+        let raw = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query","expected_epoch":1"#;
+        for name in ["browser_eval", "default::browser_eval"] {
+            let seen = std::sync::Arc::new(StdMutex::new(None));
+            let overlay = OverlayToolExecutor::new(
+                std::sync::Arc::new(BaseExecutor),
+                std::sync::Arc::new(ArgsRecordingOverlayTool {
+                    name: "browser_eval",
+                    seen: seen.clone(),
+                }),
+            );
+            let call = make_call_with_args(name, raw);
+            let counter = WarnCounter::default();
+            let events = counter.events.clone();
+            {
+                let _guard = tracing::subscriber::set_default(counter);
+                overlay
+                    .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+                    .await
+                    .expect("repaired overlay call should run");
+            }
+            assert_eq!(
+                seen.lock().unwrap().as_ref().unwrap()["code"],
+                "private-page-source"
+            );
+            let event = events.lock().unwrap().join("\n");
+            assert!(event.contains("warning=[redacted]"), "{event}");
+            assert!(!event.contains("private-page-source"), "{event}");
+            assert!(!event.contains("private-query"), "{event}");
+        }
     }
 }
