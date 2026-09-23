@@ -45,6 +45,7 @@ pub struct BrowserManager {
     sessions: Arc<AsyncMutex<HashMap<String, Arc<BrowserSession>>>>,
     session_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     retired: Arc<Mutex<HashSet<String>>>,
+    cleanup_started: Arc<AtomicBool>,
 }
 
 struct BrowserSession {
@@ -312,6 +313,7 @@ mod tests {
     #[tokio::test]
     async fn idle_sweep_closes_inactive_host_but_keeps_polled_chat_reopenable() {
         let browser = BrowserManager::default();
+        assert!(!browser.cleanup_started.load(Ordering::Acquire));
         let stale = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), false);
         let polled = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), true);
         {
@@ -319,6 +321,8 @@ mod tests {
             sessions.insert("stale-chat".into(), stale.clone());
             sessions.insert("polled-chat".into(), polled);
         }
+        assert!(browser.start_idle_cleanup());
+        assert!(!browser.start_idle_cleanup());
 
         // A workbench frame poll counts as use even if the image did not change.
         assert!(browser.frame("polled-chat", 0, 0).await.unwrap().is_none());
@@ -343,20 +347,40 @@ mod tests {
 }
 
 impl BrowserManager {
-    /// Reclaim Chromium pages after the workbench and agent both stop using them.
-    /// The task holds only a weak manager reference between sweeps.
-    pub fn spawn_idle_cleanup(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
+    /// Start one sweep only after a browser page exists. AppState instances that
+    /// never open Chromium do not leave timers behind.
+    fn start_idle_cleanup(&self) -> bool {
+        if self.cleanup_started.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let weak_sessions = Arc::downgrade(&self.sessions);
+        let weak_gates = Arc::downgrade(&self.session_gates);
+        let weak_retired = Arc::downgrade(&self.retired);
+        let weak_started = Arc::downgrade(&self.cleanup_started);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(BROWSER_IDLE_SWEEP_INTERVAL).await;
-                let Some(browser) = weak.upgrade() else { break };
+                let (Some(sessions), Some(session_gates), Some(retired), Some(cleanup_started)) = (
+                    weak_sessions.upgrade(),
+                    weak_gates.upgrade(),
+                    weak_retired.upgrade(),
+                    weak_started.upgrade(),
+                ) else {
+                    break;
+                };
+                let browser = BrowserManager {
+                    sessions,
+                    session_gates,
+                    retired,
+                    cleanup_started,
+                };
                 let reaped = browser.sweep_idle(BROWSER_IDLE_TTL).await;
                 if reaped > 0 {
                     tracing::debug!(reaped, "reclaimed idle browser sessions");
                 }
             }
         });
+        true
     }
 
     fn session_gate(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
@@ -391,6 +415,7 @@ impl BrowserManager {
                 match session.call("state", json!({})).await {
                     Ok(state) => {
                         session.touch();
+                        self.start_idle_cleanup();
                         return Ok(state);
                     }
                     Err(BrowserError::Unavailable(_)) => {}
@@ -406,6 +431,7 @@ impl BrowserManager {
             .lock()
             .await
             .insert(session_id.to_string(), session);
+        self.start_idle_cleanup();
         Ok(state)
     }
 
