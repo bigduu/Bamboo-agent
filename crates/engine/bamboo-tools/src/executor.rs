@@ -626,7 +626,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                     crate::permission::is_focused_browser_input(&tool_name, &args);
                 let native_browser_select =
                     crate::permission::is_native_browser_select(&tool_name, &args);
-                let browser_eval = canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
+                let browser_eval =
+                    canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
                 let private_browser_display =
                     focused_browser_input || native_browser_select || browser_eval;
                 let denied_message = if browser_eval {
@@ -1083,8 +1084,14 @@ mod tests {
     #[test]
     fn malformed_browser_arguments_redact_both_log_previews() {
         for (tool_name, raw) in [
-            ("browser", r#"{"action":"type","text":"private browser input"#),
-            ("default::browser", r#"{"action":"type","text":"private browser input"#),
+            (
+                "browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
+            (
+                "default::browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
             ("browser_eval", r#"{"code":"private page source"#),
             ("default::browser_eval", r#"{"code":"private page source"#),
         ] {
@@ -2333,10 +2340,7 @@ mod tests {
             .expect("eval pauses for approval");
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         assert_eq!(payload["status"], "awaiting_permission_approval");
-        assert_eq!(
-            payload["resource"],
-            "Execute browser page JavaScript on https://example.com"
-        );
+        assert_eq!(payload["resource"], "Execute browser page JavaScript");
         assert_eq!(payload["permission_request"]["resource"], private_resource);
         for secret in ["private-source", "private-query", &private_resource] {
             assert!(!payload["question"].as_str().unwrap().contains(secret));
@@ -2365,12 +2369,13 @@ mod tests {
         .await;
         assert!(matches!(denied, Err(ToolError::Execution(_))));
         let ask = captured.lock().unwrap().clone().expect("approval request");
-        assert_eq!(
-            ask.resource,
-            "Execute browser page JavaScript on https://example.com"
-        );
+        assert_eq!(ask.resource, "Execute browser page JavaScript");
         let display_request = ask.permission_request.as_ref().expect("typed request");
         assert_eq!(display_request.resource, "[redacted]");
+        assert_eq!(
+            display_request.operation_summary,
+            "Execute browser page JavaScript"
+        );
         assert!(display_request.suggested_matchers.is_empty());
         for secret in ["private-source", "private-query", &private_resource] {
             assert!(!format!("{ask:?}").contains(secret));

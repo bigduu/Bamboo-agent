@@ -450,7 +450,11 @@ impl PermissionRequest {
 
     pub fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         Self::is_focused_browser_resource(tool_name, resource)
-            || (tool_name.eq_ignore_ascii_case("browser_eval")
+            || (tool_name
+                .trim()
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser_eval"))
                 && resource.starts_with("browser_eval:"))
     }
 
