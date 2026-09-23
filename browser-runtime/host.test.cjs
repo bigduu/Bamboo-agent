@@ -251,10 +251,24 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
 
 test('hover and straight drag change the shared page and reject stale coordinates', async () => {
   let wrongPagePointerEvents = 0;
+  const noContentWaiters = [];
   const fixture = http.createServer((request, response) => {
     if (request.url === '/bad-pointer') {
       wrongPagePointerEvents++;
       response.end('ok');
+      return;
+    }
+    if (request.url?.startsWith('/no-document/')) {
+      noContentWaiters.shift()?.();
+      if (request.url === '/no-document/redirect') response.writeHead(302, { location: '/no-document/204' }).end();
+      else if (request.url === '/no-document/download') {
+        response.writeHead(200, { 'content-disposition': 'attachment; filename="sample.txt"' }).end('sample');
+      } else response.writeHead(request.url === '/no-document/205' ? 205 : 204).end();
+      return;
+    }
+    if (request.url?.startsWith('/no-document-start/')) {
+      const destination = request.url.replace('/no-document-start/', '/no-document/');
+      response.end(`<button id="hover" onpointerenter="document.querySelector('output').textContent='hovered'">Hover</button><output>idle</output><script>setTimeout(()=>location.href=${JSON.stringify(destination)},100)</script>`);
       return;
     }
     if (request.url === '/very-slow-hover') {
@@ -680,6 +694,26 @@ test('hover and straight drag change the shared page and reject stale coordinate
       assert.match(html, /<output id="dropped">idle<\/output>/, covered);
     }
 
+    for (const outcome of ['204', '205', 'redirect', 'download']) {
+      const noDocumentRequest = new Promise(resolve => noContentWaiters.push(resolve));
+      const ready = await call('navigate', {
+        url: url + `no-document-start/${outcome}`, expected_epoch: (await call('state')).result.page_epoch,
+      });
+      assert.equal(ready.ok, true);
+      await Promise.race([
+        noDocumentRequest,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${outcome} navigation not requested`)), 3000)),
+      ]);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const surviving = (await call('state')).result;
+      assert.match(surviving.url, new RegExp(`/no-document-start/${outcome}$`));
+      const hover = await call('hover_selector', {
+        selector: '#hover', expected_epoch: surviving.page_epoch,
+      });
+      assert.equal(hover.ok, true, `${outcome}: ${JSON.stringify(hover)}`);
+      assert.match((await call('dom')).result.html, /<output>hovered<\/output>/);
+    }
+
     // Target discovery and actionability consume the same budget as the slow
     // navigation they trigger. Rust would retire this host at 30 seconds.
     const deadlineReady = await call('navigate', {
@@ -822,6 +856,32 @@ test('navigation during observer setup rejects stale hover and drag before point
       assert.match(response.result.url, /\/slow-new$/, action);
       assert.notEqual(response.result.page_epoch, ready.result.page_epoch);
       assert.equal(wrongPagePointerEvents, 0, `${action} must not move or press on the navigating document`);
+    }
+    for (const action of ['hover_at', 'drag_at']) {
+      releaseNavigation = false;
+      const ready = await call('navigate', {
+        url: base + '/slow-race', expected_epoch: (await call('state')).result.page_epoch,
+      });
+      assert.equal(ready.ok, true);
+      const requestStarted = new Promise(resolve => slowNavigationWaiters.push(resolve));
+      releaseNavigation = true;
+      await within(requestStarted, `${action} navigation before observer subscription`);
+      assert.equal(latestFrameEpoch, ready.result.page_epoch, `${action} request has not committed`);
+      const responsePromise = call(action, action === 'hover_at'
+        ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
+        : { x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: ready.result.page_epoch });
+      await new Promise(resolve => setTimeout(resolve, 1700));
+      assert.equal(latestFrameEpoch, ready.result.page_epoch, `${action} request remains in flight`);
+      assert.equal(wrongPagePointerEvents, 0, `${action} must not act on a preexisting navigation`);
+      const response = await responsePromise;
+      if (response.ok) {
+        assert.match(response.result.url, /\/slow-new$/, action);
+        assert.notEqual(response.result.page_epoch, ready.result.page_epoch);
+      } else {
+        assert.equal(response.code, 'stale_epoch', `${action}: ${JSON.stringify(response)}`);
+        assert.match((await call('state')).result.url, /\/slow-new$/, action);
+      }
+      assert.equal(wrongPagePointerEvents, 0, action);
     }
   } finally {
     host.stdin.end();

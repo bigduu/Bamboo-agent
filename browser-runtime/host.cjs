@@ -368,6 +368,16 @@ async function assertDragPoint(handle, point, deadlineAt, trial) {
   }
 }
 
+function navigationResponseKind(response) {
+  const status = response.status();
+  if ([301, 302, 303, 307, 308].includes(status)) return 'redirect';
+  if (status === 204 || status === 205 ||
+      /^\s*attachment(?:\s*;|\s*$)/i.test(response.headers()['content-disposition'] ?? '')) {
+    return 'no_document';
+  }
+  return null;
+}
+
 async function observeActionNavigation(page, deadlineAt) {
   let started = false;
   let committed = false;
@@ -410,6 +420,8 @@ async function observeActionNavigation(page, deadlineAt) {
       failed = false;
       let frame = null;
       try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+      const redirectedFrom = request.redirectedFrom();
+      if (redirectedFrom) pendingRequests.delete(redirectedFrom);
       pendingRequests.set(request, frame);
       revision++;
     };
@@ -424,9 +436,11 @@ async function observeActionNavigation(page, deadlineAt) {
     };
     const onFinished = request => {
       if (target !== observedPage || (target === page && pendingPopupOpens) ||
-          !pendingRequests.has(request) || pendingRequests.get(request) !== null) return;
-      // Playwright cannot always expose a newly-created frame at request time.
-      // Its finished navigation is the fallback completion signal.
+          !pendingRequests.has(request)) return;
+      // A redirect remains pending until its successor request arrives. A
+      // 204/205/download has no document commit, so it completes here.
+      const kind = tabByPage.get(target)?.navigationResponses.get(request);
+      if (kind === 'redirect' || (pendingRequests.get(request) !== null && kind !== 'no_document')) return;
       pendingRequests.delete(request);
       committed = pendingRequests.size === 0;
       revision++;
@@ -454,6 +468,15 @@ async function observeActionNavigation(page, deadlineAt) {
     target.on('framenavigated', onFrame);
     target.on('close', onClose);
     listeners.push({ page: target, onRequest, onFailed, onFinished, onFrame, onClose });
+    // Adopted pages track navigation requests from their creation. A slow
+    // request may already be in flight before this action subscribes.
+    const inFlight = tabByPage.get(target)?.pendingNavigations;
+    if (inFlight?.size) {
+      for (const [request, frame] of inFlight) pendingRequests.set(request, frame);
+      started = true;
+      committed = false;
+      revision++;
+    }
   };
   const onPopup = target => {
     if (pendingPopupOpens) pendingPopupOpens--;
@@ -622,6 +645,8 @@ function adoptPage(target) {
     page: target,
     cdp: context.newCDPSession(target).catch(() => null),
     title: '',
+    pendingNavigations: new Map(),
+    navigationResponses: new WeakMap(),
   };
   tabs.push(tab);
   tabByPage.set(target, tab);
@@ -629,7 +654,30 @@ function adoptPage(target) {
   target.on('domcontentloaded', () => {
     void target.title().then(title => { tab.title = title; }).catch(() => {});
   });
+  target.on('request', request => {
+    if (!request.isNavigationRequest()) return;
+    let frame = null;
+    try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+    const redirectedFrom = request.redirectedFrom();
+    if (redirectedFrom) tab.pendingNavigations.delete(redirectedFrom);
+    tab.pendingNavigations.set(request, frame);
+  });
+  target.on('response', response => {
+    const kind = navigationResponseKind(response);
+    if (kind) tab.navigationResponses.set(response.request(), kind);
+  });
+  target.on('requestfailed', request => tab.pendingNavigations.delete(request));
+  target.on('requestfinished', request => {
+    if (!tab.pendingNavigations.has(request)) return;
+    const kind = tab.navigationResponses.get(request);
+    if (kind !== 'redirect' && (tab.pendingNavigations.get(request) === null || kind === 'no_document')) {
+      tab.pendingNavigations.delete(request);
+    }
+  });
   target.on('framenavigated', frame => {
+    for (const [request, requestedFrame] of tab.pendingNavigations) {
+      if (requestedFrame === frame) tab.pendingNavigations.delete(request);
+    }
     if (frame === target.mainFrame()) {
       const url = frame.url();
       if (url !== 'about:blank') {
