@@ -68,5 +68,5 @@ pub use storage::{
 };
 pub use tool_permissions::{
     check_permissions, check_tool_rules, is_delete_command, is_focused_browser_input,
-    MAX_PROACTIVE_PERMISSION_BATCH,
+    is_native_browser_select, MAX_PROACTIVE_PERMISSION_BATCH,
 };

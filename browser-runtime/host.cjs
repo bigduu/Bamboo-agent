@@ -471,20 +471,29 @@ async function command(action, args = {}) {
     case 'select_option': {
       checkEpoch(args);
       const values = selectOptionArgs(args);
-      const selectedValues = await withPinnedTarget(args, async handle => {
-        const identity = await handle.evaluate(element => ({
-          tag_name: element.tagName,
-          multiple: element.multiple,
-        }));
-        if (identity.tag_name !== 'SELECT') {
-          throw targetError('invalid_target', 'browser select target must be a native select element');
+      try {
+        const selectedValues = await withPinnedTarget(args, async handle => {
+          const identity = await handle.evaluate(element => ({
+            tag_name: element.tagName,
+            multiple: element.multiple,
+          }));
+          if (identity.tag_name !== 'SELECT') {
+            throw targetError('invalid_target', 'browser select target must be a native select element');
+          }
+          if (!identity.multiple && values.length > 1) {
+            throw targetError('invalid_target', 'single-select target accepts exactly one value');
+          }
+          return handle.selectOption(values, { timeout: 10_000 });
+        });
+        return { ...await state(), selected_values: selectedValues };
+      } catch (error) {
+        if (['invalid_target', 'target_not_found', 'ambiguous_target', 'stale_epoch'].includes(error?.code)) {
+          throw error;
         }
-        if (!identity.multiple && values.length > 1) {
-          throw targetError('invalid_target', 'single-select target accepts exactly one value');
-        }
-        return handle.selectOption(values, { timeout: 10_000 });
-      });
-      return { ...await state(), selected_values: selectedValues };
+        // Playwright's call log can quote option values. Keep the failure
+        // actionable without copying page data into the tool error.
+        throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
+      }
     }
     case 'screenshot': {
       return stableRead(async tab => {

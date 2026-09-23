@@ -71,6 +71,9 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
     assert.equal((await call('select_option', { selector: '#single', values: [], expected_epoch: pageEpoch })).code, 'invalid_target');
     assert.equal((await call('select_option', { selector: '#single', values: Array(17).fill('red'), expected_epoch: pageEpoch })).code, 'invalid_target');
     assert.equal((await call('select_option', { selector: '#single', values: ['x'.repeat(513)], expected_epoch: pageEpoch })).code, 'invalid_target');
+    const unavailable = await call('select_option', { selector: '#single', values: ['private-option-not-present'], expected_epoch: pageEpoch });
+    assert.equal(unavailable.code, 'selection_failed');
+    assert.doesNotMatch(unavailable.error, /private-option-not-present/);
     const after = await call('dom');
     assert.match(after.result.html, /<output>2<\/output>/);
     assert.match(after.result.snapshot, /Lotus/);

@@ -52,6 +52,20 @@ fn parse_warning_log_details<'a>(
     }
 }
 
+fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    let mut display = args.clone();
+    if let Some(parameters) = display.as_object_mut() {
+        if crate::permission::is_focused_browser_input(tool_name, args) {
+            parameters.remove("text");
+            parameters.remove("key");
+        } else if crate::permission::is_native_browser_select(tool_name, args) {
+            parameters.remove("selector");
+            parameters.remove("values");
+        }
+    }
+    display
+}
+
 fn copy_legacy_arg_if_missing(
     args: &mut serde_json::Map<String, serde_json::Value>,
     from: &str,
@@ -600,7 +614,10 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let permission_type = context.permission_type;
                 let focused_browser_input =
                     crate::permission::is_focused_browser_input(&tool_name, &args);
-                let approval_display_resource = if focused_browser_input {
+                let native_browser_select =
+                    crate::permission::is_native_browser_select(&tool_name, &args);
+                let private_browser_display = focused_browser_input || native_browser_select;
+                let approval_display_resource = if private_browser_display {
                     operation_summary.clone()
                 } else {
                     resource.clone()
@@ -659,6 +676,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
                             return Err(ToolError::Execution(if focused_browser_input {
                                 "Browser input denied by policy".to_string()
+                            } else if native_browser_select {
+                                "Browser selection denied by policy".to_string()
                             } else {
                                 reason.message
                             }));
@@ -687,6 +706,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                     if let Some(reason) = platform_hard_deny {
                         return Err(ToolError::Execution(if focused_browser_input {
                             "Browser input denied by policy".to_string()
+                        } else if native_browser_select {
+                            "Browser selection denied by policy".to_string()
                         } else {
                             reason
                         }));
@@ -763,6 +784,10 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 ToolError::Execution(
                                     "Browser input permission check failed".to_string(),
                                 )
+                            } else if native_browser_select {
+                                ToolError::Execution(
+                                    "Browser selection permission check failed".to_string(),
+                                )
                             } else {
                                 permission_error_to_tool_error(other)
                             });
@@ -775,7 +800,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // a stronger scope. No boolean downgrade can create a grant.
                 if let Some(proxy) = proxy {
                     let mut display_request = request.clone();
-                    if focused_browser_input {
+                    if private_browser_display {
                         display_request.resource = "[redacted]".to_string();
                         display_request.suggested_matchers.clear();
                     }
@@ -799,13 +824,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // Interactive sessions pause through the legacy question shape
                 // while carrying the complete typed request alongside it.
                 if let Some(tx) = ctx.event_tx {
-                    let mut approval_parameters = args.clone();
-                    if focused_browser_input {
-                        if let Some(parameters) = approval_parameters.as_object_mut() {
-                            parameters.remove("text");
-                            parameters.remove("key");
-                        }
-                    }
+                    let approval_parameters = approval_parameters_for_display(&tool_name, &args);
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
@@ -1052,6 +1071,26 @@ mod tests {
             parse_warning_log_details("Write", raw, &warning);
         assert!(ordinary_preview.contains("private browser input"));
         assert_eq!(ordinary_warning, warning);
+    }
+
+    #[test]
+    fn native_select_approval_event_hides_values_without_changing_execution_args() {
+        let args = json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":17,
+        });
+        let original = args.clone();
+        let display = approval_parameters_for_display("browser", &args);
+        assert_eq!(
+            display,
+            json!({"action":"select_option","expected_epoch":17})
+        );
+        assert_eq!(args, original);
+        assert!(!display.to_string().contains("private-option-value"));
+        assert!(!display.to_string().contains("data-private"));
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
     #[tokio::test]
