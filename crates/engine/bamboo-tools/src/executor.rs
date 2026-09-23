@@ -38,6 +38,20 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
     preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
+fn parse_warning_log_details<'a>(
+    execution_name: &str,
+    args_raw: &str,
+    warning: &'a str,
+) -> (String, &'a str) {
+    if execution_name.eq_ignore_ascii_case("browser") {
+        // A repaired JSON warning embeds its own preview, so both strings
+        // must be hidden when browser input may contain focused typed text.
+        ("[redacted]".to_string(), "[redacted]")
+    } else {
+        (preview_for_log(args_raw, 180), warning)
+    }
+}
+
 fn copy_legacy_arg_if_missing(
     args: &mut serde_json::Map<String, serde_json::Value>,
     from: &str,
@@ -351,6 +365,7 @@ impl BuiltinToolExecutor {
     fn parse_execution_args(
         &self,
         call: &ToolCall,
+        execution_name: &str,
         ctx: &ToolExecutionContext<'_>,
     ) -> serde_json::Value {
         if let Some(pre_parsed) = ctx.pre_parsed_args {
@@ -359,13 +374,15 @@ impl BuiltinToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
+            let (args_preview, warning) =
+                parse_warning_log_details(execution_name, args_raw, &warning);
             tracing::warn!(
                 "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
                 ctx.session_id,
                 call.id,
                 call.function.name,
                 args_raw.len(),
-                preview_for_log(args_raw, 180),
+                args_preview,
                 warning
             );
         }
@@ -383,7 +400,7 @@ impl BuiltinToolExecutor {
             .get(execution_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
         check_raw_tool_input(execution_name, &call.function.arguments)?;
-        let mut args = self.parse_execution_args(call, &ctx);
+        let mut args = self.parse_execution_args(call, execution_name, &ctx);
         check_parsed_tool_input(execution_name, &args)?;
         self.normalize_registered_builtin_args(
             &call.function.name,
@@ -989,6 +1006,21 @@ mod tests {
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         make_tool_call_with_id("call_1", name, args)
+    }
+
+    #[test]
+    fn malformed_browser_arguments_redact_both_log_previews() {
+        let raw = r#"{"action":"type","text":"private browser input"#;
+        let (_, warning) = parse_tool_args_best_effort(raw);
+        let warning = warning.expect("malformed JSON must have a warning");
+        assert!(warning.contains("private browser input"));
+        let (preview, logged_warning) = parse_warning_log_details("browser", raw, &warning);
+        assert_eq!(preview, "[redacted]");
+        assert_eq!(logged_warning, "[redacted]");
+        let (ordinary_preview, ordinary_warning) =
+            parse_warning_log_details("Write", raw, &warning);
+        assert!(ordinary_preview.contains("private browser input"));
+        assert_eq!(ordinary_warning, warning);
     }
 
     #[tokio::test]
