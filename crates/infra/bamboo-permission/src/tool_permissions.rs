@@ -613,6 +613,63 @@ pub fn check_permissions(
                 format!("Web fetch: {}", url),
             )]))
         }
+        "browser_eval" => {
+            if args.get("session_id").is_some() {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval session is bound to the current chat".into(),
+                ));
+            }
+            let code = required_string_arg(args, "code")?;
+            if code.trim().is_empty() || code.len() > 8 * 1024 {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval code must be nonempty and at most 8 KiB".into(),
+                ));
+            }
+            let epoch = args
+                .get("expected_epoch")
+                .and_then(Value::as_u64)
+                .filter(|epoch| *epoch < (1_u64 << 53))
+                .ok_or_else(|| {
+                    PermissionError::CheckFailed(
+                        "browser_eval requires a safe expected_epoch".into(),
+                    )
+                })?;
+            let expected_url = required_string_arg(args, "expected_url")?;
+            if expected_url.len() > 8 * 1024 {
+                return Err(PermissionError::CheckFailed(
+                    "browser_eval expected_url exceeds 8 KiB".into(),
+                ));
+            }
+            let display_origin = if expected_url == "about:blank" {
+                "about:blank".to_string()
+            } else {
+                let parsed = url::Url::parse(expected_url).map_err(|error| {
+                    PermissionError::CheckFailed(format!("invalid browser_eval URL: {error}"))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
+                    return Err(PermissionError::CheckFailed(
+                        "browser_eval requires an http(s) URL without credentials or about:blank"
+                            .into(),
+                    ));
+                }
+                parsed.origin().ascii_serialization()
+            };
+            // JSON tuple encoding keeps the URL and source unambiguous even if
+            // either contains delimiter bytes. The persistent keyed digest
+            // survives a parked one-shot approval across daemon restarts.
+            let fingerprint_input = serde_json::to_string(&(expected_url, code))
+                .expect("two strings always serialize as JSON");
+            let fingerprint =
+                browser_persistent_fingerprint("browser-eval-v1", &fingerprint_input)?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::BrowserInteraction,
+                format!("browser_eval:{epoch}:{fingerprint}"),
+                format!("Execute browser page JavaScript on {display_origin}; can send page data and requests to other websites"),
+            )]))
+        }
         "browser" => {
             let action = required_string_arg(args, "action")?;
             match action {
@@ -1163,6 +1220,154 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn browser_eval_fingerprint_child_process() {
+        let Some(output_path) = std::env::var_os("BAMBOO_EVAL_TEST_OUTPUT") else {
+            return;
+        };
+        let mut args = json!({
+            "code":"document.querySelector('#password').value = 'secret-value'",
+            "expected_epoch":17,
+            "expected_url":"https://example.com/account?token=private-query"
+        });
+        match std::env::var("BAMBOO_EVAL_TEST_CASE").as_deref() {
+            Ok("base") => {}
+            Ok("code") => args["code"] = json!("document.title"),
+            Ok("url") => args["expected_url"] = json!("https://example.com/other"),
+            Ok("epoch") => args["expected_epoch"] = json!(18),
+            Ok("blank") => {
+                args["code"] = json!("1");
+                args["expected_url"] = json!("about:blank");
+            }
+            other => panic!("unexpected eval fingerprint fixture: {other:?}"),
+        }
+        let context = check_permissions("browser_eval", &args)
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert_eq!(context.permission_type, PermissionType::BrowserInteraction);
+        fs::write(
+            output_path,
+            json!({
+                "resource":context.resource,
+                "description":context.operation_description,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn browser_eval_grants_bind_exact_code_url_and_epoch_after_restart() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let run = |case: &str, data_dir: &Path, output_path: &Path| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool_permissions::tests::browser_eval_fingerprint_child_process",
+                ])
+                .env("BAMBOO_DATA_DIR", data_dir)
+                .env("BAMBOO_EVAL_TEST_CASE", case)
+                .env("BAMBOO_EVAL_TEST_OUTPUT", output_path)
+                .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "eval fingerprint child failed");
+            serde_json::from_slice::<Value>(&fs::read(output_path).unwrap()).unwrap()
+        };
+        let base = run("base", data_dir.path(), &data_dir.path().join("base.json"));
+        let restarted = run(
+            "base",
+            data_dir.path(),
+            &data_dir.path().join("restarted.json"),
+        );
+        let resource = base["resource"].as_str().unwrap();
+        assert!(resource.starts_with("browser_eval:17:"));
+        assert_eq!(base, restarted);
+        assert_eq!(
+            base["description"],
+            "Execute browser page JavaScript on https://example.com; can send page data and requests to other websites"
+        );
+        for secret in ["#password", "secret-value", "private-query"] {
+            assert!(!base.to_string().contains(secret));
+        }
+
+        let config = crate::PermissionConfig::default();
+        config
+            .grant_once_for_generation(
+                "chat",
+                "call",
+                "generation",
+                PermissionType::BrowserInteraction,
+                resource.to_string(),
+            )
+            .unwrap();
+        assert!(config.consume_once_for_generation(
+            "chat",
+            "call",
+            "generation",
+            PermissionType::BrowserInteraction,
+            restarted["resource"].as_str().unwrap(),
+        ));
+        assert!(!config.consume_once_for_generation(
+            "chat",
+            "call",
+            "generation",
+            PermissionType::BrowserInteraction,
+            resource,
+        ));
+        for case in ["code", "url", "epoch", "blank"] {
+            let changed = run(
+                case,
+                data_dir.path(),
+                &data_dir.path().join(format!("{case}.json")),
+            );
+            assert_ne!(resource, changed["resource"], "{case}");
+            config
+                .grant_once_for_generation(
+                    "chat",
+                    case,
+                    "generation",
+                    PermissionType::BrowserInteraction,
+                    resource.to_string(),
+                )
+                .unwrap();
+            assert!(!config.consume_once_for_generation(
+                "chat",
+                case,
+                "generation",
+                PermissionType::BrowserInteraction,
+                changed["resource"].as_str().unwrap(),
+            ));
+        }
+        let other_install = run(
+            "base",
+            other_dir.path(),
+            &other_dir.path().join("base.json"),
+        );
+        assert_ne!(resource, other_install["resource"]);
+        assert_ne!(
+            serde_json::to_string(&("a\0b", "c")).unwrap(),
+            serde_json::to_string(&("a", "b\0c")).unwrap(),
+            "URL and code must have an unambiguous fingerprint input"
+        );
+    }
+
+    #[test]
+    fn browser_eval_rejects_unbounded_or_unsafe_requests_before_approval() {
+        for args in [
+            json!({"code":" ","expected_epoch":17,"expected_url":"about:blank"}),
+            json!({"code":"x".repeat(8193),"expected_epoch":17,"expected_url":"about:blank"}),
+            json!({"code":"1","expected_url":"about:blank"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"file:///secret"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"https://user:password@example.com/"}),
+            json!({"code":"1","expected_epoch":17,"expected_url":"about:blank","session_id":"other"}),
+        ] {
+            assert!(check_permissions("browser_eval", &args).is_err(), "{args}");
+        }
+    }
 
     #[test]
     fn browser_navigation_and_interaction_use_distinct_scoped_permissions() {

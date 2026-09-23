@@ -40,7 +40,9 @@ fn parse_warning_log_details<'a>(
     raw_arguments: &str,
     warning: &'a str,
 ) -> (String, &'a str) {
-    if execution_name.eq_ignore_ascii_case("browser") {
+    if execution_name.eq_ignore_ascii_case("browser")
+        || execution_name.eq_ignore_ascii_case("browser_eval")
+    {
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(raw_arguments, 180), warning)
@@ -455,8 +457,11 @@ async fn hook_ask_outcome(
         bamboo_tools::permission::is_focused_browser_input(execution_name, args);
     let native_browser_select =
         bamboo_tools::permission::is_native_browser_select(execution_name, args);
-    let private_browser_input = focused_browser_input || native_browser_select;
-    let private_check_error = if native_browser_select {
+    let browser_eval = execution_name.trim().eq_ignore_ascii_case("browser_eval");
+    let private_browser_approval = focused_browser_input || native_browser_select || browser_eval;
+    let private_check_error = if browser_eval {
+        "Browser page script permission check failed"
+    } else if native_browser_select {
         "Browser selection permission check failed"
     } else if focused_browser_input {
         "Focused browser input permission check failed"
@@ -466,7 +471,7 @@ async fn hook_ask_outcome(
     let permission_context = match bamboo_tools::permission::check_permissions(execution_name, args)
     {
         Ok(contexts) => contexts.and_then(|contexts| contexts.into_iter().next()),
-        Err(_) if browser_execution || private_browser_input => {
+        Err(_) if browser_execution || private_browser_approval => {
             return Some(ToolExecutionOutcome {
                 permission_replay_origin: None,
                 result: Err(private_check_error.to_string()),
@@ -477,7 +482,7 @@ async fn hook_ask_outcome(
         }
         Err(_) => None,
     };
-    if private_browser_input && permission_context.is_none() {
+    if private_browser_approval && permission_context.is_none() {
         return Some(ToolExecutionOutcome {
             permission_replay_origin: None,
             result: Err(private_check_error.to_string()),
@@ -518,7 +523,7 @@ async fn hook_ask_outcome(
         requested_mode,
         config.permission_mode.unwrap_or_default(),
     );
-    let approval_resource = if private_browser_input || browser_without_context {
+    let approval_resource = if private_browser_approval || browser_without_context {
         "[redacted]".to_string()
     } else {
         resource.clone()
@@ -540,7 +545,7 @@ async fn hook_ask_outcome(
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
-        suggested_matchers: if private_browser_input || browser_without_context {
+        suggested_matchers: if private_browser_approval || browser_without_context {
             Vec::new()
         } else {
             bamboo_tools::permission::conservative_matchers(permission_type, &resource)
@@ -1839,6 +1844,44 @@ mod hook_tests {
         assert!(!format!("{:?}", asks[0]).contains("private-key"));
         drop(asks);
 
+        let eval_args = serde_json::json!({
+            "code":"document.title = 'private-source'",
+            "expected_url":"https://example.com/?token=private-query",
+            "expected_epoch":17,
+        });
+        let eval_call = ToolCall {
+            id: "browser-eval".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser_eval".to_string(),
+                arguments: eval_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &eval_call,
+                "browser_eval",
+                &config,
+                &session,
+                &runtime_state,
+                &eval_args,
+            ),
+        )
+        .await
+        .expect("denied eval review returns a tool outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 2);
+        assert_eq!(asks[1].resource, "[redacted]");
+        let eval_request = asks[1].permission_request.as_ref().unwrap();
+        assert_eq!(eval_request.resource, "[redacted]");
+        assert!(eval_request.suggested_matchers.is_empty());
+        for secret in ["private-source", "private-query", "browser_eval:17:"] {
+            assert!(!format!("{:?}", asks[1]).contains(secret));
+        }
+        drop(asks);
+
         let invalid_type_args = serde_json::json!({
             "action":"type",
             "text":"private browser input",
@@ -1874,7 +1917,7 @@ mod hook_tests {
                 .lock()
                 .expect("browser approval record lock")
                 .len(),
-            1
+            2
         );
 
         // A namespaced model call resolves to canonical `browser` before hook
@@ -1924,7 +1967,7 @@ mod hook_tests {
                     .lock()
                     .expect("browser approval record lock")
                     .len(),
-                1
+                2
             );
         }
 
@@ -1956,16 +1999,16 @@ mod hook_tests {
         .expect("read-only browser hook Ask reaches parent");
         assert!(outcome.result.is_err());
         let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 2);
-        assert_eq!(asks[1].resource, "[redacted]");
-        let request = asks[1]
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[2].resource, "[redacted]");
+        let request = asks[2]
             .permission_request
             .as_ref()
             .expect("typed read-only review request");
         assert_eq!(request.resource, "[redacted]");
         assert!(request.suggested_matchers.is_empty());
         for private in ["private-option-value", "data-private"] {
-            assert!(!format!("{:?}", asks[1]).contains(private));
+            assert!(!format!("{:?}", asks[2]).contains(private));
         }
     }
 
@@ -2089,17 +2132,24 @@ mod hook_tests {
 
     #[test]
     fn malformed_browser_tool_warning_hides_raw_preview_and_repair_message() {
-        let raw = r#"{"action":"type","text":"private browser input"#;
-        let (_, warning) = parse_tool_args_best_effort(raw);
-        let warning = warning.expect("malformed JSON warning");
-        assert!(warning.contains("private browser input"));
-        let (preview, logged_warning) = parse_warning_log_details("browser", raw, &warning);
-        assert_eq!(preview, "[redacted]");
-        assert_eq!(logged_warning, "[redacted]");
-        let (ordinary_preview, ordinary_warning) =
-            parse_warning_log_details("probe", raw, &warning);
-        assert!(ordinary_preview.contains("private browser input"));
-        assert_eq!(ordinary_warning, warning);
+        for (tool_name, raw) in [
+            (
+                "browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
+            ("browser_eval", r#"{"code":"private page source"#),
+        ] {
+            let (_, warning) = parse_tool_args_best_effort(raw);
+            let warning = warning.expect("malformed JSON warning");
+            assert!(warning.contains("private"));
+            let (preview, logged_warning) = parse_warning_log_details(tool_name, raw, &warning);
+            assert_eq!(preview, "[redacted]");
+            assert_eq!(logged_warning, "[redacted]");
+            let (ordinary_preview, ordinary_warning) =
+                parse_warning_log_details("probe", raw, &warning);
+            assert!(ordinary_preview.contains("private"));
+            assert_eq!(ordinary_warning, warning);
+        }
     }
 
     #[tokio::test]

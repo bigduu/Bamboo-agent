@@ -25,6 +25,9 @@ const MAX_DIALOG_CHARS = 4_096;
 const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
   ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
   : 300_000;
+const MAX_EVAL_CODE_BYTES = 8 * 1024;
+const MAX_EVAL_JSON_BYTES = 64 * 1024;
+const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -195,6 +198,291 @@ function checkUrl(raw) {
 
 function checkPageUrl(raw) {
   return raw === 'about:blank' ? raw : checkUrl(raw);
+}
+
+function checkEvalArgs(args) {
+  if (typeof args.code !== 'string' || !args.code.trim() ||
+      Buffer.byteLength(args.code, 'utf8') > MAX_EVAL_CODE_BYTES) {
+    const error = new Error('browser_eval code must be nonempty and at most 8 KiB');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (!Number.isSafeInteger(args.expected_epoch) || args.expected_epoch < 0) {
+    const error = new Error('browser_eval requires a safe expected_epoch');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (typeof args.expected_url !== 'string' ||
+      Buffer.byteLength(args.expected_url, 'utf8') > 8192) {
+    const error = new Error('browser_eval requires a bounded expected_url');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  checkPageUrl(args.expected_url);
+  checkEpoch(args);
+}
+
+// Playwright installs this before document scripts in every page and frame.
+// The non-writable function keeps pristine intrinsics in its closure, so page
+// scripts cannot replace the bounded serializer before or during model eval.
+function installEvalHelper(key) {
+  const root = globalThis;
+  const nativeEval = root.eval;
+  const nativeError = Error;
+  const arrayCtor = Array;
+  const weakSetCtor = WeakSet;
+  const isArray = Array.isArray;
+  const isFiniteNumber = Number.isFinite;
+  const isSafeInteger = Number.isSafeInteger;
+  const getPrototypeOf = Object.getPrototypeOf;
+  const objectKeys = Object.keys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const create = Object.create;
+  const define = Object.defineProperty;
+  const setPrototypeOf = Object.setPrototypeOf;
+  const hasOwn = Object.hasOwn;
+  const stringify = JSON.stringify;
+  const apply = Reflect.apply;
+  const charCodeAt = String.prototype.charCodeAt;
+  const seenHas = WeakSet.prototype.has;
+  const seenAdd = WeakSet.prototype.add;
+  const seenDelete = WeakSet.prototype.delete;
+  const plainPrototype = Object.prototype;
+  const withinUtf8Bytes = (text, limit) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index++) {
+      const unit = apply(charCodeAt, text, [index]);
+      if (unit <= 0x7f) bytes++;
+      else if (unit <= 0x7ff) bytes += 2;
+      else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+        const next = apply(charCodeAt, text, [index + 1]);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index++; }
+        else bytes += 3;
+      } else bytes += 3;
+      if (bytes > limit) return false;
+    }
+    return true;
+  };
+
+  const execute = async source => {
+    const value = await (0, nativeEval)(source);
+    const seen = new weakSetCtor();
+    let entries = 0;
+    let stringUnits = 0;
+    const safe = (item, depth) => {
+      if (++entries > 256 || depth > 8) throw new nativeError('browser_eval result exceeds depth or entry limit');
+      if (item === null || typeof item === 'boolean') return item;
+      if (typeof item === 'number' && isFiniteNumber(item)) return item;
+      if (typeof item === 'string') {
+        stringUnits += item.length;
+        if (stringUnits > 65536) throw new nativeError('browser_eval result exceeds string limit');
+        return item;
+      }
+      if (typeof item !== 'object' || apply(seenHas, seen, [item])) {
+        throw new nativeError('browser_eval result is not JSON-safe');
+      }
+      apply(seenAdd, seen, [item]);
+      let result;
+      if (isArray(item)) {
+        const length = item.length;
+        if (!isSafeInteger(length) || length < 0 || length > 64) {
+          throw new nativeError('browser_eval result exceeds array limit');
+        }
+        result = new arrayCtor(length);
+        for (let index = 0; index < length; index++) {
+          const descriptor = getDescriptor(item, index);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor or hole');
+          }
+          define(result, index, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+        // A hostile page may add Array.prototype.toJSON after eval. Keep the
+        // transfer value free of inherited serialization hooks.
+        setPrototypeOf(result, null);
+      } else {
+        const prototype = getPrototypeOf(item);
+        if (prototype !== plainPrototype && prototype !== null) {
+          throw new nativeError('browser_eval result must contain only plain objects');
+        }
+        const keys = objectKeys(item);
+        if (keys.length > 64) throw new nativeError('browser_eval result exceeds object entry limit');
+        result = create(null);
+        for (let index = 0; index < keys.length; index++) {
+          const property = keys[index];
+          if (property.length > 256) throw new nativeError('browser_eval result key is too long');
+          const descriptor = getDescriptor(item, property);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor');
+          }
+          define(result, property, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+      }
+      apply(seenDelete, seen, [item]);
+      return result;
+    };
+    const safeValue = safe(value, 0);
+    const valueJson = stringify(safeValue);
+    if (!withinUtf8Bytes(valueJson, 65536)) throw new nativeError('browser_eval result exceeds 64 KiB');
+    const response = create(null);
+    define(response, 'ok', { value: true, enumerable: true });
+    define(response, 'value', { value: safeValue, enumerable: true });
+    define(response, 'observed_url', { value: root.location.href, enumerable: true });
+    // Playwright's object transfer can use mutable page intrinsics. Return a
+    // bounded primitive and parse it with trusted Node intrinsics instead.
+    const serialized = stringify(response);
+    if (!withinUtf8Bytes(serialized, 75000)) throw new nativeError('browser_eval transfer exceeds limit');
+    return serialized;
+  };
+  const run = async source => {
+    try {
+      return await execute(source);
+    } catch {
+      // Never inspect or stringify a thrown page value. Error.message and
+      // toString can be hostile getters, and Playwright would transfer an
+      // unbounded rejection if this helper let it escape.
+      return '{"ok":false}';
+    }
+  };
+  define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
+}
+
+function validateEvalResult(value) {
+  // The pre-document helper transfers a bounded JSON primitive. Validate its
+  // parsed value again with trusted Node intrinsics before returning it.
+  const stack = [[value, 0]];
+  let entries = 0;
+  let stringUnits = 0;
+  while (stack.length) {
+    const [item, depth] = stack.pop();
+    if (++entries > 256 || depth > 8) {
+      const error = new Error('browser_eval result exceeds depth or entry limit');
+      error.code = 'browser_eval_error';
+      throw error;
+    }
+    if (item === null || typeof item === 'boolean') continue;
+    if (typeof item === 'number' && Number.isFinite(item)) continue;
+    if (typeof item === 'string') {
+      stringUnits += item.length;
+      if (stringUnits <= 65536) continue;
+    } else if (Array.isArray(item)) {
+      if (item.length <= 64) {
+        let valid = true;
+        for (let index = 0; index < item.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
+      }
+    } else if (typeof item === 'object') {
+      const keys = Object.keys(item);
+      const prototype = Object.getPrototypeOf(item);
+      if ((prototype === Object.prototype || prototype === null) &&
+          keys.length <= 64 && keys.every(key => key.length <= 256)) {
+        let valid = true;
+        for (const key of keys) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, key);
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
+      }
+    }
+    const error = new Error('browser_eval result is not JSON-safe or exceeds limits');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  return value;
+}
+
+async function evalInActivePage(args) {
+  checkEvalArgs(args);
+  const tab = requireActiveTab();
+  const page = tab.page;
+  let popupStarted = false;
+  let cdp;
+  const onWindowOpen = () => { popupStarted = true; };
+  const onPopup = () => { popupStarted = true; };
+  const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
+    !page.isClosed() && page.url() === args.expected_url &&
+    // Playwright can adopt a popup after window.open returns if its destination
+    // response is slow. CDP reports the intent before the new tab is visible.
+    !popupStarted &&
+    // A same-URL reload can keep the old URL/epoch until its slow response
+    // commits. Never return a value from the document being replaced.
+    tab.pendingNavigations.size === 0;
+  if (!unchanged()) throw staleEpochError();
+  let transferred;
+  try {
+    // Playwright's page.evaluate compiles its callback through the page's
+    // mutable window.eval. CDP compiles this fixed call independently while
+    // the protected helper still evaluates the model source in the page realm.
+    cdp = await tab.cdp;
+    if (!cdp) throw new Error('browser_eval page session unavailable');
+    page.on('popup', onPopup);
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (!unchanged()) throw staleEpochError();
+    const expression = `window[${JSON.stringify(EVAL_HELPER_KEY)}](${JSON.stringify(args.code)})`;
+    const reply = await cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    });
+    if (reply.exceptionDetails) throw new Error('browser_eval page helper unavailable');
+    const serialized = reply.result?.value;
+    if (typeof serialized !== 'string' || Buffer.byteLength(serialized, 'utf8') > 75000) {
+      throw new Error('browser_eval transfer exceeds limit');
+    }
+    const evaluated = JSON.parse(serialized);
+    if (evaluated?.ok !== true) throw new Error('browser_eval JavaScript failed');
+    if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
+    // A synchronous location assignment may schedule navigation after eval
+    // resolves. Give Chromium a turn to commit it, then recheck from the host.
+    // A second page.evaluate here would expose its Promise/timeout result to
+    // page-controlled globals before any transfer limit is enforced.
+    await new Promise(resolve => setTimeout(resolve, 25));
+    if (!unchanged()) throw staleEpochError();
+    transferred = evaluated.value;
+  } catch (error) {
+    // Chromium may destroy the execution context before Playwright's frame
+    // navigation event advances our epoch. Never surface that result as a
+    // script exception from the old document.
+    if (error?.code === 'stale_epoch' || !unchanged() ||
+        String(error?.message || error).includes('Execution context was destroyed')) {
+      throw staleEpochError();
+    }
+    const boundedError = new Error(bounded(String(error?.message || error), 2048));
+    boundedError.code = 'browser_eval_error';
+    throw boundedError;
+  } finally {
+    page.off('popup', onPopup);
+    cdp?.off('Page.windowOpen', onWindowOpen);
+  }
+  if (!unchanged()) throw staleEpochError();
+  const value = validateEvalResult(transferred);
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_EVAL_JSON_BYTES) {
+    const error = new Error('browser_eval result exceeds 64 KiB');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  if (!unchanged()) throw staleEpochError();
+  return {
+    page_epoch: epoch,
+    active_tab_id: tab.id,
+    url: page.url(),
+    value,
+  };
 }
 
 function requireTabId(raw) {
@@ -1170,6 +1458,8 @@ async function command(action, args = {}) {
         return { viewport, mime_type: 'image/jpeg', data: data.toString('base64') };
       });
     }
+    case 'eval':
+      return evalInActivePage(args);
     case 'close':
       shuttingDown = true;
       await browser.close();
@@ -1191,6 +1481,7 @@ async function main() {
     acceptDownloads: false,
     serviceWorkers: 'block',
   });
+  await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
   await context.route('**/*', route => {
     const request = route.request();
     if (request.isNavigationRequest()) {

@@ -38,9 +38,10 @@ fn timeout_error(
 }
 
 fn preview_for_log(tool_name: &str, value: &str, max_chars: usize) -> String {
-    if bamboo_domain::canonical_tool_name(tool_name).eq_ignore_ascii_case("browser") {
-        // A malformed browser tool call can still contain private prompt or
-        // keyboard text. JSON parsing cannot safely identify its action.
+    let canonical = bamboo_domain::canonical_tool_name(tool_name);
+    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+        // This stream finalizer runs before executor-level argument repair.
+        // Malformed browser calls can contain private input or page source.
         return "[redacted]".to_string();
     }
     let mut iter = value.chars();

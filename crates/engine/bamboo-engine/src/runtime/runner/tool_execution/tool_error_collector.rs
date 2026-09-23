@@ -58,8 +58,9 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn error_preview(tool_name: &str, value: &str) -> String {
-    if tool_name.eq_ignore_ascii_case("browser") {
-        // Browser input and failure text can contain typed content or page
+    let canonical = bamboo_domain::canonical_tool_name(tool_name);
+    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+        // Browser input, page scripts and failure text can contain page
         // data. Keep call metadata for correlation, not those payloads.
         "[redacted]".to_string()
     } else {
@@ -157,17 +158,28 @@ mod tests {
 
     #[test]
     fn browser_hard_and_soft_errors_keep_metadata_without_input_or_result_text() {
-        let args = r#"{"action":"type","text":"private input"}"#;
-        let hard = hard_error_record("session", 3, "browser", "call", args, "private failure");
-        let soft = soft_failure_record("session", 3, "browser", "call", args, "private result");
-        assert_eq!(soft.result_snippet.as_deref(), Some("[redacted]"));
-        for record in [hard, soft] {
-            let serialized = serde_json::to_string(&record).expect("JSON record");
-            assert_eq!(record.tool_name, "browser");
-            assert_eq!(record.tool_call_id, "call");
-            assert_eq!(record.args_preview, "[redacted]");
-            assert_eq!(record.error_message, "[redacted]");
-            assert!(!serialized.contains("private"));
+        for (tool_name, args) in [
+            ("browser", r#"{"action":"type","text":"private input"}"#),
+            (
+                "browser_eval",
+                r#"{"code":"private source","expected_url":"https://example.com/?token=private-query"}"#,
+            ),
+            (
+                "default::browser_eval",
+                r#"{"code":"private source","expected_url":"https://example.com/?token=private-query"}"#,
+            ),
+        ] {
+            let hard = hard_error_record("session", 3, tool_name, "call", args, "private failure");
+            let soft = soft_failure_record("session", 3, tool_name, "call", args, "private result");
+            assert_eq!(soft.result_snippet.as_deref(), Some("[redacted]"));
+            for record in [hard, soft] {
+                let serialized = serde_json::to_string(&record).expect("JSON record");
+                assert_eq!(record.tool_name, tool_name);
+                assert_eq!(record.tool_call_id, "call");
+                assert_eq!(record.args_preview, "[redacted]");
+                assert_eq!(record.error_message, "[redacted]");
+                assert!(!serialized.contains("private"));
+            }
         }
         let ordinary = soft_failure_record("session", 3, "Bash", "call", "echo ok", "failed");
         assert_eq!(ordinary.args_preview, "echo ok");

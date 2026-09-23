@@ -175,6 +175,12 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(popupDom.active_tab_id, popupId);
     assert.match(popupDom.html, /Two page/);
     assert.doesNotMatch(popupDom.html, /One page/);
+    const popupEval = await call('eval', {
+      expected_epoch: popupState.page_epoch, expected_url: base + '/two',
+      code: '({popup: document.title})',
+    });
+    assert.equal(popupEval.ok, true, JSON.stringify(popupEval));
+    assert.deepEqual(popupEval.result.value, { popup: 'Two' });
     const popupFrame = await waitForFrame(popupId, firstFrame.frame_seq, popupState.page_epoch);
     assert.equal(popupFrame.page_epoch, popupState.page_epoch);
     assert.ok(Buffer.from(popupFrame.data, 'base64').length > 1000);
@@ -195,6 +201,12 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(created.tabs.length, 2);
     assert.notEqual(created.active_tab_id, firstId);
     assert.notEqual(created.page_epoch, closedInactive.page_epoch);
+    const newTabEval = await call('eval', {
+      expected_epoch: created.page_epoch, expected_url: 'about:blank',
+      code: '({new_tab: true})',
+    });
+    assert.equal(newTabEval.ok, true, JSON.stringify(newTabEval));
+    assert.deepEqual(newTabEval.result.value, { new_tab: true });
     const thirdId = created.active_tab_id;
     const third = (await call('navigate', { url: base + '/three', expected_epoch: created.page_epoch })).result;
     assert.equal(third.active_tab_id, thirdId);
@@ -1195,6 +1207,360 @@ test('unanswered dialog expires and a pending dialog dismisses on host close', a
   } finally {
     host.stdin.end();
     host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});
+
+test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
+  let slowReloadRequests = 0;
+  let releaseSlowPopup;
+  const slowPopupGate = new Promise(resolve => { releaseSlowPopup = resolve; });
+  let markSlowPopupStarted;
+  const slowPopupStarted = new Promise(resolve => { markSlowPopupStarted = resolve; });
+  let releaseSlowReload;
+  const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve; });
+  let markSlowReloadStarted;
+  const slowReloadStarted = new Promise(resolve => { markSlowReloadStarted = resolve; });
+  const fixture = http.createServer((request, response) => {
+    if (request.url === '/slow-popup-eval') {
+      markSlowPopupStarted();
+      void slowPopupGate.then(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end('<title>Popup destination</title><main>New popup tab</main>');
+      });
+      return;
+    }
+    if (request.url === '/slow-reload') {
+      slowReloadRequests++;
+      const sendPage = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        });
+        response.end('<title>Slow reload</title><output>Current document</output>');
+      };
+      if (slowReloadRequests === 1) sendPage();
+      else {
+        markSlowReloadStarted();
+        void slowReloadGate.then(sendPage);
+      }
+      return;
+    }
+    if (request.url === '/lexical-window.js' || request.url === '/lexical-global.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+      response.end(request.url === '/lexical-window.js'
+        ? "let window = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });"
+        : "let globalThis = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });");
+      return;
+    }
+    if (request.url === '/prepatch.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+      response.end(`
+        Object.create = () => ({ injected: 'x'.repeat(1_000_000) });
+        Object.keys = () => ['spoof'];
+        Object.getOwnPropertyDescriptor = () => ({ value: 'spoof' });
+        Array.isArray = () => false;
+        Number.isSafeInteger = () => true;
+        Array.prototype.map = () => ['spoof'];
+        Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        window.eval = () => () => 'x'.repeat(1_000_000);
+      `);
+      return;
+    }
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': "script-src 'self'",
+    });
+    response.end(request.url === '/next'
+      ? '<title>Next</title><main>New page</main>'
+      : request.url === '/prepatched'
+        ? '<title>Prepatched</title><script src="/prepatch.js"></script><output>0</output>'
+        : request.url === '/lexical-window' || request.url === '/lexical-global'
+          ? `<title>Lexical</title><script src="/${request.url.slice(1)}.js"></script><output>0</output>`
+        : '<title>Eval</title><output>0</output>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const url = `http://127.0.0.1:${fixture.address().port}/`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 30_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    const blank = await call('eval', {
+      expected_epoch: initial.page_epoch, expected_url: 'about:blank', code: '({blank: true})',
+    });
+    assert.equal(blank.ok, true, JSON.stringify(blank));
+    assert.deepEqual(blank.result.value, { blank: true });
+    const prepatchedUrl = `${url}prepatched`;
+    const prepatched = (await call('navigate', { url: prepatchedUrl, expected_epoch: initial.page_epoch })).result;
+    const prepatchedResult = await call('eval', {
+      expected_epoch: prepatched.page_epoch, expected_url: prepatchedUrl, code: '({actual: 11})',
+    });
+    assert.equal(prepatchedResult.ok, true, JSON.stringify(prepatchedResult));
+    assert.deepEqual(prepatchedResult.result.value, { actual: 11 });
+    const prepatchedArray = await call('eval', {
+      expected_epoch: prepatched.page_epoch, expected_url: prepatchedUrl, code: '[3]',
+    });
+    assert.equal(prepatchedArray.ok, true, JSON.stringify(prepatchedArray));
+    assert.deepEqual(prepatchedArray.result.value, [3]);
+    const lexicalWindowUrl = `${url}lexical-window`;
+    const lexicalWindow = (await call('navigate', {
+      url: lexicalWindowUrl, expected_epoch: prepatched.page_epoch,
+    })).result;
+    const lexicalWindowResult = await call('eval', {
+      expected_epoch: lexicalWindow.page_epoch, expected_url: lexicalWindowUrl,
+      code: '({actual: 15})',
+    });
+    assert.equal(lexicalWindowResult.ok, true, JSON.stringify(lexicalWindowResult));
+    assert.deepEqual(lexicalWindowResult.result.value, { actual: 15 });
+    const lexicalGlobalUrl = `${url}lexical-global`;
+    const lexicalGlobal = (await call('navigate', {
+      url: lexicalGlobalUrl, expected_epoch: lexicalWindow.page_epoch,
+    })).result;
+    const lexicalGlobalResult = await call('eval', {
+      expected_epoch: lexicalGlobal.page_epoch, expected_url: lexicalGlobalUrl,
+      code: '({actual: 16})',
+    });
+    assert.equal(lexicalGlobalResult.ok, true, JSON.stringify(lexicalGlobalResult));
+    assert.deepEqual(lexicalGlobalResult.result.value, { actual: 16 });
+    const navigated = (await call('navigate', { url, expected_epoch: lexicalGlobal.page_epoch })).result;
+    const expected = { expected_epoch: navigated.page_epoch, expected_url: url };
+    const read = await call('eval', { ...expected, code: 'document.querySelector("output").textContent' });
+    assert.equal(read.ok, true);
+    assert.equal(read.result.value, '0');
+    assert.equal(read.result.url, url);
+    assert.equal(read.result.active_tab_id, navigated.active_tab_id);
+    assert.equal((await call('eval', { ...expected, code: 'typeof process' })).result.value, 'undefined');
+    const duringOverride = await call('eval', {
+      ...expected,
+      code: '(() => { JSON.stringify = () => "\\\"spoofed\\\""; return {actual: 7}; })()',
+    });
+    assert.equal(duringOverride.ok, true);
+    assert.deepEqual(duringOverride.result.value, { actual: 7 });
+    const existingOverride = await call('eval', { ...expected, code: '({actual: 8})' });
+    assert.equal(existingOverride.ok, true);
+    assert.deepEqual(existingOverride.result.value, { actual: 8 });
+    const hugeOverride = await call('eval', {
+      ...expected,
+      code: '(() => { JSON.stringify = () => "x".repeat(1_000_000); return {actual: 9}; })()',
+    });
+    assert.equal(hugeOverride.ok, true);
+    assert.deepEqual(hugeOverride.result.value, { actual: 9 });
+    const intrinsicOverride = await call('eval', {
+      ...expected,
+      code: `(() => {
+        Object.create = () => ({ injected: 'x'.repeat(1_000_000) });
+        Object.keys = () => ['spoof'];
+        Object.getOwnPropertyDescriptor = () => ({ value: 'spoof' });
+        Array.isArray = () => false;
+        Number.isSafeInteger = () => true;
+        Array.prototype.map = () => ['spoof'];
+        Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        window.eval = () => () => 'x'.repeat(1_000_000);
+        return { actual: 12 };
+      })()`,
+    });
+    assert.equal(intrinsicOverride.ok, true, JSON.stringify(intrinsicOverride));
+    assert.deepEqual(intrinsicOverride.result.value, { actual: 12 });
+    const overriddenArray = await call('eval', { ...expected, code: '[4]' });
+    assert.equal(overriddenArray.ok, true, JSON.stringify(overriddenArray));
+    assert.deepEqual(overriddenArray.result.value, [4]);
+    const changingLength = await call('eval', {
+      ...expected,
+      code: `(() => {
+        const values = [3];
+        let reads = 0;
+        return new Proxy(values, { get(target, property) {
+          if (property === 'length') return ++reads === 1 ? 1 : 1_000_000;
+          return Reflect.get(target, property);
+        }});
+      })()`,
+    });
+    assert.equal(changingLength.ok, true, JSON.stringify(changingLength));
+    assert.deepEqual(changingLength.result.value, [3]);
+
+    const changed = await call('eval', {
+      ...expected,
+      code: '(() => { const output = document.querySelector("output"); output.textContent = "1"; return {count: 1, ok: true}; })()',
+    });
+    assert.equal(changed.ok, true);
+    assert.deepEqual(changed.result.value, { count: 1, ok: true });
+    const dom = (await call('dom')).result;
+    const screenshot = (await call('screenshot')).result;
+    assert.match(dom.html, /<output>1<\/output>/);
+    assert.equal(dom.page_epoch, changed.result.page_epoch);
+    assert.equal(screenshot.page_epoch, changed.result.page_epoch);
+    assert.equal(screenshot.active_tab_id, changed.result.active_tab_id);
+    assert.ok(Buffer.from(screenshot.data, 'base64').length > 1000);
+
+    const scheduledDialog = await call('eval', {
+      ...expected,
+      code: 'setTimeout(() => alert("Pending eval dialog"), 120); "scheduled"',
+    });
+    assert.equal(scheduledDialog.ok, true, JSON.stringify(scheduledDialog));
+    let dialogState;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      dialogState = (await call('state')).result;
+      if (dialogState.pending_dialog) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal(dialogState.pending_dialog.message, 'Pending eval dialog');
+    const blockedEval = await call('eval', {
+      ...expected, code: 'document.querySelector("output").textContent = "not-run"',
+    });
+    assert.equal(blockedEval.code, 'dialog_pending', JSON.stringify(blockedEval));
+    assert.equal((await call('dialog_respond', {
+      dialog_id: dialogState.pending_dialog.dialog_id,
+      accept: false,
+      expected_epoch: expected.expected_epoch,
+    })).ok, true);
+    assert.match((await call('dom')).result.html, /<output>1<\/output>/);
+
+    assert.equal((await call('eval', { ...expected, expected_url: `${url}wrong`, code: '1' })).code, 'stale_epoch');
+    assert.equal((await call('eval', { ...expected, expected_epoch: initial.page_epoch, code: '1' })).code, 'stale_epoch');
+    assert.equal((await call('eval', { ...expected, code: 'x'.repeat(8193) })).code, 'invalid_request');
+    assert.equal((await call('eval', { ...expected, code: '(() => { const x = {}; x.self = x; return x; })()' })).code, 'browser_eval_error');
+    assert.equal((await call('eval', { ...expected, code: '"x".repeat(70000)' })).code, 'browser_eval_error');
+    const multibyte = await call('eval', { ...expected, code: '"汉".repeat(30000)' });
+    assert.equal(multibyte.code, 'browser_eval_error');
+    assert.equal(multibyte.error, 'browser_eval JavaScript failed');
+    const emoji = await call('eval', { ...expected, code: '"💥".repeat(20000)' });
+    assert.equal(emoji.code, 'browser_eval_error');
+    assert.equal(emoji.error, 'browser_eval JavaScript failed');
+    const exception = await call('eval', { ...expected, code: 'throw new Error("E".repeat(5000))' });
+    assert.equal(exception.code, 'browser_eval_error');
+    assert.equal(exception.error, 'browser_eval JavaScript failed');
+    const hugeString = await call('eval', { ...expected, code: 'throw "S".repeat(1_000_000)' });
+    assert.equal(hugeString.code, 'browser_eval_error');
+    assert.equal(hugeString.error, 'browser_eval JavaScript failed');
+    const hugeRejection = await call('eval', {
+      ...expected, code: 'Promise.reject(new Error("R".repeat(1_000_000)))',
+    });
+    assert.equal(hugeRejection.code, 'browser_eval_error');
+    assert.equal(hugeRejection.error, 'browser_eval JavaScript failed');
+    const hostileError = await call('eval', {
+      ...expected,
+      code: `throw new Proxy({}, { get() { throw new Error('hostile error property'); } });`,
+    });
+    assert.equal(hostileError.code, 'browser_eval_error');
+    assert.equal(hostileError.error, 'browser_eval JavaScript failed');
+    const navigation = await call('eval', {
+      ...expected,
+      code: '(() => { location.href = "/next"; return "old"; })()',
+    });
+    assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
+    assert.match((await call('dom')).result.html, /New page/);
+    const finalState = (await call('state')).result;
+    const promiseOverride = await call('eval', {
+      expected_epoch: finalState.page_epoch, expected_url: `${url}next`,
+      code: `(() => {
+        window.Promise = function () { throw new Error('page Promise invoked'); };
+        window.setTimeout = function () { throw new Error('page timeout invoked'); };
+        return { actual: 14 };
+      })()`,
+    });
+    assert.equal(promiseOverride.ok, true, JSON.stringify(promiseOverride));
+    assert.deepEqual(promiseOverride.result.value, { actual: 14 });
+    const identityOverride = await call('eval', {
+      expected_epoch: finalState.page_epoch, expected_url: `${url}next`,
+      code: `(() => {
+        window.globalThis = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });
+        window.window = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });
+        return { actual: 13 };
+      })()`,
+    });
+    assert.equal(identityOverride.ok, true, JSON.stringify(identityOverride));
+    assert.deepEqual(identityOverride.result.value, { actual: 13 });
+
+    const slowUrl = `${url}slow-reload`;
+    const slowPage = (await call('navigate', {
+      url: slowUrl, expected_epoch: finalState.page_epoch,
+    })).result;
+    const slowResultPromise = call('eval', {
+      expected_epoch: slowPage.page_epoch, expected_url: slowUrl,
+      code: '(() => { location.reload(); return "old-document"; })()',
+    });
+    let reloadTimeout;
+    try {
+      await Promise.race([
+        slowReloadStarted,
+        new Promise((_, reject) => {
+          reloadTimeout = setTimeout(() => reject(new Error('slow reload did not start')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(reloadTimeout);
+    }
+    // The old document remains at the same URL and epoch while the response
+    // is withheld. A successful result here would be stale once it commits.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    releaseSlowReload();
+    const slowResult = await slowResultPromise;
+    assert.equal(slowResult.code, 'stale_epoch', JSON.stringify(slowResult));
+    assert.ok(slowReloadRequests >= 2);
+
+    let popupReady;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      popupReady = (await call('state')).result;
+      if (popupReady.page_epoch !== slowPage.page_epoch) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.notEqual(popupReady.page_epoch, slowPage.page_epoch, 'reload committed before popup eval');
+    const popupResult = await call('eval', {
+      expected_epoch: popupReady.page_epoch, expected_url: slowUrl,
+      code: '(() => { window.open("/slow-popup-eval", "_blank"); return "old-tab"; })()',
+    });
+    assert.equal(popupResult.code, 'stale_epoch', JSON.stringify(popupResult));
+    let popupTimer;
+    try {
+      await Promise.race([
+        slowPopupStarted,
+        new Promise((_, reject) => {
+          popupTimer = setTimeout(() => reject(new Error('slow eval popup did not start')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(popupTimer);
+    }
+    releaseSlowPopup();
+    let popupState;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      popupState = (await call('state')).result;
+      if (popupState.tabs.length === 2 && popupState.url.endsWith('/slow-popup-eval')) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(popupState.tabs.length, 2);
+    assert.match(popupState.url, /\/slow-popup-eval$/);
+    assert.notEqual(popupState.active_tab_id, popupReady.active_tab_id);
+  } finally {
+    releaseSlowReload();
+    releaseSlowPopup();
+    await call('close').catch(() => {});
+    host.stdin.end();
+    host.kill();
+    fixture.closeAllConnections();
     fixture.close();
     await once(fixture, 'close');
   }
