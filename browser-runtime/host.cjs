@@ -15,6 +15,12 @@ const POINTER_ACTION_BUDGET_MS = 22_000;
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
   ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS) || 0))
   : 0;
+const TEST_DIALOG_STATE_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DIALOG_STATE_DELAY_MS) || 0))
+  : 0;
+const TEST_DIALOG_READ_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DIALOG_READ_DELAY_MS) || 0))
+  : 0;
 const MAX_DIALOG_CHARS = 4_096;
 const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
   ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
@@ -35,6 +41,7 @@ let shuttingDown = false;
 let browserClosed = false;
 let pendingDialog;
 let inFlightAction;
+const dialogWaiters = new Set();
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -285,6 +292,7 @@ function captureDialog(tab, dialog) {
   pending.timer.unref();
   pendingDialog = pending;
   owner?.notify?.();
+  for (const notify of dialogWaiters) notify();
 }
 
 function targetError(code, message) {
@@ -849,7 +857,32 @@ async function answerDialog(args = {}) {
       throw dialogError('browser_error', 'browser action failed after dialog response');
     }
   }
-  return state();
+  return stateAfterDialog();
+}
+
+async function stateAfterDialog() {
+  if (pendingDialog) return dialogState();
+  let notify;
+  const nextDialog = new Promise(resolve => {
+    notify = resolve;
+    dialogWaiters.add(resolve);
+  });
+  try {
+    const outcome = await Promise.race([
+      (async () => {
+        if (TEST_DIALOG_STATE_DELAY_MS) {
+          await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_STATE_DELAY_MS));
+        }
+        return state();
+      })().then(result => ({ result }), error => ({ error })),
+      nextDialog.then(() => ({ dialog: true })),
+    ]);
+    if (pendingDialog || outcome.dialog) return dialogState();
+    if (outcome.error) throw outcome.error;
+    return outcome.result;
+  } finally {
+    dialogWaiters.delete(notify);
+  }
 }
 
 async function dispatch(action, args = {}) {
@@ -879,7 +912,12 @@ async function dispatch(action, args = {}) {
     nextDialog.then(() => ({ kind: 'dialog' })),
   ]);
   owner.notify = undefined;
-  if (pendingDialog) return dialogState();
+  if (pendingDialog) {
+    if (action === 'dom' || action === 'screenshot') {
+      throw dialogError('dialog_pending', 'answer the pending browser dialog first');
+    }
+    return dialogState();
+  }
   if (outcome.kind === 'error') {
     if (owner.hadDialog) {
       throw dialogError('browser_error', 'browser action failed after dialog');
@@ -973,6 +1011,9 @@ async function command(action, args = {}) {
       }
       return state();
     case 'dom': {
+      if (TEST_DIALOG_READ_DELAY_MS) {
+        await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_READ_DELAY_MS));
+      }
       return stableRead(async tab => {
         const page = tab.page;
         const snapshot = await page.ariaSnapshot({ mode: 'ai', depth: 12, timeout: 10_000 });
@@ -1119,6 +1160,9 @@ async function command(action, args = {}) {
       return state();
     }
     case 'screenshot': {
+      if (TEST_DIALOG_READ_DELAY_MS) {
+        await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_READ_DELAY_MS));
+      }
       return stableRead(async tab => {
         const page = tab.page;
         const viewport = page.viewportSize();

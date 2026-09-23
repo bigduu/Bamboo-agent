@@ -29,7 +29,7 @@ pub enum BrowserError {
     StaleEpoch,
     #[error("browser dialog is no longer pending")]
     StaleDialog,
-    #[error("answer the pending browser dialog first")]
+    #[error("answer the pending browser dialog first; use browser tabs to read its dialog_id and page_epoch")]
     DialogPending,
     #[error("invalid browser request: {0}")]
     Invalid(String),

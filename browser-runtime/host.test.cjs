@@ -910,6 +910,8 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
       <button id="confirm" onclick="document.querySelector('#result').textContent=confirm('Private confirm message')?'yes':'no'">Confirm</button>
       <button id="prompt" onclick="document.querySelector('#result').textContent=prompt('Private prompt message','default text')">Prompt</button>
       <button id="chain" onclick="alert('First dialog');document.querySelector('#result').textContent=confirm('Second dialog')?'chain yes':'chain no'">Chain</button>
+      <button id="timer-chain" onclick="alert('Timer first');setTimeout(() => { alert('Timer second');document.querySelector('#result').textContent='timer answered' }, 30)">Timer chain</button>
+      <button id="schedule-read-dialog" onclick="setTimeout(() => alert('Read dialog'), 300)">Schedule read dialog</button>
       <button id="long" onclick="prompt('m'.repeat(5000),'d'.repeat(5000))">Long</button>
       <button id="unicode-boundary" onclick="prompt('m'.repeat(4095)+String.fromCodePoint(0x1F600),'d'.repeat(4095)+String.fromCodePoint(0x1F600))">Unicode boundary</button>
       <button id="lone-surrogate" onclick="prompt('message'+String.fromCharCode(0xD800)+'end','default'+String.fromCharCode(0xDC00)+'end')">Lone surrogate</button>
@@ -921,7 +923,7 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
   await once(fixture, 'listening');
   const url = `http://127.0.0.1:${fixture.address().port}/`;
   const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
-    env: process.env,
+    env: { ...process.env, NODE_ENV: 'test', BAMBOO_BROWSER_TEST_DIALOG_STATE_DELAY_MS: '250', BAMBOO_BROWSER_TEST_DIALOG_READ_DELAY_MS: '750' },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
   const pending = new Map();
@@ -1025,6 +1027,28 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
     });
     assert.equal(chainDone.ok, true);
     assert.match((await call('dom')).result.html, /<output id="result">chain no<\/output>/);
+    const timerChain = await call('click_selector', { selector: '#timer-chain', expected_epoch: epoch });
+    assert.equal(timerChain.result.pending_dialog.message, 'Timer first');
+    const timerSecond = await call('dialog_respond', {
+      dialog_id: timerChain.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+    });
+    assert.equal(timerSecond.result.pending_dialog.message, 'Timer second');
+    assert.notEqual(timerSecond.result.pending_dialog.dialog_id, timerChain.result.pending_dialog.dialog_id);
+    const timerDone = await call('dialog_respond', {
+      dialog_id: timerSecond.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+    });
+    assert.equal(timerDone.ok, true);
+    assert.match((await call('dom')).result.html, /<output id="result">timer answered<\/output>/);
+    for (const readAction of ['dom', 'screenshot']) {
+      assert.equal((await call('click_selector', { selector: '#schedule-read-dialog', expected_epoch: epoch })).ok, true);
+      const interrupted = await call(readAction);
+      assert.equal(interrupted.code, 'dialog_pending', readAction);
+      const pendingRead = (await call('state')).result.pending_dialog;
+      assert.equal(pendingRead.message, 'Read dialog');
+      assert.equal((await call('dialog_respond', {
+        dialog_id: pendingRead.dialog_id, accept: false, expected_epoch: epoch,
+      })).ok, true);
+    }
     const long = await call('click_selector', { selector: '#long', expected_epoch: epoch });
     assert.equal(long.result.pending_dialog.message.length, 4096);
     assert.equal(long.result.pending_dialog.default_value.length, 4096);

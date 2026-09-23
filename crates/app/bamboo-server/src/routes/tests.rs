@@ -377,17 +377,25 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
         test::call_service(&app, click(epoch)).await.status(),
         StatusCode::CONFLICT
     );
-    assert_eq!(
-        test::call_service(
+    for path in ["dom", "screenshot"] {
+        let blocked = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri(&format!("{base}/dom"))
+                .uri(&format!("{base}/{path}"))
                 .to_request(),
         )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(blocked).await;
+        assert_eq!(body["error"]["code"], "dialog_pending");
+    }
+    let tool = crate::tools::browser::BrowserTool::new(state.browser.clone());
+    let mut owner_read_ctx = ToolCtx::none("dialog-test");
+    owner_read_ctx.session_id = Some(Arc::from("dialog-owner"));
+    assert!(tool
+        .invoke(json!({"action":"snapshot"}), owner_read_ctx)
         .await
-        .status(),
-        StatusCode::CONFLICT
-    );
+        .is_err_and(|error| error.to_string().contains("use browser tabs")));
     let wrong = test::call_service(
         &app,
         test::TestRequest::post()
@@ -429,7 +437,6 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
     let second: Value = test::read_body_json(second).await;
     let second_id = second["pending_dialog"]["dialog_id"].as_str().unwrap();
     assert_ne!(second_id, dialog_id);
-    let tool = crate::tools::browser::BrowserTool::new(state.browser.clone());
     let mut other_ctx = ToolCtx::none("dialog-test");
     other_ctx.session_id = Some(Arc::from("dialog-other"));
     assert!(tool
