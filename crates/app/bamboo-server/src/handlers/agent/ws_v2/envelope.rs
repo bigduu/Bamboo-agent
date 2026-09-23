@@ -267,6 +267,8 @@ pub(crate) enum Channel {
     Feed,
     /// A per-session agent event stream.
     Agent(String),
+    /// A strictly message-only visible assistant text stream.
+    Message(String),
 }
 
 impl Channel {
@@ -279,6 +281,12 @@ impl Channel {
                 None
             } else {
                 Some(Channel::Agent(sid.to_string()))
+            }
+        } else if let Some(sid) = ch.strip_prefix("message.") {
+            if sid.is_empty() {
+                None
+            } else {
+                Some(Channel::Message(sid.to_string()))
             }
         } else {
             None
@@ -355,6 +363,16 @@ mod tests {
                 token: None
             }
         );
+    }
+
+    #[test]
+    fn message_channel_parser_requires_a_session_id() {
+        assert_eq!(
+            Channel::parse("message.s1"),
+            Some(Channel::Message("s1".to_string()))
+        );
+        assert_eq!(Channel::parse("message."), None);
+        assert_eq!(Channel::parse("message"), None);
     }
 
     #[test]

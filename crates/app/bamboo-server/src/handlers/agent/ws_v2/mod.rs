@@ -78,7 +78,8 @@ use self::envelope::{
     Encoding, OutFrame,
 };
 use self::forwarders::{
-    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,
+    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder,
+    spawn_message_forwarder, OutboundTx,
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -853,6 +854,30 @@ async fn subscribe(
                 budget_event_to_replay,
                 critical_events_to_replay,
                 batch_ms,
+            )
+        }
+        Channel::Message(sid) => {
+            if state.session_store.get_index_entry(&sid).await.is_none() {
+                tracing::debug!("ws_v2: ignoring message subscribe to unknown session {sid}");
+                return;
+            }
+            // Subscribe to generation signals before the safe replay snapshot is
+            // read. Events produced during setup remain buffered, while the
+            // message forwarder serializes only the independent safe stream.
+            let (sender, generation_receiver, _runner_snapshot) =
+                crate::handlers::agent::events::subscribe_with_runner_snapshot(
+                    state.get_ref(),
+                    &sid,
+                )
+                .await;
+            state.ensure_notification_relay(&sid, sender);
+            spawn_message_forwarder(
+                state.clone(),
+                sid,
+                out_tx,
+                encoding,
+                ch.to_string(),
+                generation_receiver,
             )
         }
     };
