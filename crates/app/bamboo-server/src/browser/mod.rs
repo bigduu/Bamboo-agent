@@ -6,13 +6,16 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
+
+const BROWSER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const BROWSER_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -51,6 +54,7 @@ struct BrowserSession {
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
     alive: AtomicBool,
+    last_used: Mutex<Instant>,
 }
 
 impl Drop for BrowserSession {
@@ -122,6 +126,7 @@ impl BrowserSession {
             next_id: AtomicU64::new(1),
             frames,
             alive: AtomicBool::new(true),
+            last_used: Mutex::new(Instant::now()),
         });
         let weak = Arc::downgrade(&session);
         tokio::spawn(async move { Self::read_messages(weak, stdout).await });
@@ -208,6 +213,14 @@ impl BrowserSession {
         })));
     }
 
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+
+    fn idle_for(&self, ttl: Duration) -> bool {
+        self.last_used.lock().unwrap().elapsed() >= ttl
+    }
+
     async fn call(&self, action: &str, args: Value) -> Result<Value, BrowserError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
@@ -238,6 +251,28 @@ impl BrowserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn stub_session(idle_for: Duration, alive: bool) -> Arc<BrowserSession> {
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let (frames, _) = watch::channel(None);
+        Arc::new(BrowserSession {
+            child: Mutex::new(child),
+            stdin: AsyncMutex::new(stdin),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            frames,
+            alive: AtomicBool::new(alive),
+            last_used: Mutex::new(Instant::now() - idle_for),
+        })
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -272,9 +307,58 @@ mod tests {
             Err(BrowserError::NotOpen)
         ));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_sweep_closes_inactive_host_but_keeps_polled_chat_reopenable() {
+        let browser = BrowserManager::default();
+        let stale = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), false);
+        let polled = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), true);
+        {
+            let mut sessions = browser.sessions.lock().await;
+            sessions.insert("stale-chat".into(), stale.clone());
+            sessions.insert("polled-chat".into(), polled);
+        }
+
+        // A workbench frame poll counts as use even if the image did not change.
+        assert!(browser.frame("polled-chat", 0, 0).await.unwrap().is_none());
+        assert_eq!(browser.sweep_idle(BROWSER_IDLE_TTL).await, 1);
+        let sessions = browser.sessions.lock().await;
+        assert!(!sessions.contains_key("stale-chat"));
+        assert!(sessions.contains_key("polled-chat"));
+        drop(sessions);
+        assert!(!browser.retired.lock().unwrap().contains("stale-chat"));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if stale.child.lock().unwrap().try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle host process should exit after sweep");
+    }
 }
 
 impl BrowserManager {
+    /// Reclaim Chromium pages after the workbench and agent both stop using them.
+    /// The task holds only a weak manager reference between sweeps.
+    pub fn spawn_idle_cleanup(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(BROWSER_IDLE_SWEEP_INTERVAL).await;
+                let Some(browser) = weak.upgrade() else { break };
+                let reaped = browser.sweep_idle(BROWSER_IDLE_TTL).await;
+                if reaped > 0 {
+                    tracing::debug!(reaped, "reclaimed idle browser sessions");
+                }
+            }
+        });
+    }
+
     fn session_gate(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
         let mut gates = self.session_gates.lock().unwrap();
         if let Some(gate) = gates.get(session_id).and_then(Weak::upgrade) {
@@ -294,11 +378,21 @@ impl BrowserManager {
         if self.retired.lock().unwrap().contains(session_id) {
             return Err(BrowserError::NotOpen);
         }
-        let existing = self.sessions.lock().await.get(session_id).cloned();
+        let existing = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(session_id).cloned();
+            if let Some(session) = &session {
+                session.touch();
+            }
+            session
+        };
         if let Some(session) = existing {
             if session.alive.load(Ordering::Acquire) {
                 match session.call("state", json!({})).await {
-                    Ok(state) => return Ok(state),
+                    Ok(state) => {
+                        session.touch();
+                        return Ok(state);
+                    }
                     Err(BrowserError::Unavailable(_)) => {}
                     Err(error) => return Err(error),
                 }
@@ -307,6 +401,7 @@ impl BrowserManager {
         }
         let session = BrowserSession::spawn().await?;
         let state = session.call("state", json!({})).await?;
+        session.touch();
         self.sessions
             .lock()
             .await
@@ -324,14 +419,18 @@ impl BrowserManager {
         action: &str,
         args: Value,
     ) -> Result<Value, BrowserError> {
-        let session = self
-            .sessions
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .ok_or(BrowserError::NotOpen)?;
-        session.call(action, args).await
+        let session = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .cloned()
+                .ok_or(BrowserError::NotOpen)?;
+            session.touch();
+            session
+        };
+        let result = session.call(action, args).await;
+        session.touch();
+        result
     }
 
     pub async fn command_or_open(
@@ -362,13 +461,54 @@ impl BrowserManager {
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
         let session = self.sessions.lock().await.remove(session_id);
         if let Some(session) = session {
-            let _ = tokio::time::timeout(Duration::from_secs(2), session.call("close", json!({})))
-                .await;
-            if let Ok(mut child) = session.child.lock() {
-                let _ = child.start_kill();
-            }
+            Self::stop_session(session).await;
         }
         Ok(())
+    }
+
+    async fn stop_session(session: Arc<BrowserSession>) {
+        if session.alive.load(Ordering::Acquire) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), session.call("close", json!({})))
+                .await;
+        }
+        if let Ok(mut child) = session.child.lock() {
+            let _ = child.start_kill();
+        }
+    }
+
+    async fn sweep_idle(&self, ttl: Duration) -> usize {
+        let candidates: Vec<String> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, session)| session.idle_for(ttl))
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        let mut reaped = 0;
+        for session_id in candidates {
+            // Open and close are serialized for this chat. Commands and frame
+            // polls touch their session while holding the map lock, so the
+            // recheck/removal cannot race a newly active request.
+            let gate = self.session_gate(&session_id);
+            let _guard = gate.lock().await;
+            let session = {
+                let mut sessions = self.sessions.lock().await;
+                if sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.idle_for(ttl))
+                {
+                    sessions.remove(&session_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(session) = session {
+                Self::stop_session(session).await;
+                reaped += 1;
+            }
+        }
+        reaped
     }
 
     pub async fn frame(
@@ -377,13 +517,15 @@ impl BrowserManager {
         after: u64,
         wait_ms: u64,
     ) -> Result<Option<Arc<BrowserFrame>>, BrowserError> {
-        let session = self
-            .sessions
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .ok_or(BrowserError::NotOpen)?;
+        let session = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .cloned()
+                .ok_or(BrowserError::NotOpen)?;
+            session.touch();
+            session
+        };
         let mut receiver = session.frames.subscribe();
         if !session.alive.load(Ordering::Acquire) {
             return Err(BrowserError::Unavailable("browser host exited".into()));
@@ -415,6 +557,7 @@ impl BrowserManager {
             .await
             .ok()
             .flatten();
+        session.touch();
         if !session.alive.load(Ordering::Acquire) {
             return Err(BrowserError::Unavailable("browser host exited".into()));
         }

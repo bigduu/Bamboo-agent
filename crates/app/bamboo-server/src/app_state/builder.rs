@@ -968,6 +968,7 @@ impl AppState {
             crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
         );
         let browser = Arc::new(crate::browser::BrowserManager::default());
+        browser.spawn_idle_cleanup();
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
             Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools,
