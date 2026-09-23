@@ -16,6 +16,8 @@ fn error_response(error: BrowserError) -> HttpResponse {
         ),
         BrowserError::NotOpen => (actix_web::http::StatusCode::NOT_FOUND, "browser_not_open"),
         BrowserError::StaleEpoch => (actix_web::http::StatusCode::CONFLICT, "stale_epoch"),
+        BrowserError::StaleDialog => (actix_web::http::StatusCode::CONFLICT, "stale_dialog"),
+        BrowserError::DialogPending => (actix_web::http::StatusCode::CONFLICT, "dialog_pending"),
         BrowserError::Invalid(_) => (
             actix_web::http::StatusCode::BAD_REQUEST,
             "invalid_browser_request",
@@ -357,6 +359,47 @@ pub async fn input(
         } => json!({"kind":"key","key":key,"expected_epoch":expected_epoch}),
     };
     match state.browser.command(&session_id, "input", args).await {
+        Ok(value) => HttpResponse::Ok().json(value),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogResponseRequest {
+    dialog_id: String,
+    accept: bool,
+    text: Option<String>,
+    expected_epoch: u64,
+}
+
+pub async fn dialog_respond(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<DialogResponseRequest>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+    if !known_session(&state, &session_id).await {
+        return missing_session();
+    }
+    if !valid_tab_id(&body.dialog_id)
+        || body
+            .text
+            .as_ref()
+            .is_some_and(|text| text.encode_utf16().count() > 4096)
+        || (!body.accept && body.text.is_some())
+    {
+        return error_response(BrowserError::Invalid("invalid dialog response".into()));
+    }
+    match state
+        .browser
+        .command(
+            &session_id,
+            "dialog_respond",
+            json!({"dialog_id":body.dialog_id,"accept":body.accept,"text":body.text,"expected_epoch":body.expected_epoch}),
+        )
+        .await
+    {
         Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
     }

@@ -126,6 +126,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::browser::input),
         )
         .route(
+            "/browser/sessions/{session_id}/dialog",
+            web::post().to(agent::browser::dialog_respond),
+        )
+        .route(
             "/browser/sessions/{session_id}/dom",
             web::get().to(agent::browser::dom),
         )

@@ -3708,12 +3708,13 @@ mod integration_tests {
     }
 
     #[test]
-    fn focused_browser_keyboard_input_requires_one_shot_even_with_remembered_allow() {
+    fn private_browser_interactions_require_one_shot_even_with_remembered_allow() {
         for args in [
             serde_json::json!({"action":"type","text":"private text","expected_epoch":17}),
             serde_json::json!({"action":"key","key":"Tab","expected_epoch":17}),
             serde_json::json!({"action":"press","key":"Enter","expected_epoch":17}),
             serde_json::json!({"action":"press","selector":null,"key":"Enter","expected_epoch":17}),
+            serde_json::json!({"action":"dialog_respond","dialog_id":"a".repeat(24),"accept":true,"text":"private text","expected_epoch":17}),
         ] {
             let config = PermissionConfig::new();
             let evaluation = browser_evaluation("first", args.clone());

@@ -246,6 +246,9 @@ pub fn is_focused_browser_input(tool_name: &str, args: &Value) -> bool {
     }
     match args.get("action").and_then(Value::as_str) {
         Some("type" | "key") => true,
+        // A dialog response targets a transient page prompt and may contain
+        // private text. It uses the same one-shot approval/display boundary.
+        Some("dialog_respond") => true,
         Some("press") => {
             matches!(args.get("target"), None | Some(Value::Null))
                 && matches!(args.get("selector"), None | Some(Value::Null))
@@ -647,6 +650,61 @@ pub fn check_permissions(
                         PermissionType::BrowserInteraction,
                         format!("browser:{epoch}:{action}:{target}"),
                         description,
+                    )]))
+                }
+                "dialog_respond" => {
+                    let epoch = args
+                        .get("expected_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            PermissionError::CheckFailed(
+                                "browser dialog response requires expected_epoch".into(),
+                            )
+                        })?;
+                    let dialog_id = required_string_arg(args, "dialog_id")?;
+                    if dialog_id.len() != 24
+                        || !dialog_id
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                    {
+                        return Err(PermissionError::CheckFailed(
+                            "browser dialog_id must be a 24-character lowercase hex ID".into(),
+                        ));
+                    }
+                    let accept = args.get("accept").and_then(Value::as_bool).ok_or_else(|| {
+                        PermissionError::CheckFailed(
+                            "browser dialog response requires accept".into(),
+                        )
+                    })?;
+                    let text = match args.get("text") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(
+                            value
+                                .as_str()
+                                .filter(|text| text.encode_utf16().count() <= 4096)
+                                .ok_or_else(|| {
+                                    PermissionError::CheckFailed(
+                                        "invalid browser dialog text".into(),
+                                    )
+                                })?,
+                        ),
+                    };
+                    if !accept && text.is_some() {
+                        return Err(PermissionError::CheckFailed(
+                            "dismissed browser dialog cannot include text".into(),
+                        ));
+                    }
+                    let choice = if accept { "accept" } else { "dismiss" };
+                    let text_identity = match text {
+                        Some(text) => browser_persistent_fingerprint("dialog-response-v1", text)?,
+                        None => "none".to_string(),
+                    };
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!(
+                            "browser:{epoch}:dialog_respond:{dialog_id}:{choice}:{text_identity}"
+                        ),
+                        "Answer pending browser dialog",
                     )]))
                 }
                 "click" | "click_at" | "fill" | "select_option" | "type" | "press" | "key"
@@ -1724,6 +1782,70 @@ mod tests {
             PermissionType::BrowserInteraction,
             &different_text.resource
         ));
+    }
+
+    #[test]
+    fn browser_dialog_response_permission_binds_id_epoch_choice_and_private_text() {
+        let dialog_id = "a".repeat(24);
+        let context = |id: &str, epoch: u64, accept: bool, text: Option<&str>| {
+            check_permissions(
+                "browser",
+                &json!({
+                    "action":"dialog_respond","dialog_id":id,
+                    "expected_epoch":epoch,"accept":accept,"text":text
+                }),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+        };
+        let original = context(&dialog_id, 17, true, Some("private answer"));
+        assert_eq!(original.permission_type, PermissionType::BrowserInteraction);
+        assert!(original
+            .resource
+            .starts_with(&format!("browser:17:dialog_respond:{dialog_id}:accept:")));
+        assert!(!original.resource.contains("private answer"));
+        assert_eq!(
+            original.operation_description,
+            "Answer pending browser dialog"
+        );
+        assert!(crate::PermissionRequest::is_focused_browser_resource(
+            "browser",
+            &original.resource
+        ));
+        assert!(is_focused_browser_input(
+            "browser",
+            &json!({"action":"dialog_respond","dialog_id":dialog_id})
+        ));
+        assert_eq!(
+            original.resource,
+            context(&dialog_id, 17, true, Some("private answer")).resource
+        );
+        assert_ne!(
+            original.resource,
+            context(&dialog_id, 18, true, Some("private answer")).resource
+        );
+        assert_ne!(
+            original.resource,
+            context(&"b".repeat(24), 17, true, Some("private answer")).resource
+        );
+        assert_ne!(
+            original.resource,
+            context(&dialog_id, 17, true, Some("other answer")).resource
+        );
+        assert_ne!(
+            original.resource,
+            context(&dialog_id, 17, false, None).resource
+        );
+        for args in [
+            json!({"action":"dialog_respond","dialog_id":"short","accept":true,"expected_epoch":17}),
+            json!({"action":"dialog_respond","dialog_id":dialog_id,"accept":true}),
+            json!({"action":"dialog_respond","dialog_id":dialog_id,"expected_epoch":17}),
+            json!({"action":"dialog_respond","dialog_id":dialog_id,"accept":false,"text":"private answer","expected_epoch":17}),
+            json!({"action":"dialog_respond","dialog_id":dialog_id,"accept":true,"text":"x".repeat(4097),"expected_epoch":17}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err(), "{args}");
+        }
     }
 
     #[test]

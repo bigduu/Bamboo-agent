@@ -15,6 +15,10 @@ const POINTER_ACTION_BUDGET_MS = 22_000;
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
   ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS) || 0))
   : 0;
+const MAX_DIALOG_CHARS = 4_096;
+const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
+  ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
+  : 300_000;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -29,6 +33,8 @@ let lastFrameAt = 0;
 let closing = false;
 let shuttingDown = false;
 let browserClosed = false;
+let pendingDialog;
+let inFlightAction;
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -63,6 +69,41 @@ function tabSummary(tab) {
   };
 }
 
+function dialogError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function dialogState() {
+  const tab = requireActiveTab();
+  const pending = pendingDialog;
+  return {
+    page_epoch: epoch,
+    active_tab_id: tab.id,
+    url: tab.page.url(),
+    title: tab.title,
+    frame_seq: frameSeq,
+    viewport: tab.page.viewportSize(),
+    can_go_back: false,
+    can_go_forward: false,
+    tabs: tabs.map(tabSummary),
+    pending_dialog: pending ? {
+      dialog_id: pending.id,
+      tab_id: pending.tabId,
+      page_epoch: pending.pageEpoch,
+      url: pending.url,
+      type: pending.type,
+      message: bounded(pending.message, MAX_DIALOG_CHARS),
+      message_truncated: pending.message.length > MAX_DIALOG_CHARS,
+      default_value: bounded(pending.defaultValue, MAX_DIALOG_CHARS),
+      default_value_truncated: pending.defaultValue.length > MAX_DIALOG_CHARS,
+      expires_at_ms: pending.expiresAt,
+      status: pending.expired ? 'expired' : 'pending',
+    } : null,
+  };
+}
+
 async function stableRead(read) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const tab = requireActiveTab();
@@ -84,6 +125,10 @@ async function stableRead(read) {
 }
 
 async function state() {
+  // Browser title/history CDP calls can block while a JavaScript dialog is
+  // open. The synchronous page metadata still identifies the authoritative
+  // tab and pending dialog without wedging the host command loop.
+  if (pendingDialog) return dialogState();
   return stableRead(async tab => {
     const viewport = tab.page.viewportSize();
     const title = await tab.page.title();
@@ -179,12 +224,53 @@ function scheduleCapture() {
 
 function advanceEpoch() {
   epoch++;
+  if (pendingDialog && pendingDialog.pageEpoch !== epoch) {
+    expireDialog(pendingDialog);
+  }
   lastFrameAt = 0;
   // Reset the server's cached JPEG before replying with the new active state.
   emit({ event: 'frame_reset', active_tab_id: activeTabId || null, page_epoch: epoch });
   // Restarting screencast yields a first current-epoch JPEG even if a hidden
   // iframe changes without repainting the visible page.
   void scheduleCapture();
+}
+
+function expireDialog(pending) {
+  if (pendingDialog !== pending || pending.expired) return;
+  pending.expired = true;
+  clearTimeout(pending.timer);
+  void pending.dialog.dismiss().catch(() => {}).finally(() => {
+    if (pendingDialog === pending && (!pending.owner || pending.owner.settled)) {
+      pendingDialog = undefined;
+    }
+  });
+}
+
+function captureDialog(tab, dialog) {
+  if (shuttingDown || closing || pendingDialog ||
+      !['alert', 'confirm', 'prompt'].includes(dialog.type())) {
+    void dialog.dismiss().catch(() => {});
+    return;
+  }
+  const owner = inFlightAction;
+  if (owner) owner.hadDialog = true;
+  const pending = {
+    id: randomBytes(12).toString('hex'),
+    tabId: tab.id,
+    pageEpoch: epoch,
+    url: tab.page.url(),
+    type: dialog.type(),
+    message: dialog.message(),
+    defaultValue: dialog.defaultValue(),
+    dialog,
+    owner,
+    expired: false,
+    expiresAt: Date.now() + DIALOG_TIMEOUT_MS,
+  };
+  pending.timer = setTimeout(() => expireDialog(pending), DIALOG_TIMEOUT_MS);
+  pending.timer.unref();
+  pendingDialog = pending;
+  owner?.notify?.();
 }
 
 function targetError(code, message) {
@@ -674,6 +760,7 @@ function adoptPage(target) {
       tab.pendingNavigations.delete(request);
     }
   });
+  target.on('dialog', dialog => captureDialog(tab, dialog));
   target.on('framenavigated', frame => {
     for (const [request, requestedFrame] of tab.pendingNavigations) {
       if (requestedFrame === frame) tab.pendingNavigations.delete(request);
@@ -689,6 +776,7 @@ function adoptPage(target) {
     if (activeTabId === tab.id) advanceEpoch();
   });
   target.on('close', () => {
+    if (pendingDialog?.tabId === tab.id) expireDialog(pendingDialog);
     tabs = tabs.filter(candidate => candidate !== tab);
     if (activeTabId !== tab.id) return;
     activeTabId = tabs.at(-1)?.id;
@@ -701,6 +789,90 @@ function adoptPage(target) {
   // path, so a page cannot exist without an opaque ID and navigation guard.
   activateTab(tab);
   return tab;
+}
+
+async function answerDialog(args = {}) {
+  const pending = pendingDialog;
+  if (!pending || pending.expired || args.dialog_id !== pending.id) {
+    throw dialogError('stale_dialog', 'browser dialog is no longer pending');
+  }
+  if (args.expected_epoch !== pending.pageEpoch || epoch !== pending.pageEpoch ||
+      !tabs.some(tab => tab.id === pending.tabId && !tab.page.isClosed())) {
+    throw staleEpochError();
+  }
+  // Rust serializes an omitted Option<String> as null. Both null and an
+  // absent field mean "use the page's prompt default" or no alert text.
+  const text = args.text == null ? undefined : args.text;
+  if (typeof args.accept !== 'boolean' ||
+      (text !== undefined && (pending.type !== 'prompt' || !args.accept ||
+        typeof text !== 'string' || text.length > MAX_DIALOG_CHARS))) {
+    throw dialogError('invalid_request', 'invalid browser dialog response');
+  }
+  clearTimeout(pending.timer);
+  pendingDialog = undefined;
+  const owner = pending.owner;
+  let nextDialog;
+  if (owner && !owner.settled) {
+    nextDialog = new Promise(resolve => { owner.notify = resolve; });
+  }
+  try {
+    if (args.accept) {
+      await pending.dialog.accept(pending.type === 'prompt' ? (text ?? pending.defaultValue) : undefined);
+    } else {
+      await pending.dialog.dismiss();
+    }
+  } catch {
+    throw dialogError('browser_error', 'browser dialog response failed');
+  }
+  if (owner && !owner.settled) {
+    const outcome = await Promise.race([
+      owner.done,
+      nextDialog.then(() => ({ kind: 'dialog' })),
+    ]);
+    owner.notify = undefined;
+    if (pendingDialog) return dialogState();
+    if (outcome.kind === 'error') {
+      throw dialogError('browser_error', 'browser action failed after dialog response');
+    }
+  }
+  return state();
+}
+
+async function dispatch(action, args = {}) {
+  if (action === 'dialog_respond') return answerDialog(args);
+  if (action === 'close') {
+    if (pendingDialog) expireDialog(pendingDialog);
+    return command(action, args);
+  }
+  if (pendingDialog || inFlightAction) {
+    if (action === 'state' || action === 'tab_list') return dialogState();
+    throw dialogError('dialog_pending', 'answer the pending browser dialog first');
+  }
+  const owner = { settled: false, hadDialog: false };
+  const nextDialog = new Promise(resolve => { owner.notify = resolve; });
+  inFlightAction = owner;
+  owner.done = Promise.resolve().then(() => command(action, args)).then(
+    result => ({ kind: 'done', result }),
+    error => ({ kind: 'error', error }),
+  );
+  void owner.done.then(() => {
+    owner.settled = true;
+    if (inFlightAction === owner) inFlightAction = undefined;
+    if (pendingDialog?.owner === owner && pendingDialog.expired) pendingDialog = undefined;
+  });
+  const outcome = await Promise.race([
+    owner.done,
+    nextDialog.then(() => ({ kind: 'dialog' })),
+  ]);
+  owner.notify = undefined;
+  if (pendingDialog) return dialogState();
+  if (outcome.kind === 'error') {
+    if (owner.hadDialog) {
+      throw dialogError('browser_error', 'browser action failed after dialog');
+    }
+    throw outcome.error;
+  }
+  return outcome.result;
 }
 
 async function command(action, args = {}) {
@@ -981,7 +1153,7 @@ async function main() {
     let request;
     try {
       request = JSON.parse(line);
-      const result = await command(request.action, request.args);
+      const result = await dispatch(request.action, request.args);
       emit({ id: request.id, ok: true, result });
       if (request.action === 'close') break;
     } catch (error) {

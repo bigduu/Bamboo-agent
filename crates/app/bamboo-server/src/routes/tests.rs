@@ -38,6 +38,7 @@ async fn browser_routes_require_access_and_an_existing_chat_session() {
         ("POST", "/api/v1/browser/sessions/missing/history"),
         ("POST", "/api/v1/browser/sessions/missing/viewport"),
         ("POST", "/api/v1/browser/sessions/missing/input"),
+        ("POST", "/api/v1/browser/sessions/missing/dialog"),
         ("GET", "/api/v1/browser/sessions/missing/dom"),
         ("GET", "/api/v1/browser/sessions/missing/frame"),
         ("GET", "/api/v1/browser/sessions/missing/screenshot"),
@@ -106,6 +107,17 @@ async fn browser_routes_require_access_and_an_existing_chat_session() {
         );
     }
 
+    let missing_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/missing/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(24),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, missing_dialog).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
     // Reject malformed opaque IDs before dispatching to a browser host. This
     // also bounds IDs that enter request logs and permission resources.
     let mut session = bamboo_agent_core::Session::new("known-browser-chat", "test-model");
@@ -128,6 +140,16 @@ async fn browser_routes_require_access_and_an_existing_chat_session() {
             );
         }
     }
+    let invalid_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/known-browser-chat/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(10_000),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, invalid_dialog).await.status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[actix_web::test]
@@ -259,6 +281,184 @@ async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
     let closed =
         test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
     assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_response() {
+    use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let body = b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"alert('Private dialog');document.querySelector('output').textContent='answered'\">Ask</button><output>idle</output>";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    for session_id in ["dialog-owner", "dialog-other"] {
+        let mut session = Session::new(session_id, "test-model");
+        state.save_and_cache_session(&mut session).await;
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = "/api/v1/browser/sessions/dialog-owner";
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let navigated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(
+                json!({"url":format!("http://{address}/"),"expected_epoch":opened["page_epoch"]}),
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(navigated.status(), StatusCode::OK);
+    let navigated: Value = test::read_body_json(navigated).await;
+    let epoch = navigated["page_epoch"].as_u64().unwrap();
+
+    let click = |epoch| {
+        test::TestRequest::post()
+            .uri(&format!("{base}/input"))
+            .set_json(json!({"kind":"click","x":50,"y":35,"expected_epoch":epoch}))
+            .to_request()
+    };
+    let pending = test::call_service(&app, click(epoch)).await;
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending: Value = test::read_body_json(pending).await;
+    let dialog_id = pending["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_eq!(pending["pending_dialog"]["type"], "alert");
+    assert_eq!(pending["pending_dialog"]["message"], "Private dialog");
+    assert_eq!(pending["pending_dialog"]["page_epoch"], epoch);
+
+    let state_response =
+        test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+    assert_eq!(state_response.status(), StatusCode::OK);
+    let browser_state: Value = test::read_body_json(state_response).await;
+    assert_eq!(browser_state["pending_dialog"]["dialog_id"], dialog_id);
+    assert_eq!(
+        test::call_service(&app, click(epoch)).await.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{base}/dom"))
+                .to_request(),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let wrong = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":"0".repeat(24),"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::CONFLICT);
+
+    // The HTTP handler serializes omitted text as null. The host must accept
+    // that as an absent prompt value for alert/confirm responses.
+    let accepted = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":dialog_id,"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted: Value = test::read_body_json(accepted).await;
+    assert!(accepted.get("pending_dialog").is_none());
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert!(dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>answered</output>"));
+
+    let second = test::call_service(&app, click(epoch)).await;
+    let second: Value = test::read_body_json(second).await;
+    let second_id = second["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_ne!(second_id, dialog_id);
+    let tool = crate::tools::browser::BrowserTool::new(state.browser.clone());
+    let mut other_ctx = ToolCtx::none("dialog-test");
+    other_ctx.session_id = Some(Arc::from("dialog-other"));
+    assert!(tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            other_ctx
+        )
+        .await
+        .is_err());
+    let owner_state = state.browser.state("dialog-owner").await.unwrap();
+    assert_eq!(owner_state["pending_dialog"]["dialog_id"], second_id);
+    let mut owner_ctx = ToolCtx::none("dialog-test");
+    owner_ctx.session_id = Some(Arc::from("dialog-owner"));
+    let result = tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            owner_ctx,
+        )
+        .await
+        .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("browser dialog did not complete")
+    };
+    let result: Value = serde_json::from_str(&result.result).unwrap();
+    assert!(result.get("pending_dialog").is_none());
+    assert_eq!(result["page_epoch"], epoch);
+
+    state.browser.close("dialog-owner").await.unwrap();
+    state.browser.close("dialog-other").await.unwrap();
+    fixture.abort();
 }
 
 use super::{configure_routes, configure_routes_with_rate_limiting};

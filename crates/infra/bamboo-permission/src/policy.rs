@@ -468,6 +468,12 @@ impl PermissionRequest {
             (Some("type" | "key"), Some(_)) => true,
             (Some("press"), Some("page")) => true,
             (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+            (Some("dialog_respond"), Some(rest)) => rest.split(':').next().is_some_and(|id| {
+                id.len() == 24
+                    && id
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }),
             _ => false,
         }
     }
