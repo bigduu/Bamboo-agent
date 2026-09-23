@@ -119,7 +119,24 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let oversizedChunks = 0;
   let unsolicitedRequests = 0;
   let hangingClosed = 0;
+  let raceAutoMarkers = 0;
+  let raceMarked = false;
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/mark-auto') {
+      raceAutoMarkers++;
+      raceMarked = true;
+      response.end('marked');
+      return;
+    }
+    if (request.url === '/race-file') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="race.bin"',
+      });
+      response.end(raceMarked ? 'ambient-download' : 'selected-download');
+      raceMarked = false;
+      return;
+    }
     if (request.url === '/small' || request.url === '/unsolicited') {
       if (request.url === '/unsolicited') unsolicitedRequests++;
       response.writeHead(200, {
@@ -183,7 +200,11 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end('<main>Unsolicited page</main><script>setTimeout(() => { const link = document.createElement("a"); link.href = "/unsolicited"; document.body.append(link); link.click(); }, 100)</script>');
       return;
     }
-    response.end('<a id="small" href="/small">Small</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><output>Page remains open</output>');
+    if (request.url === '/race') {
+      response.end('<a id="race" href="/race-file" download="race.bin">Selected</a><script>const race=document.querySelector("#race");const original=race.getAttribute.bind(race);race.getAttribute=name=>{if(name==="href"&&!race.dataset.armed){race.dataset.armed="1";setTimeout(async()=>{await fetch("/mark-auto");const link=document.createElement("a");link.href="/race-file";document.body.append(link);link.click()},80)}return original(name)}</script>');
+      return;
+    }
+    response.end('<a id="small" href="/small">Small</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -193,6 +214,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       ...process.env,
       NODE_ENV: 'test',
       BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+      BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
       TMPDIR: tempRoot,
     },
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -249,9 +271,13 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.ok(oversizedChunks < 64, `oversized stream sent ${oversizedChunks} chunks`);
     assert.deepEqual(temporaryDownloadFiles(), [], 'oversized download artifact was deleted');
 
+    const timeoutStartedAt = performance.now();
     const timedOut = await call('download', { selector: '#hanging', expected_epoch: epoch });
+    const timeoutElapsedMs = performance.now() - timeoutStartedAt;
     assert.equal(timedOut.code, 'download_timeout', JSON.stringify(timedOut));
     assert.equal(timedOut.result, undefined);
+    assert.ok(timeoutElapsedMs <= 5_500,
+      `download plus cancellation exceeded the 5-second test budget: ${timeoutElapsedMs}ms`);
     for (let attempt = 0; hangingClosed === 0 && attempt < 40; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 50));
     }
@@ -263,9 +289,28 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.deepEqual(temporaryDownloadFiles(), [], 'failed download artifact was deleted');
     assert.match((await call('dom')).result.snapshot, /Page remains open/);
     assert.equal((await call('screenshot')).ok, true);
+    const staticBlob = await call('download', { selector: '#static-blob', expected_epoch: epoch });
+    assert.equal(staticBlob.code, 'download_unverifiable', JSON.stringify(staticBlob));
+    assert.equal(staticBlob.result, undefined);
+    for (const selector of ['#blob-button', '#async-button']) {
+      const scripted = await call('download', { selector, expected_epoch: epoch });
+      assert.equal(scripted.code, 'download_unverifiable', JSON.stringify(scripted));
+      assert.equal(scripted.result, undefined);
+    }
+    assert.equal((await call('click_selector', { selector: '#after', expected_epoch: epoch })).ok, true);
+    assert.match((await call('dom')).result.snapshot, /Scripts restored/);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'direct and rejected downloads left no artifacts');
+
+    const racePage = (await call('navigate', { url: base + '/race', expected_epoch: epoch })).result;
+    const race = await call('download', { selector: '#race', expected_epoch: racePage.page_epoch });
+    assert.equal(race.ok, true, JSON.stringify(race));
+    assert.equal(Buffer.from(race.result.data_base64, 'base64').toString(), 'selected-download');
+    assert.equal(raceAutoMarkers, 0, 'page timer did not claim the selected same-URL download');
+    assert.match((await call('dom')).result.snapshot, /Selected/);
+    assert.equal((await call('screenshot')).ok, true);
 
     const unsolicited = (await call('navigate', {
-      url: base + '/unsolicited-page', expected_epoch: epoch,
+      url: base + '/unsolicited-page', expected_epoch: racePage.page_epoch,
     })).result;
     await new Promise(resolve => setTimeout(resolve, 450));
     assert.equal(unsolicitedRequests, 1);
@@ -274,6 +319,56 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal((await call('close')).result.closed, true);
     if (host.exitCode === null) await once(host, 'exit');
     assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
+
+    // Force cleanup to overrun its reserved slice in a real Chromium host.
+    // The old process must exit so Rust can retire the session and its TMPDIR.
+    const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
+      [path.join(__dirname, 'host.cjs')], {
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+          BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: '2000',
+          TMPDIR: tempRoot,
+        },
+        stdio: ['pipe', 'pipe', 'inherit'],
+      });
+    const retiringPending = new Map();
+    let retiringId = 1;
+    const retiringLines = readline.createInterface({ input: retiringHost.stdout });
+    retiringLines.on('line', line => {
+      const message = JSON.parse(line);
+      if (message.event) return;
+      const resolve = retiringPending.get(message.id);
+      if (resolve) { retiringPending.delete(message.id); resolve(message); }
+    });
+    const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
+      const id = retiringId++;
+      const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
+      retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
+      retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+    });
+    try {
+      const retiredInitial = (await retiringCall('state')).result;
+      const retiredReady = (await retiringCall('navigate', {
+        url: base + '/', expected_epoch: retiredInitial.page_epoch,
+      })).result;
+      const retirementStartedAt = performance.now();
+      const retiredDownload = await retiringCall('download', {
+        selector: '#hanging', expected_epoch: retiredReady.page_epoch,
+      });
+      const retirementElapsedMs = performance.now() - retirementStartedAt;
+      assert.equal(retiredDownload.code, 'download_timeout', JSON.stringify(retiredDownload));
+      assert.ok(retirementElapsedMs <= 5_500,
+        `download cleanup exceeded its total 5-second test budget: ${retirementElapsedMs}ms`);
+      if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
+      assert.notEqual(retiringHost.exitCode, null, 'timed-out cleanup retired the old host');
+      assert.deepEqual(fs.readdirSync(tempRoot), [], 'retired host removed its temporary download directory');
+    } finally {
+      retiringLines.close();
+      retiringHost.stdin.destroy();
+      retiringHost.kill();
+    }
   } finally {
     host.stdin.end();
     host.kill();

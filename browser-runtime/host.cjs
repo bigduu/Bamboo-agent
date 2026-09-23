@@ -19,6 +19,12 @@ const MAX_DOWNLOAD_BYTES = 256 * 1024;
 const DOWNLOAD_ACTION_BUDGET_MS = process.env.NODE_ENV === 'test'
   ? Math.min(20_000, Math.max(100, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS) || 20_000))
   : 20_000;
+const TEST_DOWNLOAD_CLEANUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(5_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS) || 0))
+  : 0;
+const TEST_DOWNLOAD_CLICK_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS) || 0))
+  : 0;
 // The packaged host does not inherit NODE_ENV. Direct host tests can pause
 // observer setup to force a navigation between the first and final epoch checks.
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
@@ -54,6 +60,7 @@ let browserClosed = false;
 let pendingDialog;
 let inFlightAction;
 const dialogWaiters = new Set();
+let retireAfterReply = false;
 let downloadCdp;
 let downloadDir;
 let activeDownloadAttempt;
@@ -678,7 +685,8 @@ async function removeDownloadArtifacts(guid) {
 
 function onDownloadWillBegin(event) {
   const attempt = activeDownloadAttempt;
-  if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId) {
+  if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId ||
+      event.url !== attempt.expectedUrl) {
     cancelDownloadGuid(event.guid);
     return;
   }
@@ -706,7 +714,8 @@ function onDownloadProgress(event) {
 
 function onPageDownload(page, download) {
   const attempt = activeDownloadAttempt;
-  if (!attempt?.accepting || attempt.page !== page || attempt.download) {
+  if (!attempt?.accepting || attempt.page !== page || attempt.download ||
+      download.url() !== attempt.expectedUrl) {
     void download.cancel().catch(() => {}).then(() => download.delete().catch(() => {}));
     return;
   }
@@ -717,26 +726,34 @@ function onPageDownload(page, download) {
 
 async function boundedDownload(args) {
   const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+  // The 20-second action budget includes cancellation and artifact removal.
+  // Reserve its last slice for cleanup even when the transfer never settles.
+  const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
+  const workDeadlineAt = deadlineAt - cleanupBudget;
+  const cancelDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 2);
+  const terminalDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 4);
   checkEpoch(args);
   if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
     throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
   }
   const tab = requireActiveTab();
-  const cdp = await tab.cdp;
+  const cdp = await downloadDeadline(tab.cdp, workDeadlineAt);
   if (!cdp || !downloadCdp) {
     throw downloadError('download_failed', 'browser download observer unavailable');
   }
-  const frameTree = await downloadDeadline(cdp.send('Page.getFrameTree'), deadlineAt);
+  const frameTree = await downloadDeadline(cdp.send('Page.getFrameTree'), workDeadlineAt);
   checkEpoch(args);
   let resolveDownload;
   let resolveGuid;
   let resolveTerminal;
+  let scriptsDisabled = false;
   const attempt = {
     page: tab.page,
     frameId: frameTree.frameTree.frame.id,
     accepting: false,
     download: null,
     guid: null,
+    expectedUrl: null,
     oversized: false,
     terminal: false,
     downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
@@ -750,17 +767,46 @@ async function boundedDownload(args) {
   try {
     await downloadDeadline(withPinnedTarget(args, async handle => {
       checkEpoch(args);
+      const href = await handle.evaluate(element => {
+        if (element.localName !== 'a') return null;
+        const value = element.getAttribute('href');
+        if (typeof value !== 'string' || !value || value.length > 2_048) return null;
+        const resolved = new URL(value, document.baseURI).href;
+        return typeof resolved === 'string' && resolved.length <= 2_048 ? resolved : null;
+      });
+      if (typeof href !== 'string' || href.length > 2_048 ||
+          !(href.startsWith('http://') || href.startsWith('https://'))) {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      // An already-started navigation/download can complete after the click
+      // begins. Its bytes cannot be attributed to this selected link.
+      if ([...tab.pendingNavigations.keys()].some(request => request.url() === href)) {
+        throw downloadError('download_unverifiable', 'browser download has a competing request');
+      }
+      attempt.expectedUrl = href;
+      // Suspend page scripts during the native link click. A page timer or
+      // onclick handler must not race the approved selector for the one result.
+      scriptsDisabled = true;
+      await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+        workDeadlineAt);
+      await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
+      checkEpoch(args);
+      if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),
+          workDeadlineAt);
+      }
       attempt.accepting = true;
-      await handle.click({ timeout: pointerTimeout(deadlineAt), noWaitAfter: true });
-    }, deadlineAt), deadlineAt);
+      await handle.click({ timeout: pointerTimeout(workDeadlineAt), noWaitAfter: true });
+    }, workDeadlineAt), workDeadlineAt);
     const [download] = await downloadDeadline(
-      Promise.all([attempt.downloadPromise, attempt.guidPromise]), deadlineAt);
+      Promise.all([attempt.downloadPromise, attempt.guidPromise]), workDeadlineAt);
     if (attempt.oversized) {
       throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
     }
     let artifact;
     try {
-      artifact = await downloadDeadline(download.path(), deadlineAt);
+      artifact = await downloadDeadline(download.path(), workDeadlineAt);
     } catch (error) {
       if (attempt.oversized) {
         throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
@@ -768,17 +814,17 @@ async function boundedDownload(args) {
       if (error?.code === 'download_timeout') throw error;
       throw downloadError('download_failed', 'browser download failed');
     }
-    const size = await downloadDeadline(fs.stat(artifact), deadlineAt);
+    const size = await downloadDeadline(fs.stat(artifact), workDeadlineAt);
     if (size.size > MAX_DOWNLOAD_BYTES || attempt.oversized) {
       throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
     }
-    const bytes = await downloadDeadline(fs.readFile(artifact), deadlineAt);
+    const bytes = await downloadDeadline(fs.readFile(artifact), workDeadlineAt);
     if (bytes.length > MAX_DOWNLOAD_BYTES || attempt.oversized) {
       throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
     }
     checkEpoch(args);
     if (activeTabId !== tab.id || tab.page.isClosed()) throw staleEpochError();
-    const current = await downloadDeadline(state(), deadlineAt);
+    const current = await downloadDeadline(state(), workDeadlineAt);
     checkEpoch(args);
     if (current.active_tab_id !== tab.id) throw staleEpochError();
     return {
@@ -792,7 +838,8 @@ async function boundedDownload(args) {
     };
   } catch (error) {
     if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
-      'download_timeout', 'download_too_large', 'download_failed'].includes(error?.code)) {
+      'download_timeout', 'download_too_large', 'download_failed',
+      'download_unverifiable'].includes(error?.code)) {
       throw error;
     }
     // Playwright errors can quote a selected URL or filename. Never forward
@@ -800,35 +847,53 @@ async function boundedDownload(args) {
     throw downloadError('download_failed', 'browser download failed');
   } finally {
     attempt.accepting = false;
-    if (attempt.guid && !attempt.terminal) {
-      await cancelDownloadGuid(attempt.guid);
+    let cleanupError;
+    if (scriptsDisabled) {
+      try {
+        await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: false }),
+          cancelDeadlineAt);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    const cancellation = [];
+    if (attempt.guid && !attempt.terminal) cancellation.push(cancelDownloadGuid(attempt.guid));
+    if (attempt.download && !attempt.terminal) cancellation.push(attempt.download.cancel().catch(() => {}));
+    try {
+      if (TEST_DOWNLOAD_CLEANUP_DELAY_MS && attempt.guid) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLEANUP_DELAY_MS)),
+          cancelDeadlineAt);
+      }
+      await downloadDeadline(Promise.all(cancellation), cancelDeadlineAt);
+      if (attempt.guid && !attempt.terminal) {
+        await downloadDeadline(attempt.terminalPromise, terminalDeadlineAt);
+      }
+    } catch (error) {
+      cleanupError = error;
     }
     if (attempt.download) {
-      let cleanupTimer;
-      await Promise.race([
-        attempt.download.cancel().catch(() => {}).then(() => attempt.download.delete().catch(() => {})),
-        new Promise(resolve => { cleanupTimer = setTimeout(resolve, 2_000); }),
-      ]);
-      clearTimeout(cleanupTimer);
+      try {
+        await downloadDeadline(attempt.download.delete().catch(() => {}), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
     }
-    if (attempt.guid && !attempt.terminal) {
-      let terminalTimer;
-      await Promise.race([
-        attempt.terminalPromise,
-        new Promise(resolve => { terminalTimer = setTimeout(resolve, 2_000); }),
-      ]);
-      clearTimeout(terminalTimer);
-    }
-    let cleanupFailed = false;
     if (attempt.guid) {
       try {
-        await removeDownloadArtifacts(attempt.guid);
-      } catch {
-        cleanupFailed = true;
+        await downloadDeadline(removeDownloadArtifacts(attempt.guid), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
       }
     }
     if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
-    if (cleanupFailed) throw downloadError('download_failed', 'browser download cleanup failed');
+    if (cleanupError) {
+      // A nonterminal transfer can recreate a partial file after cleanup.
+      // Retire the host; Rust owns and removes its per-session TMPDIR on exit.
+      shuttingDown = true;
+      retireAfterReply = true;
+      throw downloadError(cleanupError.code === 'download_timeout' ? 'download_timeout' : 'download_failed',
+        'browser download cleanup failed');
+    }
   }
 }
 
@@ -1744,12 +1809,19 @@ async function main() {
       if (request.action === 'close') break;
     } catch (error) {
       emit({ id: request?.id, ok: false, code: error.code || 'browser_error', error: String(error.message || error) });
+      if (retireAfterReply) break;
     }
   }
   closing = true;
   shuttingDown = true;
   lines.close();
   process.stdin.pause();
+  if (retireAfterReply) {
+    // Never keep a timed-out Chromium transfer alive for the next request.
+    // Rust also kills/reaps this host's process group and removes its TMPDIR.
+    await Promise.race([closeHost(), new Promise(resolve => setTimeout(resolve, 250))]);
+    process.exit(1);
+  }
   await closeHost();
 }
 

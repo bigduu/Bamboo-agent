@@ -268,8 +268,6 @@ async fn execute_and_apply_single_tool_call(
         }
     };
 
-    policy_guard.observe_outcome(tool_call, &outcome.result);
-
     // Compress tool output before applying
     let task_hint = build_task_compression_hint(task_context);
     let outcome = output_compressor::maybe_compress(
@@ -285,6 +283,9 @@ async fn execute_and_apply_single_tool_call(
         task_hint.as_ref(),
     )
     .await;
+    // The output budget may turn an otherwise successful browser download
+    // into a bounded failure. Count the result the model actually receives.
+    policy_guard.observe_outcome(tool_call, &outcome.result);
 
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {

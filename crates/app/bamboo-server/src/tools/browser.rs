@@ -382,7 +382,7 @@ impl Tool for BrowserTool {
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, download, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
+                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, a direct HTTP(S) anchor download, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
                 "source_selector":{"type":"string","description":"CSS source selector for drag; pair with target_selector"},
                 "target_selector":{"type":"string","description":"CSS destination selector for drag; pair with source_selector"},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
@@ -636,6 +636,8 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("download")));
+        assert!(tool.description().contains("direct HTTP(S) <a href>"));
+        assert!(tool.description().contains("download_unverifiable"));
         assert_eq!(
             tool.classify(&json!({"action":"download"})),
             ToolClass::MUTATING_SERIAL

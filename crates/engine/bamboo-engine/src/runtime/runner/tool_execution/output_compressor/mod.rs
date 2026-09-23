@@ -655,8 +655,9 @@ fn compress_by_scenario(
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::{ToolPolicyGuard, ToolPolicyPrecheckViolation};
     use super::*;
-    use bamboo_agent_core::tools::ToolResult;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 
     #[tokio::test]
     async fn browser_download_over_tool_budget_returns_valid_no_bytes_failure() {
@@ -716,6 +717,50 @@ mod tests {
         .unwrap();
         assert!(other_action.success);
         assert_ne!(other_action.result, raw);
+    }
+
+    #[tokio::test]
+    async fn over_budget_downloads_open_the_three_failure_circuit() {
+        let args = r##"{"action":"download","selector":"#link","expected_epoch":17}"##;
+        let call = ToolCall {
+            id: "download-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "default::browser".into(),
+                arguments: args.into(),
+            },
+        };
+        let mut guard = ToolPolicyGuard::default();
+        for _ in 0..3 {
+            guard.check_before_execution(&call, 0).unwrap();
+            let raw = serde_json::json!({ "data_base64": "QUJD".repeat(4096) }).to_string();
+            let outcome = ToolExecutionOutcome {
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(true, raw)),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                tool_duration: std::time::Duration::ZERO,
+            };
+            let compressed = maybe_compress(
+                "default::browser",
+                args,
+                "test-session",
+                outcome,
+                128,
+                None,
+                None,
+            )
+            .await;
+            assert!(!compressed.result.as_ref().unwrap().success);
+            guard.observe_outcome(&call, &compressed.result);
+        }
+        assert!(matches!(
+            guard.check_before_execution(&call, 0),
+            Err(ToolPolicyPrecheckViolation::ToolCircuitOpen {
+                consecutive_failures: 3,
+                ..
+            })
+        ));
     }
 
     #[test]
