@@ -61,6 +61,7 @@ struct BrowserSession {
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
     shutdown: watch::Sender<bool>,
     termination: AsyncMutex<()>,
+    kill_issued: AtomicBool,
     reaped: AtomicBool,
     frame_epoch: AtomicU64,
     active_tab_id: Mutex<Option<String>>,
@@ -71,14 +72,7 @@ struct BrowserSession {
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         if !self.reaped.load(Ordering::Acquire) {
-            #[cfg(unix)]
-            if let Some(group) = self.process_group {
-                kill_browser_process_group(group);
-            }
-            // `kill_on_drop` also covers a Bamboo shutdown while a request is idle.
-            if let Ok(mut child) = self.child.lock() {
-                let _ = child.start_kill();
-            }
+            self.signal_stop();
         }
     }
 }
@@ -89,6 +83,48 @@ fn kill_browser_process_group(group: i32) {
     // group if a platform unexpectedly failed to apply that setting.
     if group > 0 && group != unsafe { libc::getpgrp() } {
         let _ = unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+}
+
+/// A cancelled HTTP/tool caller must not cancel the host deadline with it.
+/// A queued request can otherwise run later on a page nobody is waiting for.
+struct BrowserCallAbortGuard {
+    session: Arc<BrowserSession>,
+    managed: Option<(BrowserManager, String)>,
+    armed: bool,
+}
+
+impl BrowserCallAbortGuard {
+    fn new(session: Arc<BrowserSession>, managed: Option<(BrowserManager, String)>) -> Self {
+        Self {
+            session,
+            managed,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BrowserCallAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.session.mark_dead("browser command cancelled");
+        self.session.signal_stop();
+        let session = self.session.clone();
+        let managed = self.managed.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                session.terminate("browser command cancelled").await;
+                if let Some((browser, session_id)) = managed {
+                    browser.remove_if_same(&session_id, &session).await;
+                }
+            });
+        }
     }
 }
 
@@ -140,9 +176,15 @@ impl BrowserSession {
             .spawn()
             .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
         let session = Self::from_child(child)?;
+        let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
-        session.call("state", json!({})).await?;
+        let readiness = session.call("state", json!({})).await;
+        if readiness.is_err() {
+            session.terminate("browser host unavailable").await;
+        }
+        abort_guard.disarm();
+        readiness?;
         Ok(session)
     }
 
@@ -169,6 +211,7 @@ impl BrowserSession {
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
+            kill_issued: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -315,19 +358,28 @@ impl BrowserSession {
         }
     }
 
-    async fn terminate(&self, reason: &'static str) {
-        self.mark_dead(reason);
-        let _guard = self.termination.lock().await;
-        if self.reaped.load(Ordering::Acquire) {
+    fn signal_stop(&self) {
+        if self.kill_issued.swap(true, Ordering::AcqRel) {
             return;
         }
         #[cfg(unix)]
         if let Some(group) = self.process_group {
             kill_browser_process_group(group);
         }
+        // `kill_on_drop` remains a fallback if Bamboo's runtime shuts down
+        // before asynchronous reaping can finish.
         if let Ok(mut child) = self.child.lock() {
             let _ = child.start_kill();
         }
+    }
+
+    async fn terminate(&self, reason: &'static str) {
+        self.mark_dead(reason);
+        let _guard = self.termination.lock().await;
+        if self.reaped.load(Ordering::Acquire) {
+            return;
+        }
+        self.signal_stop();
         let reaped = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
             loop {
                 let status = self.child.lock().unwrap().try_wait();
@@ -450,6 +502,7 @@ mod tests {
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
+            kill_issued: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -710,20 +763,110 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn aborting_a_caller_retires_its_host_and_wakes_pending_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let read_marker = directory.path().join("first-read");
+        let late_marker = directory.path().join("late-action");
+        let session = fake_host(
+            r#"IFS= read -r first; : > "$READ_MARKER_FILE"; sleep 60; IFS= read -r second; : > "$LATE_MARKER_FILE""#,
+            &[
+                ("READ_MARKER_FILE", &read_marker),
+                ("LATE_MARKER_FILE", &late_marker),
+            ],
+        );
+        let browser = BrowserManager::default();
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("cancelled-chat".into(), session.clone());
+        let first = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "cancelled-chat",
+                        "dom",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !read_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first request should reach the host");
+        let second = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "cancelled-chat",
+                        "queued",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.pending.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second request should be pending");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(BrowserError::Unavailable(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while browser.sessions.lock().await.contains_key("cancelled-chat") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled host should be removed by exact identity");
+        assert!(session.pending.lock().unwrap().is_empty());
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(!late_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     #[ignore = "requires the Playwright Chromium runtime"]
     async fn renderer_hang_retires_chromium_and_reopens_chat_with_new_epoch() {
         use tokio::io::AsyncReadExt as _;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let fixture_cancel_requested = cancel_requested.clone();
         let fixture = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
+                let cancel_requested = fixture_cancel_requested.clone();
                 tokio::spawn(async move {
                     let mut request = [0u8; 2048];
-                    let _ = socket.read(&mut request).await;
+                    if let Ok(length) = socket.read(&mut request).await {
+                        if request[..length]
+                            .windows(b"/cancel".len())
+                            .any(|part| part == b"/cancel")
+                        {
+                            cancel_requested.store(true, Ordering::Release);
+                        }
+                    }
                     let body = b"<!doctype html><title>stalled</title><script>for (;;) {}</script>";
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -743,7 +886,7 @@ mod tests {
             .command_with_deadline(
                 "hung-chat",
                 "navigate",
-                json!({"url": format!("http://{address}/"), "expected_epoch": initial_epoch}),
+                json!({"url": format!("http://{address}/timeout"), "expected_epoch": initial_epoch}),
                 Duration::from_secs(1),
             )
             .await;
@@ -760,6 +903,45 @@ mod tests {
         if last_old_epoch != 0 {
             assert_ne!(new_epoch, last_old_epoch);
         }
+        let cancelled_host = browser.sessions.lock().await["hung-chat"].clone();
+        let cancelled_call = {
+            let browser = browser.clone();
+            tokio::spawn(async move {
+                browser
+                    .command_with_deadline(
+                        "hung-chat",
+                        "navigate",
+                        json!({"url": format!("http://{address}/cancel"), "expected_epoch": new_epoch}),
+                        Duration::from_secs(10),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancel_requested.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Chromium should request the page before caller cancellation");
+        cancelled_call.abort();
+        assert!(cancelled_call.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while browser.sessions.lock().await.contains_key("hung-chat") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled Chromium host should be detached");
+        assert!(cancelled_host
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some());
+        let after_cancel = browser.open("hung-chat").await.unwrap();
+        assert_ne!(after_cancel["page_epoch"].as_u64().unwrap(), new_epoch);
         browser.close("hung-chat").await.unwrap();
         fixture.abort();
     }
@@ -933,6 +1115,10 @@ impl BrowserManager {
             session
         };
         if let Some(session) = existing {
+            let mut abort_guard = BrowserCallAbortGuard::new(
+                session.clone(),
+                Some((self.clone(), session_id.to_string())),
+            );
             if session.alive.load(Ordering::Acquire) {
                 let result = session.call("state", json!({})).await;
                 if !session.alive.load(Ordering::Acquire) {
@@ -943,23 +1129,40 @@ impl BrowserManager {
                     Ok(state) => {
                         session.touch();
                         self.start_idle_cleanup();
+                        abort_guard.disarm();
                         return Ok(state);
                     }
                     Err(BrowserError::Unavailable(_)) => {}
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        abort_guard.disarm();
+                        return Err(error);
+                    }
                 }
             }
             session.terminate("browser host unavailable").await;
             self.remove_if_same(session_id, &session).await;
+            abort_guard.disarm();
         }
         let session = BrowserSession::spawn().await?;
-        let state = session.call("state", json!({})).await?;
+        let mut abort_guard = BrowserCallAbortGuard::new(
+            session.clone(),
+            Some((self.clone(), session_id.to_string())),
+        );
+        let state = match session.call("state", json!({})).await {
+            Ok(state) => state,
+            Err(error) => {
+                session.terminate("browser host unavailable").await;
+                abort_guard.disarm();
+                return Err(error);
+            }
+        };
         session.touch();
         self.sessions
             .lock()
             .await
             .insert(session_id.to_string(), session);
         self.start_idle_cleanup();
+        abort_guard.disarm();
         Ok(state)
     }
 
@@ -993,6 +1196,10 @@ impl BrowserManager {
             session.touch();
             session
         };
+        let mut abort_guard = BrowserCallAbortGuard::new(
+            session.clone(),
+            Some((self.clone(), session_id.to_string())),
+        );
         let result = session.call_with_deadline(action, args, deadline).await;
         if session.alive.load(Ordering::Acquire) {
             session.touch();
@@ -1002,6 +1209,7 @@ impl BrowserManager {
             // reopen must never be removed by the old call's completion.
             self.remove_if_same(session_id, &session).await;
         }
+        abort_guard.disarm();
         result
     }
 
