@@ -964,6 +964,7 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
     assert.match((await call('dom')).result.html, /New page/);
   } finally {
+    await call('close').catch(() => {});
     host.stdin.end();
     host.kill();
     fixture.close();
