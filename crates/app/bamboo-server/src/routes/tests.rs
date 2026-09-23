@@ -298,8 +298,14 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut request = [0u8; 2048];
-                let _ = socket.read(&mut request).await;
-                let body = b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"alert('Private dialog');document.querySelector('output').textContent='answered'\">Ask</button><output>idle</output>";
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let background = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /background "));
+                let body: &[u8] = if background {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"setTimeout(() => { alert('Background dialog'); document.querySelector('output').textContent='background answered' }, 1200)\">Schedule</button><output>idle</output>"
+                } else {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"alert('Private dialog');document.querySelector('output').textContent='answered'\">Ask</button><output>idle</output>"
+                };
                 let headers = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -333,6 +339,7 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
     .await;
     assert_eq!(opened.status(), StatusCode::OK);
     let opened: Value = test::read_body_json(opened).await;
+    let foreground_tab_id = opened["active_tab_id"].as_str().unwrap().to_string();
     let navigated = test::call_service(
         &app,
         test::TestRequest::post()
@@ -455,6 +462,96 @@ async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_respons
     let result: Value = serde_json::from_str(&result.result).unwrap();
     assert!(result.get("pending_dialog").is_none());
     assert_eq!(result["page_epoch"], epoch);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":result["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let background_tab_id = created["active_tab_id"].as_str().unwrap().to_string();
+    let background = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({"url":format!("http://{address}/background"),"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background.status(), StatusCode::OK);
+    let background: Value = test::read_body_json(background).await;
+    let scheduled =
+        test::call_service(&app, click(background["page_epoch"].as_u64().unwrap())).await;
+    assert_eq!(scheduled.status(), StatusCode::OK);
+    let scheduled: Value = test::read_body_json(scheduled).await;
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":foreground_tab_id,"expected_epoch":scheduled["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let mut background_pending: Value = test::read_body_json(activated).await;
+    for _ in 0..50 {
+        if background_pending.get("pending_dialog").is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+        background_pending = test::read_body_json(response).await;
+    }
+    assert_eq!(background_pending["active_tab_id"], foreground_tab_id);
+    assert_eq!(
+        background_pending["pending_dialog"]["tab_id"],
+        background_tab_id
+    );
+    assert_eq!(
+        background_pending["pending_dialog"]["page_epoch"],
+        background_pending["page_epoch"]
+    );
+    let answered = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({
+                "dialog_id":background_pending["pending_dialog"]["dialog_id"],
+                "accept":true,"expected_epoch":background_pending["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(answered.status(), StatusCode::OK);
+    let answered: Value = test::read_body_json(answered).await;
+    assert_eq!(answered["active_tab_id"], foreground_tab_id);
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":background_tab_id,"expected_epoch":answered["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let background_dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background_dom.status(), StatusCode::OK);
+    let background_dom: Value = test::read_body_json(background_dom).await;
+    assert!(background_dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>background answered</output>"));
 
     state.browser.close("dialog-owner").await.unwrap();
     state.browser.close("dialog-other").await.unwrap();

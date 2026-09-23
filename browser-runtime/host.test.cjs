@@ -898,6 +898,10 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
       response.end('<script>setTimeout(() => alert("Passive dialog"), 100)</script><main>Passive page</main>');
       return;
     }
+    if (request.url === '/background') {
+      response.end('<button id="schedule" onclick="setTimeout(() => { alert(\'Background dialog\'); document.querySelector(\'output\').textContent=\'background answered\' }, 1000)">Schedule</button><output>idle</output>');
+      return;
+    }
     response.end(`<!doctype html>
       <button id="plain" onclick="document.querySelector('#result').textContent='plain'">Plain</button>
       <button id="alert" onclick="alert('Private alert message');document.querySelector('#result').textContent='alert done'">Alert</button>
@@ -1020,6 +1024,44 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
     });
     assert.equal(passiveAccepted.ok, true);
     assert.equal(passiveAccepted.result.pending_dialog, undefined);
+
+    const foregroundTabId = navigated.active_tab_id;
+    const created = await call('tab_create', { expected_epoch: passiveAccepted.result.page_epoch });
+    assert.equal(created.ok, true);
+    const backgroundTabId = created.result.active_tab_id;
+    const background = await call('navigate', {
+      url: `${url}background`, expected_epoch: created.result.page_epoch,
+    });
+    assert.equal(background.ok, true);
+    const scheduled = await call('click_selector', {
+      selector: '#schedule', expected_epoch: background.result.page_epoch,
+    });
+    assert.equal(scheduled.ok, true);
+    const foreground = await call('tab_activate', {
+      tab_id: foregroundTabId, expected_epoch: scheduled.result.page_epoch,
+    });
+    assert.equal(foreground.ok, true);
+    let backgroundPending;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      backgroundPending = (await call('state')).result;
+      if (backgroundPending.pending_dialog) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(backgroundPending.active_tab_id, foregroundTabId);
+    assert.equal(backgroundPending.pending_dialog.tab_id, backgroundTabId);
+    assert.equal(backgroundPending.pending_dialog.page_epoch, backgroundPending.page_epoch);
+    assert.equal(backgroundPending.pending_dialog.url, `${url}background`);
+    const answeredBackground = await call('dialog_respond', {
+      dialog_id: backgroundPending.pending_dialog.dialog_id,
+      accept: true, expected_epoch: backgroundPending.page_epoch,
+    });
+    assert.equal(answeredBackground.ok, true);
+    assert.equal(answeredBackground.result.active_tab_id, foregroundTabId);
+    const restored = await call('tab_activate', {
+      tab_id: backgroundTabId, expected_epoch: answeredBackground.result.page_epoch,
+    });
+    assert.equal(restored.ok, true);
+    assert.match((await call('dom')).result.html, /<output>background answered<\/output>/);
   } finally {
     host.stdin.end();
     host.kill();
