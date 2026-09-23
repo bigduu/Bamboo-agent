@@ -130,6 +130,114 @@ fn browser_press_key(args: &Value) -> Result<&str, PermissionError> {
     Ok(key)
 }
 
+fn browser_pointer_coordinate(
+    args: &Value,
+    name: &str,
+    maximum: f64,
+) -> Result<f64, PermissionError> {
+    args.get(name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value < maximum)
+        .ok_or_else(|| {
+            PermissionError::CheckFailed(format!("browser {name} must be within the viewport"))
+        })
+}
+
+fn browser_pointer_selector<'a>(args: &'a Value, name: &str) -> Result<&'a str, PermissionError> {
+    let selector = required_string_arg(args, name)?;
+    if selector.trim().is_empty() || selector.encode_utf16().count() > 512 {
+        return Err(PermissionError::CheckFailed(format!(
+            "browser {name} must be 1..512 UTF-16 code units"
+        )));
+    }
+    Ok(selector)
+}
+
+fn browser_pointer_button(args: &Value) -> Result<&str, PermissionError> {
+    let button = match args.get("button") {
+        None => "left",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| PermissionError::CheckFailed("invalid browser pointer button".into()))?,
+    };
+    if !matches!(button, "left" | "right" | "middle") {
+        return Err(PermissionError::CheckFailed(
+            "invalid browser pointer button".into(),
+        ));
+    }
+    Ok(button)
+}
+
+fn browser_pointer_target(action: &str, args: &Value) -> Result<(String, String), PermissionError> {
+    let invalid =
+        || PermissionError::CheckFailed("browser pointer target is ambiguous or incomplete".into());
+    match action {
+        "hover" => {
+            if args.get("target").is_some_and(|value| !value.is_null())
+                || args.get("button").is_some()
+                || args.get("source_selector").is_some()
+                || args.get("target_selector").is_some()
+                || args.get("to_x").is_some()
+                || args.get("to_y").is_some()
+            {
+                return Err(invalid());
+            }
+            if args.get("selector").is_some_and(|value| !value.is_null()) {
+                if args.get("x").is_some() || args.get("y").is_some() {
+                    return Err(invalid());
+                }
+                let selector = browser_pointer_selector(args, "selector")?;
+                Ok((
+                    format!("css:{}", browser_target_fingerprint(selector)),
+                    format!("Hover browser selector {selector:?}"),
+                ))
+            } else {
+                let x = browser_pointer_coordinate(args, "x", 1200.0)?;
+                let y = browser_pointer_coordinate(args, "y", 1000.0)?;
+                Ok((
+                    format!("point:{x},{y}"),
+                    format!("Hover browser at {x},{y}"),
+                ))
+            }
+        }
+        "drag" => {
+            if args.get("target").is_some_and(|value| !value.is_null())
+                || args.get("selector").is_some()
+            {
+                return Err(invalid());
+            }
+            let button = browser_pointer_button(args)?;
+            if args.get("source_selector").is_some() || args.get("target_selector").is_some() {
+                if args.get("x").is_some()
+                    || args.get("y").is_some()
+                    || args.get("to_x").is_some()
+                    || args.get("to_y").is_some()
+                    || button != "left"
+                {
+                    return Err(invalid());
+                }
+                let source = browser_pointer_selector(args, "source_selector")?;
+                let target = browser_pointer_selector(args, "target_selector")?;
+                let identity = serde_json::json!([source, target]).to_string();
+                Ok((
+                    format!("css:{}", browser_target_fingerprint(&identity)),
+                    format!("Drag browser selector {source:?} to {target:?}"),
+                ))
+            } else {
+                let x = browser_pointer_coordinate(args, "x", 1200.0)?;
+                let y = browser_pointer_coordinate(args, "y", 1000.0)?;
+                let to_x = browser_pointer_coordinate(args, "to_x", 1200.0)?;
+                let to_y = browser_pointer_coordinate(args, "to_y", 1000.0)?;
+                Ok((
+                    format!("point:{x},{y}:{to_x},{to_y}:{button}"),
+                    format!("Drag browser from {x},{y} to {to_x},{to_y} with {button} button"),
+                ))
+            }
+        }
+        _ => Err(invalid()),
+    }
+}
+
 /// Focus is mutable without a page navigation or epoch change. A remembered
 /// resource grant cannot safely authorize another focused keyboard invocation.
 pub fn is_focused_browser_input(tool_name: &str, args: &Value) -> bool {
@@ -522,6 +630,23 @@ pub fn check_permissions(
                         PermissionType::HttpRequest,
                         url.as_str(),
                         format!("Navigate browser to {}", url.origin().ascii_serialization()),
+                    )]))
+                }
+                "hover" | "drag" => {
+                    let epoch = args
+                        .get("expected_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            PermissionError::CheckFailed(
+                                "browser interaction requires expected_epoch from a snapshot"
+                                    .into(),
+                            )
+                        })?;
+                    let (target, description) = browser_pointer_target(action, args)?;
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!("browser:{epoch}:{action}:{target}"),
+                        description,
                     )]))
                 }
                 "click" | "click_at" | "fill" | "select_option" | "type" | "press" | "key"
@@ -1048,6 +1173,83 @@ mod tests {
                 expected_resource
             );
         }
+    }
+
+    #[test]
+    fn browser_pointer_actions_bind_permission_to_epoch_and_exact_target() {
+        let cases = [
+            json!({"action":"hover","selector":"#tip","expected_epoch":17}),
+            json!({"action":"hover","x":12.5,"y":20,"expected_epoch":17}),
+            json!({"action":"drag","source_selector":"#source","target_selector":"#drop","expected_epoch":17}),
+            json!({"action":"drag","x":10,"y":20,"to_x":30,"to_y":40,"button":"right","expected_epoch":17}),
+        ];
+        for args in cases {
+            let context = check_permissions("browser", &args).unwrap().unwrap();
+            assert_eq!(context.len(), 1);
+            assert_eq!(
+                context[0].permission_type,
+                PermissionType::BrowserInteraction
+            );
+            let original = &context[0].resource;
+            assert!(original.starts_with("browser:17:"), "{original}");
+            let mut later = args.clone();
+            later["expected_epoch"] = json!(18);
+            assert_ne!(
+                original,
+                &check_permissions("browser", &later).unwrap().unwrap()[0].resource
+            );
+            let mut different = args.clone();
+            match args["action"].as_str().unwrap() {
+                "hover" if args.get("selector").is_some() => {
+                    different["selector"] = json!("#other")
+                }
+                "hover" => different["x"] = json!(13.5),
+                "drag" if args.get("source_selector").is_some() => {
+                    different["target_selector"] = json!("#other")
+                }
+                "drag" => different["to_x"] = json!(31),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                original,
+                &check_permissions("browser", &different).unwrap().unwrap()[0].resource
+            );
+        }
+    }
+
+    #[test]
+    fn browser_pointer_permission_rejects_ambiguous_and_out_of_bounds_targets() {
+        for (action, args) in [
+            ("hover", json!({"selector":"#tip","x":10,"y":20})),
+            ("hover", json!({"selector":" "})),
+            ("hover", json!({"x":1200,"y":20})),
+            ("hover", json!({"x":10,"y":1000})),
+            ("drag", json!({"source_selector":"#source"})),
+            (
+                "drag",
+                json!({"source_selector":"#source","target_selector":"#drop","x":10}),
+            ),
+            (
+                "drag",
+                json!({"source_selector":"#source","target_selector":"#drop","button":"right"}),
+            ),
+            ("drag", json!({"x":10,"y":20,"to_x":1200,"to_y":40})),
+            (
+                "drag",
+                json!({"x":10,"y":20,"to_x":30,"to_y":40,"button":"invalid"}),
+            ),
+        ] {
+            let mut request = args.clone();
+            request["action"] = json!(action);
+            request["expected_epoch"] = json!(17);
+            assert!(
+                check_permissions("browser", &request).is_err(),
+                "{action}: {args}"
+            );
+        }
+        assert!(
+            check_permissions("browser", &json!({"action":"hover","selector":"#tip"})).is_err()
+        );
     }
 
     #[test]

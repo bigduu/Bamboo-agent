@@ -8,6 +8,13 @@ const readline = require('node:readline');
 const MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_HTML_CHARS = 100_000;
 const MAX_TABS = 8;
+// Rust retires this host after 30 seconds. Leave time for state() and stdio.
+const POINTER_ACTION_BUDGET_MS = 22_000;
+// The packaged host does not inherit NODE_ENV. Direct host tests can pause
+// observer setup to force a navigation between the first and final epoch checks.
+const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS) || 0))
+  : 0;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -186,6 +193,15 @@ function targetError(code, message) {
   return error;
 }
 
+function pointerTimeout(deadlineAt) {
+  if (deadlineAt === undefined) return 10_000;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    throw targetError('navigation_timeout', 'browser pointer action timed out');
+  }
+  return Math.min(10_000, remaining);
+}
+
 function semanticString(target, name, maximum, required = false) {
   const value = target[name];
   if (value === undefined && !required) return undefined;
@@ -207,16 +223,17 @@ function selectOptionArgs(args) {
   return args.values;
 }
 
-async function waitForTarget(locator, missingMessage) {
+async function waitForTarget(locator, missingMessage, deadlineAt) {
   try {
-    await locator.first().waitFor({ state: 'attached', timeout: 10_000 });
+    await locator.first().waitFor({ state: 'attached', timeout: pointerTimeout(deadlineAt) });
   } catch (error) {
     if (error.name !== 'TimeoutError') throw error;
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
     throw targetError('target_not_found', missingMessage);
   }
 }
 
-async function targetLocator(args, page) {
+async function targetLocator(args, page, deadlineAt) {
   let locator;
   if (args.target === undefined) {
     if (typeof args.selector !== 'string' || !args.selector.trim()) {
@@ -245,7 +262,7 @@ async function targetLocator(args, page) {
     let scope = page;
     if (frameSelector) {
       const owner = page.frameLocator(frameSelector).owner();
-      await waitForTarget(owner, 'browser target iframe not found');
+      await waitForTarget(owner, 'browser target iframe not found', deadlineAt);
       const count = await owner.count();
       if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
       if (count !== 1) {
@@ -268,7 +285,7 @@ async function targetLocator(args, page) {
         : scope.getByText(value, { exact });
     }
   }
-  await waitForTarget(locator, 'browser target not found');
+  await waitForTarget(locator, 'browser target not found', deadlineAt);
   const count = await locator.count();
   if (count === 0) throw targetError('target_not_found', 'browser target not found');
   if (count !== 1) {
@@ -277,13 +294,13 @@ async function targetLocator(args, page) {
   return locator;
 }
 
-async function withPinnedTarget(args, act) {
+async function withPinnedTarget(args, act, deadlineAt) {
   const page = requireActiveTab().page;
-  const locator = await targetLocator(args, page);
+  const locator = await targetLocator(args, page, deadlineAt);
   checkEpoch(args);
   // A Locator may re-resolve after navigation while waiting for an old
   // disabled element. An ElementHandle stays bound to its document.
-  const handle = await locator.elementHandle({ timeout: 10_000 });
+  const handle = await locator.elementHandle({ timeout: pointerTimeout(deadlineAt) });
   if (!handle) throw targetError('target_not_found', 'browser target not found');
   try {
     const count = await locator.count();
@@ -297,6 +314,312 @@ async function withPinnedTarget(args, act) {
     return await act(handle);
   } finally {
     await handle.dispose().catch(() => {});
+  }
+}
+
+function pointerPoint(args, xName, yName, page) {
+  const viewport = page.viewportSize();
+  const x = args[xName];
+  const y = args[yName];
+  if (!Number.isFinite(x) || !Number.isFinite(y) ||
+      x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+    throw targetError('invalid_request', 'browser pointer coordinate is outside the viewport');
+  }
+  return { x, y };
+}
+
+function pointerSelector(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 512) {
+    throw targetError('invalid_request', 'invalid browser pointer selector');
+  }
+  return value;
+}
+
+function pointerButton(value) {
+  const button = value ?? 'left';
+  if (!['left', 'right', 'middle'].includes(button)) {
+    throw targetError('invalid_request', 'invalid browser pointer button');
+  }
+  return button;
+}
+
+async function assertDragPoint(handle, point, deadlineAt, trial) {
+  const hitsTarget = () => handle.evaluate((element, { x, y }) => {
+    let hit = element.ownerDocument.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (let node = hit; node; node = node.parentNode ?? node.getRootNode()?.host) {
+      if (node === element) return true;
+    }
+    return false;
+  }, point);
+  pointerTimeout(deadlineAt);
+  try {
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+    // Trial performs Playwright's receives-events checks before mouse-down.
+    // During an active drag, use the exact hit test without altering mouse state.
+    if (trial) await handle.click({ trial: true, scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+  } catch {
+    throw targetError('target_not_actionable', 'browser drag target is obscured or detached');
+  }
+}
+
+function navigationResponseKind(response) {
+  const status = response.status();
+  if ([301, 302, 303, 307, 308].includes(status)) return 'redirect';
+  if (status === 204 || status === 205 ||
+      /^\s*attachment(?:\s*;|\s*$)/i.test(response.headers()['content-disposition'] ?? '')) {
+    return 'no_document';
+  }
+  return null;
+}
+
+async function observeActionNavigation(page, deadlineAt) {
+  let started = false;
+  let committed = false;
+  let failed = false;
+  const pendingRequests = new Map();
+  let revision = 0;
+  let observedPage = page;
+  let blankPopupExpected = false;
+  let pendingPopupOpens = 0;
+  const listeners = [];
+  let cdp;
+  const onWindowOpen = event => {
+    // Playwright's popup/page events can be delayed until a slow destination
+    // response starts. CDP reports window.open at the triggering gesture.
+    started = true;
+    committed = false;
+    failed = false;
+    pendingRequests.clear();
+    blankPopupExpected = !event.url || event.url === 'about:blank';
+    pendingPopupOpens++;
+    revision++;
+  };
+  const watch = (target, popup = false) => {
+    if (listeners.some(item => item.page === target)) return;
+    if (popup) {
+      // adoptPage activates popups before their navigation commits. An initial
+      // about:blank page is not the destination of window.open(url).
+      observedPage = target;
+      started = true;
+      committed = target.url() !== 'about:blank' || blankPopupExpected;
+      failed = false;
+      pendingRequests.clear();
+      revision++;
+    }
+    const onRequest = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !request.isNavigationRequest()) return;
+      started = true;
+      committed = false;
+      failed = false;
+      let frame = null;
+      try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+      const redirectedFrom = request.redirectedFrom();
+      if (redirectedFrom) pendingRequests.delete(redirectedFrom);
+      pendingRequests.set(request, frame);
+      revision++;
+    };
+    const onFailed = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !pendingRequests.has(request)) return;
+      const frame = pendingRequests.get(request);
+      pendingRequests.delete(request);
+      // A newer request for the same frame supersedes this failure.
+      if (![...pendingRequests.values()].includes(frame)) failed = true;
+      revision++;
+    };
+    const onFinished = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !pendingRequests.has(request)) return;
+      // A redirect remains pending until its successor request arrives. A
+      // 204/205/download has no document commit, so it completes here.
+      const kind = tabByPage.get(target)?.navigationResponses.get(request);
+      if (kind === 'redirect' || (pendingRequests.get(request) !== null && kind !== 'no_document')) return;
+      pendingRequests.delete(request);
+      committed = pendingRequests.size === 0;
+      revision++;
+    };
+    const onFrame = frame => {
+      if (target !== observedPage) return;
+      if (target === page && pendingPopupOpens) return;
+      if (target !== page && frame === target.mainFrame() &&
+          frame.url() === 'about:blank' && !blankPopupExpected) return;
+      for (const [request, requestedFrame] of pendingRequests) {
+        if (requestedFrame === frame) pendingRequests.delete(request);
+      }
+      started = true;
+      committed = pendingRequests.size === 0;
+      revision++;
+    };
+    const onClose = () => {
+      if (target !== observedPage || (target === page && pendingPopupOpens)) return;
+      failed = true;
+      revision++;
+    };
+    target.on('request', onRequest);
+    target.on('requestfailed', onFailed);
+    target.on('requestfinished', onFinished);
+    target.on('framenavigated', onFrame);
+    target.on('close', onClose);
+    listeners.push({ page: target, onRequest, onFailed, onFinished, onFrame, onClose });
+    // Adopted pages track navigation requests from their creation. A slow
+    // request may already be in flight before this action subscribes.
+    const inFlight = tabByPage.get(target)?.pendingNavigations;
+    if (inFlight?.size) {
+      for (const [request, frame] of inFlight) pendingRequests.set(request, frame);
+      started = true;
+      committed = false;
+      revision++;
+    }
+  };
+  const onPopup = target => {
+    if (pendingPopupOpens) pendingPopupOpens--;
+    watch(target, true);
+  };
+  const dispose = () => {
+    cdp?.off('Page.windowOpen', onWindowOpen);
+    page.off('popup', onPopup);
+    for (const { page: target, onRequest, onFailed, onFinished, onFrame, onClose } of listeners) {
+      target.off('request', onRequest);
+      target.off('requestfailed', onFailed);
+      target.off('requestfinished', onFinished);
+      target.off('framenavigated', onFrame);
+      target.off('close', onClose);
+    }
+  };
+  // A navigation request can start before CDP setup finishes while the old
+  // document still owns the epoch. Observe Playwright events first so a
+  // pointer action cannot run into that in-flight navigation.
+  watch(page);
+  page.on('popup', onPopup);
+  try {
+    cdp = await tabByPage.get(page)?.cdp;
+    if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (TEST_OBSERVER_SETUP_DELAY_MS) {
+      emit({ event: 'test_observer_setup_waiting' });
+      await new Promise(resolve => setTimeout(resolve, TEST_OBSERVER_SETUP_DELAY_MS));
+    }
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+  return {
+    get started() { return started; },
+    async finish() {
+      // A newly committed document can immediately request another navigation.
+      // Each request invalidates the prior commit; return only after the latest
+      // request commits and navigation events have settled for one short turn.
+      const deadline = Math.min(deadlineAt ?? Infinity, Date.now() + 20_000);
+      if (Date.now() >= deadline) {
+        throw targetError('navigation_timeout', 'browser pointer action timed out');
+      }
+      let observedRevision = revision;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        if (observedRevision !== revision) {
+          observedRevision = revision;
+          continue;
+        }
+        if (failed) break;
+        if (!pendingPopupOpens && (!started || committed)) return;
+      }
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
+      if (!failed && (pendingPopupOpens || (started && !committed))) {
+        throw targetError('navigation_timeout', 'browser navigation did not complete');
+      }
+      if (failed) throw targetError('navigation_failed', 'browser navigation failed');
+    },
+    dispose,
+  };
+}
+
+async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
+  pointerTimeout(deadlineAt);
+  const navigation = await observeActionNavigation(page, deadlineAt);
+  try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
+    if (!navigation.started) {
+      try { await hover(navigation); } catch (error) {
+        if (!navigation.started && expectedEpoch === epoch) throw error;
+      }
+    }
+    await navigation.finish();
+  } finally {
+    navigation.dispose();
+  }
+}
+
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt, existingNavigation, validateTarget) {
+  if (expectedEpoch !== epoch) throw staleEpochError();
+  pointerTimeout(deadlineAt);
+  const navigation = existingNavigation ?? await observeActionNavigation(page, deadlineAt);
+  const ownsNavigation = !existingNavigation;
+  const interrupted = () => expectedEpoch !== epoch || navigation.started;
+  let downAttempted = false;
+  let safeDrop = false;
+  let failure;
+  try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
+    if (!navigation.started) {
+      try {
+        if (validateTarget) await validateTarget('source', source);
+        pointerTimeout(deadlineAt);
+        await page.mouse.move(source.x, source.y);
+        if (!interrupted()) {
+          if (validateTarget) await validateTarget('source', source);
+          pointerTimeout(deadlineAt);
+          downAttempted = true;
+          await page.mouse.down({ button });
+          let current = source;
+          if (!interrupted() && typeof destination === 'function') {
+            const viewport = page.viewportSize();
+            current = {
+              x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
+              y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
+            };
+            pointerTimeout(deadlineAt);
+            await page.mouse.move(current.x, current.y);
+            if (!interrupted()) destination = await destination();
+          }
+          if (!interrupted()) {
+            if (validateTarget) await validateTarget('destination', destination);
+            for (let step = 1; step <= 12; step++) {
+              if (interrupted()) break;
+              pointerTimeout(deadlineAt);
+              await page.mouse.move(
+                current.x + (destination.x - current.x) * step / 12,
+                current.y + (destination.y - current.y) * step / 12,
+              );
+            }
+            if (!interrupted()) {
+              if (validateTarget) await validateTarget('destination', destination);
+              safeDrop = true;
+            }
+          }
+        }
+      } catch (error) {
+        if (!interrupted()) failure = error;
+      } finally {
+        if (downAttempted) {
+          // Clear button state without finishing a rejected gesture over an
+          // unrelated overlay or on a new page.
+          if (interrupted() || !safeDrop) await page.mouse.move(-1, -1).catch(() => {});
+          await page.mouse.up({ button }).catch(() => {});
+        }
+      }
+    }
+    if (ownsNavigation) await navigation.finish();
+    if (failure) throw failure;
+  } finally {
+    if (ownsNavigation) navigation.dispose();
   }
 }
 
@@ -322,6 +645,8 @@ function adoptPage(target) {
     page: target,
     cdp: context.newCDPSession(target).catch(() => null),
     title: '',
+    pendingNavigations: new Map(),
+    navigationResponses: new WeakMap(),
   };
   tabs.push(tab);
   tabByPage.set(target, tab);
@@ -329,7 +654,30 @@ function adoptPage(target) {
   target.on('domcontentloaded', () => {
     void target.title().then(title => { tab.title = title; }).catch(() => {});
   });
+  target.on('request', request => {
+    if (!request.isNavigationRequest()) return;
+    let frame = null;
+    try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+    const redirectedFrom = request.redirectedFrom();
+    if (redirectedFrom) tab.pendingNavigations.delete(redirectedFrom);
+    tab.pendingNavigations.set(request, frame);
+  });
+  target.on('response', response => {
+    const kind = navigationResponseKind(response);
+    if (kind) tab.navigationResponses.set(response.request(), kind);
+  });
+  target.on('requestfailed', request => tab.pendingNavigations.delete(request));
+  target.on('requestfinished', request => {
+    if (!tab.pendingNavigations.has(request)) return;
+    const kind = tab.navigationResponses.get(request);
+    if (kind !== 'redirect' && (tab.pendingNavigations.get(request) === null || kind === 'no_document')) {
+      tab.pendingNavigations.delete(request);
+    }
+  });
   target.on('framenavigated', frame => {
+    for (const [request, requestedFrame] of tab.pendingNavigations) {
+      if (requestedFrame === frame) tab.pendingNavigations.delete(request);
+    }
     if (frame === target.mainFrame()) {
       const url = frame.url();
       if (url !== 'about:blank') {
@@ -494,6 +842,95 @@ async function command(action, args = {}) {
         // actionable without copying page data into the tool error.
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
+    }
+    case 'hover_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      await hoverWithNavigation(page, args.expected_epoch,
+        navigation => withPinnedTarget(args, async handle => {
+          if (navigation.started) return;
+          await handle.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+          // The scroll handler may start a navigation while the old document
+          // still owns the epoch. Never let hover's own scrolling hide that gap.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          if (navigation.started) return;
+          if (args.expected_epoch !== epoch) throw staleEpochError();
+          await handle.hover({ scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+        }, deadlineAt), deadlineAt);
+      return state();
+    }
+    case 'hover_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const hoverPoint = pointerPoint(args, 'x', 'y', page);
+      checkEpoch(args);
+      await hoverWithNavigation(page, args.expected_epoch,
+        () => page.mouse.move(hoverPoint.x, hoverPoint.y), deadlineAt);
+      return state();
+    }
+    case 'drag_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const sourceSelector = pointerSelector(args.source_selector);
+      const targetSelector = pointerSelector(args.target_selector);
+      const navigation = await observeActionNavigation(page, deadlineAt);
+      try {
+        checkEpoch(args);
+        try {
+          await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
+            await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
+              await source.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+              // A page scroll handler can start navigation before the first
+              // mouse event, while the old document still owns the epoch.
+              await new Promise(resolve => setTimeout(resolve, 50));
+              if (navigation.started || args.expected_epoch !== epoch) return;
+              const from = await source.boundingBox();
+              const to = await destination.boundingBox();
+              if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
+              const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
+              const viewport = page.viewportSize();
+              const targetX = to.x + to.width / 2;
+              const targetY = to.y + to.height / 2;
+              const targetVisible = targetX >= 0 && targetY >= 0 &&
+                targetX < viewport.width && targetY < viewport.height;
+              const end = targetVisible
+                ? pointerPoint({ x: targetX, y: targetY }, 'x', 'y', page)
+                : async () => {
+                  // Begin the drag on the visible source before scrolling a distant
+                  // destination into view; both elements need not fit together.
+                  await destination.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+                  const box = await destination.boundingBox();
+                  if (!box) throw targetError('target_not_found', 'browser drag target is detached');
+                  return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
+                };
+              checkEpoch(args);
+              await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt, navigation,
+                (kind, point) => assertDragPoint(kind === 'source' ? source : destination, point, deadlineAt,
+                  kind === 'source'));
+            }, deadlineAt);
+          }, deadlineAt);
+        } catch (error) {
+          if (!navigation.started && args.expected_epoch === epoch) throw error;
+        }
+        await navigation.finish();
+        return state();
+      } finally {
+        navigation.dispose();
+      }
+    }
+    case 'drag_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const from = pointerPoint(args, 'x', 'y', page);
+      const to = pointerPoint(args, 'to_x', 'to_y', page);
+      const button = pointerButton(args.button);
+      checkEpoch(args);
+      await dragBetween(page, from, to, args.expected_epoch, button, deadlineAt);
+      return state();
     }
     case 'screenshot': {
       return stableRead(async tab => {
