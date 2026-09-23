@@ -274,7 +274,7 @@ const DEFAULT_CSP: &str = concat!(
     "frame-ancestors 'none'; ",
     "script-src 'self'; ",
     "style-src 'self' 'unsafe-inline'; ",
-    "img-src 'self' data: https:; ",
+    "img-src 'self' data: blob: https:; ",
     "font-src 'self' data:; ",
     "connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:* http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
     "form-action 'self';"
@@ -1397,9 +1397,10 @@ mod tests {
     }
 
     #[test]
-    fn default_csp_keeps_scripts_strict_but_allows_inline_styles() {
+    fn default_csp_allows_browser_frames_without_relaxing_scripts() {
         assert!(DEFAULT_CSP.contains("script-src 'self'"));
         assert!(DEFAULT_CSP.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(DEFAULT_CSP.contains("img-src 'self' data: blob: https:;"));
         assert!(!DEFAULT_CSP.contains("unsafe-eval"));
     }
 
