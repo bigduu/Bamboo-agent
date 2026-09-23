@@ -175,6 +175,12 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(popupDom.active_tab_id, popupId);
     assert.match(popupDom.html, /Two page/);
     assert.doesNotMatch(popupDom.html, /One page/);
+    const popupEval = await call('eval', {
+      expected_epoch: popupState.page_epoch, expected_url: base + '/two',
+      code: '({popup: document.title})',
+    });
+    assert.equal(popupEval.ok, true, JSON.stringify(popupEval));
+    assert.deepEqual(popupEval.result.value, { popup: 'Two' });
     const popupFrame = await waitForFrame(popupId, firstFrame.frame_seq, popupState.page_epoch);
     assert.equal(popupFrame.page_epoch, popupState.page_epoch);
     assert.ok(Buffer.from(popupFrame.data, 'base64').length > 1000);
@@ -195,6 +201,12 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(created.tabs.length, 2);
     assert.notEqual(created.active_tab_id, firstId);
     assert.notEqual(created.page_epoch, closedInactive.page_epoch);
+    const newTabEval = await call('eval', {
+      expected_epoch: created.page_epoch, expected_url: 'about:blank',
+      code: '({new_tab: true})',
+    });
+    assert.equal(newTabEval.ok, true, JSON.stringify(newTabEval));
+    assert.deepEqual(newTabEval.result.value, { new_tab: true });
     const thirdId = created.active_tab_id;
     const third = (await call('navigate', { url: base + '/three', expected_epoch: created.page_epoch })).result;
     assert.equal(third.active_tab_id, thirdId);
@@ -1202,13 +1214,29 @@ test('unanswered dialog expires and a pending dialog dismisses on host close', a
 
 test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/prepatch.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+      response.end(`
+        Object.create = () => ({ injected: 'x'.repeat(1_000_000) });
+        Object.keys = () => ['spoof'];
+        Object.getOwnPropertyDescriptor = () => ({ value: 'spoof' });
+        Array.isArray = () => false;
+        Number.isSafeInteger = () => true;
+        Array.prototype.map = () => ['spoof'];
+        Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+      `);
+      return;
+    }
     response.writeHead(200, {
       'content-type': 'text/html; charset=utf-8',
       'content-security-policy': "script-src 'self'",
     });
     response.end(request.url === '/next'
       ? '<title>Next</title><main>New page</main>'
-      : '<title>Eval</title><output>0</output>');
+      : request.url === '/prepatched'
+        ? '<title>Prepatched</title><script src="/prepatch.js"></script><output>0</output>'
+        : '<title>Eval</title><output>0</output>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -1234,7 +1262,24 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
   });
   try {
     const initial = (await call('state')).result;
-    const navigated = (await call('navigate', { url, expected_epoch: initial.page_epoch })).result;
+    const blank = await call('eval', {
+      expected_epoch: initial.page_epoch, expected_url: 'about:blank', code: '({blank: true})',
+    });
+    assert.equal(blank.ok, true, JSON.stringify(blank));
+    assert.deepEqual(blank.result.value, { blank: true });
+    const prepatchedUrl = `${url}prepatched`;
+    const prepatched = (await call('navigate', { url: prepatchedUrl, expected_epoch: initial.page_epoch })).result;
+    const prepatchedResult = await call('eval', {
+      expected_epoch: prepatched.page_epoch, expected_url: prepatchedUrl, code: '({actual: 11})',
+    });
+    assert.equal(prepatchedResult.ok, true, JSON.stringify(prepatchedResult));
+    assert.deepEqual(prepatchedResult.result.value, { actual: 11 });
+    const prepatchedArray = await call('eval', {
+      expected_epoch: prepatched.page_epoch, expected_url: prepatchedUrl, code: '[3]',
+    });
+    assert.equal(prepatchedArray.ok, true, JSON.stringify(prepatchedArray));
+    assert.deepEqual(prepatchedArray.result.value, [3]);
+    const navigated = (await call('navigate', { url, expected_epoch: prepatched.page_epoch })).result;
     const expected = { expected_epoch: navigated.page_epoch, expected_url: url };
     const read = await call('eval', { ...expected, code: 'document.querySelector("output").textContent' });
     assert.equal(read.ok, true);
@@ -1257,6 +1302,38 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     });
     assert.equal(hugeOverride.ok, true);
     assert.deepEqual(hugeOverride.result.value, { actual: 9 });
+    const intrinsicOverride = await call('eval', {
+      ...expected,
+      code: `(() => {
+        Object.create = () => ({ injected: 'x'.repeat(1_000_000) });
+        Object.keys = () => ['spoof'];
+        Object.getOwnPropertyDescriptor = () => ({ value: 'spoof' });
+        Array.isArray = () => false;
+        Number.isSafeInteger = () => true;
+        Array.prototype.map = () => ['spoof'];
+        Array.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        Object.prototype.toJSON = () => 'x'.repeat(1_000_000);
+        return { actual: 12 };
+      })()`,
+    });
+    assert.equal(intrinsicOverride.ok, true, JSON.stringify(intrinsicOverride));
+    assert.deepEqual(intrinsicOverride.result.value, { actual: 12 });
+    const overriddenArray = await call('eval', { ...expected, code: '[4]' });
+    assert.equal(overriddenArray.ok, true, JSON.stringify(overriddenArray));
+    assert.deepEqual(overriddenArray.result.value, [4]);
+    const changingLength = await call('eval', {
+      ...expected,
+      code: `(() => {
+        const values = [3];
+        let reads = 0;
+        return new Proxy(values, { get(target, property) {
+          if (property === 'length') return ++reads === 1 ? 1 : 1_000_000;
+          return Reflect.get(target, property);
+        }});
+      })()`,
+    });
+    assert.equal(changingLength.ok, true, JSON.stringify(changingLength));
+    assert.deepEqual(changingLength.result.value, [3]);
 
     const changed = await call('eval', {
       ...expected,
@@ -1277,7 +1354,12 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.equal((await call('eval', { ...expected, code: 'x'.repeat(8193) })).code, 'invalid_request');
     assert.equal((await call('eval', { ...expected, code: '(() => { const x = {}; x.self = x; return x; })()' })).code, 'browser_eval_error');
     assert.equal((await call('eval', { ...expected, code: '"x".repeat(70000)' })).code, 'browser_eval_error');
-    assert.equal((await call('eval', { ...expected, code: '"💥".repeat(20000)' })).code, 'browser_eval_error');
+    const multibyte = await call('eval', { ...expected, code: '"汉".repeat(30000)' });
+    assert.equal(multibyte.code, 'browser_eval_error');
+    assert.match(multibyte.error, /64 KiB/);
+    const emoji = await call('eval', { ...expected, code: '"💥".repeat(20000)' });
+    assert.equal(emoji.code, 'browser_eval_error');
+    assert.match(emoji.error, /64 KiB/);
     const exception = await call('eval', { ...expected, code: 'throw new Error("E".repeat(5000))' });
     assert.equal(exception.code, 'browser_eval_error');
     assert.ok(exception.error.length <= 2048);
@@ -1287,6 +1369,18 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     });
     assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
     assert.match((await call('dom')).result.html, /New page/);
+    const finalState = (await call('state')).result;
+    const identityOverride = await call('eval', {
+      expected_epoch: finalState.page_epoch, expected_url: `${url}next`,
+      code: `(() => {
+        window.globalThis = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });
+        window.window = new Proxy({}, { get: () => () => 'x'.repeat(1_000_000) });
+        return { actual: 13 };
+      })()`,
+    });
+    assert.ok(identityOverride.ok || identityOverride.code === 'browser_eval_error', JSON.stringify(identityOverride));
+    if (identityOverride.ok) assert.deepEqual(identityOverride.result.value, { actual: 13 });
+    else assert.ok(identityOverride.error.length <= 2048);
   } finally {
     await call('close').catch(() => {});
     host.stdin.end();
