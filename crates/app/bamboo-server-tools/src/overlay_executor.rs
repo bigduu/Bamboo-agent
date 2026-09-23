@@ -314,6 +314,31 @@ mod tests {
         }
     }
 
+    struct BrowserPermissionGate;
+
+    #[async_trait]
+    impl ToolExecutor for BrowserPermissionGate {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("the overlay owns browser calls")
+        }
+
+        async fn check_permissions_for_resolved(
+            &self,
+            _call: &ToolCall,
+            execution_name: &str,
+            args: &serde_json::Value,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            bamboo_tools::permission::check_permissions(execution_name, args)
+                .map_err(|_| ToolError::InvalidArguments("invalid browser arguments".into()))?;
+            Ok(None)
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
     struct SubAgentOverlayTool;
 
     #[async_trait]
@@ -1180,6 +1205,32 @@ mod tests {
             assert!(!event.contains(payload), "{event}");
             assert!(!event.contains("private.txt"), "{event}");
         }
+
+        let poisoned_seen = std::sync::Arc::new(StdMutex::new(None));
+        let gated = OverlayToolExecutor::new(
+            std::sync::Arc::new(BrowserPermissionGate),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "browser",
+                seen: poisoned_seen.clone(),
+            }),
+        );
+        let poisoned_raw = format!(
+            "{{\"action\":\"click\",\"selector\":\"#buy\",\"data_base64\":\"{payload}\",\"expected_epoch\":17"
+        );
+        let call = make_call_with_args("default::browser", &poisoned_raw);
+        let counter = WarnCounter::default();
+        let events = counter.events.clone();
+        {
+            let _guard = tracing::subscriber::set_default(counter);
+            assert!(gated
+                .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+                .await
+                .is_err());
+        }
+        assert!(poisoned_seen.lock().unwrap().is_none());
+        let event = events.lock().unwrap().join("\n");
+        assert!(event.contains("warning=[redacted]"), "{event}");
+        assert!(!event.contains(payload), "{event}");
 
         let base64 = format!("{}==", "A".repeat((1024_usize * 1024).div_ceil(3) * 4 - 2));
         let valid = json!({

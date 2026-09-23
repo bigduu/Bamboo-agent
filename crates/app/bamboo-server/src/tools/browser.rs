@@ -410,6 +410,11 @@ impl Tool for BrowserTool {
             .session_id()
             .ok_or_else(|| ToolError::Execution("browser requires a chat session".into()))?;
         let action = text_arg(&args, "action")?;
+        if action != "set_file_input" && args.get("data_base64").is_some() {
+            return Err(ToolError::InvalidArguments(
+                "browser file bytes require set_file_input".into(),
+            ));
+        }
         if matches!(
             action,
             "new_tab"
@@ -649,6 +654,13 @@ mod tests {
             let error = tool.invoke(invalid, ctx.clone()).await.unwrap_err();
             assert!(matches!(error, ToolError::InvalidArguments(_)));
             assert!(!error.to_string().contains("secret"));
+        }
+        for action in ["click", "tabs"] {
+            let mut poisoned = base.clone();
+            poisoned["action"] = json!(action);
+            let error = tool.invoke(poisoned, ctx.clone()).await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
+            assert!(!error.to_string().contains("YQ=="));
         }
         let error = tool.invoke(
             json!({"action":"set_file_input","session_id":"other-chat","selector":"#upload","filename":"sample.txt","mime_type":"text/plain","data_base64":"YQ==","expected_epoch":17}),

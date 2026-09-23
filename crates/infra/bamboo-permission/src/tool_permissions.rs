@@ -764,6 +764,11 @@ pub fn check_permissions(
         }
         "browser" => {
             let action = required_string_arg(args, "action")?;
+            if action != "set_file_input" && args.get("data_base64").is_some() {
+                return Err(PermissionError::CheckFailed(
+                    "browser file bytes require set_file_input".into(),
+                ));
+            }
             match action {
                 "navigate" => {
                     let raw = required_string_arg(args, "url")?;
@@ -1860,6 +1865,13 @@ mod tests {
         ));
         for different in first.iter().skip(1) {
             assert_ne!(&first[0], different);
+        }
+
+        for action in ["click", "tabs"] {
+            let mut poisoned = base.clone();
+            poisoned["action"] = serde_json::json!(action);
+            assert!(is_private_browser_file_input("browser", &poisoned));
+            assert!(check_permissions("browser", &poisoned).is_err());
         }
 
         let mut invalid = base.clone();
