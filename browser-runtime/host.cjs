@@ -84,6 +84,90 @@ function checkUrl(raw) {
   return value.href;
 }
 
+function targetError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function semanticString(target, name, maximum, required = false) {
+  const value = target[name];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== 'string' || !value.trim() || value.length > maximum) {
+    throw targetError('invalid_target', `invalid browser target ${name}`);
+  }
+  return value;
+}
+
+async function waitForTarget(locator, missingMessage) {
+  try {
+    await locator.first().waitFor({ state: 'attached', timeout: 10_000 });
+  } catch (error) {
+    if (error.name !== 'TimeoutError') throw error;
+    throw targetError('target_not_found', missingMessage);
+  }
+}
+
+async function targetLocator(args) {
+  if (args.target === undefined) {
+    if (typeof args.selector !== 'string' || !args.selector.trim()) {
+      throw targetError('invalid_target', 'browser action requires a selector or target');
+    }
+    return page.locator(args.selector);
+  }
+  if (args.selector !== undefined && args.selector !== null) {
+    throw targetError('invalid_target', 'selector and target are mutually exclusive');
+  }
+  const target = args.target;
+  if (!target || typeof target !== 'object' || Array.isArray(target)) {
+    throw targetError('invalid_target', 'invalid browser semantic target');
+  }
+  const kind = target.kind;
+  const allowed = kind === 'role'
+    ? ['kind', 'role', 'name', 'exact', 'frame_selector']
+    : kind === 'label' || kind === 'text'
+      ? ['kind', 'value', 'exact', 'frame_selector']
+      : null;
+  if (!allowed || Object.keys(target).some(key => !allowed.includes(key)) ||
+      (target.exact !== undefined && typeof target.exact !== 'boolean')) {
+    throw targetError('invalid_target', 'invalid browser semantic target');
+  }
+  const frameSelector = semanticString(target, 'frame_selector', 512);
+  let scope = page;
+  if (frameSelector) {
+    const owner = page.frameLocator(frameSelector).owner();
+    await waitForTarget(owner, 'browser target iframe not found');
+    const count = await owner.count();
+    if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
+    if (count !== 1) {
+      throw targetError('ambiguous_target', `browser target iframe matched ${count} elements`);
+    }
+    scope = page.frameLocator(frameSelector);
+  }
+  const exact = target.exact ?? true;
+  let locator;
+  if (kind === 'role') {
+    const role = semanticString(target, 'role', 64, true);
+    if (!/^[a-z-]+$/.test(role)) {
+      throw targetError('invalid_target', 'invalid browser target role');
+    }
+    const name = semanticString(target, 'name', 256);
+    locator = scope.getByRole(role, name === undefined ? {} : { name, exact });
+  } else {
+    const value = semanticString(target, 'value', 256, true);
+    locator = kind === 'label'
+      ? scope.getByLabel(value, { exact })
+      : scope.getByText(value, { exact });
+  }
+  await waitForTarget(locator, 'browser semantic target not found');
+  const count = await locator.count();
+  if (count === 0) throw targetError('target_not_found', 'browser semantic target not found');
+  if (count !== 1) {
+    throw targetError('ambiguous_target', `browser semantic target matched ${count} elements`);
+  }
+  return locator;
+}
+
 async function command(action, args = {}) {
   switch (action) {
     case 'state':
@@ -142,15 +226,27 @@ async function command(action, args = {}) {
     }
     case 'click_selector':
       checkEpoch(args);
-      await page.locator(args.selector).click({ timeout: 10_000 });
+      {
+        const locator = await targetLocator(args);
+        checkEpoch(args);
+        await locator.click({ timeout: 10_000 });
+      }
       return state();
     case 'fill_selector':
       checkEpoch(args);
-      await page.locator(args.selector).fill(args.text, { timeout: 10_000 });
+      {
+        const locator = await targetLocator(args);
+        checkEpoch(args);
+        await locator.fill(args.text, { timeout: 10_000 });
+      }
       return state();
     case 'press_selector':
       checkEpoch(args);
-      if (args.selector) await page.locator(args.selector).press(args.key, { timeout: 10_000 });
+      if (args.selector || args.target !== undefined) {
+        const locator = await targetLocator(args);
+        checkEpoch(args);
+        await locator.press(args.key, { timeout: 10_000 });
+      }
       else await page.keyboard.press(args.key);
       return state();
     case 'screenshot': {
@@ -192,8 +288,12 @@ async function main() {
     return route.continue();
   });
   page.on('framenavigated', frame => {
+    // A remembered iframe target belongs to the old frame document, even if
+    // the top-level URL is unchanged. Invalidate its epoch on every document
+    // navigation and let the next screencast frame use the new generation.
+    epoch++;
+    lastFrameAt = 0;
     if (frame === page.mainFrame()) {
-      epoch++;
       const url = frame.url();
       if (url !== 'about:blank') {
         try { checkUrl(url); } catch { void page.goto('about:blank').catch(() => {}); }
