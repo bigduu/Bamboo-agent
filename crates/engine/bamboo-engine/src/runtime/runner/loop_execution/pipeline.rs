@@ -323,6 +323,21 @@ impl CompleteCapabilityDiscovery {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if browser_only {
+            // The compatibility gateway exposes only a chat-eligible browser tool.
+            // Skill and workflow stores must not gate access to that browser.
+            let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
+            let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
+            let index = crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                crate::capability_discovery::project_classified_tool_capability_metadata(
+                    &searchable_tool_catalog,
+                ),
+                &empty_skills,
+                &empty_workflows,
+                &Default::default(),
+            );
+            return Ok(Self { catalog, index });
+        }
         let (_, disabled_skill_ids) = config.resolve_disabled_filters();
         let catalog_names = catalog
             .iter()
@@ -334,8 +349,8 @@ impl CompleteCapabilityDiscovery {
                 .selected_skill_ids
                 .as_ref()
                 .map(|ids| ids.iter().cloned().collect()),
-            skill_gateway_available: !browser_only && catalog_names.contains("load_skill"),
-            workflow_gateway_available: !browser_only && catalog_names.contains("workflow_run"),
+            skill_gateway_available: catalog_names.contains("load_skill"),
+            workflow_gateway_available: catalog_names.contains("workflow_run"),
             ..Default::default()
         };
         let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
@@ -3820,6 +3835,7 @@ mod tests {
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
+    use bamboo_skills::{SkillManager, SkillStoreConfig};
     use chrono::Utc;
     use futures::stream;
     use std::collections::HashMap;
@@ -4408,6 +4424,72 @@ mod tests {
             bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         )
         .contains_execution_name("browser"));
+    }
+
+    struct FailingBrowserDiscoveryProjectSource {
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectContextSource for FailingBrowserDiscoveryProjectSource {
+        async fn find_project(
+            &self,
+            _project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            Err(ProjectContextError::Source(
+                "project catalog is unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_browser_discovery_ignores_failing_project_skill_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(FailingBrowserDiscoveryProjectSource {
+            lookups: AtomicUsize::new(0),
+        });
+        let config = AgentLoopConfig {
+            skill_manager: Some(Arc::new(SkillManager::with_config(SkillStoreConfig {
+                skills_dir: directory.path().join("skills"),
+                ..Default::default()
+            }))),
+            project_context_resolver: Some(Arc::new(ProjectContextResolver::new(source.clone()))),
+            ..AgentLoopConfig::default()
+        };
+        let mut session = Session::new("browser-with-broken-skill-store", "chat-model");
+        session.set_project_id_meta("browser-discovery-project".to_string());
+        let tools = vec![loading_test_schema_with_description(
+            "browser",
+            "Operate the browser page shared with this chat",
+        )];
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "browser-search-broken-store",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"browser","kinds":["tool"],"limit":1}"#,
+            )),
+            &mut session,
+            &config,
+            &tools,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&session),
+            vec!["browser"]
+        );
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+                &config, &session
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
