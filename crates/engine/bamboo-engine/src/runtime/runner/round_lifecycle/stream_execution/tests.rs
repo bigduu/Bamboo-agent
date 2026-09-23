@@ -8,7 +8,10 @@ use futures::stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{context_management_telemetry, execute_llm_stream, LlmStreamFrame};
+use super::{
+    context_management_telemetry, discard_latest_interrupted_assistant_output, execute_llm_stream,
+    LlmStreamFrame, INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+};
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
@@ -25,6 +28,27 @@ use bamboo_metrics::storage::MetricsStorage;
 use chrono::Utc;
 
 use super::super::PromptMemoryExposureFrame;
+
+#[test]
+fn interrupted_retry_rollback_returns_exact_removed_visible_message_id() {
+    let mut session = Session::new("retry-rollback", "model");
+    let mut interrupted = Message::assistant("partial visible text", None);
+    interrupted.id = "visible-attempt-1".to_string();
+    interrupted.metadata = Some(serde_json::json!({
+        "runtime_kind": INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+    }));
+    session.add_message(interrupted.clone());
+
+    let removed = discard_latest_interrupted_assistant_output(&mut session, None);
+    assert_eq!(removed.as_deref(), Some("visible-attempt-1"));
+    assert!(session.messages.is_empty());
+
+    session.add_message(interrupted);
+    let protected =
+        discard_latest_interrupted_assistant_output(&mut session, Some("visible-attempt-1"));
+    assert!(protected.is_none());
+    assert_eq!(session.messages.len(), 1);
+}
 
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     let guard = crate::runtime::tests::env_cache_lock_acquire();
@@ -494,8 +518,24 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let first = event_rx.recv().await.expect("budget event expected");
     assert!(matches!(first, AgentEvent::TokenBudgetUpdated { .. }));
 
-    let second = event_rx.recv().await.expect("token event expected");
-    assert!(matches!(second, AgentEvent::Token { .. }));
+    let second = event_rx
+        .recv()
+        .await
+        .expect("visible message identity expected");
+    let visible_message = stream_output
+        .visible_message
+        .as_ref()
+        .expect("visible token must carry a stable identity");
+    assert!(matches!(
+        second,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == visible_message.message_id && created_at == visible_message.created_at
+    ));
+
+    let third = event_rx.recv().await.expect("token event expected");
+    assert!(matches!(third, AgentEvent::Token { content } if content == "hi"));
     assert_eq!(
         llm.requested_text_verbosity
             .lock()

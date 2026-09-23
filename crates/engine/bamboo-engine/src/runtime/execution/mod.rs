@@ -21,6 +21,7 @@ pub mod runner_lifecycle;
 pub mod runner_state;
 pub mod session_events;
 pub mod spawn;
+pub mod visible_messages;
 
 pub use agent_spawn::{
     log_base_system_prompt_snapshot, reserve_session_execution, spawn_session_execution,
@@ -41,4 +42,8 @@ pub use session_events::{get_or_create_event_sender, SESSION_EVENT_CHANNEL_CAPAC
 pub use spawn::{
     ChildRunLaunchHook, ExternalChildRunner, SessionInboxRuntimeBinding, SpawnContext, SpawnJob,
     SpawnScheduler,
+};
+pub use visible_messages::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+    VisibleMessageStream,
 };
