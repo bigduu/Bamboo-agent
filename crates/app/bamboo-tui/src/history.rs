@@ -466,22 +466,29 @@ mod tests {
     #[test]
     fn resumed_focused_browser_approval_keeps_private_input_out_of_chat() {
         let args = serde_json::json!({"action":"key","key":"private input","expected_epoch":17});
-        let result = serde_json::json!({
+        let normal_result = serde_json::json!({
             "status":"awaiting_permission_approval",
             "question":"Approve private input?",
             "permission_request":{"tool_name":"browser","resource":"browser:17:key:opaque"},
-        });
-        let out = map_history(vec![
-            assistant("", vec![("browser-call", "browser", &args.to_string())]),
-            tool("browser-call", &result.to_string(), Some(true)),
-        ]);
-        let displayed = &out[0].tool_calls[0];
-        assert!(!displayed.arguments.contains("private input"));
-        assert_eq!(
-            displayed.result.as_deref(),
-            Some("Browser input awaiting permission approval")
-        );
-        assert!(!format!("{displayed:?}").contains("opaque"));
+        })
+        .to_string();
+        for result in [
+            normal_result,
+            r#"{"permission_request":{"resource":"browser:17:key:opaque"}}"#.to_string(),
+            r#"{"permission_request":{"resource":"browser:17:key:opaque""#.to_string(),
+        ] {
+            let out = map_history(vec![
+                assistant("", vec![("browser-call", "browser", &args.to_string())]),
+                tool("browser-call", &result, Some(true)),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert!(!displayed.arguments.contains("private input"));
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser input awaiting permission approval")
+            );
+            assert!(!format!("{displayed:?}").contains("opaque"));
+        }
     }
 
     #[test]
