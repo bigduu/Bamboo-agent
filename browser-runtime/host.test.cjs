@@ -631,3 +631,96 @@ test('hover and straight drag change the shared page and reject stale coordinate
     await once(fixture, 'close');
   }
 });
+
+test('navigation during observer setup rejects stale hover and drag before pointer events', async () => {
+  let releaseNavigation = false;
+  let wrongPagePointerEvents = 0;
+  const fixture = http.createServer((request, response) => {
+    response.setHeader('cache-control', 'no-store');
+    if (request.url === '/go') {
+      response.end(releaseNavigation ? 'yes' : 'no');
+    } else if (request.url === '/bad-pointer') {
+      wrongPagePointerEvents++;
+      response.end('ok');
+    } else if (request.url === '/race') {
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      response.end('<script>setInterval(async () => { if (window.going) return; if (await fetch("/go", {cache:"no-store"}).then(r => r.text()) === "yes") { window.going = true; location.href = "/new" } }, 20)</script><main>Old document</main>');
+    } else if (request.url === '/new') {
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      response.end('<div style="position:absolute;inset:0" onpointermove="fetch(\'/bad-pointer\')" onmousedown="fetch(\'/bad-pointer\')">New document</div>');
+    } else {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const base = `http://127.0.0.1:${fixture.address().port}`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: { ...process.env, NODE_ENV: 'test', BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS: '1500' },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  const observerWaiters = [];
+  const epochWaiters = [];
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event === 'test_observer_setup_waiting') {
+      observerWaiters.shift()?.();
+      return;
+    }
+    if (message.event === 'frame_reset') {
+      const waiter = epochWaiters.find(waiter => waiter.before !== message.page_epoch);
+      if (waiter) {
+        epochWaiters.splice(epochWaiters.indexOf(waiter), 1);
+        waiter.resolve();
+      }
+      return;
+    }
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 10_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  const within = (promise, label) => new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`${label} timed out`)), 5000);
+    promise.then(value => { clearTimeout(timeout); resolve(value); }, error => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+  try {
+    for (const action of ['hover_at', 'drag_at']) {
+      releaseNavigation = false;
+      const previous = (await call('state')).result;
+      const ready = await call('navigate', { url: base + '/race', expected_epoch: previous.page_epoch });
+      assert.equal(ready.ok, true);
+      const observing = new Promise(resolve => observerWaiters.push(resolve));
+      const responsePromise = call(action, action === 'hover_at'
+        ? { x: 60, y: 35, expected_epoch: ready.result.page_epoch }
+        : { x: 60, y: 120, to_x: 270, to_y: 120, expected_epoch: ready.result.page_epoch });
+      await within(observing, `${action} observer setup`);
+      const changedEpoch = new Promise(resolve => epochWaiters.push({ before: ready.result.page_epoch, resolve }));
+      releaseNavigation = true;
+      await within(changedEpoch, `${action} page navigation`);
+      const response = await responsePromise;
+      assert.equal(response.code, 'stale_epoch', `${action}: ${JSON.stringify(response)}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(wrongPagePointerEvents, 0, action);
+      assert.match((await call('state')).result.url, /\/new$/, action);
+    }
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.closeAllConnections();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});

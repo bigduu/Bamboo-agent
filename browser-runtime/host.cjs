@@ -10,6 +10,11 @@ const MAX_HTML_CHARS = 100_000;
 const MAX_TABS = 8;
 // Rust retires this host after 30 seconds. Leave time for state() and stdio.
 const POINTER_ACTION_BUDGET_MS = 22_000;
+// The packaged host does not inherit NODE_ENV. Direct host tests can pause
+// observer setup to force a navigation between the first and final epoch checks.
+const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS) || 0))
+  : 0;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -351,6 +356,10 @@ async function observeActionNavigation(page, deadlineAt) {
   const cdp = await tabByPage.get(page)?.cdp;
   if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
   await cdp.send('Page.enable');
+  if (TEST_OBSERVER_SETUP_DELAY_MS) {
+    emit({ event: 'test_observer_setup_waiting' });
+    await new Promise(resolve => setTimeout(resolve, TEST_OBSERVER_SETUP_DELAY_MS));
+  }
   const onWindowOpen = event => {
     // Playwright's popup/page events can be delayed until a slow destination
     // response starts. CDP reports window.open at the triggering gesture.
@@ -478,6 +487,7 @@ async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
   pointerTimeout(deadlineAt);
   const navigation = await observeActionNavigation(page, deadlineAt);
   try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
     try { await hover(); } catch (error) {
       if (!navigation.started && expectedEpoch === epoch) throw error;
     }
@@ -495,6 +505,7 @@ async function dragBetween(page, source, destination, expectedEpoch, button = 'l
   let downAttempted = false;
   let failure;
   try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
     try {
       pointerTimeout(deadlineAt);
       await page.mouse.move(source.x, source.y);
