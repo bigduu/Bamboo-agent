@@ -903,12 +903,16 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
       return;
     }
     response.end(`<!doctype html>
+      <style>#drag-source{position:absolute;left:20px;top:160px;width:80px;height:80px;background:blue}#drag-drop{position:absolute;left:220px;top:160px;width:80px;height:80px;background:green}</style>
       <button id="plain" onclick="document.querySelector('#result').textContent='plain'">Plain</button>
       <button id="alert" onclick="alert('Private alert message');document.querySelector('#result').textContent='alert done'">Alert</button>
+      <button id="hover-dialog" onpointerenter="alert('Hover dialog');document.querySelector('#result').textContent='hover answered'">Hover dialog</button>
       <button id="confirm" onclick="document.querySelector('#result').textContent=confirm('Private confirm message')?'yes':'no'">Confirm</button>
       <button id="prompt" onclick="document.querySelector('#result').textContent=prompt('Private prompt message','default text')">Prompt</button>
       <button id="chain" onclick="alert('First dialog');document.querySelector('#result').textContent=confirm('Second dialog')?'chain yes':'chain no'">Chain</button>
       <button id="long" onclick="prompt('m'.repeat(5000),'d'.repeat(5000))">Long</button>
+      <div id="drag-source" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','moved')">Drag</div>
+      <div id="drag-drop" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.querySelector('#result').textContent=confirm('Drag dialog')?event.dataTransfer.getData('text/plain'):'dismissed'">Drop</div>
       <output id="result">idle</output>`);
   });
   fixture.listen(0, '127.0.0.1');
@@ -949,7 +953,14 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
     assert.match(alertId, /^[0-9a-f]{24}$/);
     const pendingState = await call('state');
     assert.equal(pendingState.result.pending_dialog.dialog_id, alertId);
-    assert.equal((await call('click_selector', { selector: '#plain', expected_epoch: epoch })).code, 'dialog_pending');
+    for (const [action, args] of [
+      ['click_selector', { selector: '#plain' }],
+      ['hover_selector', { selector: '#hover-dialog' }],
+      ['drag_selector', { source_selector: '#drag-source', target_selector: '#drag-drop' }],
+      ['select_option', { selector: '#plain', values: ['private'] }],
+    ]) {
+      assert.equal((await call(action, { ...args, expected_epoch: epoch })).code, 'dialog_pending', action);
+    }
     assert.equal((await call('dialog_respond', { dialog_id: '0'.repeat(24), accept: true, expected_epoch: epoch })).code, 'stale_dialog');
     assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, expected_epoch: epoch - 1 })).code, 'stale_epoch');
     assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, text: 'invalid', expected_epoch: epoch })).code, 'invalid_request');
@@ -960,6 +971,21 @@ test('JavaScript dialogs return pending state, accept or dismiss by identity, an
     assert.equal(accepted.result.pending_dialog, undefined);
     assert.match((await call('dom')).result.html, /<output id="result">alert done<\/output>/);
     assert.equal((await call('dialog_respond', { dialog_id: alertId, accept: true, expected_epoch: epoch })).code, 'stale_dialog');
+
+    for (const [action, args, message, result] of [
+      ['hover_selector', { selector: '#hover-dialog' }, 'Hover dialog', 'hover answered'],
+      ['drag_selector', { source_selector: '#drag-source', target_selector: '#drag-drop' }, 'Drag dialog', 'moved'],
+    ]) {
+      const gesture = await call(action, { ...args, expected_epoch: epoch });
+      assert.equal(gesture.ok, true, `${action}: ${JSON.stringify(gesture)}`);
+      assert.equal(gesture.result.pending_dialog.message, message);
+      const answered = await call('dialog_respond', {
+        dialog_id: gesture.result.pending_dialog.dialog_id, accept: true, expected_epoch: epoch,
+      });
+      assert.equal(answered.ok, true, `${action}: ${JSON.stringify(answered)}`);
+      assert.equal(answered.result.pending_dialog, undefined);
+      assert.match((await call('dom')).result.html, new RegExp(`<output id="result">${result}<\\/output>`));
+    }
 
     const confirm = await call('click_selector', { selector: '#confirm', expected_epoch: epoch });
     assert.equal(confirm.result.pending_dialog.type, 'confirm');
