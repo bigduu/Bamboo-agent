@@ -666,8 +666,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                     if let Some(reason) = platform_hard_deny {
                         return Err(ToolError::Execution(reason));
                     }
-                    let force_ask =
-                        permission_checker.requires_forced_confirmation(&tool_name, &args);
+                    let force_ask = crate::permission::is_focused_browser_input(&tool_name, &args)
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
@@ -1861,6 +1861,107 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn configless_checker_still_asks_for_focused_browser_input_under_bypass_and_hook_allow() {
+        struct ConfiglessPromptChecker(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::permission::PermissionChecker for ConfiglessPromptChecker {
+            async fn needs_confirmation(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: &str,
+            ) -> bool {
+                true
+            }
+
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    context,
+                ))
+            }
+
+            fn grant_session_permission(
+                &self,
+                _permission_type: crate::permission::PermissionType,
+                _resource: String,
+            ) {
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "browser",
+                label: "browser-was-invoked",
+                args_sensitive: false,
+            })
+            .expect("register browser stub")
+            .with_permission_checker(Arc::new(ConfiglessPromptChecker(Arc::clone(&requests))))
+            .build();
+
+        for (index, args) in [
+            json!({"action":"type","text":"private text","expected_epoch":17}),
+            json!({"action":"key","key":"Tab","expected_epoch":17}),
+            json!({"action":"press","key":"Enter","expected_epoch":17}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = make_tool_call_with_id(&format!("focused-{index}"), "browser", args);
+            let (event_tx, _event_rx) = mpsc::channel(4);
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some("configless-browser"),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: Some(&event_tx),
+                available_tool_schemas: None,
+                bypass_permissions: true,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            let result = crate::with_hook_permission_override(
+                Some(crate::HookPermissionOverride::Allow),
+                &call.id,
+                executor.execute_with_context(&call, ctx),
+            )
+            .await
+            .expect("focused browser input must pause for approval");
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.result).expect("approval payload");
+            assert_eq!(payload["status"], "awaiting_permission_approval");
+            assert_eq!(
+                payload["permission_request"]["allowed_decisions"],
+                json!(["allow_once", "deny_once"])
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), index + 1);
+        }
+
+        let selector_call = make_tool_call(
+            "browser",
+            json!({"action":"press","selector":"#save","key":"Enter","expected_epoch":17}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("configless-browser"),
+            bypass_permissions: true,
+            ..ToolExecutionContext::none(&selector_call.id)
+        };
+        let result = executor
+            .execute_with_context(&selector_call, ctx)
+            .await
+            .expect("selector-bound press keeps compatibility bypass");
+        assert!(result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

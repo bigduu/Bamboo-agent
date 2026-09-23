@@ -1,7 +1,10 @@
 use std::sync::OnceLock;
+use std::{fs, path::Path};
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use sha2_11::Sha256 as Sha256V11;
 
 use crate::bash_security;
 use crate::hierarchy::PermissionRuleSet;
@@ -14,9 +17,9 @@ const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd
 /// schema-valid request can eventually complete.
 pub const MAX_PROACTIVE_PERMISSION_BATCH: usize = 64;
 
-/// Keep a remembered `type` grant tied to the exact bytes without putting
+/// Keep selector-bound `fill` grants tied to exact bytes without putting
 /// potentially sensitive browser input into permission resources or logs.
-/// Temporary grants are process-local, so the salt can be process-local too.
+/// Those remembered grants are process-local, so this salt can be too.
 fn browser_type_fingerprint(text: &str) -> String {
     static SALT: OnceLock<[u8; 16]> = OnceLock::new();
     let salt = SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
@@ -26,8 +29,89 @@ fn browser_type_fingerprint(text: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// A focused `type` approval may be accepted after a daemon restart. Its
+/// one-shot receipt therefore needs the same private resource fingerprint in
+/// both processes. Never fall back to an ephemeral or unkeyed digest: that
+/// would strand the approved replay or disclose low-entropy typed input.
+fn browser_focused_type_fingerprint(text: &str) -> Result<String, PermissionError> {
+    browser_persistent_fingerprint("focused-type-v1", text)
+}
+
+/// Reusable private fingerprint for browser actions whose approval may replay
+/// after a daemon restart. Callers must use a distinct fixed purpose for each
+/// resource shape and must not substitute a process-local or unkeyed digest.
+pub(crate) fn browser_persistent_fingerprint(
+    purpose: &'static str,
+    input: &str,
+) -> Result<String, PermissionError> {
+    let data_dir = bamboo_config::paths::bamboo_dir();
+    let key = bamboo_config::encryption::get_encryption_key();
+    let env_key = std::env::var("BAMBOO_CONFIG_ENCRYPTION_KEY").ok();
+    let key = verified_persistent_browser_key(&key, &data_dir, env_key.as_deref())?;
+    fs::create_dir_all(&data_dir).map_err(|_| browser_fingerprint_key_error())?;
+    let canonical_dir = fs::canonicalize(&data_dir).map_err(|_| browser_fingerprint_key_error())?;
+    Ok(browser_persistent_fingerprint_with_key(
+        purpose,
+        input,
+        key,
+        &canonical_dir,
+    ))
+}
+
+fn browser_fingerprint_key_error() -> PermissionError {
+    PermissionError::CheckFailed(
+        "browser permission requires a stable private fingerprint key".into(),
+    )
+}
+
+fn verified_persistent_browser_key<'a>(
+    key: &'a [u8],
+    data_dir: &Path,
+    configured_env_key: Option<&str>,
+) -> Result<&'a [u8], PermissionError> {
+    if key.len() != 32 {
+        return Err(browser_fingerprint_key_error());
+    }
+    let configured_key = configured_env_key
+        .and_then(|value| hex::decode(value).ok())
+        .filter(|value| value.len() == 32);
+    if let Some(configured_key) = configured_key {
+        return (configured_key == key)
+            .then_some(key)
+            .ok_or_else(browser_fingerprint_key_error);
+    }
+    let persisted = fs::read_to_string(data_dir.join(".bamboo_encryption_key"))
+        .ok()
+        .and_then(|value| hex::decode(value.trim()).ok());
+    if persisted.as_deref() == Some(key) {
+        Ok(key)
+    } else {
+        Err(browser_fingerprint_key_error())
+    }
+}
+
+fn browser_persistent_fingerprint_with_key(
+    purpose: &str,
+    input: &str,
+    key: &[u8],
+    data_dir: &Path,
+) -> String {
+    type HmacSha256 = Hmac<Sha256V11>;
+    let mut derivation = HmacSha256::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    derivation.update(b"bamboo-browser-permission-key-v1\0");
+    derivation.update(&(purpose.len() as u32).to_be_bytes());
+    derivation.update(purpose.as_bytes());
+    derivation.update(data_dir.as_os_str().as_encoded_bytes());
+    let derived_key = derivation.finalize().into_bytes();
+    let mut fingerprint =
+        HmacSha256::new_from_slice(&derived_key).expect("HMAC accepts derived keys");
+    fingerprint.update(input.as_bytes());
+    hex::encode(fingerprint.finalize().into_bytes())
+}
+
 /// Stable across restarts so a durable approval for the same visible target
-/// continues to match. Input text uses the separate salted fingerprint above.
+/// continues to match. Focused text uses the persistent keyed fingerprint;
+/// selector-bound fill still uses the separate process-local salt above.
 fn browser_target_fingerprint(target: &str) -> String {
     format!("{:x}", Sha256::digest(target.as_bytes()))
 }
@@ -526,7 +610,7 @@ pub fn check_permissions(
                         }
                         "type" => {
                             let text = required_string_arg(args, "text")?;
-                            format!("focused:{}", browser_type_fingerprint(text))
+                            format!("focused:{}", browser_focused_type_fingerprint(text)?)
                         }
                         "key" => {
                             let key = required_string_arg(args, "key")?;
@@ -838,6 +922,7 @@ pub fn check_tool_rules(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::process::Command;
 
     use super::*;
 
@@ -985,6 +1070,231 @@ mod tests {
             &json!({"action":"press","selector":"","key":"Enter","expected_epoch":17})
         )
         .is_err());
+    }
+
+    #[test]
+    fn focused_type_key_must_be_persistent_and_is_scoped_to_data_dir() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let other_key = [8u8; 32];
+        assert!(verified_persistent_browser_key(&key, first_dir.path(), None).is_err());
+        fs::write(
+            first_dir.path().join(".bamboo_encryption_key"),
+            hex::encode(key),
+        )
+        .unwrap();
+        assert!(verified_persistent_browser_key(&key, first_dir.path(), None).is_ok());
+        assert!(verified_persistent_browser_key(&other_key, first_dir.path(), None).is_err());
+        assert!(
+            verified_persistent_browser_key(&key, second_dir.path(), Some(&hex::encode(key)))
+                .is_ok()
+        );
+
+        let original = browser_persistent_fingerprint_with_key(
+            "focused-type-v1",
+            "fixture input",
+            &key,
+            first_dir.path(),
+        );
+        assert_eq!(
+            original,
+            browser_persistent_fingerprint_with_key(
+                "focused-type-v1",
+                "fixture input",
+                &key,
+                first_dir.path()
+            )
+        );
+        assert_ne!(
+            original,
+            browser_persistent_fingerprint_with_key(
+                "focused-type-v1",
+                "other input",
+                &key,
+                first_dir.path()
+            )
+        );
+        assert_ne!(
+            original,
+            browser_persistent_fingerprint_with_key(
+                "focused-type-v1",
+                "fixture input",
+                &key,
+                second_dir.path()
+            )
+        );
+        assert_ne!(
+            original,
+            browser_persistent_fingerprint_with_key(
+                "focused-type-v1",
+                "fixture input",
+                &other_key,
+                first_dir.path()
+            )
+        );
+        assert_ne!(
+            original,
+            browser_persistent_fingerprint_with_key(
+                "browser-eval-v1",
+                "fixture input",
+                &key,
+                first_dir.path()
+            )
+        );
+
+        let css_fill = check_permissions(
+            "browser",
+            &json!({"action":"fill","selector":"#name","text":"fixture input","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(css_fill[0].resource, "browser:17:fill:#name");
+        let semantic_fill = check_permissions(
+            "browser",
+            &json!({"action":"fill","target":{"kind":"role","role":"textbox","name":"Name"},"text":"fixture input","expected_epoch":17}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(semantic_fill[0].resource.ends_with(&format!(
+            ":text:{}",
+            browser_type_fingerprint("fixture input")
+        )));
+    }
+
+    #[test]
+    fn focused_type_fingerprint_child_process() {
+        let Some(output_path) = std::env::var_os("BAMBOO_FOCUSED_TYPE_TEST_OUTPUT") else {
+            return;
+        };
+        let result = check_permissions(
+            "browser",
+            &json!({"action":"type","text":"fixture input","expected_epoch":17}),
+        );
+        let outcome = match result {
+            Ok(Some(mut contexts)) => format!("ok:{}", contexts.remove(0).resource),
+            Err(error) => format!("error:{error}"),
+            Ok(None) => panic!("focused type needs a permission context"),
+        };
+        fs::write(output_path, outcome).unwrap();
+    }
+
+    #[test]
+    fn focused_type_one_shot_receipt_matches_after_process_restart() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let blocked_file_name = "bamboo-encryption-test-key";
+        let run = |data_dir: &Path, output_path: &Path, env_key: Option<&str>| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tool_permissions::tests::focused_type_fingerprint_child_process",
+                ])
+                .env("BAMBOO_DATA_DIR", data_dir)
+                .env("BAMBOO_FOCUSED_TYPE_TEST_OUTPUT", output_path);
+            if let Some(env_key) = env_key {
+                command.env("BAMBOO_CONFIG_ENCRYPTION_KEY", env_key);
+            } else {
+                command.env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "fingerprint child process failed");
+            fs::read_to_string(output_path).unwrap()
+        };
+        let first = run(first_dir.path(), &first_dir.path().join("first.txt"), None);
+        let restarted = run(
+            first_dir.path(),
+            &first_dir.path().join("restarted.txt"),
+            None,
+        );
+        let other_install = run(
+            second_dir.path(),
+            &second_dir.path().join("other.txt"),
+            None,
+        );
+        assert!(first.starts_with("ok:browser:17:type:focused:"));
+        assert_eq!(
+            first, restarted,
+            "same data dir must replay the exact resource"
+        );
+        assert_ne!(first, other_install, "different data dirs must be isolated");
+
+        let config = crate::PermissionConfig::default();
+        let old_resource = first.strip_prefix("ok:").unwrap();
+        let current_resource = restarted.strip_prefix("ok:").unwrap();
+        config
+            .grant_once_for_generation(
+                "chat",
+                "call",
+                "generation",
+                PermissionType::BrowserInteraction,
+                old_resource.to_string(),
+            )
+            .unwrap();
+        assert!(config.consume_once_for_generation(
+            "chat",
+            "call",
+            "generation",
+            PermissionType::BrowserInteraction,
+            current_resource,
+        ));
+        assert!(!config.consume_once_for_generation(
+            "chat",
+            "call",
+            "generation",
+            PermissionType::BrowserInteraction,
+            current_resource,
+        ));
+
+        let env_key_before = hex::encode([9u8; 32]);
+        let env_key_after = hex::encode([10u8; 32]);
+        let env_only_dir = first_dir.path().join("env-only");
+        let env_first = run(
+            &env_only_dir,
+            &first_dir.path().join("env-first.txt"),
+            Some(&env_key_before),
+        );
+        let env_restarted = run(
+            &env_only_dir,
+            &first_dir.path().join("env-restarted.txt"),
+            Some(&env_key_before),
+        );
+        let env_rotated = run(
+            &env_only_dir,
+            &first_dir.path().join("env-rotated.txt"),
+            Some(&env_key_after),
+        );
+        assert!(env_only_dir.is_dir(), "valid env key creates the data dir");
+        assert_eq!(env_first, env_restarted);
+        assert_ne!(
+            env_first, env_rotated,
+            "key rotation invalidates old receipts"
+        );
+        config
+            .grant_once_for_generation(
+                "chat",
+                "rotated-call",
+                "generation",
+                PermissionType::BrowserInteraction,
+                env_first.strip_prefix("ok:").unwrap().to_string(),
+            )
+            .unwrap();
+        assert!(!config.consume_once_for_generation(
+            "chat",
+            "rotated-call",
+            "generation",
+            PermissionType::BrowserInteraction,
+            env_rotated.strip_prefix("ok:").unwrap(),
+        ));
+
+        let blocked_dir = first_dir.path().join(blocked_file_name);
+        fs::write(&blocked_dir, "not a directory").unwrap();
+        let blocked = run(&blocked_dir, &first_dir.path().join("blocked.txt"), None);
+        assert_eq!(
+            blocked,
+            "error:Permission check failed: browser permission requires a stable private fingerprint key"
+        );
     }
 
     #[test]
