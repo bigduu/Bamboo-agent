@@ -2714,6 +2714,9 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
 }
 
 fn has_select_result_key(raw: &str) -> bool {
+    if !raw.trim_start().starts_with('{') {
+        return false;
+    }
     const KEY: &str = "\"selected_values\"";
     raw.match_indices(KEY)
         .any(|(start, _)| raw[start + KEY.len()..].trim_start().starts_with(':'))
@@ -16819,7 +16822,7 @@ mod question_tests {
                 "Browser result unavailable"
             );
         }
-        let snapshot = "- heading \"Public page with selected_values text\"";
+        let snapshot = "page_epoch: 17\n- paragraph '{\"selected_values\":[\"red\"]}'";
         assert_eq!(
             tool_complete_result_for_display("default::browser", snapshot, false),
             snapshot
