@@ -1213,7 +1213,29 @@ test('unanswered dialog expires and a pending dialog dismisses on host close', a
 });
 
 test('bounded page eval changes the same DOM and rejects stale or unsafe results', async () => {
+  let slowReloadRequests = 0;
+  let releaseSlowReload;
+  const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve; });
+  let markSlowReloadStarted;
+  const slowReloadStarted = new Promise(resolve => { markSlowReloadStarted = resolve; });
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/slow-reload') {
+      slowReloadRequests++;
+      const sendPage = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        });
+        response.end('<title>Slow reload</title><output>Current document</output>');
+      };
+      if (slowReloadRequests === 1) sendPage();
+      else {
+        markSlowReloadStarted();
+        void slowReloadGate.then(sendPage);
+      }
+      return;
+    }
     if (request.url === '/lexical-window.js' || request.url === '/lexical-global.js') {
       response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
       response.end(request.url === '/lexical-window.js'
@@ -1435,10 +1457,39 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     });
     assert.equal(identityOverride.ok, true, JSON.stringify(identityOverride));
     assert.deepEqual(identityOverride.result.value, { actual: 13 });
+
+    const slowUrl = `${url}slow-reload`;
+    const slowPage = (await call('navigate', {
+      url: slowUrl, expected_epoch: finalState.page_epoch,
+    })).result;
+    const slowResultPromise = call('eval', {
+      expected_epoch: slowPage.page_epoch, expected_url: slowUrl,
+      code: '(() => { location.reload(); return "old-document"; })()',
+    });
+    let reloadTimeout;
+    try {
+      await Promise.race([
+        slowReloadStarted,
+        new Promise((_, reject) => {
+          reloadTimeout = setTimeout(() => reject(new Error('slow reload did not start')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(reloadTimeout);
+    }
+    // The old document remains at the same URL and epoch while the response
+    // is withheld. A successful result here would be stale once it commits.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    releaseSlowReload();
+    const slowResult = await slowResultPromise;
+    assert.equal(slowResult.code, 'stale_epoch', JSON.stringify(slowResult));
+    assert.ok(slowReloadRequests >= 2);
   } finally {
+    releaseSlowReload();
     await call('close').catch(() => {});
     host.stdin.end();
     host.kill();
+    fixture.closeAllConnections();
     fixture.close();
     await once(fixture, 'close');
   }

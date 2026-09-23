@@ -412,7 +412,10 @@ async function evalInActivePage(args) {
   const tab = requireActiveTab();
   const page = tab.page;
   const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
-    !page.isClosed() && page.url() === args.expected_url;
+    !page.isClosed() && page.url() === args.expected_url &&
+    // A same-URL reload can keep the old URL/epoch until its slow response
+    // commits. Never return a value from the document being replaced.
+    tab.pendingNavigations.size === 0;
   if (!unchanged()) throw staleEpochError();
   let transferred;
   try {
