@@ -278,7 +278,7 @@ async function evalInActivePage(args) {
     // This callback and indirect eval run in the page realm. Only the source
     // string crosses into Chromium; no Node, Playwright page object, or CDP
     // handle is made available to evaluated code.
-    encoded = await page.evaluate(async source => {
+    const evaluated = await page.evaluate(async source => {
       const value = await (0, eval)(source);
       const seen = new WeakSet();
       let entries = 0;
@@ -320,13 +320,22 @@ async function evalInActivePage(args) {
         seen.delete(item);
         return result;
       };
-      return JSON.stringify(safe(value, 0));
+      return { encoded: JSON.stringify(safe(value, 0)), observed_url: location.href };
     }, args.code);
+    if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
+    // A synchronous location assignment may schedule the navigation after
+    // evaluate resolves. Give the page one event-loop turn to commit it before
+    // accepting the result from the old document.
+    const settledUrl = await page.evaluate(() =>
+      new Promise(resolve => setTimeout(() => resolve(location.href), 0)));
+    if (settledUrl !== args.expected_url) throw staleEpochError();
+    encoded = evaluated.encoded;
   } catch (error) {
     // Chromium may destroy the execution context before Playwright's frame
     // navigation event advances our epoch. Never surface that result as a
     // script exception from the old document.
-    if (!unchanged() || String(error?.message || error).includes('Execution context was destroyed')) {
+    if (error?.code === 'stale_epoch' || !unchanged() ||
+        String(error?.message || error).includes('Execution context was destroyed')) {
       throw staleEpochError();
     }
     const boundedError = new Error(bounded(String(error?.message || error), 2048));

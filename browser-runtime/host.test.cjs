@@ -1267,7 +1267,7 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
     assert.ok(exception.error.length <= 2048);
     const navigation = await call('eval', {
       ...expected,
-      code: '(() => { location.href = "/next"; return new Promise(resolve => setTimeout(() => resolve("old"), 200)); })()',
+      code: '(() => { location.href = "/next"; return "old"; })()',
     });
     assert.equal(navigation.code, 'stale_epoch', JSON.stringify(navigation));
     assert.match((await call('dom')).result.html, /New page/);
