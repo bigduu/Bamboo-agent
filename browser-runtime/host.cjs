@@ -25,6 +25,8 @@ const MAX_DIALOG_CHARS = 4_096;
 const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
   ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
   : 300_000;
+const MAX_EVAL_CODE_BYTES = 8 * 1024;
+const MAX_EVAL_JSON_BYTES = 64 * 1024;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -195,6 +197,154 @@ function checkUrl(raw) {
 
 function checkPageUrl(raw) {
   return raw === 'about:blank' ? raw : checkUrl(raw);
+}
+
+function checkEvalArgs(args) {
+  if (typeof args.code !== 'string' || !args.code.trim() ||
+      Buffer.byteLength(args.code, 'utf8') > MAX_EVAL_CODE_BYTES) {
+    const error = new Error('browser_eval code must be nonempty and at most 8 KiB');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (!Number.isSafeInteger(args.expected_epoch) || args.expected_epoch < 0) {
+    const error = new Error('browser_eval requires a safe expected_epoch');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (typeof args.expected_url !== 'string' ||
+      Buffer.byteLength(args.expected_url, 'utf8') > 8192) {
+    const error = new Error('browser_eval requires a bounded expected_url');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  checkPageUrl(args.expected_url);
+  checkEpoch(args);
+}
+
+function parseEvalResult(encoded) {
+  let value;
+  try {
+    value = JSON.parse(encoded);
+  } catch {
+    const error = new Error('browser_eval result is not valid JSON');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  // The page can replace JSON.stringify; recheck its output in trusted Node
+  // before forwarding it over the host protocol.
+  const stack = [[value, 0]];
+  let entries = 0;
+  let stringUnits = 0;
+  while (stack.length) {
+    const [item, depth] = stack.pop();
+    if (++entries > 256 || depth > 8) {
+      const error = new Error('browser_eval result exceeds depth or entry limit');
+      error.code = 'browser_eval_error';
+      throw error;
+    }
+    if (item === null || typeof item === 'boolean') continue;
+    if (typeof item === 'number' && Number.isFinite(item)) continue;
+    if (typeof item === 'string') {
+      stringUnits += item.length;
+      if (stringUnits <= 65536) continue;
+    } else if (Array.isArray(item)) {
+      if (item.length <= 64) {
+        for (const child of item) stack.push([child, depth + 1]);
+        continue;
+      }
+    } else if (typeof item === 'object') {
+      const keys = Object.keys(item);
+      if (keys.length <= 64 && keys.every(key => key.length <= 256)) {
+        for (const key of keys) stack.push([item[key], depth + 1]);
+        continue;
+      }
+    }
+    const error = new Error('browser_eval result is not JSON-safe or exceeds limits');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  return value;
+}
+
+async function evalInActivePage(args) {
+  checkEvalArgs(args);
+  const tab = requireActiveTab();
+  const page = tab.page;
+  const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
+    !page.isClosed() && page.url() === args.expected_url;
+  if (!unchanged()) throw staleEpochError();
+  let encoded;
+  try {
+    // This callback and indirect eval run in the page realm. Only the source
+    // string crosses into Chromium; no Node, Playwright page object, or CDP
+    // handle is made available to evaluated code.
+    encoded = await page.evaluate(async source => {
+      const value = await (0, eval)(source);
+      const seen = new WeakSet();
+      let entries = 0;
+      let stringUnits = 0;
+      const safe = (item, depth) => {
+        if (++entries > 256 || depth > 8) throw new Error('browser_eval result exceeds depth or entry limit');
+        if (item === null || typeof item === 'boolean') return item;
+        if (typeof item === 'number' && Number.isFinite(item)) return item;
+        if (typeof item === 'string') {
+          stringUnits += item.length;
+          if (stringUnits > 65536) throw new Error('browser_eval result exceeds string limit');
+          return item;
+        }
+        if (typeof item !== 'object' || seen.has(item)) {
+          throw new Error('browser_eval result is not JSON-safe');
+        }
+        seen.add(item);
+        let result;
+        if (Array.isArray(item)) {
+          if (item.length > 64) throw new Error('browser_eval result exceeds array limit');
+          result = item.map(child => safe(child, depth + 1));
+        } else {
+          const prototype = Object.getPrototypeOf(item);
+          if (prototype !== Object.prototype && prototype !== null) {
+            throw new Error('browser_eval result must contain only plain objects');
+          }
+          const keys = Object.keys(item);
+          if (keys.length > 64) throw new Error('browser_eval result exceeds object entry limit');
+          result = Object.create(null);
+          for (const key of keys) {
+            if (key.length > 256) throw new Error('browser_eval result key is too long');
+            const descriptor = Object.getOwnPropertyDescriptor(item, key);
+            if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+              throw new Error('browser_eval result contains an accessor');
+            }
+            result[key] = safe(descriptor.value, depth + 1);
+          }
+        }
+        seen.delete(item);
+        return result;
+      };
+      return JSON.stringify(safe(value, 0));
+    }, args.code);
+  } catch (error) {
+    // Chromium may destroy the execution context before Playwright's frame
+    // navigation event advances our epoch. Never surface that result as a
+    // script exception from the old document.
+    if (!unchanged() || String(error?.message || error).includes('Execution context was destroyed')) {
+      throw staleEpochError();
+    }
+    const boundedError = new Error(bounded(String(error?.message || error), 2048));
+    boundedError.code = 'browser_eval_error';
+    throw boundedError;
+  }
+  if (!unchanged()) throw staleEpochError();
+  if (typeof encoded !== 'string' || Buffer.byteLength(encoded, 'utf8') > MAX_EVAL_JSON_BYTES) {
+    const error = new Error('browser_eval result exceeds 64 KiB');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  return {
+    page_epoch: epoch,
+    active_tab_id: tab.id,
+    url: page.url(),
+    value: parseEvalResult(encoded),
+  };
 }
 
 function requireTabId(raw) {
@@ -1170,6 +1320,8 @@ async function command(action, args = {}) {
         return { viewport, mime_type: 'image/jpeg', data: data.toString('base64') };
       });
     }
+    case 'eval':
+      return evalInActivePage(args);
     case 'close':
       shuttingDown = true;
       await browser.close();
