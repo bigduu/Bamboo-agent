@@ -53,14 +53,16 @@ fn parse_warning_log_details<'a>(
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if crate::permission::is_native_browser_select(tool_name, args) {
+        // The display event is emitted before all schema paths necessarily
+        // reject extra fields. Only the action is safe to expose here.
+        return serde_json::json!({"action":"select_option"});
+    }
     let mut display = args.clone();
     if let Some(parameters) = display.as_object_mut() {
         if crate::permission::is_focused_browser_input(tool_name, args) {
             parameters.remove("text");
             parameters.remove("key");
-        } else if crate::permission::is_native_browser_select(tool_name, args) {
-            parameters.remove("selector");
-            parameters.remove("values");
         }
     }
     display
@@ -1080,16 +1082,18 @@ mod tests {
             "selector":"select[data-private='account']",
             "values":["private-option-value"],
             "expected_epoch":17,
+            "text":"private-text",
+            "url":"https://example.com/?private=query",
+            "nested":{"secret":"private-nested"},
         });
         let original = args.clone();
         let display = approval_parameters_for_display("browser", &args);
-        assert_eq!(
-            display,
-            json!({"action":"select_option","expected_epoch":17})
-        );
+        assert_eq!(display, json!({"action":"select_option"}));
         assert_eq!(args, original);
         assert!(!display.to_string().contains("private-option-value"));
         assert!(!display.to_string().contains("data-private"));
+        assert!(!display.to_string().contains("private-query"));
+        assert!(!display.to_string().contains("private-nested"));
         assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
