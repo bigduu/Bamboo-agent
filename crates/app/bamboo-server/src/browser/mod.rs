@@ -1,5 +1,5 @@
 //! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
-//! Each chat session has one isolated Playwright page in a child Node process.
+//! Each chat session has one isolated Playwright context in a child Node process.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ pub enum BrowserError {
 
 #[derive(Clone, Debug)]
 pub struct BrowserFrame {
+    pub tab_id: String,
     pub page_epoch: u64,
     pub frame_seq: u64,
     pub viewport_width: u32,
@@ -55,6 +56,7 @@ struct BrowserSession {
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
     frame_epoch: AtomicU64,
+    active_tab_id: Mutex<Option<String>>,
     alive: AtomicBool,
     last_used: Mutex<Instant>,
 }
@@ -128,6 +130,7 @@ impl BrowserSession {
             next_id: AtomicU64::new(1),
             frames,
             frame_epoch: AtomicU64::new(0),
+            active_tab_id: Mutex::new(None),
             alive: AtomicBool::new(true),
             last_used: Mutex::new(Instant::now()),
         });
@@ -169,7 +172,9 @@ impl BrowserSession {
                         .unwrap_or("unknown error");
                     Err(match message.get("code").and_then(Value::as_str) {
                         Some("stale_epoch") => BrowserError::StaleEpoch,
-                        Some("invalid_url") => BrowserError::Invalid(error.to_string()),
+                        Some("invalid_url" | "invalid_request") => {
+                            BrowserError::Invalid(error.to_string())
+                        }
                         _ => BrowserError::Failed(error.to_string()),
                     })
                 };
@@ -179,6 +184,7 @@ impl BrowserSession {
         if let Some(session) = weak.upgrade() {
             session.alive.store(false, Ordering::Release);
             session.frames.send_replace(None);
+            *session.active_tab_id.lock().unwrap() = None;
             let pending = std::mem::take(&mut *session.pending.lock().unwrap());
             for (_, sender) in pending {
                 let _ = sender.send(Err(BrowserError::Unavailable("browser host exited".into())));
@@ -187,6 +193,12 @@ impl BrowserSession {
     }
 
     fn accept_frame(&self, value: &Value) {
+        let Some(tab_id) = value.get("active_tab_id").and_then(Value::as_str) else {
+            return;
+        };
+        if self.active_tab_id.lock().unwrap().as_deref() != Some(tab_id) {
+            return;
+        }
         let Some(data) = value.get("data").and_then(Value::as_str) else {
             return;
         };
@@ -216,6 +228,7 @@ impl BrowserSession {
         };
         self.frame_epoch.store(page_epoch, Ordering::Release);
         self.frames.send_replace(Some(Arc::new(BrowserFrame {
+            tab_id: tab_id.to_string(),
             page_epoch,
             frame_seq,
             viewport_width,
@@ -232,6 +245,11 @@ impl BrowserSession {
             return;
         }
         self.frame_epoch.store(page_epoch, Ordering::Release);
+        let tab_id = value
+            .get("active_tab_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        *self.active_tab_id.lock().unwrap() = tab_id;
         self.frames.send_replace(None);
     }
 
@@ -292,6 +310,7 @@ mod tests {
             next_id: AtomicU64::new(1),
             frames,
             frame_epoch: AtomicU64::new(0),
+            active_tab_id: Mutex::new(None),
             alive: AtomicBool::new(alive),
             last_used: Mutex::new(Instant::now() - idle_for),
         })
@@ -312,10 +331,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn frame_reset_discards_old_epoch_jpeg_and_late_frames() {
+    async fn active_tab_reset_discards_cached_and_late_epoch_frames() {
         let session = stub_session(Duration::ZERO, true);
-        let frame = |page_epoch, frame_seq| {
+        let frame = |tab_id, page_epoch, frame_seq| {
             json!({
+                "active_tab_id":tab_id,
                 "page_epoch":page_epoch,
                 "frame_seq":frame_seq,
                 "viewport_width":640,
@@ -323,14 +343,23 @@ mod tests {
                 "data":base64::engine::general_purpose::STANDARD.encode([1, 2, 3]),
             })
         };
-        session.accept_frame(&frame(17, 1));
-        assert_eq!(session.frames.borrow().as_ref().unwrap().page_epoch, 17);
-        session.accept_frame_reset(&json!({"page_epoch":18}));
+        session.accept_frame_reset(&json!({"active_tab_id":"first","page_epoch":17}));
+        session.accept_frame(&frame("first", 17, 1));
+        assert_eq!(session.frames.borrow().as_ref().unwrap().tab_id, "first");
+
+        session.accept_frame_reset(&json!({"active_tab_id":"second","page_epoch":18}));
         assert!(session.frames.borrow().is_none());
-        session.accept_frame(&frame(17, 2));
+        session.accept_frame(&frame("first", 17, 2));
+        session.accept_frame(&frame("second", 17, 3));
         assert!(session.frames.borrow().is_none());
-        session.accept_frame(&frame(18, 3));
-        assert_eq!(session.frames.borrow().as_ref().unwrap().page_epoch, 18);
+        session.accept_frame(&frame("second", 18, 4));
+        assert_eq!(session.frames.borrow().as_ref().unwrap().tab_id, "second");
+
+        session.accept_frame_reset(&json!({"active_tab_id":"second","page_epoch":19}));
+        session.accept_frame(&frame("second", 18, 5));
+        assert!(session.frames.borrow().is_none());
+        session.accept_frame(&frame("second", 19, 6));
+        assert_eq!(session.frames.borrow().as_ref().unwrap().page_epoch, 19);
     }
 
     #[tokio::test]

@@ -399,7 +399,7 @@ pub fn check_permissions(
                     )]))
                 }
                 "click" | "click_at" | "fill" | "type" | "press" | "key" | "scroll" | "history"
-                | "viewport" => {
+                | "viewport" | "new_tab" | "activate_tab" | "close_tab" => {
                     // Bind remembered grants to the page generation. Navigation
                     // increments the epoch, so a selector approved on one site
                     // cannot silently carry authority to the next site.
@@ -418,6 +418,8 @@ pub fn check_permissions(
                         None
                     };
                     let target = match action {
+                        "new_tab" => "new".to_string(),
+                        "activate_tab" | "close_tab" => browser_tab_id_arg(args)?.to_string(),
                         "click" | "fill" => match &semantic {
                             Some((identity, _)) => identity.clone(),
                             None => required_string_arg(args, "selector")?.to_string(),
@@ -532,7 +534,7 @@ pub fn check_permissions(
                         description,
                     )]))
                 }
-                "snapshot" | "screenshot" => Ok(None),
+                "tabs" | "snapshot" | "screenshot" => Ok(None),
                 _ => Err(PermissionError::CheckFailed(
                     "unknown browser action".into(),
                 )),
@@ -757,6 +759,20 @@ fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, Permis
         })
 }
 
+fn browser_tab_id_arg(args: &Value) -> Result<&str, PermissionError> {
+    let tab_id = required_string_arg(args, "tab_id")?;
+    if tab_id.len() != 24
+        || !tab_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(PermissionError::CheckFailed(
+            "browser tab_id must be a 24-character lowercase hex ID".into(),
+        ));
+    }
+    Ok(tab_id)
+}
+
 fn first_present_string_arg<'a>(
     args: &'a Value,
     keys: &[&str],
@@ -862,6 +878,50 @@ mod tests {
                 check_permissions("browser", &later).unwrap().unwrap()[0].resource,
                 expected_resource
             );
+        }
+    }
+
+    #[test]
+    fn browser_tab_mutations_bind_grants_to_epoch_and_opaque_tab_id() {
+        assert!(check_permissions("browser", &json!({"action":"tabs"}))
+            .unwrap()
+            .is_none());
+        for (args, resource) in [
+            (
+                json!({"action":"new_tab","expected_epoch":17}),
+                "browser:17:new_tab:new",
+            ),
+            (
+                json!({"action":"activate_tab","tab_id":"aaaaaaaaaaaaaaaaaaaaaaaa","expected_epoch":17}),
+                "browser:17:activate_tab:aaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                json!({"action":"close_tab","tab_id":"aaaaaaaaaaaaaaaaaaaaaaaa","expected_epoch":17}),
+                "browser:17:close_tab:aaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            let context = check_permissions("browser", &args).unwrap().unwrap();
+            assert_eq!(
+                context[0].permission_type,
+                PermissionType::BrowserInteraction
+            );
+            assert_eq!(context[0].resource, resource);
+            let mut stale = args;
+            stale["expected_epoch"] = json!(18);
+            assert_ne!(
+                check_permissions("browser", &stale).unwrap().unwrap()[0].resource,
+                resource
+            );
+        }
+        for args in [
+            json!({"action":"new_tab"}),
+            json!({"action":"activate_tab","expected_epoch":17}),
+            json!({"action":"close_tab","expected_epoch":17}),
+            json!({"action":"activate_tab","tab_id":"short","expected_epoch":17}),
+            json!({"action":"close_tab","tab_id":"AAAAAAAAAAAAAAAAAAAAAAAA","expected_epoch":17}),
+            json!({"action":"activate_tab","tab_id":"a".repeat(10000),"expected_epoch":17}),
+        ] {
+            assert!(check_permissions("browser", &args).is_err());
         }
     }
 

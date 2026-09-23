@@ -761,11 +761,12 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
     };
 
     // Session metadata mutations use ETag as their If-Match CAS token. The
-    // browser workbench also needs frame sequence, epoch, and geometry headers
+    // browser workbench also needs active tab, frame sequence, epoch, and geometry headers
     // when its frontend and Bamboo use different local origins.
     cors.expose_headers([
         header::ETAG,
         header::HeaderName::from_static("x-frame-seq"),
+        header::HeaderName::from_static("x-tab-id"),
         header::HeaderName::from_static("x-page-epoch"),
         header::HeaderName::from_static("x-viewport-width"),
         header::HeaderName::from_static("x-viewport-height"),
@@ -1218,6 +1219,7 @@ mod tests {
             );
             for name in [
                 "x-frame-seq",
+                "x-tab-id",
                 "x-page-epoch",
                 "x-viewport-width",
                 "x-viewport-height",
@@ -1229,7 +1231,7 @@ mod tests {
             }
             assert_eq!(
                 exposed.len(),
-                5,
+                6,
                 "only the CAS and browser frame headers are exposed for bind {bind_addr}"
             );
 

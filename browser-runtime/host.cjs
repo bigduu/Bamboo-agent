@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// One host process owns one isolated Chromium context and page. Bamboo is the
+// One host process owns one isolated Chromium context and a bounded tab set. Bamboo is the
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
 const { randomBytes } = require('node:crypto');
@@ -7,16 +7,21 @@ const readline = require('node:readline');
 
 const MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_HTML_CHARS = 100_000;
+const MAX_TABS = 8;
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
-let page;
-let cdp;
-let frameSeq = 0;
-let lastFrameAt = 0;
+let tabs = [];
+const tabByPage = new WeakMap();
+let activeTabId;
+let activeCapture;
 let captureGeneration = 0;
 let captureTask = Promise.resolve();
+let frameSeq = 0;
+let lastFrameAt = 0;
 let closing = false;
+let shuttingDown = false;
+let browserClosed = false;
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -32,36 +37,65 @@ function staleEpochError() {
   return error;
 }
 
+function activeTab() {
+  return tabs.find(tab => tab.id === activeTabId);
+}
+
+function requireActiveTab() {
+  const tab = activeTab();
+  if (!tab || tab.page.isClosed()) throw staleEpochError();
+  return tab;
+}
+
+function tabSummary(tab) {
+  return {
+    tab_id: tab.id,
+    url: tab.page.url(),
+    title: tab.title,
+    active: tab.id === activeTabId,
+  };
+}
+
 async function stableRead(read) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    const tab = requireActiveTab();
     const readEpoch = epoch;
-    const readUrl = page.url();
+    const readUrl = tab.page.url();
+    checkPageUrl(readUrl);
     try {
-      const value = await read();
-      if (epoch === readEpoch && page.url() === readUrl) {
-        return { page_epoch: readEpoch, url: readUrl, ...value };
+      const value = await read(tab);
+      if (epoch === readEpoch && activeTabId === tab.id &&
+          !tab.page.isClosed() && tab.page.url() === readUrl) {
+        return { page_epoch: readEpoch, active_tab_id: tab.id, url: readUrl, ...value };
       }
     } catch (error) {
-      if (epoch === readEpoch && page.url() === readUrl) throw error;
+      if (epoch === readEpoch && activeTabId === tab.id &&
+          !tab.page.isClosed() && tab.page.url() === readUrl) throw error;
     }
   }
   throw staleEpochError();
 }
 
 async function state() {
-  return stableRead(async () => {
-    const viewport = page.viewportSize();
-    const title = await page.title();
+  return stableRead(async tab => {
+    const viewport = tab.page.viewportSize();
+    const title = await tab.page.title();
+    tab.title = title;
     let canGoBack = false;
     let canGoForward = false;
     try {
+      const cdp = await tab.cdp;
       const history = await cdp.send('Page.getNavigationHistory');
       canGoBack = history.currentIndex > 0;
       canGoForward = history.currentIndex < history.entries.length - 1;
     } catch {
       // Navigation history is a hint and may be briefly unavailable.
     }
-    return { frame_seq: frameSeq, title, viewport, can_go_back: canGoBack, can_go_forward: canGoForward };
+    return {
+      frame_seq: frameSeq, title, viewport,
+      can_go_back: canGoBack, can_go_forward: canGoForward,
+      tabs: tabs.map(tabSummary),
+    };
   });
 }
 
@@ -86,36 +120,63 @@ function checkUrl(raw) {
   return value.href;
 }
 
+function checkPageUrl(raw) {
+  return raw === 'about:blank' ? raw : checkUrl(raw);
+}
+
+function requireTabId(raw) {
+  if (typeof raw !== 'string' || !/^[0-9a-f]{24}$/.test(raw)) {
+    const error = new Error('invalid browser tab ID');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  return raw;
+}
+
 function scheduleCapture() {
   const generation = ++captureGeneration;
   captureTask = captureTask.catch(() => {}).then(async () => {
-    if (generation !== captureGeneration || closing || page.isClosed()) return;
-    await page.screencast.stop().catch(() => {});
-    if (generation !== captureGeneration || closing || page.isClosed()) return;
-    await page.screencast.start({
-      quality: 75,
-      size: { width: 1200, height: 1000 },
-      onFrame: ({ data, viewportWidth, viewportHeight }) => {
-        if (generation !== captureGeneration || closing || page.isClosed()) return;
-        const now = Date.now();
-        if (now - lastFrameAt < 100) return;
-        lastFrameAt = now;
-        emit({ event: 'frame', page_epoch: epoch, frame_seq: ++frameSeq,
-          viewport_width: viewportWidth, viewport_height: viewportHeight,
-          data: data.toString('base64') });
-      },
-    });
+    if (generation !== captureGeneration || shuttingDown || closing) return;
+    if (activeCapture) {
+      const previous = activeCapture;
+      activeCapture = undefined;
+      await previous.page.screencast.stop().catch(() => {});
+    }
+    if (generation !== captureGeneration || shuttingDown || closing) return;
+    const tab = activeTab();
+    if (!tab || tab.page.isClosed()) return;
+    const capture = { page: tab.page, tabId: tab.id, generation };
+    activeCapture = capture;
+    try {
+      await tab.page.screencast.start({
+        quality: 75,
+        size: { width: 1200, height: 1000 },
+        onFrame: ({ data, viewportWidth, viewportHeight }) => {
+          if (captureGeneration !== generation || activeTabId !== tab.id ||
+              activeCapture !== capture || tab.page.isClosed() || shuttingDown || closing) return;
+          const now = Date.now();
+          if (now - lastFrameAt < 100) return;
+          lastFrameAt = now;
+          emit({
+            event: 'frame', active_tab_id: tab.id, page_epoch: epoch,
+            frame_seq: ++frameSeq, viewport_width: viewportWidth,
+            viewport_height: viewportHeight, data: data.toString('base64'),
+          });
+        },
+      });
+    } catch {
+      if (activeCapture === capture) activeCapture = undefined;
+    }
   });
-  return captureTask;
 }
 
 function advanceEpoch() {
   epoch++;
   lastFrameAt = 0;
-  // Drop an old JPEG before returning a state for the new frame document.
-  emit({ event: 'frame_reset', page_epoch: epoch });
-  // Restarting screencast produces a current-epoch first frame even when a
-  // hidden iframe changes without repainting the visible page.
+  // Reset the server's cached JPEG before replying with the new active state.
+  emit({ event: 'frame_reset', active_tab_id: activeTabId || null, page_epoch: epoch });
+  // Restarting screencast yields a first current-epoch JPEG even if a hidden
+  // iframe changes without repainting the visible page.
   void scheduleCapture();
 }
 
@@ -143,7 +204,7 @@ async function waitForTarget(locator, missingMessage) {
   }
 }
 
-async function targetLocator(args) {
+async function targetLocator(args, page) {
   let locator;
   if (args.target === undefined) {
     if (typeof args.selector !== 'string' || !args.selector.trim()) {
@@ -205,11 +266,11 @@ async function targetLocator(args) {
 }
 
 async function withPinnedTarget(args, act) {
-  const locator = await targetLocator(args);
+  const page = requireActiveTab().page;
+  const locator = await targetLocator(args, page);
   checkEpoch(args);
-  // Locator actions can silently re-resolve on a new document while waiting
-  // for an old disabled element. A handle is bound to the resolved document;
-  // navigation detaches it instead of retargeting the action.
+  // A Locator may re-resolve after navigation while waiting for an old
+  // disabled element. An ElementHandle stays bound to its document.
   const handle = await locator.elementHandle({ timeout: 10_000 });
   if (!handle) throw targetError('target_not_found', 'browser target not found');
   try {
@@ -227,16 +288,109 @@ async function withPinnedTarget(args, act) {
   }
 }
 
+function activateTab(tab) {
+  if (activeTabId === tab.id) return;
+  activeTabId = tab.id;
+  advanceEpoch();
+}
+
+function adoptPage(target) {
+  if (shuttingDown) {
+    void target.close().catch(() => {});
+    return null;
+  }
+  const existing = tabByPage.get(target);
+  if (existing) return existing;
+  if (tabs.length >= MAX_TABS) {
+    void target.close().catch(() => {});
+    return null;
+  }
+  const tab = {
+    id: randomBytes(12).toString('hex'),
+    page: target,
+    cdp: context.newCDPSession(target).catch(() => null),
+    title: '',
+  };
+  tabs.push(tab);
+  tabByPage.set(target, tab);
+  target.setDefaultTimeout(10_000);
+  target.on('domcontentloaded', () => {
+    void target.title().then(title => { tab.title = title; }).catch(() => {});
+  });
+  target.on('framenavigated', frame => {
+    if (frame === target.mainFrame()) {
+      const url = frame.url();
+      if (url !== 'about:blank') {
+        try { checkUrl(url); } catch { void target.goto('about:blank').catch(() => {}); }
+      }
+    }
+    // Every frame navigation invalidates coordinates and semantic targets in
+    // the active view, including iframe content.
+    if (activeTabId === tab.id) advanceEpoch();
+  });
+  target.on('close', () => {
+    tabs = tabs.filter(candidate => candidate !== tab);
+    if (activeTabId !== tab.id) return;
+    activeTabId = tabs.at(-1)?.id;
+    if (!shuttingDown) {
+      advanceEpoch();
+      if (!activeTabId) void context.newPage().catch(() => {});
+    }
+  });
+  // A popup becomes the visible workbench tab. Explicit new tabs use this same
+  // path, so a page cannot exist without an opaque ID and navigation guard.
+  activateTab(tab);
+  return tab;
+}
+
 async function command(action, args = {}) {
   switch (action) {
     case 'state':
+    case 'tab_list':
       return state();
+    case 'tab_create':
+      checkEpoch(args);
+      if (tabs.length >= MAX_TABS) {
+        const error = new Error('browser tab limit reached');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      adoptPage(await context.newPage());
+      return state();
+    case 'tab_activate': {
+      checkEpoch(args);
+      const tabId = requireTabId(args.tab_id);
+      const tab = tabs.find(tab => tab.id === tabId);
+      if (!tab) {
+        const error = new Error('browser tab not found');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      activateTab(tab);
+      return state();
+    }
+    case 'tab_close': {
+      checkEpoch(args);
+      const tabId = requireTabId(args.tab_id);
+      const tab = tabs.find(tab => tab.id === tabId);
+      if (!tab) {
+        const error = new Error('browser tab not found');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      // Keep a valid active view when the last tab is closed.
+      if (tabs.length === 1) adoptPage(await context.newPage());
+      await tab.page.close();
+      return state();
+    }
     case 'navigate':
       checkEpoch(args);
+      var page = requireActiveTab().page;
       await page.goto(checkUrl(args.url), { waitUntil: 'domcontentloaded', timeout: 20_000 });
       return state();
     case 'history':
       checkEpoch(args);
+      page = requireActiveTab().page;
       if (args.direction === 'back') await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20_000 });
       else if (args.direction === 'forward') await page.goForward({ waitUntil: 'domcontentloaded', timeout: 20_000 });
       else if (args.direction === 'reload') await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
@@ -244,6 +398,7 @@ async function command(action, args = {}) {
       return state();
     case 'viewport':
       checkEpoch(args);
+      page = requireActiveTab().page;
       if (!Number.isInteger(args.width) || !Number.isInteger(args.height) ||
           args.width < 320 || args.width > 1200 || args.height < 240 || args.height > 1000) {
         throw new Error('viewport must be within 320..1200 by 240..1000 CSS pixels');
@@ -257,6 +412,7 @@ async function command(action, args = {}) {
       return state();
     case 'input':
       checkEpoch(args);
+      page = requireActiveTab().page;
       if (args.kind === 'click') {
         await page.mouse.click(args.x, args.y, { button: args.button || 'left' });
       } else if (args.kind === 'scroll') {
@@ -271,7 +427,8 @@ async function command(action, args = {}) {
       }
       return state();
     case 'dom': {
-      return stableRead(async () => {
+      return stableRead(async tab => {
+        const page = tab.page;
         const snapshot = await page.ariaSnapshot({ mode: 'ai', depth: 12, timeout: 10_000 });
         const html = await page.content();
         return {
@@ -295,18 +452,22 @@ async function command(action, args = {}) {
       checkEpoch(args);
       if (args.selector || args.target !== undefined) {
         await withPinnedTarget(args, handle => handle.press(args.key, { timeout: 10_000 }));
+      } else {
+        await requireActiveTab().page.keyboard.press(args.key);
       }
-      else await page.keyboard.press(args.key);
       return state();
     case 'screenshot': {
-      return stableRead(async () => {
+      return stableRead(async tab => {
+        const page = tab.page;
         const viewport = page.viewportSize();
         const data = await page.screenshot({ type: 'jpeg', quality: 80, scale: 'css', timeout: 10_000 });
         return { viewport, mime_type: 'image/jpeg', data: data.toString('base64') };
       });
     }
     case 'close':
+      shuttingDown = true;
       await browser.close();
+      browserClosed = true;
       return { closed: true };
     default:
       throw new Error(`unknown browser action: ${action}`);
@@ -324,10 +485,9 @@ async function main() {
     acceptDownloads: false,
     serviceWorkers: 'block',
   });
-  page = await context.newPage();
-  await page.route('**/*', route => {
+  await context.route('**/*', route => {
     const request = route.request();
-    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+    if (request.isNavigationRequest()) {
       try {
         checkUrl(request.url());
       } catch {
@@ -336,24 +496,9 @@ async function main() {
     }
     return route.continue();
   });
-  page.on('framenavigated', frame => {
-    // A remembered iframe target belongs to the old frame document, even if
-    // the top-level URL is unchanged. Invalidate its epoch on every document
-    // navigation and let the next screencast frame use the new generation.
-    advanceEpoch();
-    if (frame === page.mainFrame()) {
-      const url = frame.url();
-      if (url !== 'about:blank') {
-        try { checkUrl(url); } catch { void page.goto('about:blank').catch(() => {}); }
-      }
-    }
-  });
-  context.on('page', target => {
-    if (target !== page) void target.close().catch(() => {});
-  });
-  page.setDefaultTimeout(10_000);
-  cdp = await context.newCDPSession(page);
-  await scheduleCapture();
+  context.on('page', target => { adoptPage(target); });
+  adoptPage(await context.newPage());
+  await captureTask;
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of lines) {
@@ -368,7 +513,10 @@ async function main() {
     }
   }
   closing = true;
-  await browser.close().catch(() => {});
+  shuttingDown = true;
+  lines.close();
+  process.stdin.pause();
+  if (!browserClosed) await browser.close().catch(() => {});
 }
 
 main().catch(error => {

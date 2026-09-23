@@ -455,6 +455,44 @@ mod tests {
             state.browser.state(session_id).await.unwrap()["page_epoch"],
             reloaded["page_epoch"]
         );
+        let listed: serde_json::Value =
+            serde_json::from_str(&run!(serde_json::json!({"action":"tabs"})).result).unwrap();
+        let first_tab_id = listed["active_tab_id"].as_str().unwrap().to_string();
+        assert_eq!(listed["tabs"].as_array().unwrap().len(), 1);
+        let created: serde_json::Value = serde_json::from_str(
+            &run!(serde_json::json!({"action":"new_tab","expected_epoch":reloaded["page_epoch"]}))
+                .result,
+        )
+        .unwrap();
+        let second_tab_id = created["active_tab_id"].as_str().unwrap().to_string();
+        assert_ne!(first_tab_id, second_tab_id);
+        assert_eq!(created["tabs"].as_array().unwrap().len(), 2);
+        assert_ne!(created["page_epoch"], reloaded["page_epoch"]);
+        assert!(run!(serde_json::json!({"action":"snapshot"}))
+            .result
+            .contains(&format!("active_tab_id: {second_tab_id}")));
+        let activated: serde_json::Value = serde_json::from_str(
+            &run!(serde_json::json!({
+                "action":"activate_tab",
+                "tab_id":first_tab_id,
+                "expected_epoch":created["page_epoch"]
+            }))
+            .result,
+        )
+        .unwrap();
+        assert_eq!(activated["active_tab_id"], first_tab_id);
+        assert_eq!(activated["url"], second_url);
+        let closed: serde_json::Value = serde_json::from_str(
+            &run!(serde_json::json!({
+                "action":"close_tab",
+                "tab_id":second_tab_id,
+                "expected_epoch":activated["page_epoch"]
+            }))
+            .result,
+        )
+        .unwrap();
+        assert_eq!(closed["tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(closed["page_epoch"], activated["page_epoch"]);
         state.browser.close(session_id).await.unwrap();
         fixture.abort();
     }
