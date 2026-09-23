@@ -1861,6 +1861,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.default_work_area = source.default_work_area.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
+            target.context_management = source.context_management.clone();
             target.extra = source.extra.clone();
         }
         SectionId::Providers => {
@@ -7519,6 +7520,52 @@ for line in sys.stdin:
             &event.event,
             AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
         )));
+    }
+
+    #[tokio::test]
+    async fn generic_core_update_publishes_context_management_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+
+        let published = state
+            .update_config(
+                |candidate| {
+                    candidate.context_management.strategy =
+                        bamboo_config::ContextManagementStrategy::RetrievalWindow;
+                    candidate
+                        .context_management
+                        .retrieval_window
+                        .history_tool_required = true;
+                    candidate
+                        .context_management
+                        .retrieval_window
+                        .fallback_strategy = bamboo_config::ContextManagementFallbackStrategy::None;
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+
+        let durable_strategy = bamboo_config::ConfigFacade::open(dir.path())
+            .unwrap()
+            .effective_config()
+            .context_management
+            .strategy;
+        assert_eq!(
+            durable_strategy,
+            bamboo_config::ContextManagementStrategy::RetrievalWindow,
+            "the live authority must match the durable Core section"
+        );
+        assert_eq!(
+            published.context_management.strategy,
+            bamboo_config::ContextManagementStrategy::RetrievalWindow
+        );
+        assert_eq!(
+            state.config.read().await.context_management.strategy,
+            bamboo_config::ContextManagementStrategy::RetrievalWindow,
+            "the committed Core section must become the live authority immediately"
+        );
     }
 
     #[tokio::test]
