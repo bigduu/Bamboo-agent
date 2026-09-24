@@ -164,10 +164,25 @@ mod tests {
             })
             .await
             .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext {
+                    result: Box::new(bamboo_domain::HookResult::Deny {
+                        reason: private.into(),
+                    }),
+                    text: private.into(),
+                },
+            })
+            .await
+            .unwrap();
         drop(input);
 
         let mut visible = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             visible.push(
                 tokio::time::timeout(std::time::Duration::from_secs(5), broadcast_rx.recv())
                     .await
@@ -186,6 +201,18 @@ mod tests {
             matches!(&visible[4], AgentEvent::ToolComplete { result, .. }
             if result.result == "ordinary Read result")
         );
+        assert!(!serde_json::to_string(&visible[5])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[5],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext { .. },
+                ..
+            }
+        ));
         forwarder.await.unwrap();
     }
 
@@ -267,6 +294,63 @@ mod tests {
         let (session_id, mirrored) = rx.recv().await.unwrap();
         assert_eq!(session_id.as_deref(), Some("parent-1"));
         assert!(matches!(mirrored, AgentEvent::ChildApprovalChanged { .. }));
+    }
+
+    #[tokio::test]
+    async fn child_browser_approval_is_redacted_before_broadcast_replay_and_account_feed() {
+        let session_id = "child-browser-private";
+        let private = "private-download-selector";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(8);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            runner,
+        )])));
+        let (account_tx, mut account_rx) = mpsc::channel(8);
+        let (event_tx, forwarder) = create_event_forwarder(
+            session_id.into(),
+            run_id,
+            broadcast_tx,
+            runners.clone(),
+            Some(account_tx),
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        event_tx
+            .send(AgentEvent::ChildApprovalChanged {
+                parent_session_id: "parent-private".into(),
+                child_session_id: session_id.into(),
+                child_attempt: 4,
+                request_id: "request-private".into(),
+                version: 7,
+                status: "denied".into(),
+                reason: Some(private.into()),
+                tool_name: "browser".into(),
+                permission: private.into(),
+                resource: format!("browser:17:download:css:{private}"),
+                created_at: "2026-09-24T00:00:00Z".into(),
+                resolved_at: Some("2026-09-24T00:00:01Z".into()),
+            })
+            .await
+            .unwrap();
+        let live = broadcast_rx.recv().await.unwrap();
+        assert!(!serde_json::to_string(&live).unwrap().contains(private));
+        let _started = account_rx.recv().await.unwrap();
+        let (route, feed) = account_rx.recv().await.unwrap();
+        assert_eq!(route.as_deref(), Some("parent-private"));
+        assert!(!serde_json::to_string(&feed).unwrap().contains(private));
+        assert!(
+            !serde_json::to_string(&runners.read().await[session_id].last_critical_events)
+                .unwrap()
+                .contains(private)
+        );
+        drop(event_tx);
+        forwarder.await.unwrap();
     }
 
     #[tokio::test]
@@ -432,6 +516,7 @@ pub fn create_event_forwarder_with_history_commit_barrier(
         let mut tool_event_display = bamboo_agent_core::NativeToolEventDisplay::default();
         while let Some(event) = mpsc_rx.recv().await {
             let event = tool_event_display.project(event);
+            let event = crate::external_agents::live::approval_event_for_display(event);
             let needs_runner_update = event.is_replayable_session_state()
                 || matches!(
                     &event,
