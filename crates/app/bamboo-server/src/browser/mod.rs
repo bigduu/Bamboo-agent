@@ -196,6 +196,11 @@ impl BrowserSession {
                 BrowserError::Unavailable("unable to create browser temporary directory".into())
             })?;
         command.env("TMPDIR", temp_dir.path());
+        // Node's os.tmpdir() uses TEMP/TMP on Windows. The host also receives
+        // this owned path explicitly for its download directory.
+        command.env("TEMP", temp_dir.path());
+        command.env("TMP", temp_dir.path());
+        command.env("BAMBOO_BROWSER_DOWNLOAD_ROOT", temp_dir.path());
         command
             .arg(script)
             .stdin(Stdio::piped())

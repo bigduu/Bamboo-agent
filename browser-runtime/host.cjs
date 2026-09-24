@@ -64,6 +64,7 @@ let inFlightAction;
 const dialogWaiters = new Set();
 let retireAfterReply = false;
 let downloadCdp;
+let downloadContextId;
 let downloadDir;
 let activeDownloadAttempt;
 let transientPageCreation;
@@ -711,7 +712,9 @@ function cleanDownloadFilename(value) {
 }
 
 function cancelDownloadGuid(guid) {
-  return downloadCdp?.send('Browser.cancelDownload', { guid }).catch(() => {});
+  return downloadCdp?.send('Browser.cancelDownload', {
+    guid, browserContextId: downloadContextId,
+  }).catch(() => {});
 }
 
 async function removeDownloadArtifacts(guid) {
@@ -891,11 +894,13 @@ async function boundedDownload(args) {
         if (element.localName !== 'a') return null;
         const value = element.getAttribute('href');
         if (typeof value !== 'string' || !value || value.length > 2_048) return null;
-        const resolved = new URL(value, document.baseURI).href;
+        const resolved = new URL(value, document.baseURI);
+        // Fragments never reach the HTTP request or Chromium's download URL.
+        resolved.hash = '';
         const download = element.getAttribute('download');
         if (download !== null && (typeof download !== 'string' || download.length > 180)) return null;
-        return typeof resolved === 'string' && resolved.length <= 2_048
-          ? { href: resolved, download } : null;
+        return resolved.href.length <= 2_048
+          ? { href: resolved.href, download } : null;
       });
       const href = link?.href;
       if (typeof href !== 'string' || href.length > 2_048 ||
@@ -916,7 +921,7 @@ async function boundedDownload(args) {
           'browser download requires an HTTP(S) page');
       }
       const sourceResponse = tab.mainDocumentResponse;
-      if (!sourceResponse || sourceResponse.url() !== documentUrl.href) throw downloadError(
+      if (!sourceResponse || tab.mainDocumentUrl !== documentUrl.href) throw downloadError(
         'download_unverifiable', 'browser download cannot verify the source page policy');
       const sourceHeaders = await downloadDeadline(sourceResponse.headersArray(), workDeadlineAt).catch(() => null);
       if (!sourceHeaders || sourceHeaders.some(header =>
@@ -1541,6 +1546,7 @@ function adoptPage(target) {
     navigationResponses: new WeakMap(),
     pendingDocumentResponse: null,
     mainDocumentResponse: null,
+    mainDocumentUrl: null,
   };
   tabs.push(tab);
   tabByPage.set(target, tab);
@@ -1576,14 +1582,43 @@ function adoptPage(target) {
   });
   target.on('dialog', dialog => captureDialog(tab, dialog));
   target.on('framenavigated', frame => {
+    const mainFrame = target.mainFrame();
+    const pendingMainRequest = frame === mainFrame && [...tab.pendingNavigations]
+      .reverse().find(([, requestedFrame]) => requestedFrame === frame || requestedFrame === null)?.[0];
+    const hadDocumentRequest = Boolean(pendingMainRequest);
     for (const [request, requestedFrame] of tab.pendingNavigations) {
       if (requestedFrame === frame) tab.pendingNavigations.delete(request);
     }
-    if (frame === target.mainFrame()) {
+    if (frame === mainFrame) {
       const url = frame.url();
       const committedUrl = url.split('#', 1)[0];
-      tab.mainDocumentResponse = tab.pendingDocumentResponse?.url() === committedUrl
+      const response = hadDocumentRequest &&
+        tab.pendingDocumentResponse?.request() === pendingMainRequest &&
+        tab.pendingDocumentResponse.url() === committedUrl
         ? tab.pendingDocumentResponse : null;
+      if (response) {
+        tab.mainDocumentResponse = response;
+        tab.mainDocumentUrl = committedUrl;
+      } else if (!hadDocumentRequest && tab.mainDocumentResponse &&
+                 tab.mainDocumentUrl && committedUrl.startsWith('http')) {
+        // Hash/history API transitions keep the same document and enforcing
+        // response policy. A new document request without a matching response
+        // still loses provenance and fails closed at download time.
+        try {
+          if (new URL(committedUrl).origin === new URL(tab.mainDocumentUrl).origin) {
+            tab.mainDocumentUrl = committedUrl;
+          } else {
+            tab.mainDocumentResponse = null;
+            tab.mainDocumentUrl = null;
+          }
+        } catch {
+          tab.mainDocumentResponse = null;
+          tab.mainDocumentUrl = null;
+        }
+      } else {
+        tab.mainDocumentResponse = null;
+        tab.mainDocumentUrl = null;
+      }
       tab.pendingDocumentResponse = null;
       if (url !== 'about:blank') {
         try { checkUrl(url); } catch { void target.goto('about:blank').catch(() => {}); }
@@ -2006,6 +2041,7 @@ async function closeHost() {
   await browser?.close().catch(() => {});
   browserClosed = true;
   downloadCdp = undefined;
+  downloadContextId = undefined;
   if (downloadDir) {
     await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
     downloadDir = undefined;
@@ -2013,7 +2049,10 @@ async function closeHost() {
 }
 
 async function main() {
-  downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bamboo-browser-download-'));
+  // Bamboo passes its per-session TempDir explicitly; Node's os.tmpdir()
+  // selects different environment variables on Windows.
+  const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
+  downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
   browser = await chromium.launch({
     headless: true,
     downloadsPath: downloadDir,
@@ -2026,12 +2065,6 @@ async function main() {
     serviceWorkers: 'block',
   });
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
-  downloadCdp = await browser.newBrowserCDPSession();
-  downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
-  downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
-  await downloadCdp.send('Browser.setDownloadBehavior', {
-    behavior: 'allowAndName', downloadPath: downloadDir, eventsEnabled: true,
-  });
   await context.route('**/*', route => {
     const request = route.request();
     if (request.isNavigationRequest()) {
@@ -2064,6 +2097,18 @@ async function main() {
     adoptPage(target);
   });
   adoptPage(await context.newPage());
+  const initialCdp = await requireActiveTab().cdp;
+  if (!initialCdp) throw new Error('browser page session unavailable');
+  const targetInfo = await initialCdp.send('Target.getTargetInfo');
+  downloadContextId = targetInfo.targetInfo?.browserContextId;
+  if (!downloadContextId) throw new Error('browser context identity unavailable');
+  downloadCdp = await browser.newBrowserCDPSession();
+  downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
+  downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
+  await downloadCdp.send('Browser.setDownloadBehavior', {
+    behavior: 'allowAndName', browserContextId: downloadContextId,
+    downloadPath: downloadDir, eventsEnabled: true,
+  });
   await captureTask;
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });

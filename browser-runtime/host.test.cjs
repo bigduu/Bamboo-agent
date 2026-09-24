@@ -158,6 +158,10 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let smallReferer;
   let namedReferer;
   let smallRequests = 0;
+  let spaRequests = 0;
+  let staleResponseRequests = 0;
+  let concurrentStarted = false;
+  let backgroundBlobMarkers = 0;
   let sandboxRequests = 0;
   let redirectedRequests = 0;
   let privateScriptRequests = 0;
@@ -242,6 +246,29 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     if (request.url === '/private-popup') privatePopupRequests++;
     if (request.url === '/private-resource') privateResourceRequests++;
     if (request.url === '/sandbox-file') sandboxRequests++;
+    if (request.url === '/spa') spaRequests++;
+    if (request.url === '/background-blob-ready') {
+      response.end(concurrentStarted ? 'yes' : 'no');
+      return;
+    }
+    if (request.url === '/background-blob-marker') {
+      backgroundBlobMarkers++;
+      response.end('marked');
+      return;
+    }
+    if (request.url === '/background-blob') {
+      response.end('<script>async function fire(){if(await fetch("/background-blob-ready").then(r=>r.text())!=="yes"){setTimeout(fire,20);return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["ambient-private-bytes"]));a.download="ambient.bin";document.body.append(a);a.click();await fetch("/background-blob-marker")}fire()</script>');
+      return;
+    }
+    if (request.url === '/concurrent-file') {
+      concurrentStarted = true;
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="selected.bin"',
+      });
+      setTimeout(() => response.end('selected-concurrent'), 800);
+      return;
+    }
     if (request.url === '/sandbox-page') {
       response.writeHead(200, [
         ['content-type', 'text/html'],
@@ -249,6 +276,17 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
         ['content-security-policy', 'report-uri /sandbox, SaNdBoX allow-scripts'],
       ]);
       response.end('<a id="sandbox" href="/sandbox-file" download>Blocked</a>');
+      return;
+    }
+    if (request.url === '/stale-response') {
+      if (++staleResponseRequests === 1) {
+        response.end('<a id="small" href="/small">Small</a>');
+      } else {
+        // A no-document response for the same URL must not replace the
+        // committed document's policy when a later hash navigation fires.
+        response.writeHead(204, { 'content-security-policy': 'sandbox' });
+        response.end();
+      }
       return;
     }
     if (request.url === '/exact-limit' || request.url === '/over-limit') {
@@ -318,7 +356,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end(`<a id="selected" href="${href}" download="prior.bin">Selected</a><script>setTimeout(()=>{const a=document.createElement("a");a.href="${href}";a.download="prior.bin";document.body.append(a);a.click()},100)</script>`);
       return;
     }
-    response.end('<a id="small" href="/small">Small</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+    response.end('<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -329,7 +367,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       NODE_ENV: 'test',
       BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
       BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
-      TMPDIR: tempRoot,
+      TMPDIR: os.tmpdir(),
+      BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
     },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
@@ -353,6 +392,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   });
   try {
     const initial = (await call('state')).result;
+    assert.ok(fs.readdirSync(tempRoot).some(name => name.startsWith('bamboo-browser-download-')),
+      'an explicit session-owned root overrides Node platform temp defaults');
     const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
     const epoch = ready.page_epoch;
     const first = await call('download', { selector: '#small', expected_epoch: epoch });
@@ -373,6 +414,9 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const hidden = await call('download', { selector: '#hidden', expected_epoch: epoch });
     assert.equal(hidden.code, 'download_unverifiable', JSON.stringify(hidden));
     assert.equal(smallRequests, 1, 'hidden target did not start a private request');
+    const fragment = await call('download', { selector: '#fragment', expected_epoch: epoch });
+    assert.equal(fragment.ok, true, JSON.stringify(fragment));
+    assert.deepEqual(Buffer.from(fragment.result.data_base64, 'base64'), bytes);
     const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
     assert.equal(redirected.code, 'download_unverifiable', JSON.stringify(redirected));
     assert.equal(redirected.result, undefined);
@@ -435,7 +479,73 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.match((await call('dom')).result.snapshot, /Scripts restored/);
     assert.deepEqual(temporaryDownloadFiles(), [], 'direct and rejected downloads left no artifacts');
 
-    const racePage = (await call('navigate', { url: base + '/race', expected_epoch: epoch })).result;
+    const pushed = await call('eval', {
+      code: 'history.pushState({}, "", "/spa")', expected_epoch: epoch, expected_url: base + '/',
+    });
+    assert.equal(pushed.code, 'stale_epoch', JSON.stringify(pushed));
+    const spa = (await call('state')).result;
+    assert.equal(spa.url, base + '/spa');
+    assert.equal(spaRequests, 0, 'same-document history did not fetch a new response');
+    const spaDownload = await call('download', { selector: '#small', expected_epoch: spa.page_epoch });
+    assert.equal(spaDownload.ok, true, JSON.stringify(spaDownload));
+    assert.deepEqual(Buffer.from(spaDownload.result.data_base64, 'base64'), bytes);
+    const hashed = await call('eval', {
+      code: 'location.hash = "#view"', expected_epoch: spa.page_epoch, expected_url: base + '/spa',
+    });
+    assert.equal(hashed.code, 'stale_epoch', JSON.stringify(hashed));
+    const hashPage = (await call('state')).result;
+    assert.equal(hashPage.url, base + '/spa#view');
+    const hashDownload = await call('download', {
+      selector: '#small', expected_epoch: hashPage.page_epoch,
+    });
+    assert.equal(hashDownload.ok, true, JSON.stringify(hashDownload));
+    assert.deepEqual(Buffer.from(hashDownload.result.data_base64, 'base64'), bytes);
+
+    const background = (await call('tab_create', { expected_epoch: hashPage.page_epoch })).result;
+    const backgroundPage = (await call('navigate', {
+      url: base + '/background-blob', expected_epoch: background.page_epoch,
+    })).result;
+    const restored = (await call('tab_activate', {
+      tab_id: hashPage.active_tab_id, expected_epoch: backgroundPage.page_epoch,
+    })).result;
+    const concurrent = await call('download', {
+      selector: '#concurrent', expected_epoch: restored.page_epoch,
+    });
+    assert.equal(concurrent.ok, true, JSON.stringify(concurrent));
+    assert.equal(Buffer.from(concurrent.result.data_base64, 'base64').toString(),
+      'selected-concurrent');
+    assert.equal(backgroundBlobMarkers, 1,
+      'a background tab started a Blob download during the approved direct transfer');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'the ambient Blob left no artifact');
+    const stillShared = (await call('state')).result;
+    assert.equal(stillShared.active_tab_id, hashPage.active_tab_id);
+    assert.equal(stillShared.tabs.length, 2, 'only the known background tab remains');
+    const afterBackground = (await call('tab_close', {
+      tab_id: background.active_tab_id, expected_epoch: stillShared.page_epoch,
+    })).result;
+    assert.equal(afterBackground.tabs.length, 1);
+
+    const stalePage = (await call('navigate', {
+      url: base + '/stale-response', expected_epoch: afterBackground.page_epoch,
+    })).result;
+    await call('history', { direction: 'reload', expected_epoch: stalePage.page_epoch });
+    assert.equal(staleResponseRequests, 2);
+    const beforeHash = (await call('state')).result;
+    await call('eval', {
+      code: 'location.hash = "#after-no-document"',
+      expected_epoch: beforeHash.page_epoch, expected_url: base + '/stale-response',
+    });
+    const afterHash = (await call('state')).result;
+    assert.equal(afterHash.url, base + '/stale-response#after-no-document');
+    const preservedPolicy = await call('download', {
+      selector: '#small', expected_epoch: afterHash.page_epoch,
+    });
+    assert.equal(preservedPolicy.ok, true, JSON.stringify(preservedPolicy));
+    assert.deepEqual(Buffer.from(preservedPolicy.result.data_base64, 'base64'), bytes);
+
+    const racePage = (await call('navigate', {
+      url: base + '/race', expected_epoch: afterHash.page_epoch,
+    })).result;
     const race = await call('download', { selector: '#race', expected_epoch: racePage.page_epoch });
     assert.equal(race.ok, true, JSON.stringify(race));
     assert.equal(Buffer.from(race.result.data_base64, 'base64').toString(), 'selected-download');
@@ -491,7 +601,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
         [path.join(__dirname, 'host.cjs')], {
           env: {
-            ...process.env, NODE_ENV: 'test', TMPDIR: tempRoot,
+            ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
+            BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
             BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
             BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
             BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
