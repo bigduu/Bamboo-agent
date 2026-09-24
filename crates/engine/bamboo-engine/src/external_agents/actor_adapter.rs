@@ -2573,6 +2573,13 @@ fn actor_arguments_for_display(tool_name: &str, args: &serde_json::Value) -> ser
 }
 
 impl ActorEventDisplay {
+    fn fail_closed(&mut self) {
+        self.overflowed = true;
+        self.calls.clear();
+        self.nested_overflowed = true;
+        self.children.clear();
+    }
+
     fn remember_start(&mut self, id: &str, private: bool) -> DisplayCallKind {
         if self.overflowed || id.is_empty() || id.len() > 256 {
             return DisplayCallKind::Reused;
@@ -3066,6 +3073,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 received_seq = batch.first_seq,
                                 "actor event sequence gap; authoritative session snapshot is required"
                             );
+                            // A missing ToolStart may have reused an earlier
+                            // call ID for a private browser download. No prior
+                            // identity remains safe for display after a gap.
+                            display.fail_closed();
                         }
                         let skip = next_actor_event_seq
                             .saturating_sub(batch.first_seq)
@@ -4647,6 +4658,64 @@ mod tests {
         assert!(!serde_json::to_string(&forwarded)
             .unwrap()
             .contains("private-bytes"));
+    }
+
+    #[tokio::test]
+    async fn actor_batch_sequence_gap_invalidates_prior_tool_identity() {
+        let session_id = "actor-gap";
+        let batch = |seq, event: AgentEvent| {
+            let event = serde_json::to_value(event).unwrap();
+            ChildFrame::EventBatch {
+                batch: ActorEventBatch {
+                    logical_session: Some(LogicalSessionIdentity {
+                        session_id: session_id.into(),
+                        parent_session_id: Some("permission-parent".into()),
+                        root_session_id: session_id.into(),
+                    }),
+                    activation_id: None,
+                    execution_epoch: 0,
+                    source_node_id: None,
+                    source_actor_id: Some(session_id.into()),
+                    first_seq: seq,
+                    last_seq: seq,
+                    qos: bamboo_subagent::ActorEventQos::classify(&event),
+                    events: vec![event],
+                },
+            }
+        };
+        let (outcome, _, forwarded, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                batch(
+                    1,
+                    AgentEvent::ToolStart {
+                        tool_call_id: "reused-call".into(),
+                        tool_name: "Read".into(),
+                        arguments: serde_json::json!({"file_path":"README.md"}),
+                    },
+                ),
+                // Sequence 2 may have replaced this ID with a private browser
+                // call. The actor's next result must not inherit Read display.
+                batch(
+                    3,
+                    AgentEvent::ToolComplete {
+                        tool_call_id: "reused-call".into(),
+                        result: bamboo_agent_core::tools::ToolResult::text(
+                            true,
+                            "private-download-bytes",
+                        ),
+                    },
+                ),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(!wire.contains("private-download-bytes"), "{wire}");
+        assert!(wire.contains("Tool result hidden"));
     }
 
     #[tokio::test]
