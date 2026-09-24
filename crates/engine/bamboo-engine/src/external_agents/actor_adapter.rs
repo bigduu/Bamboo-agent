@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2489,6 +2489,7 @@ fn validate_actor_event_batch(
 
 const MAX_DISPLAY_CALLS: usize = 4_096;
 const MAX_NESTED_DISPLAY_DEPTH: usize = 8;
+const MAX_DISPLAY_ID_BYTES: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DisplayCallKind {
@@ -2507,6 +2508,9 @@ struct DisplayCall {
 struct ActorEventDisplay {
     calls: HashMap<String, DisplayCall>,
     children: HashMap<(String, String), Box<ActorEventDisplay>>,
+    // Shared by every nested child: a per-level cap alone permits an
+    // exponential number of identities across an actor event tree.
+    identities: Arc<AtomicUsize>,
     overflowed: bool,
     nested_overflowed: bool,
 }
@@ -2574,14 +2578,25 @@ fn actor_arguments_for_display(tool_name: &str, args: &serde_json::Value) -> ser
 
 impl ActorEventDisplay {
     fn fail_closed(&mut self) {
+        self.identities
+            .store(MAX_DISPLAY_CALLS + 1, Ordering::Relaxed);
         self.overflowed = true;
         self.calls.clear();
         self.nested_overflowed = true;
         self.children.clear();
     }
 
+    fn reserve_identity(&mut self) -> bool {
+        if self.identities.fetch_add(1, Ordering::Relaxed) < MAX_DISPLAY_CALLS {
+            true
+        } else {
+            self.fail_closed();
+            false
+        }
+    }
+
     fn remember_start(&mut self, id: &str, private: bool) -> DisplayCallKind {
-        if self.overflowed || id.is_empty() || id.len() > 256 {
+        if self.overflowed || id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES {
             return DisplayCallKind::Reused;
         }
         let kind = if private {
@@ -2596,9 +2611,7 @@ impl ActorEventDisplay {
             call.started = true;
             return call.kind;
         }
-        if self.calls.len() >= MAX_DISPLAY_CALLS {
-            self.overflowed = true;
-            self.calls.clear();
+        if !self.reserve_identity() {
             return DisplayCallKind::Reused;
         }
         self.calls.insert(
@@ -2612,7 +2625,7 @@ impl ActorEventDisplay {
     }
 
     fn remember_approval(&mut self, id: &str, private: bool) -> DisplayCallKind {
-        if self.overflowed || id.is_empty() || id.len() > 256 {
+        if self.overflowed || id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES {
             return DisplayCallKind::Reused;
         }
         let kind = if private {
@@ -2626,9 +2639,7 @@ impl ActorEventDisplay {
             }
             return call.kind;
         }
-        if self.calls.len() >= MAX_DISPLAY_CALLS {
-            self.overflowed = true;
-            self.calls.clear();
+        if !self.reserve_identity() {
             return DisplayCallKind::Reused;
         }
         self.calls.insert(
@@ -2642,7 +2653,7 @@ impl ActorEventDisplay {
     }
 
     fn known_kind(&self, id: &str) -> Option<DisplayCallKind> {
-        if self.overflowed {
+        if self.overflowed || self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
             return None;
         }
         self.calls
@@ -2652,6 +2663,22 @@ impl ActorEventDisplay {
     }
 
     fn project(&mut self, event: AgentEvent, depth: usize) -> Option<AgentEvent> {
+        let call_id = match &event {
+            AgentEvent::ToolStart { tool_call_id, .. }
+            | AgentEvent::ToolApprovalRequested { tool_call_id, .. }
+            | AgentEvent::ToolToken { tool_call_id, .. }
+            | AgentEvent::ToolComplete { tool_call_id, .. }
+            | AgentEvent::ToolError { tool_call_id, .. }
+            | AgentEvent::ToolLifecycle { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        };
+        if call_id.is_some_and(|id| id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES) {
+            self.fail_closed();
+            return None;
+        }
+        if self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
+            self.fail_closed();
+        }
         Some(match event {
             AgentEvent::ToolStart {
                 tool_call_id,
@@ -2826,14 +2853,30 @@ impl ActorEventDisplay {
                 if depth >= MAX_NESTED_DISPLAY_DEPTH || self.nested_overflowed {
                     return None;
                 }
-                let key = (parent_session_id.clone(), child_session_id.clone());
-                if !self.children.contains_key(&key) && self.children.len() >= MAX_DISPLAY_CALLS {
-                    self.nested_overflowed = true;
-                    self.children.clear();
+                if parent_session_id.is_empty()
+                    || child_session_id.is_empty()
+                    || parent_session_id.len() > MAX_DISPLAY_ID_BYTES
+                    || child_session_id.len() > MAX_DISPLAY_ID_BYTES
+                {
+                    self.fail_closed();
                     return None;
                 }
-                let child = self.children.entry(key).or_default();
+                let key = (parent_session_id.clone(), child_session_id.clone());
+                if !self.children.contains_key(&key) && !self.reserve_identity() {
+                    return None;
+                }
+                let identities = self.identities.clone();
+                let child = self.children.entry(key).or_insert_with(|| {
+                    Box::new(ActorEventDisplay {
+                        identities,
+                        ..Default::default()
+                    })
+                });
                 let event = child.project(*event, depth + 1)?;
+                if self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
+                    self.fail_closed();
+                    return None;
+                }
                 AgentEvent::SubAgentEvent {
                     parent_session_id,
                     child_session_id,
@@ -2867,7 +2910,13 @@ async fn process_actor_event(
                     .to_string(),
             ));
         }
-        Err(_) => return Ok(()),
+        Err(_) => {
+            // A legacy actor can omit a malformed ToolStart that reuses an
+            // earlier public call ID. Its later result must not inherit the
+            // stale public display classification.
+            display.fail_closed();
+            return Ok(());
+        }
     };
     if matches!(&event, AgentEvent::PermissionPostureActivated { .. }) {
         if permission_handshake.posture_was_confirmed() {
@@ -4660,6 +4709,59 @@ mod tests {
             .contains("private-bytes"));
     }
 
+    #[test]
+    fn nested_actor_display_uses_one_identity_budget_and_bounded_keys() {
+        let mut display = ActorEventDisplay::default();
+        let nested = |index: usize| AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: format!("child-{index}"),
+            event: Box::new(AgentEvent::ToolStart {
+                tool_call_id: format!("read-{index}"),
+                tool_name: "Read".into(),
+                arguments: serde_json::json!({"file_path":"README.md"}),
+            }),
+        };
+        for index in 0..(MAX_DISPLAY_CALLS / 2) {
+            assert!(display.project(nested(index), 0).is_some());
+        }
+        assert_eq!(
+            display.identities.load(Ordering::Relaxed),
+            MAX_DISPLAY_CALLS
+        );
+        assert!(display.project(nested(MAX_DISPLAY_CALLS / 2), 0).is_none());
+        assert!(display.overflowed);
+        assert!(display.children.is_empty());
+
+        let mut oversized = ActorEventDisplay::default();
+        assert!(oversized
+            .project(
+                AgentEvent::SubAgentEvent {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "x".repeat(MAX_DISPLAY_ID_BYTES + 1),
+                    event: Box::new(AgentEvent::ToolComplete {
+                        tool_call_id: "call".into(),
+                        result: bamboo_agent_core::tools::ToolResult::text(
+                            true,
+                            "private-download-bytes",
+                        ),
+                    }),
+                },
+                0,
+            )
+            .is_none());
+        assert!(oversized.overflowed);
+        assert!(oversized
+            .project(
+                AgentEvent::ToolStart {
+                    tool_call_id: "x".repeat(MAX_DISPLAY_ID_BYTES + 1),
+                    tool_name: "Read".into(),
+                    arguments: serde_json::json!({"file_path":"README.md"}),
+                },
+                0,
+            )
+            .is_none());
+    }
+
     #[tokio::test]
     async fn actor_batch_sequence_gap_invalidates_prior_tool_identity() {
         let session_id = "actor-gap";
@@ -4715,6 +4817,77 @@ mod tests {
         assert_eq!(outcome.unwrap().as_deref(), Some("done"));
         let wire = serde_json::to_string(&forwarded).unwrap();
         assert!(!wire.contains("private-download-bytes"), "{wire}");
+        assert!(wire.contains("Tool result hidden"));
+    }
+
+    #[tokio::test]
+    async fn legacy_malformed_actor_event_invalidates_prior_tool_identity() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut session = Session::new("legacy-malformed-private", "model");
+        let mut handshake = PermissionPostureHandshake::NotRequired;
+        let mut display = ActorEventDisplay::default();
+        let read_start = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "reused-call".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({"file_path":"README.md"}),
+        })
+        .unwrap();
+        process_actor_event(
+            read_start,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+
+        // A mixed-version actor may send a browser ToolStart whose name has
+        // the wrong wire type. Serde drops it; the reused ID is no longer safe.
+        let mut malformed = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "reused-call".into(),
+            tool_name: "browser".into(),
+            arguments: serde_json::json!({
+                "action":"download", "selector":"private-download-selector"
+            }),
+        })
+        .unwrap();
+        malformed["tool_name"] = serde_json::json!(7);
+        process_actor_event(
+            malformed,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        process_actor_event(
+            serde_json::to_value(AgentEvent::ToolComplete {
+                tool_call_id: "reused-call".into(),
+                result: bamboo_agent_core::tools::ToolResult::text(true, "private-download-bytes"),
+            })
+            .unwrap(),
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        let forwarded = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(forwarded.len(), 2);
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(!wire.contains("private-download"), "{wire}");
         assert!(wire.contains("Tool result hidden"));
     }
 
