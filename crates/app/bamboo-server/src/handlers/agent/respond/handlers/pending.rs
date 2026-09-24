@@ -506,6 +506,11 @@ pub async fn get_pending_question(
                     .permission_request
                     .as_ref()
                     .is_some_and(is_private_browser_download_request);
+            let browser_tool_name_for_display = is_browser_display_tool_name(&pending.tool_name)
+                || interaction
+                    .permission_request
+                    .as_ref()
+                    .is_some_and(|request| is_browser_display_tool_name(&request.tool_name));
             let private_browser_file_input = !browser_download
                 && (tool_arguments.as_ref().is_some_and(|arguments| {
                     bamboo_tools::permission::is_private_browser_file_input("browser", arguments)
@@ -520,7 +525,11 @@ pub async fn get_pending_question(
                     }));
             let permission_request_for_display =
                 interaction.permission_request.map(|mut request| {
-                    if request.has_private_browser_resource()
+                    let private_browser_resource = request.has_private_browser_resource();
+                    if browser_tool_name_for_display {
+                        request.tool_name = "browser".to_string();
+                    }
+                    if private_browser_resource
                         || native_browser_select
                         || private_browser_file_input
                         || dialog_response
@@ -531,9 +540,6 @@ pub async fn get_pending_question(
                         // Keep the exact request registered for receipt matching,
                         // but do not send its private resource to approval UIs.
                         request.resource = "[redacted]".to_string();
-                        if browser_download {
-                            request.tool_name = "browser".to_string();
-                        }
                         request.operation_summary = if dialog_response {
                             "Answer pending browser dialog"
                         } else if private_browser_file_input {
@@ -589,7 +595,7 @@ pub async fn get_pending_question(
                 "options": pending.options,
                 "allow_custom": pending.allow_custom,
                 "tool_call_id": pending.tool_call_id,
-                "tool_name": if browser_download { "browser" } else { pending.tool_name.as_str() },
+                "tool_name": if browser_tool_name_for_display { "browser" } else { pending.tool_name.as_str() },
                 "source": pending.source,
                 "interaction_kind": interaction.kind.as_str(),
                 "permission_request": permission_request_for_display,

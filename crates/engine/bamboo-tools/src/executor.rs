@@ -62,8 +62,8 @@ fn is_browser_download_action(tool_name: &str, args: &serde_json::Value) -> bool
         && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
 }
 
-fn approval_tool_name_for_display(tool_name: &str, args: &serde_json::Value) -> String {
-    if is_browser_download_action(tool_name, args) {
+fn approval_tool_name_for_display(tool_name: &str) -> String {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser") {
         "browser".to_string()
     } else {
         tool_name.to_string()
@@ -863,13 +863,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // a stronger scope. No boolean downgrade can create a grant.
                 if let Some(proxy) = proxy {
                     let mut display_request = request.clone();
+                    if canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser") {
+                        display_request.tool_name = "browser".to_string();
+                    }
                     if private_browser_display {
                         display_request.resource = "[redacted]".to_string();
                         display_request.matched_rule = None;
                         display_request.suggested_matchers.clear();
-                        if browser_download {
-                            display_request.tool_name = "browser".to_string();
-                        }
                         if browser_eval {
                             display_request.operation_summary =
                                 "Execute browser page JavaScript".to_string();
@@ -877,7 +877,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }
                     let approved = proxy
                         .request_approval(crate::approval::ApprovalAsk {
-                            tool_name: approval_tool_name_for_display(&tool_name, &args),
+                            tool_name: approval_tool_name_for_display(&tool_name),
                             permission: permission_type.description().to_string(),
                             resource: approval_display_resource.clone(),
                             permission_request: Some(display_request),
@@ -899,14 +899,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
-                            tool_name: approval_tool_name_for_display(&tool_name, &args),
+                            tool_name: approval_tool_name_for_display(&tool_name),
                             parameters: approval_parameters,
                         })
                         .await;
 
                     let question = format!(
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                        approval_tool_name_for_display(&tool_name, &args),
+                        approval_tool_name_for_display(&tool_name),
                         permission_type.description(),
                         approval_display_resource
                     );
@@ -1198,8 +1198,9 @@ mod tests {
                 approval_parameters_for_display(name, &args),
                 json!({"action":"download","expected_epoch":17})
             );
-            assert_eq!(approval_tool_name_for_display(name, &args), "browser");
+            assert_eq!(approval_tool_name_for_display(name), "browser");
         }
+        assert_eq!(approval_tool_name_for_display("Read"), "Read");
         assert_eq!(
             args, original,
             "display projection must not change execution args"

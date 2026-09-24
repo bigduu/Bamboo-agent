@@ -78,13 +78,12 @@ fn tool_start_arguments_for_display(
     }
 }
 
-fn tool_start_name_for_display(tool_name: &str, args: &serde_json::Value) -> String {
+fn tool_start_name_for_display(tool_name: &str) -> String {
     if tool_name
         .trim()
         .rsplit("::")
         .next()
         .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
-        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
     {
         "browser".to_string()
     } else {
@@ -252,7 +251,7 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.session_id,
         ctx.round,
         ctx.tool_call.id,
-        tool_start_name_for_display(&ctx.tool_call.function.name, &args),
+        tool_start_name_for_display(&ctx.tool_call.function.name),
         raw_arguments.len()
     );
 
@@ -263,7 +262,7 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.round_id,
         AgentEvent::ToolStart {
             tool_call_id: ctx.tool_call.id.clone(),
-            tool_name: tool_start_name_for_display(&ctx.tool_call.function.name, &args),
+            tool_name: tool_start_name_for_display(&ctx.tool_call.function.name),
             arguments: tool_start_arguments_for_display(execution_name, &args),
         },
     )
@@ -1347,6 +1346,25 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn malformed_namespaced_browser_call_starts_with_fixed_display_name() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&["browser"]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable =
+            effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let mut call = probe_call("private-selector::browser");
+        call.function.arguments = "{malformed".to_string();
+        let _ = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStart { tool_name, arguments, .. }
+                if tool_name == "browser" && !arguments.to_string().contains("private-selector")
+        )));
+        assert_eq!(call.function.name, "private-selector::browser");
+    }
+
+    #[tokio::test]
     async fn capability_gate_rejects_unloaded_host_only_unknown_and_excluded_before_hooks() {
         let concrete_tools = Arc::new(NameRecordingExecutor::new(&[
             "Read",
@@ -2355,10 +2373,7 @@ mod hook_tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
-        assert_eq!(
-            tool_start_name_for_display("default::browser", &args),
-            "default::browser"
-        );
+        assert_eq!(tool_start_name_for_display("default::browser"), "browser");
     }
 
     #[test]
@@ -2384,10 +2399,10 @@ mod hook_tests {
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
         assert_eq!(
-            tool_start_name_for_display("private-selector::browser", &args),
+            tool_start_name_for_display("private-selector::browser"),
             "browser"
         );
-        assert_eq!(tool_start_name_for_display("other", &args), "other");
+        assert_eq!(tool_start_name_for_display("other"), "other");
     }
 
     #[tokio::test]

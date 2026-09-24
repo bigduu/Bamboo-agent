@@ -78,13 +78,12 @@ fn tool_start_arguments_for_display(
     }
 }
 
-fn tool_start_name_for_display(tool_name: &str, args: &serde_json::Value) -> String {
+fn tool_start_name_for_display(tool_name: &str) -> String {
     if tool_name
         .trim()
         .rsplit("::")
         .next()
         .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
-        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
     {
         "browser".to_string()
     } else {
@@ -512,10 +511,14 @@ async fn execute_sub_actions_with_persistence(
                 "Plan mode: {} operation blocked",
                 action.function.name.trim()
             );
+            let display_error = format!(
+                "Plan mode: {} operation blocked",
+                tool_start_name_for_display(&action.function.name)
+            );
             let _ = event_tx
                 .send(AgentEvent::ToolError {
                     tool_call_id: action.id.clone(),
-                    error: error.clone(),
+                    error: display_error,
                 })
                 .await;
             session.add_message(Message::tool_result_with_status(
@@ -532,7 +535,7 @@ async fn execute_sub_actions_with_persistence(
         let _ = event_tx
             .send(AgentEvent::ToolStart {
                 tool_call_id: action.id.clone(),
-                tool_name: tool_start_name_for_display(&action.function.name, &args),
+                tool_name: tool_start_name_for_display(&action.function.name),
                 arguments: tool_start_arguments_for_display(&action.function.name, &args),
             })
             .await;
@@ -670,10 +673,7 @@ mod tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
-        assert_eq!(
-            tool_start_name_for_display("default::browser", &args),
-            "default::browser"
-        );
+        assert_eq!(tool_start_name_for_display("default::browser"), "browser");
     }
 
     #[test]
@@ -699,10 +699,10 @@ mod tests {
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
         assert_eq!(
-            tool_start_name_for_display("private-selector::browser", &args),
+            tool_start_name_for_display("private-selector::browser"),
             "browser"
         );
-        assert_eq!(tool_start_name_for_display("other", &args), "other");
+        assert_eq!(tool_start_name_for_display("other"), "other");
     }
 
     struct StaticExecutor {
@@ -1119,6 +1119,92 @@ mod tests {
             message.tool_call_id.as_deref() == Some("call_write")
                 && message.content.contains("Plan mode")
         }));
+    }
+
+    #[tokio::test]
+    async fn plan_denial_hides_private_browser_namespace_in_event_only() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let tools = Arc::new(ContextRecordingExecutor::default());
+        let mut session = Session::new("plan-private-browser", "test-model");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let result = ToolResult::text(
+            true,
+            serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![make_tool_call(
+                    "call_browser",
+                    "private-selector::browser",
+                    "{malformed",
+                )],
+                reason: "denial".to_string(),
+            })
+            .unwrap(),
+        );
+        let flags = ToolExecutionSessionFlags {
+            plan_read_only: true,
+            ..ToolExecutionSessionFlags::default()
+        };
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &parent_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            flags,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            event_rx.try_recv().expect("display denial"),
+            AgentEvent::ToolError { error, .. } if error == "Plan mode: browser operation blocked"
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("call_browser")
+                && message.content.contains("private-selector::browser")
+        }));
+    }
+
+    #[tokio::test]
+    async fn malformed_browser_sub_action_starts_with_fixed_display_name() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let tools = Arc::new(ContextRecordingExecutor::default());
+        let mut session = Session::new("malformed-browser-sub-action", "test-model");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let raw_name = "private-selector::browser";
+        let result = ToolResult::text(
+            true,
+            serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![make_tool_call("call_browser", raw_name, "{malformed")],
+                reason: "display".to_string(),
+            })
+            .unwrap(),
+        );
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &parent_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                AgentEvent::ToolStart { tool_name, arguments, .. }
+                    if tool_name == "browser" && arguments == serde_json::json!({})
+            ))
+        );
+        assert!(
+            result.result.contains(raw_name),
+            "model input stays authoritative"
+        );
     }
 
     #[tokio::test]
