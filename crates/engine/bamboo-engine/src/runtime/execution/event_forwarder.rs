@@ -104,6 +104,91 @@ fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, ev
 mod tests {
     use super::*;
 
+    use bamboo_agent_core::ToolResult;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn generic_forwarder_projects_native_download_without_changing_ordinary_results() {
+        let session_id = "generic-download-display";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(16);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            runner,
+        )])));
+        let (input, forwarder) =
+            create_event_forwarder(session_id.to_string(), run_id, broadcast_tx, runners, None);
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        let private = "private-file-url-and-bytes";
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "download".into(),
+                tool_name: "browser".into(),
+                arguments: json!({"action":"download","selector":private,"expected_epoch":9}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolError {
+                tool_call_id: "download".into(),
+                error: private.into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "download".into(),
+                result: ToolResult::text(false, private),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "read".into(),
+                tool_name: "Read".into(),
+                arguments: json!({"path":"readme.md"}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "read".into(),
+                result: ToolResult::text(true, "ordinary Read result"),
+            })
+            .await
+            .unwrap();
+        drop(input);
+
+        let mut visible = Vec::new();
+        for _ in 0..5 {
+            visible.push(
+                tokio::time::timeout(std::time::Duration::from_secs(5), broadcast_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for event in &visible[..3] {
+            assert!(!serde_json::to_string(event).unwrap().contains(private));
+        }
+        assert!(
+            matches!(&visible[2], AgentEvent::ToolComplete { result, .. }
+            if result.result == "Tool result hidden" && result.images.is_empty())
+        );
+        assert!(
+            matches!(&visible[4], AgentEvent::ToolComplete { result, .. }
+            if result.result == "ordinary Read result")
+        );
+        forwarder.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn hundreds_of_child_streams_progress_while_global_registry_is_locked() {
         let runners = Arc::new(RwLock::new(HashMap::new()));
@@ -344,7 +429,9 @@ pub fn create_event_forwarder_with_history_commit_barrier(
             runner.event_publication.clone()
         };
 
+        let mut tool_event_display = bamboo_agent_core::NativeToolEventDisplay::default();
         while let Some(event) = mpsc_rx.recv().await {
+            let event = tool_event_display.project(event);
             let needs_runner_update = event.is_replayable_session_state()
                 || matches!(
                     &event,
