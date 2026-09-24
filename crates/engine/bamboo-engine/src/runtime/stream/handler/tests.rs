@@ -873,6 +873,54 @@ async fn stalled_stream_bootstrap_times_out_before_response_headers() {
     assert!(message.contains("last_transport_ms_ago=2000"));
     assert!(message.contains("last_semantic_ms_ago=never"));
     assert!(message.contains("retry_safe=true"));
+    assert!(timeout.last_http_retry().is_none());
+}
+
+#[tokio::test]
+async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "2")
+                .set_body_string("private provider response body"),
+        )
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/responses", server.uri());
+    let retry_config = bamboo_llm::retry::RetryConfig {
+        max_attempts: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    let context = timeout_context(1, 20, 20).begin_request();
+
+    let result = await_stream_bootstrap(
+        bamboo_llm::retry::send_with_retry(&retry_config, "test", || client.post(&url)),
+        &CancellationToken::new(),
+        "session-rate-limited-bootstrap",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected bootstrap StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+    assert!(timeout.retry_safe());
+    assert_eq!(
+        timeout.last_http_retry(),
+        Some((429, Duration::from_secs(2)))
+    );
+    let message = timeout.to_string();
+    assert!(message.contains("last_http_status=429, retry_delay_ms=2000"));
+    assert!(!message.contains("private provider response body"));
 }
 
 #[tokio::test(start_paused = true)]

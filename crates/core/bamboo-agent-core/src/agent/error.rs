@@ -51,6 +51,7 @@ pub struct StreamTimeoutError {
     last_transport: Duration,
     last_semantic: Option<Duration>,
     turn_retry_eligible: bool,
+    last_http_retry: Option<Box<(u16, Duration)>>,
 }
 
 impl StreamTimeoutError {
@@ -74,7 +75,19 @@ impl StreamTimeoutError {
             last_transport,
             last_semantic,
             turn_retry_eligible,
+            last_http_retry: None,
         }
+    }
+
+    /// Attach a status and bounded delay observed while the initial provider
+    /// request was being retried. No response body, URL, or credential is kept.
+    pub fn with_last_http_retry(mut self, status: u16, delay: Duration) -> Self {
+        self.last_http_retry = Some(Box::new((status, delay)));
+        self
+    }
+
+    pub fn last_http_retry(&self) -> Option<(u16, Duration)> {
+        self.last_http_retry.as_deref().copied()
     }
 
     /// Watchdog phase that expired.
@@ -113,7 +126,15 @@ impl fmt::Display for StreamTimeoutError {
             last_semantic,
             self.semantic_output_started(),
             self.retry_safe(),
-        )
+        )?;
+        if let Some((status, delay)) = self.last_http_retry() {
+            write!(
+                formatter,
+                ", last_http_status={status}, retry_delay_ms={}",
+                delay.as_millis()
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -247,5 +268,28 @@ mod tests {
              model=model-id, last_transport_ms_ago=120000, last_semantic_ms_ago=never, \
              semantic_output_started=false, retry_safe=true"
         );
+    }
+
+    #[test]
+    fn bootstrap_timeout_can_include_secret_free_http_retry_evidence() {
+        let timeout = StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            None,
+            None,
+            Duration::from_secs(120),
+            None,
+            true,
+        )
+        .with_last_http_retry(429, Duration::from_secs(60));
+
+        assert!(timeout.retry_safe());
+        assert_eq!(
+            timeout.last_http_retry(),
+            Some((429, Duration::from_secs(60)))
+        );
+        assert!(timeout
+            .to_string()
+            .contains("last_http_status=429, retry_delay_ms=60000"));
     }
 }

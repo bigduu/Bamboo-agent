@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -10,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::tools::ToolCall;
 use bamboo_agent_core::{AgentError, AgentEvent, StreamTimeoutError, StreamTimeoutPhase};
 use bamboo_config::StreamTimeoutConfig;
+use bamboo_llm::retry::{InitialHttpRetry, InitialHttpRetryObserver};
 use bamboo_llm::LLMStream;
 
 mod chunk_handling;
@@ -71,7 +73,26 @@ impl StreamTimeoutContext {
         last_transport: Duration,
         last_semantic: Option<Duration>,
     ) -> AgentError {
-        let timeout = StreamTimeoutError::new(
+        self.timeout_error_with_http_retry(
+            session_id,
+            phase,
+            deadline,
+            last_transport,
+            last_semantic,
+            None,
+        )
+    }
+
+    fn timeout_error_with_http_retry(
+        &self,
+        session_id: &str,
+        phase: StreamTimeoutPhase,
+        deadline: Duration,
+        last_transport: Duration,
+        last_semantic: Option<Duration>,
+        http_retry: Option<InitialHttpRetry>,
+    ) -> AgentError {
+        let mut timeout = StreamTimeoutError::new(
             phase,
             deadline,
             self.provider.clone(),
@@ -80,6 +101,9 @@ impl StreamTimeoutContext {
             last_semantic,
             self.turn_retry_eligible,
         );
+        if let Some(retry) = http_retry {
+            timeout = timeout.with_last_http_retry(retry.status, retry.delay);
+        }
         tracing::warn!("[{}] LLM stream watchdog expired: {}", session_id, timeout,);
         AgentError::StreamTimeout(timeout)
     }
@@ -112,22 +136,27 @@ where
         .unwrap_or_else(Instant::now);
     let deadline = Duration::from_secs(timeout_context.policy.transport_idle_timeout_secs);
     let expires_at = started_at + deadline;
+    let http_retry_observer = Arc::new(InitialHttpRetryObserver::default());
 
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
-        result = future => Ok(result),
-        _ = tokio::time::sleep_until(expires_at) => {
-            let now = Instant::now();
-            Err(timeout_context.timeout_error(
-                session_id,
-                StreamTimeoutPhase::Bootstrap,
-                deadline,
-                now.saturating_duration_since(started_at),
-                None,
-            ))
+    bamboo_llm::retry::observe_initial_http_retries(http_retry_observer.clone(), async {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
+            result = future => Ok(result),
+            _ = tokio::time::sleep_until(expires_at) => {
+                let now = Instant::now();
+                Err(timeout_context.timeout_error_with_http_retry(
+                    session_id,
+                    StreamTimeoutPhase::Bootstrap,
+                    deadline,
+                    now.saturating_duration_since(started_at),
+                    None,
+                    http_retry_observer.last(),
+                ))
+            }
         }
-    }
+    })
+    .await
 }
 
 fn sanitize_identifier(value: &str) -> Option<String> {
