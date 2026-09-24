@@ -291,22 +291,20 @@ fn pending_tool_arguments_for_display(
             .map(|(args, truncated)| (args, truncated, false));
     }
     let raw = pending_tool_argument_text(session, pending.tool_call_id.as_str())?;
+    if request.is_some_and(|request| {
+        PermissionRequest::is_private_browser_file_resource(&request.tool_name, &request.resource)
+    }) {
+        // The parked request identifies the private action for normal,
+        // oversized, and auto-repaired original arguments alike. Keep the
+        // original bytes in the session and send one fixed display copy.
+        return Some((
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"}),
+            false,
+            false,
+        ));
+    }
     let parked_focused = request.is_some_and(PermissionRequest::is_focused_browser_input);
     if raw.len() > MAX_PENDING_TOOL_ARGUMENT_BYTES {
-        if request.is_some_and(|request| {
-            PermissionRequest::is_private_browser_file_resource(
-                &request.tool_name,
-                &request.resource,
-            )
-        }) {
-            // The validated parked request identifies the action without
-            // parsing or sending a potentially 1 MiB file argument to the UI.
-            return Some((
-                serde_json::json!({"action":"set_file_input","file":"[redacted]"}),
-                false,
-                false,
-            ));
-        }
         return Some((
             serde_json::json!({"arguments":"[omitted]"}),
             true,
@@ -924,9 +922,10 @@ mod http_tests {
                 .await
                 .expect("app state"),
         );
-        for (case, data_base64) in [
-            ("short", "cHJpdmF0ZSBieXRlcw==".to_string()),
-            ("oversized-preview", "A".repeat(20_000)),
+        for (case, data_base64, repaired_original) in [
+            ("short", "cHJpdmF0ZSBieXRlcw==".to_string(), false),
+            ("oversized-preview", "A".repeat(20_000), false),
+            ("repaired-short", "cHJpdmF0ZSBieXRlcw==".to_string(), true),
         ] {
             let session_id = format!("file-input-private-display-{case}");
             let tool_call_id = format!("file-input-call-{case}");
@@ -943,9 +942,14 @@ mod http_tests {
             request.suggested_matchers[0].value = request.resource.clone();
             request.allowed_decisions = PermissionDecisionKind::all_supported();
             let mut session = Session::new(&session_id, "test-model");
+            let mut original_arguments = args.to_string();
+            if repaired_original {
+                original_arguments.pop();
+                assert!(serde_json::from_str::<Value>(&original_arguments).is_err());
+            }
             session
                 .messages
-                .push(assistant_browser_call(&tool_call_id, &args.to_string()));
+                .push(assistant_browser_call(&tool_call_id, &original_arguments));
             session.messages.push(Message::tool_result(
                 &tool_call_id,
                 serde_json::json!({
@@ -994,7 +998,11 @@ mod http_tests {
                 .contains(args["data_base64"].as_str().unwrap()));
             assert_eq!(
                 pending_tool_arguments_exact(&session, &tool_call_id).unwrap(),
-                args
+                if repaired_original {
+                    Value::String(original_arguments)
+                } else {
+                    args
+                }
             );
         }
     }
