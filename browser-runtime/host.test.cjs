@@ -217,6 +217,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let backgroundBlobMarkers = 0;
   let sandboxRequests = 0;
   let redirectedRequests = 0;
+  let metaTargetRequests = 0;
+  let maxRedirectLoopIndex = -1;
   let privateScriptRequests = 0;
   let privatePopupRequests = 0;
   let privateResourceRequests = 0;
@@ -276,6 +278,50 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     }
     if (request.url === '/redirect-file') {
       response.writeHead(302, { location: '/redirected-file' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirect-307') {
+      response.writeHead(307, { location: '/redirect-hop' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirect-hop') {
+      response.writeHead(302, { location: '/redirected-file' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirect-concurrent') {
+      response.writeHead(302, { location: '/concurrent-file' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirect-meta') {
+      response.writeHead(302, { location: '/meta-page' });
+      response.end();
+      return;
+    }
+    if (request.url === '/meta-page') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<meta http-equiv="refresh" content="0;url=/meta-target"><title>Private redirect</title>');
+      return;
+    }
+    if (request.url === '/meta-target') {
+      metaTargetRequests++;
+      response.writeHead(200, { 'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="wrong.bin"' });
+      response.end('unapproved');
+      return;
+    }
+    if (request.url === '/redirect-credentials') {
+      response.writeHead(302, { location: `http://user:secret@127.0.0.1:${fixture.address().port}/redirected-file` });
+      response.end();
+      return;
+    }
+    const redirectLoop = /^\/redirect-loop\/(\d+)$/.exec(request.url);
+    if (redirectLoop) {
+      maxRedirectLoopIndex = Math.max(maxRedirectLoopIndex, Number(redirectLoop[1]));
+      response.writeHead(302, { location: `/redirect-loop/${Number(redirectLoop[1]) + 1}` });
       response.end();
       return;
     }
@@ -435,7 +481,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       return;
     }
     response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
-      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/redirect-concurrent" download>Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="redirect-307" href="/redirect-307" download>307</a><a id="meta" href="/redirect-meta" download>Meta</a><a id="credentials" href="/redirect-credentials" download>Credentials</a><a id="loop" href="/redirect-loop/0" download>Loop</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -502,9 +548,28 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(fragment.ok, true, JSON.stringify(fragment));
     assert.deepEqual(Buffer.from(fragment.result.data_base64, 'base64'), bytes);
     const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
-    assert.equal(redirected.code, 'download_unverifiable', JSON.stringify(redirected));
-    assert.equal(redirected.result, undefined);
-    assert.equal(redirectedRequests, 0, 'the redirect was blocked before its destination');
+    assert.equal(redirected.ok, true, JSON.stringify(redirected));
+    assert.equal(Buffer.from(redirected.result.data_base64, 'base64').toString(), 'redirected-bytes');
+    assert.equal(redirected.result.sha256,
+      createHash('sha256').update('redirected-bytes').digest('hex'));
+    const redirected307 = await call('download', { selector: '#redirect-307', expected_epoch: epoch });
+    assert.equal(redirected307.ok, true, JSON.stringify(redirected307));
+    assert.equal(Buffer.from(redirected307.result.data_base64, 'base64').toString(), 'redirected-bytes');
+    assert.equal(redirected307.result.sha256, redirected.result.sha256);
+    assert.equal(redirectedRequests, 2, 'both verified chains reached the terminal attachment');
+    const afterRedirects = (await call('state')).result;
+    assert.equal(afterRedirects.page_epoch, epoch);
+    assert.equal(afterRedirects.active_tab_id, ready.active_tab_id);
+    assert.equal(afterRedirects.tabs.length, 1, 'private redirect page did not join shared tabs');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
+    assert.equal((await call('screenshot')).ok, true);
+    for (const selector of ['#meta', '#credentials', '#loop']) {
+      const denied = await call('download', { selector, expected_epoch: epoch });
+      assert.equal(denied.code, 'download_unverifiable', JSON.stringify(denied));
+    }
+    assert.equal(metaTargetRequests, 0, 'private HTML meta refresh never loaded its target');
+    assert.equal(maxRedirectLoopIndex, 5, 'redirect chain stops at the five-hop limit');
+    assert.equal(redirectedRequests, 2, 'credential-bearing redirect never reached the attachment');
     const html = await call('download', { selector: '#html', expected_epoch: epoch });
     assert.equal(html.code, 'download_unverifiable', JSON.stringify(html));
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -607,7 +672,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(Buffer.from(concurrent.result.data_base64, 'base64').toString(),
       'selected-concurrent');
     assert.equal(backgroundBlobMarkers, 1,
-      'a background tab started a Blob download during the approved direct transfer');
+      'a background tab started a Blob download during the approved redirected transfer');
     assert.deepEqual(temporaryDownloadFiles(), [], 'the ambient Blob left no artifact');
     const stillShared = (await call('state')).result;
     assert.equal(stillShared.active_tab_id, hashPage.active_tab_id);
