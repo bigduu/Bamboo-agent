@@ -13,14 +13,23 @@ const { installScriptBlobCapture } = require('./host.cjs');
 test('real Chromium captures only a selected synchronous Blob click', async () => {
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-script-blob-'));
   const fixture = http.createServer((_request, response) => {
-    response.setHeader('content-type', 'text/html');
+    response.setHeader('content-type', 'text/html; charset=utf-8');
     if (_request.url === '/tamper') {
       response.end('<button id="selected">Tampered</button><script>URL.createObjectURL = () => "blob:forged"</script>');
       return;
     }
     response.end(`<!doctype html><button id="selected">Selected</button><button id="old">Old</button>
       <button id="delayed">Delayed</button><button id="double">Double</button>
-      <button id="exact">Exact limit</button><button id="over">Too large</button><output>0</output><script>
+      <button id="exact">Exact limit</button><button id="over">Too large</button>
+      <button id="registered">Listener</button>
+      <button id="inline" onclick="save(fresh('inline-bytes'),'inline.txt')">Inline</button>
+      <button id="micro">Microtask</button><button id="promise">Promise</button>
+      <button id="observer">Observer</button><button id="mixed">Mixed</button>
+      <button id="preambient">Before handler</button><button id="delegated">Delegated</button>
+      <button id="borrowed">Borrowed realm</button>
+      <button id="manual">Manual</button><button id="surrogate">Surrogate</button>
+      <button id="emoji">Emoji</button><button id="path">Path</button>
+      <output>0</output><output id="observed">0</output><script>
       const oldUrl = URL.createObjectURL(new Blob(['old-bytes']));
       const save = (url, name) => { const a=document.createElement('a');a.href=url;a.download=name;a.click(); };
       const fresh = text => URL.createObjectURL(new Blob([text]));
@@ -32,6 +41,34 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
       double.onclick = () => {save(fresh('first'),'first.txt');save(fresh('second'),'second.txt')};
       exact.onclick = () => save(URL.createObjectURL(new Blob([new Uint8Array(256*1024)])),'exact.bin');
       over.onclick = () => save(URL.createObjectURL(new Blob([new Uint8Array(256*1024+1)])),'over.bin');
+      registered.addEventListener('click', () => save(fresh('listener-bytes'),'listener.txt'));
+      const removed = () => save(fresh('removed-bytes'),'removed.txt');
+      registered.addEventListener('click', removed);
+      registered.removeEventListener('click', removed);
+      micro.onclick = () => queueMicrotask(() => save(fresh('micro-bytes'),'micro.txt'));
+      promise.onclick = () => Promise.resolve().then(() => save(fresh('promise-bytes'),'promise.txt'));
+      new MutationObserver(() => save(fresh('ambient-bytes'),'ambient.txt'))
+        .observe(observed, { childList: true });
+      observer.onclick = () => { observed.textContent = '1'; };
+      mixed.onclick = () => { save(fresh('selected-bytes'),'selected.txt'); observed.textContent = '2'; };
+      document.addEventListener('click', event => {
+        if (event.target.id === 'preambient') {
+          queueMicrotask(() => save(fresh('preambient-bytes'),'preambient.txt'));
+        }
+        if (event.target.id === 'delegated') save(fresh('delegated-bytes'),'delegated.txt');
+      }, true);
+      preambient.onclick = () => save(fresh('legitimate-bytes'),'legitimate.txt');
+      const frame = document.createElement('iframe');
+      document.body.append(frame);
+      frame.contentWindow.EventTarget.prototype.addEventListener.call(borrowed, 'click',
+        () => save(fresh('borrowed-bytes'),'borrowed.txt'));
+      manual.onclick = e => {
+        if (window.manualReplay) save(fresh('manual-bytes'),'manual.txt');
+        else queueMicrotask(() => { window.manualReplay = true; manual.onclick.call(manual, e); });
+      };
+      surrogate.onclick = () => save(fresh('surrogate-bytes'),'\\ud800');
+      emoji.onclick = () => save(fresh('emoji-bytes'),'photo-😀.txt');
+      path.onclick = () => save(fresh('path-bytes'),'../outside.txt');
       </script>`);
   });
   fixture.listen(0, '127.0.0.1');
@@ -79,7 +116,7 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     assert.equal(Buffer.from(selected.data_base64, 'base64').toString(), 'selected-bytes');
     assert.equal(selected.byte_count, 'selected-bytes'.length);
     assert.equal(selected.filename, 'selected.txt');
-    assert.equal(await page.locator('output').textContent(), '1');
+    assert.equal(await page.locator('output').first().textContent(), '1');
     assert.equal(page.url(), initialUrl);
     await page.waitForTimeout(150);
     // The later automatic download uses the same Blob URL and frame, yet the
@@ -89,6 +126,37 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     assert.equal((await attempt('#old')).status, 'unverifiable');
     assert.equal((await attempt('#delayed')).status, 'unverifiable');
     assert.equal((await attempt('#double')).status, 'unverifiable');
+    const registered = await attempt('#registered');
+    assert.equal(Buffer.from(registered.data_base64, 'base64').toString(), 'listener-bytes');
+    const inline = await attempt('#inline');
+    assert.equal(Buffer.from(inline.data_base64, 'base64').toString(), 'inline-bytes');
+    assert.equal((await attempt('#micro')).status, 'unverifiable');
+    assert.equal((await attempt('#promise')).status, 'unverifiable');
+    assert.equal((await attempt('#observer')).status, 'unverifiable',
+      'an unrelated MutationObserver must not be attributed to the click handler');
+    assert.equal((await attempt('#mixed')).status, 'unverifiable',
+      'an ambient creation during a valid click makes the action ambiguous');
+    assert.equal((await attempt('#preambient')).status, 'unverifiable',
+      'a document capture microtask before the approved handler is ambiguous');
+    assert.equal((await attempt('#delegated')).status, 'unverifiable',
+      'the supported boundary is a direct handler on the selected element');
+    assert.equal((await attempt('#borrowed')).status, 'unverifiable',
+      'listeners registered with another realm native method are not trusted');
+    assert.equal((await command('arm', '#manual')).status, 'armed');
+    assert.equal(await page.evaluate(() => {
+      const nativeGetter = Object.getOwnPropertyDescriptor(
+        frame.contentWindow.HTMLElement.prototype, 'onclick').get;
+      return nativeGetter.call(manual);
+    }), null, 'a fresh realm native getter must not expose the hidden wrapper');
+    assert.equal((await command('cancel')).status, 'unverifiable');
+    assert.equal((await attempt('#manual')).status, 'unverifiable',
+      'reading and invoking onclick from a microtask cannot enter the hidden handler');
+    assert.equal((await attempt('#surrogate')).status, 'unverifiable',
+      'page-supplied unpaired UTF-16 cannot reach the Rust JSON protocol');
+    const emoji = await attempt('#emoji');
+    assert.equal(emoji.filename, 'photo-😀.txt');
+    assert.equal((await attempt('#path')).status, 'unverifiable',
+      'page-supplied filenames must remain basenames');
     const exact = await attempt('#exact');
     assert.equal(exact.status, 'ok');
     assert.equal(Buffer.from(exact.data_base64, 'base64').length, 256 * 1024);
@@ -109,6 +177,10 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     assert.equal((await command('finish')).status, 'unverifiable');
     await page.evaluate(() => { URL.createObjectURL = () => 'blob:forged'; });
     assert.equal((await command('arm', '#selected')).status, 'unverifiable');
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
+    await page.evaluate(() => { EventTarget.prototype.addEventListener = () => {}; });
+    assert.equal((await command('arm', '#selected')).status, 'unverifiable',
+      'page replacement of the pre-document listener wrapper is rejected');
     await page.goto(`http://127.0.0.1:${fixture.address().port}/tamper`);
     assert.equal((await command('arm', '#selected')).status, 'unverifiable',
       'a site script that replaces a pristine hook before the action is rejected');

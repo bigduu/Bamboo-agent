@@ -367,6 +367,9 @@ function installScriptBlobCapture({ key, secret }) {
   const stringify = json.stringify;
   const urlClass = URL;
   const anchorClass = HTMLAnchorElement;
+  const eventTargetClass = EventTarget;
+  const htmlElementClass = HTMLElement;
+  const weakMapClass = WeakMap;
   const stringClass = String;
   const byteArrayClass = Uint8Array;
   const isSafeInteger = Number.isSafeInteger;
@@ -376,6 +379,7 @@ function installScriptBlobCapture({ key, secret }) {
   const nativeBlobArrayBuffer = Blob.prototype.arrayBuffer;
   const nativeEventTarget = getDescriptor(Event.prototype, 'target').get;
   const nativeCurrentEvent = getDescriptor(root, 'event').get;
+  const nativePreventDefault = Event.prototype.preventDefault;
   const nativeContains = Node.prototype.contains;
   const nativeQuerySelectorAll = root.document.querySelectorAll;
   const nativeNodeListLength = getDescriptor(NodeList.prototype, 'length').get;
@@ -384,9 +388,17 @@ function installScriptBlobCapture({ key, secret }) {
   const nativeGetAttribute = Element.prototype.getAttribute;
   const nativeBtoa = root.btoa;
   const nativeFromCharCode = stringClass.fromCharCode;
+  const nativeCodePointAt = stringClass.prototype.codePointAt;
   const typedArrayPrototype = Object.getPrototypeOf(byteArrayClass.prototype);
   const nativeTypedArrayLength = getDescriptor(typedArrayPrototype, 'length').get;
   const nativeTypedArrayByteLength = getDescriptor(typedArrayPrototype, 'byteLength').get;
+  const nativeAdd = eventTargetClass.prototype.addEventListener;
+  const nativeRemove = eventTargetClass.prototype.removeEventListener;
+  const nativeOnclick = getDescriptor(htmlElementClass.prototype, 'onclick');
+  const nativeDelete = Reflect.deleteProperty;
+  const weakGet = WeakMap.prototype.get;
+  const weakSet = WeakMap.prototype.set;
+  const listeners = new weakMapClass();
   const maxBytes = 256 * 1024;
   let armed = false;
   let selectedElement = null;
@@ -397,6 +409,8 @@ function installScriptBlobCapture({ key, secret }) {
   let clicked = null;
   let clicks = 0;
   let ambiguous = false;
+  let handlerDepth = 0;
+  let onclickCapture = null;
   const reset = () => {
     armed = false;
     selectedElement = null;
@@ -407,10 +421,57 @@ function installScriptBlobCapture({ key, secret }) {
     clicked = null;
     clicks = 0;
     ambiguous = false;
+    handlerDepth = 0;
   };
   const inSelectedDispatch = () => armed && selectedEvent !== null &&
     apply(nativeCurrentEvent, root, []) === selectedEvent;
-  root.document.addEventListener('click', event => {
+  const inSelectedHandler = () => inSelectedDispatch() && handlerDepth > 0;
+  // A microtask can run while window.event, eventPhase and currentTarget still
+  // identify the trusted click. Only a directly invoked selected-element
+  // handler may produce the returned Blob, and any other creation is ambiguous.
+  const wrappedAdd = function(type, listener, options) {
+    if (type !== 'click' || listener === null ||
+        (typeof listener !== 'function' && typeof listener !== 'object') ||
+        (typeof this !== 'object' && typeof this !== 'function') || this === null) {
+      return apply(nativeAdd, this, [type, listener, options]);
+    }
+    let byListener = apply(weakGet, listeners, [this]);
+    if (!byListener) {
+      byListener = new weakMapClass();
+      apply(weakSet, listeners, [this, byListener]);
+    }
+    let wrapper = apply(weakGet, byListener, [listener]);
+    if (!wrapper) {
+      wrapper = function(event) {
+        const direct = armed && this === selectedElement && event === selectedEvent;
+        if (direct) handlerDepth++;
+        try {
+          if (typeof listener === 'function') return apply(listener, this, [event]);
+          return apply(listener.handleEvent, listener, [event]);
+        } finally {
+          if (direct) handlerDepth--;
+        }
+      };
+      apply(weakSet, byListener, [listener, wrapper]);
+    }
+    return apply(nativeAdd, this, [type, wrapper, options]);
+  };
+  const wrappedRemove = function(type, listener, options) {
+    const byListener = this !== null && (typeof this === 'object' || typeof this === 'function')
+      ? apply(weakGet, listeners, [this]) : null;
+    const wrapper = byListener && listener !== null &&
+      (typeof listener === 'function' || typeof listener === 'object')
+      ? apply(weakGet, byListener, [listener]) : null;
+    if (type === 'click' && wrapper) apply(nativeRemove, this, [type, wrapper, options]);
+    return apply(nativeRemove, this, [type, listener, options]);
+  };
+  define(eventTargetClass.prototype, 'addEventListener', {
+    value: wrappedAdd, writable: true, configurable: true,
+  });
+  define(eventTargetClass.prototype, 'removeEventListener', {
+    value: wrappedRemove, writable: true, configurable: true,
+  });
+  apply(nativeAdd, root.document, ['click', event => {
     if (!armed) return;
     try {
       if (!apply(getDescriptor(event, 'isTrusted').get, event, [])) return;
@@ -420,10 +481,11 @@ function installScriptBlobCapture({ key, secret }) {
       if (trustedClicks === 1) selectedEvent = event;
       else ambiguous = true;
     } catch { ambiguous = true; }
-  }, true);
+  }, true]);
   const captureCreate = function(blob) {
     const url = apply(nativeCreate, this, [blob]);
     if (inSelectedDispatch()) {
+      if (!inSelectedHandler()) { ambiguous = true; return url; }
       creations++;
       if (creations === 1) {
         try {
@@ -435,25 +497,107 @@ function installScriptBlobCapture({ key, secret }) {
   };
   const captureClick = function(...args) {
     if (!inSelectedDispatch()) return apply(nativeAnchorClick, this, args);
+    if (!inSelectedHandler()) { ambiguous = true; return undefined; }
     clicks++;
     try {
       const url = apply(nativeHref, this, []);
       const filename = apply(nativeGetAttribute, this, ['download']);
-      if (clicks === 1 && created && url === created.url && filename !== null &&
-          filename.length <= 180) clicked = { url, filename };
+      if (clicks === 1 && created && url === created.url && safeFilename(filename)) {
+        clicked = { url, filename };
+      }
       else ambiguous = true;
     } catch { ambiguous = true; }
     // Never let a script click start a native download while it is being
     // attributed. Unmatched/multiple activations fail closed at finish().
     return undefined;
   };
+  const safeFilename = filename => {
+    if (typeof filename !== 'string' || !filename || filename.length > 180 ||
+        filename === '.' || filename === '..') return false;
+    for (let index = 0; index < filename.length; index++) {
+      const codePoint = apply(nativeCodePointAt, filename, [index]);
+      if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ||
+          codePoint === 0x2f || codePoint === 0x3a || codePoint === 0x5c ||
+          (codePoint >= 0xd800 && codePoint <= 0xdfff)) return false;
+      if (codePoint > 0xffff) index++;
+    }
+    return true;
+  };
+  const captureOnclick = target => {
+    if (getDescriptor(target, 'onclick')) return false;
+    const original = apply(nativeOnclick.get, target, []);
+    if (original === null) return true;
+    if (typeof original !== 'function') return false;
+    const info = { target, original, changed: false, value: original };
+    info.getter = function() {
+      if (this === target) return info.value;
+      return apply(nativeOnclick.get, this, []);
+    };
+    info.setter = function(value) {
+      if (this !== target) return apply(nativeOnclick.set, this, [value]);
+      info.changed = true;
+      info.value = value;
+      ambiguous = true;
+      return apply(nativeOnclick.set, target, [value]);
+    };
+    info.listener = function(event) {
+      if (info.changed || apply(nativeOnclick.get, target, []) !== null) {
+        ambiguous = true;
+        return undefined;
+      }
+      const direct = armed && this === target && event === selectedEvent;
+      if (direct) handlerDepth++;
+      try {
+        const result = apply(original, this, [event]);
+        if (result === false) apply(nativePreventDefault, event, []);
+        return result;
+      } finally {
+        if (direct) handlerDepth--;
+      }
+    };
+    onclickCapture = info;
+    apply(nativeOnclick.set, target, [null]);
+    apply(nativeAdd, target, ['click', info.listener, false]);
+    define(target, 'onclick', {
+      get: info.getter, set: info.setter, enumerable: true, configurable: true,
+    });
+    return true;
+  };
+  const onclickIntact = () => !onclickCapture ||
+    (getDescriptor(onclickCapture.target, 'onclick')?.get === onclickCapture.getter &&
+      getDescriptor(onclickCapture.target, 'onclick')?.set === onclickCapture.setter &&
+      apply(nativeOnclick.get, onclickCapture.target, []) === null &&
+      !onclickCapture.changed);
   const nativeMethodsIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
-    urlClass.createObjectURL === nativeCreate && anchorClass.prototype.click === nativeAnchorClick;
+    root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
+    root.WeakMap === weakMapClass &&
+    urlClass.createObjectURL === nativeCreate && anchorClass.prototype.click === nativeAnchorClick &&
+    eventTargetClass.prototype.addEventListener === wrappedAdd &&
+    eventTargetClass.prototype.removeEventListener === wrappedRemove &&
+    getDescriptor(htmlElementClass.prototype, 'onclick')?.get === nativeOnclick.get &&
+    getDescriptor(htmlElementClass.prototype, 'onclick')?.set === nativeOnclick.set;
   const wrappersIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
-    urlClass.createObjectURL === captureCreate && anchorClass.prototype.click === captureClick;
+    root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
+    root.WeakMap === weakMapClass &&
+    urlClass.createObjectURL === captureCreate && anchorClass.prototype.click === captureClick &&
+    eventTargetClass.prototype.addEventListener === wrappedAdd &&
+    eventTargetClass.prototype.removeEventListener === wrappedRemove && onclickIntact();
   const restore = () => {
     let restored = true;
     try {
+      if (onclickCapture) {
+        const info = onclickCapture;
+        apply(nativeRemove, info.target, ['click', info.listener, false]);
+        const descriptor = getDescriptor(info.target, 'onclick');
+        if (descriptor?.get === info.getter && descriptor?.set === info.setter) {
+          if (!apply(nativeDelete, Reflect, [info.target, 'onclick'])) restored = false;
+        } else restored = false;
+        const current = apply(nativeOnclick.get, info.target, []);
+        if (!info.changed && current === null && restored) {
+          apply(nativeOnclick.set, info.target, [info.original]);
+        }
+        onclickCapture = null;
+      }
       if (urlClass.createObjectURL === captureCreate) {
         define(urlClass, 'createObjectURL', {
           value: nativeCreate, writable: true, configurable: true,
@@ -477,7 +621,7 @@ function installScriptBlobCapture({ key, secret }) {
       return restored ? '{"status":"unverifiable"}' : '{"status":"cleanup_failed"}';
     }
     if (operation === 'arm') {
-      const restored = !armed || restore();
+      const restored = !(armed || onclickCapture) || restore();
       reset();
       if (!restored) return '{"status":"cleanup_failed"}';
       if (!nativeMethodsIntact() || typeof selector !== 'string' || !selector ||
@@ -494,6 +638,7 @@ function installScriptBlobCapture({ key, secret }) {
         }
       } catch { return '{"status":"unverifiable"}'; }
       try {
+        if (!captureOnclick(target)) return '{"status":"unverifiable"}';
         define(urlClass, 'createObjectURL', {
           value: captureCreate, writable: true, configurable: true,
         });
