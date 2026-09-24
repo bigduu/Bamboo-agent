@@ -612,6 +612,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
             BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
             BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
             BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
+            BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS: mode === 'reject' ? '500' : '0',
           },
           stdio: ['pipe', 'pipe', 'inherit'],
         });

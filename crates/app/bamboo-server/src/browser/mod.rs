@@ -420,7 +420,7 @@ impl BrowserSession {
         self.mark_dead(reason);
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
-            self.cleanup_temp_dir();
+            self.cleanup_temp_dir().await;
             return;
         }
         self.signal_stop();
@@ -443,14 +443,34 @@ impl BrowserSession {
         } else {
             tracing::warn!("browser host did not exit after process termination");
         }
-        self.cleanup_temp_dir();
+        self.cleanup_temp_dir().await;
     }
 
-    fn cleanup_temp_dir(&self) {
-        if let Some(temp_dir) = self.temp_dir.lock().unwrap().take() {
-            if temp_dir.close().is_err() {
-                tracing::warn!("failed to remove browser temporary directory");
+    async fn cleanup_temp_dir(&self) {
+        let temp_dir = { self.temp_dir.lock().unwrap().take() };
+        if let Some(temp_dir) = temp_dir {
+            let path = temp_dir.path().to_path_buf();
+            let close_error = match temp_dir.close() {
+                Ok(()) => return,
+                Err(error) => error,
+            };
+            let mut retry_error = close_error.to_string();
+            let mut retry_kind = close_error.kind();
+            // Chromium descendants can still finish exiting after the Node
+            // parent is reaped. Retry the owned directory, never another TMPDIR.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => {
+                        retry_kind = error.kind();
+                        retry_error = error.to_string();
+                    }
+                }
             }
+            tracing::warn!(%close_error, %retry_error, ?retry_kind,
+                "failed to remove browser temporary directory after host retirement");
         }
     }
 

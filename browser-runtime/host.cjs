@@ -3,6 +3,7 @@
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
 const { createHash, randomBytes } = require('node:crypto');
+const { rmSync } = require('node:fs');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -27,6 +28,9 @@ const TEST_DOWNLOAD_CLICK_DELAY_MS = process.env.NODE_ENV === 'test'
   : 0;
 const TEST_PRIVATE_PAGE_FAILURE = process.env.NODE_ENV === 'test'
   ? process.env.BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE : '';
+const TEST_RETIRE_CLOSE_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS) || 0))
+  : 0;
 // The packaged host does not inherit NODE_ENV. Direct host tests can pause
 // observer setup to force a navigation between the first and final epoch checks.
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
@@ -2048,6 +2052,9 @@ async function closeHost() {
   browserClosed = true;
   downloadCdp = undefined;
   downloadContextId = undefined;
+  if (retireAfterReply && TEST_RETIRE_CLOSE_DELAY_MS) {
+    await new Promise(resolve => setTimeout(resolve, TEST_RETIRE_CLOSE_DELAY_MS));
+  }
   if (downloadDir) {
     await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
     downloadDir = undefined;
@@ -2138,6 +2145,11 @@ async function main() {
     // Never keep a timed-out Chromium transfer alive for the next request.
     // Rust also kills/reaps this host's process group and removes its TMPDIR.
     await Promise.race([closeHost(), new Promise(resolve => setTimeout(resolve, 250))]);
+    // closeHost may still be waiting on Chromium when the bounded race ends.
+    // Remove this host's private directory before forcing Node to exit.
+    if (downloadDir) {
+      try { rmSync(downloadDir, { recursive: true, force: true }); } catch { /* Rust owns the fallback. */ }
+    }
     process.exit(1);
   }
   await closeHost();
