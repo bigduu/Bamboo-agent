@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "frontend_name": "lotus-next",
-  "frontend_version": "2026.9.16",
-  "bundle_hash": "sha256:7c2b11ca81c320a8a71f16485d8eb4abe12bc07baa58cc588cd60dbacdc776fc",
-  "built_at": "2026-09-15T19:14:58.988Z",
+  "frontend_version": "2026.9.22",
+  "bundle_hash": "sha256:62330d39d2769d684489738047b24fe7fc21cf1841f02dbd19e05858957605cc",
+  "built_at": "2026-09-22T07:22:24.007Z",
   "entry": "index.html"
 }

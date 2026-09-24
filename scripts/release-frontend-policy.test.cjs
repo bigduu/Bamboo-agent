@@ -17,7 +17,7 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const LOTUS_NEXT_PACKAGE_NAME = "@bigduu/lotus-next";
-const LOTUS_NEXT_VERSION = "2026.9.16";
+const LOTUS_NEXT_VERSION = "2026.9.22";
 
 test("defaults releases and tag events to the exact locked Lotus Next artifact", () => {
   assert.deepEqual(resolveReleaseFrontend(), {

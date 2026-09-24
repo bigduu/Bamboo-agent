@@ -1,0 +1,2436 @@
+#!/usr/bin/env node
+// One host process owns one isolated Chromium context and a bounded tab set. Bamboo is the
+// only client: newline-delimited JSON over stdio never exposes a CDP port.
+const { chromium } = require('playwright-core');
+const { createHash, randomBytes } = require('node:crypto');
+const { rmSync } = require('node:fs');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const readline = require('node:readline');
+
+const MAX_SNAPSHOT_CHARS = 80_000;
+const MAX_HTML_CHARS = 100_000;
+const MAX_TABS = 8;
+// Rust retires this host after 30 seconds. Leave time for state() and stdio.
+const POINTER_ACTION_BUDGET_MS = 22_000;
+// Bound returned bytes, not OS disk usage: Chromium may buffer a chunk before
+// its next progress event lets us cancel an oversized transfer.
+const MAX_DOWNLOAD_BYTES = 256 * 1024;
+const DOWNLOAD_ACTION_BUDGET_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(20_000, Math.max(100, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS) || 20_000))
+  : 20_000;
+const TEST_DOWNLOAD_CLEANUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(5_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS) || 0))
+  : 0;
+const TEST_DOWNLOAD_CLICK_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS) || 0))
+  : 0;
+const TEST_PRIVATE_PAGE_FAILURE = process.env.NODE_ENV === 'test'
+  ? process.env.BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE : '';
+const TEST_RETIRE_CLOSE_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS) || 0))
+  : 0;
+// The packaged host does not inherit NODE_ENV. Direct host tests can pause
+// observer setup to force a navigation between the first and final epoch checks.
+const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_OBSERVER_DELAY_MS) || 0))
+  : 0;
+const TEST_DIALOG_STATE_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DIALOG_STATE_DELAY_MS) || 0))
+  : 0;
+const TEST_DIALOG_READ_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DIALOG_READ_DELAY_MS) || 0))
+  : 0;
+const MAX_DIALOG_CHARS = 4_096;
+const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
+  ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
+  : 300_000;
+const MAX_EVAL_CODE_BYTES = 8 * 1024;
+const MAX_EVAL_JSON_BYTES = 64 * 1024;
+const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
+const DOWNLOAD_LINK_KEY = `__bamboo_link_${randomBytes(16).toString('hex')}`;
+const DOWNLOAD_LINK_SECRET = randomBytes(24).toString('hex');
+let epoch = randomBytes(6).readUIntBE(0, 6);
+let browser;
+let context;
+let tabs = [];
+const tabByPage = new WeakMap();
+let activeTabId;
+let activeCapture;
+let captureGeneration = 0;
+let captureTask = Promise.resolve();
+let frameSeq = 0;
+let lastFrameAt = 0;
+let closing = false;
+let shuttingDown = false;
+let browserClosed = false;
+let pendingDialog;
+let inFlightAction;
+const dialogWaiters = new Set();
+let retireAfterReply = false;
+let downloadCdp;
+let downloadContextId;
+let downloadDir;
+let activeDownloadAttempt;
+let transientPageCreation;
+const transientPages = new WeakSet();
+const orphanDownloads = new Set();
+let downloadSweep = Promise.resolve();
+
+function emit(message) {
+  if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function bounded(value, maximum) {
+  return value.length > maximum ? value.slice(0, maximum) : value;
+}
+
+function boundedDialogText(value) {
+  let text = '';
+  let consumed = 0;
+  for (const character of value) {
+    if (consumed + character.length > MAX_DIALOG_CHARS) break;
+    const codePoint = character.codePointAt(0);
+    text += codePoint >= 0xD800 && codePoint <= 0xDFFF ? '\uFFFD' : character;
+    consumed += character.length;
+  }
+  return { text, truncated: consumed < value.length };
+}
+
+function staleEpochError() {
+  const error = new Error('browser page changed; refresh state and retry');
+  error.code = 'stale_epoch';
+  return error;
+}
+
+function activeTab() {
+  return tabs.find(tab => tab.id === activeTabId);
+}
+
+function requireActiveTab() {
+  const tab = activeTab();
+  if (!tab || tab.page.isClosed()) throw staleEpochError();
+  return tab;
+}
+
+function tabSummary(tab) {
+  return {
+    tab_id: tab.id,
+    url: tab.page.url(),
+    title: tab.title,
+    active: tab.id === activeTabId,
+  };
+}
+
+function dialogError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function dialogState() {
+  const tab = requireActiveTab();
+  const pending = pendingDialog;
+  const message = pending && boundedDialogText(pending.message);
+  const defaultValue = pending && boundedDialogText(pending.defaultValue);
+  return {
+    page_epoch: epoch,
+    active_tab_id: tab.id,
+    url: tab.page.url(),
+    title: tab.title,
+    frame_seq: frameSeq,
+    viewport: tab.page.viewportSize(),
+    can_go_back: false,
+    can_go_forward: false,
+    tabs: tabs.map(tabSummary),
+    pending_dialog: pending ? {
+      dialog_id: pending.id,
+      tab_id: pending.tabId,
+      page_epoch: pending.pageEpoch,
+      url: pending.url,
+      type: pending.type,
+      message: message.text,
+      message_truncated: message.truncated,
+      default_value: defaultValue.text,
+      default_value_truncated: defaultValue.truncated,
+      expires_at_ms: pending.expiresAt,
+      status: pending.expired ? 'expired' : 'pending',
+    } : null,
+  };
+}
+
+async function stableRead(read) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const tab = requireActiveTab();
+    const readEpoch = epoch;
+    const readUrl = tab.page.url();
+    checkPageUrl(readUrl);
+    try {
+      const value = await read(tab);
+      if (epoch === readEpoch && activeTabId === tab.id &&
+          !tab.page.isClosed() && tab.page.url() === readUrl) {
+        return { page_epoch: readEpoch, active_tab_id: tab.id, url: readUrl, ...value };
+      }
+    } catch (error) {
+      if (epoch === readEpoch && activeTabId === tab.id &&
+          !tab.page.isClosed() && tab.page.url() === readUrl) throw error;
+    }
+  }
+  throw staleEpochError();
+}
+
+async function state() {
+  // Browser title/history CDP calls can block while a JavaScript dialog is
+  // open. The synchronous page metadata still identifies the authoritative
+  // tab and pending dialog without wedging the host command loop.
+  if (pendingDialog) return dialogState();
+  return stableRead(async tab => {
+    const viewport = tab.page.viewportSize();
+    const title = await tab.page.title();
+    tab.title = title;
+    let canGoBack = false;
+    let canGoForward = false;
+    try {
+      const cdp = await tab.cdp;
+      const history = await cdp.send('Page.getNavigationHistory');
+      canGoBack = history.currentIndex > 0;
+      canGoForward = history.currentIndex < history.entries.length - 1;
+    } catch {
+      // Navigation history is a hint and may be briefly unavailable.
+    }
+    return {
+      frame_seq: frameSeq, title, viewport,
+      can_go_back: canGoBack, can_go_forward: canGoForward,
+      tabs: tabs.map(tabSummary),
+    };
+  });
+}
+
+function checkEpoch(args) {
+  if (args.expected_epoch !== epoch) {
+    throw staleEpochError();
+  }
+}
+
+function checkUrl(raw) {
+  const value = new URL(raw);
+  if (value.protocol !== 'http:' && value.protocol !== 'https:') {
+    const error = new Error('only http and https pages are supported');
+    error.code = 'invalid_url';
+    throw error;
+  }
+  if (value.username || value.password) {
+    const error = new Error('URLs with embedded credentials are not supported');
+    error.code = 'invalid_url';
+    throw error;
+  }
+  return value.href;
+}
+
+function checkPageUrl(raw) {
+  return raw === 'about:blank' ? raw : checkUrl(raw);
+}
+
+function checkEvalArgs(args) {
+  if (typeof args.code !== 'string' || !args.code.trim() ||
+      Buffer.byteLength(args.code, 'utf8') > MAX_EVAL_CODE_BYTES) {
+    const error = new Error('browser_eval code must be nonempty and at most 8 KiB');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (!Number.isSafeInteger(args.expected_epoch) || args.expected_epoch < 0) {
+    const error = new Error('browser_eval requires a safe expected_epoch');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  if (typeof args.expected_url !== 'string' ||
+      Buffer.byteLength(args.expected_url, 'utf8') > 8192) {
+    const error = new Error('browser_eval requires a bounded expected_url');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  checkPageUrl(args.expected_url);
+  checkEpoch(args);
+}
+
+// Playwright installs this before document scripts in every page and frame.
+// The non-writable function keeps pristine intrinsics in its closure, so page
+// scripts cannot replace the bounded serializer before or during model eval.
+function installEvalHelper(key) {
+  const root = globalThis;
+  const nativeEval = root.eval;
+  const nativeError = Error;
+  const arrayCtor = Array;
+  const weakSetCtor = WeakSet;
+  const isArray = Array.isArray;
+  const isFiniteNumber = Number.isFinite;
+  const isSafeInteger = Number.isSafeInteger;
+  const getPrototypeOf = Object.getPrototypeOf;
+  const objectKeys = Object.keys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const create = Object.create;
+  const define = Object.defineProperty;
+  const setPrototypeOf = Object.setPrototypeOf;
+  const hasOwn = Object.hasOwn;
+  const stringify = JSON.stringify;
+  const apply = Reflect.apply;
+  const charCodeAt = String.prototype.charCodeAt;
+  const seenHas = WeakSet.prototype.has;
+  const seenAdd = WeakSet.prototype.add;
+  const seenDelete = WeakSet.prototype.delete;
+  const plainPrototype = Object.prototype;
+  const withinUtf8Bytes = (text, limit) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index++) {
+      const unit = apply(charCodeAt, text, [index]);
+      if (unit <= 0x7f) bytes++;
+      else if (unit <= 0x7ff) bytes += 2;
+      else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+        const next = apply(charCodeAt, text, [index + 1]);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index++; }
+        else bytes += 3;
+      } else bytes += 3;
+      if (bytes > limit) return false;
+    }
+    return true;
+  };
+
+  const execute = async source => {
+    const value = await (0, nativeEval)(source);
+    const seen = new weakSetCtor();
+    let entries = 0;
+    let stringUnits = 0;
+    const safe = (item, depth) => {
+      if (++entries > 256 || depth > 8) throw new nativeError('browser_eval result exceeds depth or entry limit');
+      if (item === null || typeof item === 'boolean') return item;
+      if (typeof item === 'number' && isFiniteNumber(item)) return item;
+      if (typeof item === 'string') {
+        stringUnits += item.length;
+        if (stringUnits > 65536) throw new nativeError('browser_eval result exceeds string limit');
+        return item;
+      }
+      if (typeof item !== 'object' || apply(seenHas, seen, [item])) {
+        throw new nativeError('browser_eval result is not JSON-safe');
+      }
+      apply(seenAdd, seen, [item]);
+      let result;
+      if (isArray(item)) {
+        const length = item.length;
+        if (!isSafeInteger(length) || length < 0 || length > 64) {
+          throw new nativeError('browser_eval result exceeds array limit');
+        }
+        result = new arrayCtor(length);
+        for (let index = 0; index < length; index++) {
+          const descriptor = getDescriptor(item, index);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor or hole');
+          }
+          define(result, index, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+        // A hostile page may add Array.prototype.toJSON after eval. Keep the
+        // transfer value free of inherited serialization hooks.
+        setPrototypeOf(result, null);
+      } else {
+        const prototype = getPrototypeOf(item);
+        if (prototype !== plainPrototype && prototype !== null) {
+          throw new nativeError('browser_eval result must contain only plain objects');
+        }
+        const keys = objectKeys(item);
+        if (keys.length > 64) throw new nativeError('browser_eval result exceeds object entry limit');
+        result = create(null);
+        for (let index = 0; index < keys.length; index++) {
+          const property = keys[index];
+          if (property.length > 256) throw new nativeError('browser_eval result key is too long');
+          const descriptor = getDescriptor(item, property);
+          if (!descriptor || !hasOwn(descriptor, 'value')) {
+            throw new nativeError('browser_eval result contains an accessor');
+          }
+          define(result, property, {
+            value: safe(descriptor.value, depth + 1),
+            enumerable: true, configurable: true, writable: true,
+          });
+        }
+      }
+      apply(seenDelete, seen, [item]);
+      return result;
+    };
+    const safeValue = safe(value, 0);
+    const valueJson = stringify(safeValue);
+    if (!withinUtf8Bytes(valueJson, 65536)) throw new nativeError('browser_eval result exceeds 64 KiB');
+    const response = create(null);
+    define(response, 'ok', { value: true, enumerable: true });
+    define(response, 'value', { value: safeValue, enumerable: true });
+    define(response, 'observed_url', { value: root.location.href, enumerable: true });
+    // Playwright's object transfer can use mutable page intrinsics. Return a
+    // bounded primitive and parse it with trusted Node intrinsics instead.
+    const serialized = stringify(response);
+    if (!withinUtf8Bytes(serialized, 75000)) throw new nativeError('browser_eval transfer exceeds limit');
+    return serialized;
+  };
+  const run = async source => {
+    try {
+      return await execute(source);
+    } catch {
+      // Never inspect or stringify a thrown page value. Error.message and
+      // toString can be hostile getters, and Playwright would transfer an
+      // unbounded rejection if this helper let it escape.
+      return '{"ok":false}';
+    }
+  };
+  define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
+}
+
+// Resolve the approved CSS link with pristine DOM methods. Playwright's
+// ElementHandle.evaluate can be intercepted by a site's window.eval, even
+// after CDP disables page scripts, so it cannot authorize a download URL.
+function installDownloadLinkInspector({ key, secret }) {
+  const root = globalThis;
+  const document = root.document;
+  const apply = Reflect.apply;
+  const define = Object.defineProperty;
+  const create = Object.create;
+  const stringify = JSON.stringify;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const getPrototypeOf = Object.getPrototypeOf;
+  const hasOwn = Object.hasOwn;
+  const evalDescriptor = getDescriptor(root, 'eval');
+  const nativeEval = evalDescriptor?.value;
+  const queryPath = [];
+  let queryOwner = document;
+  while (queryOwner && !getDescriptor(queryOwner, 'querySelectorAll')) {
+    queryPath.push(queryOwner);
+    queryOwner = getPrototypeOf(queryOwner);
+  }
+  const querySelectorAll = queryOwner && getDescriptor(queryOwner, 'querySelectorAll')?.value;
+  const nodeListLength = getDescriptor(NodeList.prototype, 'length').get;
+  const nodeListItem = NodeList.prototype.item;
+  const getAttribute = Element.prototype.getAttribute;
+  const anchorHref = getDescriptor(HTMLAnchorElement.prototype, 'href').get;
+  const contains = Node.prototype.contains;
+  const unverifiable = '{"status":"unverifiable"}';
+  let observed;
+  const pristineMethods = () => {
+    const currentEval = getDescriptor(root, 'eval');
+    if (!currentEval || !hasOwn(currentEval, 'value') || currentEval.value !== nativeEval ||
+        typeof nativeEval !== 'function') return false;
+    let owner = document;
+    for (const expected of queryPath) {
+      if (owner !== expected || getDescriptor(owner, 'querySelectorAll')) return false;
+      owner = getPrototypeOf(owner);
+    }
+    const currentQuery = owner && getDescriptor(owner, 'querySelectorAll');
+    return owner === queryOwner && currentQuery && hasOwn(currentQuery, 'value') &&
+      currentQuery.value === querySelectorAll && typeof querySelectorAll === 'function';
+  };
+  const inspect = (operation, suppliedSecret, selector) => {
+    if (suppliedSecret !== secret || !pristineMethods()) {
+      return unverifiable;
+    }
+    if (operation === 'matches') {
+      return observed && selector === observed.element &&
+        apply(contains, document, [selector]) ? '{"status":"matched"}' : unverifiable;
+    }
+    if ((operation !== 'inspect' && operation !== 'confirm') ||
+        typeof selector !== 'string' || !selector || selector.length > 512) {
+      return unverifiable;
+    }
+    if (operation === 'inspect') observed = undefined;
+    try {
+      const matches = apply(querySelectorAll, document, [selector]);
+      if (apply(nodeListLength, matches, []) !== 1) return unverifiable;
+      const element = apply(nodeListItem, matches, [0]);
+      if (!element || !apply(contains, document, [element])) return unverifiable;
+      const rawHref = apply(getAttribute, element, ['href']);
+      const download = apply(getAttribute, element, ['download']);
+      const href = apply(anchorHref, element, []);
+      if (typeof rawHref !== 'string' || !rawHref.trim() || rawHref.length > 2_048 ||
+          typeof href !== 'string' || href.length > 2_048 ||
+          (download !== null && (typeof download !== 'string' || download.length > 180))) {
+        return unverifiable;
+      }
+      if (operation === 'confirm') {
+        if (!observed || observed.selector !== selector || observed.element !== element ||
+            observed.rawHref !== rawHref || observed.href !== href ||
+            observed.download !== download) return unverifiable;
+      } else {
+        observed = { selector, element, rawHref, href, download };
+      }
+      const result = apply(create, Object, [null]);
+      result.status = 'ok';
+      result.href = href;
+      result.download = download;
+      return apply(stringify, JSON, [result]);
+    } catch { return unverifiable; }
+  };
+  define(root, key, { value: inspect, enumerable: false, configurable: false, writable: false });
+}
+
+function validateEvalResult(value) {
+  // The pre-document helper transfers a bounded JSON primitive. Validate its
+  // parsed value again with trusted Node intrinsics before returning it.
+  const stack = [[value, 0]];
+  let entries = 0;
+  let stringUnits = 0;
+  while (stack.length) {
+    const [item, depth] = stack.pop();
+    if (++entries > 256 || depth > 8) {
+      const error = new Error('browser_eval result exceeds depth or entry limit');
+      error.code = 'browser_eval_error';
+      throw error;
+    }
+    if (item === null || typeof item === 'boolean') continue;
+    if (typeof item === 'number' && Number.isFinite(item)) continue;
+    if (typeof item === 'string') {
+      stringUnits += item.length;
+      if (stringUnits <= 65536) continue;
+    } else if (Array.isArray(item)) {
+      if (item.length <= 64) {
+        let valid = true;
+        for (let index = 0; index < item.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
+      }
+    } else if (typeof item === 'object') {
+      const keys = Object.keys(item);
+      const prototype = Object.getPrototypeOf(item);
+      if ((prototype === Object.prototype || prototype === null) &&
+          keys.length <= 64 && keys.every(key => key.length <= 256)) {
+        let valid = true;
+        for (const key of keys) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, key);
+          if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            valid = false;
+            break;
+          }
+          stack.push([descriptor.value, depth + 1]);
+        }
+        if (valid) continue;
+      }
+    }
+    const error = new Error('browser_eval result is not JSON-safe or exceeds limits');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  return value;
+}
+
+async function evalInActivePage(args) {
+  checkEvalArgs(args);
+  const tab = requireActiveTab();
+  const page = tab.page;
+  let popupStarted = false;
+  let cdp;
+  const onWindowOpen = () => { popupStarted = true; };
+  const onPopup = () => { popupStarted = true; };
+  const unchanged = () => epoch === args.expected_epoch && activeTabId === tab.id &&
+    !page.isClosed() && page.url() === args.expected_url &&
+    // Playwright can adopt a popup after window.open returns if its destination
+    // response is slow. CDP reports the intent before the new tab is visible.
+    !popupStarted &&
+    // A same-URL reload can keep the old URL/epoch until its slow response
+    // commits. Never return a value from the document being replaced.
+    tab.pendingNavigations.size === 0;
+  if (!unchanged()) throw staleEpochError();
+  let transferred;
+  try {
+    // Playwright's page.evaluate compiles its callback through the page's
+    // mutable window.eval. CDP compiles this fixed call independently while
+    // the protected helper still evaluates the model source in the page realm.
+    cdp = await tab.cdp;
+    if (!cdp) throw new Error('browser_eval page session unavailable');
+    page.on('popup', onPopup);
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (!unchanged()) throw staleEpochError();
+    const expression = `window[${JSON.stringify(EVAL_HELPER_KEY)}](${JSON.stringify(args.code)})`;
+    const reply = await cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    });
+    if (reply.exceptionDetails) throw new Error('browser_eval page helper unavailable');
+    const serialized = reply.result?.value;
+    if (typeof serialized !== 'string' || Buffer.byteLength(serialized, 'utf8') > 75000) {
+      throw new Error('browser_eval transfer exceeds limit');
+    }
+    const evaluated = JSON.parse(serialized);
+    if (evaluated?.ok !== true) throw new Error('browser_eval JavaScript failed');
+    if (evaluated.observed_url !== args.expected_url) throw staleEpochError();
+    // A synchronous location assignment may schedule navigation after eval
+    // resolves. Give Chromium a turn to commit it, then recheck from the host.
+    // A second page.evaluate here would expose its Promise/timeout result to
+    // page-controlled globals before any transfer limit is enforced.
+    await new Promise(resolve => setTimeout(resolve, 25));
+    if (!unchanged()) throw staleEpochError();
+    transferred = evaluated.value;
+  } catch (error) {
+    // Chromium may destroy the execution context before Playwright's frame
+    // navigation event advances our epoch. Never surface that result as a
+    // script exception from the old document.
+    if (error?.code === 'stale_epoch' || !unchanged() ||
+        String(error?.message || error).includes('Execution context was destroyed')) {
+      throw staleEpochError();
+    }
+    const boundedError = new Error(bounded(String(error?.message || error), 2048));
+    boundedError.code = 'browser_eval_error';
+    throw boundedError;
+  } finally {
+    page.off('popup', onPopup);
+    cdp?.off('Page.windowOpen', onWindowOpen);
+  }
+  if (!unchanged()) throw staleEpochError();
+  const value = validateEvalResult(transferred);
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_EVAL_JSON_BYTES) {
+    const error = new Error('browser_eval result exceeds 64 KiB');
+    error.code = 'browser_eval_error';
+    throw error;
+  }
+  if (!unchanged()) throw staleEpochError();
+  return {
+    page_epoch: epoch,
+    active_tab_id: tab.id,
+    url: page.url(),
+    value,
+  };
+}
+
+function requireTabId(raw) {
+  if (typeof raw !== 'string' || !/^[0-9a-f]{24}$/.test(raw)) {
+    const error = new Error('invalid browser tab ID');
+    error.code = 'invalid_request';
+    throw error;
+  }
+  return raw;
+}
+
+function scheduleCapture() {
+  const generation = ++captureGeneration;
+  captureTask = captureTask.catch(() => {}).then(async () => {
+    if (generation !== captureGeneration || shuttingDown || closing) return;
+    if (activeCapture) {
+      const previous = activeCapture;
+      activeCapture = undefined;
+      await previous.page.screencast.stop().catch(() => {});
+    }
+    if (generation !== captureGeneration || shuttingDown || closing) return;
+    const tab = activeTab();
+    if (!tab || tab.page.isClosed()) return;
+    const capture = { page: tab.page, tabId: tab.id, generation };
+    activeCapture = capture;
+    try {
+      await tab.page.screencast.start({
+        quality: 75,
+        size: { width: 1200, height: 1000 },
+        onFrame: ({ data, viewportWidth, viewportHeight }) => {
+          if (captureGeneration !== generation || activeTabId !== tab.id ||
+              activeCapture !== capture || tab.page.isClosed() || shuttingDown || closing) return;
+          const now = Date.now();
+          if (now - lastFrameAt < 100) return;
+          lastFrameAt = now;
+          emit({
+            event: 'frame', active_tab_id: tab.id, page_epoch: epoch,
+            frame_seq: ++frameSeq, viewport_width: viewportWidth,
+            viewport_height: viewportHeight, data: data.toString('base64'),
+          });
+        },
+      });
+    } catch {
+      if (activeCapture === capture) activeCapture = undefined;
+    }
+  });
+}
+
+function advanceEpoch() {
+  epoch++;
+  if (pendingDialog && pendingDialog.pageEpoch !== epoch) {
+    expireDialog(pendingDialog);
+  }
+  lastFrameAt = 0;
+  // Reset the server's cached JPEG before replying with the new active state.
+  emit({ event: 'frame_reset', active_tab_id: activeTabId || null, page_epoch: epoch });
+  // Restarting screencast yields a first current-epoch JPEG even if a hidden
+  // iframe changes without repainting the visible page.
+  void scheduleCapture();
+}
+
+function expireDialog(pending) {
+  if (pendingDialog !== pending || pending.expired) return;
+  pending.expired = true;
+  clearTimeout(pending.timer);
+  void pending.dialog.dismiss().catch(() => {}).finally(() => {
+    if (pendingDialog === pending && (!pending.owner || pending.owner.settled)) {
+      pendingDialog = undefined;
+    }
+  });
+}
+
+function captureDialog(tab, dialog) {
+  if (shuttingDown || closing || pendingDialog ||
+      !['alert', 'confirm', 'prompt'].includes(dialog.type())) {
+    void dialog.dismiss().catch(() => {});
+    return;
+  }
+  const owner = inFlightAction;
+  if (owner) owner.hadDialog = true;
+  const pending = {
+    id: randomBytes(12).toString('hex'),
+    tabId: tab.id,
+    pageEpoch: epoch,
+    url: tab.page.url(),
+    type: dialog.type(),
+    message: dialog.message(),
+    defaultValue: dialog.defaultValue(),
+    dialog,
+    owner,
+    expired: false,
+    expiresAt: Date.now() + DIALOG_TIMEOUT_MS,
+  };
+  pending.timer = setTimeout(() => expireDialog(pending), DIALOG_TIMEOUT_MS);
+  pending.timer.unref();
+  pendingDialog = pending;
+  owner?.notify?.();
+  for (const notify of dialogWaiters) notify();
+}
+
+function targetError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function pointerTimeout(deadlineAt) {
+  if (deadlineAt === undefined) return 10_000;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    throw targetError('navigation_timeout', 'browser pointer action timed out');
+  }
+  return Math.min(10_000, remaining);
+}
+
+function semanticString(target, name, maximum, required = false) {
+  const value = target[name];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== 'string' || !value.trim() || value.length > maximum) {
+    throw targetError('invalid_target', `invalid browser target ${name}`);
+  }
+  return value;
+}
+
+function selectOptionArgs(args) {
+  if (typeof args.selector !== 'string' || !args.selector.trim() ||
+      args.selector.length > 512) {
+    throw targetError('invalid_target', 'browser select requires a bounded CSS selector');
+  }
+  if (!Array.isArray(args.values) || args.values.length < 1 || args.values.length > 16 ||
+      args.values.some(value => typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 512)) {
+    throw targetError('invalid_target', 'browser select requires 1..16 option values of at most 512 bytes each');
+  }
+  return args.values;
+}
+
+function downloadError(code, message) {
+  return targetError(code, message);
+}
+
+function downloadDeadline(promise, deadlineAt) {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(downloadError('download_timeout', 'browser download timed out'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(downloadError('download_timeout', 'browser download timed out')), remaining);
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+async function inspectDownloadLink(cdp, selector, operation, deadlineAt) {
+  const expression = `window[${JSON.stringify(DOWNLOAD_LINK_KEY)}](` +
+    `${JSON.stringify(operation)},${JSON.stringify(DOWNLOAD_LINK_SECRET)},` +
+    `${JSON.stringify(selector)})`;
+  let answer;
+  try {
+    answer = await downloadDeadline(cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    }), deadlineAt);
+  } catch (error) {
+    if (error?.code === 'download_timeout') throw error;
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  if (answer.exceptionDetails || answer.result?.type !== 'string' ||
+      typeof answer.result.value !== 'string' || answer.result.value.length > 4_096) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  let link;
+  try { link = JSON.parse(answer.result.value); } catch { /* Fail closed below. */ }
+  if (link?.status !== 'ok' || typeof link.href !== 'string' || link.href.length > 2_048 ||
+      (link.download !== null && (typeof link.download !== 'string' || link.download.length > 180))) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  return link;
+}
+
+function verifiedDownloadUrl(value, previousUrl) {
+  if (typeof value !== 'string' || !value || value.length > 2_048 || /[\x00-\x1f\x7f]/.test(value)) return null;
+  try {
+    const url = new URL(value, previousUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password ||
+        (previousUrl?.startsWith('https://') && url.protocol !== 'https:')) return null;
+    url.hash = '';
+    return url.href.length <= 2_048 ? url.href : null;
+  } catch { return null; }
+}
+
+function downloadResponseHeader(event, name) {
+  if (!Array.isArray(event.responseHeaders)) return null;
+  const values = event.responseHeaders.filter(header =>
+    header && typeof header.name === 'string' && header.name.toLowerCase() === name);
+  return values.length === 1 && typeof values[0].value === 'string' ? values[0].value : null;
+}
+
+async function observeDownloadRedirects(attempt, cdp, initialUrl, nativeDownloadAttribute, deadlineAt) {
+  let current;
+  let hops = 0;
+  let failed = false;
+  let enabled = true;
+  let disablePromise;
+  const pending = new Set();
+  const reject = () => {
+    failed = true;
+    attempt.verifiedFinalUrl = null;
+    attempt.resolveUnverifiable();
+  };
+  const disable = until => {
+    if (!enabled) return Promise.resolve();
+    if (!disablePromise) {
+      cdp.off('Fetch.requestPaused', onPaused);
+      disablePromise = cdp.send('Fetch.disable').then(() => { enabled = false; });
+    }
+    return downloadDeadline(disablePromise, until);
+  };
+  const onPaused = event => {
+    const requestUrl = verifiedDownloadUrl(event.request?.url);
+    const responseStage = Number.isInteger(event.responseStatusCode);
+    let finalResponse = false;
+    if (failed || !attempt.accepting || event.frameId !== attempt.frameId ||
+        event.resourceType !== 'Document' || event.request?.method !== 'GET' || !requestUrl) {
+      reject();
+    } else if (!responseStage) {
+      if (!current) {
+        if (event.redirectedRequestId || requestUrl !== initialUrl) reject();
+      } else if (!current.redirectUrl || event.redirectedRequestId !== current.id ||
+                 requestUrl !== current.redirectUrl) {
+        reject();
+      }
+      if (!failed) current = { id: event.requestId, url: requestUrl, responseSeen: false };
+    } else if (!current || current.id !== event.requestId || current.url !== requestUrl ||
+               current.responseSeen) {
+      reject();
+    } else {
+      current.responseSeen = true;
+      const status = event.responseStatusCode;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const next = verifiedDownloadUrl(downloadResponseHeader(event, 'location'), current.url);
+        if (!next || ++hops > 5) reject();
+        else current.redirectUrl = next;
+      } else {
+        const type = downloadResponseHeader(event, 'content-type');
+        const disposition = downloadResponseHeader(event, 'content-disposition');
+        const refresh = Array.isArray(event.responseHeaders) && event.responseHeaders.some(header =>
+          typeof header?.name === 'string' && header.name.toLowerCase() === 'refresh');
+        // Keep all terminal documents paused until their headers prove they
+        // cannot render HTML or load resources in the private page. Redirects
+        // receive no exception to the direct-download policy.
+        const nativeDownload = /^\s*attachment\s*(?:;|$)/i.test(disposition || '') ||
+          (nativeDownloadAttribute && new URL(current.url).origin === new URL(initialUrl).origin) ||
+          /^\s*application\/octet-stream\s*(?:;|$)/i.test(type || '');
+        if (![200, 206].includes(status) || refresh || !type ||
+            /^\s*(?:text\/html|application\/xhtml\+xml)\s*(?:;|$)/i.test(type) ||
+            !nativeDownload || attempt.verifiedFinalUrl) {
+          reject();
+        } else {
+          attempt.verifiedFinalUrl = current.url;
+          finalResponse = true;
+        }
+      }
+    }
+    const method = failed ? 'Fetch.failRequest' :
+      responseStage ? 'Fetch.continueResponse' : 'Fetch.continueRequest';
+    const params = method === 'Fetch.failRequest'
+      ? { requestId: event.requestId, errorReason: 'BlockedByClient' }
+      : { requestId: event.requestId };
+    const continuation = downloadDeadline(cdp.send(method, params), deadlineAt)
+      .then(async () => {
+        if (finalResponse && !failed) {
+          await disable(deadlineAt);
+          attempt.resolveVerified();
+        }
+      })
+      .catch(reject).finally(() => pending.delete(continuation));
+    pending.add(continuation);
+  };
+  cdp.on('Fetch.requestPaused', onPaused);
+  try {
+    await downloadDeadline(cdp.send('Fetch.enable', { patterns: [
+      { urlPattern: '*', requestStage: 'Request' },
+      { urlPattern: '*', requestStage: 'Response' },
+    ] }), deadlineAt);
+  } catch (error) {
+    cdp.off('Fetch.requestPaused', onPaused);
+    throw error;
+  }
+  return async cleanupDeadlineAt => {
+    cdp.off('Fetch.requestPaused', onPaused);
+    // Closing the private target tears down its Fetch domain. Sending
+    // Fetch.disable afterward fails because the CDP session is detached.
+    if (attempt.page?.isClosed()) return;
+    await disable(cleanupDeadlineAt);
+    await downloadDeadline(Promise.all(pending), cleanupDeadlineAt);
+  };
+}
+
+async function createTransientDownloadPage(deadlineAt) {
+  // Hold page events until the private newPage identity is known.
+  const creation = { observed: [], page: null };
+  transientPageCreation = creation;
+  const pending = Promise.resolve().then(async () => {
+    const page = await context.newPage();
+    if (TEST_PRIVATE_PAGE_FAILURE === 'reject') throw new Error('private page setup failed');
+    if (TEST_PRIVATE_PAGE_FAILURE === 'timeout') await new Promise(resolve => setTimeout(resolve, 6_000));
+    return page;
+  });
+  let failed = false;
+  try {
+    creation.page = await downloadDeadline(pending, deadlineAt);
+    transientPages.add(creation.page);
+    return creation.page;
+  } catch (error) {
+    // An emitted page without proven identity must never enter shared tabs.
+    failed = true;
+    shuttingDown = true;
+    retireAfterReply = true;
+    void pending.then(page => page.close().catch(() => {})).catch(() => {});
+    throw error;
+  } finally {
+    transientPageCreation = undefined;
+    for (const page of creation.observed) {
+      if (failed) void page.close().catch(() => {});
+      else if (page !== creation.page) adoptPage(page);
+    }
+  }
+}
+
+function escapeHtmlAttribute(value) {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function cleanDownloadFilename(value) {
+  const basename = path.posix.basename(String(value || '').slice(0, 1024).replace(/\\/g, '/'))
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .trim();
+  if (!basename || basename === '.' || basename === '..') return 'download.bin';
+  let cleaned = '';
+  for (const character of basename) {
+    if (Buffer.byteLength(cleaned + character, 'utf8') > 180) break;
+    cleaned += character;
+  }
+  return cleaned || 'download.bin';
+}
+
+function cancelDownloadGuid(guid) {
+  return downloadCdp?.send('Browser.cancelDownload', {
+    guid, browserContextId: downloadContextId,
+  }).catch(() => {});
+}
+
+async function removeDownloadArtifacts(guid) {
+  // allowAndName uses the CDP guid for both the final file and its partial
+  // .crdownload file. Never use a browser-supplied path or suggested filename.
+  if (!downloadDir || !/^[a-zA-Z0-9_-]{1,128}$/.test(guid)) return;
+  await Promise.all([
+    fs.rm(path.join(downloadDir, guid), { force: true }),
+    fs.rm(path.join(downloadDir, `${guid}.crdownload`), { force: true }),
+  ]);
+}
+
+async function clearDownloadDirectory() {
+  if (!downloadDir) return;
+  const entries = await fs.readdir(downloadDir).catch(error => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  await Promise.all(entries.map(name => fs.rm(path.join(downloadDir, name), { recursive: true, force: true })));
+}
+
+async function settleDownloadDirectory(deadlineAt) {
+  // Chromium can recreate a .crdownload shortly after reporting cancellation.
+  // Do not return a reusable host until its private directory stays empty.
+  let emptySince = 0;
+  while (true) {
+    const entries = await downloadDeadline(fs.readdir(downloadDir), deadlineAt);
+    if (entries.length) {
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      emptySince = 0;
+    } else if (emptySince && Date.now() - emptySince >= 100) {
+      return;
+    } else if (!emptySince) {
+      emptySince = Date.now();
+    }
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), deadlineAt);
+  }
+}
+
+function sweepOrphanDownloads() {
+  const sweep = downloadSweep.then(async () => {
+    if (!activeDownloadAttempt) await clearDownloadDirectory();
+  });
+  downloadSweep = sweep.catch(() => {});
+  return sweep;
+}
+
+function onDownloadWillBegin(event) {
+  const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && event.frameId === attempt.frameId &&
+      event.url !== attempt.verifiedFinalUrl) {
+    attempt.resolveUnverifiable();
+  }
+  if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId ||
+      event.url !== attempt.verifiedFinalUrl) {
+    cancelDownloadGuid(event.guid);
+    return;
+  }
+  attempt.guid = event.guid;
+  attempt.resolveGuid(event.guid);
+}
+
+function onDownloadProgress(event) {
+  const attempt = activeDownloadAttempt;
+  if (!attempt || event.guid !== attempt.guid) {
+    if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
+    else void removeDownloadArtifacts(event.guid).catch(() => {});
+    return;
+  }
+  if (event.state !== 'inProgress') {
+    attempt.terminal = true;
+    attempt.resolveTerminal();
+  }
+  if (event.receivedBytes > MAX_DOWNLOAD_BYTES) {
+    attempt.oversized = true;
+    cancelDownloadGuid(event.guid);
+    if (attempt.download) void attempt.download.cancel().catch(() => {});
+  }
+}
+
+function onPageDownload(page, download) {
+  const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && attempt.page === page && download.url() !== attempt.verifiedFinalUrl) {
+    attempt.resolveUnverifiable();
+  }
+  if (!attempt?.accepting || attempt.page !== page || attempt.download ||
+      download.url() !== attempt.verifiedFinalUrl) {
+    const cleanup = download.cancel().catch(() => {})
+      .then(() => download.delete().catch(() => {}));
+    orphanDownloads.add(cleanup);
+    void cleanup.finally(() => {
+      orphanDownloads.delete(cleanup);
+      void sweepOrphanDownloads().catch(() => {
+        // This directory contains only this host's browser downloads. A
+        // failed sweep must not leave unapproved bytes in a reusable session.
+        shuttingDown = true;
+        void closeHost().finally(() => process.exit(1));
+      });
+    });
+    return;
+  }
+  attempt.download = download;
+  attempt.resolveDownload(download);
+  if (attempt.oversized) void download.cancel().catch(() => {});
+}
+
+async function boundedDownload(args) {
+  const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+  // The 20-second action budget includes cancellation and artifact removal.
+  // Reserve its last slice for cleanup even when the transfer never settles.
+  const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
+  const workDeadlineAt = deadlineAt - cleanupBudget;
+  const cancelDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 2);
+  const terminalDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 4);
+  checkEpoch(args);
+  if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
+    throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
+  }
+  await downloadDeadline(downloadSweep, workDeadlineAt);
+  const tab = requireActiveTab();
+  const cdp = await downloadDeadline(tab.cdp, workDeadlineAt);
+  if (!cdp || !downloadCdp) {
+    throw downloadError('download_failed', 'browser download observer unavailable');
+  }
+  checkEpoch(args);
+  let resolveDownload;
+  let resolveGuid;
+  let resolveTerminal;
+  let resolveUnverifiable;
+  let resolveVerified;
+  let scriptsDisabled = false;
+  let transientPage;
+  let closeGuard;
+  const attempt = {
+    page: null,
+    frameId: null,
+    accepting: false,
+    download: null,
+    guid: null,
+    verifiedFinalUrl: null,
+    oversized: false,
+    terminal: false,
+    downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
+    guidPromise: new Promise(resolve => { resolveGuid = resolve; }),
+    terminalPromise: new Promise(resolve => { resolveTerminal = resolve; }),
+    unverifiablePromise: new Promise(resolve => { resolveUnverifiable = resolve; }),
+    verifiedPromise: new Promise(resolve => { resolveVerified = resolve; }),
+    resolveDownload: download => resolveDownload(download),
+    resolveGuid: guid => resolveGuid(guid),
+    resolveTerminal: () => resolveTerminal(),
+    resolveUnverifiable: () => resolveUnverifiable(),
+    resolveVerified: () => resolveVerified(),
+  };
+  activeDownloadAttempt = attempt;
+  try {
+    // Freeze page timers and handlers before resolving the selected link.
+    // Otherwise a getter invoked during target inspection could schedule a
+    // same-URL download in the gap before the native click.
+    scriptsDisabled = true;
+    await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+      workDeadlineAt);
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
+    const link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    await downloadDeadline(withPinnedTarget(args, async handle => {
+      checkEpoch(args);
+      if (await handle.ownerFrame() !== tab.page.mainFrame()) {
+        throw downloadError('download_unverifiable',
+          'browser download requires a link in the main page');
+      }
+      // The pinned ElementHandle must be the inspector's exact DOM node. Its
+      // evaluate result is used only for identity, after the helper checked
+      // that page eval is pristine; href bytes still come solely from CDP.
+      let pinnedMatch;
+      try {
+        pinnedMatch = await downloadDeadline(handle.evaluate((element, identity) =>
+          window[identity.key]('matches', identity.secret, element), {
+          key: DOWNLOAD_LINK_KEY, secret: DOWNLOAD_LINK_SECRET,
+        }), workDeadlineAt);
+      } catch (error) {
+        if (error?.code === 'download_timeout') throw error;
+      }
+      if (pinnedMatch !== '{"status":"matched"}') {
+        throw downloadError('download_unverifiable',
+          'browser download target changed before trial click');
+      }
+      try {
+        // Verify the selected element could receive a native click, without
+        // running its handlers or starting the download in the shared page.
+        await handle.click({ trial: true,
+          timeout: Math.min(1_500, pointerTimeout(workDeadlineAt)) });
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires an actionable link');
+      }
+      checkEpoch(args);
+      // The helper pins the unique DOM element and compares it after the
+      // trial click, so a replaced selector cannot authorize another href.
+      const confirmed = await inspectDownloadLink(cdp, args.selector, 'confirm', workDeadlineAt);
+      if (confirmed.href !== link.href || confirmed.download !== link.download) {
+        throw downloadError('download_unverifiable', 'browser download selected link changed');
+      }
+      let href;
+      try {
+        const resolved = new URL(link.href);
+        // Fragments never reach the HTTP request or Chromium's download URL.
+        resolved.hash = '';
+        href = resolved.href;
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      if (typeof href !== 'string' || href.length > 2_048 ||
+          !(href.startsWith('http://') || href.startsWith('https://'))) {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      try {
+        checkUrl(href);
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      // Download requests lack reliable Network events; use a private frame ID.
+      const sharedUrl = tab.page.url();
+      if (sharedUrl === 'about:blank') throw downloadError('download_unverifiable',
+        'browser download requires an HTTP(S) page');
+      let documentUrl;
+      try {
+        documentUrl = new URL(checkUrl(sharedUrl));
+        documentUrl.hash = '';
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires an HTTP(S) page');
+      }
+      const sourceResponse = tab.mainDocumentResponse;
+      if (!sourceResponse || tab.mainDocumentUrl !== documentUrl.href) throw downloadError(
+        'download_unverifiable', 'browser download cannot verify the source page policy');
+      const sourceHeaders = await downloadDeadline(sourceResponse.headersArray(), workDeadlineAt).catch(() => null);
+      if (!sourceHeaders || sourceHeaders.some(header =>
+        header.name.toLowerCase() === 'content-security-policy' &&
+        header.value.split(/[;,]/).some(policyDirective =>
+          policyDirective.trim().split(/\s+/, 1)[0].toLowerCase() === 'sandbox'))) {
+        throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+      }
+      transientPage = await createTransientDownloadPage(workDeadlineAt);
+      transientPage.on('download', download => onPageDownload(transientPage, download));
+      transientPage.on('framenavigated', frame => {
+        if (attempt.accepting && frame === transientPage.mainFrame()) {
+          attempt.resolveUnverifiable();
+        }
+      });
+      const privateCdp = await downloadDeadline(context.newCDPSession(transientPage), workDeadlineAt);
+      await downloadDeadline(privateCdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+        workDeadlineAt);
+      const downloadAttribute = link.download === null ? '' : ` download="${escapeHtmlAttribute(link.download)}"`;
+      const html = `<a id="bamboo-download" href="${escapeHtmlAttribute(href)}"${downloadAttribute}>Download</a>`;
+      await downloadDeadline(transientPage.route(url => url.href === documentUrl.href,
+        route => route.fulfill({
+          status: 200, contentType: 'text/html',
+          headers: { 'content-security-policy': "default-src 'none'; script-src 'none'; object-src 'none'",
+            'referrer-policy': 'no-referrer' },
+          body: html,
+        }), { times: 1 }), workDeadlineAt);
+      await downloadDeadline(transientPage.goto(documentUrl.href, {
+        waitUntil: 'domcontentloaded', timeout: pointerTimeout(workDeadlineAt),
+      }), workDeadlineAt);
+      await downloadDeadline(transientPage.route('**/*', route => {
+        const request = route.request();
+        let mainNavigation = false;
+        try {
+          mainNavigation = request.isNavigationRequest() &&
+            request.frame() === transientPage.mainFrame();
+        } catch { /* Unknown provenance is blocked. */ }
+        if (mainNavigation) {
+          return route.continue();
+        }
+        return route.abort('blockedbyclient');
+      }), workDeadlineAt);
+      const frameTree = await downloadDeadline(privateCdp.send('Page.getFrameTree'), workDeadlineAt);
+      attempt.page = transientPage;
+      attempt.frameId = frameTree.frameTree.frame.id;
+      if (verifiedDownloadUrl(href) !== href) {
+        throw downloadError('download_unverifiable', 'browser download requires a safe HTTP(S) link');
+      }
+      closeGuard = await observeDownloadRedirects(attempt, privateCdp, href,
+        link.download !== null && documentUrl.origin === new URL(href).origin, workDeadlineAt);
+      checkEpoch(args);
+      if (activeTabId !== tab.id || tab.page.url() !== sharedUrl) throw staleEpochError();
+      if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),
+          workDeadlineAt);
+      }
+      attempt.accepting = true;
+      await transientPage.locator('#bamboo-download').click({
+        timeout: pointerTimeout(workDeadlineAt), noWaitAfter: true,
+      });
+    }, workDeadlineAt), workDeadlineAt);
+    const accepted = await downloadDeadline(Promise.race([
+      Promise.all([attempt.downloadPromise, attempt.guidPromise, attempt.verifiedPromise])
+        .then(([download]) => ({ download })),
+      attempt.unverifiablePromise.then(() => ({ unverifiable: true })),
+    ]), workDeadlineAt);
+    if (accepted.unverifiable) {
+      throw downloadError('download_unverifiable',
+        'browser download redirect cannot be verified');
+    }
+    const { download } = accepted;
+    if (attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    let artifact;
+    try {
+      artifact = await downloadDeadline(download.path(), workDeadlineAt);
+    } catch (error) {
+      if (attempt.oversized) {
+        throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+      }
+      if (error?.code === 'download_timeout') throw error;
+      throw downloadError('download_failed', 'browser download failed');
+    }
+    const size = await downloadDeadline(fs.stat(artifact), workDeadlineAt);
+    if (size.size > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    const bytes = await downloadDeadline(fs.readFile(artifact), workDeadlineAt);
+    if (bytes.length > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    checkEpoch(args);
+    if (activeTabId !== tab.id || tab.page.isClosed()) throw staleEpochError();
+    const current = await downloadDeadline(state(), workDeadlineAt);
+    checkEpoch(args);
+    if (current.active_tab_id !== tab.id) throw staleEpochError();
+    return {
+      page_epoch: current.page_epoch,
+      active_tab_id: current.active_tab_id,
+      url: current.url,
+      filename: cleanDownloadFilename(download.suggestedFilename()),
+      byte_count: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      data_base64: bytes.toString('base64'),
+    };
+  } catch (error) {
+    if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
+      'download_timeout', 'download_too_large', 'download_failed',
+      'download_unverifiable'].includes(error?.code)) {
+      throw error;
+    }
+    // Playwright errors can quote a selected URL or filename. Never forward
+    // them through the host's generic error envelope.
+    throw downloadError('download_failed', 'browser download failed');
+  } finally {
+    attempt.accepting = false;
+    let cleanupError;
+    if (scriptsDisabled) {
+      try {
+        await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: false }),
+          cancelDeadlineAt);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    const cancellation = [];
+    if (attempt.guid && !attempt.terminal) cancellation.push(cancelDownloadGuid(attempt.guid));
+    if (attempt.download && !attempt.terminal) cancellation.push(attempt.download.cancel().catch(() => {}));
+    try {
+      if (TEST_DOWNLOAD_CLEANUP_DELAY_MS && attempt.guid) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLEANUP_DELAY_MS)),
+          cancelDeadlineAt);
+      }
+      await downloadDeadline(Promise.all(cancellation), cancelDeadlineAt);
+      if (attempt.guid && !attempt.terminal) {
+        await downloadDeadline(attempt.terminalPromise, terminalDeadlineAt);
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (attempt.download) {
+      try {
+        await downloadDeadline(attempt.download.delete().catch(() => {}), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (attempt.guid) {
+      try {
+        await downloadDeadline(removeDownloadArtifacts(attempt.guid), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (transientPage) {
+      try {
+        await downloadDeadline(transientPage.close(), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (closeGuard) {
+      try {
+        await closeGuard(deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
+    try {
+      await downloadDeadline(Promise.all([...orphanDownloads]), deadlineAt);
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      await settleDownloadDirectory(deadlineAt);
+    } catch (error) {
+      cleanupError ||= error;
+    }
+    if (cleanupError) {
+      // A nonterminal transfer can recreate a partial file after cleanup.
+      // Retire the host; Rust owns and removes its per-session TMPDIR on exit.
+      shuttingDown = true;
+      retireAfterReply = true;
+      throw downloadError(cleanupError.code === 'download_timeout' ? 'download_timeout' : 'download_failed',
+        'browser download cleanup failed');
+    }
+  }
+}
+
+function fileInputArgs(args) {
+  const invalid = () => targetError('invalid_request', 'invalid browser in-memory file input');
+  if (!args || typeof args !== 'object' || Array.isArray(args) ||
+      Object.keys(args).some(key => !['selector', 'filename', 'mime_type', 'data_base64', 'expected_epoch'].includes(key))) {
+    throw invalid();
+  }
+  const { selector, filename, mime_type: mimeType, data_base64: dataBase64 } = args;
+  if (typeof selector !== 'string' || !selector.trim() || selector.length > 512 ||
+      typeof filename !== 'string' || !filename.trim() || filename.length > 128 ||
+      filename === '.' || filename === '..' || /[\p{Cc}/\\:]/u.test(filename) ||
+      typeof mimeType !== 'string' || mimeType.length > 128 ||
+      !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType) ||
+      typeof dataBase64 !== 'string' || dataBase64.length > 1398104 ||
+      dataBase64.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(dataBase64)) {
+    throw invalid();
+  }
+  const buffer = Buffer.from(dataBase64, 'base64');
+  if (buffer.length > 1024 * 1024 || buffer.toString('base64') !== dataBase64) throw invalid();
+  return { name: filename, mimeType, buffer };
+}
+
+async function waitForTarget(locator, missingMessage, deadlineAt) {
+  try {
+    await locator.first().waitFor({ state: 'attached', timeout: pointerTimeout(deadlineAt) });
+  } catch (error) {
+    if (error.name !== 'TimeoutError') throw error;
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
+    throw targetError('target_not_found', missingMessage);
+  }
+}
+
+async function targetLocator(args, page, deadlineAt) {
+  let locator;
+  if (args.target === undefined) {
+    if (typeof args.selector !== 'string' || !args.selector.trim()) {
+      throw targetError('invalid_target', 'browser action requires a selector or target');
+    }
+    locator = page.locator(args.selector);
+  } else {
+    if (args.selector !== undefined && args.selector !== null) {
+      throw targetError('invalid_target', 'selector and target are mutually exclusive');
+    }
+    const target = args.target;
+    if (!target || typeof target !== 'object' || Array.isArray(target)) {
+      throw targetError('invalid_target', 'invalid browser semantic target');
+    }
+    const kind = target.kind;
+    const allowed = kind === 'role'
+      ? ['kind', 'role', 'name', 'exact', 'frame_selector']
+      : kind === 'label' || kind === 'text'
+        ? ['kind', 'value', 'exact', 'frame_selector']
+        : null;
+    if (!allowed || Object.keys(target).some(key => !allowed.includes(key)) ||
+        (target.exact !== undefined && typeof target.exact !== 'boolean')) {
+      throw targetError('invalid_target', 'invalid browser semantic target');
+    }
+    const frameSelector = semanticString(target, 'frame_selector', 512);
+    let scope = page;
+    if (frameSelector) {
+      const owner = page.frameLocator(frameSelector).owner();
+      await waitForTarget(owner, 'browser target iframe not found', deadlineAt);
+      const count = await owner.count();
+      if (count === 0) throw targetError('target_not_found', 'browser target iframe not found');
+      if (count !== 1) {
+        throw targetError('ambiguous_target', `browser target iframe matched ${count} elements`);
+      }
+      scope = page.frameLocator(frameSelector);
+    }
+    const exact = target.exact ?? true;
+    if (kind === 'role') {
+      const role = semanticString(target, 'role', 64, true);
+      if (!/^[a-z-]+$/.test(role)) {
+        throw targetError('invalid_target', 'invalid browser target role');
+      }
+      const name = semanticString(target, 'name', 256);
+      locator = scope.getByRole(role, name === undefined ? {} : { name, exact });
+    } else {
+      const value = semanticString(target, 'value', 256, true);
+      locator = kind === 'label'
+        ? scope.getByLabel(value, { exact })
+        : scope.getByText(value, { exact });
+    }
+  }
+  await waitForTarget(locator, 'browser target not found', deadlineAt);
+  const count = await locator.count();
+  if (count === 0) throw targetError('target_not_found', 'browser target not found');
+  if (count !== 1) {
+    throw targetError('ambiguous_target', `browser target matched ${count} elements`);
+  }
+  return locator;
+}
+
+async function withPinnedTarget(args, act, deadlineAt) {
+  const page = requireActiveTab().page;
+  const locator = await targetLocator(args, page, deadlineAt);
+  checkEpoch(args);
+  // A Locator may re-resolve after navigation while waiting for an old
+  // disabled element. An ElementHandle stays bound to its document.
+  const handle = await locator.elementHandle({ timeout: pointerTimeout(deadlineAt) });
+  if (!handle) throw targetError('target_not_found', 'browser target not found');
+  try {
+    const count = await locator.count();
+    if (count !== 1) {
+      throw targetError(
+        count === 0 ? 'target_not_found' : 'ambiguous_target',
+        `browser target matched ${count} elements`,
+      );
+    }
+    checkEpoch(args);
+    return await act(handle);
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+}
+
+function pointerPoint(args, xName, yName, page) {
+  const viewport = page.viewportSize();
+  const x = args[xName];
+  const y = args[yName];
+  if (!Number.isFinite(x) || !Number.isFinite(y) ||
+      x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+    throw targetError('invalid_request', 'browser pointer coordinate is outside the viewport');
+  }
+  return { x, y };
+}
+
+function pointerSelector(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 512) {
+    throw targetError('invalid_request', 'invalid browser pointer selector');
+  }
+  return value;
+}
+
+function pointerButton(value) {
+  const button = value ?? 'left';
+  if (!['left', 'right', 'middle'].includes(button)) {
+    throw targetError('invalid_request', 'invalid browser pointer button');
+  }
+  return button;
+}
+
+async function assertDragPoint(handle, point, deadlineAt, trial) {
+  const hitsTarget = () => handle.evaluate((element, { x, y }) => {
+    let hit = element.ownerDocument.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    for (let node = hit; node; node = node.parentNode ?? node.getRootNode()?.host) {
+      if (node === element) return true;
+    }
+    return false;
+  }, point);
+  pointerTimeout(deadlineAt);
+  try {
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+    // Trial performs Playwright's receives-events checks before mouse-down.
+    // During an active drag, use the exact hit test without altering mouse state.
+    if (trial) await handle.click({ trial: true, scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+    if (!await hitsTarget()) throw new Error('pointer intercepted');
+  } catch {
+    throw targetError('target_not_actionable', 'browser drag target is obscured or detached');
+  }
+}
+
+function navigationResponseKind(response) {
+  const status = response.status();
+  if ([301, 302, 303, 307, 308].includes(status)) return 'redirect';
+  if (status === 204 || status === 205 ||
+      /^\s*attachment(?:\s*;|\s*$)/i.test(response.headers()['content-disposition'] ?? '')) {
+    return 'no_document';
+  }
+  return null;
+}
+
+async function observeActionNavigation(page, deadlineAt) {
+  let started = false;
+  let committed = false;
+  let failed = false;
+  const pendingRequests = new Map();
+  let revision = 0;
+  let observedPage = page;
+  let blankPopupExpected = false;
+  let pendingPopupOpens = 0;
+  const listeners = [];
+  let cdp;
+  const onWindowOpen = event => {
+    // Playwright's popup/page events can be delayed until a slow destination
+    // response starts. CDP reports window.open at the triggering gesture.
+    started = true;
+    committed = false;
+    failed = false;
+    pendingRequests.clear();
+    blankPopupExpected = !event.url || event.url === 'about:blank';
+    pendingPopupOpens++;
+    revision++;
+  };
+  const watch = (target, popup = false) => {
+    if (listeners.some(item => item.page === target)) return;
+    if (popup) {
+      // adoptPage activates popups before their navigation commits. An initial
+      // about:blank page is not the destination of window.open(url).
+      observedPage = target;
+      started = true;
+      committed = target.url() !== 'about:blank' || blankPopupExpected;
+      failed = false;
+      pendingRequests.clear();
+      revision++;
+    }
+    const onRequest = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !request.isNavigationRequest()) return;
+      started = true;
+      committed = false;
+      failed = false;
+      let frame = null;
+      try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+      const redirectedFrom = request.redirectedFrom();
+      if (redirectedFrom) pendingRequests.delete(redirectedFrom);
+      pendingRequests.set(request, frame);
+      revision++;
+    };
+    const onFailed = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !pendingRequests.has(request)) return;
+      const frame = pendingRequests.get(request);
+      pendingRequests.delete(request);
+      // A newer request for the same frame supersedes this failure.
+      if (![...pendingRequests.values()].includes(frame)) failed = true;
+      revision++;
+    };
+    const onFinished = request => {
+      if (target !== observedPage || (target === page && pendingPopupOpens) ||
+          !pendingRequests.has(request)) return;
+      // A redirect remains pending until its successor request arrives. A
+      // 204/205/download has no document commit, so it completes here.
+      const kind = tabByPage.get(target)?.navigationResponses.get(request);
+      if (kind === 'redirect' || (pendingRequests.get(request) !== null && kind !== 'no_document')) return;
+      pendingRequests.delete(request);
+      committed = pendingRequests.size === 0;
+      revision++;
+    };
+    const onFrame = frame => {
+      if (target !== observedPage) return;
+      if (target === page && pendingPopupOpens) return;
+      if (target !== page && frame === target.mainFrame() &&
+          frame.url() === 'about:blank' && !blankPopupExpected) return;
+      for (const [request, requestedFrame] of pendingRequests) {
+        if (requestedFrame === frame) pendingRequests.delete(request);
+      }
+      started = true;
+      committed = pendingRequests.size === 0;
+      revision++;
+    };
+    const onClose = () => {
+      if (target !== observedPage || (target === page && pendingPopupOpens)) return;
+      failed = true;
+      revision++;
+    };
+    target.on('request', onRequest);
+    target.on('requestfailed', onFailed);
+    target.on('requestfinished', onFinished);
+    target.on('framenavigated', onFrame);
+    target.on('close', onClose);
+    listeners.push({ page: target, onRequest, onFailed, onFinished, onFrame, onClose });
+    // Adopted pages track navigation requests from their creation. A slow
+    // request may already be in flight before this action subscribes.
+    const inFlight = tabByPage.get(target)?.pendingNavigations;
+    if (inFlight?.size) {
+      for (const [request, frame] of inFlight) pendingRequests.set(request, frame);
+      started = true;
+      committed = false;
+      revision++;
+    }
+  };
+  const onPopup = target => {
+    if (pendingPopupOpens) pendingPopupOpens--;
+    watch(target, true);
+  };
+  const dispose = () => {
+    cdp?.off('Page.windowOpen', onWindowOpen);
+    page.off('popup', onPopup);
+    for (const { page: target, onRequest, onFailed, onFinished, onFrame, onClose } of listeners) {
+      target.off('request', onRequest);
+      target.off('requestfailed', onFailed);
+      target.off('requestfinished', onFinished);
+      target.off('framenavigated', onFrame);
+      target.off('close', onClose);
+    }
+  };
+  // A navigation request can start before CDP setup finishes while the old
+  // document still owns the epoch. Observe Playwright events first so a
+  // pointer action cannot run into that in-flight navigation.
+  watch(page);
+  page.on('popup', onPopup);
+  try {
+    cdp = await tabByPage.get(page)?.cdp;
+    if (!cdp) throw targetError('browser_error', 'browser page navigation observer unavailable');
+    cdp.on('Page.windowOpen', onWindowOpen);
+    await cdp.send('Page.enable');
+    if (TEST_OBSERVER_SETUP_DELAY_MS) {
+      emit({ event: 'test_observer_setup_waiting' });
+      await new Promise(resolve => setTimeout(resolve, TEST_OBSERVER_SETUP_DELAY_MS));
+    }
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+  return {
+    get started() { return started; },
+    async finish() {
+      // A newly committed document can immediately request another navigation.
+      // Each request invalidates the prior commit; return only after the latest
+      // request commits and navigation events have settled for one short turn.
+      const deadline = Math.min(deadlineAt ?? Infinity, Date.now() + 20_000);
+      if (Date.now() >= deadline) {
+        throw targetError('navigation_timeout', 'browser pointer action timed out');
+      }
+      let observedRevision = revision;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        if (observedRevision !== revision) {
+          observedRevision = revision;
+          continue;
+        }
+        if (failed) break;
+        if (!pendingPopupOpens && (!started || committed)) return;
+      }
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) pointerTimeout(deadlineAt);
+      if (!failed && (pendingPopupOpens || (started && !committed))) {
+        throw targetError('navigation_timeout', 'browser navigation did not complete');
+      }
+      if (failed) throw targetError('navigation_failed', 'browser navigation failed');
+    },
+    dispose,
+  };
+}
+
+async function hoverWithNavigation(page, expectedEpoch, hover, deadlineAt) {
+  pointerTimeout(deadlineAt);
+  const navigation = await observeActionNavigation(page, deadlineAt);
+  try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
+    if (!navigation.started) {
+      try { await hover(navigation); } catch (error) {
+        if (!navigation.started && expectedEpoch === epoch) throw error;
+      }
+    }
+    await navigation.finish();
+  } finally {
+    navigation.dispose();
+  }
+}
+
+async function dragBetween(page, source, destination, expectedEpoch, button = 'left', deadlineAt, existingNavigation, validateTarget) {
+  if (expectedEpoch !== epoch) throw staleEpochError();
+  pointerTimeout(deadlineAt);
+  const navigation = existingNavigation ?? await observeActionNavigation(page, deadlineAt);
+  const ownsNavigation = !existingNavigation;
+  const interrupted = () => expectedEpoch !== epoch || navigation.started;
+  let downAttempted = false;
+  let safeDrop = false;
+  let failure;
+  try {
+    if (expectedEpoch !== epoch) throw staleEpochError();
+    if (!navigation.started) {
+      try {
+        if (validateTarget) await validateTarget('source', source);
+        pointerTimeout(deadlineAt);
+        await page.mouse.move(source.x, source.y);
+        if (!interrupted()) {
+          if (validateTarget) await validateTarget('source', source);
+          pointerTimeout(deadlineAt);
+          downAttempted = true;
+          await page.mouse.down({ button });
+          let current = source;
+          if (!interrupted() && typeof destination === 'function') {
+            const viewport = page.viewportSize();
+            current = {
+              x: source.x + (source.x + 8 < viewport.width ? 8 : -8),
+              y: source.y + (source.y + 8 < viewport.height ? 8 : -8),
+            };
+            pointerTimeout(deadlineAt);
+            await page.mouse.move(current.x, current.y);
+            if (!interrupted()) destination = await destination();
+          }
+          if (!interrupted()) {
+            if (validateTarget) await validateTarget('destination', destination);
+            for (let step = 1; step <= 12; step++) {
+              if (interrupted()) break;
+              pointerTimeout(deadlineAt);
+              await page.mouse.move(
+                current.x + (destination.x - current.x) * step / 12,
+                current.y + (destination.y - current.y) * step / 12,
+              );
+            }
+            if (!interrupted()) {
+              if (validateTarget) await validateTarget('destination', destination);
+              safeDrop = true;
+            }
+          }
+        }
+      } catch (error) {
+        if (!interrupted()) failure = error;
+      } finally {
+        if (downAttempted) {
+          // Clear button state without finishing a rejected gesture over an
+          // unrelated overlay or on a new page.
+          if (interrupted() || !safeDrop) await page.mouse.move(-1, -1).catch(() => {});
+          await page.mouse.up({ button }).catch(() => {});
+        }
+      }
+    }
+    if (ownsNavigation) await navigation.finish();
+    if (failure) throw failure;
+  } finally {
+    if (ownsNavigation) navigation.dispose();
+  }
+}
+
+function activateTab(tab) {
+  if (activeTabId === tab.id) return;
+  activeTabId = tab.id;
+  advanceEpoch();
+}
+
+function adoptPage(target) {
+  if (shuttingDown) {
+    void target.close().catch(() => {});
+    return null;
+  }
+  const existing = tabByPage.get(target);
+  if (existing) return existing;
+  if (tabs.length >= MAX_TABS) {
+    void target.close().catch(() => {});
+    return null;
+  }
+  const tab = {
+    id: randomBytes(12).toString('hex'),
+    page: target,
+    cdp: context.newCDPSession(target).catch(() => null),
+    title: '',
+    pendingNavigations: new Map(),
+    navigationResponses: new WeakMap(),
+    pendingDocumentResponse: null,
+    mainDocumentResponse: null,
+    mainDocumentUrl: null,
+  };
+  tabs.push(tab);
+  tabByPage.set(target, tab);
+  target.setDefaultTimeout(10_000);
+  target.on('domcontentloaded', () => {
+    void target.title().then(title => { tab.title = title; }).catch(() => {});
+  });
+  target.on('request', request => {
+    if (!request.isNavigationRequest()) return;
+    let frame = null;
+    try { frame = request.frame(); } catch { /* A new frame may not exist yet. */ }
+    const redirectedFrom = request.redirectedFrom();
+    if (redirectedFrom) tab.pendingNavigations.delete(redirectedFrom);
+    tab.pendingNavigations.set(request, frame);
+  });
+  target.on('response', response => {
+    const kind = navigationResponseKind(response);
+    if (kind) tab.navigationResponses.set(response.request(), kind);
+    try {
+      if (response.request().isNavigationRequest() && response.frame() === target.mainFrame()) {
+        tab.pendingDocumentResponse = response;
+      }
+    } catch { /* A response without a committed main frame is not authoritative. */ }
+  });
+  target.on('requestfailed', request => tab.pendingNavigations.delete(request));
+  target.on('download', download => onPageDownload(target, download));
+  target.on('requestfinished', request => {
+    if (!tab.pendingNavigations.has(request)) return;
+    const kind = tab.navigationResponses.get(request);
+    if (kind !== 'redirect' && (tab.pendingNavigations.get(request) === null || kind === 'no_document')) {
+      tab.pendingNavigations.delete(request);
+    }
+  });
+  target.on('dialog', dialog => captureDialog(tab, dialog));
+  target.on('framenavigated', frame => {
+    const mainFrame = target.mainFrame();
+    const pendingMainRequest = frame === mainFrame && [...tab.pendingNavigations]
+      .reverse().find(([, requestedFrame]) => requestedFrame === frame || requestedFrame === null)?.[0];
+    const hadDocumentRequest = Boolean(pendingMainRequest);
+    for (const [request, requestedFrame] of tab.pendingNavigations) {
+      if (requestedFrame === frame) tab.pendingNavigations.delete(request);
+    }
+    if (frame === mainFrame) {
+      const url = frame.url();
+      const committedUrl = url.split('#', 1)[0];
+      const response = hadDocumentRequest &&
+        tab.pendingDocumentResponse?.request() === pendingMainRequest &&
+        tab.pendingDocumentResponse.url() === committedUrl
+        ? tab.pendingDocumentResponse : null;
+      if (response) {
+        tab.mainDocumentResponse = response;
+        tab.mainDocumentUrl = committedUrl;
+      } else if (!hadDocumentRequest && tab.mainDocumentResponse &&
+                 tab.mainDocumentUrl && committedUrl.startsWith('http')) {
+        // Hash/history API transitions keep the same document and enforcing
+        // response policy. A new document request without a matching response
+        // still loses provenance and fails closed at download time.
+        try {
+          if (new URL(committedUrl).origin === new URL(tab.mainDocumentUrl).origin) {
+            tab.mainDocumentUrl = committedUrl;
+          } else {
+            tab.mainDocumentResponse = null;
+            tab.mainDocumentUrl = null;
+          }
+        } catch {
+          tab.mainDocumentResponse = null;
+          tab.mainDocumentUrl = null;
+        }
+      } else {
+        tab.mainDocumentResponse = null;
+        tab.mainDocumentUrl = null;
+      }
+      tab.pendingDocumentResponse = null;
+      if (url !== 'about:blank') {
+        try { checkUrl(url); } catch { void target.goto('about:blank').catch(() => {}); }
+      }
+    }
+    // Every frame navigation invalidates coordinates and semantic targets in
+    // the active view, including iframe content.
+    if (activeTabId === tab.id) advanceEpoch();
+  });
+  target.on('close', () => {
+    if (pendingDialog?.tabId === tab.id) expireDialog(pendingDialog);
+    tabs = tabs.filter(candidate => candidate !== tab);
+    if (activeTabId !== tab.id) return;
+    activeTabId = tabs.at(-1)?.id;
+    if (!shuttingDown) {
+      advanceEpoch();
+      if (!activeTabId) void context.newPage().catch(() => {});
+    }
+  });
+  // A popup becomes the visible workbench tab. Explicit new tabs use this same
+  // path, so a page cannot exist without an opaque ID and navigation guard.
+  activateTab(tab);
+  return tab;
+}
+
+async function answerDialog(args = {}) {
+  const pending = pendingDialog;
+  if (!pending || pending.expired || args.dialog_id !== pending.id) {
+    throw dialogError('stale_dialog', 'browser dialog is no longer pending');
+  }
+  if (args.expected_epoch !== pending.pageEpoch || epoch !== pending.pageEpoch ||
+      !tabs.some(tab => tab.id === pending.tabId && !tab.page.isClosed())) {
+    throw staleEpochError();
+  }
+  // Rust serializes an omitted Option<String> as null. Both null and an
+  // absent field mean "use the page's prompt default" or no alert text.
+  const text = args.text == null ? undefined : args.text;
+  if (typeof args.accept !== 'boolean' ||
+      (text !== undefined && (pending.type !== 'prompt' || !args.accept ||
+        typeof text !== 'string' || text.length > MAX_DIALOG_CHARS))) {
+    throw dialogError('invalid_request', 'invalid browser dialog response');
+  }
+  clearTimeout(pending.timer);
+  pendingDialog = undefined;
+  const owner = pending.owner;
+  let nextDialog;
+  if (owner && !owner.settled) {
+    nextDialog = new Promise(resolve => { owner.notify = resolve; });
+  }
+  try {
+    if (args.accept) {
+      await pending.dialog.accept(pending.type === 'prompt' ? (text ?? pending.defaultValue) : undefined);
+    } else {
+      await pending.dialog.dismiss();
+    }
+  } catch {
+    throw dialogError('browser_error', 'browser dialog response failed');
+  }
+  if (owner && !owner.settled) {
+    const outcome = await Promise.race([
+      owner.done,
+      nextDialog.then(() => ({ kind: 'dialog' })),
+    ]);
+    owner.notify = undefined;
+    if (pendingDialog) return dialogState();
+    if (outcome.kind === 'error') {
+      throw dialogError('browser_error', 'browser action failed after dialog response');
+    }
+  }
+  return stateAfterDialog();
+}
+
+async function stateAfterDialog() {
+  if (pendingDialog) return dialogState();
+  let notify;
+  const nextDialog = new Promise(resolve => {
+    notify = resolve;
+    dialogWaiters.add(resolve);
+  });
+  try {
+    const outcome = await Promise.race([
+      (async () => {
+        if (TEST_DIALOG_STATE_DELAY_MS) {
+          await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_STATE_DELAY_MS));
+        }
+        return state();
+      })().then(result => ({ result }), error => ({ error })),
+      nextDialog.then(() => ({ dialog: true })),
+    ]);
+    if (pendingDialog || outcome.dialog) return dialogState();
+    if (outcome.error) throw outcome.error;
+    return outcome.result;
+  } finally {
+    dialogWaiters.delete(notify);
+  }
+}
+
+async function dispatch(action, args = {}) {
+  if (action === 'dialog_respond') return answerDialog(args);
+  if (action === 'close') {
+    if (pendingDialog) expireDialog(pendingDialog);
+    return command(action, args);
+  }
+  if (pendingDialog || inFlightAction) {
+    if (action === 'state' || action === 'tab_list') return dialogState();
+    throw dialogError('dialog_pending', 'answer the pending browser dialog first');
+  }
+  const owner = { settled: false, hadDialog: false };
+  const nextDialog = new Promise(resolve => { owner.notify = resolve; });
+  inFlightAction = owner;
+  owner.done = Promise.resolve().then(() => command(action, args)).then(
+    result => ({ kind: 'done', result }),
+    error => ({ kind: 'error', error }),
+  );
+  void owner.done.then(() => {
+    owner.settled = true;
+    if (inFlightAction === owner) inFlightAction = undefined;
+    if (pendingDialog?.owner === owner && pendingDialog.expired) pendingDialog = undefined;
+  });
+  const outcome = await Promise.race([
+    owner.done,
+    nextDialog.then(() => ({ kind: 'dialog' })),
+  ]);
+  owner.notify = undefined;
+  if (pendingDialog) {
+    if (action === 'dom' || action === 'screenshot') {
+      throw dialogError('dialog_pending', 'answer the pending browser dialog first');
+    }
+    return dialogState();
+  }
+  if (outcome.kind === 'error') {
+    if (owner.hadDialog) {
+      throw dialogError('browser_error', 'browser action failed after dialog');
+    }
+    throw outcome.error;
+  }
+  return outcome.result;
+}
+
+async function command(action, args = {}) {
+  switch (action) {
+    case 'state':
+    case 'tab_list':
+      return state();
+    case 'tab_create':
+      checkEpoch(args);
+      if (tabs.length >= MAX_TABS) {
+        const error = new Error('browser tab limit reached');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      adoptPage(await context.newPage());
+      return state();
+    case 'tab_activate': {
+      checkEpoch(args);
+      const tabId = requireTabId(args.tab_id);
+      const tab = tabs.find(tab => tab.id === tabId);
+      if (!tab) {
+        const error = new Error('browser tab not found');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      activateTab(tab);
+      return state();
+    }
+    case 'tab_close': {
+      checkEpoch(args);
+      const tabId = requireTabId(args.tab_id);
+      const tab = tabs.find(tab => tab.id === tabId);
+      if (!tab) {
+        const error = new Error('browser tab not found');
+        error.code = 'invalid_request';
+        throw error;
+      }
+      // Keep a valid active view when the last tab is closed.
+      if (tabs.length === 1) adoptPage(await context.newPage());
+      await tab.page.close();
+      return state();
+    }
+    case 'navigate':
+      checkEpoch(args);
+      var page = requireActiveTab().page;
+      await page.goto(checkUrl(args.url), { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      return state();
+    case 'history':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      if (args.direction === 'back') await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+      else if (args.direction === 'forward') await page.goForward({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+      else if (args.direction === 'reload') await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+      else throw new Error('invalid history direction');
+      return state();
+    case 'viewport':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      if (!Number.isInteger(args.width) || !Number.isInteger(args.height) ||
+          args.width < 320 || args.width > 1200 || args.height < 240 || args.height > 1000) {
+        throw new Error('viewport must be within 320..1200 by 240..1000 CSS pixels');
+      }
+      if (page.viewportSize().width !== args.width || page.viewportSize().height !== args.height) {
+        await page.setViewportSize({ width: args.width, height: args.height });
+        // Frame coordinates from the prior viewport must not be applied to
+        // the resized page, even if its URL has not changed.
+        advanceEpoch();
+      }
+      return state();
+    case 'input':
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      if (args.kind === 'click') {
+        await page.mouse.click(args.x, args.y, { button: args.button || 'left' });
+      } else if (args.kind === 'scroll') {
+        await page.mouse.move(args.x, args.y);
+        await page.mouse.wheel(args.delta_x, args.delta_y);
+      } else if (args.kind === 'type') {
+        await page.keyboard.insertText(args.text);
+      } else if (args.kind === 'key') {
+        await page.keyboard.press(args.key);
+      } else {
+        throw new Error('invalid input kind');
+      }
+      return state();
+    case 'dom': {
+      if (TEST_DIALOG_READ_DELAY_MS) {
+        await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_READ_DELAY_MS));
+      }
+      return stableRead(async tab => {
+        const page = tab.page;
+        const snapshot = await page.ariaSnapshot({ mode: 'ai', depth: 12, timeout: 10_000 });
+        const html = await page.content();
+        return {
+          title: await page.title(),
+          snapshot: bounded(snapshot, MAX_SNAPSHOT_CHARS),
+          html: bounded(html, MAX_HTML_CHARS),
+          snapshot_truncated: snapshot.length > MAX_SNAPSHOT_CHARS,
+          html_truncated: html.length > MAX_HTML_CHARS,
+        };
+      });
+    }
+    case 'click_selector':
+      checkEpoch(args);
+      await withPinnedTarget(args, handle => handle.click({ timeout: 10_000 }));
+      return state();
+    case 'fill_selector':
+      checkEpoch(args);
+      await withPinnedTarget(args, handle => handle.fill(args.text, { timeout: 10_000 }));
+      return state();
+    case 'press_selector':
+      checkEpoch(args);
+      if (args.selector || args.target !== undefined) {
+        await withPinnedTarget(args, handle => handle.press(args.key, { timeout: 10_000 }));
+      } else {
+        await requireActiveTab().page.keyboard.press(args.key);
+      }
+      return state();
+    case 'select_option': {
+      checkEpoch(args);
+      const values = selectOptionArgs(args);
+      try {
+        const selectedValues = await withPinnedTarget(args, async handle => {
+          const identity = await handle.evaluate(element => ({
+            tag_name: element.tagName,
+            multiple: element.multiple,
+          }));
+          if (identity.tag_name !== 'SELECT') {
+            throw targetError('invalid_target', 'browser select target must be a native select element');
+          }
+          if (!identity.multiple && values.length > 1) {
+            throw targetError('invalid_target', 'single-select target accepts exactly one value');
+          }
+          return handle.selectOption(values, { timeout: 10_000 });
+        });
+        return { ...await state(), selected_values: selectedValues };
+      } catch (error) {
+        if (['invalid_target', 'target_not_found', 'ambiguous_target', 'stale_epoch'].includes(error?.code)) {
+          throw error;
+        }
+        // Playwright's call log can quote option values. Keep the failure
+        // actionable without copying page data into the tool error.
+        throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
+      }
+    }
+    case 'download':
+      return boundedDownload(args);
+    case 'set_file_input': {
+      checkEpoch(args);
+      const file = fileInputArgs(args);
+      try {
+        await withPinnedTarget(args, async handle => {
+          const isFileInput = await handle.evaluate(element =>
+            element instanceof HTMLInputElement && element.type === 'file');
+          if (!isFileInput) {
+            throw targetError('invalid_target', 'browser target must be a file input');
+          }
+          await handle.setInputFiles(file, { timeout: 10_000 });
+        });
+        return state();
+      } catch (error) {
+        if (['invalid_request', 'invalid_target', 'stale_epoch'].includes(error?.code)) throw error;
+        // Playwright errors may quote the filename or page content.
+        throw targetError('file_input_failed', 'browser file input failed; refresh the page and retry');
+      }
+    }
+    case 'hover_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      await hoverWithNavigation(page, args.expected_epoch,
+        navigation => withPinnedTarget(args, async handle => {
+          if (navigation.started) return;
+          await handle.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+          // The scroll handler may start a navigation while the old document
+          // still owns the epoch. Never let hover's own scrolling hide that gap.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          if (navigation.started) return;
+          if (args.expected_epoch !== epoch) throw staleEpochError();
+          await handle.hover({ scroll: 'none', timeout: pointerTimeout(deadlineAt) });
+        }, deadlineAt), deadlineAt);
+      return state();
+    }
+    case 'hover_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const hoverPoint = pointerPoint(args, 'x', 'y', page);
+      checkEpoch(args);
+      await hoverWithNavigation(page, args.expected_epoch,
+        () => page.mouse.move(hoverPoint.x, hoverPoint.y), deadlineAt);
+      return state();
+    }
+    case 'drag_selector': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const sourceSelector = pointerSelector(args.source_selector);
+      const targetSelector = pointerSelector(args.target_selector);
+      const navigation = await observeActionNavigation(page, deadlineAt);
+      try {
+        checkEpoch(args);
+        try {
+          await withPinnedTarget({ selector: sourceSelector, expected_epoch: args.expected_epoch }, async source => {
+            await withPinnedTarget({ selector: targetSelector, expected_epoch: args.expected_epoch }, async destination => {
+              await source.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+              // A page scroll handler can start navigation before the first
+              // mouse event, while the old document still owns the epoch.
+              await new Promise(resolve => setTimeout(resolve, 50));
+              if (navigation.started || args.expected_epoch !== epoch) return;
+              const from = await source.boundingBox();
+              const to = await destination.boundingBox();
+              if (!from || !to) throw targetError('target_not_found', 'browser drag target is detached');
+              const start = pointerPoint({ x: from.x + from.width / 2, y: from.y + from.height / 2 }, 'x', 'y', page);
+              const viewport = page.viewportSize();
+              const targetX = to.x + to.width / 2;
+              const targetY = to.y + to.height / 2;
+              const targetVisible = targetX >= 0 && targetY >= 0 &&
+                targetX < viewport.width && targetY < viewport.height;
+              const end = targetVisible
+                ? pointerPoint({ x: targetX, y: targetY }, 'x', 'y', page)
+                : async () => {
+                  // Begin the drag on the visible source before scrolling a distant
+                  // destination into view; both elements need not fit together.
+                  await destination.scrollIntoViewIfNeeded({ timeout: pointerTimeout(deadlineAt) });
+                  const box = await destination.boundingBox();
+                  if (!box) throw targetError('target_not_found', 'browser drag target is detached');
+                  return pointerPoint({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, 'x', 'y', page);
+                };
+              checkEpoch(args);
+              await dragBetween(page, start, end, args.expected_epoch, 'left', deadlineAt, navigation,
+                (kind, point) => assertDragPoint(kind === 'source' ? source : destination, point, deadlineAt,
+                  kind === 'source'));
+            }, deadlineAt);
+          }, deadlineAt);
+        } catch (error) {
+          if (!navigation.started && args.expected_epoch === epoch) throw error;
+        }
+        await navigation.finish();
+        return state();
+      } finally {
+        navigation.dispose();
+      }
+    }
+    case 'drag_at': {
+      const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
+      checkEpoch(args);
+      page = requireActiveTab().page;
+      const from = pointerPoint(args, 'x', 'y', page);
+      const to = pointerPoint(args, 'to_x', 'to_y', page);
+      const button = pointerButton(args.button);
+      checkEpoch(args);
+      await dragBetween(page, from, to, args.expected_epoch, button, deadlineAt);
+      return state();
+    }
+    case 'screenshot': {
+      if (TEST_DIALOG_READ_DELAY_MS) {
+        await new Promise(resolve => setTimeout(resolve, TEST_DIALOG_READ_DELAY_MS));
+      }
+      return stableRead(async tab => {
+        const page = tab.page;
+        const viewport = page.viewportSize();
+        const data = await page.screenshot({ type: 'jpeg', quality: 80, scale: 'css', timeout: 10_000 });
+        return { viewport, mime_type: 'image/jpeg', data: data.toString('base64') };
+      });
+    }
+    case 'eval':
+      return evalInActivePage(args);
+    case 'close':
+      shuttingDown = true;
+      await closeHost();
+      return { closed: true };
+    default:
+      throw new Error(`unknown browser action: ${action}`);
+  }
+}
+
+async function closeHost() {
+  if (browserClosed) return;
+  shuttingDown = true;
+  activeDownloadAttempt?.download?.cancel().catch(() => {});
+  await context?.close().catch(() => {});
+  await browser?.close().catch(() => {});
+  browserClosed = true;
+  downloadCdp = undefined;
+  downloadContextId = undefined;
+  if (retireAfterReply && TEST_RETIRE_CLOSE_DELAY_MS) {
+    await new Promise(resolve => setTimeout(resolve, TEST_RETIRE_CLOSE_DELAY_MS));
+  }
+  if (downloadDir) {
+    await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    downloadDir = undefined;
+  }
+}
+
+async function main() {
+  // Bamboo passes its per-session TempDir explicitly; Node's os.tmpdir()
+  // selects different environment variables on Windows.
+  const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
+  downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
+  browser = await chromium.launch({
+    headless: true,
+    downloadsPath: downloadDir,
+    ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
+  });
+  context = await browser.newContext({
+    viewport: { width: 1000, height: 720 },
+    deviceScaleFactor: 1,
+    acceptDownloads: true,
+    serviceWorkers: 'block',
+  });
+  await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
+  await context.addInitScript(installDownloadLinkInspector, {
+    key: DOWNLOAD_LINK_KEY, secret: DOWNLOAD_LINK_SECRET,
+  });
+  await context.route('**/*', route => {
+    const request = route.request();
+    if (request.isNavigationRequest()) {
+      try {
+        checkUrl(request.url());
+      } catch {
+        return route.abort('blockedbyclient');
+      }
+    }
+    return route.continue();
+  });
+  context.on('page', target => {
+    if (transientPages.has(target)) return;
+    if (transientPageCreation) {
+      transientPageCreation.observed.push(target);
+      return;
+    }
+    if (activeDownloadAttempt?.page) {
+      // Do not publish a popup before proving it did not descend from the
+      // private download target. Unknown provenance fails closed.
+      void target.opener().then(opener => {
+        if (!opener || transientPages.has(opener)) {
+          transientPages.add(target);
+          return target.close().catch(() => {});
+        }
+        adoptPage(target);
+      }).catch(() => target.close().catch(() => {}));
+      return;
+    }
+    adoptPage(target);
+  });
+  adoptPage(await context.newPage());
+  const initialCdp = await requireActiveTab().cdp;
+  if (!initialCdp) throw new Error('browser page session unavailable');
+  const targetInfo = await initialCdp.send('Target.getTargetInfo');
+  downloadContextId = targetInfo.targetInfo?.browserContextId;
+  if (!downloadContextId) throw new Error('browser context identity unavailable');
+  downloadCdp = await browser.newBrowserCDPSession();
+  downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
+  downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
+  await downloadCdp.send('Browser.setDownloadBehavior', {
+    behavior: 'allowAndName', browserContextId: downloadContextId,
+    downloadPath: downloadDir, eventsEnabled: true,
+  });
+  await captureTask;
+
+  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of lines) {
+    let request;
+    try {
+      request = JSON.parse(line);
+      const result = await dispatch(request.action, request.args);
+      emit({ id: request.id, ok: true, result });
+      if (request.action === 'close') break;
+    } catch (error) {
+      emit({ id: request?.id, ok: false, code: error.code || 'browser_error', error: String(error.message || error) });
+      if (retireAfterReply) break;
+    }
+  }
+  closing = true;
+  shuttingDown = true;
+  lines.close();
+  process.stdin.pause();
+  if (retireAfterReply) {
+    // Never keep a timed-out Chromium transfer alive for the next request.
+    // Rust also kills/reaps this host's process group and removes its TMPDIR.
+    await Promise.race([closeHost(), new Promise(resolve => setTimeout(resolve, 250))]);
+    // closeHost may still be waiting on Chromium when the bounded race ends.
+    // Remove this host's private directory before forcing Node to exit.
+    if (downloadDir) {
+      try { rmSync(downloadDir, { recursive: true, force: true }); } catch { /* Rust owns the fallback. */ }
+    }
+    process.exit(1);
+  }
+  await closeHost();
+}
+
+if (require.main === module) {
+  main().catch(async error => {
+    await closeHost();
+    process.stderr.write(`browser host failed: ${error.message || error}\n`);
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = { installDownloadLinkInspector };
+}

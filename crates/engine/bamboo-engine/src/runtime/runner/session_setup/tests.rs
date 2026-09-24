@@ -1043,6 +1043,36 @@ fn progressive_effective_set_intersects_final_session_eligible_catalog() {
 }
 
 #[test]
+fn browser_eval_is_independently_deferred_from_ordinary_browser_controls() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("browser"), schema("browser_eval")],
+    };
+    let session = Session::new("progressive-browser-eval", "model");
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    assert_eq!(catalog.len(), 2);
+    assert!(catalog
+        .iter()
+        .all(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred));
+
+    let browser_only = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        ["browser"],
+    );
+    assert!(browser_only.contains_execution_name("browser"));
+    assert!(!browser_only.contains_execution_name("browser_eval"));
+
+    let eval_only = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        ["browser_eval"],
+    );
+    assert!(!eval_only.contains_execution_name("browser"));
+    assert!(eval_only.contains_execution_name("browser_eval"));
+}
+
+#[test]
 fn ordinary_discover_named_function_is_deferred_and_disableable() {
     let config = crate::runtime::config::AgentLoopConfig {
         disabled_tools: ["discover".to_string()].into_iter().collect(),

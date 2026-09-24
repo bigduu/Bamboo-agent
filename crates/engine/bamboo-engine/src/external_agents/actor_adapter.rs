@@ -12,14 +12,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bamboo_agent_core::tools::tool_start_arguments_for_display;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::poison::PoisonRecover;
-use bamboo_domain::SessionInboxClaim;
+use bamboo_domain::{HookResult, SessionInboxClaim};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -2486,6 +2487,482 @@ fn validate_actor_event_batch(
     Ok(())
 }
 
+const MAX_DISPLAY_CALLS: usize = 4_096;
+const MAX_NESTED_DISPLAY_DEPTH: usize = 8;
+const MAX_DISPLAY_ID_BYTES: usize = 256;
+const MAX_DISPLAY_HOOK_RESULT_DEPTH: usize = 16;
+
+fn hook_result_for_display(result: HookResult, depth: usize) -> Option<HookResult> {
+    if depth >= MAX_DISPLAY_HOOK_RESULT_DEPTH {
+        return None;
+    }
+    Some(match result {
+        HookResult::Continue => HookResult::Continue,
+        HookResult::Mutated => HookResult::Mutated,
+        HookResult::Allow => HookResult::Allow,
+        HookResult::Ask => HookResult::Ask,
+        HookResult::Deny { .. } => HookResult::Deny {
+            reason: "Hook denied".into(),
+        },
+        HookResult::InjectContext { .. } => HookResult::InjectContext {
+            text: "Hook context hidden".into(),
+        },
+        HookResult::WithContext { result, .. } => HookResult::WithContext {
+            result: Box::new(hook_result_for_display(*result, depth + 1)?),
+            text: "Hook context hidden".into(),
+        },
+        HookResult::Suspend { .. } => HookResult::Suspend {
+            reason: "Hook suspended".into(),
+        },
+        HookResult::Abort { .. } => HookResult::Abort {
+            reason: "Hook aborted".into(),
+        },
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayCallKind {
+    Ordinary,
+    PrivateBrowser,
+    Reused,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayCall {
+    kind: DisplayCallKind,
+    started: bool,
+}
+
+#[derive(Default)]
+struct ActorEventDisplay {
+    calls: HashMap<String, DisplayCall>,
+    hook_names: HashMap<String, usize>,
+    children: HashMap<(String, String), Box<ActorEventDisplay>>,
+    // Shared by every nested child: a per-level cap alone permits an
+    // exponential number of identities across an actor event tree.
+    identities: Arc<AtomicUsize>,
+    overflowed: bool,
+    nested_overflowed: bool,
+}
+
+fn is_browser_tool_name(tool_name: &str) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+}
+
+fn known_browser_action(args: &serde_json::Value) -> bool {
+    matches!(
+        args.get("action").and_then(serde_json::Value::as_str),
+        Some(
+            "tabs"
+                | "new_tab"
+                | "activate_tab"
+                | "close_tab"
+                | "navigate"
+                | "history"
+                | "viewport"
+                | "snapshot"
+                | "click"
+                | "click_at"
+                | "hover"
+                | "drag"
+                | "fill"
+                | "select_option"
+                | "set_file_input"
+                | "type"
+                | "press"
+                | "key"
+                | "scroll"
+                | "download"
+                | "screenshot"
+                | "dialog_respond"
+        )
+    )
+}
+
+fn is_private_browser_call(tool_name: &str, args: &serde_json::Value) -> bool {
+    is_browser_tool_name(tool_name)
+        && (!known_browser_action(args)
+            || args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| {
+                    action.eq_ignore_ascii_case("download") || action == "set_file_input"
+                })
+            || args.get("data_base64").is_some())
+}
+
+fn actor_arguments_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if is_browser_tool_name(tool_name) {
+        // A malformed or unknown action has no reliable privacy class. A
+        // mixed-version actor may emit it before its schema rejects it.
+        if !known_browser_action(args) {
+            return serde_json::json!({"details":"[redacted]"});
+        }
+    }
+    tool_start_arguments_for_display(tool_name, args)
+}
+
+impl ActorEventDisplay {
+    fn fail_closed(&mut self) {
+        self.identities
+            .store(MAX_DISPLAY_CALLS + 1, Ordering::Relaxed);
+        self.overflowed = true;
+        self.calls.clear();
+        self.hook_names.clear();
+        self.nested_overflowed = true;
+        self.children.clear();
+    }
+
+    fn reserve_identity(&mut self) -> bool {
+        if self.identities.fetch_add(1, Ordering::Relaxed) < MAX_DISPLAY_CALLS {
+            true
+        } else {
+            self.fail_closed();
+            false
+        }
+    }
+
+    fn remember_start(&mut self, id: &str, private: bool) -> DisplayCallKind {
+        if self.overflowed || id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES {
+            return DisplayCallKind::Reused;
+        }
+        let kind = if private {
+            DisplayCallKind::PrivateBrowser
+        } else {
+            DisplayCallKind::Ordinary
+        };
+        if let Some(call) = self.calls.get_mut(id) {
+            if call.started || call.kind != kind {
+                call.kind = DisplayCallKind::Reused;
+            }
+            call.started = true;
+            return call.kind;
+        }
+        if !self.reserve_identity() {
+            return DisplayCallKind::Reused;
+        }
+        self.calls.insert(
+            id.to_string(),
+            DisplayCall {
+                kind,
+                started: true,
+            },
+        );
+        kind
+    }
+
+    fn remember_approval(&mut self, id: &str, private: bool) -> DisplayCallKind {
+        if self.overflowed || id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES {
+            return DisplayCallKind::Reused;
+        }
+        let kind = if private {
+            DisplayCallKind::PrivateBrowser
+        } else {
+            DisplayCallKind::Ordinary
+        };
+        if let Some(call) = self.calls.get_mut(id) {
+            if call.kind != kind {
+                call.kind = DisplayCallKind::Reused;
+            }
+            return call.kind;
+        }
+        if !self.reserve_identity() {
+            return DisplayCallKind::Reused;
+        }
+        self.calls.insert(
+            id.to_string(),
+            DisplayCall {
+                kind,
+                started: false,
+            },
+        );
+        kind
+    }
+
+    fn known_kind(&self, id: &str) -> Option<DisplayCallKind> {
+        if self.overflowed || self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
+            return None;
+        }
+        self.calls
+            .get(id)
+            .filter(|call| call.started)
+            .map(|call| call.kind)
+    }
+
+    fn display_hook_name(&mut self, hook_name: &str) -> Option<String> {
+        if self.overflowed || hook_name.is_empty() || hook_name.len() > MAX_DISPLAY_ID_BYTES {
+            self.fail_closed();
+            return None;
+        }
+        if let Some(index) = self.hook_names.get(hook_name) {
+            return Some(format!("actor-hook-{index}"));
+        }
+        if !self.reserve_identity() {
+            return None;
+        }
+        let index = self.hook_names.len() + 1;
+        self.hook_names.insert(hook_name.to_string(), index);
+        Some(format!("actor-hook-{index}"))
+    }
+
+    fn project(&mut self, event: AgentEvent, depth: usize) -> Option<AgentEvent> {
+        let call_id = match &event {
+            AgentEvent::ToolStart { tool_call_id, .. }
+            | AgentEvent::ToolApprovalRequested { tool_call_id, .. }
+            | AgentEvent::ToolToken { tool_call_id, .. }
+            | AgentEvent::ToolComplete { tool_call_id, .. }
+            | AgentEvent::ToolError { tool_call_id, .. }
+            | AgentEvent::ToolLifecycle { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        };
+        if call_id.is_some_and(|id| id.is_empty() || id.len() > MAX_DISPLAY_ID_BYTES) {
+            self.fail_closed();
+            return None;
+        }
+        if self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
+            self.fail_closed();
+        }
+        Some(match event {
+            AgentEvent::ToolStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                let private = is_private_browser_call(&tool_name, &arguments);
+                let kind = self.remember_start(&tool_call_id, private);
+                let arguments = if kind == DisplayCallKind::Reused {
+                    serde_json::json!({"details":"[redacted]"})
+                } else {
+                    actor_arguments_for_display(&tool_name, &arguments)
+                };
+                AgentEvent::ToolStart {
+                    tool_call_id,
+                    tool_name: match kind {
+                        DisplayCallKind::Reused => "unknown".into(),
+                        _ if is_browser_tool_name(&tool_name) => "browser".into(),
+                        _ => tool_name,
+                    },
+                    arguments,
+                }
+            }
+            AgentEvent::ToolApprovalRequested {
+                tool_call_id,
+                tool_name,
+                parameters,
+            } => {
+                let private = is_private_browser_call(&tool_name, &parameters);
+                let kind = self.remember_approval(&tool_call_id, private);
+                let parameters = if kind == DisplayCallKind::Reused {
+                    serde_json::json!({"details":"[redacted]"})
+                } else {
+                    actor_arguments_for_display(&tool_name, &parameters)
+                };
+                AgentEvent::ToolApprovalRequested {
+                    tool_call_id,
+                    tool_name: match kind {
+                        DisplayCallKind::Reused => "unknown".into(),
+                        _ if is_browser_tool_name(&tool_name) => "browser".into(),
+                        _ => tool_name,
+                    },
+                    parameters,
+                }
+            }
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                let content = match self.known_kind(&tool_call_id) {
+                    Some(DisplayCallKind::Ordinary) => content,
+                    Some(DisplayCallKind::PrivateBrowser) => "Browser tool output hidden".into(),
+                    _ => "Tool output hidden".into(),
+                };
+                AgentEvent::ToolToken {
+                    tool_call_id,
+                    content,
+                }
+            }
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => {
+                let result = match self.known_kind(&tool_call_id) {
+                    Some(DisplayCallKind::Ordinary) => result,
+                    Some(DisplayCallKind::PrivateBrowser) => {
+                        bamboo_agent_core::tools::ToolResult::text(
+                            result.success,
+                            "Browser tool result hidden",
+                        )
+                    }
+                    _ => bamboo_agent_core::tools::ToolResult::text(
+                        result.success,
+                        "Tool result hidden",
+                    ),
+                };
+                AgentEvent::ToolComplete {
+                    tool_call_id,
+                    result,
+                }
+            }
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } => {
+                let error = match self.known_kind(&tool_call_id) {
+                    Some(DisplayCallKind::Ordinary) => error,
+                    Some(DisplayCallKind::PrivateBrowser) => "Browser tool failed".into(),
+                    _ => "Tool failed".into(),
+                };
+                AgentEvent::ToolError {
+                    tool_call_id,
+                    error,
+                }
+            }
+            AgentEvent::ToolLifecycle {
+                tool_call_id,
+                tool_name,
+                phase,
+                elapsed_ms,
+                is_mutating,
+                auto_approved,
+                summary,
+                error,
+            } => {
+                let kind = self.known_kind(&tool_call_id);
+                let (summary, error) = match kind {
+                    Some(DisplayCallKind::Ordinary) => (summary, error),
+                    Some(DisplayCallKind::PrivateBrowser) => (
+                        summary.map(|_| "Browser tool activity hidden".into()),
+                        error.map(|_| "Browser tool failed".into()),
+                    ),
+                    _ => (
+                        summary.map(|_| "Tool activity hidden".into()),
+                        error.map(|_| "Tool failed".into()),
+                    ),
+                };
+                AgentEvent::ToolLifecycle {
+                    tool_call_id,
+                    tool_name: match kind {
+                        Some(DisplayCallKind::Ordinary) => tool_name,
+                        Some(DisplayCallKind::PrivateBrowser) => "browser".into(),
+                        _ => "unknown".into(),
+                    },
+                    phase: if kind == Some(DisplayCallKind::Ordinary)
+                        || matches!(phase.as_str(), "begin" | "finished" | "error" | "cancelled")
+                    {
+                        phase
+                    } else {
+                        "event".into()
+                    },
+                    elapsed_ms,
+                    is_mutating,
+                    auto_approved,
+                    summary,
+                    error,
+                }
+            }
+            AgentEvent::HookLifecycle {
+                hook_name,
+                point,
+                phase,
+                duration_ms,
+                decision,
+            } => {
+                let Some(decision) = hook_result_for_display(decision, 0) else {
+                    self.fail_closed();
+                    return None;
+                };
+                let hook_name = self.display_hook_name(&hook_name)?;
+                let phase = match phase.as_str() {
+                    "completed" | "started" | "error" => phase,
+                    _ => "event".into(),
+                };
+                AgentEvent::HookLifecycle {
+                    hook_name,
+                    point,
+                    phase,
+                    duration_ms,
+                    decision,
+                }
+            }
+            AgentEvent::ChildApprovalRequested {
+                child_session_id,
+                request_id,
+                tool_name,
+                permission,
+                resource,
+            } => {
+                let (tool_name, permission, resource) = if is_browser_tool_name(&tool_name) {
+                    (
+                        "browser".into(),
+                        "Browser interaction approval".into(),
+                        "[redacted]".into(),
+                    )
+                } else {
+                    (tool_name, permission, resource)
+                };
+                AgentEvent::ChildApprovalRequested {
+                    child_session_id,
+                    request_id,
+                    tool_name,
+                    permission,
+                    resource,
+                }
+            }
+            AgentEvent::ChildApprovalChanged { tool_name, .. }
+                if is_browser_tool_name(&tool_name) =>
+            {
+                // This durable approval delta is host-owned. An actor-supplied
+                // copy is neither authoritative nor safe to mirror to the
+                // account feed; the host publishes its own record separately.
+                return None;
+            }
+            AgentEvent::SubAgentEvent {
+                parent_session_id,
+                child_session_id,
+                event,
+            } => {
+                if depth >= MAX_NESTED_DISPLAY_DEPTH || self.nested_overflowed {
+                    return None;
+                }
+                if parent_session_id.is_empty()
+                    || child_session_id.is_empty()
+                    || parent_session_id.len() > MAX_DISPLAY_ID_BYTES
+                    || child_session_id.len() > MAX_DISPLAY_ID_BYTES
+                {
+                    self.fail_closed();
+                    return None;
+                }
+                let key = (parent_session_id.clone(), child_session_id.clone());
+                if !self.children.contains_key(&key) && !self.reserve_identity() {
+                    return None;
+                }
+                let identities = self.identities.clone();
+                let child = self.children.entry(key).or_insert_with(|| {
+                    Box::new(ActorEventDisplay {
+                        identities,
+                        ..Default::default()
+                    })
+                });
+                let event = child.project(*event, depth + 1)?;
+                if self.identities.load(Ordering::Relaxed) > MAX_DISPLAY_CALLS {
+                    self.fail_closed();
+                    return None;
+                }
+                AgentEvent::SubAgentEvent {
+                    parent_session_id,
+                    child_session_id,
+                    event: Box::new(event),
+                }
+            }
+            other => other,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_actor_event(
     event: serde_json::Value,
@@ -2495,15 +2972,26 @@ async fn process_actor_event(
     session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
     logical_session: &mut Session,
     event_tx: &mpsc::Sender<AgentEvent>,
+    display: &mut ActorEventDisplay,
 ) -> crate::runtime::runner::Result<()> {
     let event = match serde_json::from_value::<AgentEvent>(event) {
         Ok(event) => event,
-        Err(error) if strict_permission_events => {
-            return Err(AgentError::LLM(format!(
-                "actor emitted malformed AgentEvent under a typed permission posture contract: {error}"
-            )));
+        Err(_) if strict_permission_events => {
+            // Serde errors can quote an unrecognized variant or field value.
+            // The actor event is untrusted display input, including browser
+            // download metadata, so never echo its decode details to SSE.
+            return Err(AgentError::LLM(
+                "actor emitted malformed AgentEvent under a typed permission posture contract"
+                    .to_string(),
+            ));
         }
-        Err(_) => return Ok(()),
+        Err(_) => {
+            // A legacy actor can omit a malformed ToolStart that reuses an
+            // earlier public call ID. Its later result must not inherit the
+            // stale public display classification.
+            display.fail_closed();
+            return Ok(());
+        }
     };
     if matches!(&event, AgentEvent::PermissionPostureActivated { .. }) {
         if permission_handshake.posture_was_confirmed() {
@@ -2579,7 +3067,9 @@ async fn process_actor_event(
             "actor emitted an execution event before permission posture confirmation".to_string(),
         ));
     }
-    let _ = event_tx.send(event).await;
+    if let Some(event) = display.project(event, 0) {
+        let _ = event_tx.send(event).await;
+    }
     Ok(())
 }
 
@@ -2630,6 +3120,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
     let mut next_actor_event_seq = 1u64;
+    let mut display = ActorEventDisplay::default();
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -2683,6 +3174,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             session_inbox_runtime,
                             logical_session,
                             event_tx,
+                            &mut display,
                         )
                         .await?;
                     }
@@ -2705,6 +3197,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 received_seq = batch.first_seq,
                                 "actor event sequence gap; authoritative session snapshot is required"
                             );
+                            // A missing ToolStart may have reused an earlier
+                            // call ID for a private browser download. No prior
+                            // identity remains safe for display after a gap.
+                            display.fail_closed();
                         }
                         let skip = next_actor_event_seq
                             .saturating_sub(batch.first_seq)
@@ -2719,6 +3215,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 session_inbox_runtime,
                                 logical_session,
                                 event_tx,
+                                &mut display,
                             )
                             .await?;
                             next_actor_event_seq = seq.saturating_add(1);
@@ -3674,7 +4171,7 @@ mod tests {
             frames: frames.into_iter().collect(),
             sent: Vec::new(),
         };
-        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
         let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
@@ -3742,6 +4239,27 @@ mod tests {
             .contains("malformed AgentEvent"));
         assert!(events.is_empty());
         assert!(bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata).is_none());
+
+        let (result, _, events, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                ChildFrame::Event {
+                    event: serde_json::json!({"type":"private-download-secret"}),
+                },
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert!(!result
+            .unwrap_err()
+            .to_string()
+            .contains("private-download-secret"));
+        assert_eq!(
+            events.len(),
+            1,
+            "only the confirmed posture may be forwarded"
+        );
     }
 
     #[tokio::test]
@@ -3953,6 +4471,788 @@ mod tests {
             .expect("matching posture must be recorded before execution events are accepted");
         assert_eq!(audit.policy_revision, 7);
         assert_eq!(audit.executor_mapping, "test_actor:permission_mode=default");
+    }
+
+    #[tokio::test]
+    async fn actor_download_tool_start_is_projected_before_parent_forwarding() {
+        for (index, tool_name) in ["browser", "default::browser", "private-namespace::browser"]
+            .into_iter()
+            .enumerate()
+        {
+            let session_id = format!("actor-download-{index}");
+            let args = serde_json::json!({
+                "action":"download",
+                "selector":"a[data-secret='private-selector']",
+                "expected_epoch":17,
+                "data_base64":"private-extra-bytes",
+                "extra":{"url":"https://private.test/file"},
+            });
+            let original = args.clone();
+            let read_args = serde_json::json!({"file_path":"README.md"});
+            let (result, _session, events, _) = drive_permission_handshake_frames(
+                &session_id,
+                [
+                    permission_posture_frame(&session_id, 7),
+                    actor_event_frame(AgentEvent::ToolStart {
+                        tool_call_id: "download-call".to_string(),
+                        tool_name: tool_name.to_string(),
+                        arguments: args.clone(),
+                    }),
+                    actor_event_frame(AgentEvent::ToolStart {
+                        tool_call_id: "read-call".to_string(),
+                        tool_name: "Read".to_string(),
+                        arguments: read_args.clone(),
+                    }),
+                    completed_actor_frame(),
+                ],
+                expected_default_permission_posture(7),
+            )
+            .await;
+            assert_eq!(result.expect("actor completed").as_deref(), Some("done"));
+            assert_eq!(args, original);
+            let starts: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolStart {
+                        tool_name,
+                        arguments,
+                        ..
+                    } => Some((tool_name.as_str(), arguments)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts.len(), 2);
+            assert_eq!(starts[0].0, "browser");
+            assert_eq!(
+                starts[0].1,
+                &serde_json::json!({"action":"download","expected_epoch":17})
+            );
+            assert_eq!(starts[1], ("Read", &read_args));
+            assert!(!format!("{events:?}").contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_hook_lifecycle_hides_every_decision_text_across_event_batch_and_nested_stream() {
+        let session_id = "actor-hook-display";
+        let private = "private-selector-url-filename-response";
+        let hook_name = format!("audit-{private}");
+        let hook = |duration_ms, phase: &str, decision| AgentEvent::HookLifecycle {
+            hook_name: hook_name.clone(),
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: phase.into(),
+            duration_ms,
+            decision,
+        };
+        let decisions = [
+            HookResult::Deny {
+                reason: private.into(),
+            },
+            HookResult::InjectContext {
+                text: private.into(),
+            },
+            HookResult::WithContext {
+                result: Box::new(HookResult::WithContext {
+                    result: Box::new(HookResult::Deny {
+                        reason: private.into(),
+                    }),
+                    text: private.into(),
+                }),
+                text: private.into(),
+            },
+            HookResult::Suspend {
+                reason: private.into(),
+            },
+            HookResult::Abort {
+                reason: private.into(),
+            },
+        ];
+        let originals = decisions.to_vec();
+        let batch_events = [
+            hook(2, "completed", decisions[1].clone()),
+            hook(3, "completed", decisions[2].clone()),
+            hook(4, "completed", decisions[3].clone()),
+        ]
+        .into_iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+        let batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.into(),
+                parent_session_id: Some("permission-parent".into()),
+                root_session_id: session_id.into(),
+            }),
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: Some(session_id.into()),
+            first_seq: 1,
+            last_seq: batch_events.len() as u64,
+            qos: bamboo_subagent::ActorEventQos::classify(&batch_events[0]),
+            events: batch_events,
+        };
+        let nested = AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: "child".into(),
+            event: Box::new(hook(5, "completed", decisions[4].clone())),
+        };
+        let raw = serde_json::to_string(&originals).unwrap();
+        assert!(raw.contains(private));
+
+        let (outcome, _session, forwarded, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                actor_event_frame(hook(1, private, decisions[0].clone())),
+                ChildFrame::EventBatch { batch },
+                actor_event_frame(nested),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(
+            !wire.contains(private),
+            "private hook text reached SSE: {wire}"
+        );
+
+        let hooks = forwarded
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::HookLifecycle {
+                    hook_name,
+                    point,
+                    phase,
+                    duration_ms,
+                    decision,
+                } => Some((hook_name, point, phase, duration_ms, decision)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hooks.len(), 4);
+        assert!(hooks.iter().all(|(name, point, _, _, _)| {
+            name == &&"actor-hook-1".to_string()
+                && **point == bamboo_domain::AgentHookPoint::BeforeToolExecution
+        }));
+        assert_eq!(hooks[0].2, "event");
+        assert_eq!(hooks[1].2, "completed");
+        assert_eq!(*hooks[0].3, 1);
+        assert_eq!(*hooks[3].3, 4);
+        assert!(matches!(hooks[0].4, HookResult::Deny { reason } if reason == "Hook denied"));
+        assert!(
+            matches!(hooks[1].4, HookResult::InjectContext { text } if text == "Hook context hidden")
+        );
+        assert!(
+            matches!(hooks[2].4, HookResult::WithContext { result, text }
+            if text == "Hook context hidden" && matches!(result.as_ref(),
+                HookResult::WithContext { result, text }
+                    if text == "Hook context hidden" && matches!(result.as_ref(),
+                        HookResult::Deny { reason } if reason == "Hook denied")))
+        );
+        assert!(matches!(hooks[3].4, HookResult::Suspend { reason } if reason == "Hook suspended"));
+        assert!(forwarded.iter().any(|event| matches!(event,
+            AgentEvent::SubAgentEvent { event, .. }
+                if matches!(event.as_ref(), AgentEvent::HookLifecycle {
+                    hook_name, duration_ms: 5,
+                    decision: HookResult::Abort { reason }, ..
+                } if hook_name == "actor-hook-1" && reason == "Hook aborted")
+        )));
+    }
+
+    #[test]
+    fn actor_hook_display_depth_and_identity_limits_fail_closed() {
+        let mut display = ActorEventDisplay::default();
+        let mut deep = HookResult::Allow;
+        for _ in 0..=MAX_DISPLAY_HOOK_RESULT_DEPTH {
+            deep = HookResult::WithContext {
+                result: Box::new(deep),
+                text: "private-download-bytes".into(),
+            };
+        }
+        let event = |hook_name: String, decision| AgentEvent::HookLifecycle {
+            hook_name,
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: "completed".into(),
+            duration_ms: 7,
+            decision,
+        };
+        assert!(display.project(event("deep".into(), deep), 0).is_none());
+        assert!(display.overflowed);
+        assert!(display
+            .project(
+                event(
+                    "private-download-bytes".into(),
+                    HookResult::Deny {
+                        reason: "private-download-bytes".into(),
+                    },
+                ),
+                0,
+            )
+            .is_none());
+
+        let mut oversized = ActorEventDisplay::default();
+        assert!(oversized
+            .project(
+                event("x".repeat(MAX_DISPLAY_ID_BYTES + 1), HookResult::Allow),
+                0,
+            )
+            .is_none());
+        assert!(oversized.overflowed);
+
+        // A new actor connection gets a fresh opaque alias, never the raw
+        // hook name. Repeated names keep the same alias until the shared
+        // identity budget is exhausted, then the stream fails closed.
+        let mut reconnected = ActorEventDisplay::default();
+        let private = "private-download-bytes";
+        for _ in 0..2 {
+            let projected = reconnected
+                .project(event(private.into(), HookResult::Allow), 0)
+                .unwrap();
+            assert!(
+                matches!(projected, AgentEvent::HookLifecycle { hook_name, .. }
+                if hook_name == "actor-hook-1")
+            );
+        }
+        assert_eq!(reconnected.identities.load(Ordering::Relaxed), 1);
+        for index in 1..MAX_DISPLAY_CALLS {
+            assert!(reconnected
+                .project(event(format!("hook-{index}"), HookResult::Allow), 0)
+                .is_some());
+        }
+        assert!(reconnected
+            .project(event("overflow-private".into(), HookResult::Allow), 0)
+            .is_none());
+        assert!(reconnected.overflowed);
+        assert!(reconnected.hook_names.is_empty());
+    }
+
+    #[test]
+    fn actor_hook_display_preserves_nontext_decision_kinds() {
+        for result in [
+            HookResult::Continue,
+            HookResult::Mutated,
+            HookResult::Allow,
+            HookResult::Ask,
+        ] {
+            assert_eq!(hook_result_for_display(result.clone(), 0), Some(result));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_actor_hook_events_never_fall_back_to_raw_display() {
+        let session_id = "actor-malformed-hook";
+        let private = "private-download-selector";
+        let original = AgentEvent::HookLifecycle {
+            hook_name: "audit".into(),
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: "completed".into(),
+            duration_ms: 9,
+            decision: HookResult::Deny {
+                reason: private.into(),
+            },
+        };
+        let mut invalid = serde_json::to_value(&original).unwrap();
+        invalid["decision"]["type"] = serde_json::json!("unknown_decision");
+        let nested = AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: "child".into(),
+            event: Box::new(original),
+        };
+        let mut invalid_nested = serde_json::to_value(nested).unwrap();
+        invalid_nested["event"]["decision"]["type"] = serde_json::json!("unknown_decision");
+        let batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.into(),
+                parent_session_id: Some("permission-parent".into()),
+                root_session_id: session_id.into(),
+            }),
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: Some(session_id.into()),
+            first_seq: 1,
+            last_seq: 1,
+            qos: bamboo_subagent::ActorEventQos::classify(&invalid),
+            events: vec![invalid.clone()],
+        };
+        for frame in [
+            ChildFrame::Event {
+                event: invalid.clone(),
+            },
+            ChildFrame::EventBatch { batch },
+            ChildFrame::Event {
+                event: invalid_nested,
+            },
+        ] {
+            let (outcome, _session, forwarded, _) = drive_permission_handshake_frames(
+                session_id,
+                [permission_posture_frame(session_id, 7), frame],
+                expected_default_permission_posture(7),
+            )
+            .await;
+            let error = outcome.unwrap_err().to_string();
+            assert!(error.contains("malformed AgentEvent"), "{error}");
+            assert!(!error.contains(private));
+            assert!(!serde_json::to_string(&forwarded).unwrap().contains(private));
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut session = Session::new("legacy-hook", "model");
+        let mut handshake = PermissionPostureHandshake::NotRequired;
+        let mut display = ActorEventDisplay::default();
+        process_actor_event(
+            invalid,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        assert!(display.overflowed);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn actor_download_event_batch_hides_output_and_preserves_read_output() {
+        let session_id = "actor-download-batch";
+        let private = "private-download-bytes-and-url";
+        let events = vec![
+            AgentEvent::ToolStart {
+                tool_call_id: "download-call".into(),
+                tool_name: "default::browser".into(),
+                arguments: serde_json::json!({
+                    "action":"download", "selector": private, "expected_epoch": 17,
+                }),
+            },
+            AgentEvent::ToolApprovalRequested {
+                tool_call_id: "download-call".into(),
+                tool_name: format!("{private}::browser"),
+                parameters: serde_json::json!({
+                    "action":"download", "selector": private, "expected_epoch": 17,
+                }),
+            },
+            AgentEvent::ToolStart {
+                tool_call_id: "read-call".into(),
+                tool_name: "Read".into(),
+                arguments: serde_json::json!({"file_path":"README.md"}),
+            },
+        ];
+        let batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.into(),
+                parent_session_id: Some("permission-parent".into()),
+                root_session_id: session_id.into(),
+            }),
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: Some(session_id.into()),
+            first_seq: 1,
+            last_seq: events.len() as u64,
+            qos: bamboo_subagent::ActorEventQos::Durable,
+            events: events
+                .into_iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect(),
+        };
+        let result = bamboo_agent_core::tools::ToolResult {
+            success: true,
+            result: format!("{{\"data_base64\":\"{private}\"}}"),
+            display_preference: Some(private.into()),
+            images: vec![bamboo_agent_core::tools::ToolResultImage {
+                mime_type: "image/png".into(),
+                data: private.into(),
+            }],
+        };
+        let (outcome, _, forwarded, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                ChildFrame::EventBatch { batch },
+                actor_event_frame(AgentEvent::ToolToken {
+                    tool_call_id: "download-call".into(),
+                    content: private.into(),
+                }),
+                actor_event_frame(AgentEvent::ToolToken {
+                    tool_call_id: "read-call".into(),
+                    content: "public live output".into(),
+                }),
+                actor_event_frame(AgentEvent::ToolComplete {
+                    tool_call_id: "download-call".into(),
+                    result,
+                }),
+                actor_event_frame(AgentEvent::ToolLifecycle {
+                    tool_call_id: "download-call".into(),
+                    tool_name: "browser".into(),
+                    phase: "finished".into(),
+                    elapsed_ms: Some(1),
+                    is_mutating: false,
+                    auto_approved: false,
+                    summary: Some(private.into()),
+                    error: Some(private.into()),
+                }),
+                actor_event_frame(AgentEvent::ToolError {
+                    tool_call_id: "download-call".into(),
+                    error: private.into(),
+                }),
+                actor_event_frame(AgentEvent::ToolComplete {
+                    tool_call_id: "read-call".into(),
+                    result: bamboo_agent_core::tools::ToolResult::text(true, "public README text"),
+                }),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(
+            !wire.contains(private),
+            "private content reached actor SSE: {wire}"
+        );
+        assert!(wire.contains("public README text"));
+        assert!(wire.contains("public live output"));
+        assert!(forwarded.iter().any(|event| matches!(event,
+            AgentEvent::ToolComplete { tool_call_id, result }
+                if tool_call_id == "download-call"
+                && result.result == "Browser tool result hidden"
+                && result.images.is_empty() && result.display_preference.is_none()
+        )));
+    }
+
+    #[tokio::test]
+    async fn actor_missing_reused_and_nested_tool_identity_fails_closed() {
+        let private = "private-download-content";
+        let nested = |event| AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: "nested-child".into(),
+            event: Box::new(event),
+        };
+        let (outcome, _, forwarded, _) = drive_permission_handshake_frames(
+            "actor-reorder",
+            [
+                permission_posture_frame("actor-reorder", 7),
+                actor_event_frame(AgentEvent::ToolComplete {
+                    tool_call_id: "missing".into(),
+                    result: bamboo_agent_core::tools::ToolResult::text(true, private),
+                }),
+                actor_event_frame(AgentEvent::ToolLifecycle {
+                    tool_call_id: "missing".into(),
+                    tool_name: "browser".into(),
+                    phase: private.into(),
+                    elapsed_ms: None,
+                    is_mutating: false,
+                    auto_approved: false,
+                    summary: Some(private.into()),
+                    error: Some(private.into()),
+                }),
+                actor_event_frame(AgentEvent::ToolApprovalRequested {
+                    tool_call_id: "approval-only".into(),
+                    tool_name: "browser".into(),
+                    parameters: serde_json::json!({"action":"download","selector":private}),
+                }),
+                actor_event_frame(AgentEvent::ToolToken {
+                    tool_call_id: "approval-only".into(),
+                    content: private.into(),
+                }),
+                actor_event_frame(AgentEvent::ToolStart {
+                    tool_call_id: "malformed-browser".into(),
+                    tool_name: format!("{private}::browser"),
+                    arguments: serde_json::json!({"selector":private}),
+                }),
+                actor_event_frame(AgentEvent::ToolComplete {
+                    tool_call_id: "malformed-browser".into(),
+                    result: bamboo_agent_core::tools::ToolResult::text(true, private),
+                }),
+                actor_event_frame(AgentEvent::ToolStart {
+                    tool_call_id: "reused".into(),
+                    tool_name: "Read".into(),
+                    arguments: serde_json::json!({"file_path":"README.md"}),
+                }),
+                actor_event_frame(AgentEvent::ToolStart {
+                    tool_call_id: "reused".into(),
+                    tool_name: "browser".into(),
+                    arguments: serde_json::json!({"action":"download","selector":private}),
+                }),
+                actor_event_frame(AgentEvent::ToolToken {
+                    tool_call_id: "reused".into(),
+                    content: private.into(),
+                }),
+                actor_event_frame(nested(AgentEvent::ToolStart {
+                    tool_call_id: "nested".into(),
+                    tool_name: "browser".into(),
+                    arguments: serde_json::json!({"action":"download","selector":private}),
+                })),
+                actor_event_frame(nested(AgentEvent::ToolComplete {
+                    tool_call_id: "nested".into(),
+                    result: bamboo_agent_core::tools::ToolResult::text(true, private),
+                })),
+                actor_event_frame(AgentEvent::ChildApprovalRequested {
+                    child_session_id: "nested-child".into(),
+                    request_id: "approval".into(),
+                    tool_name: format!("{private}::browser"),
+                    permission: private.into(),
+                    resource: private.into(),
+                }),
+                actor_event_frame(AgentEvent::ChildApprovalChanged {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "nested-child".into(),
+                    child_attempt: 1,
+                    request_id: "approval".into(),
+                    version: 1,
+                    status: "pending".into(),
+                    reason: Some(private.into()),
+                    tool_name: "browser".into(),
+                    permission: private.into(),
+                    resource: private.into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    resolved_at: None,
+                }),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(
+            !wire.contains(private),
+            "private content reached actor SSE: {wire}"
+        );
+        assert!(wire.contains("Tool result hidden"));
+        assert!(wire.contains("Browser tool result hidden"));
+        assert!(wire.contains("Browser interaction approval"));
+        assert!(!forwarded
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ChildApprovalChanged { .. })));
+    }
+
+    #[test]
+    fn actor_display_tracking_overflow_never_reclassifies_old_private_id() {
+        let mut display = ActorEventDisplay::default();
+        display
+            .project(
+                AgentEvent::ToolStart {
+                    tool_call_id: "private-call".into(),
+                    tool_name: "browser".into(),
+                    arguments: serde_json::json!({"action":"download","selector":"private"}),
+                },
+                0,
+            )
+            .unwrap();
+        for index in 0..MAX_DISPLAY_CALLS {
+            display
+                .project(
+                    AgentEvent::ToolStart {
+                        tool_call_id: format!("ordinary-{index}"),
+                        tool_name: "Read".into(),
+                        arguments: serde_json::json!({"file_path":"README.md"}),
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        assert!(display.overflowed);
+        let forwarded = display
+            .project(
+                AgentEvent::ToolComplete {
+                    tool_call_id: "private-call".into(),
+                    result: bamboo_agent_core::tools::ToolResult::text(true, "private-bytes"),
+                },
+                0,
+            )
+            .unwrap();
+        assert!(!serde_json::to_string(&forwarded)
+            .unwrap()
+            .contains("private-bytes"));
+    }
+
+    #[test]
+    fn nested_actor_display_uses_one_identity_budget_and_bounded_keys() {
+        let mut display = ActorEventDisplay::default();
+        let nested = |index: usize| AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: format!("child-{index}"),
+            event: Box::new(AgentEvent::ToolStart {
+                tool_call_id: format!("read-{index}"),
+                tool_name: "Read".into(),
+                arguments: serde_json::json!({"file_path":"README.md"}),
+            }),
+        };
+        for index in 0..(MAX_DISPLAY_CALLS / 2) {
+            assert!(display.project(nested(index), 0).is_some());
+        }
+        assert_eq!(
+            display.identities.load(Ordering::Relaxed),
+            MAX_DISPLAY_CALLS
+        );
+        assert!(display.project(nested(MAX_DISPLAY_CALLS / 2), 0).is_none());
+        assert!(display.overflowed);
+        assert!(display.children.is_empty());
+
+        let mut oversized = ActorEventDisplay::default();
+        assert!(oversized
+            .project(
+                AgentEvent::SubAgentEvent {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "x".repeat(MAX_DISPLAY_ID_BYTES + 1),
+                    event: Box::new(AgentEvent::ToolComplete {
+                        tool_call_id: "call".into(),
+                        result: bamboo_agent_core::tools::ToolResult::text(
+                            true,
+                            "private-download-bytes",
+                        ),
+                    }),
+                },
+                0,
+            )
+            .is_none());
+        assert!(oversized.overflowed);
+        assert!(oversized
+            .project(
+                AgentEvent::ToolStart {
+                    tool_call_id: "x".repeat(MAX_DISPLAY_ID_BYTES + 1),
+                    tool_name: "Read".into(),
+                    arguments: serde_json::json!({"file_path":"README.md"}),
+                },
+                0,
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn actor_batch_sequence_gap_invalidates_prior_tool_identity() {
+        let session_id = "actor-gap";
+        let batch = |seq, event: AgentEvent| {
+            let event = serde_json::to_value(event).unwrap();
+            ChildFrame::EventBatch {
+                batch: ActorEventBatch {
+                    logical_session: Some(LogicalSessionIdentity {
+                        session_id: session_id.into(),
+                        parent_session_id: Some("permission-parent".into()),
+                        root_session_id: session_id.into(),
+                    }),
+                    activation_id: None,
+                    execution_epoch: 0,
+                    source_node_id: None,
+                    source_actor_id: Some(session_id.into()),
+                    first_seq: seq,
+                    last_seq: seq,
+                    qos: bamboo_subagent::ActorEventQos::classify(&event),
+                    events: vec![event],
+                },
+            }
+        };
+        let (outcome, _, forwarded, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                batch(
+                    1,
+                    AgentEvent::ToolStart {
+                        tool_call_id: "reused-call".into(),
+                        tool_name: "Read".into(),
+                        arguments: serde_json::json!({"file_path":"README.md"}),
+                    },
+                ),
+                // Sequence 2 may have replaced this ID with a private browser
+                // call. The actor's next result must not inherit Read display.
+                batch(
+                    3,
+                    AgentEvent::ToolComplete {
+                        tool_call_id: "reused-call".into(),
+                        result: bamboo_agent_core::tools::ToolResult::text(
+                            true,
+                            "private-download-bytes",
+                        ),
+                    },
+                ),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(!wire.contains("private-download-bytes"), "{wire}");
+        assert!(wire.contains("Tool result hidden"));
+    }
+
+    #[tokio::test]
+    async fn legacy_malformed_actor_event_invalidates_prior_tool_identity() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut session = Session::new("legacy-malformed-private", "model");
+        let mut handshake = PermissionPostureHandshake::NotRequired;
+        let mut display = ActorEventDisplay::default();
+        let read_start = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "reused-call".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({"file_path":"README.md"}),
+        })
+        .unwrap();
+        process_actor_event(
+            read_start,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+
+        // A mixed-version actor may send a browser ToolStart whose name has
+        // the wrong wire type. Serde drops it; the reused ID is no longer safe.
+        let mut malformed = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "reused-call".into(),
+            tool_name: "browser".into(),
+            arguments: serde_json::json!({
+                "action":"download", "selector":"private-download-selector"
+            }),
+        })
+        .unwrap();
+        malformed["tool_name"] = serde_json::json!(7);
+        process_actor_event(
+            malformed,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        process_actor_event(
+            serde_json::to_value(AgentEvent::ToolComplete {
+                tool_call_id: "reused-call".into(),
+                result: bamboo_agent_core::tools::ToolResult::text(true, "private-download-bytes"),
+            })
+            .unwrap(),
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        let forwarded = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(forwarded.len(), 2);
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(!wire.contains("private-download"), "{wire}");
+        assert!(wire.contains("Tool result hidden"));
     }
 
     #[tokio::test]

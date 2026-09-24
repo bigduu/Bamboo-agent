@@ -4,6 +4,7 @@
 //! chat, execution, event streaming, session management, and MCP.
 
 pub mod bootstrap;
+pub mod browser;
 pub mod chat;
 pub mod child_approval;
 pub mod delete;

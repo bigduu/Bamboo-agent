@@ -41,6 +41,85 @@ fn timeout_context(
     .allow_turn_retry_before_semantic_output()
 }
 
+#[derive(Clone, Default)]
+struct FinalizerWarnings {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct WarningFields(String);
+
+impl tracing::field::Visit for WarningFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for FinalizerWarnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            self.events.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_browser_arguments_hide_private_invalid_json_in_logs() {
+    let private_args = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query""#;
+    for name in [
+        "browser_eval",
+        "default::browser_eval",
+        "browser",
+        "default::browser",
+    ] {
+        let stream = build_stream(vec![
+            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                id: "call_private".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: private_args.to_string(),
+                },
+            }])),
+            Ok(LLMChunk::Done),
+        ]);
+        let (event_tx, _) = mpsc::channel::<AgentEvent>(8);
+        let warnings = FinalizerWarnings::default();
+        let recorded = warnings.events.clone();
+        let output = {
+            let _guard = tracing::subscriber::set_default(warnings);
+            consume_llm_stream(
+                stream,
+                &event_tx,
+                &CancellationToken::new(),
+                "private-finalizer-test",
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(output.tool_calls[0].function.arguments, private_args);
+        let text = recorded.lock().unwrap().join("\n");
+        assert!(
+            text.contains("args_preview=") && text.contains("[redacted]"),
+            "{name}: {text}"
+        );
+        assert!(!text.contains("private-page-source"), "{name}: {text}");
+        assert!(!text.contains("private-query"), "{name}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![

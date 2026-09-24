@@ -586,8 +586,10 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{HistoryFunctionCall, HistoryMessage, HistoryToolCall};
     use crate::api::BambooClient;
     use crate::app::{ChatMessage, MessageRole, SubAgentDisplay};
+    use crate::history::map_history;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -637,6 +639,46 @@ mod tests {
         );
         // args(1) + all 5 result lines = 6
         assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn expanded_reloaded_browser_approval_renders_only_safe_display_copy() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![
+            HistoryMessage {
+                id: "assistant-1".to_string(),
+                role: "assistant".to_string(),
+                tool_calls: Some(vec![HistoryToolCall {
+                    id: "browser-call".to_string(),
+                    function: HistoryFunctionCall {
+                        name: "browser".to_string(),
+                        arguments:
+                            r#"{"action":"type","text":"private input","expected_epoch":17}"#
+                                .to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            HistoryMessage {
+                role: "tool".to_string(),
+                tool_call_id: Some("browser-call".to_string()),
+                content: r#"{"status":"awaiting_permission_approval","question":"Approve private input?","permission_request":{"tool_name":"browser","resource":"browser:17:type:focused:opaque"}}"#.to_string(),
+                tool_success: Some(true),
+                ..Default::default()
+            },
+        ]);
+        app.chat.block_ui.insert(
+            "assistant-1:tool:browser-call".to_string(),
+            ConversationBlockUiState {
+                expanded: true,
+                ..Default::default()
+            },
+        );
+        let rendered = rendered_text(&build_conversation_lines(&app, 100));
+        assert!(rendered.contains("Browser input awaiting permission approval"));
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("private input"));
+        assert!(!rendered.contains("opaque"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //!
 //! "Round" is kept only as a counter for metrics compatibility.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +93,20 @@ fn effective_callable_set_for_round(
     capability_loading_mode: CapabilityLoadingMode,
 ) -> EffectiveCallableSet {
     if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        if legacy_browser_needs_discovery(
+            session,
+            tool_schemas,
+            crate::runtime::runner::round_lifecycle::required_tool_for_session(session),
+        ) {
+            let without_browser = tool_schemas
+                .iter()
+                .filter(|schema| schema.function.name != "browser")
+                .cloned()
+                .collect::<Vec<_>>();
+            return crate::runtime::runner::tool_execution::legacy_effective_callable_set(
+                &without_browser,
+            );
+        }
         return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
     }
 
@@ -294,6 +308,7 @@ impl CompleteCapabilityDiscovery {
         session: &Session,
         config: &AgentLoopConfig,
         tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+        browser_only: bool,
     ) -> Result<Self, AgentError> {
         let catalog = tool_schemas
             .iter()
@@ -302,9 +317,27 @@ impl CompleteCapabilityDiscovery {
             .collect::<Vec<_>>();
         let searchable_tool_catalog = catalog
             .iter()
-            .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred)
+            .filter(|entry| {
+                entry.loading_class() == CapabilityLoadingClass::Deferred
+                    && (!browser_only || entry.execution_name() == "browser")
+            })
             .cloned()
             .collect::<Vec<_>>();
+        if browser_only {
+            // The compatibility gateway exposes only a chat-eligible browser tool.
+            // Skill and workflow stores must not gate access to that browser.
+            let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
+            let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
+            let index = crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                crate::capability_discovery::project_classified_tool_capability_metadata(
+                    &searchable_tool_catalog,
+                ),
+                &empty_skills,
+                &empty_workflows,
+                &Default::default(),
+            );
+            return Ok(Self { catalog, index });
+        }
         let (_, disabled_skill_ids) = config.resolve_disabled_filters();
         let catalog_names = catalog
             .iter()
@@ -464,6 +497,46 @@ fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String>
     loaded
 }
 
+/// Return only canonical, browser-only discovery results. The full result in
+/// Session history remains the authority for admission; callers may replace a
+/// matching provider-visible copy when the browser schema is already present
+/// in that request's top-level tool catalog.
+pub(in crate::runtime::runner) fn legacy_browser_loaded_result_content(
+    session: &Session,
+) -> BTreeMap<String, String> {
+    validated_sticky_fallback_results(session)
+        .into_iter()
+        .filter(|message| {
+            let canonical_browser_only = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata["canonical_new_names"].as_array())
+                .is_some_and(|names| names.len() == 1 && names[0].as_str() == Some("browser"));
+            let browser_definition_only =
+                sticky_result_definition_values(message).is_some_and(|definitions| {
+                    definitions.len() == 1
+                        && sticky_definition_name(&definitions[0]) == Some("browser")
+                });
+            canonical_browser_only && browser_definition_only
+        })
+        .map(|message| (message.id.clone(), message.content.clone()))
+        .collect()
+}
+
+pub(in crate::runtime::runner) fn legacy_browser_needs_discovery(
+    session: &Session,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    required_tool: Option<&str>,
+) -> bool {
+    required_tool != Some("browser")
+        && tool_schemas
+            .iter()
+            .any(|schema| schema.function.name == "browser")
+        && !validated_sticky_fallback_loaded_tool_names(session)
+            .iter()
+            .any(|name| name == "browser")
+}
+
 fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
     validated_sticky_fallback_results(session)
         .into_iter()
@@ -506,6 +579,7 @@ async fn commit_sticky_fallback_discovery_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    browser_only: bool,
 ) -> Result<(), AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -559,17 +633,22 @@ async fn commit_sticky_fallback_discovery_round(
             serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
                 .map_err(|error| format!("invalid discovery arguments: {error}"));
         let definitions = match discovery_result {
-            Ok(request) => match CompleteCapabilityDiscovery::new(session, config, tool_schemas)
-                .await
-                .and_then(|discovery| discovery.discover_complete_schemas(&request))
-            {
-                Ok(schemas) => {
-                    sticky_fallback_definition_delta(session, &schemas).map_err(|error| {
-                        format!("discovered tool definitions could not be serialized: {error}")
-                    })
+            Ok(request) => {
+                match CompleteCapabilityDiscovery::new(session, config, tool_schemas, browser_only)
+                    .await
+                    .and_then(|discovery| discovery.discover_complete_schemas(&request))
+                {
+                    Ok(mut schemas) => {
+                        if browser_only {
+                            schemas.retain(|schema| schema.function.name == "browser");
+                        }
+                        sticky_fallback_definition_delta(session, &schemas).map_err(|error| {
+                            format!("discovered tool definitions could not be serialized: {error}")
+                        })
+                    }
+                    Err(error) => Err(error.to_string()),
                 }
-                Err(error) => Err(error.to_string()),
-            },
+            }
             Err(error) => Err(error),
         };
         match definitions {
@@ -633,7 +712,7 @@ async fn build_openai_client_tool_search_outputs(
     provider_items: &[ProviderTranscriptItem],
 ) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
     let requests = openai_client_tool_search_requests(provider_items)?;
-    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas).await?;
+    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas, false).await?;
     let mut outputs = Vec::with_capacity(requests.len());
     for (call_id, request) in requests {
         let tools = discovery
@@ -3163,7 +3242,11 @@ async fn run_pipeline_inner(
             let capability_loading_mode = llm
                 .capability_loading_mode(&state.model_name, required_tool)
                 .await;
-            if capability_loading_mode == CapabilityLoadingMode::StickyFallback
+            let legacy_browser_discovery = capability_loading_mode
+                == CapabilityLoadingMode::LegacyFullCatalog
+                && legacy_browser_needs_discovery(session, &tool_schemas, required_tool);
+            if (capability_loading_mode == CapabilityLoadingMode::StickyFallback
+                || legacy_browser_discovery)
                 && stream_output.tool_calls.iter().any(|call| {
                     call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
                 })
@@ -3173,6 +3256,7 @@ async fn run_pipeline_inner(
                     session,
                     config,
                     &tool_schemas,
+                    legacy_browser_discovery,
                 )
                 .await
                 {
@@ -3822,6 +3906,7 @@ mod tests {
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
+    use bamboo_skills::{SkillManager, SkillStoreConfig};
     use chrono::Utc;
     use futures::stream;
     use std::collections::HashMap;
@@ -4271,6 +4356,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_browser_discovery_loads_only_this_chats_browser() {
+        let mut browser = loading_test_schema_with_description(
+            "browser",
+            "Operate the browser page shared with this chat",
+        );
+        browser.function.parameters = serde_json::json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["navigate","snapshot","click","fill","press","scroll","screenshot"]},
+                "url":{"type":"string"},
+                "selector":{"type":"string"},
+                "text":{"type":"string"},
+                "expected_epoch":{"type":"integer"}
+            },
+            "required":["action"],
+            "additionalProperties":false
+        });
+        let tools = vec![
+            loading_test_schema_with_description("Read", "Read files"),
+            loading_test_schema_with_description("Glob", "Find paths"),
+            browser.clone(),
+        ];
+        let provider: Arc<dyn LLMProvider> = Arc::new(StubProvider);
+        let mut first_chat = Session::new("browser-chat-a", "chat-model");
+        let mut second_chat = Session::new("browser-chat-b", "chat-model");
+
+        let initial = crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+            &first_chat,
+            &provider,
+            "chat-model",
+            &tools,
+        )
+        .await;
+        assert!(initial.iter().all(|tool| tool.function.name != "browser"));
+        assert!(initial
+            .iter()
+            .any(|tool| tool.function.name == "discover_capabilities"));
+        assert_eq!(initial[1].function.name, "Glob");
+        let initial_bytes = serde_json::to_vec(initial.as_ref()).unwrap().len();
+        let full_bytes = serde_json::to_vec(&tools).unwrap().len();
+        assert!(
+            initial_bytes < full_bytes,
+            "initial projection should be smaller: {initial_bytes} vs {full_bytes} bytes"
+        );
+        let first_before = effective_callable_set_for_round(
+            &first_chat,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        );
+        assert!(first_before.contains_execution_name("Glob"));
+        assert!(!first_before.contains_execution_name("browser"));
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "browser-search-a",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"browser","kinds":["tool"],"limit":1}"#,
+            )),
+            &mut first_chat,
+            &AgentLoopConfig::default(),
+            &tools,
+            true,
+        )
+        .await
+        .unwrap();
+        let loaded = first_chat.messages.last().unwrap();
+        let definitions = sticky_result_definition_values(loaded).unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0]["function"]["name"], "browser");
+        assert_eq!(
+            definitions[0]["function"]["parameters"],
+            browser.function.parameters
+        );
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&first_chat),
+            vec!["browser"]
+        );
+        let first_after = effective_callable_set_for_round(
+            &first_chat,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        );
+        assert!(first_after.contains_execution_name("browser"));
+        let resumed: Session =
+            serde_json::from_value(serde_json::to_value(&first_chat).unwrap()).unwrap();
+        assert!(effective_callable_set_for_round(
+            &resumed,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .contains_execution_name("browser"));
+        let loaded_projection =
+            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                &first_chat,
+                &provider,
+                "chat-model",
+                &tools,
+            )
+            .await;
+        assert_eq!(
+            serde_json::to_value(loaded_projection.as_ref()).unwrap(),
+            serde_json::to_value(&tools).unwrap()
+        );
+
+        let second_before = effective_callable_set_for_round(
+            &second_chat,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        );
+        assert!(!second_before.contains_execution_name("browser"));
+        let second_projection =
+            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                &second_chat,
+                &provider,
+                "chat-model",
+                &tools,
+            )
+            .await;
+        assert!(second_projection
+            .iter()
+            .all(|tool| tool.function.name != "browser"));
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "unrelated-search-b",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"paths","kinds":["tool"],"limit":1}"#,
+            )),
+            &mut second_chat,
+            &AgentLoopConfig::default(),
+            &tools,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            sticky_result_definition_values(second_chat.messages.last().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        second_chat.add_message(Message::assistant(
+            "",
+            Some(vec![activation_call("ordinary-browser", "browser", "{}")]),
+        ));
+        second_chat.add_message(Message::tool_result_with_status(
+            "ordinary-browser",
+            format!(
+                "<loaded_tools>{}</loaded_tools>",
+                serde_json::json!({"tools":[serde_json::to_value(&browser).unwrap()]})
+            ),
+            true,
+        ));
+        assert!(validated_sticky_fallback_loaded_tool_names(&second_chat).is_empty());
+        assert!(!effective_callable_set_for_round(
+            &second_chat,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .contains_execution_name("browser"));
+    }
+
+    struct FailingBrowserDiscoveryProjectSource {
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectContextSource for FailingBrowserDiscoveryProjectSource {
+        async fn find_project(
+            &self,
+            _project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            Err(ProjectContextError::Source(
+                "project catalog is unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_browser_discovery_ignores_failing_project_skill_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(FailingBrowserDiscoveryProjectSource {
+            lookups: AtomicUsize::new(0),
+        });
+        let config = AgentLoopConfig {
+            skill_manager: Some(Arc::new(SkillManager::with_config(SkillStoreConfig {
+                skills_dir: directory.path().join("skills"),
+                ..Default::default()
+            }))),
+            project_context_resolver: Some(Arc::new(ProjectContextResolver::new(source.clone()))),
+            ..AgentLoopConfig::default()
+        };
+        let mut session = Session::new("browser-with-broken-skill-store", "chat-model");
+        session.set_project_id_meta("browser-discovery-project".to_string());
+        let tools = vec![loading_test_schema_with_description(
+            "browser",
+            "Operate the browser page shared with this chat",
+        )];
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "browser-search-broken-store",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"browser","kinds":["tool"],"limit":1}"#,
+            )),
+            &mut session,
+            &config,
+            &tools,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&session),
+            vec!["browser"]
+        );
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+                &config, &session
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn sticky_discovery_persists_canonical_delta_and_resumes_callable_membership() {
         let mut deferred =
             loading_test_schema_with_description("ReadArchive", "Read archived repository files");
@@ -4298,6 +4612,7 @@ mod tests {
             &mut session,
             &config,
             &tools,
+            false,
         )
         .await
         .unwrap();
@@ -4379,6 +4694,7 @@ mod tests {
             &mut resumed,
             &config,
             &tools,
+            false,
         )
         .await
         .unwrap();

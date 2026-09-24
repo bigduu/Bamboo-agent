@@ -111,6 +111,12 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
         }
     };
 
+    if deleted_from_storage {
+        for id in &ids_to_cancel {
+            let _ = state.browser.retire(id).await;
+        }
+    }
+
     let removed_from_memory = {
         let mut removed = false;
         for id in ids_to_cancel.iter() {

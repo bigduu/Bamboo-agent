@@ -440,6 +440,84 @@ pub struct PermissionDecisionReceipt {
 }
 
 impl PermissionRequest {
+    /// Display surfaces must hide the private keyed identity of page scripts.
+    /// This is separate from focused input's one-shot approval policy: eval
+    /// keeps the configured BrowserInteraction decision scopes.
+    pub fn has_private_browser_resource(&self) -> bool {
+        self.permission_type == PermissionType::BrowserInteraction
+            && Self::is_private_browser_resource(&self.tool_name, &self.resource)
+    }
+
+    pub fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
+        Self::is_focused_browser_resource(tool_name, resource)
+            || Self::is_private_browser_file_resource(tool_name, resource)
+            || (tool_name
+                .trim()
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser_eval"))
+                && resource.starts_with("browser_eval:"))
+    }
+
+    /// Browser file bytes use a keyed resource fingerprint. Presentation and
+    /// logging surfaces must never expose that fingerprint or the original
+    /// payload, while the authoritative request retains it for exact replay.
+    pub fn is_private_browser_file_resource(tool_name: &str, resource: &str) -> bool {
+        if !tool_name
+            .trim()
+            .rsplit("::")
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        {
+            return false;
+        }
+        let mut parts = resource.splitn(4, ':');
+        parts.next() == Some("browser")
+            && parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+            && parts.next() == Some("set_file_input")
+            && parts.next().is_some_and(|rest| rest.starts_with("upload:"))
+    }
+
+    /// Recover the focus-bound keyboard boundary from the server-generated
+    /// resource when validating a persisted approval request after restart.
+    pub fn is_focused_browser_input(&self) -> bool {
+        if self.permission_type != PermissionType::BrowserInteraction {
+            return false;
+        }
+        Self::is_focused_browser_resource(&self.tool_name, &self.resource)
+    }
+
+    /// Child approval snapshots carry a tool name and resource, but not a
+    /// typed permission request. Use the same focused-input boundary when
+    /// presenting either approval surface.
+    pub fn is_focused_browser_resource(tool_name: &str, resource: &str) -> bool {
+        if !tool_name.eq_ignore_ascii_case("browser") {
+            return false;
+        }
+        let mut parts = resource.splitn(4, ':');
+        if parts.next() != Some("browser")
+            || !parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+        {
+            return false;
+        }
+        match (parts.next(), parts.next()) {
+            (Some("type" | "key"), Some(_)) => true,
+            (Some("press"), Some("page")) => true,
+            (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
+            (Some("dialog_respond"), Some(rest)) => rest.split(':').next().is_some_and(|id| {
+                id.len() == 24
+                    && id
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }),
+            _ => false,
+        }
+    }
+
     pub fn fresh_generation() -> String {
         uuid::Uuid::new_v4().to_string()
     }
@@ -525,6 +603,7 @@ pub fn conservative_matchers(
                 }
             }
         }
+        PermissionType::BrowserInteraction => {}
     }
 
     matchers.retain(|matcher| matcher.validate(permission_type).is_ok());
