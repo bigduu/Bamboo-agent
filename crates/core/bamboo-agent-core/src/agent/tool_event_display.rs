@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use bamboo_domain::{AgentHookPoint, HookResult};
 use serde_json::{json, Value};
 
 use super::events::AgentEvent;
@@ -75,6 +76,33 @@ fn safe_download_arguments(arguments: &Value) -> Value {
         display["expected_epoch"] = json!(epoch);
     }
     display
+}
+
+fn hidden_hook_result(result: HookResult, depth: usize) -> HookResult {
+    if depth >= 8 {
+        return HookResult::Deny {
+            reason: "Hook result hidden".into(),
+        };
+    }
+    match result {
+        HookResult::Deny { .. } => HookResult::Deny {
+            reason: "Hook reason hidden".into(),
+        },
+        HookResult::InjectContext { .. } => HookResult::InjectContext {
+            text: "Hook context hidden".into(),
+        },
+        HookResult::WithContext { result, .. } => HookResult::WithContext {
+            result: Box::new(hidden_hook_result(*result, depth + 1)),
+            text: "Hook context hidden".into(),
+        },
+        HookResult::Suspend { .. } => HookResult::Suspend {
+            reason: "Hook reason hidden".into(),
+        },
+        HookResult::Abort { .. } => HookResult::Abort {
+            reason: "Hook reason hidden".into(),
+        },
+        other => other,
+    }
 }
 
 impl NativeToolEventDisplay {
@@ -247,6 +275,40 @@ impl NativeToolEventDisplay {
                             "Tool error hidden".to_string()
                         }
                     }),
+                }
+            }
+            AgentEvent::HookLifecycle {
+                hook_name,
+                point,
+                phase,
+                duration_ms,
+                decision,
+            } => {
+                if !matches!(
+                    point,
+                    AgentHookPoint::BeforeToolExecution | AgentHookPoint::AfterToolExecution
+                ) {
+                    return AgentEvent::HookLifecycle {
+                        hook_name,
+                        point,
+                        phase,
+                        duration_ms,
+                        decision,
+                    };
+                }
+                // Tool hooks carry no call ID. A dropped browser ToolStart can
+                // coexist with an unrelated Read, so active calls cannot
+                // authorize any free text in this outward event.
+                AgentEvent::HookLifecycle {
+                    hook_name: "Tool hook hidden".into(),
+                    point,
+                    phase: if phase == "completed" {
+                        phase
+                    } else {
+                        "hidden".into()
+                    },
+                    duration_ms,
+                    decision: hidden_hook_result(decision, 0),
                 }
             }
             other => other,
@@ -461,5 +523,134 @@ mod tests {
             matches!(display.project(complete("snapshot", "page_epoch: 17")),
             AgentEvent::ToolComplete { result, .. } if result.result == "page_epoch: 17")
         );
+    }
+
+    fn hook(point: AgentHookPoint, secret: &str, decision: HookResult) -> AgentEvent {
+        AgentEvent::HookLifecycle {
+            hook_name: format!("hook-{secret}"),
+            point,
+            phase: format!("phase-{secret}"),
+            duration_ms: 7,
+            decision,
+        }
+    }
+
+    #[test]
+    fn native_download_hook_outcomes_hide_all_free_text_before_publication() {
+        let secret = "private-download-selector-url-and-bytes";
+        let decisions = [
+            HookResult::Deny {
+                reason: secret.into(),
+            },
+            HookResult::InjectContext {
+                text: secret.into(),
+            },
+            HookResult::WithContext {
+                result: Box::new(HookResult::WithContext {
+                    result: Box::new(HookResult::Suspend {
+                        reason: secret.into(),
+                    }),
+                    text: secret.into(),
+                }),
+                text: secret.into(),
+            },
+            HookResult::Abort {
+                reason: secret.into(),
+            },
+        ];
+        let mut display = NativeToolEventDisplay::default();
+        display.project(start(
+            "download",
+            &format!("{secret}::browser"),
+            json!({"action":"download","selector":secret,"expected_epoch":17}),
+        ));
+        for point in [
+            AgentHookPoint::BeforeToolExecution,
+            AgentHookPoint::AfterToolExecution,
+        ] {
+            for decision in &decisions {
+                let original = hook(point, secret, decision.clone());
+                let projected = display.project(original.clone());
+                let wire = serde_json::to_string(&projected).unwrap();
+                assert!(
+                    !wire.contains(secret),
+                    "private hook text reached the display event"
+                );
+                assert!(wire.contains("Tool hook hidden"));
+                assert!(serde_json::to_string(&original).unwrap().contains(secret));
+            }
+        }
+        let nested = display.project(hook(
+            AgentHookPoint::AfterToolExecution,
+            secret,
+            HookResult::WithContext {
+                result: Box::new(HookResult::Deny {
+                    reason: secret.into(),
+                }),
+                text: secret.into(),
+            },
+        ));
+        assert!(matches!(nested,
+            AgentEvent::HookLifecycle {
+                decision: HookResult::WithContext { result, .. }, ..
+            } if matches!(*result, HookResult::Deny { .. })));
+    }
+
+    #[test]
+    fn unkeyed_tool_hooks_hide_text_even_with_only_read_visible() {
+        let secret = "private-hook-reason";
+        let mut display = NativeToolEventDisplay::default();
+        let make_hook = || {
+            hook(
+                AgentHookPoint::BeforeToolExecution,
+                secret,
+                HookResult::Deny {
+                    reason: secret.into(),
+                },
+            )
+        };
+        let missing = display.project(make_hook());
+        assert!(!serde_json::to_string(&missing).unwrap().contains(secret));
+
+        display.project(start("read", "Read", json!({"path":"readme.md"})));
+        // The browser ToolStart could have been dropped while Read remains
+        // visible. HookLifecycle has no call ID to disprove that case.
+        let dropped_browser_start = display.project(make_hook());
+        assert!(!serde_json::to_string(&dropped_browser_start)
+            .unwrap()
+            .contains(secret));
+        let ordinary_result = display.project(complete("read", "ordinary Read result"));
+        assert!(matches!(ordinary_result,
+            AgentEvent::ToolComplete { result, .. } if result.result == "ordinary Read result"));
+        display.project(start("download", "browser", json!({"action":"download"})));
+        let overlap = display.project(make_hook());
+        assert!(!serde_json::to_string(&overlap).unwrap().contains(secret));
+
+        display.project(AgentEvent::RunnerProgress {
+            session_id: "chat".into(),
+            round_count: 2,
+        });
+        display.project(start("reused", "Read", json!({"path":"readme.md"})));
+        display.project(complete("reused", "ordinary"));
+        display.project(start("reused", "Read", json!({"path":"readme.md"})));
+        let reused = display.project(make_hook());
+        assert!(!serde_json::to_string(&reused).unwrap().contains(secret));
+
+        display.project(AgentEvent::RunnerProgress {
+            session_id: "chat".into(),
+            round_count: 3,
+        });
+        display.project(start("reused", "Read", json!({"path":"readme.md"})));
+        let next_round = display.project(make_hook());
+        assert!(!serde_json::to_string(&next_round).unwrap().contains(secret));
+
+        let unrelated = display.project(hook(
+            AgentHookPoint::AfterRound,
+            secret,
+            HookResult::Deny {
+                reason: secret.into(),
+            },
+        ));
+        assert!(serde_json::to_string(&unrelated).unwrap().contains(secret));
     }
 }
