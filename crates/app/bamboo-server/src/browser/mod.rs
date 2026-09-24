@@ -58,6 +58,8 @@ pub struct BrowserManager {
 
 struct BrowserSession {
     child: Mutex<Child>,
+    /// Owns the host's TMPDIR, including Chromium's download scratch files.
+    temp_dir: Mutex<Option<tempfile::TempDir>>,
     #[cfg(unix)]
     process_group: Option<i32>,
     stdin: AsyncMutex<ChildStdin>,
@@ -187,6 +189,18 @@ impl BrowserSession {
         let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         restrict_host_environment(&mut command);
+        let temp_dir = tempfile::Builder::new()
+            .prefix("bamboo-browser-session-")
+            .tempdir()
+            .map_err(|_| {
+                BrowserError::Unavailable("unable to create browser temporary directory".into())
+            })?;
+        command.env("TMPDIR", temp_dir.path());
+        // Node's os.tmpdir() uses TEMP/TMP on Windows. The host also receives
+        // this owned path explicitly for its download directory.
+        command.env("TEMP", temp_dir.path());
+        command.env("TMP", temp_dir.path());
+        command.env("BAMBOO_BROWSER_DOWNLOAD_ROOT", temp_dir.path());
         command
             .arg(script)
             .stdin(Stdio::piped())
@@ -198,7 +212,7 @@ impl BrowserSession {
         let child = command
             .spawn()
             .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
-        let session = Self::from_child(child)?;
+        let session = Self::from_child(child, Some(temp_dir))?;
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
@@ -211,7 +225,10 @@ impl BrowserSession {
         Ok(session)
     }
 
-    fn from_child(mut child: Child) -> Result<Arc<Self>, BrowserError> {
+    fn from_child(
+        mut child: Child,
+        temp_dir: Option<tempfile::TempDir>,
+    ) -> Result<Arc<Self>, BrowserError> {
         #[cfg(unix)]
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child
@@ -226,6 +243,7 @@ impl BrowserSession {
         let (shutdown, _) = watch::channel(false);
         let session = Arc::new(Self {
             child: Mutex::new(child),
+            temp_dir: Mutex::new(temp_dir),
             #[cfg(unix)]
             process_group,
             stdin: AsyncMutex::new(stdin),
@@ -402,6 +420,7 @@ impl BrowserSession {
         self.mark_dead(reason);
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
+            self.cleanup_temp_dir().await;
             return;
         }
         self.signal_stop();
@@ -423,6 +442,35 @@ impl BrowserSession {
             self.reaped.store(true, Ordering::Release);
         } else {
             tracing::warn!("browser host did not exit after process termination");
+        }
+        self.cleanup_temp_dir().await;
+    }
+
+    async fn cleanup_temp_dir(&self) {
+        let temp_dir = { self.temp_dir.lock().unwrap().take() };
+        if let Some(temp_dir) = temp_dir {
+            let path = temp_dir.path().to_path_buf();
+            let close_error = match temp_dir.close() {
+                Ok(()) => return,
+                Err(error) => error,
+            };
+            let mut retry_error = close_error.to_string();
+            let mut retry_kind = close_error.kind();
+            // Chromium descendants can still finish exiting after the Node
+            // parent is reaped. Retry the owned directory, never another TMPDIR.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => {
+                        retry_kind = error.kind();
+                        retry_error = error.to_string();
+                    }
+                }
+            }
+            tracing::warn!(%close_error, %retry_error, ?retry_kind,
+                "failed to remove browser temporary directory after host retirement");
         }
     }
 
@@ -545,6 +593,7 @@ mod tests {
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
             child: Mutex::new(child),
+            temp_dir: Mutex::new(None),
             process_group,
             stdin: AsyncMutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -575,7 +624,7 @@ mod tests {
             command.env(name, path);
         }
         command.process_group(0);
-        BrowserSession::from_child(command.spawn().unwrap()).unwrap()
+        BrowserSession::from_child(command.spawn().unwrap(), None).unwrap()
     }
 
     #[cfg(unix)]
@@ -987,6 +1036,64 @@ mod tests {
         .expect("cancelled input host should be retired");
         assert!(!session.alive.load(Ordering::Acquire));
         assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn chromium_temporary_download_directory_is_removed_on_close_and_timeout() {
+        let unrelated = tempfile::tempdir().unwrap();
+        let sentinel = unrelated.path().join("unrelated-tempdir-sentinel");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        for (session_id, timed_out) in [
+            ("close-download-temp", false),
+            ("timeout-download-temp", true),
+        ] {
+            let browser = BrowserManager::default();
+            browser.open(session_id).await.unwrap();
+            let session = browser.sessions.lock().await[session_id].clone();
+            let owned_temp = session
+                .temp_dir
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .path()
+                .to_path_buf();
+            assert!(owned_temp.is_dir());
+            assert!(
+                std::fs::read_dir(&owned_temp).unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("bamboo-browser-download-")),
+                "Chromium download directory must be inside the session-owned TMPDIR"
+            );
+
+            if timed_out {
+                let result = browser
+                    .command_with_deadline(session_id, "state", json!({}), Duration::ZERO)
+                    .await;
+                assert!(
+                    matches!(result, Err(BrowserError::Failed(message)) if message.contains("timed out"))
+                );
+                assert!(session.kill_issued.load(Ordering::Acquire));
+                assert!(!browser.sessions.lock().await.contains_key(session_id));
+            } else {
+                browser.close(session_id).await.unwrap();
+            }
+            assert!(session.reaped.load(Ordering::Acquire));
+            assert!(session.temp_dir.lock().unwrap().is_none());
+            assert!(
+                !owned_temp.exists(),
+                "session close must remove its download scratch directory"
+            );
+            assert!(
+                sentinel.is_file(),
+                "another temporary directory must remain untouched"
+            );
+        }
     }
 
     #[cfg(unix)]

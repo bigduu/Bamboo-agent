@@ -28,9 +28,13 @@ test("routine dev pull requests run one locked Rust build-and-test gate", () => 
   const testJob = job("test")
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(testJob, /run: cargo test --locked\n/u)
+  assert.match(
+    testJob,
+    /- name: Setup Node\.js\n        uses: actions\/setup-node@v7\n        with:\n          node-version: lts\/\*/u,
+    "Node must be installed before Rust hook tests on dev pull requests",
+  )
 
   for (const name of [
-    "Setup Node.js",
     "Test frontend artifact and release policies",
     "Stage frontend package",
     "Verify published server crate owns the frontend package",

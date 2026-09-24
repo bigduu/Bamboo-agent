@@ -9,6 +9,7 @@ pub(crate) mod scenarios;
 pub(crate) mod tee;
 
 use super::per_call::ToolExecutionOutcome;
+use bamboo_agent_core::tools::parse_tool_args_best_effort;
 
 // ── Context Pressure ─────────────────────────────────────────────────────────
 
@@ -417,6 +418,40 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens {
+            let browser_download = tool_name
+                .trim()
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+                && parse_tool_args_best_effort(args_json)
+                    .0
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("download");
+            if result.success
+                && browser_download
+                && serde_json::from_str::<serde_json::Value>(&result.result)
+                    .ok()
+                    .is_some_and(|payload| {
+                        payload
+                            .get("data_base64")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                    })
+            {
+                // A generic textual truncation corrupts the Base64 and can
+                // leave a successful download with invalid JSON. The bytes
+                // have already been cleaned up by the host, so report a
+                // bounded failure and let the model request a smaller file.
+                result.success = false;
+                result.result = serde_json::json!({
+                    "error":"download_result_exceeds_tool_output_budget",
+                    "message":"Browser download bytes exceed the configured tool output token budget",
+                    "limit_tokens":max_tool_output_tokens,
+                })
+                .to_string();
+                return outcome;
+            }
             let truncated = truncate_to_token_budget(
                 &result.result,
                 max_tool_output_tokens,
@@ -621,7 +656,126 @@ fn compress_by_scenario(
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::{ToolPolicyGuard, ToolPolicyPrecheckViolation};
     use super::*;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
+
+    #[tokio::test]
+    async fn browser_download_over_tool_budget_returns_valid_no_bytes_failure() {
+        let raw = serde_json::json!({
+            "page_epoch":17,
+            "active_tab_id":"tab-1",
+            "url":"https://example.test/",
+            "filename":"archive.bin",
+            "byte_count":12288,
+            "sha256":"a".repeat(64),
+            "data_base64":"QUJD".repeat(4096),
+        })
+        .to_string();
+        let args = r##"{"action":"download","selector":"#link","expected_epoch":17}"##;
+        let outcome = || ToolExecutionOutcome {
+            permission_replay_origin: None,
+            result: Ok(ToolResult::text(true, raw.clone())),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        for tool_name in ["browser", "default::browser"] {
+            for arguments in [
+                args,
+                r##"{"action":"download","selector":"#link","expected_epoch":17"##,
+            ] {
+                let output = maybe_compress(
+                    tool_name,
+                    arguments,
+                    "test-session",
+                    outcome(),
+                    128,
+                    None,
+                    None,
+                )
+                .await;
+                let result = output.result.unwrap();
+                assert!(
+                    !result.success,
+                    "an over-budget download must not look successful"
+                );
+                let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_eq!(
+                    payload["error"],
+                    "download_result_exceeds_tool_output_budget"
+                );
+                assert_eq!(payload["limit_tokens"], 128);
+                assert!(payload.get("data_base64").is_none());
+            }
+        }
+
+        let unlimited = maybe_compress("browser", args, "test-session", outcome(), 0, None, None)
+            .await
+            .result
+            .unwrap();
+        assert!(unlimited.success);
+        assert_eq!(unlimited.result, raw);
+
+        let other_action = maybe_compress(
+            "browser",
+            r#"{"action":"snapshot"}"#,
+            "test-session",
+            outcome(),
+            128,
+            None,
+            None,
+        )
+        .await
+        .result
+        .unwrap();
+        assert!(other_action.success);
+        assert_ne!(other_action.result, raw);
+    }
+
+    #[tokio::test]
+    async fn over_budget_downloads_open_the_three_failure_circuit() {
+        let args = r##"{"action":"download","selector":"#link","expected_epoch":17"##;
+        let call = ToolCall {
+            id: "download-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "default::browser".into(),
+                arguments: args.into(),
+            },
+        };
+        let mut guard = ToolPolicyGuard::default();
+        for _ in 0..3 {
+            guard.check_before_execution(&call, 0).unwrap();
+            let raw = serde_json::json!({ "data_base64": "QUJD".repeat(4096) }).to_string();
+            let outcome = ToolExecutionOutcome {
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(true, raw)),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                tool_duration: std::time::Duration::ZERO,
+            };
+            let compressed = maybe_compress(
+                "default::browser",
+                args,
+                "test-session",
+                outcome,
+                128,
+                None,
+                None,
+            )
+            .await;
+            assert!(!compressed.result.as_ref().unwrap().success);
+            guard.observe_outcome(&call, &compressed.result);
+        }
+        assert!(matches!(
+            guard.check_before_execution(&call, 0),
+            Err(ToolPolicyPrecheckViolation::ToolCircuitOpen {
+                consecutive_failures: 3,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn detect_cargo_test() {

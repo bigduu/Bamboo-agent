@@ -2,7 +2,11 @@
 // One host process owns one isolated Chromium context and a bounded tab set. Bamboo is the
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
-const { randomBytes } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
+const { rmSync } = require('node:fs');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 
 const MAX_SNAPSHOT_CHARS = 80_000;
@@ -10,6 +14,23 @@ const MAX_HTML_CHARS = 100_000;
 const MAX_TABS = 8;
 // Rust retires this host after 30 seconds. Leave time for state() and stdio.
 const POINTER_ACTION_BUDGET_MS = 22_000;
+// Bound returned bytes, not OS disk usage: Chromium may buffer a chunk before
+// its next progress event lets us cancel an oversized transfer.
+const MAX_DOWNLOAD_BYTES = 256 * 1024;
+const DOWNLOAD_ACTION_BUDGET_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(20_000, Math.max(100, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS) || 20_000))
+  : 20_000;
+const TEST_DOWNLOAD_CLEANUP_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(5_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS) || 0))
+  : 0;
+const TEST_DOWNLOAD_CLICK_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS) || 0))
+  : 0;
+const TEST_PRIVATE_PAGE_FAILURE = process.env.NODE_ENV === 'test'
+  ? process.env.BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE : '';
+const TEST_RETIRE_CLOSE_DELAY_MS = process.env.NODE_ENV === 'test'
+  ? Math.min(1_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS) || 0))
+  : 0;
 // The packaged host does not inherit NODE_ENV. Direct host tests can pause
 // observer setup to force a navigation between the first and final epoch checks.
 const TEST_OBSERVER_SETUP_DELAY_MS = process.env.NODE_ENV === 'test'
@@ -30,6 +51,9 @@ const MAX_EVAL_JSON_BYTES = 64 * 1024;
 const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
 const SCRIPT_BLOB_KEY = `__bamboo_blob_${randomBytes(16).toString('hex')}`;
 const SCRIPT_BLOB_SECRET = randomBytes(24).toString('hex');
+const DOWNLOAD_LINK_KEY = `__bamboo_link_${randomBytes(16).toString('hex')}`;
+const DOWNLOAD_LINK_SECRET = randomBytes(24).toString('hex');
+
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -47,6 +71,15 @@ let browserClosed = false;
 let pendingDialog;
 let inFlightAction;
 const dialogWaiters = new Set();
+let retireAfterReply = false;
+let downloadCdp;
+let downloadContextId;
+let downloadDir;
+let activeDownloadAttempt;
+let transientPageCreation;
+const transientPages = new WeakSet();
+const orphanDownloads = new Set();
+let downloadSweep = Promise.resolve();
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -694,6 +727,92 @@ function installScriptBlobCapture({ key, secret }) {
   define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
 }
 
+// Resolve the approved CSS link with pristine DOM methods. Playwright's
+// ElementHandle.evaluate can be intercepted by a site's window.eval, even
+// after CDP disables page scripts, so it cannot authorize a download URL.
+function installDownloadLinkInspector({ key, secret }) {
+  const root = globalThis;
+  const document = root.document;
+  const apply = Reflect.apply;
+  const define = Object.defineProperty;
+  const create = Object.create;
+  const stringify = JSON.stringify;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const getPrototypeOf = Object.getPrototypeOf;
+  const hasOwn = Object.hasOwn;
+  const evalDescriptor = getDescriptor(root, 'eval');
+  const nativeEval = evalDescriptor?.value;
+  const queryPath = [];
+  let queryOwner = document;
+  while (queryOwner && !getDescriptor(queryOwner, 'querySelectorAll')) {
+    queryPath.push(queryOwner);
+    queryOwner = getPrototypeOf(queryOwner);
+  }
+  const querySelectorAll = queryOwner && getDescriptor(queryOwner, 'querySelectorAll')?.value;
+  const nodeListLength = getDescriptor(NodeList.prototype, 'length').get;
+  const nodeListItem = NodeList.prototype.item;
+  const getAttribute = Element.prototype.getAttribute;
+  const anchorHref = getDescriptor(HTMLAnchorElement.prototype, 'href').get;
+  const contains = Node.prototype.contains;
+  const unverifiable = '{"status":"unverifiable"}';
+  let observed;
+  const pristineMethods = () => {
+    const currentEval = getDescriptor(root, 'eval');
+    if (!currentEval || !hasOwn(currentEval, 'value') || currentEval.value !== nativeEval ||
+        typeof nativeEval !== 'function') return false;
+    let owner = document;
+    for (const expected of queryPath) {
+      if (owner !== expected || getDescriptor(owner, 'querySelectorAll')) return false;
+      owner = getPrototypeOf(owner);
+    }
+    const currentQuery = owner && getDescriptor(owner, 'querySelectorAll');
+    return owner === queryOwner && currentQuery && hasOwn(currentQuery, 'value') &&
+      currentQuery.value === querySelectorAll && typeof querySelectorAll === 'function';
+  };
+  const inspect = (operation, suppliedSecret, selector) => {
+    if (suppliedSecret !== secret || !pristineMethods()) {
+      return unverifiable;
+    }
+    if (operation === 'matches') {
+      return observed && selector === observed.element &&
+        apply(contains, document, [selector]) ? '{"status":"matched"}' : unverifiable;
+    }
+    if ((operation !== 'inspect' && operation !== 'confirm') ||
+        typeof selector !== 'string' || !selector || selector.length > 512) {
+      return unverifiable;
+    }
+    if (operation === 'inspect') observed = undefined;
+    try {
+      const matches = apply(querySelectorAll, document, [selector]);
+      if (apply(nodeListLength, matches, []) !== 1) return unverifiable;
+      const element = apply(nodeListItem, matches, [0]);
+      if (!element || !apply(contains, document, [element])) return unverifiable;
+      const rawHref = apply(getAttribute, element, ['href']);
+      const download = apply(getAttribute, element, ['download']);
+      const href = apply(anchorHref, element, []);
+      if (typeof rawHref !== 'string' || !rawHref.trim() || rawHref.length > 2_048 ||
+          typeof href !== 'string' || href.length > 2_048 ||
+          (download !== null && (typeof download !== 'string' || download.length > 180))) {
+        return unverifiable;
+      }
+      if (operation === 'confirm') {
+        if (!observed || observed.selector !== selector || observed.element !== element ||
+            observed.rawHref !== rawHref || observed.href !== href ||
+            observed.download !== download) return unverifiable;
+      } else {
+        observed = { selector, element, rawHref, href, download };
+      }
+      const result = apply(create, Object, [null]);
+      result.status = 'ok';
+      result.href = href;
+      result.download = download;
+      return apply(stringify, JSON, [result]);
+    } catch { return unverifiable; }
+  };
+  define(root, key, { value: inspect, enumerable: false, configurable: false, writable: false });
+
+}
+
 function validateEvalResult(value) {
   // The pre-document helper transfers a bounded JSON primitive. Validate its
   // parsed value again with trusted Node intrinsics before returning it.
@@ -959,6 +1078,610 @@ function selectOptionArgs(args) {
     throw targetError('invalid_target', 'browser select requires 1..16 option values of at most 512 bytes each');
   }
   return args.values;
+}
+
+function downloadError(code, message) {
+  return targetError(code, message);
+}
+
+function downloadDeadline(promise, deadlineAt) {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(downloadError('download_timeout', 'browser download timed out'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(downloadError('download_timeout', 'browser download timed out')), remaining);
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+async function inspectDownloadLink(cdp, selector, operation, deadlineAt) {
+  const expression = `window[${JSON.stringify(DOWNLOAD_LINK_KEY)}](` +
+    `${JSON.stringify(operation)},${JSON.stringify(DOWNLOAD_LINK_SECRET)},` +
+    `${JSON.stringify(selector)})`;
+  let answer;
+  try {
+    answer = await downloadDeadline(cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    }), deadlineAt);
+  } catch (error) {
+    if (error?.code === 'download_timeout') throw error;
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  if (answer.exceptionDetails || answer.result?.type !== 'string' ||
+      typeof answer.result.value !== 'string' || answer.result.value.length > 4_096) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  let link;
+  try { link = JSON.parse(answer.result.value); } catch { /* Fail closed below. */ }
+  if (link?.status !== 'ok' || typeof link.href !== 'string' || link.href.length > 2_048 ||
+      (link.download !== null && (typeof link.download !== 'string' || link.download.length > 180))) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected link');
+  }
+  return link;
+}
+
+async function guardDirectDownload(attempt, cdp, nativeDownloadAttribute, deadlineAt) {
+  let requestId;
+  let responseSeen = false;
+  let failed = false;
+  let enabled = true;
+  let disablePromise;
+  const pending = new Set();
+  const reject = () => {
+    failed = true;
+    attempt.resolveUnverifiable();
+  };
+  const disable = until => {
+    if (!enabled) return Promise.resolve();
+    if (!disablePromise) {
+      cdp.off('Fetch.requestPaused', onPaused);
+      disablePromise = cdp.send('Fetch.disable').then(() => { enabled = false; });
+    }
+    return downloadDeadline(disablePromise, until);
+  };
+  const onPaused = event => {
+    const responseStage = Number.isInteger(event.responseStatusCode);
+    let allowed = !failed && attempt.accepting && event.frameId === attempt.frameId &&
+      event.resourceType === 'Document' && event.request?.method === 'GET' &&
+      event.request.url === attempt.expectedUrl;
+    if (allowed && !responseStage) {
+      allowed = !requestId && !event.redirectedRequestId;
+      if (allowed) requestId = event.requestId;
+    } else if (allowed) {
+      const headers = event.responseHeaders;
+      const contentTypes = Array.isArray(headers) ? headers.filter(header =>
+        header?.name?.toLowerCase() === 'content-type') : [];
+      const dispositions = Array.isArray(headers) ? headers.filter(header =>
+        header?.name?.toLowerCase() === 'content-disposition') : [];
+      const refresh = Array.isArray(headers) && headers.some(header =>
+        header?.name?.toLowerCase() === 'refresh');
+      const type = contentTypes.length === 1 ? contentTypes[0].value : '';
+      const disposition = dispositions.length === 1 ? dispositions[0].value : '';
+      // Only release Fetch when Chromium cannot render a document that may
+      // create child requests. Direct HTML and ambiguous inline content stay
+      // paused, then fail before the renderer sees their response bodies.
+      const nativeDownload = /^\s*attachment\s*(?:;|$)/i.test(disposition) ||
+        nativeDownloadAttribute || /^\s*application\/octet-stream\s*(?:;|$)/i.test(type);
+      allowed = !responseSeen && requestId === event.requestId &&
+        [200, 206].includes(event.responseStatusCode) && !refresh &&
+        typeof type === 'string' && type.length > 0 &&
+        !/^\s*(?:text\/html|application\/xhtml\+xml)\s*(?:;|$)/i.test(type) && nativeDownload;
+      if (allowed) responseSeen = true;
+    }
+    if (!allowed) reject();
+    const method = !allowed ? 'Fetch.failRequest' :
+      responseStage ? 'Fetch.continueResponse' : 'Fetch.continueRequest';
+    const params = method === 'Fetch.failRequest'
+      ? { requestId: event.requestId, errorReason: 'BlockedByClient' }
+      : { requestId: event.requestId };
+    const terminal = allowed && responseStage;
+    const continuation = downloadDeadline(cdp.send(method, params), deadlineAt)
+      .then(async () => {
+        if (terminal && !failed) {
+          await disable(deadlineAt);
+          attempt.resolveVerified();
+        }
+      })
+      .catch(reject).finally(() => pending.delete(continuation));
+    pending.add(continuation);
+  };
+  cdp.on('Fetch.requestPaused', onPaused);
+  try {
+    await downloadDeadline(cdp.send('Fetch.enable', { patterns: [
+      { urlPattern: '*', requestStage: 'Request' },
+      { urlPattern: '*', requestStage: 'Response' },
+    ] }), deadlineAt);
+  } catch (error) {
+    cdp.off('Fetch.requestPaused', onPaused);
+    throw error;
+  }
+  return async cleanupDeadlineAt => {
+    cdp.off('Fetch.requestPaused', onPaused);
+    // Closing the private target tears down its Fetch domain. Sending
+    // Fetch.disable afterward fails because the CDP session is detached.
+    if (attempt.page?.isClosed()) return;
+    await disable(cleanupDeadlineAt);
+    await downloadDeadline(Promise.all(pending), cleanupDeadlineAt);
+  };
+}
+
+async function createTransientDownloadPage(deadlineAt) {
+  // Hold page events until the private newPage identity is known.
+  const creation = { observed: [], page: null };
+  transientPageCreation = creation;
+  const pending = Promise.resolve().then(async () => {
+    const page = await context.newPage();
+    if (TEST_PRIVATE_PAGE_FAILURE === 'reject') throw new Error('private page setup failed');
+    if (TEST_PRIVATE_PAGE_FAILURE === 'timeout') await new Promise(resolve => setTimeout(resolve, 6_000));
+    return page;
+  });
+  let failed = false;
+  try {
+    creation.page = await downloadDeadline(pending, deadlineAt);
+    transientPages.add(creation.page);
+    return creation.page;
+  } catch (error) {
+    // An emitted page without proven identity must never enter shared tabs.
+    failed = true;
+    shuttingDown = true;
+    retireAfterReply = true;
+    void pending.then(page => page.close().catch(() => {})).catch(() => {});
+    throw error;
+  } finally {
+    transientPageCreation = undefined;
+    for (const page of creation.observed) {
+      if (failed) void page.close().catch(() => {});
+      else if (page !== creation.page) adoptPage(page);
+    }
+  }
+}
+
+function escapeHtmlAttribute(value) {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function cleanDownloadFilename(value) {
+  const basename = path.posix.basename(String(value || '').slice(0, 1024).replace(/\\/g, '/'))
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .trim();
+  if (!basename || basename === '.' || basename === '..') return 'download.bin';
+  let cleaned = '';
+  for (const character of basename) {
+    if (Buffer.byteLength(cleaned + character, 'utf8') > 180) break;
+    cleaned += character;
+  }
+  return cleaned || 'download.bin';
+}
+
+function cancelDownloadGuid(guid) {
+  return downloadCdp?.send('Browser.cancelDownload', {
+    guid, browserContextId: downloadContextId,
+  }).catch(() => {});
+}
+
+async function removeDownloadArtifacts(guid) {
+  // allowAndName uses the CDP guid for both the final file and its partial
+  // .crdownload file. Never use a browser-supplied path or suggested filename.
+  if (!downloadDir || !/^[a-zA-Z0-9_-]{1,128}$/.test(guid)) return;
+  await Promise.all([
+    fs.rm(path.join(downloadDir, guid), { force: true }),
+    fs.rm(path.join(downloadDir, `${guid}.crdownload`), { force: true }),
+  ]);
+}
+
+async function clearDownloadDirectory() {
+  if (!downloadDir) return;
+  const entries = await fs.readdir(downloadDir).catch(error => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  await Promise.all(entries.map(name => fs.rm(path.join(downloadDir, name), { recursive: true, force: true })));
+}
+
+async function settleDownloadDirectory(deadlineAt) {
+  // Chromium can recreate a .crdownload shortly after reporting cancellation.
+  // Do not return a reusable host until its private directory stays empty.
+  let emptySince = 0;
+  while (true) {
+    const entries = await downloadDeadline(fs.readdir(downloadDir), deadlineAt);
+    if (entries.length) {
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      emptySince = 0;
+    } else if (emptySince && Date.now() - emptySince >= 100) {
+      return;
+    } else if (!emptySince) {
+      emptySince = Date.now();
+    }
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), deadlineAt);
+  }
+}
+
+function sweepOrphanDownloads() {
+  const sweep = downloadSweep.then(async () => {
+    if (!activeDownloadAttempt) await clearDownloadDirectory();
+  });
+  downloadSweep = sweep.catch(() => {});
+  return sweep;
+}
+
+function onDownloadWillBegin(event) {
+  const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && event.frameId === attempt.frameId &&
+      event.url !== attempt.expectedUrl) {
+    // A redirect cannot be attributed without a verified request chain.
+    attempt.resolveUnverifiable();
+  }
+  if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId ||
+      event.url !== attempt.expectedUrl) {
+    cancelDownloadGuid(event.guid);
+    return;
+  }
+  attempt.guid = event.guid;
+  attempt.resolveGuid(event.guid);
+}
+
+function onDownloadProgress(event) {
+  const attempt = activeDownloadAttempt;
+  if (!attempt || event.guid !== attempt.guid) {
+    if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
+    else void removeDownloadArtifacts(event.guid).catch(() => {});
+    return;
+  }
+  if (event.state !== 'inProgress') {
+    attempt.terminal = true;
+    attempt.resolveTerminal();
+  }
+  if (event.receivedBytes > MAX_DOWNLOAD_BYTES) {
+    attempt.oversized = true;
+    cancelDownloadGuid(event.guid);
+    if (attempt.download) void attempt.download.cancel().catch(() => {});
+  }
+}
+
+function onPageDownload(page, download) {
+  const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && attempt.page === page && download.url() !== attempt.expectedUrl) {
+    attempt.resolveUnverifiable();
+  }
+  if (!attempt?.accepting || attempt.page !== page || attempt.download ||
+      download.url() !== attempt.expectedUrl) {
+    const cleanup = download.cancel().catch(() => {})
+      .then(() => download.delete().catch(() => {}));
+    orphanDownloads.add(cleanup);
+    void cleanup.finally(() => {
+      orphanDownloads.delete(cleanup);
+      void sweepOrphanDownloads().catch(() => {
+        // This directory contains only this host's browser downloads. A
+        // failed sweep must not leave unapproved bytes in a reusable session.
+        shuttingDown = true;
+        void closeHost().finally(() => process.exit(1));
+      });
+    });
+    return;
+  }
+  attempt.download = download;
+  attempt.resolveDownload(download);
+  if (attempt.oversized) void download.cancel().catch(() => {});
+}
+
+async function boundedDownload(args) {
+  const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+  // The 20-second action budget includes cancellation and artifact removal.
+  // Reserve its last slice for cleanup even when the transfer never settles.
+  const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
+  const workDeadlineAt = deadlineAt - cleanupBudget;
+  const cancelDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 2);
+  const terminalDeadlineAt = deadlineAt - Math.ceil(cleanupBudget / 4);
+  checkEpoch(args);
+  if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
+    throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
+  }
+  await downloadDeadline(downloadSweep, workDeadlineAt);
+  const tab = requireActiveTab();
+  const cdp = await downloadDeadline(tab.cdp, workDeadlineAt);
+  if (!cdp || !downloadCdp) {
+    throw downloadError('download_failed', 'browser download observer unavailable');
+  }
+  checkEpoch(args);
+  let resolveDownload;
+  let resolveGuid;
+  let resolveTerminal;
+  let resolveUnverifiable;
+  let resolveVerified;
+  let scriptsDisabled = false;
+  let transientPage;
+  let closeGuard;
+  const attempt = {
+    page: null,
+    frameId: null,
+    accepting: false,
+    download: null,
+    guid: null,
+    expectedUrl: null,
+    oversized: false,
+    terminal: false,
+    downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
+    guidPromise: new Promise(resolve => { resolveGuid = resolve; }),
+    terminalPromise: new Promise(resolve => { resolveTerminal = resolve; }),
+    unverifiablePromise: new Promise(resolve => { resolveUnverifiable = resolve; }),
+    verifiedPromise: new Promise(resolve => { resolveVerified = resolve; }),
+    resolveDownload: download => resolveDownload(download),
+    resolveGuid: guid => resolveGuid(guid),
+    resolveTerminal: () => resolveTerminal(),
+    resolveUnverifiable: () => resolveUnverifiable(),
+    resolveVerified: () => resolveVerified(),
+  };
+  activeDownloadAttempt = attempt;
+  try {
+    // Freeze page timers and handlers before resolving the selected link.
+    // Otherwise a getter invoked during target inspection could schedule a
+    // same-URL download in the gap before the native click.
+    scriptsDisabled = true;
+    await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+      workDeadlineAt);
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
+    const link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    await downloadDeadline(withPinnedTarget(args, async handle => {
+      checkEpoch(args);
+      if (await handle.ownerFrame() !== tab.page.mainFrame()) {
+        throw downloadError('download_unverifiable',
+          'browser download requires a link in the main page');
+      }
+      // The pinned ElementHandle must be the inspector's exact DOM node. Its
+      // evaluate result is used only for identity, after the helper checked
+      // that page eval is pristine; href bytes still come solely from CDP.
+      let pinnedMatch;
+      try {
+        pinnedMatch = await downloadDeadline(handle.evaluate((element, identity) =>
+          window[identity.key]('matches', identity.secret, element), {
+          key: DOWNLOAD_LINK_KEY, secret: DOWNLOAD_LINK_SECRET,
+        }), workDeadlineAt);
+      } catch (error) {
+        if (error?.code === 'download_timeout') throw error;
+      }
+      if (pinnedMatch !== '{"status":"matched"}') {
+        throw downloadError('download_unverifiable',
+          'browser download target changed before trial click');
+      }
+      try {
+        // Verify the selected element could receive a native click, without
+        // running its handlers or starting the download in the shared page.
+        await handle.click({ trial: true,
+          timeout: Math.min(1_500, pointerTimeout(workDeadlineAt)) });
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires an actionable link');
+      }
+      checkEpoch(args);
+      // The helper pins the unique DOM element and compares it after the
+      // trial click, so a replaced selector cannot authorize another href.
+      const confirmed = await inspectDownloadLink(cdp, args.selector, 'confirm', workDeadlineAt);
+      if (confirmed.href !== link.href || confirmed.download !== link.download) {
+        throw downloadError('download_unverifiable', 'browser download selected link changed');
+      }
+      let href;
+      try {
+        const resolved = new URL(link.href);
+        // Fragments never reach the HTTP request or Chromium's download URL.
+        resolved.hash = '';
+        href = resolved.href;
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      if (typeof href !== 'string' || href.length > 2_048 ||
+          !(href.startsWith('http://') || href.startsWith('https://'))) {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      try {
+        checkUrl(href);
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
+      // Download requests lack reliable Network events; use a private frame ID.
+      const sharedUrl = tab.page.url();
+      if (sharedUrl === 'about:blank') throw downloadError('download_unverifiable',
+        'browser download requires an HTTP(S) page');
+      let documentUrl;
+      try {
+        documentUrl = new URL(checkUrl(sharedUrl));
+        documentUrl.hash = '';
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires an HTTP(S) page');
+      }
+      const sourceResponse = tab.mainDocumentResponse;
+      if (!sourceResponse || tab.mainDocumentUrl !== documentUrl.href) throw downloadError(
+        'download_unverifiable', 'browser download cannot verify the source page policy');
+      const sourceHeaders = await downloadDeadline(sourceResponse.headersArray(), workDeadlineAt).catch(() => null);
+      if (!sourceHeaders || sourceHeaders.some(header =>
+        header.name.toLowerCase() === 'content-security-policy' &&
+        header.value.split(/[;,]/).some(policyDirective =>
+          policyDirective.trim().split(/\s+/, 1)[0].toLowerCase() === 'sandbox'))) {
+        throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+      }
+      transientPage = await createTransientDownloadPage(workDeadlineAt);
+      transientPage.on('download', download => onPageDownload(transientPage, download));
+      transientPage.on('framenavigated', frame => {
+        if (attempt.accepting && frame === transientPage.mainFrame()) {
+          attempt.resolveUnverifiable();
+        }
+      });
+      const privateCdp = await downloadDeadline(context.newCDPSession(transientPage), workDeadlineAt);
+      await downloadDeadline(privateCdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+        workDeadlineAt);
+      const downloadAttribute = link.download === null ? '' : ` download="${escapeHtmlAttribute(link.download)}"`;
+      const html = `<a id="bamboo-download" href="${escapeHtmlAttribute(href)}"${downloadAttribute}>Download</a>`;
+      await downloadDeadline(transientPage.route(url => url.href === documentUrl.href,
+        route => route.fulfill({
+          status: 200, contentType: 'text/html',
+          headers: { 'content-security-policy': "default-src 'none'; script-src 'none'; object-src 'none'",
+            'referrer-policy': 'no-referrer' },
+          body: html,
+        }), { times: 1 }), workDeadlineAt);
+      await downloadDeadline(transientPage.goto(documentUrl.href, {
+        waitUntil: 'domcontentloaded', timeout: pointerTimeout(workDeadlineAt),
+      }), workDeadlineAt);
+      await downloadDeadline(transientPage.route('**/*', route => {
+        const request = route.request();
+        let mainNavigation = false;
+        try {
+          mainNavigation = request.isNavigationRequest() &&
+            request.frame() === transientPage.mainFrame();
+        } catch { /* Unknown provenance is blocked. */ }
+        if (mainNavigation) {
+          return route.continue();
+        }
+        return route.abort('blockedbyclient');
+      }), workDeadlineAt);
+      const frameTree = await downloadDeadline(privateCdp.send('Page.getFrameTree'), workDeadlineAt);
+      attempt.page = transientPage;
+      attempt.frameId = frameTree.frameTree.frame.id;
+      attempt.expectedUrl = href;
+      closeGuard = await guardDirectDownload(attempt, privateCdp,
+        link.download !== null && documentUrl.origin === new URL(href).origin, workDeadlineAt);
+      checkEpoch(args);
+      if (activeTabId !== tab.id || tab.page.url() !== sharedUrl) throw staleEpochError();
+      if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),
+          workDeadlineAt);
+      }
+      attempt.accepting = true;
+      await transientPage.locator('#bamboo-download').click({
+        timeout: pointerTimeout(workDeadlineAt), noWaitAfter: true,
+      });
+    }, workDeadlineAt), workDeadlineAt);
+    const accepted = await downloadDeadline(Promise.race([
+      Promise.all([attempt.downloadPromise, attempt.guidPromise, attempt.verifiedPromise])
+        .then(([download]) => ({ download })),
+      attempt.unverifiablePromise.then(() => ({ unverifiable: true })),
+    ]), workDeadlineAt);
+    if (accepted.unverifiable) {
+      throw downloadError('download_unverifiable',
+        'browser download redirect cannot be verified');
+    }
+    const { download } = accepted;
+    if (attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    let artifact;
+    try {
+      artifact = await downloadDeadline(download.path(), workDeadlineAt);
+    } catch (error) {
+      if (attempt.oversized) {
+        throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+      }
+      if (error?.code === 'download_timeout') throw error;
+      throw downloadError('download_failed', 'browser download failed');
+    }
+    const size = await downloadDeadline(fs.stat(artifact), workDeadlineAt);
+    if (size.size > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    const bytes = await downloadDeadline(fs.readFile(artifact), workDeadlineAt);
+    if (bytes.length > MAX_DOWNLOAD_BYTES || attempt.oversized) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    checkEpoch(args);
+    if (activeTabId !== tab.id || tab.page.isClosed()) throw staleEpochError();
+    const current = await downloadDeadline(state(), workDeadlineAt);
+    checkEpoch(args);
+    if (current.active_tab_id !== tab.id) throw staleEpochError();
+    return {
+      page_epoch: current.page_epoch,
+      active_tab_id: current.active_tab_id,
+      url: current.url,
+      filename: cleanDownloadFilename(download.suggestedFilename()),
+      byte_count: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      data_base64: bytes.toString('base64'),
+    };
+  } catch (error) {
+    if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
+      'download_timeout', 'download_too_large', 'download_failed',
+      'download_unverifiable'].includes(error?.code)) {
+      throw error;
+    }
+    // Playwright errors can quote a selected URL or filename. Never forward
+    // them through the host's generic error envelope.
+    throw downloadError('download_failed', 'browser download failed');
+  } finally {
+    attempt.accepting = false;
+    let cleanupError;
+    if (scriptsDisabled) {
+      try {
+        await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: false }),
+          cancelDeadlineAt);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    const cancellation = [];
+    if (attempt.guid && !attempt.terminal) cancellation.push(cancelDownloadGuid(attempt.guid));
+    if (attempt.download && !attempt.terminal) cancellation.push(attempt.download.cancel().catch(() => {}));
+    try {
+      if (TEST_DOWNLOAD_CLEANUP_DELAY_MS && attempt.guid) {
+        await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLEANUP_DELAY_MS)),
+          cancelDeadlineAt);
+      }
+      await downloadDeadline(Promise.all(cancellation), cancelDeadlineAt);
+      if (attempt.guid && !attempt.terminal) {
+        await downloadDeadline(attempt.terminalPromise, terminalDeadlineAt);
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (attempt.download) {
+      try {
+        await downloadDeadline(attempt.download.delete().catch(() => {}), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (attempt.guid) {
+      try {
+        await downloadDeadline(removeDownloadArtifacts(attempt.guid), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (transientPage) {
+      try {
+        await downloadDeadline(transientPage.close(), deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (closeGuard) {
+      try {
+        await closeGuard(deadlineAt);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+    if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
+    try {
+      await downloadDeadline(Promise.all([...orphanDownloads]), deadlineAt);
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      await settleDownloadDirectory(deadlineAt);
+    } catch (error) {
+      cleanupError ||= error;
+    }
+    if (cleanupError) {
+      // A nonterminal transfer can recreate a partial file after cleanup.
+      // Retire the host; Rust owns and removes its per-session TMPDIR on exit.
+      shuttingDown = true;
+      retireAfterReply = true;
+      throw downloadError(cleanupError.code === 'download_timeout' ? 'download_timeout' : 'download_failed',
+        'browser download cleanup failed');
+    }
+  }
 }
 
 function fileInputArgs(args) {
@@ -1407,6 +2130,9 @@ function adoptPage(target) {
     title: '',
     pendingNavigations: new Map(),
     navigationResponses: new WeakMap(),
+    pendingDocumentResponse: null,
+    mainDocumentResponse: null,
+    mainDocumentUrl: null,
   };
   tabs.push(tab);
   tabByPage.set(target, tab);
@@ -1425,8 +2151,14 @@ function adoptPage(target) {
   target.on('response', response => {
     const kind = navigationResponseKind(response);
     if (kind) tab.navigationResponses.set(response.request(), kind);
+    try {
+      if (response.request().isNavigationRequest() && response.frame() === target.mainFrame()) {
+        tab.pendingDocumentResponse = response;
+      }
+    } catch { /* A response without a committed main frame is not authoritative. */ }
   });
   target.on('requestfailed', request => tab.pendingNavigations.delete(request));
+  target.on('download', download => onPageDownload(target, download));
   target.on('requestfinished', request => {
     if (!tab.pendingNavigations.has(request)) return;
     const kind = tab.navigationResponses.get(request);
@@ -1436,11 +2168,44 @@ function adoptPage(target) {
   });
   target.on('dialog', dialog => captureDialog(tab, dialog));
   target.on('framenavigated', frame => {
+    const mainFrame = target.mainFrame();
+    const pendingMainRequest = frame === mainFrame && [...tab.pendingNavigations]
+      .reverse().find(([, requestedFrame]) => requestedFrame === frame || requestedFrame === null)?.[0];
+    const hadDocumentRequest = Boolean(pendingMainRequest);
     for (const [request, requestedFrame] of tab.pendingNavigations) {
       if (requestedFrame === frame) tab.pendingNavigations.delete(request);
     }
-    if (frame === target.mainFrame()) {
+    if (frame === mainFrame) {
       const url = frame.url();
+      const committedUrl = url.split('#', 1)[0];
+      const response = hadDocumentRequest &&
+        tab.pendingDocumentResponse?.request() === pendingMainRequest &&
+        tab.pendingDocumentResponse.url() === committedUrl
+        ? tab.pendingDocumentResponse : null;
+      if (response) {
+        tab.mainDocumentResponse = response;
+        tab.mainDocumentUrl = committedUrl;
+      } else if (!hadDocumentRequest && tab.mainDocumentResponse &&
+                 tab.mainDocumentUrl && committedUrl.startsWith('http')) {
+        // Hash/history API transitions keep the same document and enforcing
+        // response policy. A new document request without a matching response
+        // still loses provenance and fails closed at download time.
+        try {
+          if (new URL(committedUrl).origin === new URL(tab.mainDocumentUrl).origin) {
+            tab.mainDocumentUrl = committedUrl;
+          } else {
+            tab.mainDocumentResponse = null;
+            tab.mainDocumentUrl = null;
+          }
+        } catch {
+          tab.mainDocumentResponse = null;
+          tab.mainDocumentUrl = null;
+        }
+      } else {
+        tab.mainDocumentResponse = null;
+        tab.mainDocumentUrl = null;
+      }
+      tab.pendingDocumentResponse = null;
       if (url !== 'about:blank') {
         try { checkUrl(url); } catch { void target.goto('about:blank').catch(() => {}); }
       }
@@ -1722,6 +2487,8 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
+    case 'download':
+      return boundedDownload(args);
     case 'set_file_input': {
       checkEpoch(args);
       const file = fileInputArgs(args);
@@ -1845,28 +2612,53 @@ async function command(action, args = {}) {
       return evalInActivePage(args);
     case 'close':
       shuttingDown = true;
-      await browser.close();
-      browserClosed = true;
+      await closeHost();
       return { closed: true };
     default:
       throw new Error(`unknown browser action: ${action}`);
   }
 }
 
+async function closeHost() {
+  if (browserClosed) return;
+  shuttingDown = true;
+  activeDownloadAttempt?.download?.cancel().catch(() => {});
+  await context?.close().catch(() => {});
+  await browser?.close().catch(() => {});
+  browserClosed = true;
+  downloadCdp = undefined;
+  downloadContextId = undefined;
+  if (retireAfterReply && TEST_RETIRE_CLOSE_DELAY_MS) {
+    await new Promise(resolve => setTimeout(resolve, TEST_RETIRE_CLOSE_DELAY_MS));
+  }
+  if (downloadDir) {
+    await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    downloadDir = undefined;
+  }
+}
+
 async function main() {
+  // Bamboo passes its per-session TempDir explicitly; Node's os.tmpdir()
+  // selects different environment variables on Windows.
+  const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
+  downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
   browser = await chromium.launch({
     headless: true,
+    downloadsPath: downloadDir,
     ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
   });
   context = await browser.newContext({
     viewport: { width: 1000, height: 720 },
     deviceScaleFactor: 1,
-    acceptDownloads: false,
+    acceptDownloads: true,
     serviceWorkers: 'block',
   });
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
   await context.addInitScript(installScriptBlobCapture, {
     key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
+  });
+  await context.addInitScript(installDownloadLinkInspector, {
+    key: DOWNLOAD_LINK_KEY, secret: DOWNLOAD_LINK_SECRET,
   });
   await context.route('**/*', route => {
     const request = route.request();
@@ -1879,8 +2671,39 @@ async function main() {
     }
     return route.continue();
   });
-  context.on('page', target => { adoptPage(target); });
+  context.on('page', target => {
+    if (transientPages.has(target)) return;
+    if (transientPageCreation) {
+      transientPageCreation.observed.push(target);
+      return;
+    }
+    if (activeDownloadAttempt?.page) {
+      // Do not publish a popup before proving it did not descend from the
+      // private download target. Unknown provenance fails closed.
+      void target.opener().then(opener => {
+        if (!opener || transientPages.has(opener)) {
+          transientPages.add(target);
+          return target.close().catch(() => {});
+        }
+        adoptPage(target);
+      }).catch(() => target.close().catch(() => {}));
+      return;
+    }
+    adoptPage(target);
+  });
   adoptPage(await context.newPage());
+  const initialCdp = await requireActiveTab().cdp;
+  if (!initialCdp) throw new Error('browser page session unavailable');
+  const targetInfo = await initialCdp.send('Target.getTargetInfo');
+  downloadContextId = targetInfo.targetInfo?.browserContextId;
+  if (!downloadContextId) throw new Error('browser context identity unavailable');
+  downloadCdp = await browser.newBrowserCDPSession();
+  downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
+  downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
+  await downloadCdp.send('Browser.setDownloadBehavior', {
+    behavior: 'allowAndName', browserContextId: downloadContextId,
+    downloadPath: downloadDir, eventsEnabled: true,
+  });
   await captureTask;
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -1893,20 +2716,33 @@ async function main() {
       if (request.action === 'close') break;
     } catch (error) {
       emit({ id: request?.id, ok: false, code: error.code || 'browser_error', error: String(error.message || error) });
+      if (retireAfterReply) break;
     }
   }
   closing = true;
   shuttingDown = true;
   lines.close();
   process.stdin.pause();
-  if (!browserClosed) await browser.close().catch(() => {});
+  if (retireAfterReply) {
+    // Never keep a timed-out Chromium transfer alive for the next request.
+    // Rust also kills/reaps this host's process group and removes its TMPDIR.
+    await Promise.race([closeHost(), new Promise(resolve => setTimeout(resolve, 250))]);
+    // closeHost may still be waiting on Chromium when the bounded race ends.
+    // Remove this host's private directory before forcing Node to exit.
+    if (downloadDir) {
+      try { rmSync(downloadDir, { recursive: true, force: true }); } catch { /* Rust owns the fallback. */ }
+    }
+    process.exit(1);
+  }
+  await closeHost();
 }
 
 if (require.main === module) {
-  main().catch(error => {
+  main().catch(async error => {
+    await closeHost();
     process.stderr.write(`browser host failed: ${error.message || error}\n`);
     process.exitCode = 1;
   });
 } else {
-  module.exports = { installScriptBlobCapture };
+  module.exports = { installScriptBlobCapture, installDownloadLinkInspector };
 }
