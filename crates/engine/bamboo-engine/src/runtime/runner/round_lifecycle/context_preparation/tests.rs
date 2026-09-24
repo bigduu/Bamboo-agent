@@ -3457,16 +3457,18 @@ async fn retrieval_window_post_archive_projection_failure_discards_staged_state(
     .await
     .expect_err("expanded retained request must fail before checkpoint");
 
-    assert!(error.to_string().contains("exact retained request exceeds"));
+    assert!(error
+        .to_string()
+        .contains("estimated retained request exceeds"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
     assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn retrieval_window_native_image_without_complete_cost_fails_before_mutation() {
+async fn retrieval_window_archives_older_turns_with_native_image_estimate() {
     let mut session = retrieval_window_session("retrieval-image-cost");
-    session.messages.push(Message::user_with_parts(
+    let image = Message::user_with_parts(
         "latest image evidence",
         vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
@@ -3477,14 +3479,19 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         .into_iter()
         .map(Into::into)
         .collect(),
-    ));
-    let before = serde_json::to_vec(&session).unwrap();
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
-    let config = retrieval_window_config(persistence);
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
     let tool_schemas = vec![retrieval_history_tool_schema()];
     let llm = noop_llm();
 
-    let error = prepare_round_context(
+    let prepared = prepare_round_context(
         &mut session,
         &config,
         "test-model",
@@ -3494,11 +3501,150 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         None,
     )
     .await
-    .expect_err("provider-native image cost must fail closed");
+    .expect("native images should be estimated for retrieval planning");
 
-    assert!(error.to_string().contains("active image message"));
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
+async fn retrieval_window_native_image_below_trigger_does_not_archive() {
+    let mut session = Session::new("retrieval-image-below-trigger", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    let image = Message::user_with_parts(
+        "inspect the image",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-below-trigger",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("a low-usage image request should not require archival capability");
+
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+}
+
+#[test]
+fn retrieval_window_image_estimate_ignores_base64_length() {
+    let counter = TiktokenTokenCounter::default();
+    let image_message = |encoded: &str, detail: &str| {
+        Message::user_with_parts(
+            "inspect the image",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:image/png;base64,{encoded}"),
+                    detail: Some(detail.to_string()),
+                },
+            }]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )
+    };
+    let short = image_message("AA==", "high");
+    let long = image_message(&"A".repeat(40_000), "high");
+    let original_with_dimensions = image_message(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/C1cAAAAASUVORK5CYII=",
+        "original",
+    );
+    let original_without_dimensions = image_message("AA==", "original");
+    let image_tokens = |message: &Message| {
+        super::provider_prepared_message_tokens(message, &counter)
+            .saturating_sub(counter.count_message(message))
+    };
+
+    assert_eq!(image_tokens(&short), 1_844);
+    assert_eq!(image_tokens(&long), image_tokens(&short));
+    assert_eq!(image_tokens(&original_with_dimensions), 1);
+    assert_eq!(image_tokens(&original_without_dimensions), 10_000);
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_recovery_archives_with_native_image() {
+    let mut session = retrieval_window_session("retrieval-image-overflow");
+    let image = Message::user_with_parts(
+        "latest image evidence",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let llm = noop_llm();
+
+    let recovered = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-overflow",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("provider overflow should archive older turns around the active image");
+
+    assert!(recovered);
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
 }
 
 #[tokio::test]
