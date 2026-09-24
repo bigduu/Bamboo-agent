@@ -42,6 +42,14 @@ const TEST_DIALOG_STATE_DELAY_MS = process.env.NODE_ENV === 'test'
 const TEST_DIALOG_READ_DELAY_MS = process.env.NODE_ENV === 'test'
   ? Math.min(2_000, Math.max(0, Number(process.env.BAMBOO_BROWSER_TEST_DIALOG_READ_DELAY_MS) || 0))
   : 0;
+const TEST_SUPPRESS_SCREENCAST_FRAMES = process.env.NODE_ENV === 'test' &&
+  process.env.BAMBOO_BROWSER_TEST_SUPPRESS_SCREENCAST_FRAMES === '1';
+const TEST_STALL_SCREENCAST_STOP = process.env.NODE_ENV === 'test' &&
+  process.env.BAMBOO_BROWSER_TEST_STALL_SCREENCAST_STOP === '1';
+const CAPTURE_FIRST_FRAME_WAIT_MS = 750;
+const CAPTURE_RESTART_LIMIT = 3;
+const CAPTURE_FALLBACK_INTERVAL_MS = 1_500;
+const CAPTURE_STILL_TIMEOUT_MS = 3_000;
 const MAX_DIALOG_CHARS = 4_096;
 const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS))
   ? Math.max(100, Math.min(300_000, Number(process.env.BAMBOO_BROWSER_DIALOG_TIMEOUT_MS)))
@@ -61,8 +69,10 @@ let tabs = [];
 const tabByPage = new WeakMap();
 let activeTabId;
 let activeCapture;
+let desiredCapture;
 let captureGeneration = 0;
 let captureTask = Promise.resolve();
+let captureTimer;
 let frameSeq = 0;
 let lastFrameAt = 0;
 let closing = false;
@@ -984,39 +994,123 @@ function requireTabId(raw) {
   return raw;
 }
 
-function scheduleCapture() {
+function captureIsCurrent(capture) {
+  return captureGeneration === capture.generation && desiredCapture === capture &&
+    activeTabId === capture.tabId && epoch === capture.epoch &&
+    !capture.page.isClosed() && !shuttingDown && !closing;
+}
+
+function clearCaptureTimer() {
+  if (captureTimer) clearTimeout(captureTimer);
+  captureTimer = undefined;
+}
+
+function emitCaptureFrame(capture, data, viewportWidth, viewportHeight) {
+  if (!captureIsCurrent(capture)) return false;
+  const now = Date.now();
+  if (now - lastFrameAt < 100) return false;
+  lastFrameAt = now;
+  emit({
+    event: 'frame', active_tab_id: capture.tabId, page_epoch: capture.epoch,
+    frame_seq: ++frameSeq, viewport_width: viewportWidth,
+    viewport_height: viewportHeight, data: data.toString('base64'),
+  });
+  return true;
+}
+
+function armCaptureRecovery(capture, delay = CAPTURE_FIRST_FRAME_WAIT_MS) {
+  if (!captureIsCurrent(capture) || capture.screencastSeen) return;
+  clearCaptureTimer();
+  captureTimer = setTimeout(() => {
+    captureTimer = undefined;
+    void recoverCapture(capture);
+  }, delay);
+}
+
+async function recoverCapture(capture) {
+  if (!captureIsCurrent(capture) || capture.screencastSeen) return;
+  if (!capture.reportedStall) {
+    capture.reportedStall = true;
+    console.warn('browser screencast produced no current frame; recovering');
+  }
+  // A direct Chromium screenshot keeps the shared picture stream usable while
+  // Playwright's asynchronous screencast stop/start recovers. Its result may
+  // complete after a navigation or tab switch, so fence it on both sides.
+  try {
+    const viewport = capture.page.viewportSize();
+    const url = capture.page.url();
+    const data = await capture.page.screenshot({
+      type: 'jpeg', quality: 75, scale: 'css', timeout: CAPTURE_STILL_TIMEOUT_MS,
+    });
+    const currentViewport = capture.page.viewportSize();
+    if (!capture.screencastSeen && viewport && currentViewport &&
+        url === capture.url && url === capture.page.url() &&
+        viewport.width === currentViewport.width && viewport.height === currentViewport.height) {
+      emitCaptureFrame(capture, data, viewport.width, viewport.height);
+    }
+  } catch {
+    if (captureIsCurrent(capture)) console.warn('browser recovery screenshot failed');
+  }
+  if (!captureIsCurrent(capture) || capture.screencastSeen) return;
+  if (!capture.startSettled) {
+    // A channel start can remain pending while direct screenshots still work.
+    // Keep the fallback alive without queuing a second start behind it.
+    armCaptureRecovery(capture, CAPTURE_FALLBACK_INTERVAL_MS);
+  } else if (capture.restart < CAPTURE_RESTART_LIMIT) {
+    scheduleCapture(capture.restart + 1);
+  } else {
+    // At most one 3-second screenshot every 1.5 seconds for the active tab;
+    // normal screencast frames immediately cancel this fallback timer.
+    armCaptureRecovery(capture, CAPTURE_FALLBACK_INTERVAL_MS);
+  }
+}
+
+function scheduleCapture(restart = 0) {
   const generation = ++captureGeneration;
+  clearCaptureTimer();
+  const tab = activeTab();
+  const capture = tab && !tab.page.isClosed() ? {
+    page: tab.page, tabId: tab.id, url: tab.page.url(), epoch, generation, restart,
+    screencastSeen: false, reportedStall: restart > 0, startSettled: false,
+  } : undefined;
+  desiredCapture = capture;
+  // The previous Playwright stop may itself remain pending. A fenced direct
+  // screenshot can still seed the new epoch while the serialized restart waits.
+  if (capture) armCaptureRecovery(capture);
   captureTask = captureTask.catch(() => {}).then(async () => {
     if (generation !== captureGeneration || shuttingDown || closing) return;
     if (activeCapture) {
       const previous = activeCapture;
       activeCapture = undefined;
-      await previous.page.screencast.stop().catch(() => {});
+      // Playwright marks a screencast started before its channel call returns.
+      // Even a failed start must be stopped before another start is attempted.
+      // Exercise a permanently pending stop in the real Chromium host test.
+      if (TEST_STALL_SCREENCAST_STOP) await new Promise(() => {});
+      await previous.page.screencast.stop().catch(() => {
+        if (!previous.page.isClosed() && !shuttingDown && !closing) {
+          console.warn('browser screencast stop failed; retrying capture');
+        }
+      });
     }
     if (generation !== captureGeneration || shuttingDown || closing) return;
-    const tab = activeTab();
-    if (!tab || tab.page.isClosed()) return;
-    const capture = { page: tab.page, tabId: tab.id, generation };
+    if (!capture || tab.page.isClosed()) return;
     activeCapture = capture;
     try {
       await tab.page.screencast.start({
         quality: 75,
         size: { width: 1200, height: 1000 },
         onFrame: ({ data, viewportWidth, viewportHeight }) => {
-          if (captureGeneration !== generation || activeTabId !== tab.id ||
-              activeCapture !== capture || tab.page.isClosed() || shuttingDown || closing) return;
-          const now = Date.now();
-          if (now - lastFrameAt < 100) return;
-          lastFrameAt = now;
-          emit({
-            event: 'frame', active_tab_id: tab.id, page_epoch: epoch,
-            frame_seq: ++frameSeq, viewport_width: viewportWidth,
-            viewport_height: viewportHeight, data: data.toString('base64'),
-          });
+          if (!captureIsCurrent(capture) || TEST_SUPPRESS_SCREENCAST_FRAMES) return;
+          if (emitCaptureFrame(capture, data, viewportWidth, viewportHeight)) {
+            capture.screencastSeen = true;
+            clearCaptureTimer();
+          }
         },
       });
     } catch {
-      if (activeCapture === capture) activeCapture = undefined;
+      if (captureIsCurrent(capture)) console.warn('browser screencast start failed; recovering');
+    } finally {
+      capture.startSettled = true;
     }
   });
 }
@@ -2923,6 +3017,10 @@ async function command(action, args = {}) {
 async function closeHost() {
   if (browserClosed) return;
   shuttingDown = true;
+  clearCaptureTimer();
+  captureGeneration++;
+  desiredCapture = undefined;
+  activeCapture = undefined;
   activeDownloadAttempt?.download?.cancel().catch(() => {});
   await context?.close().catch(() => {});
   await browser?.close().catch(() => {});
