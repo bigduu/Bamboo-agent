@@ -2886,6 +2886,11 @@ pub(crate) fn tool_complete_result_for_display(
             "Browser result unavailable".to_string()
         } else if browser && has_download_result_key(raw) {
             "Browser download result hidden".to_string()
+        } else if browser && raw.trim_start().starts_with('{') {
+            // A truncated JSON result may end before data_base64 appears,
+            // leaving a private filename or URL in its prefix. Snapshot text
+            // has its own non-JSON envelope and remains visible below.
+            "Browser result unavailable".to_string()
         } else {
             raw.to_string()
         };
@@ -17371,6 +17376,16 @@ mod question_tests {
         assert_eq!(
             browser_download_result_for_display("private-error", false),
             "Browser download failed"
+        );
+        let truncated_before_bytes = r#"{"filename":"private-name","url":"https://private.test/""#;
+        assert_eq!(
+            tool_complete_result_for_display("default::browser", truncated_before_bytes, false),
+            "Browser result unavailable"
+        );
+        let snapshot = "page_epoch: 17\n- paragraph '{\"data_base64\":\"example\"}'";
+        assert_eq!(
+            tool_complete_result_for_display("browser", snapshot, false),
+            snapshot
         );
     }
 

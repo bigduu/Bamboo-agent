@@ -508,11 +508,11 @@ pub async fn get_pending_question(
                         .to_string();
                         request.matched_rule = None;
                         request.suggested_matchers.clear();
-                        if private_browser_file_input {
+                        if private_browser_file_input || browser_download {
                             // Remembered decisions require a matcher. The
-                            // private file matcher is deliberately hidden from
-                            // approval UIs, so only offer usable one-shot
-                            // choices in this display copy.
+                            // private file/download matcher is deliberately
+                            // hidden from approval UIs, so only offer usable
+                            // one-shot choices in this display copy.
                             request.allowed_decisions.retain(|decision| {
                                 matches!(
                                     decision,
@@ -1200,6 +1200,7 @@ mod http_tests {
             request.permission_type = PermissionType::BrowserInteraction;
             request.resource = "browser:17:download:css:private-fingerprint".to_string();
             request.operation_summary = "Download private-summary".to_string();
+            request.allowed_decisions = PermissionDecisionKind::all_supported();
             request.suggested_matchers[0].value = request.resource.clone();
             let mut session = Session::new(&session_id, "test-model");
             session.messages.push(assistant_named_browser_call(
@@ -1246,6 +1247,10 @@ mod http_tests {
             assert_eq!(
                 body["permission_request"]["suggested_matchers"],
                 serde_json::json!([])
+            );
+            assert_eq!(
+                body["permission_request"]["allowed_decisions"],
+                serde_json::json!(["allow_once", "deny_once"])
             );
             for private in [
                 "private-selector",

@@ -595,6 +595,26 @@ mod tests {
             let displayed = &out[0].tool_calls[0];
             assert_eq!(displayed.error.as_deref(), Some("Browser download failed"));
             assert!(!format!("{displayed:?}").contains("private-error"));
+
+            let out = map_history(vec![
+                assistant(
+                    "",
+                    vec![("download-call", tool_name, "{\"action\":\"download\",")],
+                ),
+                tool(
+                    "download-call",
+                    "{\"filename\":\"private-filename.bin\",\"url\":\"https://private.test/\"",
+                    Some(true),
+                ),
+            ]);
+            let displayed = &out[0].tool_calls[0];
+            assert_eq!(displayed.arguments, "[browser arguments unavailable]");
+            assert_eq!(
+                displayed.result.as_deref(),
+                Some("Browser result unavailable")
+            );
+            assert!(!format!("{displayed:?}").contains("private-filename"));
+            assert!(!format!("{displayed:?}").contains("private.test"));
         }
         assert!(args.contains("private-selector"));
         assert!(result.contains("private-base64"));
