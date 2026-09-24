@@ -8,6 +8,59 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const { createHash } = require('node:crypto');
+const { chromium } = require('playwright-core');
+const { installDownloadLinkInspector } = require('./host.cjs');
+
+test('download link inspector binds the exact pinned node across a trial', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    const key = '__test_link_inspector';
+    const secret = 'test-secret';
+    await context.addInitScript(installDownloadLinkInspector, { key, secret });
+    const page = await context.newPage();
+    await page.goto('data:text/html,<a id="real" href="https://example.com/real">Real</a><a id="other" href="https://example.com/other">Other</a>');
+    const cdp = await context.newCDPSession(page);
+    const command = async (operation, selector) => {
+      const answer = await cdp.send('Runtime.evaluate', {
+        expression: `window[${JSON.stringify(key)}](${JSON.stringify(operation)},` +
+          `${JSON.stringify(secret)},${JSON.stringify(selector)})`,
+        awaitPromise: true, returnByValue: true,
+      });
+      assert.equal(answer.exceptionDetails, undefined);
+      return JSON.parse(answer.result.value);
+    };
+    assert.equal((await command('inspect', 'a')).status, 'unverifiable',
+      'ambiguous selectors never choose a link');
+    const inspected = await command('inspect', '#real');
+    assert.equal(inspected.href, 'https://example.com/real');
+    const real = await page.$('#real');
+    const other = await page.$('#other');
+    const match = element => element.evaluate((node, identity) =>
+      window[identity.key]('matches', identity.secret, node), { key, secret }).then(JSON.parse);
+    assert.equal((await match(other)).status, 'unverifiable',
+      'a different pinned ElementHandle cannot authorize the selected URL');
+    assert.equal((await match(real)).status, 'matched');
+    await real.click({ trial: true });
+    assert.deepEqual(await command('confirm', '#real'), inspected);
+    await page.evaluate(() => { document.querySelector('#real').href = 'https://example.com/changed'; });
+    assert.equal((await command('confirm', '#real')).status, 'unverifiable',
+      'a changed href cannot reuse the inspected element');
+    await page.evaluate(() => { Object.prototype.toJSON = () => ({ href: 'https://example.com/spoof' }); });
+    assert.equal((await command('inspect', '#real')).href, 'https://example.com/changed',
+      'page JSON hooks cannot forge the CDP result');
+    await page.evaluate(() => {
+      const pristine = window.eval;
+      let reads = 0;
+      Object.defineProperty(window, 'eval', { configurable: true, get() {
+        return ++reads % 2 ? pristine : () => () => ({ href: 'https://example.com/spoof' });
+      } });
+    });
+    assert.equal((await command('inspect', '#real')).status, 'unverifiable',
+      'an alternating eval getter is rejected before Playwright can compile a callback');
+    await context.close();
+  } finally { await browser.close(); }
+});
 
 test('one isolated page supplies DOM, screenshot, and interactive changes without an iframe', async () => {
   const fixture = http.createServer((_request, response) => {
@@ -167,6 +220,9 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let privateScriptRequests = 0;
   let privatePopupRequests = 0;
   let privateResourceRequests = 0;
+  const privateResourceTypes = [];
+  let directHtmlRequests = 0;
+  let spoofedRequests = 0;
   const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
   const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
@@ -237,16 +293,38 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end();
       return;
     }
-    if (request.url === '/html-page') {
+    if (request.url === '/html-page' || request.url === '/html-direct') {
+      if (request.url === '/html-direct') directHtmlRequests++;
       response.writeHead(200, { 'content-type': 'text/html' });
       response.end('<title>Private login</title><img src="/private-resource"><iframe src="/private-resource"></iframe><script>fetch("/private-script");window.open("/private-popup")</script>');
       return;
     }
     if (request.url === '/private-script') privateScriptRequests++;
     if (request.url === '/private-popup') privatePopupRequests++;
-    if (request.url === '/private-resource') privateResourceRequests++;
+    if (request.url === '/private-resource') {
+      privateResourceRequests++;
+      privateResourceTypes.push({
+        dest: request.headers['sec-fetch-dest'],
+        site: request.headers['sec-fetch-site'],
+        referer: request.headers.referer,
+      });
+    }
     if (request.url === '/sandbox-file') sandboxRequests++;
     if (request.url === '/spa') spaRequests++;
+    if (request.url === '/spoofed-file') {
+      spoofedRequests++;
+      response.writeHead(200, { 'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="spoofed.bin"' });
+      response.end('spoofed-bytes');
+      return;
+    }
+    if (request.url === '/eval-spoof') {
+      response.end('<a id="small" href="/small">Real link</a><script>' +
+        'window.eval=()=>()=>({href:location.origin+"/spoofed-file",download:null});' +
+        'Object.prototype.toJSON=()=>({status:"ok",href:location.origin+"/spoofed-file",download:null})' +
+        '</script>');
+      return;
+    }
     if (request.url === '/background-blob-ready') {
       response.end(concurrentStarted ? 'yes' : 'no');
       return;
@@ -357,7 +435,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       return;
     }
     response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
-      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -426,12 +504,20 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
     assert.equal(redirected.code, 'download_unverifiable', JSON.stringify(redirected));
     assert.equal(redirected.result, undefined);
-    assert.equal(redirectedRequests, 1, 'the redirect reached the file but its bytes were rejected');
+    assert.equal(redirectedRequests, 0, 'the redirect was blocked before its destination');
     const html = await call('download', { selector: '#html', expected_epoch: epoch });
     assert.equal(html.code, 'download_unverifiable', JSON.stringify(html));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const directHtml = await call('download', { selector: '#html-direct', expected_epoch: epoch });
+      assert.equal(directHtml.code, 'download_unverifiable', JSON.stringify(directHtml));
+      assert.equal(privateResourceRequests, 0,
+        `private HTML attempt ${attempt + 1} loaded site resources: ${JSON.stringify(privateResourceTypes)}`);
+    }
+    assert.equal(directHtmlRequests, 5, 'each direct HTML request reached response headers');
     assert.equal(privateScriptRequests, 0, 'HTML reached through the private page never ran script');
     assert.equal(privatePopupRequests, 0, 'private HTML did not open a shared popup');
-    assert.equal(privateResourceRequests, 0, 'private HTML did not load site resources');
+    assert.equal(privateResourceRequests, 0,
+      `private HTML did not load site resources: ${JSON.stringify(privateResourceTypes)}`);
     assert.equal((await call('state')).result.tabs.length, 1,
       'the private page and its descendants did not enter shared tabs');
     assert.match((await call('dom')).result.snapshot, /Page remains open/);
@@ -598,6 +684,19 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(unsolicitedRequests, 1);
     assert.deepEqual(temporaryDownloadFiles(), [], 'unsolicited download artifact was deleted');
     assert.equal((await call('state')).result.page_epoch, unsolicited.page_epoch);
+    const tamperedPage = (await call('navigate', {
+      url: base + '/eval-spoof', expected_epoch: unsolicited.page_epoch,
+    })).result;
+    const tampered = await call('download', {
+      selector: '#small', expected_epoch: tamperedPage.page_epoch,
+    });
+    if (tampered.ok) {
+      assert.deepEqual(Buffer.from(tampered.result.data_base64, 'base64'), bytes,
+        'download bytes came from the actual selected href');
+    } else {
+      assert.equal(tampered.code, 'download_unverifiable', JSON.stringify(tampered));
+    }
+    assert.equal(spoofedRequests, 0, 'page eval/JSON hooks cannot authorize a forged href');
     assert.equal((await call('close')).result.closed, true);
     if (host.exitCode === null) await once(host, 'exit');
     assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
