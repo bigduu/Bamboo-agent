@@ -128,6 +128,10 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let namedReferer;
   let smallRequests = 0;
   let sandboxRequests = 0;
+  let redirectedRequests = 0;
+  let privateScriptRequests = 0;
+  let privatePopupRequests = 0;
+  let privateResourceRequests = 0;
   const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
   const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
@@ -179,6 +183,33 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end('named-by-anchor');
       return;
     }
+    if (request.url === '/redirect-file') {
+      response.writeHead(302, { location: '/redirected-file' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirected-file') {
+      redirectedRequests++;
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="redirected.bin"',
+      });
+      response.end('redirected-bytes');
+      return;
+    }
+    if (request.url === '/redirect-html') {
+      response.writeHead(302, { location: '/html-page' });
+      response.end();
+      return;
+    }
+    if (request.url === '/html-page') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<title>Private login</title><img src="/private-resource"><iframe src="/private-resource"></iframe><script>fetch("/private-script");window.open("/private-popup")</script>');
+      return;
+    }
+    if (request.url === '/private-script') privateScriptRequests++;
+    if (request.url === '/private-popup') privatePopupRequests++;
+    if (request.url === '/private-resource') privateResourceRequests++;
     if (request.url === '/sandbox-file') sandboxRequests++;
     if (request.url === '/sandbox-page') {
       response.writeHead(200, [
@@ -254,7 +285,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end(`<a id="selected" href="${href}" download="prior.bin">Selected</a><script>setTimeout(()=>{const a=document.createElement("a");a.href="${href}";a.download="prior.bin";document.body.append(a);a.click()},100)</script>`);
       return;
     }
-    response.end('<a id="small" href="/small">Small</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+    response.end('<a id="small" href="/small">Small</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -309,6 +340,18 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const hidden = await call('download', { selector: '#hidden', expected_epoch: epoch });
     assert.equal(hidden.code, 'download_unverifiable', JSON.stringify(hidden));
     assert.equal(smallRequests, 1, 'hidden target did not start a private request');
+    const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
+    assert.equal(redirected.code, 'download_unverifiable', JSON.stringify(redirected));
+    assert.equal(redirected.result, undefined);
+    assert.equal(redirectedRequests, 1, 'the redirect reached the file but its bytes were rejected');
+    const html = await call('download', { selector: '#html', expected_epoch: epoch });
+    assert.equal(html.code, 'download_unverifiable', JSON.stringify(html));
+    assert.equal(privateScriptRequests, 0, 'HTML reached through the private page never ran script');
+    assert.equal(privatePopupRequests, 0, 'private HTML did not open a shared popup');
+    assert.equal(privateResourceRequests, 0, 'private HTML did not load site resources');
+    assert.equal((await call('state')).result.tabs.length, 1,
+      'the private page and its descendants did not enter shared tabs');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
     assert.deepEqual(temporaryDownloadFiles(), [], 'successful download artifact was deleted');
     assert.equal((await call('download', { selector: '#small', expected_epoch: initial.page_epoch })).code, 'stale_epoch');
 

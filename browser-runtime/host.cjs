@@ -743,6 +743,11 @@ function sweepOrphanDownloads() {
 
 function onDownloadWillBegin(event) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && event.frameId === attempt.frameId &&
+      event.url !== attempt.expectedUrl) {
+    // A redirect cannot be attributed without a verified request chain.
+    attempt.resolveUnverifiable();
+  }
   if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId ||
       event.url !== attempt.expectedUrl) {
     cancelDownloadGuid(event.guid);
@@ -772,6 +777,9 @@ function onDownloadProgress(event) {
 
 function onPageDownload(page, download) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.accepting && attempt.page === page && download.url() !== attempt.expectedUrl) {
+    attempt.resolveUnverifiable();
+  }
   if (!attempt?.accepting || attempt.page !== page || attempt.download ||
       download.url() !== attempt.expectedUrl) {
     const cleanup = download.cancel().catch(() => {})
@@ -815,6 +823,7 @@ async function boundedDownload(args) {
   let resolveDownload;
   let resolveGuid;
   let resolveTerminal;
+  let resolveUnverifiable;
   let scriptsDisabled = false;
   let transientPage;
   const attempt = {
@@ -829,9 +838,11 @@ async function boundedDownload(args) {
     downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
     guidPromise: new Promise(resolve => { resolveGuid = resolve; }),
     terminalPromise: new Promise(resolve => { resolveTerminal = resolve; }),
+    unverifiablePromise: new Promise(resolve => { resolveUnverifiable = resolve; }),
     resolveDownload: download => resolveDownload(download),
     resolveGuid: guid => resolveGuid(guid),
     resolveTerminal: () => resolveTerminal(),
+    resolveUnverifiable: () => resolveUnverifiable(),
   };
   activeDownloadAttempt = attempt;
   try {
@@ -897,6 +908,14 @@ async function boundedDownload(args) {
       }
       transientPage = await createTransientDownloadPage(workDeadlineAt);
       transientPage.on('download', download => onPageDownload(transientPage, download));
+      transientPage.on('framenavigated', frame => {
+        if (attempt.accepting && frame === transientPage.mainFrame()) {
+          attempt.resolveUnverifiable();
+        }
+      });
+      const privateCdp = await downloadDeadline(context.newCDPSession(transientPage), workDeadlineAt);
+      await downloadDeadline(privateCdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
+        workDeadlineAt);
       const downloadAttribute = link.download === null ? '' : ` download="${escapeHtmlAttribute(link.download)}"`;
       const html = `<a id="bamboo-download" href="${escapeHtmlAttribute(href)}"${downloadAttribute}>Download</a>`;
       await downloadDeadline(transientPage.route(url => url.href === documentUrl.href,
@@ -909,7 +928,18 @@ async function boundedDownload(args) {
       await downloadDeadline(transientPage.goto(documentUrl.href, {
         waitUntil: 'domcontentloaded', timeout: pointerTimeout(workDeadlineAt),
       }), workDeadlineAt);
-      const privateCdp = await downloadDeadline(context.newCDPSession(transientPage), workDeadlineAt);
+      await downloadDeadline(transientPage.route('**/*', route => {
+        const request = route.request();
+        let mainNavigation = false;
+        try {
+          mainNavigation = request.isNavigationRequest() &&
+            request.frame() === transientPage.mainFrame();
+        } catch { /* Unknown provenance is blocked. */ }
+        if (mainNavigation) {
+          return route.continue();
+        }
+        return route.abort('blockedbyclient');
+      }), workDeadlineAt);
       const frameTree = await downloadDeadline(privateCdp.send('Page.getFrameTree'), workDeadlineAt);
       attempt.page = transientPage;
       attempt.frameId = frameTree.frameTree.frame.id;
@@ -925,8 +955,15 @@ async function boundedDownload(args) {
         timeout: pointerTimeout(workDeadlineAt), noWaitAfter: true,
       });
     }, workDeadlineAt), workDeadlineAt);
-    const [download] = await downloadDeadline(
-      Promise.all([attempt.downloadPromise, attempt.guidPromise]), workDeadlineAt);
+    const accepted = await downloadDeadline(Promise.race([
+      Promise.all([attempt.downloadPromise, attempt.guidPromise]).then(([download]) => ({ download })),
+      attempt.unverifiablePromise.then(() => ({ unverifiable: true })),
+    ]), workDeadlineAt);
+    if (accepted.unverifiable) {
+      throw downloadError('download_unverifiable',
+        'browser download redirect cannot be verified');
+    }
+    const { download } = accepted;
     if (attempt.oversized) {
       throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
     }
@@ -1949,6 +1986,18 @@ async function main() {
     if (transientPages.has(target)) return;
     if (transientPageCreation) {
       transientPageCreation.observed.push(target);
+      return;
+    }
+    if (activeDownloadAttempt?.page) {
+      // Do not publish a popup before proving it did not descend from the
+      // private download target. Unknown provenance fails closed.
+      void target.opener().then(opener => {
+        if (!opener || transientPages.has(opener)) {
+          transientPages.add(target);
+          return target.close().catch(() => {});
+        }
+        adoptPage(target);
+      }).catch(() => target.close().catch(() => {}));
       return;
     }
     adoptPage(target);
