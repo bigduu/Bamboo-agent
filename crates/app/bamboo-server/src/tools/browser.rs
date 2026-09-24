@@ -366,7 +366,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, scroll, or download one file through a CSS selector. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. Download resolves an actionable main-frame CSS <a href> in the shared page, then follows its direct HTTP(S) link from a script-free private page in the same BrowserContext; it does not run the source page's onclick/JavaScript or change shared tabs. It returns at most 256 KiB as Base64 with filename, byte_count and SHA-256. Script-triggered or Blob downloads, HTTP redirects, HTML or Refresh responses, sites requiring Referer, enforcing CSP sandbox, and pages with unverified response provenance (including some popups) return download_unverifiable. It cannot fetch an arbitrary URL or save to a chosen path. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, scroll, or download one file through a CSS selector. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. Download resolves an actionable main-frame CSS <a href> in the shared page, then follows its direct HTTP(S) link from a script-free private page in the same BrowserContext; it does not run the source page's onclick/JavaScript or change shared tabs. It returns at most 256 KiB as Base64 with filename, byte_count and SHA-256. A selected element without a direct href may return one Blob created and activated inside its direct synchronous click handler; delegated, delayed/async, or ambiguous script downloads fail closed. HTTP redirects, HTML or Refresh responses, sites requiring Referer, enforcing CSP sandbox, and pages with unverified response provenance (including some popups) return download_unverifiable. It cannot fetch an arbitrary URL or save to a chosen path. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -698,6 +698,12 @@ mod tests {
             .contains(&json!("download")));
         assert!(tool.description().contains("direct HTTP(S) link"));
         assert!(tool.description().contains("script-free private page"));
+        assert!(tool
+            .description()
+            .contains("direct synchronous click handler"));
+        assert!(tool
+            .description()
+            .contains("delayed/async, or ambiguous script downloads fail closed"));
         assert!(tool.description().contains("download_unverifiable"));
         assert_eq!(
             tool.classify(&json!({"action":"download"})),
@@ -915,7 +921,8 @@ mod tests {
         const BINARY: &[u8] = &[0, 1, 2, 3, 0, 255, 254, 128, 42, 10, 13];
         const PAGE: &[u8] = br#"<!doctype html><title>Shared download page</title>
             <main id="still-here">The page remains open</main>
-            <a id="binary" href="/file" download="sample.bin">Download binary</a>"#;
+            <a id="binary" href="/file" download="sample.bin">Download binary</a>
+            <button id="script-blob" onclick="const anchor=document.createElement('a');anchor.href=window.URL.createObjectURL(new Blob(['model-blob']));anchor.download='model.bin';anchor.click()">Download Blob</button>"#;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -987,6 +994,32 @@ mod tests {
         assert_eq!(result["active_tab_id"], active_tab_id);
         assert_eq!(result["url"], url);
         assert!(result.get("path").is_none());
+
+        let ToolOutcome::Completed(scripted) = tool
+            .invoke(
+                json!({"action":"download","selector":"#script-blob","expected_epoch":epoch}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("synchronous script Blob download must complete");
+        };
+        let scripted: Value = serde_json::from_str(&scripted.result).unwrap();
+        let scripted_bytes = base64::engine::general_purpose::STANDARD
+            .decode(scripted["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(scripted_bytes, b"model-blob");
+        assert_eq!(scripted["filename"], "model.bin");
+        assert_eq!(scripted["byte_count"], scripted_bytes.len());
+        assert_eq!(
+            scripted["sha256"],
+            hex::encode(Sha256::digest(&scripted_bytes))
+        );
+        assert_eq!(scripted["page_epoch"], epoch);
+        assert_eq!(scripted["active_tab_id"], active_tab_id);
+        assert_eq!(scripted["url"], url);
+        assert!(scripted.get("path").is_none());
 
         let dom = browser
             .command("download-chat", "dom", json!({}))

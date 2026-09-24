@@ -413,8 +413,10 @@ function installScriptBlobCapture({ key, secret }) {
   const nativeEventTarget = getDescriptor(Event.prototype, 'target').get;
   const nativeCurrentEvent = getDescriptor(root, 'event').get;
   const nativePreventDefault = Event.prototype.preventDefault;
+  const nativeStopImmediatePropagation = Event.prototype.stopImmediatePropagation;
   const nativeContains = Node.prototype.contains;
   const nativeQuerySelectorAll = root.document.querySelectorAll;
+  const nativeClosest = Element.prototype.closest;
   const nativeNodeListLength = getDescriptor(NodeList.prototype, 'length').get;
   const nativeNodeListItem = NodeList.prototype.item;
   const nativeHref = getDescriptor(anchorClass.prototype, 'href').get;
@@ -428,6 +430,7 @@ function installScriptBlobCapture({ key, secret }) {
   const nativeAdd = eventTargetClass.prototype.addEventListener;
   const nativeRemove = eventTargetClass.prototype.removeEventListener;
   const nativeOnclick = getDescriptor(htmlElementClass.prototype, 'onclick');
+  const nativeEval = root.eval;
   const nativeDelete = Reflect.deleteProperty;
   const weakGet = WeakMap.prototype.get;
   const weakSet = WeakMap.prototype.set;
@@ -443,6 +446,7 @@ function installScriptBlobCapture({ key, secret }) {
   let clicks = 0;
   let ambiguous = false;
   let handlerDepth = 0;
+  let matched = false;
   let onclickCapture = null;
   const reset = () => {
     armed = false;
@@ -455,6 +459,7 @@ function installScriptBlobCapture({ key, secret }) {
     clicks = 0;
     ambiguous = false;
     handlerDepth = 0;
+    matched = false;
   };
   const inSelectedDispatch = () => armed && selectedEvent !== null &&
     apply(nativeCurrentEvent, root, []) === selectedEvent;
@@ -504,12 +509,17 @@ function installScriptBlobCapture({ key, secret }) {
   define(eventTargetClass.prototype, 'removeEventListener', {
     value: wrappedRemove, writable: true, configurable: true,
   });
-  apply(nativeAdd, root.document, ['click', event => {
+  apply(nativeAdd, root, ['click', event => {
     if (!armed) return;
     try {
       if (!apply(getDescriptor(event, 'isTrusted').get, event, [])) return;
       const target = apply(nativeEventTarget, event, []);
-      if (target !== selectedElement && !apply(nativeContains, selectedElement, [target])) return;
+      if (target !== selectedElement && !apply(nativeContains, selectedElement, [target])) {
+        ambiguous = true;
+        apply(nativePreventDefault, event, []);
+        apply(nativeStopImmediatePropagation, event, []);
+        return;
+      }
       trustedClicks++;
       if (trustedClicks === 1) selectedEvent = event;
       else ambiguous = true;
@@ -601,6 +611,7 @@ function installScriptBlobCapture({ key, secret }) {
       getDescriptor(onclickCapture.target, 'onclick')?.set === onclickCapture.setter &&
       apply(nativeOnclick.get, onclickCapture.target, []) === null &&
       !onclickCapture.changed);
+  const evalIntact = () => getDescriptor(root, 'eval')?.value === nativeEval;
   const nativeMethodsIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
     root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
     root.WeakMap === weakMapClass &&
@@ -608,7 +619,7 @@ function installScriptBlobCapture({ key, secret }) {
     eventTargetClass.prototype.addEventListener === wrappedAdd &&
     eventTargetClass.prototype.removeEventListener === wrappedRemove &&
     getDescriptor(htmlElementClass.prototype, 'onclick')?.get === nativeOnclick.get &&
-    getDescriptor(htmlElementClass.prototype, 'onclick')?.set === nativeOnclick.set;
+    getDescriptor(htmlElementClass.prototype, 'onclick')?.set === nativeOnclick.set && evalIntact();
   const wrappersIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
     root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
     root.WeakMap === weakMapClass &&
@@ -646,6 +657,18 @@ function installScriptBlobCapture({ key, secret }) {
   };
   const run = async (operation, suppliedSecret, selector) => {
     if (suppliedSecret !== secret) return '{"status":"unverifiable"}';
+    if (operation === 'matches') {
+      if (armed && evalIntact() && wrappersIntact() && selector === selectedElement) {
+        matched = true;
+        return '{"status":"matched"}';
+      }
+      ambiguous = true;
+      return '{"status":"unverifiable"}';
+    }
+    if (operation === 'status') {
+      return armed && matched && !ambiguous && evalIntact() && wrappersIntact()
+        ? '{"status":"matched"}' : '{"status":"unverifiable"}';
+    }
     if (operation === 'cancel') {
       const hadAttempt = armed;
       armed = false;
@@ -669,6 +692,12 @@ function installScriptBlobCapture({ key, secret }) {
         if (!target || !apply(nativeContains, root.document, [target])) {
           return '{"status":"unverifiable"}';
         }
+        // A link with href is handled by the script-free private-page flow.
+        // A bare <a onclick> without href can be a synchronous Blob producer.
+        const anchor = apply(nativeClosest, target, ['a']);
+        if (anchor && (anchor !== target || apply(nativeGetAttribute, target, ['href']) !== null)) {
+          return '{"status":"unverifiable"}';
+        }
       } catch { return '{"status":"unverifiable"}'; }
       try {
         if (!captureOnclick(target)) return '{"status":"unverifiable"}';
@@ -686,7 +715,7 @@ function installScriptBlobCapture({ key, secret }) {
       return '{"status":"armed"}';
     }
     if (operation !== 'finish') return '{"status":"unverifiable"}';
-    const valid = armed && wrappersIntact() && !ambiguous && trustedClicks === 1 &&
+    const valid = armed && evalIntact() && wrappersIntact() && !ambiguous && trustedClicks === 1 &&
       creations === 1 && clicks === 1 && clicked && created &&
       clicked.url === created.url;
     const captured = valid ? { blob: created.blob, size: created.size,
@@ -1124,6 +1153,32 @@ async function inspectDownloadLink(cdp, selector, operation, deadlineAt) {
   return link;
 }
 
+async function scriptBlobCommand(cdp, operation, selector, deadlineAt) {
+  const expression = `window[${JSON.stringify(SCRIPT_BLOB_KEY)}](` +
+    `${JSON.stringify(operation)},${JSON.stringify(SCRIPT_BLOB_SECRET)},` +
+    `${JSON.stringify(selector)})`;
+  let answer;
+  try {
+    answer = await downloadDeadline(cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    }), deadlineAt);
+  } catch (error) {
+    if (error?.code === 'download_timeout') throw error;
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  if (answer.exceptionDetails || answer.result?.type !== 'string' ||
+      typeof answer.result.value !== 'string' || answer.result.value.length > 360_000) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  let result;
+  try { result = JSON.parse(answer.result.value); } catch { /* Fail closed below. */ }
+  if (!result || typeof result !== 'object' || Array.isArray(result) ||
+      !['armed', 'matched', 'ok', 'too_large', 'unverifiable', 'cleanup_failed'].includes(result.status)) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  return result;
+}
+
 async function guardDirectDownload(attempt, cdp, nativeDownloadAttribute, deadlineAt) {
   let requestId;
   let responseSeen = false;
@@ -1310,6 +1365,11 @@ function sweepOrphanDownloads() {
 
 function onDownloadWillBegin(event) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') {
+    attempt.nativeDownloadObserved = true;
+    cancelDownloadGuid(event.guid);
+    return;
+  }
   if (attempt?.accepting && event.frameId === attempt.frameId &&
       event.url !== attempt.expectedUrl) {
     // A redirect cannot be attributed without a verified request chain.
@@ -1326,6 +1386,12 @@ function onDownloadWillBegin(event) {
 
 function onDownloadProgress(event) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') {
+    attempt.nativeDownloadObserved = true;
+    if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
+    else void removeDownloadArtifacts(event.guid).catch(() => {});
+    return;
+  }
   if (!attempt || event.guid !== attempt.guid) {
     if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
     else void removeDownloadArtifacts(event.guid).catch(() => {});
@@ -1344,6 +1410,7 @@ function onDownloadProgress(event) {
 
 function onPageDownload(page, download) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') attempt.nativeDownloadObserved = true;
   if (attempt?.accepting && attempt.page === page && download.url() !== attempt.expectedUrl) {
     attempt.resolveUnverifiable();
   }
@@ -1368,8 +1435,7 @@ function onPageDownload(page, download) {
   if (attempt.oversized) void download.cancel().catch(() => {});
 }
 
-async function boundedDownload(args) {
-  const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+async function boundedDownload(args, deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS) {
   // The 20-second action budget includes cancellation and artifact removal.
   // Reserve its last slice for cleanup even when the transfer never settles.
   const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
@@ -1682,6 +1748,185 @@ async function boundedDownload(args) {
         'browser download cleanup failed');
     }
   }
+}
+
+async function boundedScriptBlobDownload(args, deadlineAt) {
+  const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
+  const workDeadlineAt = deadlineAt - cleanupBudget;
+  checkEpoch(args);
+  if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
+    throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
+  }
+  await downloadDeadline(downloadSweep, workDeadlineAt);
+  const tab = requireActiveTab();
+  const cdp = await downloadDeadline(tab.cdp, workDeadlineAt);
+  if (!cdp || !downloadCdp) throw downloadError('download_failed', 'browser download observer unavailable');
+  const sharedUrl = tab.page.url();
+  let documentUrl;
+  try {
+    documentUrl = new URL(checkUrl(sharedUrl));
+    documentUrl.hash = '';
+  } catch {
+    throw downloadError('download_unverifiable', 'browser download requires an HTTP(S) page');
+  }
+  if (!tab.mainDocumentResponse || tab.mainDocumentUrl !== documentUrl.href) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+  }
+  const sourceHeaders = await downloadDeadline(tab.mainDocumentResponse.headersArray(), workDeadlineAt)
+    .catch(() => null);
+  if (!sourceHeaders || sourceHeaders.some(header =>
+    header.name.toLowerCase() === 'content-security-policy' &&
+    header.value.split(/[;,]/).some(directive =>
+      directive.trim().split(/\s+/, 1)[0].toLowerCase() === 'sandbox'))) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+  }
+  checkEpoch(args);
+  const attempt = { mode: 'script_blob', accepting: false, nativeDownloadObserved: false };
+  activeDownloadAttempt = attempt;
+  let helperArmed = false;
+  let cleanupError;
+  let response;
+  try {
+    const captured = await downloadDeadline(withPinnedTarget(args, async handle => {
+      checkEpoch(args);
+      let owner;
+      try { owner = await handle.ownerFrame(); } catch { /* Tampered page eval can spoof a Node. */ }
+      if (owner !== tab.page.mainFrame()) {
+        throw downloadError('download_unverifiable',
+          'browser script download requires a target in the main page');
+      }
+      try {
+        await handle.click({ trial: true,
+          timeout: Math.min(1_500, pointerTimeout(workDeadlineAt)) });
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser script download requires an actionable target');
+      }
+      checkEpoch(args);
+      const armed = await scriptBlobCommand(cdp, 'arm', args.selector, workDeadlineAt);
+      if (armed.status === 'cleanup_failed') {
+        cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+        throw cleanupError;
+      }
+      if (armed.status !== 'armed') {
+        throw downloadError('download_unverifiable',
+          'browser download cannot verify the selected script');
+      }
+      helperArmed = true;
+      try {
+        // Playwright evaluates against the pinned ElementHandle, but page eval
+        // may be tampered with. Trust only the helper's separate CDP status:
+        // a forged evaluate return cannot set its private matched bit.
+        await downloadDeadline(handle.evaluate((element, identity) =>
+          window[identity.key]('matches', identity.secret, element), {
+          key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
+        }), workDeadlineAt).catch(error => {
+          if (error?.code === 'download_timeout') throw error;
+        });
+        const identity = await scriptBlobCommand(cdp, 'status', null, workDeadlineAt);
+        if (identity.status !== 'matched' || attempt.nativeDownloadObserved) {
+          throw downloadError('download_unverifiable',
+            'browser download target changed before click');
+        }
+        if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
+          await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),
+            workDeadlineAt);
+        }
+        if (attempt.nativeDownloadObserved) {
+          throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+        }
+        checkEpoch(args);
+        if (activeTabId !== tab.id || tab.page.url() !== sharedUrl ||
+            tab.pendingNavigations.size) throw staleEpochError();
+        await downloadDeadline(handle.click({
+          noWaitAfter: true, timeout: pointerTimeout(workDeadlineAt),
+        }), workDeadlineAt);
+        checkEpoch(args);
+        if (activeTabId !== tab.id || tab.page.url() !== sharedUrl ||
+            tab.pendingNavigations.size) throw staleEpochError();
+        const result = await scriptBlobCommand(cdp, 'finish', null, workDeadlineAt);
+        helperArmed = result.status === 'cleanup_failed';
+        if (result.status === 'cleanup_failed') {
+          cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+          throw cleanupError;
+        }
+        return result;
+      } finally {
+        if (helperArmed) {
+          try {
+            const cancelled = await scriptBlobCommand(cdp, 'cancel', null, deadlineAt);
+            if (cancelled.status === 'cleanup_failed') {
+              cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+            }
+          } catch (error) { cleanupError = error; }
+          helperArmed = false;
+        }
+      }
+    }, workDeadlineAt), workDeadlineAt);
+    if (attempt.nativeDownloadObserved) {
+      throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+    }
+    if (captured.status === 'too_large') {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    if (captured.status !== 'ok' || typeof captured.filename !== 'string' ||
+        cleanDownloadFilename(captured.filename) !== captured.filename ||
+        Buffer.byteLength(captured.filename, 'utf8') > 180 ||
+        typeof captured.data_base64 !== 'string' ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(captured.data_base64)) {
+      throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+    }
+    const bytes = Buffer.from(captured.data_base64, 'base64');
+    if (bytes.length > MAX_DOWNLOAD_BYTES) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    if (bytes.length !== captured.byte_count ||
+        bytes.toString('base64') !== captured.data_base64) {
+      throw downloadError('download_unverifiable', 'browser download bytes could not be verified');
+    }
+    const current = await downloadDeadline(state(), workDeadlineAt);
+    checkEpoch(args);
+    if (current.active_tab_id !== tab.id || current.url !== sharedUrl ||
+        tab.pendingNavigations.size) throw staleEpochError();
+    response = {
+      page_epoch: current.page_epoch,
+      active_tab_id: current.active_tab_id,
+      url: current.url,
+      filename: captured.filename,
+      byte_count: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      data_base64: captured.data_base64,
+    };
+  } catch (error) {
+    const pageChanged = epoch !== args.expected_epoch || activeTabId !== tab.id ||
+      tab.page.isClosed() || tab.page.url() !== sharedUrl || tab.pendingNavigations.size > 0;
+    if (pageChanged || error?.code === 'stale_epoch' || error?.code === 'download_timeout' ||
+        attempt.nativeDownloadObserved) {
+      shuttingDown = true;
+      retireAfterReply = true;
+    }
+    if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
+      'download_timeout', 'download_too_large', 'download_failed',
+      'download_unverifiable'].includes(error?.code)) throw error;
+    throw downloadError('download_failed', 'browser script download failed');
+  } finally {
+    try {
+      await downloadDeadline(Promise.all([...orphanDownloads]), deadlineAt);
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      await settleDownloadDirectory(deadlineAt);
+    } catch (error) { cleanupError ||= error; }
+    if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
+    if (cleanupError || attempt.nativeDownloadObserved) {
+      shuttingDown = true;
+      retireAfterReply = true;
+      if (cleanupError) {
+        throw downloadError(cleanupError.code === 'download_timeout' ? 'download_timeout' : 'download_failed',
+          'browser script download cleanup failed');
+      }
+      throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+    }
+  }
+  return response;
 }
 
 function fileInputArgs(args) {
@@ -2487,8 +2732,18 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
-    case 'download':
-      return boundedDownload(args);
+    case 'download': {
+      const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+      try {
+        return await boundedDownload(args, deadlineAt);
+      } catch (error) {
+        if (error?.code !== 'download_unverifiable' || retireAfterReply) throw error;
+        // The direct path never clicks the shared page. A non-link target may
+        // instead be a supported synchronous script Blob producer. The Blob
+        // helper rejects native links, so failed direct links stay rejected.
+        return boundedScriptBlobDownload(args, deadlineAt);
+      }
+    }
     case 'set_file_input': {
       checkEpoch(args);
       const file = fileInputArgs(args);

@@ -37,7 +37,7 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
       selected.onclick = e => { if (!e.isTrusted) return; document.querySelector('output').textContent='1';
         const url=fresh('selected-bytes');window.selectedUrl=url;save(url,'selected.txt');
         setTimeout(()=>save(url,'ambient.txt'),100); };
-      old.onclick = () => save(oldUrl,'old.txt');
+      old.onclick = () => { window.wrongClicked = true; save(oldUrl,'old.txt') };
       delayed.onclick = () => setTimeout(()=>save(fresh('delayed-bytes'),'delayed.txt'),30);
       double.onclick = () => {save(fresh('first'),'first.txt');save(fresh('second'),'second.txt')};
       exact.onclick = () => save(URL.createObjectURL(new Blob([new Uint8Array(256*1024)])),'exact.bin');
@@ -124,6 +124,11 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     // result was obtained from the synchronous Blob object, not this event.
     const selectedUrl = await page.evaluate(() => window.selectedUrl);
     assert.ok(downloads.some(event => event.url === selectedUrl && event.frameId === frameId));
+    assert.equal((await command('arm', '#selected')).status, 'armed');
+    await page.locator('#old').click();
+    assert.equal(await page.evaluate(() => window.wrongClicked), undefined,
+      'a changed pinned target is stopped before an unrelated handler runs');
+    assert.equal((await command('finish')).status, 'unverifiable');
     assert.equal((await attempt('#old')).status, 'unverifiable');
     assert.equal((await attempt('#delayed')).status, 'unverifiable');
     assert.equal((await attempt('#double')).status, 'unverifiable');
@@ -191,11 +196,16 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     await pageCdp.send('Runtime.evaluate', {
       expression: "window.eval = () => () => '{\"status\":\"ok\",\"filename\":\"spoof.txt\",\"data_base64\":\"c3Bvb2ZlZA==\"}'",
     });
-    const safeUnderEvalTamper = await attempt('#selected');
-    assert.equal(safeUnderEvalTamper.filename, 'selected.txt');
-    assert.equal(Buffer.from(safeUnderEvalTamper.data_base64, 'base64').toString(), 'selected-bytes');
+    assert.equal((await attempt('#selected')).status, 'unverifiable',
+      'a page-replaced eval fails closed before the host can bind its pinned target');
     assert.equal((await command('arm', 'button')).status, 'unverifiable',
       'the helper requires one exact CSS target');
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
+    await page.evaluate(() => { JSON.stringify = () =>
+      '{"status":"ok","filename":"spoof.bin","byte_count":7,"data_base64":"c3Bvb2ZlZA=="}'; });
+    assert.equal((await attempt('#micro')).status, 'unverifiable',
+      'page JSON hooks cannot turn an ambiguous click into accepted bytes');
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
     await pageCdp.send('Runtime.evaluate', {
       expression: 'document.querySelectorAll = () => []; NodeList.prototype.item = () => null',
     });
@@ -537,6 +547,26 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end('<script>async function fire(){if(await fetch("/background-blob-ready").then(r=>r.text())!=="yes"){setTimeout(fire,20);return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["ambient-private-bytes"]));a.download="ambient.bin";document.body.append(a);a.click();await fetch("/background-blob-marker")}fire()</script>');
       return;
     }
+    if (request.url === '/script-native-race') {
+      response.end('<button id="script-native-race" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'approved\']));a.download=\'approved.bin\';a.click()">Blob</button><script>const original=URL.createObjectURL;const race=setInterval(()=>{if(URL.createObjectURL!==original){clearInterval(race);const a=document.createElement("a");a.href="/small";a.click()}},5)</script>');
+      return;
+    }
+    if (request.url === '/script-json-spoof') {
+      response.end('<button id="script-json-spoof" onclick="queueMicrotask(()=>{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'ambient\']));a.download=\'ambient.bin\';a.click()})">Spoof</button><script>JSON.stringify=()=>\'{"status":"ok","filename":"spoof.bin","byte_count":7,"data_base64":"c3Bvb2ZlZA=="}\'</script>');
+      return;
+    }
+    if (request.url === '/script-eval-spoof') {
+      response.end('<button id="script-eval-spoof" onclick="document.querySelector(\'output\').textContent=\'clicked\';const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'spoof\']));a.download=\'spoof.bin\';a.click()">Spoof</button><output>not clicked</output><script>window.eval=()=>()=>\'{"status":"matched"}\'</script>');
+      return;
+    }
+    if (request.url === '/script-helper-tamper') {
+      response.end('<button id="script-helper-tamper" onclick="window.HTMLAnchorElement.prototype.click=()=>{}">Tamper</button>');
+      return;
+    }
+    if (request.url === '/script-navigate') {
+      response.end('<button id="script-navigate" onclick="location.href=\'/spa\';const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'old-page\']));a.download=\'old.bin\';a.click()">Navigate</button>');
+      return;
+    }
     if (request.url === '/concurrent-file') {
       concurrentStarted = true;
       response.writeHead(200, {
@@ -634,7 +664,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       return;
     }
     response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
-      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="script-exact" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024)]));a.download=\'exact-script.bin\';a.click()">Exact script</button><button id="script-over" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024+1)]));a.download=\'over-script.bin\';a.click()">Over script</button><button id="micro-blob" onclick="queueMicrotask(()=>{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'ambient\']));a.download=\'ambient.bin\';a.click()})">Microtask Blob</button><button id="mixed-blob" onclick="{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'valid\']));a.download=\'valid.bin\';a.click();queueMicrotask(()=>{const b=document.createElement(\'a\');b.href=window.URL.createObjectURL(new Blob([\'ambient\']));b.download=\'ambient.bin\';b.click()})}">Mixed Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob);const scriptLink=document.createElement("a");scriptLink.id="script-link";scriptLink.textContent="Script link";scriptLink.onclick=()=>{const a=document.createElement("a");a.href=window.URL.createObjectURL(new Blob(["link-blob"]));a.download="link.bin";a.click()};document.body.append(scriptLink)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -761,7 +791,28 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const staticBlob = await call('download', { selector: '#static-blob', expected_epoch: epoch });
     assert.equal(staticBlob.code, 'download_unverifiable', JSON.stringify(staticBlob));
     assert.equal(staticBlob.result, undefined);
-    for (const selector of ['#blob-button', '#async-button']) {
+    const scriptedBlob = await call('download', { selector: '#blob-button', expected_epoch: epoch });
+    assert.equal(scriptedBlob.ok, true, JSON.stringify(scriptedBlob));
+    assert.equal(scriptedBlob.result.filename, 'dynamic.bin');
+    assert.equal(scriptedBlob.result.byte_count, 7);
+    assert.equal(Buffer.from(scriptedBlob.result.data_base64, 'base64').toString(), 'dynamic');
+    assert.equal(scriptedBlob.result.sha256,
+      createHash('sha256').update('dynamic').digest('hex'));
+    assert.equal(scriptedBlob.result.page_epoch, epoch);
+    assert.equal(scriptedBlob.result.active_tab_id, ready.active_tab_id);
+    const scriptLink = await call('download', { selector: '#script-link', expected_epoch: epoch });
+    assert.equal(scriptLink.ok, true, JSON.stringify(scriptLink));
+    assert.equal(scriptLink.result.filename, 'link.bin');
+    assert.equal(Buffer.from(scriptLink.result.data_base64, 'base64').toString(), 'link-blob');
+    const scriptExact = await call('download', { selector: '#script-exact', expected_epoch: epoch });
+    assert.equal(scriptExact.ok, true, scriptExact.code);
+    assert.equal(scriptExact.result.byte_count, 256 * 1024);
+    assert.equal(scriptExact.result.sha256,
+      createHash('sha256').update(Buffer.alloc(256 * 1024)).digest('hex'));
+    const scriptOver = await call('download', { selector: '#script-over', expected_epoch: epoch });
+    assert.equal(scriptOver.code, 'download_too_large', JSON.stringify(scriptOver));
+    assert.equal(scriptOver.result, undefined);
+    for (const selector of ['#micro-blob', '#mixed-blob', '#async-button']) {
       const scripted = await call('download', { selector, expected_epoch: epoch });
       assert.equal(scripted.code, 'download_unverifiable', JSON.stringify(scripted));
       assert.equal(scripted.result, undefined);
@@ -896,12 +947,38 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       assert.equal(tampered.code, 'download_unverifiable', JSON.stringify(tampered));
     }
     assert.equal(spoofedRequests, 0, 'page eval/JSON hooks cannot authorize a forged href');
-    assert.equal((await call('close')).result.closed, true);
+    const jsonSpoofPage = (await call('navigate', {
+      url: base + '/script-json-spoof', expected_epoch: tamperedPage.page_epoch,
+    })).result;
+    const jsonSpoof = await call('download', {
+      selector: '#script-json-spoof', expected_epoch: jsonSpoofPage.page_epoch,
+    });
+    assert.equal(jsonSpoof.code, 'download_unverifiable', JSON.stringify(jsonSpoof));
+    assert.equal(jsonSpoof.result, undefined, 'tampered JSON cannot forge a Blob result');
+    const evalSpoofPage = (await call('navigate', {
+      url: base + '/script-eval-spoof', expected_epoch: jsonSpoofPage.page_epoch,
+    })).result;
+    const evalSpoof = await call('download', {
+      selector: '#script-eval-spoof', expected_epoch: evalSpoofPage.page_epoch,
+    });
+    assert.equal(evalSpoof.code, 'download_unverifiable', JSON.stringify(evalSpoof));
+    assert.equal(evalSpoof.result, undefined);
+    assert.match((await call('dom')).result.html, /<output>not clicked<\/output>/,
+      'eval tampering must not authorize a click on the source page');
+    const nativeRacePage = (await call('navigate', {
+      url: base + '/script-native-race', expected_epoch: evalSpoofPage.page_epoch,
+    })).result;
+    const nativeRace = await call('download', {
+      selector: '#script-native-race', expected_epoch: nativeRacePage.page_epoch,
+    });
+    assert.equal(nativeRace.code, 'download_unverifiable', JSON.stringify(nativeRace));
+    assert.equal(nativeRace.result, undefined);
     if (host.exitCode === null) await once(host, 'exit');
-    assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
+    assert.deepEqual(fs.readdirSync(tempRoot), [],
+      'an ambiguous native download retires the host and its temporary directory');
 
     // Failed cleanup/private-page creation must retire with no temp artifact.
-    for (const mode of ['cleanup', 'reject', 'timeout']) {
+    for (const mode of ['cleanup', 'reject', 'timeout', 'script-helper-tamper', 'script-navigate']) {
       const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
         [path.join(__dirname, 'host.cjs')], {
           env: {
@@ -932,15 +1009,23 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       try {
         const initial = (await retiringCall('state')).result;
         const ready = (await retiringCall('navigate', {
-          url: base + '/', expected_epoch: initial.page_epoch,
+          url: base + (mode.startsWith('script-') ? `/${mode}` : '/'),
+          expected_epoch: initial.page_epoch,
         })).result;
         const startedAt = performance.now();
         const result = await retiringCall('download', {
-          selector: mode === 'cleanup' ? '#hanging' : '#small',
+          selector: mode === 'cleanup' ? '#hanging' :
+            mode.startsWith('script-') ? `#${mode}` : '#small',
           expected_epoch: ready.page_epoch,
         });
-        assert.equal(result.code, mode === 'reject' ? 'download_failed' : 'download_timeout',
-          `${mode}: ${JSON.stringify(result)}`);
+        if (mode === 'script-navigate') {
+          assert.ok(['stale_epoch', 'download_unverifiable'].includes(result.code),
+            `${mode}: ${JSON.stringify(result)}`);
+        } else {
+          assert.equal(result.code,
+            mode === 'reject' || mode === 'script-helper-tamper' ? 'download_failed' : 'download_timeout',
+            `${mode}: ${JSON.stringify(result)}`);
+        }
         assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
         if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
         assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
