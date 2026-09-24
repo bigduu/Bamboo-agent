@@ -5,6 +5,106 @@ const readline = require('node:readline');
 const { once } = require('node:events');
 const { test } = require('node:test');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const { chromium } = require('playwright-core');
+const { installScriptBlobCapture } = require('./host.cjs');
+
+test('real Chromium captures only a selected synchronous Blob click', async () => {
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-script-blob-'));
+  const fixture = http.createServer((_request, response) => {
+    response.setHeader('content-type', 'text/html');
+    if (_request.url === '/tamper') {
+      response.end('<button id="selected">Tampered</button><script>URL.createObjectURL = () => "blob:forged"</script>');
+      return;
+    }
+    response.end(`<!doctype html><button id="selected">Selected</button><button id="old">Old</button>
+      <button id="delayed">Delayed</button><button id="double">Double</button>
+      <button id="exact">Exact limit</button><button id="over">Too large</button><output>0</output><script>
+      const oldUrl = URL.createObjectURL(new Blob(['old-bytes']));
+      const save = (url, name) => { const a=document.createElement('a');a.href=url;a.download=name;a.click(); };
+      const fresh = text => URL.createObjectURL(new Blob([text]));
+      selected.onclick = e => { if (!e.isTrusted) return; document.querySelector('output').textContent='1';
+        const url=fresh('selected-bytes');window.selectedUrl=url;save(url,'selected.txt');
+        setTimeout(()=>save(url,'ambient.txt'),100); };
+      old.onclick = () => save(oldUrl,'old.txt');
+      delayed.onclick = () => setTimeout(()=>save(fresh('delayed-bytes'),'delayed.txt'),30);
+      double.onclick = () => {save(fresh('first'),'first.txt');save(fresh('second'),'second.txt')};
+      exact.onclick = () => save(URL.createObjectURL(new Blob([new Uint8Array(256*1024)])),'exact.bin');
+      over.onclick = () => save(URL.createObjectURL(new Blob([new Uint8Array(256*1024+1)])),'over.bin');
+      </script>`);
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const browser = await chromium.launch({ headless: true, downloadsPath: downloadDir });
+  const context = await browser.newContext({ acceptDownloads: true });
+  const key = '__test_blob_capture';
+  const secret = 'host-only-secret';
+  await context.addInitScript(installScriptBlobCapture, { key, secret });
+  const page = await context.newPage();
+  const pageCdp = await context.newCDPSession(page);
+  const frameId = (await pageCdp.send('Page.getFrameTree')).frameTree.frame.id;
+  const cdp = await browser.newBrowserCDPSession();
+  const { browserContextIds } = await cdp.send('Target.getBrowserContexts');
+  assert.equal(browserContextIds.length, 1);
+  const browserContextId = browserContextIds[0];
+  const downloads = [];
+  cdp.on('Browser.downloadWillBegin', event => downloads.push(event));
+  await cdp.send('Browser.setDownloadBehavior', {
+    behavior: 'deny', eventsEnabled: true, browserContextId,
+  });
+  const command = (operation, selector) => page.evaluate(
+    ({ operation, selector, key, secret }) => globalThis[key](
+      operation, secret, selector ? document.querySelector(selector) : undefined),
+    { operation, selector, key, secret },
+  ).then(JSON.parse);
+  const attempt = async selector => {
+    const armed = await command('arm', selector);
+    if (armed.status !== 'armed') return armed;
+    await page.locator(selector).click({ noWaitAfter: true });
+    return command('finish');
+  };
+  try {
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
+    const initialUrl = page.url();
+    const selected = await attempt('#selected');
+    assert.equal(selected.status, 'ok');
+    assert.equal(Buffer.from(selected.data_base64, 'base64').toString(), 'selected-bytes');
+    assert.equal(selected.byte_count, 'selected-bytes'.length);
+    assert.equal(selected.filename, 'selected.txt');
+    assert.equal(await page.locator('output').textContent(), '1');
+    assert.equal(page.url(), initialUrl);
+    await page.waitForTimeout(150);
+    // The later automatic download uses the same Blob URL and frame, yet the
+    // result was obtained from the synchronous Blob object, not this event.
+    const selectedUrl = await page.evaluate(() => window.selectedUrl);
+    assert.ok(downloads.some(event => event.url === selectedUrl && event.frameId === frameId));
+    assert.equal((await attempt('#old')).status, 'unverifiable');
+    assert.equal((await attempt('#delayed')).status, 'unverifiable');
+    assert.equal((await attempt('#double')).status, 'unverifiable');
+    const exact = await attempt('#exact');
+    assert.equal(exact.status, 'ok');
+    assert.equal(Buffer.from(exact.data_base64, 'base64').length, 256 * 1024);
+    assert.equal((await attempt('#over')).status, 'too_large');
+    await page.waitForTimeout(80);
+    assert.deepEqual(fs.readdirSync(downloadDir), []);
+    // A synthetic click can run the site's handler but never supplies the
+    // trusted event object from the approved host click.
+    assert.equal((await command('arm', '#selected')).status, 'armed');
+    await page.evaluate(() => selected.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    assert.equal((await command('finish')).status, 'unverifiable');
+    await page.evaluate(() => { URL.createObjectURL = () => 'blob:forged'; });
+    assert.equal((await command('arm', '#selected')).status, 'unverifiable');
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/tamper`);
+    assert.equal((await command('arm', '#selected')).status, 'unverifiable',
+      'a site script that replaces a pristine hook before the action is rejected');
+  } finally {
+    await context.close();
+    await browser.close();
+    await new Promise(resolve => fixture.close(resolve));
+    fs.rmSync(downloadDir, { recursive: true, force: true });
+  }
+});
 
 test('one isolated page supplies DOM, screenshot, and interactive changes without an iframe', async () => {
   const fixture = http.createServer((_request, response) => {

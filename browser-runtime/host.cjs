@@ -28,6 +28,8 @@ const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIA
 const MAX_EVAL_CODE_BYTES = 8 * 1024;
 const MAX_EVAL_JSON_BYTES = 64 * 1024;
 const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
+const SCRIPT_BLOB_KEY = `__bamboo_blob_${randomBytes(16).toString('hex')}`;
+const SCRIPT_BLOB_SECRET = randomBytes(24).toString('hex');
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -347,6 +349,176 @@ function installEvalHelper(key) {
       // toString can be hostile getters, and Playwright would transfer an
       // unbounded rejection if this helper let it escape.
       return '{"ok":false}';
+    }
+  };
+  define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
+}
+
+// Installed before site scripts to save pristine intrinsics. Only the bounded
+// attempt wraps page methods; a site-installed hook makes the attempt fail.
+// Captured values live in this private closure, behind a host-only secret.
+function installScriptBlobCapture({ key, secret }) {
+  const root = globalThis;
+  const apply = Reflect.apply;
+  const define = Object.defineProperty;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const json = JSON;
+  const stringify = json.stringify;
+  const urlClass = URL;
+  const anchorClass = HTMLAnchorElement;
+  const stringClass = String;
+  const byteArrayClass = Uint8Array;
+  const isSafeInteger = Number.isSafeInteger;
+  const nativeCreate = urlClass.createObjectURL;
+  const nativeAnchorClick = anchorClass.prototype.click;
+  const nativeBlobSize = getDescriptor(Blob.prototype, 'size').get;
+  const nativeBlobArrayBuffer = Blob.prototype.arrayBuffer;
+  const nativeEventTarget = getDescriptor(Event.prototype, 'target').get;
+  const nativeCurrentEvent = getDescriptor(root, 'event').get;
+  const nativeContains = Node.prototype.contains;
+  const nativeHref = getDescriptor(anchorClass.prototype, 'href').get;
+  const nativeGetAttribute = Element.prototype.getAttribute;
+  const nativeBtoa = root.btoa;
+  const nativeFromCharCode = stringClass.fromCharCode;
+  const maxBytes = 256 * 1024;
+  let armed = false;
+  let selectedElement = null;
+  let selectedEvent = null;
+  let trustedClicks = 0;
+  let created = null;
+  let creations = 0;
+  let clicked = null;
+  let clicks = 0;
+  let ambiguous = false;
+  const reset = () => {
+    armed = false;
+    selectedElement = null;
+    selectedEvent = null;
+    trustedClicks = 0;
+    created = null;
+    creations = 0;
+    clicked = null;
+    clicks = 0;
+    ambiguous = false;
+  };
+  const inSelectedDispatch = () => armed && selectedEvent !== null &&
+    apply(nativeCurrentEvent, root, []) === selectedEvent;
+  root.document.addEventListener('click', event => {
+    if (!armed) return;
+    try {
+      if (!apply(getDescriptor(event, 'isTrusted').get, event, [])) return;
+      const target = apply(nativeEventTarget, event, []);
+      if (target !== selectedElement && !apply(nativeContains, selectedElement, [target])) return;
+      trustedClicks++;
+      if (trustedClicks === 1) selectedEvent = event;
+      else ambiguous = true;
+    } catch { ambiguous = true; }
+  }, true);
+  const captureCreate = function(blob) {
+    const url = apply(nativeCreate, this, [blob]);
+    if (inSelectedDispatch()) {
+      creations++;
+      if (creations === 1) {
+        try {
+          created = { blob, url, size: apply(nativeBlobSize, blob, []) };
+        } catch { ambiguous = true; }
+      } else ambiguous = true;
+    }
+    return url;
+  };
+  const captureClick = function(...args) {
+    if (!inSelectedDispatch()) return apply(nativeAnchorClick, this, args);
+    clicks++;
+    try {
+      const url = apply(nativeHref, this, []);
+      const filename = apply(nativeGetAttribute, this, ['download']);
+      if (clicks === 1 && created && url === created.url && filename !== null &&
+          filename.length <= 180) clicked = { url, filename };
+      else ambiguous = true;
+    } catch { ambiguous = true; }
+    // Never let a script click start a native download while it is being
+    // attributed. Unmatched/multiple activations fail closed at finish().
+    return undefined;
+  };
+  const nativeMethodsIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
+    urlClass.createObjectURL === nativeCreate && anchorClass.prototype.click === nativeAnchorClick;
+  const wrappersIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
+    urlClass.createObjectURL === captureCreate && anchorClass.prototype.click === captureClick;
+  const restore = () => {
+    let restored = true;
+    try {
+      if (urlClass.createObjectURL === captureCreate) {
+        define(urlClass, 'createObjectURL', {
+          value: nativeCreate, writable: true, configurable: true,
+        });
+      } else if (urlClass.createObjectURL !== nativeCreate) restored = false;
+      if (anchorClass.prototype.click === captureClick) {
+        define(anchorClass.prototype, 'click', {
+          value: nativeAnchorClick, writable: true, configurable: true,
+        });
+      } else if (anchorClass.prototype.click !== nativeAnchorClick) restored = false;
+    } catch { restored = false; }
+    return restored;
+  };
+  const run = async (operation, suppliedSecret, target) => {
+    if (suppliedSecret !== secret) return '{"status":"unverifiable"}';
+    if (operation === 'cancel') {
+      const hadAttempt = armed;
+      armed = false;
+      const restored = !hadAttempt || restore();
+      reset();
+      return restored ? '{"status":"unverifiable"}' : '{"status":"cleanup_failed"}';
+    }
+    if (operation === 'arm') {
+      const restored = !armed || restore();
+      reset();
+      if (!restored) return '{"status":"cleanup_failed"}';
+      if (!nativeMethodsIntact() || !target || !apply(nativeContains, root.document, [target])) {
+        return '{"status":"unverifiable"}';
+      }
+      try {
+        define(urlClass, 'createObjectURL', {
+          value: captureCreate, writable: true, configurable: true,
+        });
+        define(anchorClass.prototype, 'click', {
+          value: captureClick, writable: true, configurable: true,
+        });
+      } catch {
+        return restore() ? '{"status":"unverifiable"}' : '{"status":"cleanup_failed"}';
+      }
+      selectedElement = target;
+      armed = true;
+      return '{"status":"armed"}';
+    }
+    if (operation !== 'finish') return '{"status":"unverifiable"}';
+    const valid = armed && wrappersIntact() && !ambiguous && trustedClicks === 1 &&
+      creations === 1 && clicks === 1 && clicked && created &&
+      clicked.url === created.url;
+    const captured = valid ? { blob: created.blob, size: created.size,
+      filename: clicked.filename } : null;
+    const hadAttempt = armed;
+    armed = false;
+    const restored = !hadAttempt || restore();
+    reset();
+    if (!restored) return '{"status":"cleanup_failed"}';
+    if (!captured) return '{"status":"unverifiable"}';
+    if (!isSafeInteger(captured.size) || captured.size > maxBytes) {
+      return '{"status":"too_large"}';
+    }
+    try {
+      const data = await apply(nativeBlobArrayBuffer, captured.blob, []);
+      const bytes = new byteArrayClass(data);
+      if (bytes.byteLength !== captured.size || bytes.byteLength > maxBytes) {
+        return '{"status":"unverifiable"}';
+      }
+      let binary = '';
+      for (let index = 0; index < bytes.length; index++) {
+        binary += apply(nativeFromCharCode, stringClass, [bytes[index]]);
+      }
+      return apply(stringify, json, [{ status: 'ok', filename: captured.filename,
+        byte_count: bytes.length, data_base64: apply(nativeBtoa, root, [binary]) }]);
+    } catch {
+      return '{"status":"unverifiable"}';
     }
   };
   define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
@@ -1523,6 +1695,9 @@ async function main() {
     serviceWorkers: 'block',
   });
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
+  await context.addInitScript(installScriptBlobCapture, {
+    key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
+  });
   await context.route('**/*', route => {
     const request = route.request();
     if (request.isNavigationRequest()) {
@@ -1557,7 +1732,11 @@ async function main() {
   if (!browserClosed) await browser.close().catch(() => {});
 }
 
-main().catch(error => {
-  process.stderr.write(`browser host failed: ${error.message || error}\n`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(error => {
+    process.stderr.write(`browser host failed: ${error.message || error}\n`);
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = { installScriptBlobCapture };
+}
