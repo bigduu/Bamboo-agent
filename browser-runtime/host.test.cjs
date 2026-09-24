@@ -53,11 +53,18 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
   await cdp.send('Browser.setDownloadBehavior', {
     behavior: 'deny', eventsEnabled: true, browserContextId,
   });
-  const command = (operation, selector) => page.evaluate(
-    ({ operation, selector, key, secret }) => globalThis[key](
-      operation, secret, selector ? document.querySelector(selector) : undefined),
-    { operation, selector, key, secret },
-  ).then(JSON.parse);
+  // Page/ElementHandle.evaluate compiles through the page's mutable eval.
+  // Use the page's main-world CDP context for this authoritative command.
+  const command = async (operation, selector) => {
+    const expression = `window[${JSON.stringify(key)}](${JSON.stringify(operation)},` +
+      `${JSON.stringify(secret)},${JSON.stringify(selector ?? null)})`;
+    const answer = await pageCdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    });
+    assert.equal(answer.exceptionDetails, undefined);
+    assert.equal(answer.result.type, 'string');
+    return JSON.parse(answer.result.value);
+  };
   const attempt = async selector => {
     const armed = await command('arm', selector);
     if (armed.status !== 'armed') return armed;
@@ -88,6 +95,13 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     assert.equal((await attempt('#over')).status, 'too_large');
     await page.waitForTimeout(80);
     assert.deepEqual(fs.readdirSync(downloadDir), []);
+    await page.evaluate(() => {
+      Object.prototype.toJSON = () => ({ status: 'ok', filename: 'spoof.txt',
+        byte_count: 7, data_base64: 'c3Bvb2ZlZA==' });
+    });
+    const safeEnvelope = await attempt('#selected');
+    assert.equal(safeEnvelope.filename, 'selected.txt');
+    assert.equal(Buffer.from(safeEnvelope.data_base64, 'base64').toString(), 'selected-bytes');
     // A synthetic click can run the site's handler but never supplies the
     // trusted event object from the approved host click.
     assert.equal((await command('arm', '#selected')).status, 'armed');
@@ -98,6 +112,23 @@ test('real Chromium captures only a selected synchronous Blob click', async () =
     await page.goto(`http://127.0.0.1:${fixture.address().port}/tamper`);
     assert.equal((await command('arm', '#selected')).status, 'unverifiable',
       'a site script that replaces a pristine hook before the action is rejected');
+    // Playwright evaluate can be page-eval spoofed; CDP must still invoke the
+    // pre-injected helper and never return the attacker's fabricated bytes.
+    await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
+    await pageCdp.send('Runtime.evaluate', {
+      expression: "window.eval = () => () => '{\"status\":\"ok\",\"filename\":\"spoof.txt\",\"data_base64\":\"c3Bvb2ZlZA==\"}'",
+    });
+    const safeUnderEvalTamper = await attempt('#selected');
+    assert.equal(safeUnderEvalTamper.filename, 'selected.txt');
+    assert.equal(Buffer.from(safeUnderEvalTamper.data_base64, 'base64').toString(), 'selected-bytes');
+    assert.equal((await command('arm', 'button')).status, 'unverifiable',
+      'the helper requires one exact CSS target');
+    await pageCdp.send('Runtime.evaluate', {
+      expression: 'document.querySelectorAll = () => []; NodeList.prototype.item = () => null',
+    });
+    assert.equal((await command('arm', '#selected')).status, 'armed',
+      'page mutations cannot replace the pre-injected native selector');
+    assert.equal((await command('cancel')).status, 'unverifiable');
   } finally {
     await context.close();
     await browser.close();

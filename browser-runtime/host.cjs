@@ -362,6 +362,7 @@ function installScriptBlobCapture({ key, secret }) {
   const apply = Reflect.apply;
   const define = Object.defineProperty;
   const getDescriptor = Object.getOwnPropertyDescriptor;
+  const createObject = Object.create;
   const json = JSON;
   const stringify = json.stringify;
   const urlClass = URL;
@@ -376,10 +377,16 @@ function installScriptBlobCapture({ key, secret }) {
   const nativeEventTarget = getDescriptor(Event.prototype, 'target').get;
   const nativeCurrentEvent = getDescriptor(root, 'event').get;
   const nativeContains = Node.prototype.contains;
+  const nativeQuerySelectorAll = root.document.querySelectorAll;
+  const nativeNodeListLength = getDescriptor(NodeList.prototype, 'length').get;
+  const nativeNodeListItem = NodeList.prototype.item;
   const nativeHref = getDescriptor(anchorClass.prototype, 'href').get;
   const nativeGetAttribute = Element.prototype.getAttribute;
   const nativeBtoa = root.btoa;
   const nativeFromCharCode = stringClass.fromCharCode;
+  const typedArrayPrototype = Object.getPrototypeOf(byteArrayClass.prototype);
+  const nativeTypedArrayLength = getDescriptor(typedArrayPrototype, 'length').get;
+  const nativeTypedArrayByteLength = getDescriptor(typedArrayPrototype, 'byteLength').get;
   const maxBytes = 256 * 1024;
   let armed = false;
   let selectedElement = null;
@@ -460,7 +467,7 @@ function installScriptBlobCapture({ key, secret }) {
     } catch { restored = false; }
     return restored;
   };
-  const run = async (operation, suppliedSecret, target) => {
+  const run = async (operation, suppliedSecret, selector) => {
     if (suppliedSecret !== secret) return '{"status":"unverifiable"}';
     if (operation === 'cancel') {
       const hadAttempt = armed;
@@ -473,9 +480,19 @@ function installScriptBlobCapture({ key, secret }) {
       const restored = !armed || restore();
       reset();
       if (!restored) return '{"status":"cleanup_failed"}';
-      if (!nativeMethodsIntact() || !target || !apply(nativeContains, root.document, [target])) {
+      if (!nativeMethodsIntact() || typeof selector !== 'string' || !selector ||
+          selector.length > 512) {
         return '{"status":"unverifiable"}';
       }
+      let target;
+      try {
+        const matches = apply(nativeQuerySelectorAll, root.document, [selector]);
+        if (apply(nativeNodeListLength, matches, []) !== 1) return '{"status":"unverifiable"}';
+        target = apply(nativeNodeListItem, matches, [0]);
+        if (!target || !apply(nativeContains, root.document, [target])) {
+          return '{"status":"unverifiable"}';
+        }
+      } catch { return '{"status":"unverifiable"}'; }
       try {
         define(urlClass, 'createObjectURL', {
           value: captureCreate, writable: true, configurable: true,
@@ -508,15 +525,23 @@ function installScriptBlobCapture({ key, secret }) {
     try {
       const data = await apply(nativeBlobArrayBuffer, captured.blob, []);
       const bytes = new byteArrayClass(data);
-      if (bytes.byteLength !== captured.size || bytes.byteLength > maxBytes) {
+      const byteLength = apply(nativeTypedArrayByteLength, bytes, []);
+      const length = apply(nativeTypedArrayLength, bytes, []);
+      if (byteLength !== captured.size || byteLength > maxBytes || length !== byteLength) {
         return '{"status":"unverifiable"}';
       }
       let binary = '';
-      for (let index = 0; index < bytes.length; index++) {
+      for (let index = 0; index < length; index++) {
         binary += apply(nativeFromCharCode, stringClass, [bytes[index]]);
       }
-      return apply(stringify, json, [{ status: 'ok', filename: captured.filename,
-        byte_count: bytes.length, data_base64: apply(nativeBtoa, root, [binary]) }]);
+      // A page may replace Object.prototype.toJSON after init. A null-prototype
+      // envelope keeps the captured native serializer from calling page code.
+      const result = apply(createObject, Object, [null]);
+      result.status = 'ok';
+      result.filename = captured.filename;
+      result.byte_count = length;
+      result.data_base64 = apply(nativeBtoa, root, [binary]);
+      return apply(stringify, json, [result]);
     } catch {
       return '{"status":"unverifiable"}';
     }
