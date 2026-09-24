@@ -903,7 +903,8 @@ async function boundedDownload(args) {
       const sourceHeaders = await downloadDeadline(sourceResponse.headersArray(), workDeadlineAt).catch(() => null);
       if (!sourceHeaders || sourceHeaders.some(header =>
         header.name.toLowerCase() === 'content-security-policy' &&
-        /\bsandbox\b/i.test(header.value))) {
+        header.value.split(/[;,]/).some(policyDirective =>
+          policyDirective.trim().split(/\s+/, 1)[0].toLowerCase() === 'sandbox'))) {
         throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
       }
       transientPage = await createTransientDownloadPage(workDeadlineAt);

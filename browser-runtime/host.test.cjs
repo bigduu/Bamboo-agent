@@ -214,7 +214,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     if (request.url === '/sandbox-page') {
       response.writeHead(200, [
         ['content-type', 'text/html'],
-        ['Content-Security-Policy', "default-src 'self'"], ['content-security-policy', 'sandbox allow-scripts'],
+        ['Content-Security-Policy', "default-src 'self'"],
+        ['content-security-policy', 'report-uri /sandbox, SaNdBoX allow-scripts'],
       ]);
       response.end('<a id="sandbox" href="/sandbox-file" download>Blocked</a>');
       return;
@@ -270,6 +271,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8',
       'referrer-policy': 'no-referrer',
+      'content-security-policy': 'report-uri /sandbox',
       'content-security-policy-report-only': 'sandbox' });
     if (request.url === '/unsolicited-page') {
       response.end('<main>Unsolicited page</main><script>setTimeout(() => { const link = document.createElement("a"); link.href = "/unsolicited"; document.body.append(link); link.click(); }, 100)</script>');
