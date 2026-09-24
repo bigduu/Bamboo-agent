@@ -291,6 +291,18 @@ fn pending_tool_arguments_for_display(
             .map(|(args, truncated)| (args, truncated, false));
     }
     let raw = pending_tool_argument_text(session, pending.tool_call_id.as_str())?;
+    if request.is_some_and(|request| {
+        PermissionRequest::is_private_browser_file_resource(&request.tool_name, &request.resource)
+    }) {
+        // The parked request identifies the private action for normal,
+        // oversized, and auto-repaired original arguments alike. Keep the
+        // original bytes in the session and send one fixed display copy.
+        return Some((
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"}),
+            false,
+            false,
+        ));
+    }
     let parked_focused = request.is_some_and(PermissionRequest::is_focused_browser_input);
     if raw.len() > MAX_PENDING_TOOL_ARGUMENT_BYTES {
         return Some((
@@ -341,6 +353,13 @@ fn pending_tool_arguments_for_display(
             display["expected_epoch"] = serde_json::json!(epoch);
         }
         return Some((display, false, false));
+    }
+    if bamboo_tools::permission::is_private_browser_file_input("browser", &parsed) {
+        return Some((
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"}),
+            false,
+            false,
+        ));
     }
     Some((parsed, false, false))
 }
@@ -436,6 +455,17 @@ pub async fn get_pending_question(
             let native_browser_select = tool_arguments.as_ref().is_some_and(|arguments| {
                 bamboo_tools::permission::is_native_browser_select("browser", arguments)
             });
+            let private_browser_file_input = tool_arguments.as_ref().is_some_and(|arguments| {
+                bamboo_tools::permission::is_private_browser_file_input("browser", arguments)
+            }) || interaction
+                .permission_request
+                .as_ref()
+                .is_some_and(|request| {
+                    PermissionRequest::is_private_browser_file_resource(
+                        &request.tool_name,
+                        &request.resource,
+                    )
+                });
             let dialog_response = tool_arguments
                 .as_ref()
                 .and_then(|arguments| arguments.get("action").and_then(serde_json::Value::as_str))
@@ -453,6 +483,7 @@ pub async fn get_pending_question(
                 interaction.permission_request.map(|mut request| {
                     if request.has_private_browser_resource()
                         || native_browser_select
+                        || private_browser_file_input
                         || dialog_response
                         || browser_eval
                         || browser_download
@@ -463,6 +494,8 @@ pub async fn get_pending_question(
                         request.resource = "[redacted]".to_string();
                         request.operation_summary = if dialog_response {
                             "Answer pending browser dialog"
+                        } else if private_browser_file_input {
+                            "Set one in-memory browser file input"
                         } else if browser_eval {
                             "Execute browser page JavaScript"
                         } else if native_browser_select {
@@ -475,6 +508,19 @@ pub async fn get_pending_question(
                         .to_string();
                         request.matched_rule = None;
                         request.suggested_matchers.clear();
+                        if private_browser_file_input {
+                            // Remembered decisions require a matcher. The
+                            // private file matcher is deliberately hidden from
+                            // approval UIs, so only offer usable one-shot
+                            // choices in this display copy.
+                            request.allowed_decisions.retain(|decision| {
+                                matches!(
+                                    decision,
+                                    PermissionDecisionKind::AllowOnce
+                                        | PermissionDecisionKind::DenyOnce
+                                )
+                            });
+                        }
                     }
                     request
                 });
@@ -489,6 +535,8 @@ pub async fn get_pending_question(
                     "Approve focused browser input?"
                 } else if native_browser_select {
                     "Approve native browser selection?"
+                } else if private_browser_file_input {
+                    "Approve in-memory browser file input?"
                 } else if browser_eval {
                     "Approve browser page JavaScript on the active page?"
                 } else if browser_download {
@@ -883,6 +931,99 @@ mod http_tests {
             pending_tool_arguments_exact(&session, tool_call_id).unwrap(),
             args
         );
+    }
+
+    #[actix_web::test]
+    async fn pending_browser_file_input_keeps_original_call_but_redacts_http_display() {
+        let temp_dir = tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for (case, data_base64, repaired_original) in [
+            ("short", "cHJpdmF0ZSBieXRlcw==".to_string(), false),
+            ("oversized-preview", "A".repeat(20_000), false),
+            ("repaired-short", "cHJpdmF0ZSBieXRlcw==".to_string(), true),
+        ] {
+            let session_id = format!("file-input-private-display-{case}");
+            let tool_call_id = format!("file-input-call-{case}");
+            let args = serde_json::json!({
+                "action":"set_file_input","selector":"#private-upload",
+                "filename":"private.txt","mime_type":"text/plain",
+                "data_base64":data_base64,"expected_epoch":17,
+            });
+            assert!(bamboo_tools::permission::validate_browser_file_input(&args).is_ok());
+            let mut request = permission_request(&session_id, &tool_call_id);
+            request.tool_name = "browser".to_string();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser:17:set_file_input:upload:private-fingerprint".to_string();
+            request.suggested_matchers[0].value = request.resource.clone();
+            request.allowed_decisions = PermissionDecisionKind::all_supported();
+            let mut session = Session::new(&session_id, "test-model");
+            let mut original_arguments = args.to_string();
+            if repaired_original {
+                original_arguments.pop();
+                assert!(serde_json::from_str::<Value>(&original_arguments).is_err());
+            }
+            session
+                .messages
+                .push(assistant_browser_call(&tool_call_id, &original_arguments));
+            session.messages.push(Message::tool_result(
+                &tool_call_id,
+                serde_json::json!({
+                    "status":"awaiting_permission_approval",
+                    "question":"Approve private.txt?",
+                    "permission_request":request,
+                })
+                .to_string(),
+            ));
+            session.set_pending_question_with_source(
+                tool_call_id.clone(),
+                "browser".to_string(),
+                "Approve private.txt?".to_string(),
+                vec!["Approve".to_string(), "Deny".to_string()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
+            state.save_and_cache_session(&mut session).await;
+            let response = get_pending_question(state.clone(), web::Path::from(session_id.clone()))
+                .await
+                .expect("pending response");
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("response body");
+            let body: Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["question"], "Approve in-memory browser file input?");
+            assert_eq!(
+                body["tool_arguments"],
+                serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+            );
+            assert_eq!(body["tool_arguments_truncated"], false);
+            assert_eq!(body["permission_request"]["resource"], "[redacted]");
+            assert_eq!(
+                body["permission_request"]["suggested_matchers"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                body["permission_request"]["allowed_decisions"],
+                serde_json::json!(["allow_once", "deny_once"])
+            );
+            for private in ["private-upload", "private.txt", "private-fingerprint"] {
+                assert!(!body.to_string().contains(private));
+            }
+            assert!(!body
+                .to_string()
+                .contains(args["data_base64"].as_str().unwrap()));
+            assert_eq!(
+                pending_tool_arguments_exact(&session, &tool_call_id).unwrap(),
+                if repaired_original {
+                    Value::String(original_arguments)
+                } else {
+                    args
+                }
+            );
+        }
     }
 
     #[actix_web::test]

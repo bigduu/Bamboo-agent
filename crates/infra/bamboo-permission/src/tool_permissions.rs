@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 use std::{fs, path::Path};
 
+use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -267,6 +268,97 @@ pub fn is_native_browser_select(tool_name: &str, args: &Value) -> bool {
         .next()
         .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
         && args.get("action").and_then(Value::as_str) == Some("select_option")
+}
+
+/// File bytes are authoritative tool arguments, never approval display data.
+pub fn is_private_browser_file_input(tool_name: &str, args: &Value) -> bool {
+    tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser"))
+        && (args.get("action").and_then(Value::as_str) == Some("set_file_input")
+            || args.get("data_base64").is_some())
+}
+
+const MAX_BROWSER_FILE_BYTES: usize = 1024 * 1024;
+const MAX_BROWSER_FILE_BASE64: usize = MAX_BROWSER_FILE_BYTES.div_ceil(3) * 4;
+
+/// Validate before a browser is opened or a grant is considered. The host
+/// repeats these checks because its stdio interface is an independent boundary.
+pub fn validate_browser_file_input(args: &Value) -> Result<(), PermissionError> {
+    let invalid = || PermissionError::CheckFailed("invalid browser in-memory file input".into());
+    let object = args.as_object().ok_or_else(invalid)?;
+    let allowed = [
+        "action",
+        "selector",
+        "filename",
+        "mime_type",
+        "data_base64",
+        "expected_epoch",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || object.get("action").and_then(Value::as_str) != Some("set_file_input")
+        || object
+            .get("expected_epoch")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(invalid());
+    }
+    let selector = object
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if selector.trim().is_empty() || selector.encode_utf16().count() > 512 {
+        return Err(invalid());
+    }
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if filename.trim().is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.encode_utf16().count() > 128
+        || filename
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+    {
+        return Err(invalid());
+    }
+    let mime_type = object
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let mime_token = |token: &str| {
+        !token.is_empty()
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
+    };
+    let Some((major, minor)) = mime_type.split_once('/') else {
+        return Err(invalid());
+    };
+    if mime_type.len() > 128 || !mime_token(major) || !mime_token(minor) {
+        return Err(invalid());
+    }
+    let data = object
+        .get("data_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if data.len() > MAX_BROWSER_FILE_BASE64 || data.len() % 4 != 0 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| invalid())?;
+    if bytes.len() > MAX_BROWSER_FILE_BYTES
+        || base64::engine::general_purpose::STANDARD.encode(bytes) != data
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// A semantic locator's grant identity is independent of JSON key order and
@@ -672,6 +764,11 @@ pub fn check_permissions(
         }
         "browser" => {
             let action = required_string_arg(args, "action")?;
+            if action != "set_file_input" && args.get("data_base64").is_some() {
+                return Err(PermissionError::CheckFailed(
+                    "browser file bytes require set_file_input".into(),
+                ));
+            }
             match action {
                 "navigate" => {
                     let raw = required_string_arg(args, "url")?;
@@ -795,6 +892,23 @@ pub fn check_permissions(
                         PermissionType::BrowserInteraction,
                         format!("browser:{epoch}:download:css:{fingerprint}"),
                         "Download from selected browser element",
+                    )]))
+                }
+                "set_file_input" => {
+                    validate_browser_file_input(args)?;
+                    let epoch = args["expected_epoch"].as_u64().expect("validated epoch");
+                    let identity = serde_json::json!([
+                        args["selector"],
+                        args["filename"],
+                        args["mime_type"],
+                        args["data_base64"],
+                    ]);
+                    let fingerprint =
+                        browser_persistent_fingerprint("file-input-v1", &identity.to_string())?;
+                    Ok(Some(vec![PermissionContext::new(
+                        PermissionType::BrowserInteraction,
+                        format!("browser:{epoch}:set_file_input:upload:{fingerprint}"),
+                        "Set one in-memory browser file input",
                     )]))
                 }
                 "click" | "click_at" | "fill" | "select_option" | "type" | "press" | "key"
@@ -1775,6 +1889,125 @@ mod tests {
         ] {
             assert!(check_permissions("browser", &args).is_err(), "{args}");
         }
+    }
+
+    #[test]
+    fn browser_file_input_fingerprint_child_process() {
+        let Some(output_path) = std::env::var_os("BAMBOO_FILE_INPUT_TEST_OUTPUT") else {
+            return;
+        };
+        let base = serde_json::json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "mime_type":"text/plain","data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        let mut cases = vec![base.clone(); 6];
+        cases[1]["data_base64"] = serde_json::json!("b3RoZXIgYnl0ZXM=");
+        cases[2]["selector"] = serde_json::json!("#other");
+        cases[3]["filename"] = serde_json::json!("other.txt");
+        cases[4]["mime_type"] = serde_json::json!("application/octet-stream");
+        cases[5]["expected_epoch"] = serde_json::json!(18);
+        let resources: Vec<String> = cases
+            .iter()
+            .map(|args| {
+                let context = check_permissions("browser", args)
+                    .unwrap()
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(context.permission_type, PermissionType::BrowserInteraction);
+                assert_eq!(
+                    context.operation_description,
+                    "Set one in-memory browser file input"
+                );
+                context.resource
+            })
+            .collect();
+        fs::write(output_path, serde_json::to_vec(&resources).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_file_input_grant_is_private_bounded_and_restart_stable() {
+        let base = serde_json::json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "mime_type":"text/plain","data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        assert!(is_private_browser_file_input("default::browser", &base));
+        assert!(!is_private_browser_file_input("other", &base));
+        let data_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let run = |dir: &Path, output_path: &Path| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool_permissions::tests::browser_file_input_fingerprint_child_process",
+                ])
+                .env("BAMBOO_DATA_DIR", dir)
+                .env("BAMBOO_FILE_INPUT_TEST_OUTPUT", output_path)
+                .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "file input fingerprint child process failed"
+            );
+            let bytes = fs::read(output_path).unwrap();
+            let serialized = String::from_utf8_lossy(&bytes);
+            assert!(!serialized.contains("private.txt"));
+            assert!(!serialized.contains("cHJpdmF0"));
+            serde_json::from_slice::<Vec<String>>(&bytes).unwrap()
+        };
+        let first = run(data_dir.path(), &data_dir.path().join("first.json"));
+        let restarted = run(data_dir.path(), &data_dir.path().join("restarted.json"));
+        let other = run(other_dir.path(), &other_dir.path().join("other.json"));
+        assert_eq!(first, restarted);
+        assert_ne!(first, other);
+        assert!(first[0].starts_with("browser:17:set_file_input:upload:"));
+        assert!(crate::PermissionRequest::is_private_browser_file_resource(
+            "default::browser",
+            &first[0]
+        ));
+        assert!(!crate::PermissionRequest::is_focused_browser_resource(
+            "browser", &first[0]
+        ));
+        for different in first.iter().skip(1) {
+            assert_ne!(&first[0], different);
+        }
+
+        for action in ["click", "tabs"] {
+            let mut poisoned = base.clone();
+            poisoned["action"] = serde_json::json!(action);
+            assert!(is_private_browser_file_input("browser", &poisoned));
+            assert!(check_permissions("browser", &poisoned).is_err());
+        }
+
+        let mut invalid = base.clone();
+        for (field, value) in [
+            ("filename", serde_json::json!("../private.txt")),
+            ("filename", serde_json::json!("C:\\private.txt")),
+            ("mime_type", serde_json::json!("text/plain; charset=utf-8")),
+            ("selector", serde_json::json!(" ")),
+            ("data_base64", serde_json::json!("YQ=")),
+            ("data_base64", serde_json::json!("YQ==\n")),
+            ("data_base64", serde_json::json!("YR==")),
+            ("data_base64", serde_json::json!("A".repeat(1398108))),
+            ("filename", serde_json::json!("x".repeat(129))),
+            (
+                "mime_type",
+                serde_json::json!(format!("text/{}", "x".repeat(124))),
+            ),
+        ] {
+            invalid[field] = value;
+            assert!(validate_browser_file_input(&invalid).is_err(), "{field}");
+            invalid = base.clone();
+        }
+        invalid["path"] = serde_json::json!("/tmp/private");
+        assert!(validate_browser_file_input(&invalid).is_err());
+        let mut empty = base;
+        empty["data_base64"] = serde_json::json!("");
+        assert!(validate_browser_file_input(&empty).is_ok());
+        empty["data_base64"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_BROWSER_FILE_BYTES])
+        );
+        assert!(validate_browser_file_input(&empty).is_ok());
     }
 
     #[test]

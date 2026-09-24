@@ -2665,6 +2665,7 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         (Some("press"), Some("page")) => true,
         (Some("press"), Some(rest)) => rest.starts_with("focused:key:"),
         (Some("select_option"), Some(rest)) => rest.starts_with("options:"),
+        (Some("set_file_input"), Some(rest)) => rest.starts_with("upload:"),
         (Some("dialog_respond"), Some(rest)) => rest.split(':').next().is_some_and(|id| {
             id.len() == 24
                 && id
@@ -2697,7 +2698,7 @@ fn focused_browser_action<'a>(tool_name: &str, args: &'a serde_json::Value) -> O
     }
     let action = args.get("action")?.as_str()?;
     match action {
-        "type" | "key" | "dialog_respond" => Some(action),
+        "type" | "key" | "dialog_respond" | "set_file_input" => Some(action),
         "press" if !valid_browser_press_target(args) => Some(action),
         _ => None,
     }
@@ -2755,6 +2756,9 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
         return "[browser arguments unavailable]".to_string();
     };
+    if args.get("data_base64").is_some() {
+        return serde_json::json!({"action":"set_file_input","input":"[redacted]"}).to_string();
+    }
     if let Some(action) = focused_browser_action(tool_name, &args) {
         return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
     }
@@ -16926,6 +16930,7 @@ mod question_tests {
             "browser:17:key:private-fingerprint",
             "browser:17:press:focused:key:private-fingerprint",
             "browser:17:select_option:options:private-fingerprint",
+            "browser:17:set_file_input:upload:private-fingerprint",
             "browser:17:dialog_respond:aaaaaaaaaaaaaaaaaaaaaaaa:accept:private-fingerprint",
         ] {
             permission.request.resource = focused_resource.to_string();
@@ -17367,6 +17372,126 @@ mod question_tests {
             browser_download_result_for_display("private-error", false),
             "Browser download failed"
         );
+    }
+
+    #[test]
+    fn browser_file_input_events_and_permission_inspector_hide_file_bytes() {
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#private-upload",
+            "filename":"private.txt","mime_type":"text/plain",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        for tool_name in ["browser", "default::browser"] {
+            let display = tool_arguments_for_display(tool_name, &args.to_string());
+            assert_eq!(
+                display,
+                r#"{"action":"set_file_input","input":"[redacted]"}"#
+            );
+            let invalid =
+                serde_json::json!({"action":"unknown","data_base64":"cHJpdmF0ZSBieXRlcw=="});
+            assert_eq!(
+                tool_arguments_for_display(tool_name, &invalid.to_string()),
+                display
+            );
+            assert_eq!(
+                tool_arguments_for_display(
+                    tool_name,
+                    r#"{"action":"set_file_input","data_base64":"cHJpdmF0ZSBieXRlcw==""#,
+                ),
+                "[browser arguments unavailable]"
+            );
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "file-call".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args.clone(),
+            })
+            .unwrap();
+            app.handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "file-call".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: serde_json::json!({"page_epoch":17,"active_tab_id":"a"}).to_string(),
+                },
+            })
+            .unwrap();
+            let displayed = &app.chat.current_tool_calls[0];
+            for private in ["private-upload", "private.txt", "cHJpdmF0"] {
+                assert!(!format!("{displayed:?}").contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_file_input_pending_modal_offers_usable_one_shot_choices() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut request = sample_permission_request(
+            "file-chat",
+            "file-call",
+            vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce,
+            ],
+        );
+        request.tool_name = "browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = "[redacted]".to_string();
+        request.operation_summary = "Set one in-memory browser file input".to_string();
+        request.suggested_matchers.clear();
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Approve in-memory browser file input?".to_string(),
+            tool_call_id: Some("file-call".to_string()),
+            tool_name: Some("browser".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Permission),
+            permission_request: Some(request),
+            tool_arguments: Some(serde_json::json!({
+                "action":"set_file_input","file":"[redacted]"
+            })),
+            ..PendingQuestion::default()
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("file-chat".to_string());
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "file:approval".to_string(),
+            "file-chat".to_string(),
+            &pending,
+            String::new(),
+        ));
+        let ActiveQuestionKind::Permission(permission) =
+            &app.pending_question.as_ref().unwrap().kind
+        else {
+            panic!("typed file permission")
+        };
+        assert!(permission.request.suggested_matchers.is_empty());
+        let choice = build_permission_decision(
+            &permission.request,
+            PermissionDecisionKind::AllowOnce,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(choice.request_id, "file-call");
+        assert_eq!(choice.decision, PermissionDecisionKind::AllowOnce);
+        assert_eq!(choice.matcher_id, None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Allow once"), "{rendered}");
+        assert!(rendered.contains("Deny once"), "{rendered}");
+        assert!(!rendered.contains("Allow for session"), "{rendered}");
+        assert!(!rendered.contains("Allow globally"), "{rendered}");
+        assert!(!rendered.contains("private"), "{rendered}");
     }
 
     #[test]

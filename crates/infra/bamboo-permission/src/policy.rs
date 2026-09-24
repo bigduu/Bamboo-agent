@@ -450,12 +450,34 @@ impl PermissionRequest {
 
     pub fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
         Self::is_focused_browser_resource(tool_name, resource)
+            || Self::is_private_browser_file_resource(tool_name, resource)
             || (tool_name
                 .trim()
                 .rsplit("::")
                 .next()
                 .is_some_and(|name| name.trim().eq_ignore_ascii_case("browser_eval"))
                 && resource.starts_with("browser_eval:"))
+    }
+
+    /// Browser file bytes use a keyed resource fingerprint. Presentation and
+    /// logging surfaces must never expose that fingerprint or the original
+    /// payload, while the authoritative request retains it for exact replay.
+    pub fn is_private_browser_file_resource(tool_name: &str, resource: &str) -> bool {
+        if !tool_name
+            .trim()
+            .rsplit("::")
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        {
+            return false;
+        }
+        let mut parts = resource.splitn(4, ':');
+        parts.next() == Some("browser")
+            && parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+            && parts.next() == Some("set_file_input")
+            && parts.next().is_some_and(|rest| rest.starts_with("upload:"))
     }
 
     /// Recover the focus-bound keyboard boundary from the server-generated

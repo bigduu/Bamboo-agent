@@ -323,7 +323,10 @@ fn is_private_browser_resource(permission_type: PermissionType, resource: &str) 
                 "browser_eval",
                 resource,
             )
-            || is_private_browser_download_resource(resource))
+            || is_private_browser_download_resource(resource)
+            || super::policy::PermissionRequest::is_private_browser_file_resource(
+                "browser", resource,
+            ))
 }
 
 fn is_private_browser_download_resource(resource: &str) -> bool {
@@ -1353,9 +1356,23 @@ mod tests {
         let checker = LoggingPermissionChecker::new(PromptChecker);
         let download_fingerprint = "a".repeat(64);
         let download_resource = format!("browser:17:download:css:{download_fingerprint}");
-        for resource in [
-            "browser:17:type:focused:private-fingerprint",
-            download_resource.as_str(),
+        for (resource, description) in [
+            (
+                "browser:17:type:focused:private-fingerprint",
+                "Type into focused browser element",
+            ),
+            (
+                download_resource.as_str(),
+                "Download from selected browser element",
+            ),
+            (
+                "browser:17:set_file_input:upload:private-fingerprint",
+                "Set one in-memory browser file input",
+            ),
+            (
+                "browser_eval:17:private-eval-fingerprint",
+                "Execute browser page JavaScript",
+            ),
         ] {
             assert!(
                 checker
@@ -1366,7 +1383,7 @@ mod tests {
                 .request_confirmation(PermissionContext::new(
                     PermissionType::BrowserInteraction,
                     resource,
-                    "Browser operation",
+                    description,
                 ))
                 .await;
             assert!(matches!(
@@ -1376,27 +1393,6 @@ mod tests {
             checker
                 .grant_session_permission(PermissionType::BrowserInteraction, resource.to_string());
         }
-        let eval_resource = "browser_eval:17:private-eval-fingerprint";
-        assert!(
-            checker
-                .needs_confirmation(PermissionType::BrowserInteraction, eval_resource)
-                .await
-        );
-        let eval_result = checker
-            .request_confirmation(PermissionContext::new(
-                PermissionType::BrowserInteraction,
-                eval_resource,
-                "Execute browser page JavaScript",
-            ))
-            .await;
-        assert!(matches!(
-            eval_result,
-            Err(PermissionError::ConfirmationRequired { .. })
-        ));
-        checker.grant_session_permission(
-            PermissionType::BrowserInteraction,
-            eval_resource.to_string(),
-        );
         let logged =
             String::from_utf8(bytes.lock().expect("log buffer lock").clone()).expect("UTF-8 logs");
         assert!(logged.contains("[redacted]"));

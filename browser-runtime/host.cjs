@@ -733,6 +733,24 @@ async function clearDownloadDirectory() {
   await Promise.all(entries.map(name => fs.rm(path.join(downloadDir, name), { recursive: true, force: true })));
 }
 
+async function settleDownloadDirectory(deadlineAt) {
+  // Chromium can recreate a .crdownload shortly after reporting cancellation.
+  // Do not return a reusable host until its private directory stays empty.
+  let emptySince = 0;
+  while (true) {
+    const entries = await downloadDeadline(fs.readdir(downloadDir), deadlineAt);
+    if (entries.length) {
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      emptySince = 0;
+    } else if (emptySince && Date.now() - emptySince >= 100) {
+      return;
+    } else if (!emptySince) {
+      emptySince = Date.now();
+    }
+    await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), deadlineAt);
+  }
+}
+
 function sweepOrphanDownloads() {
   const sweep = downloadSweep.then(async () => {
     if (!activeDownloadAttempt) await clearDownloadDirectory();
@@ -1060,6 +1078,7 @@ async function boundedDownload(args) {
     try {
       await downloadDeadline(Promise.all([...orphanDownloads]), deadlineAt);
       await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      await settleDownloadDirectory(deadlineAt);
     } catch (error) {
       cleanupError ||= error;
     }
@@ -1072,6 +1091,28 @@ async function boundedDownload(args) {
         'browser download cleanup failed');
     }
   }
+}
+
+function fileInputArgs(args) {
+  const invalid = () => targetError('invalid_request', 'invalid browser in-memory file input');
+  if (!args || typeof args !== 'object' || Array.isArray(args) ||
+      Object.keys(args).some(key => !['selector', 'filename', 'mime_type', 'data_base64', 'expected_epoch'].includes(key))) {
+    throw invalid();
+  }
+  const { selector, filename, mime_type: mimeType, data_base64: dataBase64 } = args;
+  if (typeof selector !== 'string' || !selector.trim() || selector.length > 512 ||
+      typeof filename !== 'string' || !filename.trim() || filename.length > 128 ||
+      filename === '.' || filename === '..' || /[\p{Cc}/\\:]/u.test(filename) ||
+      typeof mimeType !== 'string' || mimeType.length > 128 ||
+      !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType) ||
+      typeof dataBase64 !== 'string' || dataBase64.length > 1398104 ||
+      dataBase64.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(dataBase64)) {
+    throw invalid();
+  }
+  const buffer = Buffer.from(dataBase64, 'base64');
+  if (buffer.length > 1024 * 1024 || buffer.toString('base64') !== dataBase64) throw invalid();
+  return { name: filename, mimeType, buffer };
 }
 
 async function waitForTarget(locator, missingMessage, deadlineAt) {
@@ -1827,6 +1868,25 @@ async function command(action, args = {}) {
     }
     case 'download':
       return boundedDownload(args);
+    case 'set_file_input': {
+      checkEpoch(args);
+      const file = fileInputArgs(args);
+      try {
+        await withPinnedTarget(args, async handle => {
+          const isFileInput = await handle.evaluate(element =>
+            element instanceof HTMLInputElement && element.type === 'file');
+          if (!isFileInput) {
+            throw targetError('invalid_target', 'browser target must be a file input');
+          }
+          await handle.setInputFiles(file, { timeout: 10_000 });
+        });
+        return state();
+      } catch (error) {
+        if (['invalid_request', 'invalid_target', 'stale_epoch'].includes(error?.code)) throw error;
+        // Playwright errors may quote the filename or page content.
+        throw targetError('file_input_failed', 'browser file input failed; refresh the page and retry');
+      }
+    }
     case 'hover_selector': {
       const deadlineAt = Date.now() + POINTER_ACTION_BUDGET_MS;
       checkEpoch(args);

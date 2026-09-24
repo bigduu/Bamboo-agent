@@ -45,6 +45,25 @@ pub fn parse_tool_args(arguments: &str) -> std::result::Result<serde_json::Value
         .map_err(|error| ToolError::InvalidArguments(format!("Invalid JSON arguments: {error}")))
 }
 
+fn tool_start_arguments_for_display(
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let browser = tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"));
+    if browser
+        && (args.get("action").and_then(serde_json::Value::as_str) == Some("set_file_input")
+            || args.get("data_base64").is_some())
+    {
+        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+    } else {
+        args.clone()
+    }
+}
+
 fn trim_end_whitespace_in_place(value: &mut String) {
     let trimmed_len = value.trim_end_matches(char::is_whitespace).len();
     value.truncate(trimmed_len);
@@ -486,7 +505,7 @@ async fn execute_sub_actions_with_persistence(
             .send(AgentEvent::ToolStart {
                 tool_call_id: action.id.clone(),
                 tool_name: action.function.name.clone(),
-                arguments: args,
+                arguments: tool_start_arguments_for_display(&action.function.name, &args),
             })
             .await;
 
@@ -609,6 +628,21 @@ mod tests {
     use crate::tools::{FunctionCall, ToolSchema};
 
     use super::*;
+
+    #[test]
+    fn browser_file_input_start_event_hides_bytes_without_changing_authoritative_args() {
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==","expected_epoch":17,
+        });
+        let original = args.clone();
+        assert_eq!(
+            tool_start_arguments_for_display("default::browser", &args),
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+    }
 
     struct StaticExecutor {
         results: HashMap<String, ToolResult>,
