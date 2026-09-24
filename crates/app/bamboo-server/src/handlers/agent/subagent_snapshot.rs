@@ -178,7 +178,11 @@ pub async fn handler(state: web::Data<AppState>) -> Result<HttpResponse> {
         snapshot_seq,
         approvals_revision: approval_snapshot.revision,
         generated_at: chrono::Utc::now().to_rfc3339(),
-        approvals: approval_snapshot.approvals,
+        approvals: approval_snapshot
+            .approvals
+            .into_iter()
+            .map(bamboo_engine::external_agents::live::approval_record_for_display)
+            .collect(),
         children,
     }))
 }
@@ -351,5 +355,50 @@ mod tests {
             response["children"][0]["approval_request_ids"][0],
             "request-1"
         );
+    }
+
+    #[actix_web::test]
+    async fn snapshot_redacts_browser_approval_without_changing_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let private = "private-download-url-selector";
+        let mut approval = pending_approval();
+        approval.tool_name = "default::browser".into();
+        approval.permission = private.into();
+        approval.resource = format!("browser:17:download:css:{private}");
+        approval.reason = Some(private.into());
+        state
+            .approval_registry
+            .lock()
+            .unwrap()
+            .register(approval)
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/api/v1/subagents/snapshot", web::get().to(handler)),
+        )
+        .await;
+        let response: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/subagents/snapshot")
+                .to_request(),
+        )
+        .await;
+        let wire = response.to_string();
+        assert!(!wire.contains(private), "{wire}");
+        assert_eq!(response["approvals"][0]["request_id"], "request-1");
+        assert_eq!(response["approvals"][0]["child_attempt"], 2);
+        assert_eq!(response["approvals"][0]["version"], 1);
+        assert_eq!(response["approvals"][0]["resource"], "[redacted]");
+        assert!(state
+            .approval_registry
+            .lock()
+            .unwrap()
+            .unresolved_snapshot()
+            .approvals[0]
+            .resource
+            .contains(private));
     }
 }

@@ -69,6 +69,7 @@ pub(crate) fn spawn_event_forwarder(
             let mut tool_event_display = NativeToolEventDisplay::default();
             while let Some(event) = mpsc_rx.recv().await {
                 let event = tool_event_display.project(event);
+                let event = bamboo_engine::external_agents::live::approval_event_for_display(event);
                 let lifecycle_id = match &event {
                     AgentEvent::WorkflowActivated { event_id, .. }
                     | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
@@ -888,7 +889,7 @@ mod tests {
         }
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        let (session_tx, mut session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
         let mut history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
@@ -921,6 +922,7 @@ mod tests {
                 .await,
             "history barrier must be durably published before the producer continues"
         );
+        let private = "private-download-selector";
         mpsc_tx
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
@@ -929,10 +931,10 @@ mod tests {
                 request_id: "req-1".into(),
                 version: 2,
                 status: "approved".into(),
-                reason: None,
-                tool_name: "Bash".into(),
-                permission: "execute".into(),
-                resource: "/tmp/x".into(),
+                reason: Some(private.into()),
+                tool_name: "default::browser".into(),
+                permission: private.into(),
+                resource: format!("browser:17:download:css:{private}"),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 resolved_at: Some("2026-01-01T00:00:01Z".into()),
             })
@@ -966,6 +968,16 @@ mod tests {
             journaled[4].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
+        assert!(!serde_json::to_string(&journaled[4].event)
+            .unwrap()
+            .contains(private));
+        let broadcast = std::iter::from_fn(|| session_rx.try_recv().ok())
+            .find(|event| matches!(event, AgentEvent::ChildApprovalChanged { .. }))
+            .expect("child approval reached the live session stream");
+        assert!(!serde_json::to_string(&broadcast).unwrap().contains(private));
+        let runners = state.agent_runners.read().await;
+        let replay = &runners[session_id].last_critical_events;
+        assert!(!serde_json::to_string(replay).unwrap().contains(private));
         // Sequence numbers are monotonic and 1-based.
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);
