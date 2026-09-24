@@ -1,0 +1,378 @@
+//! Display-only projection for native tool events before they reach live clients.
+//!
+//! The execution channel and session history keep the authoritative events.
+//! This projector belongs to one run and only trusts a `ToolStart` from the
+//! current round to identify subsequent call-id-only events.
+
+use std::collections::HashMap;
+
+use serde_json::{json, Value};
+
+use super::events::AgentEvent;
+use crate::tools::ToolResult;
+
+#[derive(Debug, Clone)]
+enum CallIdentity {
+    Download,
+    Other(String),
+    UnknownBrowser,
+}
+
+/// Sanitizes the outward copy of native events, without changing execution.
+#[derive(Debug, Default)]
+pub struct NativeToolEventDisplay {
+    calls: HashMap<String, CallIdentity>,
+    round: Option<u32>,
+}
+
+fn canonical_tool_name(tool_name: &str) -> &str {
+    tool_name.trim().rsplit("::").next().unwrap_or("")
+}
+
+fn is_browser(tool_name: &str) -> bool {
+    canonical_tool_name(tool_name).eq_ignore_ascii_case("browser")
+}
+
+fn is_download(arguments: &Value) -> bool {
+    arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .is_some_and(|action| action.eq_ignore_ascii_case("download"))
+}
+
+fn is_known_browser_action(arguments: &Value) -> bool {
+    matches!(
+        arguments.get("action").and_then(Value::as_str),
+        Some(
+            "tabs"
+                | "new_tab"
+                | "activate_tab"
+                | "close_tab"
+                | "navigate"
+                | "history"
+                | "viewport"
+                | "snapshot"
+                | "click"
+                | "click_at"
+                | "hover"
+                | "drag"
+                | "fill"
+                | "select_option"
+                | "set_file_input"
+                | "type"
+                | "press"
+                | "key"
+                | "scroll"
+                | "screenshot"
+                | "dialog_respond"
+        )
+    )
+}
+
+fn safe_download_arguments(arguments: &Value) -> Value {
+    let mut display = json!({"action":"download"});
+    if let Some(epoch) = arguments.get("expected_epoch").and_then(Value::as_u64) {
+        display["expected_epoch"] = json!(epoch);
+    }
+    display
+}
+
+impl NativeToolEventDisplay {
+    /// Return a display copy of an event. A missing or stale call identity may
+    /// be a dropped `ToolStart`, so call-id-only payloads fail closed.
+    pub fn project(&mut self, event: AgentEvent) -> AgentEvent {
+        match event {
+            AgentEvent::RunnerProgress {
+                session_id,
+                round_count,
+            } => {
+                if self.round != Some(round_count) {
+                    self.calls.clear();
+                    self.round = Some(round_count);
+                }
+                AgentEvent::RunnerProgress {
+                    session_id,
+                    round_count,
+                }
+            }
+            AgentEvent::ToolStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                // The namespace is model-supplied and can itself contain a
+                // private selector or URL. Outward browser identity is fixed.
+                let display_tool_name = if is_browser(&tool_name) {
+                    "browser".to_string()
+                } else {
+                    tool_name.clone()
+                };
+                let identity = if is_browser(&tool_name) && is_download(&arguments) {
+                    CallIdentity::Download
+                } else if is_browser(&tool_name) && !is_known_browser_action(&arguments) {
+                    CallIdentity::UnknownBrowser
+                } else {
+                    CallIdentity::Other(canonical_tool_name(&tool_name).to_ascii_lowercase())
+                };
+                let arguments = match &identity {
+                    CallIdentity::Download => safe_download_arguments(&arguments),
+                    CallIdentity::UnknownBrowser => {
+                        json!({"action":"browser","arguments":"[redacted]"})
+                    }
+                    CallIdentity::Other(_) => arguments,
+                };
+                self.calls.insert(tool_call_id.clone(), identity);
+                AgentEvent::ToolStart {
+                    tool_call_id,
+                    tool_name: display_tool_name,
+                    arguments,
+                }
+            }
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                let content =
+                    if matches!(self.calls.get(&tool_call_id), Some(CallIdentity::Other(_))) {
+                        content
+                    } else {
+                        "Tool output hidden".to_string()
+                    };
+                AgentEvent::ToolToken {
+                    tool_call_id,
+                    content,
+                }
+            }
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => {
+                let result = match self.calls.remove(&tool_call_id) {
+                    Some(CallIdentity::Other(_)) => result,
+                    Some(CallIdentity::Download) => {
+                        ToolResult::text(result.success, "Browser download result hidden")
+                    }
+                    _ => ToolResult::text(result.success, "Tool result hidden"),
+                };
+                AgentEvent::ToolComplete {
+                    tool_call_id,
+                    result,
+                }
+            }
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } => {
+                let error = match self.calls.remove(&tool_call_id) {
+                    Some(CallIdentity::Other(_)) => error,
+                    Some(CallIdentity::Download) => "Browser download error hidden".to_string(),
+                    _ => "Tool error hidden".to_string(),
+                };
+                AgentEvent::ToolError {
+                    tool_call_id,
+                    error,
+                }
+            }
+            AgentEvent::ToolLifecycle {
+                tool_call_id,
+                tool_name,
+                phase,
+                elapsed_ms,
+                is_mutating,
+                auto_approved,
+                summary,
+                error,
+            } => {
+                let display_tool_name = if is_browser(&tool_name) {
+                    "browser".to_string()
+                } else {
+                    tool_name.clone()
+                };
+                let known_other = matches!(
+                    self.calls.get(&tool_call_id),
+                    Some(CallIdentity::Other(name))
+                        if name.eq_ignore_ascii_case(canonical_tool_name(&tool_name))
+                );
+                // A lifecycle from another tool with a reused call ID must
+                // not inherit an earlier ordinary tool's display authority.
+                if matches!(self.calls.get(&tool_call_id), Some(CallIdentity::Other(_)))
+                    && !known_other
+                {
+                    self.calls
+                        .insert(tool_call_id.clone(), CallIdentity::UnknownBrowser);
+                }
+                AgentEvent::ToolLifecycle {
+                    tool_call_id,
+                    tool_name: display_tool_name,
+                    phase,
+                    elapsed_ms,
+                    is_mutating,
+                    auto_approved,
+                    summary: summary.map(|text| {
+                        if known_other {
+                            text
+                        } else {
+                            "Tool activity hidden".to_string()
+                        }
+                    }),
+                    error: error.map(|text| {
+                        if known_other {
+                            text
+                        } else {
+                            "Tool error hidden".to_string()
+                        }
+                    }),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolResultImage;
+
+    fn start(id: &str, name: &str, arguments: Value) -> AgentEvent {
+        AgentEvent::ToolStart {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            arguments,
+        }
+    }
+
+    fn complete(id: &str, private: &str) -> AgentEvent {
+        AgentEvent::ToolComplete {
+            tool_call_id: id.into(),
+            result: ToolResult {
+                success: true,
+                result: private.into(),
+                display_preference: Some(private.into()),
+                images: vec![ToolResultImage {
+                    mime_type: "image/png".into(),
+                    data: private.into(),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn download_projection_hides_every_result_field_and_lifecycle_text() {
+        let secret = "private-selector-url-filename-and-bytes";
+        let mut display = NativeToolEventDisplay::default();
+        let authoritative = complete("call-1", secret);
+        let projected = display.project(start(
+            "call-1",
+            &format!("{secret}::browser"),
+            json!({"action":"download","selector":secret,"expected_epoch":17,"extra":{"url":secret}}),
+        ));
+        assert!(!serde_json::to_string(&projected).unwrap().contains(secret));
+        assert!(
+            matches!(projected, AgentEvent::ToolStart { tool_name, arguments, .. }
+            if tool_name == "browser" && arguments == json!({"action":"download","expected_epoch":17}))
+        );
+        let lifecycle = display.project(AgentEvent::ToolLifecycle {
+            tool_call_id: "call-1".into(),
+            tool_name: format!("{secret}::browser"),
+            phase: "error".into(),
+            elapsed_ms: Some(2),
+            is_mutating: false,
+            auto_approved: false,
+            summary: Some(secret.into()),
+            error: Some(secret.into()),
+        });
+        let lifecycle_json = serde_json::to_string(&lifecycle).unwrap();
+        assert!(!lifecycle_json.contains(secret));
+        let token = display.project(AgentEvent::ToolToken {
+            tool_call_id: "call-1".into(),
+            content: secret.into(),
+        });
+        assert!(!serde_json::to_string(&token).unwrap().contains(secret));
+        let result = display.project(authoritative.clone());
+        let AgentEvent::ToolComplete { result, .. } = result else {
+            panic!("expected completion");
+        };
+        assert!(result.success);
+        assert_eq!(result.result, "Browser download result hidden");
+        assert!(result.images.is_empty());
+        assert_eq!(result.display_preference, None);
+        assert!(serde_json::to_string(&authoritative)
+            .unwrap()
+            .contains(secret));
+    }
+
+    #[test]
+    fn missing_start_and_reused_id_fail_closed_without_hiding_ordinary_tools() {
+        let secret = "private-download-payload";
+        let mut display = NativeToolEventDisplay::default();
+        let unknown = display.project(complete("missing", secret));
+        assert!(!serde_json::to_string(&unknown).unwrap().contains(secret));
+        let orphan_lifecycle = display.project(AgentEvent::ToolLifecycle {
+            tool_call_id: "missing".into(),
+            tool_name: format!("{secret}::browser"),
+            phase: "error".into(),
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: Some(secret.into()),
+            error: Some(secret.into()),
+        });
+        assert!(!serde_json::to_string(&orphan_lifecycle)
+            .unwrap()
+            .contains(secret));
+
+        display.project(start("shared", "Read", json!({"path":"readme.md"})));
+        assert!(
+            matches!(display.project(complete("shared", "ordinary Read result")),
+            AgentEvent::ToolComplete { result, .. } if result.result == "ordinary Read result")
+        );
+        let late = display.project(complete("shared", secret));
+        assert!(!serde_json::to_string(&late).unwrap().contains(secret));
+
+        display.project(start("same-round", "Read", json!({"path":"readme.md"})));
+        display.project(AgentEvent::ToolLifecycle {
+            tool_call_id: "same-round".into(),
+            tool_name: "browser".into(),
+            phase: "begin".into(),
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: None,
+            error: None,
+        });
+        let mismatched = display.project(complete("same-round", secret));
+        assert!(!serde_json::to_string(&mismatched).unwrap().contains(secret));
+
+        display.project(start("across-rounds", "Read", json!({"path":"readme.md"})));
+        display.project(AgentEvent::RunnerProgress {
+            session_id: "chat".into(),
+            round_count: 2,
+        });
+        let reused = display.project(complete("across-rounds", secret));
+        assert!(!serde_json::to_string(&reused).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn malformed_browser_start_hides_arguments_and_error_but_snapshot_stays_visible() {
+        let secret = "private-selector-and-url";
+        let mut display = NativeToolEventDisplay::default();
+        let malformed = display.project(start(
+            "bad",
+            "browser",
+            json!({"selector":secret,"url":secret}),
+        ));
+        assert!(!serde_json::to_string(&malformed).unwrap().contains(secret));
+        let error = display.project(AgentEvent::ToolError {
+            tool_call_id: "bad".into(),
+            error: secret.into(),
+        });
+        assert!(!serde_json::to_string(&error).unwrap().contains(secret));
+
+        display.project(start("snapshot", "browser", json!({"action":"snapshot"})));
+        assert!(
+            matches!(display.project(complete("snapshot", "page_epoch: 17")),
+            AgentEvent::ToolComplete { result, .. } if result.result == "page_epoch: 17")
+        );
+    }
+}
