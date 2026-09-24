@@ -45,7 +45,10 @@ pub fn parse_tool_args(arguments: &str) -> std::result::Result<serde_json::Value
         .map_err(|error| ToolError::InvalidArguments(format!("Invalid JSON arguments: {error}")))
 }
 
-fn tool_start_arguments_for_display(
+/// Project a tool-start event for observers without changing authoritative
+/// execution arguments. Browser uploads and downloads can carry private page
+/// data before permission and schema validation complete.
+pub fn tool_start_arguments_for_display(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
@@ -55,12 +58,39 @@ fn tool_start_arguments_for_display(
         .next()
         .is_some_and(|name| name.eq_ignore_ascii_case("browser"));
     if browser
+        && args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| action.eq_ignore_ascii_case("download"))
+    {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = args
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        display
+    } else if browser
         && (args.get("action").and_then(serde_json::Value::as_str) == Some("set_file_input")
             || args.get("data_base64").is_some())
     {
         serde_json::json!({"action":"set_file_input","file":"[redacted]"})
     } else {
         args.clone()
+    }
+}
+
+fn tool_start_name_for_display(tool_name: &str) -> String {
+    if tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+    {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
     }
 }
 
@@ -484,10 +514,14 @@ async fn execute_sub_actions_with_persistence(
                 "Plan mode: {} operation blocked",
                 action.function.name.trim()
             );
+            let display_error = format!(
+                "Plan mode: {} operation blocked",
+                tool_start_name_for_display(&action.function.name)
+            );
             let _ = event_tx
                 .send(AgentEvent::ToolError {
                     tool_call_id: action.id.clone(),
-                    error: error.clone(),
+                    error: display_error,
                 })
                 .await;
             session.add_message(Message::tool_result_with_status(
@@ -504,7 +538,7 @@ async fn execute_sub_actions_with_persistence(
         let _ = event_tx
             .send(AgentEvent::ToolStart {
                 tool_call_id: action.id.clone(),
-                tool_name: action.function.name.clone(),
+                tool_name: tool_start_name_for_display(&action.function.name),
                 arguments: tool_start_arguments_for_display(&action.function.name, &args),
             })
             .await;
@@ -642,6 +676,36 @@ mod tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(tool_start_name_for_display("default::browser"), "browser");
+    }
+
+    #[test]
+    fn browser_download_start_event_hides_selector_and_extras_without_changing_args() {
+        let args = serde_json::json!({
+            "action":"download","selector":"a[data-secret='private']",
+            "expected_epoch":17,"url":"https://private.example/file",
+            "nested":{"filename":"private.txt"},
+        });
+        let original = args.clone();
+        let display = serde_json::json!({"action":"download","expected_epoch":17});
+        assert_eq!(tool_start_arguments_for_display("browser", &args), display);
+        assert_eq!(
+            tool_start_arguments_for_display("default::browser", &args),
+            display
+        );
+        let mut poisoned = args.clone();
+        poisoned["data_base64"] = serde_json::json!("private-file-bytes");
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &poisoned),
+            display
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("private-selector::browser"),
+            "browser"
+        );
+        assert_eq!(tool_start_name_for_display("other"), "other");
     }
 
     struct StaticExecutor {
@@ -1058,6 +1122,92 @@ mod tests {
             message.tool_call_id.as_deref() == Some("call_write")
                 && message.content.contains("Plan mode")
         }));
+    }
+
+    #[tokio::test]
+    async fn plan_denial_hides_private_browser_namespace_in_event_only() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let tools = Arc::new(ContextRecordingExecutor::default());
+        let mut session = Session::new("plan-private-browser", "test-model");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let result = ToolResult::text(
+            true,
+            serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![make_tool_call(
+                    "call_browser",
+                    "private-selector::browser",
+                    "{malformed",
+                )],
+                reason: "denial".to_string(),
+            })
+            .unwrap(),
+        );
+        let flags = ToolExecutionSessionFlags {
+            plan_read_only: true,
+            ..ToolExecutionSessionFlags::default()
+        };
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &parent_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            flags,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            event_rx.try_recv().expect("display denial"),
+            AgentEvent::ToolError { error, .. } if error == "Plan mode: browser operation blocked"
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("call_browser")
+                && message.content.contains("private-selector::browser")
+        }));
+    }
+
+    #[tokio::test]
+    async fn malformed_browser_sub_action_starts_with_fixed_display_name() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let tools = Arc::new(ContextRecordingExecutor::default());
+        let mut session = Session::new("malformed-browser-sub-action", "test-model");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let raw_name = "private-selector::browser";
+        let result = ToolResult::text(
+            true,
+            serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![make_tool_call("call_browser", raw_name, "{malformed")],
+                reason: "display".to_string(),
+            })
+            .unwrap(),
+        );
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &parent_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                AgentEvent::ToolStart { tool_name, arguments, .. }
+                    if tool_name == "browser" && arguments == serde_json::json!({})
+            ))
+        );
+        assert!(
+            result.result.contains(raw_name),
+            "model input stays authoritative"
+        );
     }
 
     #[tokio::test]

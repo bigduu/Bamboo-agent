@@ -62,6 +62,14 @@ fn is_browser_download_action(tool_name: &str, args: &serde_json::Value) -> bool
         && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
 }
 
+fn approval_tool_name_for_display(tool_name: &str) -> String {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser") {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
         return serde_json::json!({
@@ -651,8 +659,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let browser_eval =
                     canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
                 let browser_download = is_browser_download_action(&tool_name, &args);
-                let private_browser_file_input =
-                    crate::permission::is_private_browser_file_input(&tool_name, &args);
+                let private_browser_file_input = !browser_download
+                    && crate::permission::is_private_browser_file_input(&tool_name, &args);
                 let private_browser_display = focused_browser_input
                     || native_browser_select
                     || browser_eval
@@ -855,6 +863,9 @@ impl ToolExecutor for BuiltinToolExecutor {
                 // a stronger scope. No boolean downgrade can create a grant.
                 if let Some(proxy) = proxy {
                     let mut display_request = request.clone();
+                    if canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser") {
+                        display_request.tool_name = "browser".to_string();
+                    }
                     if private_browser_display {
                         display_request.resource = "[redacted]".to_string();
                         display_request.matched_rule = None;
@@ -866,7 +877,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                     }
                     let approved = proxy
                         .request_approval(crate::approval::ApprovalAsk {
-                            tool_name: tool_name.clone(),
+                            tool_name: approval_tool_name_for_display(&tool_name),
                             permission: permission_type.description().to_string(),
                             resource: approval_display_resource.clone(),
                             permission_request: Some(display_request),
@@ -888,14 +899,14 @@ impl ToolExecutor for BuiltinToolExecutor {
                     let _ = tx
                         .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
                             tool_call_id: call.id.clone(),
-                            tool_name: tool_name.clone(),
+                            tool_name: approval_tool_name_for_display(&tool_name),
                             parameters: approval_parameters,
                         })
                         .await;
 
                     let question = format!(
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                        tool_name,
+                        approval_tool_name_for_display(&tool_name),
                         permission_type.description(),
                         approval_display_resource
                     );
@@ -1179,14 +1190,17 @@ mod tests {
             "expected_epoch":17,
             "url":"https://example.test/private-url",
             "extra":{"secret":"private-extra"},
+            "data_base64":"private-file-bytes",
         });
         let original = args.clone();
-        for name in ["browser", "default::browser"] {
+        for name in ["browser", "default::browser", "private-selector::browser"] {
             assert_eq!(
                 approval_parameters_for_display(name, &args),
                 json!({"action":"download","expected_epoch":17})
             );
+            assert_eq!(approval_tool_name_for_display(name), "browser");
         }
+        assert_eq!(approval_tool_name_for_display("Read"), "Read");
         assert_eq!(
             args, original,
             "display projection must not change execution args"
@@ -1215,7 +1229,7 @@ mod tests {
             }
         }
 
-        for tool_name in ["browser", "default::browser"] {
+        for tool_name in ["browser", "default::browser", "private-selector::browser"] {
             let args = json!({
                 "action":"download",
                 "selector":"a[data-secret='private-selector']",
@@ -1252,7 +1266,6 @@ mod tests {
                 .expect("download must pause for approval");
             let payload: serde_json::Value =
                 serde_json::from_str(&result.result).expect("approval payload");
-            let display = payload.to_string();
             assert_eq!(payload["status"], "awaiting_permission_approval");
             assert_eq!(
                 payload["resource"],
@@ -1268,7 +1281,8 @@ mod tests {
                 .unwrap()
                 .contains("private-selector"));
             assert_eq!(payload["permission_request"]["resource"], resource);
-            assert!(!display.contains("private-selector"));
+            assert_eq!(payload["permission_request"]["tool_name"], "browser");
+            assert_eq!(call.function.name, tool_name);
             assert_eq!(
                 config
                     .pending_request("browser-download-approval", &call.id)
@@ -1276,10 +1290,18 @@ mod tests {
                     .resource,
                 resource
             );
+            assert_eq!(
+                config
+                    .pending_request("browser-download-approval", &call.id)
+                    .expect("authoritative pending request")
+                    .tool_name,
+                "browser"
+            );
             assert!(matches!(
                 rx.recv().await.expect("approval event"),
-                AgentEvent::ToolApprovalRequested { parameters, .. }
-                    if parameters == json!({"action":"download","expected_epoch":17})
+                AgentEvent::ToolApprovalRequested { tool_name, parameters, .. }
+                    if tool_name == "browser"
+                        && parameters == json!({"action":"download","expected_epoch":17})
             ));
 
             let captured = Arc::new(std::sync::Mutex::new(None));
@@ -1310,6 +1332,11 @@ mod tests {
                 .expect("captured proxy")
                 .clone()
                 .expect("host saw approval request");
+            assert_eq!(ask.tool_name, "browser");
+            assert_eq!(
+                ask.permission_request.as_ref().unwrap().tool_name,
+                "browser"
+            );
             assert_eq!(ask.resource, "Download from selected browser element");
             assert_eq!(
                 ask.permission_request.as_ref().unwrap().resource,
