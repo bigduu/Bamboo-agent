@@ -45,7 +45,10 @@ pub fn parse_tool_args(arguments: &str) -> std::result::Result<serde_json::Value
         .map_err(|error| ToolError::InvalidArguments(format!("Invalid JSON arguments: {error}")))
 }
 
-fn tool_start_arguments_for_display(
+/// Project a tool-start event for observers without changing authoritative
+/// execution arguments. Browser uploads and downloads can carry private page
+/// data before permission and schema validation complete.
+pub fn tool_start_arguments_for_display(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {

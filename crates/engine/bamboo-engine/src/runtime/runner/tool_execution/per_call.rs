@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
-    parse_tool_args_best_effort, ExecutingSupervisorObservation, ToolCall, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, tool_start_arguments_for_display, ExecutingSupervisorObservation,
+    ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
@@ -46,35 +47,6 @@ fn parse_warning_log_details<'a>(
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(raw_arguments, 180), warning)
-    }
-}
-
-fn tool_start_arguments_for_display(
-    execution_name: &str,
-    args: &serde_json::Value,
-) -> serde_json::Value {
-    if execution_name
-        .trim()
-        .rsplit("::")
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
-        && args
-            .get("action")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|action| action.eq_ignore_ascii_case("download"))
-    {
-        let mut display = serde_json::json!({"action":"download"});
-        if let Some(epoch) = args
-            .get("expected_epoch")
-            .and_then(serde_json::Value::as_u64)
-        {
-            display["expected_epoch"] = serde_json::json!(epoch);
-        }
-        display
-    } else if bamboo_tools::permission::is_private_browser_file_input(execution_name, args) {
-        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
-    } else {
-        args.clone()
     }
 }
 
