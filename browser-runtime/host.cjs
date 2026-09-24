@@ -49,8 +49,11 @@ const DIALOG_TIMEOUT_MS = Number.isInteger(Number(process.env.BAMBOO_BROWSER_DIA
 const MAX_EVAL_CODE_BYTES = 8 * 1024;
 const MAX_EVAL_JSON_BYTES = 64 * 1024;
 const EVAL_HELPER_KEY = `__bamboo_eval_${randomBytes(16).toString('hex')}`;
+const SCRIPT_BLOB_KEY = `__bamboo_blob_${randomBytes(16).toString('hex')}`;
+const SCRIPT_BLOB_SECRET = randomBytes(24).toString('hex');
 const DOWNLOAD_LINK_KEY = `__bamboo_link_${randomBytes(16).toString('hex')}`;
 const DOWNLOAD_LINK_SECRET = randomBytes(24).toString('hex');
+
 let epoch = randomBytes(6).readUIntBE(0, 6);
 let browser;
 let context;
@@ -384,6 +387,375 @@ function installEvalHelper(key) {
   define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
 }
 
+// Installed before site scripts to save pristine intrinsics. Only the bounded
+// attempt wraps page methods; a site-installed hook makes the attempt fail.
+// Captured values live in this private closure, behind a host-only secret.
+function installScriptBlobCapture({ key, secret }) {
+  const root = globalThis;
+  const apply = Reflect.apply;
+  const define = Object.defineProperty;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const createObject = Object.create;
+  const json = JSON;
+  const stringify = json.stringify;
+  const urlClass = URL;
+  const anchorClass = HTMLAnchorElement;
+  const eventTargetClass = EventTarget;
+  const htmlElementClass = HTMLElement;
+  const weakMapClass = WeakMap;
+  const stringClass = String;
+  const byteArrayClass = Uint8Array;
+  const isSafeInteger = Number.isSafeInteger;
+  const nativeCreate = urlClass.createObjectURL;
+  const nativeAnchorClick = anchorClass.prototype.click;
+  const nativeBlobSize = getDescriptor(Blob.prototype, 'size').get;
+  const nativeBlobArrayBuffer = Blob.prototype.arrayBuffer;
+  const nativeEventTarget = getDescriptor(Event.prototype, 'target').get;
+  const nativeCurrentEvent = getDescriptor(root, 'event').get;
+  const nativePreventDefault = Event.prototype.preventDefault;
+  const nativeStopImmediatePropagation = Event.prototype.stopImmediatePropagation;
+  const nativeContains = Node.prototype.contains;
+  const nativeQuerySelectorAll = root.document.querySelectorAll;
+  const nativeClosest = Element.prototype.closest;
+  const nativeNodeListLength = getDescriptor(NodeList.prototype, 'length').get;
+  const nativeNodeListItem = NodeList.prototype.item;
+  const nativeHref = getDescriptor(anchorClass.prototype, 'href').get;
+  const nativeGetAttribute = Element.prototype.getAttribute;
+  const nativeBtoa = root.btoa;
+  const nativeFromCharCode = stringClass.fromCharCode;
+  const nativeCodePointAt = stringClass.prototype.codePointAt;
+  const typedArrayPrototype = Object.getPrototypeOf(byteArrayClass.prototype);
+  const nativeTypedArrayLength = getDescriptor(typedArrayPrototype, 'length').get;
+  const nativeTypedArrayByteLength = getDescriptor(typedArrayPrototype, 'byteLength').get;
+  const nativeAdd = eventTargetClass.prototype.addEventListener;
+  const nativeRemove = eventTargetClass.prototype.removeEventListener;
+  const nativeOnclick = getDescriptor(htmlElementClass.prototype, 'onclick');
+  const nativeEval = root.eval;
+  const nativeDelete = Reflect.deleteProperty;
+  const weakGet = WeakMap.prototype.get;
+  const weakSet = WeakMap.prototype.set;
+  const listeners = new weakMapClass();
+  const maxBytes = 256 * 1024;
+  let armed = false;
+  let selectedElement = null;
+  let selectedEvent = null;
+  let trustedClicks = 0;
+  let created = null;
+  let creations = 0;
+  let clicked = null;
+  let clicks = 0;
+  let ambiguous = false;
+  let handlerDepth = 0;
+  let matched = false;
+  let onclickCapture = null;
+  const reset = () => {
+    armed = false;
+    selectedElement = null;
+    selectedEvent = null;
+    trustedClicks = 0;
+    created = null;
+    creations = 0;
+    clicked = null;
+    clicks = 0;
+    ambiguous = false;
+    handlerDepth = 0;
+    matched = false;
+  };
+  const inSelectedDispatch = () => armed && selectedEvent !== null &&
+    apply(nativeCurrentEvent, root, []) === selectedEvent;
+  const inSelectedHandler = () => inSelectedDispatch() && handlerDepth > 0;
+  // A microtask can run while window.event, eventPhase and currentTarget still
+  // identify the trusted click. Only a directly invoked selected-element
+  // handler may produce the returned Blob, and any other creation is ambiguous.
+  const wrappedAdd = function(type, listener, options) {
+    if (type !== 'click' || listener === null ||
+        (typeof listener !== 'function' && typeof listener !== 'object') ||
+        (typeof this !== 'object' && typeof this !== 'function') || this === null) {
+      return apply(nativeAdd, this, [type, listener, options]);
+    }
+    let byListener = apply(weakGet, listeners, [this]);
+    if (!byListener) {
+      byListener = new weakMapClass();
+      apply(weakSet, listeners, [this, byListener]);
+    }
+    let wrapper = apply(weakGet, byListener, [listener]);
+    if (!wrapper) {
+      wrapper = function(event) {
+        const direct = armed && this === selectedElement && event === selectedEvent;
+        if (direct) handlerDepth++;
+        try {
+          if (typeof listener === 'function') return apply(listener, this, [event]);
+          return apply(listener.handleEvent, listener, [event]);
+        } finally {
+          if (direct) handlerDepth--;
+        }
+      };
+      apply(weakSet, byListener, [listener, wrapper]);
+    }
+    return apply(nativeAdd, this, [type, wrapper, options]);
+  };
+  const wrappedRemove = function(type, listener, options) {
+    const byListener = this !== null && (typeof this === 'object' || typeof this === 'function')
+      ? apply(weakGet, listeners, [this]) : null;
+    const wrapper = byListener && listener !== null &&
+      (typeof listener === 'function' || typeof listener === 'object')
+      ? apply(weakGet, byListener, [listener]) : null;
+    if (type === 'click' && wrapper) apply(nativeRemove, this, [type, wrapper, options]);
+    return apply(nativeRemove, this, [type, listener, options]);
+  };
+  define(eventTargetClass.prototype, 'addEventListener', {
+    value: wrappedAdd, writable: true, configurable: true,
+  });
+  define(eventTargetClass.prototype, 'removeEventListener', {
+    value: wrappedRemove, writable: true, configurable: true,
+  });
+  apply(nativeAdd, root, ['click', event => {
+    if (!armed) return;
+    try {
+      if (!apply(getDescriptor(event, 'isTrusted').get, event, [])) return;
+      const target = apply(nativeEventTarget, event, []);
+      if (target !== selectedElement && !apply(nativeContains, selectedElement, [target])) {
+        ambiguous = true;
+        apply(nativePreventDefault, event, []);
+        apply(nativeStopImmediatePropagation, event, []);
+        return;
+      }
+      trustedClicks++;
+      if (trustedClicks === 1) selectedEvent = event;
+      else ambiguous = true;
+    } catch { ambiguous = true; }
+  }, true]);
+  const captureCreate = function(blob) {
+    const url = apply(nativeCreate, this, [blob]);
+    if (inSelectedDispatch()) {
+      if (!inSelectedHandler()) { ambiguous = true; return url; }
+      creations++;
+      if (creations === 1) {
+        try {
+          created = { blob, url, size: apply(nativeBlobSize, blob, []) };
+        } catch { ambiguous = true; }
+      } else ambiguous = true;
+    }
+    return url;
+  };
+  const captureClick = function(...args) {
+    if (!inSelectedDispatch()) return apply(nativeAnchorClick, this, args);
+    if (!inSelectedHandler()) { ambiguous = true; return undefined; }
+    clicks++;
+    try {
+      const url = apply(nativeHref, this, []);
+      const filename = apply(nativeGetAttribute, this, ['download']);
+      if (clicks === 1 && created && url === created.url && safeFilename(filename)) {
+        clicked = { url, filename };
+      }
+      else ambiguous = true;
+    } catch { ambiguous = true; }
+    // Never let a script click start a native download while it is being
+    // attributed. Unmatched/multiple activations fail closed at finish().
+    return undefined;
+  };
+  const safeFilename = filename => {
+    if (typeof filename !== 'string' || !filename || filename.length > 180 ||
+        filename === '.' || filename === '..') return false;
+    for (let index = 0; index < filename.length; index++) {
+      const codePoint = apply(nativeCodePointAt, filename, [index]);
+      if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ||
+          codePoint === 0x2f || codePoint === 0x3a || codePoint === 0x5c ||
+          (codePoint >= 0xd800 && codePoint <= 0xdfff)) return false;
+      if (codePoint > 0xffff) index++;
+    }
+    return true;
+  };
+  const captureOnclick = target => {
+    if (getDescriptor(target, 'onclick')) return false;
+    const original = apply(nativeOnclick.get, target, []);
+    if (original === null) return true;
+    if (typeof original !== 'function') return false;
+    const info = { target, original, changed: false, value: original };
+    info.getter = function() {
+      if (this === target) return info.value;
+      return apply(nativeOnclick.get, this, []);
+    };
+    info.setter = function(value) {
+      if (this !== target) return apply(nativeOnclick.set, this, [value]);
+      info.changed = true;
+      info.value = value;
+      ambiguous = true;
+      return apply(nativeOnclick.set, target, [value]);
+    };
+    info.listener = function(event) {
+      if (info.changed || apply(nativeOnclick.get, target, []) !== null) {
+        ambiguous = true;
+        return undefined;
+      }
+      const direct = armed && this === target && event === selectedEvent;
+      if (direct) handlerDepth++;
+      try {
+        const result = apply(original, this, [event]);
+        if (result === false) apply(nativePreventDefault, event, []);
+        return result;
+      } finally {
+        if (direct) handlerDepth--;
+      }
+    };
+    onclickCapture = info;
+    apply(nativeOnclick.set, target, [null]);
+    apply(nativeAdd, target, ['click', info.listener, false]);
+    define(target, 'onclick', {
+      get: info.getter, set: info.setter, enumerable: true, configurable: true,
+    });
+    return true;
+  };
+  const onclickIntact = () => !onclickCapture ||
+    (getDescriptor(onclickCapture.target, 'onclick')?.get === onclickCapture.getter &&
+      getDescriptor(onclickCapture.target, 'onclick')?.set === onclickCapture.setter &&
+      apply(nativeOnclick.get, onclickCapture.target, []) === null &&
+      !onclickCapture.changed);
+  const evalIntact = () => getDescriptor(root, 'eval')?.value === nativeEval;
+  const nativeMethodsIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
+    root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
+    root.WeakMap === weakMapClass &&
+    urlClass.createObjectURL === nativeCreate && anchorClass.prototype.click === nativeAnchorClick &&
+    eventTargetClass.prototype.addEventListener === wrappedAdd &&
+    eventTargetClass.prototype.removeEventListener === wrappedRemove &&
+    getDescriptor(htmlElementClass.prototype, 'onclick')?.get === nativeOnclick.get &&
+    getDescriptor(htmlElementClass.prototype, 'onclick')?.set === nativeOnclick.set && evalIntact();
+  const wrappersIntact = () => root.URL === urlClass && root.HTMLAnchorElement === anchorClass &&
+    root.EventTarget === eventTargetClass && root.HTMLElement === htmlElementClass &&
+    root.WeakMap === weakMapClass &&
+    urlClass.createObjectURL === captureCreate && anchorClass.prototype.click === captureClick &&
+    eventTargetClass.prototype.addEventListener === wrappedAdd &&
+    eventTargetClass.prototype.removeEventListener === wrappedRemove && onclickIntact();
+  const restore = () => {
+    let restored = true;
+    try {
+      if (onclickCapture) {
+        const info = onclickCapture;
+        apply(nativeRemove, info.target, ['click', info.listener, false]);
+        const descriptor = getDescriptor(info.target, 'onclick');
+        if (descriptor?.get === info.getter && descriptor?.set === info.setter) {
+          if (!apply(nativeDelete, Reflect, [info.target, 'onclick'])) restored = false;
+        } else restored = false;
+        const current = apply(nativeOnclick.get, info.target, []);
+        if (!info.changed && current === null && restored) {
+          apply(nativeOnclick.set, info.target, [info.original]);
+        }
+        onclickCapture = null;
+      }
+      if (urlClass.createObjectURL === captureCreate) {
+        define(urlClass, 'createObjectURL', {
+          value: nativeCreate, writable: true, configurable: true,
+        });
+      } else if (urlClass.createObjectURL !== nativeCreate) restored = false;
+      if (anchorClass.prototype.click === captureClick) {
+        define(anchorClass.prototype, 'click', {
+          value: nativeAnchorClick, writable: true, configurable: true,
+        });
+      } else if (anchorClass.prototype.click !== nativeAnchorClick) restored = false;
+    } catch { restored = false; }
+    return restored;
+  };
+  const run = async (operation, suppliedSecret, selector) => {
+    if (suppliedSecret !== secret) return '{"status":"unverifiable"}';
+    if (operation === 'matches') {
+      if (armed && evalIntact() && wrappersIntact() && selector === selectedElement) {
+        matched = true;
+        return '{"status":"matched"}';
+      }
+      ambiguous = true;
+      return '{"status":"unverifiable"}';
+    }
+    if (operation === 'status') {
+      return armed && matched && !ambiguous && evalIntact() && wrappersIntact()
+        ? '{"status":"matched"}' : '{"status":"unverifiable"}';
+    }
+    if (operation === 'cancel') {
+      const hadAttempt = armed;
+      armed = false;
+      const restored = !hadAttempt || restore();
+      reset();
+      return restored ? '{"status":"unverifiable"}' : '{"status":"cleanup_failed"}';
+    }
+    if (operation === 'arm') {
+      const restored = !(armed || onclickCapture) || restore();
+      reset();
+      if (!restored) return '{"status":"cleanup_failed"}';
+      if (!nativeMethodsIntact() || typeof selector !== 'string' || !selector ||
+          selector.length > 512) {
+        return '{"status":"unverifiable"}';
+      }
+      let target;
+      try {
+        const matches = apply(nativeQuerySelectorAll, root.document, [selector]);
+        if (apply(nativeNodeListLength, matches, []) !== 1) return '{"status":"unverifiable"}';
+        target = apply(nativeNodeListItem, matches, [0]);
+        if (!target || !apply(nativeContains, root.document, [target])) {
+          return '{"status":"unverifiable"}';
+        }
+        // A link with href is handled by the script-free private-page flow.
+        // A bare <a onclick> without href can be a synchronous Blob producer.
+        const anchor = apply(nativeClosest, target, ['a']);
+        if (anchor && (anchor !== target || apply(nativeGetAttribute, target, ['href']) !== null)) {
+          return '{"status":"unverifiable"}';
+        }
+      } catch { return '{"status":"unverifiable"}'; }
+      try {
+        if (!captureOnclick(target)) return '{"status":"unverifiable"}';
+        define(urlClass, 'createObjectURL', {
+          value: captureCreate, writable: true, configurable: true,
+        });
+        define(anchorClass.prototype, 'click', {
+          value: captureClick, writable: true, configurable: true,
+        });
+      } catch {
+        return restore() ? '{"status":"unverifiable"}' : '{"status":"cleanup_failed"}';
+      }
+      selectedElement = target;
+      armed = true;
+      return '{"status":"armed"}';
+    }
+    if (operation !== 'finish') return '{"status":"unverifiable"}';
+    const valid = armed && evalIntact() && wrappersIntact() && !ambiguous && trustedClicks === 1 &&
+      creations === 1 && clicks === 1 && clicked && created &&
+      clicked.url === created.url;
+    const captured = valid ? { blob: created.blob, size: created.size,
+      filename: clicked.filename } : null;
+    const hadAttempt = armed;
+    armed = false;
+    const restored = !hadAttempt || restore();
+    reset();
+    if (!restored) return '{"status":"cleanup_failed"}';
+    if (!captured) return '{"status":"unverifiable"}';
+    if (!isSafeInteger(captured.size) || captured.size > maxBytes) {
+      return '{"status":"too_large"}';
+    }
+    try {
+      const data = await apply(nativeBlobArrayBuffer, captured.blob, []);
+      const bytes = new byteArrayClass(data);
+      const byteLength = apply(nativeTypedArrayByteLength, bytes, []);
+      const length = apply(nativeTypedArrayLength, bytes, []);
+      if (byteLength !== captured.size || byteLength > maxBytes || length !== byteLength) {
+        return '{"status":"unverifiable"}';
+      }
+      let binary = '';
+      for (let index = 0; index < length; index++) {
+        binary += apply(nativeFromCharCode, stringClass, [bytes[index]]);
+      }
+      // A page may replace Object.prototype.toJSON after init. A null-prototype
+      // envelope keeps the captured native serializer from calling page code.
+      const result = apply(createObject, Object, [null]);
+      result.status = 'ok';
+      result.filename = captured.filename;
+      result.byte_count = length;
+      result.data_base64 = apply(nativeBtoa, root, [binary]);
+      return apply(stringify, json, [result]);
+    } catch {
+      return '{"status":"unverifiable"}';
+    }
+  };
+  define(root, key, { value: run, enumerable: false, configurable: false, writable: false });
+}
+
 // Resolve the approved CSS link with pristine DOM methods. Playwright's
 // ElementHandle.evaluate can be intercepted by a site's window.eval, even
 // after CDP disables page scripts, so it cannot authorize a download URL.
@@ -467,6 +839,7 @@ function installDownloadLinkInspector({ key, secret }) {
     } catch { return unverifiable; }
   };
   define(root, key, { value: inspect, enumerable: false, configurable: false, writable: false });
+
 }
 
 function validateEvalResult(value) {
@@ -780,6 +1153,32 @@ async function inspectDownloadLink(cdp, selector, operation, deadlineAt) {
   return link;
 }
 
+async function scriptBlobCommand(cdp, operation, selector, deadlineAt) {
+  const expression = `window[${JSON.stringify(SCRIPT_BLOB_KEY)}](` +
+    `${JSON.stringify(operation)},${JSON.stringify(SCRIPT_BLOB_SECRET)},` +
+    `${JSON.stringify(selector)})`;
+  let answer;
+  try {
+    answer = await downloadDeadline(cdp.send('Runtime.evaluate', {
+      expression, awaitPromise: true, returnByValue: true,
+    }), deadlineAt);
+  } catch (error) {
+    if (error?.code === 'download_timeout') throw error;
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  if (answer.exceptionDetails || answer.result?.type !== 'string' ||
+      typeof answer.result.value !== 'string' || answer.result.value.length > 360_000) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  let result;
+  try { result = JSON.parse(answer.result.value); } catch { /* Fail closed below. */ }
+  if (!result || typeof result !== 'object' || Array.isArray(result) ||
+      !['armed', 'matched', 'ok', 'too_large', 'unverifiable', 'cleanup_failed'].includes(result.status)) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+  }
+  return result;
+}
+
 function verifiedDownloadUrl(value, previousUrl) {
   if (typeof value !== 'string' || !value || value.length > 2_048 || /[\x00-\x1f\x7f]/.test(value)) return null;
   try {
@@ -1000,6 +1399,11 @@ function sweepOrphanDownloads() {
 
 function onDownloadWillBegin(event) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') {
+    attempt.nativeDownloadObserved = true;
+    cancelDownloadGuid(event.guid);
+    return;
+  }
   if (attempt?.accepting && event.frameId === attempt.frameId &&
       event.url !== attempt.verifiedFinalUrl) {
     attempt.resolveUnverifiable();
@@ -1015,6 +1419,12 @@ function onDownloadWillBegin(event) {
 
 function onDownloadProgress(event) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') {
+    attempt.nativeDownloadObserved = true;
+    if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
+    else void removeDownloadArtifacts(event.guid).catch(() => {});
+    return;
+  }
   if (!attempt || event.guid !== attempt.guid) {
     if (event.state === 'inProgress') cancelDownloadGuid(event.guid);
     else void removeDownloadArtifacts(event.guid).catch(() => {});
@@ -1033,6 +1443,7 @@ function onDownloadProgress(event) {
 
 function onPageDownload(page, download) {
   const attempt = activeDownloadAttempt;
+  if (attempt?.mode === 'script_blob') attempt.nativeDownloadObserved = true;
   if (attempt?.accepting && attempt.page === page && download.url() !== attempt.verifiedFinalUrl) {
     attempt.resolveUnverifiable();
   }
@@ -1057,8 +1468,7 @@ function onPageDownload(page, download) {
   if (attempt.oversized) void download.cancel().catch(() => {});
 }
 
-async function boundedDownload(args) {
-  const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+async function boundedDownload(args, deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS) {
   // The 20-second action budget includes cancellation and artifact removal.
   // Reserve its last slice for cleanup even when the transfer never settles.
   const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
@@ -1113,7 +1523,16 @@ async function boundedDownload(args) {
     await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
       workDeadlineAt);
     await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
-    const link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    let link;
+    try {
+      link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    } catch (error) {
+      // Only a failed initial inspection can enter the script-Blob path.
+      // Later failures may follow a private click/request; retrying the same
+      // selector could act on a different DOM node in the shared page.
+      if (error?.code === 'download_unverifiable') error.scriptFallbackEligible = true;
+      throw error;
+    }
     await downloadDeadline(withPinnedTarget(args, async handle => {
       checkEpoch(args);
       if (await handle.ownerFrame() !== tab.page.mainFrame()) {
@@ -1373,6 +1792,185 @@ async function boundedDownload(args) {
         'browser download cleanup failed');
     }
   }
+}
+
+async function boundedScriptBlobDownload(args, deadlineAt) {
+  const cleanupBudget = Math.min(2_000, Math.floor(DOWNLOAD_ACTION_BUDGET_MS / 4));
+  const workDeadlineAt = deadlineAt - cleanupBudget;
+  checkEpoch(args);
+  if (typeof args.selector !== 'string' || !args.selector.trim() || args.selector.length > 512) {
+    throw downloadError('invalid_target', 'browser download requires a bounded CSS selector');
+  }
+  await downloadDeadline(downloadSweep, workDeadlineAt);
+  const tab = requireActiveTab();
+  const cdp = await downloadDeadline(tab.cdp, workDeadlineAt);
+  if (!cdp || !downloadCdp) throw downloadError('download_failed', 'browser download observer unavailable');
+  const sharedUrl = tab.page.url();
+  let documentUrl;
+  try {
+    documentUrl = new URL(checkUrl(sharedUrl));
+    documentUrl.hash = '';
+  } catch {
+    throw downloadError('download_unverifiable', 'browser download requires an HTTP(S) page');
+  }
+  if (!tab.mainDocumentResponse || tab.mainDocumentUrl !== documentUrl.href) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+  }
+  const sourceHeaders = await downloadDeadline(tab.mainDocumentResponse.headersArray(), workDeadlineAt)
+    .catch(() => null);
+  if (!sourceHeaders || sourceHeaders.some(header =>
+    header.name.toLowerCase() === 'content-security-policy' &&
+    header.value.split(/[;,]/).some(directive =>
+      directive.trim().split(/\s+/, 1)[0].toLowerCase() === 'sandbox'))) {
+    throw downloadError('download_unverifiable', 'browser download cannot verify the source page policy');
+  }
+  checkEpoch(args);
+  const attempt = { mode: 'script_blob', accepting: false, nativeDownloadObserved: false };
+  activeDownloadAttempt = attempt;
+  let helperArmed = false;
+  let cleanupError;
+  let response;
+  try {
+    const captured = await downloadDeadline(withPinnedTarget(args, async handle => {
+      checkEpoch(args);
+      let owner;
+      try { owner = await handle.ownerFrame(); } catch { /* Tampered page eval can spoof a Node. */ }
+      if (owner !== tab.page.mainFrame()) {
+        throw downloadError('download_unverifiable',
+          'browser script download requires a target in the main page');
+      }
+      try {
+        await handle.click({ trial: true,
+          timeout: Math.min(1_500, pointerTimeout(workDeadlineAt)) });
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser script download requires an actionable target');
+      }
+      checkEpoch(args);
+      const armed = await scriptBlobCommand(cdp, 'arm', args.selector, workDeadlineAt);
+      if (armed.status === 'cleanup_failed') {
+        cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+        throw cleanupError;
+      }
+      if (armed.status !== 'armed') {
+        throw downloadError('download_unverifiable',
+          'browser download cannot verify the selected script');
+      }
+      helperArmed = true;
+      try {
+        // Playwright evaluates against the pinned ElementHandle, but page eval
+        // may be tampered with. Trust only the helper's separate CDP status:
+        // a forged evaluate return cannot set its private matched bit.
+        await downloadDeadline(handle.evaluate((element, identity) =>
+          window[identity.key]('matches', identity.secret, element), {
+          key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
+        }), workDeadlineAt).catch(error => {
+          if (error?.code === 'download_timeout') throw error;
+        });
+        const identity = await scriptBlobCommand(cdp, 'status', null, workDeadlineAt);
+        if (identity.status !== 'matched' || attempt.nativeDownloadObserved) {
+          throw downloadError('download_unverifiable',
+            'browser download target changed before click');
+        }
+        if (TEST_DOWNLOAD_CLICK_DELAY_MS) {
+          await downloadDeadline(new Promise(resolve => setTimeout(resolve, TEST_DOWNLOAD_CLICK_DELAY_MS)),
+            workDeadlineAt);
+        }
+        if (attempt.nativeDownloadObserved) {
+          throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+        }
+        checkEpoch(args);
+        if (activeTabId !== tab.id || tab.page.url() !== sharedUrl ||
+            tab.pendingNavigations.size) throw staleEpochError();
+        await downloadDeadline(handle.click({
+          noWaitAfter: true, timeout: pointerTimeout(workDeadlineAt),
+        }), workDeadlineAt);
+        checkEpoch(args);
+        if (activeTabId !== tab.id || tab.page.url() !== sharedUrl ||
+            tab.pendingNavigations.size) throw staleEpochError();
+        const result = await scriptBlobCommand(cdp, 'finish', null, workDeadlineAt);
+        helperArmed = result.status === 'cleanup_failed';
+        if (result.status === 'cleanup_failed') {
+          cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+          throw cleanupError;
+        }
+        return result;
+      } finally {
+        if (helperArmed) {
+          try {
+            const cancelled = await scriptBlobCommand(cdp, 'cancel', null, deadlineAt);
+            if (cancelled.status === 'cleanup_failed') {
+              cleanupError = downloadError('download_failed', 'browser script download cleanup failed');
+            }
+          } catch (error) { cleanupError = error; }
+          helperArmed = false;
+        }
+      }
+    }, workDeadlineAt), workDeadlineAt);
+    if (attempt.nativeDownloadObserved) {
+      throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+    }
+    if (captured.status === 'too_large') {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    if (captured.status !== 'ok' || typeof captured.filename !== 'string' ||
+        cleanDownloadFilename(captured.filename) !== captured.filename ||
+        Buffer.byteLength(captured.filename, 'utf8') > 180 ||
+        typeof captured.data_base64 !== 'string' ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(captured.data_base64)) {
+      throw downloadError('download_unverifiable', 'browser download cannot verify the selected script');
+    }
+    const bytes = Buffer.from(captured.data_base64, 'base64');
+    if (bytes.length > MAX_DOWNLOAD_BYTES) {
+      throw downloadError('download_too_large', 'browser download exceeds 256 KiB');
+    }
+    if (bytes.length !== captured.byte_count ||
+        bytes.toString('base64') !== captured.data_base64) {
+      throw downloadError('download_unverifiable', 'browser download bytes could not be verified');
+    }
+    const current = await downloadDeadline(state(), workDeadlineAt);
+    checkEpoch(args);
+    if (current.active_tab_id !== tab.id || current.url !== sharedUrl ||
+        tab.pendingNavigations.size) throw staleEpochError();
+    response = {
+      page_epoch: current.page_epoch,
+      active_tab_id: current.active_tab_id,
+      url: current.url,
+      filename: captured.filename,
+      byte_count: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      data_base64: captured.data_base64,
+    };
+  } catch (error) {
+    const pageChanged = epoch !== args.expected_epoch || activeTabId !== tab.id ||
+      tab.page.isClosed() || tab.page.url() !== sharedUrl || tab.pendingNavigations.size > 0;
+    if (pageChanged || error?.code === 'stale_epoch' || error?.code === 'download_timeout' ||
+        attempt.nativeDownloadObserved) {
+      shuttingDown = true;
+      retireAfterReply = true;
+    }
+    if (['stale_epoch', 'invalid_target', 'target_not_found', 'ambiguous_target',
+      'download_timeout', 'download_too_large', 'download_failed',
+      'download_unverifiable'].includes(error?.code)) throw error;
+    throw downloadError('download_failed', 'browser script download failed');
+  } finally {
+    try {
+      await downloadDeadline(Promise.all([...orphanDownloads]), deadlineAt);
+      await downloadDeadline(clearDownloadDirectory(), deadlineAt);
+      await settleDownloadDirectory(deadlineAt);
+    } catch (error) { cleanupError ||= error; }
+    if (activeDownloadAttempt === attempt) activeDownloadAttempt = undefined;
+    if (cleanupError || attempt.nativeDownloadObserved) {
+      shuttingDown = true;
+      retireAfterReply = true;
+      if (cleanupError) {
+        throw downloadError(cleanupError.code === 'download_timeout' ? 'download_timeout' : 'download_failed',
+          'browser script download cleanup failed');
+      }
+      throw downloadError('download_unverifiable', 'browser download attribution is ambiguous');
+    }
+  }
+  return response;
 }
 
 function fileInputArgs(args) {
@@ -2178,8 +2776,20 @@ async function command(action, args = {}) {
         throw targetError('selection_failed', 'browser select option failed; refresh the page and retry');
       }
     }
-    case 'download':
-      return boundedDownload(args);
+    case 'download': {
+      const deadlineAt = Date.now() + DOWNLOAD_ACTION_BUDGET_MS;
+      try {
+        return await boundedDownload(args, deadlineAt);
+      } catch (error) {
+        if (error?.code !== 'download_unverifiable' ||
+            error.scriptFallbackEligible !== true || retireAfterReply) throw error;
+        // Initial inspection failed before any private navigation or download
+        // request. The Blob helper independently requires a unique non-link
+        // target; a direct attempt that progressed past inspection never
+        // authorizes a second click after a same-epoch DOM replacement.
+        return boundedScriptBlobDownload(args, deadlineAt);
+      }
+    }
     case 'set_file_input': {
       checkEpoch(args);
       const file = fileInputArgs(args);
@@ -2345,6 +2955,9 @@ async function main() {
     serviceWorkers: 'block',
   });
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
+  await context.addInitScript(installScriptBlobCapture, {
+    key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
+  });
   await context.addInitScript(installDownloadLinkInspector, {
     key: DOWNLOAD_LINK_KEY, secret: DOWNLOAD_LINK_SECRET,
   });
@@ -2432,5 +3045,5 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 } else {
-  module.exports = { installDownloadLinkInspector };
+  module.exports = { installScriptBlobCapture, installDownloadLinkInspector };
 }
