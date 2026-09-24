@@ -356,7 +356,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end(`<a id="selected" href="${href}" download="prior.bin">Selected</a><script>setTimeout(()=>{const a=document.createElement("a");a.href="${href}";a.download="prior.bin";document.body.append(a);a.click()},100)</script>`);
       return;
     }
-    response.end('<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+    response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -407,6 +408,11 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(first.result.sha256, createHash('sha256').update(bytes).digest('hex'));
     assert.deepEqual(Buffer.from(first.result.data_base64, 'base64'), bytes);
     assert.equal(smallReferer, undefined, 'private request never adds a forbidden Referer');
+    const credential = await call('download', { selector: '#credential', expected_epoch: epoch });
+    assert.equal(credential.code, 'download_unverifiable', JSON.stringify(credential));
+    assert.equal(credential.result, undefined);
+    assert.equal(smallRequests, 1, 'embedded credentials never start a private request');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'rejected credential URL left no artifact');
     const named = await call('download', { selector: '#named', expected_epoch: epoch });
     assert.equal(named.ok, true, JSON.stringify(named));
     assert.equal(named.result.filename, 'chosen.txt');

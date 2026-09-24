@@ -908,6 +908,12 @@ async function boundedDownload(args) {
         throw downloadError('download_unverifiable',
           'browser download requires a direct HTTP(S) link');
       }
+      try {
+        checkUrl(href);
+      } catch {
+        throw downloadError('download_unverifiable',
+          'browser download requires a direct HTTP(S) link');
+      }
       // Download requests lack reliable Network events; use a private frame ID.
       const sharedUrl = tab.page.url();
       if (sharedUrl === 'about:blank') throw downloadError('download_unverifiable',
