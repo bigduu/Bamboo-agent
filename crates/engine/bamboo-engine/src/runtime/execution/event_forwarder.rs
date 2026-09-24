@@ -164,10 +164,25 @@ mod tests {
             })
             .await
             .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext {
+                    result: Box::new(bamboo_domain::HookResult::Deny {
+                        reason: private.into(),
+                    }),
+                    text: private.into(),
+                },
+            })
+            .await
+            .unwrap();
         drop(input);
 
         let mut visible = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             visible.push(
                 tokio::time::timeout(std::time::Duration::from_secs(5), broadcast_rx.recv())
                     .await
@@ -186,6 +201,18 @@ mod tests {
             matches!(&visible[4], AgentEvent::ToolComplete { result, .. }
             if result.result == "ordinary Read result")
         );
+        assert!(!serde_json::to_string(&visible[5])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[5],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::AfterToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::WithContext { .. },
+                ..
+            }
+        ));
         forwarder.await.unwrap();
     }
 
