@@ -479,6 +479,19 @@ pub async fn get_pending_question(
                         .to_string();
                         request.matched_rule = None;
                         request.suggested_matchers.clear();
+                        if private_browser_file_input {
+                            // Remembered decisions require a matcher. The
+                            // private file matcher is deliberately hidden from
+                            // approval UIs, so only offer usable one-shot
+                            // choices in this display copy.
+                            request.allowed_decisions.retain(|decision| {
+                                matches!(
+                                    decision,
+                                    PermissionDecisionKind::AllowOnce
+                                        | PermissionDecisionKind::DenyOnce
+                                )
+                            });
+                        }
                     }
                     request
                 });
@@ -909,6 +922,7 @@ mod http_tests {
         request.permission_type = PermissionType::BrowserInteraction;
         request.resource = "browser:17:set_file_input:upload:private-fingerprint".to_string();
         request.suggested_matchers[0].value = request.resource.clone();
+        request.allowed_decisions = PermissionDecisionKind::all_supported();
         let mut session = Session::new(session_id, "test-model");
         session
             .messages
@@ -949,6 +963,10 @@ mod http_tests {
         assert_eq!(
             body["permission_request"]["suggested_matchers"],
             serde_json::json!([])
+        );
+        assert_eq!(
+            body["permission_request"]["allowed_decisions"],
+            serde_json::json!(["allow_once", "deny_once"])
         );
         for private in [
             "private-upload",

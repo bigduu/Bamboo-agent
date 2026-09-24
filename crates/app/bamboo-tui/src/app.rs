@@ -17132,6 +17132,77 @@ mod question_tests {
     }
 
     #[test]
+    fn browser_file_input_pending_modal_offers_usable_one_shot_choices() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut request = sample_permission_request(
+            "file-chat",
+            "file-call",
+            vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce,
+            ],
+        );
+        request.tool_name = "browser".to_string();
+        request.permission_type = PermissionType::BrowserInteraction;
+        request.resource = "[redacted]".to_string();
+        request.operation_summary = "Set one in-memory browser file input".to_string();
+        request.suggested_matchers.clear();
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Approve in-memory browser file input?".to_string(),
+            tool_call_id: Some("file-call".to_string()),
+            tool_name: Some("browser".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Permission),
+            permission_request: Some(request),
+            tool_arguments: Some(serde_json::json!({
+                "action":"set_file_input","file":"[redacted]"
+            })),
+            ..PendingQuestion::default()
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("file-chat".to_string());
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "file:approval".to_string(),
+            "file-chat".to_string(),
+            &pending,
+            String::new(),
+        ));
+        let ActiveQuestionKind::Permission(permission) =
+            &app.pending_question.as_ref().unwrap().kind
+        else {
+            panic!("typed file permission")
+        };
+        assert!(permission.request.suggested_matchers.is_empty());
+        let choice = build_permission_decision(
+            &permission.request,
+            PermissionDecisionKind::AllowOnce,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(choice.request_id, "file-call");
+        assert_eq!(choice.decision, PermissionDecisionKind::AllowOnce);
+        assert_eq!(choice.matcher_id, None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Allow once"), "{rendered}");
+        assert!(rendered.contains("Deny once"), "{rendered}");
+        assert!(!rendered.contains("Allow for session"), "{rendered}");
+        assert!(!rendered.contains("Allow globally"), "{rendered}");
+        assert!(!rendered.contains("private"), "{rendered}");
+    }
+
+    #[test]
     fn native_select_result_without_tool_start_or_valid_json_hides_values() {
         let private_value = "private-option-value";
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
