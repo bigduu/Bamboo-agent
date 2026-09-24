@@ -44,6 +44,8 @@ const TEST_DIALOG_READ_DELAY_MS = process.env.NODE_ENV === 'test'
   : 0;
 const TEST_SUPPRESS_SCREENCAST_FRAMES = process.env.NODE_ENV === 'test' &&
   process.env.BAMBOO_BROWSER_TEST_SUPPRESS_SCREENCAST_FRAMES === '1';
+const TEST_STALL_SCREENCAST_STOP = process.env.NODE_ENV === 'test' &&
+  process.env.BAMBOO_BROWSER_TEST_STALL_SCREENCAST_STOP === '1';
 const CAPTURE_FIRST_FRAME_WAIT_MS = 750;
 const CAPTURE_RESTART_LIMIT = 3;
 const CAPTURE_FALLBACK_INTERVAL_MS = 1_500;
@@ -67,6 +69,7 @@ let tabs = [];
 const tabByPage = new WeakMap();
 let activeTabId;
 let activeCapture;
+let desiredCapture;
 let captureGeneration = 0;
 let captureTask = Promise.resolve();
 let captureTimer;
@@ -992,7 +995,7 @@ function requireTabId(raw) {
 }
 
 function captureIsCurrent(capture) {
-  return captureGeneration === capture.generation && activeCapture === capture &&
+  return captureGeneration === capture.generation && desiredCapture === capture &&
     activeTabId === capture.tabId && epoch === capture.epoch &&
     !capture.page.isClosed() && !shuttingDown && !closing;
 }
@@ -1065,6 +1068,15 @@ async function recoverCapture(capture) {
 function scheduleCapture(restart = 0) {
   const generation = ++captureGeneration;
   clearCaptureTimer();
+  const tab = activeTab();
+  const capture = tab && !tab.page.isClosed() ? {
+    page: tab.page, tabId: tab.id, url: tab.page.url(), epoch, generation, restart,
+    screencastSeen: false, reportedStall: restart > 0, startSettled: false,
+  } : undefined;
+  desiredCapture = capture;
+  // The previous Playwright stop may itself remain pending. A fenced direct
+  // screenshot can still seed the new epoch while the serialized restart waits.
+  if (capture) armCaptureRecovery(capture);
   captureTask = captureTask.catch(() => {}).then(async () => {
     if (generation !== captureGeneration || shuttingDown || closing) return;
     if (activeCapture) {
@@ -1072,6 +1084,8 @@ function scheduleCapture(restart = 0) {
       activeCapture = undefined;
       // Playwright marks a screencast started before its channel call returns.
       // Even a failed start must be stopped before another start is attempted.
+      // Exercise a permanently pending stop in the real Chromium host test.
+      if (TEST_STALL_SCREENCAST_STOP) await new Promise(() => {});
       await previous.page.screencast.stop().catch(() => {
         if (!previous.page.isClosed() && !shuttingDown && !closing) {
           console.warn('browser screencast stop failed; retrying capture');
@@ -1079,14 +1093,8 @@ function scheduleCapture(restart = 0) {
       });
     }
     if (generation !== captureGeneration || shuttingDown || closing) return;
-    const tab = activeTab();
-    if (!tab || tab.page.isClosed()) return;
-    const capture = {
-      page: tab.page, tabId: tab.id, url: tab.page.url(), epoch, generation, restart,
-      screencastSeen: false, reportedStall: false, startSettled: false,
-    };
+    if (!capture || tab.page.isClosed()) return;
     activeCapture = capture;
-    armCaptureRecovery(capture);
     try {
       await tab.page.screencast.start({
         quality: 75,
@@ -3011,6 +3019,7 @@ async function closeHost() {
   shuttingDown = true;
   clearCaptureTimer();
   captureGeneration++;
+  desiredCapture = undefined;
   activeCapture = undefined;
   activeDownloadAttempt?.download?.cancel().catch(() => {});
   await context?.close().catch(() => {});

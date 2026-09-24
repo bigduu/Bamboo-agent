@@ -398,7 +398,9 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
   }
 });
 
-test('real Chromium keeps current JPEG frames after a rapid viewport then navigation when screencast stalls', async () => {
+const recoveryTest = stalledStop => test(
+  `real Chromium keeps current JPEG frames after a rapid viewport then navigation with ${stalledStop ? 'stalled stop' : 'missing screencast frames'}`,
+  async () => {
   const fixture = http.createServer((request, response) => {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     response.end(request.url === '/alpha'
@@ -410,7 +412,11 @@ test('real Chromium keeps current JPEG frames after a rapid viewport then naviga
   const base = `http://127.0.0.1:${fixture.address().port}`;
   const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
     [path.join(__dirname, 'host.cjs')], {
-      env: { ...process.env, NODE_ENV: 'test', BAMBOO_BROWSER_TEST_SUPPRESS_SCREENCAST_FRAMES: '1' },
+      env: {
+        ...process.env, NODE_ENV: 'test',
+        BAMBOO_BROWSER_TEST_SUPPRESS_SCREENCAST_FRAMES: '1',
+        BAMBOO_BROWSER_TEST_STALL_SCREENCAST_STOP: stalledStop ? '1' : '0',
+      },
       stdio: ['pipe', 'pipe', 'inherit'],
     });
   const pending = new Map();
@@ -486,6 +492,8 @@ test('real Chromium keeps current JPEG frames after a rapid viewport then naviga
     await once(fixture, 'close');
   }
 });
+recoveryTest(false);
+recoveryTest(true);
 
 test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
   const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
