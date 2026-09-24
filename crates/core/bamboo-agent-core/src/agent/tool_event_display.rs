@@ -4,7 +4,7 @@
 //! This projector belongs to one run and only trusts a `ToolStart` from the
 //! current round to identify subsequent call-id-only events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bamboo_domain::{AgentHookPoint, HookResult};
 use serde_json::{json, Value};
@@ -24,8 +24,6 @@ enum CallIdentity {
 pub struct NativeToolEventDisplay {
     calls: HashMap<String, CallIdentity>,
     round: Option<u32>,
-    hook_seen_ids: HashSet<String>,
-    hook_identity_ambiguous: bool,
 }
 
 fn canonical_tool_name(tool_name: &str) -> &str {
@@ -118,8 +116,6 @@ impl NativeToolEventDisplay {
             } => {
                 if self.round != Some(round_count) {
                     self.calls.clear();
-                    self.hook_seen_ids.clear();
-                    self.hook_identity_ambiguous = false;
                     self.round = Some(round_count);
                 }
                 AgentEvent::RunnerProgress {
@@ -165,14 +161,6 @@ impl NativeToolEventDisplay {
                     }
                     CallIdentity::Other(_) => arguments,
                 };
-                // HookLifecycle has no call ID. Only an uninterrupted,
-                // single-call sequence can supply its display identity.
-                if tool_call_id.is_empty()
-                    || !self.hook_seen_ids.insert(tool_call_id.clone())
-                    || !self.calls.is_empty()
-                {
-                    self.hook_identity_ambiguous = true;
-                }
                 self.calls.insert(tool_call_id.clone(), identity);
                 AgentEvent::ToolStart {
                     tool_call_id,
@@ -308,29 +296,19 @@ impl NativeToolEventDisplay {
                         decision,
                     };
                 }
-                let known_ordinary = !self.hook_identity_ambiguous
-                    && self.calls.len() == 1
-                    && self.calls.iter().next().is_some_and(|(id, identity)| {
-                        !id.is_empty() && matches!(identity, CallIdentity::Other(_))
-                    });
+                // Tool hooks carry no call ID. A dropped browser ToolStart can
+                // coexist with an unrelated Read, so active calls cannot
+                // authorize any free text in this outward event.
                 AgentEvent::HookLifecycle {
-                    hook_name: if known_ordinary {
-                        hook_name
-                    } else {
-                        "Tool hook hidden".into()
-                    },
+                    hook_name: "Tool hook hidden".into(),
                     point,
-                    phase: if known_ordinary || phase == "completed" {
+                    phase: if phase == "completed" {
                         phase
                     } else {
                         "hidden".into()
                     },
                     duration_ms,
-                    decision: if known_ordinary {
-                        decision
-                    } else {
-                        hidden_hook_result(decision, 0)
-                    },
+                    decision: hidden_hook_result(decision, 0),
                 }
             }
             other => other,
@@ -619,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_overlapping_and_reused_hook_identity_fail_closed_but_read_stays_visible() {
+    fn unkeyed_tool_hooks_hide_text_even_with_only_read_visible() {
         let secret = "private-hook-reason";
         let mut display = NativeToolEventDisplay::default();
         let make_hook = || {
@@ -635,8 +613,15 @@ mod tests {
         assert!(!serde_json::to_string(&missing).unwrap().contains(secret));
 
         display.project(start("read", "Read", json!({"path":"readme.md"})));
-        let ordinary = display.project(make_hook());
-        assert!(serde_json::to_string(&ordinary).unwrap().contains(secret));
+        // The browser ToolStart could have been dropped while Read remains
+        // visible. HookLifecycle has no call ID to disprove that case.
+        let dropped_browser_start = display.project(make_hook());
+        assert!(!serde_json::to_string(&dropped_browser_start)
+            .unwrap()
+            .contains(secret));
+        let ordinary_result = display.project(complete("read", "ordinary Read result"));
+        assert!(matches!(ordinary_result,
+            AgentEvent::ToolComplete { result, .. } if result.result == "ordinary Read result"));
         display.project(start("download", "browser", json!({"action":"download"})));
         let overlap = display.project(make_hook());
         assert!(!serde_json::to_string(&overlap).unwrap().contains(secret));
@@ -657,6 +642,15 @@ mod tests {
         });
         display.project(start("reused", "Read", json!({"path":"readme.md"})));
         let next_round = display.project(make_hook());
-        assert!(serde_json::to_string(&next_round).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&next_round).unwrap().contains(secret));
+
+        let unrelated = display.project(hook(
+            AgentHookPoint::AfterRound,
+            secret,
+            HookResult::Deny {
+                reason: secret.into(),
+            },
+        ));
+        assert!(serde_json::to_string(&unrelated).unwrap().contains(secret));
     }
 }

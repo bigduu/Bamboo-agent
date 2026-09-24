@@ -787,9 +787,21 @@ mod tests {
             })
             .await
             .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny {
+                    reason: private.into(),
+                },
+            })
+            .await
+            .unwrap();
 
         let mut visible = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             visible.push(
                 timeout(Duration::from_secs(5), receiver.recv())
                     .await
@@ -809,6 +821,20 @@ mod tests {
             matches!(&visible[5], AgentEvent::ToolComplete { result, .. }
             if result.result == "ordinary Read result")
         );
+        assert!(!serde_json::to_string(&visible[6])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[6],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny { .. },
+                ..
+            }
+        ));
+        assert!(!visible[6].is_durable_change());
+        assert!(!visible[6].is_replayable_session_state());
         assert_eq!(
             authoritative.result, private,
             "model-facing result remains unchanged"
