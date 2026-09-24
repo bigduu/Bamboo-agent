@@ -2694,10 +2694,10 @@ impl ActorEventDisplay {
                 };
                 AgentEvent::ToolStart {
                     tool_call_id,
-                    tool_name: if kind != DisplayCallKind::Reused {
-                        tool_name
-                    } else {
-                        "unknown".into()
+                    tool_name: match kind {
+                        DisplayCallKind::Reused => "unknown".into(),
+                        _ if is_browser_tool_name(&tool_name) => "browser".into(),
+                        _ => tool_name,
                     },
                     arguments,
                 }
@@ -2716,10 +2716,10 @@ impl ActorEventDisplay {
                 };
                 AgentEvent::ToolApprovalRequested {
                     tool_call_id,
-                    tool_name: if kind != DisplayCallKind::Reused {
-                        tool_name
-                    } else {
-                        "unknown".into()
+                    tool_name: match kind {
+                        DisplayCallKind::Reused => "unknown".into(),
+                        _ if is_browser_tool_name(&tool_name) => "browser".into(),
+                        _ => tool_name,
                     },
                     parameters,
                 }
@@ -2824,10 +2824,14 @@ impl ActorEventDisplay {
                 permission,
                 resource,
             } => {
-                let (permission, resource) = if is_browser_tool_name(&tool_name) {
-                    ("Browser interaction approval".into(), "[redacted]".into())
+                let (tool_name, permission, resource) = if is_browser_tool_name(&tool_name) {
+                    (
+                        "browser".into(),
+                        "Browser interaction approval".into(),
+                        "[redacted]".into(),
+                    )
                 } else {
-                    (permission, resource)
+                    (tool_name, permission, resource)
                 };
                 AgentEvent::ChildApprovalRequested {
                     child_session_id,
@@ -4400,8 +4404,11 @@ mod tests {
 
     #[tokio::test]
     async fn actor_download_tool_start_is_projected_before_parent_forwarding() {
-        for tool_name in ["browser", "default::browser"] {
-            let session_id = format!("actor-download-{tool_name}");
+        for (index, tool_name) in ["browser", "default::browser", "private-namespace::browser"]
+            .into_iter()
+            .enumerate()
+        {
+            let session_id = format!("actor-download-{index}");
             let args = serde_json::json!({
                 "action":"download",
                 "selector":"a[data-secret='private-selector']",
@@ -4444,7 +4451,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(starts.len(), 2);
-            assert_eq!(starts[0].0, tool_name);
+            assert_eq!(starts[0].0, "browser");
             assert_eq!(
                 starts[0].1,
                 &serde_json::json!({"action":"download","expected_epoch":17})
@@ -4468,7 +4475,7 @@ mod tests {
             },
             AgentEvent::ToolApprovalRequested {
                 tool_call_id: "download-call".into(),
-                tool_name: "default::browser".into(),
+                tool_name: format!("{private}::browser"),
                 parameters: serde_json::json!({
                     "action":"download", "selector": private, "expected_epoch": 17,
                 }),
@@ -4599,7 +4606,7 @@ mod tests {
                 }),
                 actor_event_frame(AgentEvent::ToolStart {
                     tool_call_id: "malformed-browser".into(),
-                    tool_name: "default::browser".into(),
+                    tool_name: format!("{private}::browser"),
                     arguments: serde_json::json!({"selector":private}),
                 }),
                 actor_event_frame(AgentEvent::ToolComplete {
@@ -4632,7 +4639,7 @@ mod tests {
                 actor_event_frame(AgentEvent::ChildApprovalRequested {
                     child_session_id: "nested-child".into(),
                     request_id: "approval".into(),
-                    tool_name: "default::browser".into(),
+                    tool_name: format!("{private}::browser"),
                     permission: private.into(),
                     resource: private.into(),
                 }),
