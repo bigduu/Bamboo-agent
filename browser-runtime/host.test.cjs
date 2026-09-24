@@ -13,7 +13,7 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
       'x-frame-options': 'DENY',
       'content-security-policy': "frame-ancestors 'none'",
     });
-    response.end('<style>button,input,output,select{display:block}</style><button id="increment" onclick="const output=document.querySelector(\'output\');output.textContent=String(Number(output.textContent)+1)">Increment</button><input id="name" aria-label="Name"><output>0</output><select id="single" onchange="document.querySelector(\'#chosen\').textContent=\'Single \'+this.value"><option value="">None</option><option value="red">Red</option></select><select id="multi" multiple onchange="document.querySelector(\'#chosen\').textContent=\'Multi \'+Array.from(this.selectedOptions).map(option=>option.value).join(\',\')"><option value="green">Green</option><option value="blue">Blue</option><option value="yellow">Yellow</option></select><output id="chosen">No selection</output>');
+    response.end('<style>button,input,output,select{display:block}</style><button id="increment" onclick="const output=document.querySelector(\'output\');output.textContent=String(Number(output.textContent)+1)">Increment</button><input id="name" aria-label="Name"><output>0</output><select id="single" onchange="document.querySelector(\'#chosen\').textContent=\'Single \'+this.value"><option value="">None</option><option value="red">Red</option></select><select id="multi" multiple onchange="document.querySelector(\'#chosen\').textContent=\'Multi \'+Array.from(this.selectedOptions).map(option=>option.value).join(\',\')"><option value="green">Green</option><option value="blue">Blue</option><option value="yellow">Yellow</option></select><output id="chosen">No selection</output><input id="upload" type="file" onchange="const file=this.files[0];const reader=new FileReader();reader.onload=()=>document.querySelector(\'#file-result\').textContent=[file.name,file.type,file.size,reader.result].join(\'|\');reader.readAsText(file)"><output id="file-result">No file</output>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -74,6 +74,37 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
     const unavailable = await call('select_option', { selector: '#single', values: ['private-option-not-present'], expected_epoch: pageEpoch });
     assert.equal(unavailable.code, 'selection_failed');
     assert.doesNotMatch(unavailable.error, /private-option-not-present/);
+    const file = {
+      selector: '#upload', filename: 'sample.txt', mime_type: 'text/plain',
+      data_base64: Buffer.from('memory-only file').toString('base64'), expected_epoch: pageEpoch,
+    };
+    const uploaded = await call('set_file_input', file);
+    assert.equal(uploaded.ok, true);
+    assert.equal(uploaded.result.page_epoch, pageEpoch);
+    assert.doesNotMatch(JSON.stringify(uploaded.result), /bWVtb3J5/);
+    let fileDom;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      fileDom = (await call('dom')).result;
+      if (fileDom.html.includes('sample.txt|text/plain|16|memory-only file')) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.match(fileDom.html, /sample.txt\|text\/plain\|16\|memory-only file/);
+    for (const invalid of [
+      { ...file, data_base64: 'bWVtb3J5*' },
+      { ...file, data_base64: 'YQ===' },
+      { ...file, data_base64: Buffer.alloc(1024 * 1024 + 1).toString('base64') },
+      { ...file, filename: '../private.txt' },
+      { ...file, filename: 'C:\\private.txt' },
+      { ...file, mime_type: 'text/plain; charset=utf-8' },
+      { ...file, path: '/tmp/private' },
+      { ...file, selector: '#name' },
+    ]) {
+      const rejected = await call('set_file_input', invalid);
+      assert.equal(rejected.ok, false);
+      assert.doesNotMatch(rejected.error, /memory-only file|bWVtb3J5|private.txt/);
+    }
+    assert.equal((await call('set_file_input', { ...file, expected_epoch: epoch })).code, 'stale_epoch');
+    assert.match((await call('dom')).result.html, /sample.txt\|text\/plain\|16\|memory-only file/);
     const after = await call('dom');
     assert.match(after.result.html, /<output>2<\/output>/);
     assert.match(after.result.snapshot, /Lotus/);

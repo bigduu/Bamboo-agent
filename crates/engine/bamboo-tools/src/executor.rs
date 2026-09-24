@@ -61,6 +61,9 @@ fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) ->
             "expected_epoch":args.get("expected_epoch").and_then(serde_json::Value::as_u64),
         });
     }
+    if crate::permission::is_private_browser_file_input(tool_name, args) {
+        return serde_json::json!({"action":"set_file_input","file":"[redacted]"});
+    }
     if crate::permission::is_native_browser_select(tool_name, args) {
         // The display event is emitted before all schema paths necessarily
         // reject extra fields. Only the action is safe to expose here.
@@ -628,10 +631,16 @@ impl ToolExecutor for BuiltinToolExecutor {
                     crate::permission::is_native_browser_select(&tool_name, &args);
                 let browser_eval =
                     canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
-                let private_browser_display =
-                    focused_browser_input || native_browser_select || browser_eval;
+                let private_browser_file_input =
+                    crate::permission::is_private_browser_file_input(&tool_name, &args);
+                let private_browser_display = focused_browser_input
+                    || native_browser_select
+                    || browser_eval
+                    || private_browser_file_input;
                 let denied_message = if browser_eval {
                     "Browser page script denied by policy"
+                } else if private_browser_file_input {
+                    "Browser file input denied by policy"
                 } else if native_browser_select {
                     "Browser selection denied by policy"
                 } else {
@@ -639,6 +648,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                 };
                 let check_failed_message = if browser_eval {
                     "Browser page script permission check failed"
+                } else if private_browser_file_input {
+                    "Browser file input permission check failed"
                 } else if native_browser_select {
                     "Browser selection permission check failed"
                 } else {
@@ -1131,6 +1142,24 @@ mod tests {
         assert!(!display.to_string().contains("data-private"));
         assert!(!display.to_string().contains("private-query"));
         assert!(!display.to_string().contains("private-nested"));
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
+    }
+
+    #[test]
+    fn browser_file_input_approval_event_hides_bytes_and_metadata() {
+        let args = json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "mime_type":"text/plain","data_base64":"cHJpdmF0ZSBieXRlcw==",
+            "expected_epoch":17,
+        });
+        let original = args.clone();
+        for tool in ["browser", "default::browser"] {
+            assert_eq!(
+                approval_parameters_for_display(tool, &args),
+                json!({"action":"set_file_input","file":"[redacted]"})
+            );
+        }
+        assert_eq!(args, original);
         assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
