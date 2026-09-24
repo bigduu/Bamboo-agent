@@ -49,6 +49,17 @@ fn parse_warning_log_details<'a>(
     }
 }
 
+fn tool_start_arguments_for_display(
+    execution_name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    if bamboo_tools::permission::is_private_browser_file_input(execution_name, args) {
+        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+    } else {
+        args.clone()
+    }
+}
+
 pub(super) struct ToolExecutionOnlyContext<'a> {
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
@@ -221,7 +232,7 @@ async fn execute_tool_call_only_with_execution_name(
         AgentEvent::ToolStart {
             tool_call_id: ctx.tool_call.id.clone(),
             tool_name: ctx.tool_call.function.name.clone(),
-            arguments: args.clone(),
+            arguments: tool_start_arguments_for_display(execution_name, &args),
         },
     )
     .await;
@@ -458,9 +469,16 @@ async fn hook_ask_outcome(
     let native_browser_select =
         bamboo_tools::permission::is_native_browser_select(execution_name, args);
     let browser_eval = execution_name.trim().eq_ignore_ascii_case("browser_eval");
-    let private_browser_approval = focused_browser_input || native_browser_select || browser_eval;
+    let private_browser_file_input =
+        bamboo_tools::permission::is_private_browser_file_input(execution_name, args);
+    let private_browser_approval = focused_browser_input
+        || native_browser_select
+        || browser_eval
+        || private_browser_file_input;
     let private_check_error = if browser_eval {
         "Browser page script permission check failed"
+    } else if private_browser_file_input {
+        "Browser file input permission check failed"
     } else if native_browser_select {
         "Browser selection permission check failed"
     } else if focused_browser_input {
@@ -2150,6 +2168,21 @@ mod hook_tests {
             assert!(ordinary_preview.contains("private"));
             assert_eq!(ordinary_warning, warning);
         }
+    }
+
+    #[test]
+    fn file_input_tool_start_is_display_only_and_never_carries_file_bytes() {
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==",
+        });
+        let original = args.clone();
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &args),
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
     }
 
     #[tokio::test]
