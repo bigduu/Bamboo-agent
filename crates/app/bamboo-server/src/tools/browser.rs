@@ -306,6 +306,23 @@ fn select_option_request(args: &Value, epoch: u64) -> Result<Value, ToolError> {
     Ok(json!({"selector":selector,"values":values,"expected_epoch":epoch}))
 }
 
+fn download_request(args: &Value, epoch: u64) -> Result<Value, ToolError> {
+    let fields = args.as_object().ok_or_else(|| {
+        ToolError::InvalidArguments(
+            "browser download accepts only a CSS selector and expected_epoch".into(),
+        )
+    })?;
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "action" | "selector" | "expected_epoch"))
+    {
+        return Err(ToolError::InvalidArguments(
+            "browser download accepts only a CSS selector and expected_epoch".into(),
+        ));
+    }
+    Ok(json!({"selector":pointer_selector(args,"selector")?,"expected_epoch":epoch}))
+}
+
 fn input_request(action: &str, args: &Value, epoch: u64) -> Result<Value, ToolError> {
     match action {
         "click_at" => {
@@ -349,14 +366,14 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, or scroll. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, scroll, or download one file through a CSS selector. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. Download resolves an actionable main-frame CSS <a href> in the shared page, then follows its direct HTTP(S) link from a script-free private page in the same BrowserContext; it does not run the source page's onclick/JavaScript or change shared tabs. It returns at most 256 KiB as Base64 with filename, byte_count and SHA-256. Script-triggered or Blob downloads, HTTP redirects, HTML or Refresh responses, sites requiring Referer, enforcing CSP sandbox, and pages with unverified response provenance (including some popups) return download_unverifiable. It cannot fetch an arbitrary URL or save to a chosen path. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type":"object",
             "properties": {
-                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","screenshot","dialog_respond"]},
+                "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","download","screenshot","dialog_respond"]},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
                 "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
@@ -365,7 +382,7 @@ impl Tool for BrowserTool {
                 "direction":{"type":"string","enum":["back","forward","reload"],"description":"Direction for history"},
                 "width":{"type":"integer","minimum":320,"maximum":1200,"description":"CSS viewport width for viewport"},
                 "height":{"type":"integer","minimum":240,"maximum":1000,"description":"CSS viewport height for viewport"},
-                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, set_file_input, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
+                "selector":{"type":"string","description":"CSS selector for click, fill, hover, select_option, set_file_input, a direct HTTP(S) anchor download, or optional press; mutually exclusive with target or hover coordinates","maxLength":512},
                 "source_selector":{"type":"string","description":"CSS source selector for drag; pair with target_selector"},
                 "target_selector":{"type":"string","description":"CSS destination selector for drag; pair with source_selector"},
                 "target":{"type":"object","description":"Semantic target for click, fill, or press; mutually exclusive with selector. Use kind=role with role and optional name, or kind=label/text with value. Optional frame_selector is a CSS selector for one iframe. Exact matching defaults to true.","properties":{"kind":{"type":"string","enum":["role","label","text"]},"role":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"exact":{"type":"boolean"},"frame_selector":{"type":"string"}},"required":["kind"],"additionalProperties":false},
@@ -381,7 +398,7 @@ impl Tool for BrowserTool {
                 "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button for click_at or coordinate drag; defaults to left"},
                 "delta_x":{"type":"number"},
                 "delta_y":{"type":"number"},
-                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/set_file_input/type/press/key/scroll/dialog_respond: page_epoch from a prior snapshot or action result; rejects stale actions"},
+                "expected_epoch":{"type":"integer","description":"Required for new_tab/activate_tab/close_tab/history/viewport/click/click_at/hover/drag/fill/select_option/set_file_input/type/press/key/scroll/download/dialog_respond: page_epoch from a prior snapshot or action result; rejects stale actions"},
                 "include_html":{"type":"boolean","description":"Include bounded raw HTML in snapshot output"}
             },
             "required":["action"],
@@ -434,6 +451,7 @@ impl Tool for BrowserTool {
                 | "key"
                 | "scroll"
                 | "dialog_respond"
+                | "download"
         ) && args.get("expected_epoch").and_then(Value::as_u64).is_none()
         {
             return Err(ToolError::InvalidArguments(
@@ -496,6 +514,7 @@ impl Tool for BrowserTool {
                 self.browser.command(session_id, "fill_selector", request).await.map_err(browser_error)?
             },
             "select_option" => self.browser.command(session_id, "select_option", select_option_request(&args, epoch)?).await.map_err(browser_error)?,
+            "download" => self.browser.command(session_id, "download", download_request(&args, epoch)?).await.map_err(browser_error)?,
             "set_file_input" => self.browser.command(session_id, "set_file_input", json!({
                 "selector":args["selector"],
                 "filename":args["filename"],
@@ -667,6 +686,40 @@ mod tests {
             ctx,
         ).await.unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn download_action_passes_only_a_bounded_selector_and_epoch_to_host() {
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("download")));
+        assert!(tool.description().contains("direct HTTP(S) link"));
+        assert!(tool.description().contains("script-free private page"));
+        assert!(tool.description().contains("download_unverifiable"));
+        assert_eq!(
+            tool.classify(&json!({"action":"download"})),
+            ToolClass::MUTATING_SERIAL
+        );
+        assert_eq!(
+            download_request(
+                &json!({"action":"download","selector":"a#invoice","expected_epoch":17}),
+                17
+            )
+            .unwrap(),
+            json!({"selector":"a#invoice","expected_epoch":17})
+        );
+        for args in [
+            json!({"action":"download","selector":" ","expected_epoch":17}),
+            json!({"action":"download","selector":"x".repeat(513),"expected_epoch":17}),
+            json!({"action":"download","selector":"#file","url":"https://example.test/file","expected_epoch":17}),
+            json!({"action":"download","selector":"#file","path":"/tmp/file","expected_epoch":17}),
+            json!({"action":"download","selector":"#file","target":{"kind":"text","value":"Save"},"expected_epoch":17}),
+        ] {
+            assert!(download_request(&args, 17).is_err(), "{args}");
+        }
     }
 
     #[test]
@@ -850,6 +903,107 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn model_download_returns_binary_bytes_without_replacing_shared_page() {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const BINARY: &[u8] = &[0, 1, 2, 3, 0, 255, 254, 128, 42, 10, 13];
+        const PAGE: &[u8] = br#"<!doctype html><title>Shared download page</title>
+            <main id="still-here">The page remains open</main>
+            <a id="binary" href="/file" download="sample.bin">Download binary</a>"#;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let read = socket.read(&mut request).await.unwrap_or(0);
+                    let file = request[..read].starts_with(b"GET /file ");
+                    let (body, headers): (&[u8], &str) = if file {
+                        (
+                            BINARY,
+                            "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"sample.bin\"\r\n",
+                        )
+                    } else {
+                        (PAGE, "Content-Type: text/html\r\n")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let browser = Arc::new(BrowserManager::default());
+        let tool = BrowserTool::new(browser.clone());
+        let mut ctx = ToolCtx::none("browser-test");
+        ctx.session_id = Some(Arc::from("download-chat"));
+        let opened = browser.open("download-chat").await.unwrap();
+        let ToolOutcome::Completed(navigated) = tool
+            .invoke(
+                json!({"action":"navigate","url":url,"expected_epoch":opened["page_epoch"]}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("navigation must complete");
+        };
+        let navigated: Value = serde_json::from_str(&navigated.result).unwrap();
+        let epoch = navigated["page_epoch"].as_u64().unwrap();
+        let active_tab_id = navigated["active_tab_id"].as_str().unwrap();
+
+        let ToolOutcome::Completed(download) = tool
+            .invoke(
+                json!({"action":"download","selector":"#binary","expected_epoch":epoch}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("download must complete");
+        };
+        let result: Value = serde_json::from_str(&download.result).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, BINARY);
+        assert_eq!(result["byte_count"], BINARY.len());
+        assert_eq!(result["sha256"], hex::encode(Sha256::digest(BINARY)));
+        assert_eq!(result["filename"], "sample.bin");
+        assert_eq!(result["page_epoch"], epoch);
+        assert_eq!(result["active_tab_id"], active_tab_id);
+        assert_eq!(result["url"], url);
+        assert!(result.get("path").is_none());
+
+        let dom = browser
+            .command("download-chat", "dom", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(dom["page_epoch"], epoch);
+        assert_eq!(dom["active_tab_id"], active_tab_id);
+        assert!(dom["html"].as_str().unwrap().contains("id=\"still-here\""));
+        let image = browser
+            .command("download-chat", "screenshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(image["page_epoch"], epoch);
+        assert_eq!(image["active_tab_id"], active_tab_id);
+        assert!(image["data"].as_str().unwrap().len() > 1000);
+        browser.close("download-chat").await.unwrap();
+        fixture.abort();
     }
 
     #[tokio::test]

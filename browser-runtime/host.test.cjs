@@ -5,6 +5,62 @@ const readline = require('node:readline');
 const { once } = require('node:events');
 const { test } = require('node:test');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const { createHash } = require('node:crypto');
+const { chromium } = require('playwright-core');
+const { installDownloadLinkInspector } = require('./host.cjs');
+
+test('download link inspector binds the exact pinned node across a trial', async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    const key = '__test_link_inspector';
+    const secret = 'test-secret';
+    await context.addInitScript(installDownloadLinkInspector, { key, secret });
+    const page = await context.newPage();
+    await page.goto('data:text/html,<a id="real" href="https://example.com/real">Real</a><a id="other" href="https://example.com/other">Other</a>');
+    const cdp = await context.newCDPSession(page);
+    const command = async (operation, selector) => {
+      const answer = await cdp.send('Runtime.evaluate', {
+        expression: `window[${JSON.stringify(key)}](${JSON.stringify(operation)},` +
+          `${JSON.stringify(secret)},${JSON.stringify(selector)})`,
+        awaitPromise: true, returnByValue: true,
+      });
+      assert.equal(answer.exceptionDetails, undefined);
+      return JSON.parse(answer.result.value);
+    };
+    assert.equal((await command('inspect', 'a')).status, 'unverifiable',
+      'ambiguous selectors never choose a link');
+    const inspected = await command('inspect', '#real');
+    assert.equal(inspected.href, 'https://example.com/real');
+    const real = await page.$('#real');
+    const other = await page.$('#other');
+    const match = element => element.evaluate((node, identity) =>
+      window[identity.key]('matches', identity.secret, node), { key, secret }).then(JSON.parse);
+    assert.equal((await match(other)).status, 'unverifiable',
+      'a different pinned ElementHandle cannot authorize the selected URL');
+    assert.equal((await match(real)).status, 'matched');
+    await real.click({ trial: true });
+    assert.deepEqual(await command('confirm', '#real'), inspected);
+    await page.evaluate(() => { document.querySelector('#real').href = 'https://example.com/changed'; });
+    assert.equal((await command('confirm', '#real')).status, 'unverifiable',
+      'a changed href cannot reuse the inspected element');
+    await page.evaluate(() => { Object.prototype.toJSON = () => ({ href: 'https://example.com/spoof' }); });
+    assert.equal((await command('inspect', '#real')).href, 'https://example.com/changed',
+      'page JSON hooks cannot forge the CDP result');
+    await page.evaluate(() => {
+      const pristine = window.eval;
+      let reads = 0;
+      Object.defineProperty(window, 'eval', { configurable: true, get() {
+        return ++reads % 2 ? pristine : () => () => ({ href: 'https://example.com/spoof' });
+      } });
+    });
+    assert.equal((await command('inspect', '#real')).status, 'unverifiable',
+      'an alternating eval getter is rejected before Playwright can compile a callback');
+    await context.close();
+  } finally { await browser.close(); }
+});
 
 test('one isolated page supplies DOM, screenshot, and interactive changes without an iframe', async () => {
   const fixture = http.createServer((_request, response) => {
@@ -133,13 +189,588 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
   }
 });
 
-test('popup and explicit tabs keep active DOM, frames, and epochs on one page', async () => {
+test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
+  const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
+  const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const temporaryFilesIn = directory => fs.readdirSync(directory, { withFileTypes: true })
+    .flatMap(entry => entry.isDirectory()
+      ? temporaryFilesIn(path.join(directory, entry.name))
+      : [path.join(directory, entry.name)]);
+  const temporaryDownloadFiles = () => fs.readdirSync(tempRoot)
+    .filter(name => name.startsWith('bamboo-browser-download-'))
+    .flatMap(name => temporaryFilesIn(path.join(tempRoot, name)));
+  let oversizedChunks = 0;
+  let unsolicitedRequests = 0;
+  let hangingClosed = 0;
+  let raceAutoMarkers = 0;
+  let raceMarked = false;
+  const priorRequests = { inflight: 0, completed: 0 };
+  let priorInflightStarted;
+  let priorCompletedFinished;
+  let smallReferer;
+  let namedReferer;
+  let smallRequests = 0;
+  let spaRequests = 0;
+  let staleResponseRequests = 0;
+  let concurrentStarted = false;
+  let backgroundBlobMarkers = 0;
+  let sandboxRequests = 0;
+  let redirectedRequests = 0;
+  let privateScriptRequests = 0;
+  let privatePopupRequests = 0;
+  let privateResourceRequests = 0;
+  const privateResourceTypes = [];
+  let directHtmlRequests = 0;
+  let spoofedRequests = 0;
+  const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
+  const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/mark-auto') {
+      raceAutoMarkers++;
+      raceMarked = true;
+      response.end('marked');
+      return;
+    }
+    if (request.url === '/race-file') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="race.bin"',
+      });
+      response.end(raceMarked ? 'ambient-download' : 'selected-download');
+      raceMarked = false;
+      return;
+    }
+    const priorKind = /^\/prior-(inflight|completed)-file$/.exec(request.url)?.[1];
+    if (priorKind) {
+      const requestIndex = ++priorRequests[priorKind];
+      if (priorKind === 'inflight' && requestIndex === 1) priorInflightStarted();
+      const send = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="prior.bin"',
+        });
+        response.end(`${requestIndex === 1 ? 'ambient' : 'selected'}-${priorKind}`,
+          priorKind === 'completed' && requestIndex === 1 ? priorCompletedFinished : undefined);
+      };
+      if (priorKind === 'inflight' && requestIndex === 1) setTimeout(send, 800);
+      else send();
+      return;
+    }
+    if (request.url === '/small' || request.url === '/unsolicited') {
+      if (request.url === '/unsolicited') unsolicitedRequests++;
+      else { smallReferer = request.headers.referer; smallRequests++; }
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="../private.bin"',
+      });
+      response.end(bytes);
+      return;
+    }
+    if (request.url === '/named-file') {
+      namedReferer = request.headers.referer;
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.end('named-by-anchor');
+      return;
+    }
+    if (request.url === '/redirect-file') {
+      response.writeHead(302, { location: '/redirected-file' });
+      response.end();
+      return;
+    }
+    if (request.url === '/redirected-file') {
+      redirectedRequests++;
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="redirected.bin"',
+      });
+      response.end('redirected-bytes');
+      return;
+    }
+    if (request.url === '/redirect-html') {
+      response.writeHead(302, { location: '/html-page' });
+      response.end();
+      return;
+    }
+    if (request.url === '/html-page' || request.url === '/html-direct') {
+      if (request.url === '/html-direct') directHtmlRequests++;
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<title>Private login</title><img src="/private-resource"><iframe src="/private-resource"></iframe><script>fetch("/private-script");window.open("/private-popup")</script>');
+      return;
+    }
+    if (request.url === '/private-script') privateScriptRequests++;
+    if (request.url === '/private-popup') privatePopupRequests++;
+    if (request.url === '/private-resource') {
+      privateResourceRequests++;
+      privateResourceTypes.push({
+        dest: request.headers['sec-fetch-dest'],
+        site: request.headers['sec-fetch-site'],
+        referer: request.headers.referer,
+      });
+    }
+    if (request.url === '/sandbox-file') sandboxRequests++;
+    if (request.url === '/spa') spaRequests++;
+    if (request.url === '/spoofed-file') {
+      spoofedRequests++;
+      response.writeHead(200, { 'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="spoofed.bin"' });
+      response.end('spoofed-bytes');
+      return;
+    }
+    if (request.url === '/eval-spoof') {
+      response.end('<a id="small" href="/small">Real link</a><script>' +
+        'window.eval=()=>()=>({href:location.origin+"/spoofed-file",download:null});' +
+        'Object.prototype.toJSON=()=>({status:"ok",href:location.origin+"/spoofed-file",download:null})' +
+        '</script>');
+      return;
+    }
+    if (request.url === '/background-blob-ready') {
+      response.end(concurrentStarted ? 'yes' : 'no');
+      return;
+    }
+    if (request.url === '/background-blob-marker') {
+      backgroundBlobMarkers++;
+      response.end('marked');
+      return;
+    }
+    if (request.url === '/background-blob') {
+      response.end('<script>async function fire(){if(await fetch("/background-blob-ready").then(r=>r.text())!=="yes"){setTimeout(fire,20);return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["ambient-private-bytes"]));a.download="ambient.bin";document.body.append(a);a.click();await fetch("/background-blob-marker")}fire()</script>');
+      return;
+    }
+    if (request.url === '/concurrent-file') {
+      concurrentStarted = true;
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="selected.bin"',
+      });
+      setTimeout(() => response.end('selected-concurrent'), 800);
+      return;
+    }
+    if (request.url === '/sandbox-page') {
+      response.writeHead(200, [
+        ['content-type', 'text/html'],
+        ['Content-Security-Policy', "default-src 'self'"],
+        ['content-security-policy', 'report-uri /sandbox, SaNdBoX allow-scripts'],
+      ]);
+      response.end('<a id="sandbox" href="/sandbox-file" download>Blocked</a>');
+      return;
+    }
+    if (request.url === '/stale-response') {
+      if (++staleResponseRequests === 1) {
+        response.end('<a id="small" href="/small">Small</a>');
+      } else {
+        // A no-document response for the same URL must not replace the
+        // committed document's policy when a later hash navigation fires.
+        response.writeHead(204, { 'content-security-policy': 'sandbox' });
+        response.end();
+      }
+      return;
+    }
+    if (request.url === '/exact-limit' || request.url === '/over-limit') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="boundary.bin"',
+      });
+      response.end(request.url === '/exact-limit'
+        ? maximumBytes : Buffer.concat([maximumBytes, Buffer.from([0])]));
+      return;
+    }
+    if (request.url === '/oversized') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="large.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      const timer = setInterval(() => {
+        if (response.destroyed || oversizedChunks >= 64) {
+          clearInterval(timer);
+          response.end();
+          return;
+        }
+        response.write(Buffer.alloc(64 * 1024, oversizedChunks));
+        oversizedChunks++;
+      }, 60);
+      response.on('close', () => clearInterval(timer));
+      return;
+    }
+    if (request.url === '/hanging') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="hanging.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      response.flushHeaders();
+      response.write(Buffer.alloc(1024));
+      response.on('close', () => { hangingClosed++; });
+      return;
+    }
+    if (request.url === '/failed') {
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="failed.bin"',
+        'transfer-encoding': 'chunked',
+      });
+      response.flushHeaders();
+      response.write(Buffer.alloc(1024));
+      setTimeout(() => response.destroy(), 100);
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': 'report-uri /sandbox',
+      'content-security-policy-report-only': 'sandbox' });
+    if (request.url === '/unsolicited-page') {
+      response.end('<main>Unsolicited page</main><script>setTimeout(() => { const link = document.createElement("a"); link.href = "/unsolicited"; document.body.append(link); link.click(); }, 100)</script>');
+      return;
+    }
+    if (request.url === '/race') {
+      response.end('<a id="race" href="/race-file" download="race.bin">Selected</a><script>const race=document.querySelector("#race");const original=race.getAttribute.bind(race);race.getAttribute=name=>{if(name==="href"&&!race.dataset.armed){race.dataset.armed="1";setTimeout(async()=>{await fetch("/mark-auto");const link=document.createElement("a");link.href="/race-file";document.body.append(link);link.click()},80)}return original(name)}</script>');
+      return;
+    }
+    if (request.url === '/prior-inflight' || request.url === '/prior-completed') {
+      const href = request.url === '/prior-inflight'
+        ? '/prior-inflight-file' : '/prior-completed-file';
+      response.end(`<a id="selected" href="${href}" download="prior.bin">Selected</a><script>setTimeout(()=>{const a=document.createElement("a");a.href="${href}";a.download="prior.bin";document.body.append(a);a.click()},100)</script>`);
+      return;
+    }
+    response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/concurrent-file">Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const base = `http://127.0.0.1:${fixture.address().port}`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+      BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
+      TMPDIR: os.tmpdir(),
+      BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+    },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`${action} host response timed out`));
+    }, 30_000);
+    pending.set(id, message => { clearTimeout(timer); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  try {
+    const initial = (await call('state')).result;
+    assert.ok(fs.readdirSync(tempRoot).some(name => name.startsWith('bamboo-browser-download-')),
+      'an explicit session-owned root overrides Node platform temp defaults');
+    const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
+    const epoch = ready.page_epoch;
+    const first = await call('download', { selector: '#small', expected_epoch: epoch });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.result.page_epoch, epoch);
+    assert.equal(first.result.active_tab_id, ready.active_tab_id);
+    assert.equal(first.result.url, base + '/');
+    assert.match(first.result.filename, /private\.bin$/);
+    assert.doesNotMatch(first.result.filename, /[\\/]|\.\./);
+    assert.equal(first.result.byte_count, bytes.length);
+    assert.equal(first.result.sha256, createHash('sha256').update(bytes).digest('hex'));
+    assert.deepEqual(Buffer.from(first.result.data_base64, 'base64'), bytes);
+    assert.equal(smallReferer, undefined, 'private request never adds a forbidden Referer');
+    const credential = await call('download', { selector: '#credential', expected_epoch: epoch });
+    assert.equal(credential.code, 'download_unverifiable', JSON.stringify(credential));
+    assert.equal(credential.result, undefined);
+    assert.equal(smallRequests, 1, 'embedded credentials never start a private request');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'rejected credential URL left no artifact');
+    const named = await call('download', { selector: '#named', expected_epoch: epoch });
+    assert.equal(named.ok, true, JSON.stringify(named));
+    assert.equal(named.result.filename, 'chosen.txt');
+    assert.equal(namedReferer, undefined);
+    const hidden = await call('download', { selector: '#hidden', expected_epoch: epoch });
+    assert.equal(hidden.code, 'download_unverifiable', JSON.stringify(hidden));
+    assert.equal(smallRequests, 1, 'hidden target did not start a private request');
+    const fragment = await call('download', { selector: '#fragment', expected_epoch: epoch });
+    assert.equal(fragment.ok, true, JSON.stringify(fragment));
+    assert.deepEqual(Buffer.from(fragment.result.data_base64, 'base64'), bytes);
+    const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
+    assert.equal(redirected.code, 'download_unverifiable', JSON.stringify(redirected));
+    assert.equal(redirected.result, undefined);
+    assert.equal(redirectedRequests, 0, 'the redirect was blocked before its destination');
+    const html = await call('download', { selector: '#html', expected_epoch: epoch });
+    assert.equal(html.code, 'download_unverifiable', JSON.stringify(html));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const directHtml = await call('download', { selector: '#html-direct', expected_epoch: epoch });
+      assert.equal(directHtml.code, 'download_unverifiable', JSON.stringify(directHtml));
+      assert.equal(privateResourceRequests, 0,
+        `private HTML attempt ${attempt + 1} loaded site resources: ${JSON.stringify(privateResourceTypes)}`);
+    }
+    assert.equal(directHtmlRequests, 5, 'each direct HTML request reached response headers');
+    assert.equal(privateScriptRequests, 0, 'HTML reached through the private page never ran script');
+    assert.equal(privatePopupRequests, 0, 'private HTML did not open a shared popup');
+    assert.equal(privateResourceRequests, 0,
+      `private HTML did not load site resources: ${JSON.stringify(privateResourceTypes)}`);
+    assert.equal((await call('state')).result.tabs.length, 1,
+      'the private page and its descendants did not enter shared tabs');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'successful download artifact was deleted');
+    assert.equal((await call('download', { selector: '#small', expected_epoch: initial.page_epoch })).code, 'stale_epoch');
+
+    const exactLimit = await call('download', { selector: '#exact-limit', expected_epoch: epoch });
+    assert.equal(exactLimit.ok, true, JSON.stringify(exactLimit));
+    assert.equal(exactLimit.result.byte_count, maximumBytes.length);
+    assert.equal(exactLimit.result.sha256, createHash('sha256').update(maximumBytes).digest('hex'));
+    assert.deepEqual(Buffer.from(exactLimit.result.data_base64, 'base64'), maximumBytes);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'exact-limit download artifact was deleted');
+    const overLimit = await call('download', { selector: '#over-limit', expected_epoch: epoch });
+    assert.equal(overLimit.code, 'download_too_large', JSON.stringify(overLimit));
+    assert.equal(overLimit.result, undefined);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'over-limit download artifact was deleted');
+
+    const oversized = await call('download', { selector: '#oversized', expected_epoch: epoch });
+    assert.equal(oversized.code, 'download_too_large', JSON.stringify(oversized));
+    assert.equal(oversized.result, undefined);
+    assert.ok(oversizedChunks < 64, `oversized stream sent ${oversizedChunks} chunks`);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'oversized download artifact was deleted');
+
+    const timeoutStartedAt = performance.now();
+    const timedOut = await call('download', { selector: '#hanging', expected_epoch: epoch });
+    const timeoutElapsedMs = performance.now() - timeoutStartedAt;
+    assert.equal(timedOut.code, 'download_timeout', JSON.stringify(timedOut));
+    assert.equal(timedOut.result, undefined);
+    assert.ok(timeoutElapsedMs <= 5_500,
+      `download plus cancellation exceeded the 5-second test budget: ${timeoutElapsedMs}ms`);
+    for (let attempt = 0; hangingClosed === 0 && attempt < 40; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(hangingClosed, 1, 'timed-out transfer was cancelled');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'timed-out download artifact was deleted');
+    const failed = await call('download', { selector: '#failed', expected_epoch: epoch });
+    assert.equal(failed.code, 'download_failed', JSON.stringify(failed));
+    assert.equal(failed.result, undefined);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'failed download artifact was deleted');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
+    assert.equal((await call('screenshot')).ok, true);
+    const staticBlob = await call('download', { selector: '#static-blob', expected_epoch: epoch });
+    assert.equal(staticBlob.code, 'download_unverifiable', JSON.stringify(staticBlob));
+    assert.equal(staticBlob.result, undefined);
+    for (const selector of ['#blob-button', '#async-button']) {
+      const scripted = await call('download', { selector, expected_epoch: epoch });
+      assert.equal(scripted.code, 'download_unverifiable', JSON.stringify(scripted));
+      assert.equal(scripted.result, undefined);
+    }
+    assert.equal((await call('click_selector', { selector: '#after', expected_epoch: epoch })).ok, true);
+    assert.match((await call('dom')).result.snapshot, /Scripts restored/);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'direct and rejected downloads left no artifacts');
+
+    const pushed = await call('eval', {
+      code: 'history.pushState({}, "", "/spa")', expected_epoch: epoch, expected_url: base + '/',
+    });
+    assert.equal(pushed.code, 'stale_epoch', JSON.stringify(pushed));
+    const spa = (await call('state')).result;
+    assert.equal(spa.url, base + '/spa');
+    assert.equal(spaRequests, 0, 'same-document history did not fetch a new response');
+    const spaDownload = await call('download', { selector: '#small', expected_epoch: spa.page_epoch });
+    assert.equal(spaDownload.ok, true, JSON.stringify(spaDownload));
+    assert.deepEqual(Buffer.from(spaDownload.result.data_base64, 'base64'), bytes);
+    const hashed = await call('eval', {
+      code: 'location.hash = "#view"', expected_epoch: spa.page_epoch, expected_url: base + '/spa',
+    });
+    assert.equal(hashed.code, 'stale_epoch', JSON.stringify(hashed));
+    const hashPage = (await call('state')).result;
+    assert.equal(hashPage.url, base + '/spa#view');
+    const hashDownload = await call('download', {
+      selector: '#small', expected_epoch: hashPage.page_epoch,
+    });
+    assert.equal(hashDownload.ok, true, JSON.stringify(hashDownload));
+    assert.deepEqual(Buffer.from(hashDownload.result.data_base64, 'base64'), bytes);
+
+    const background = (await call('tab_create', { expected_epoch: hashPage.page_epoch })).result;
+    const backgroundPage = (await call('navigate', {
+      url: base + '/background-blob', expected_epoch: background.page_epoch,
+    })).result;
+    const restored = (await call('tab_activate', {
+      tab_id: hashPage.active_tab_id, expected_epoch: backgroundPage.page_epoch,
+    })).result;
+    const concurrent = await call('download', {
+      selector: '#concurrent', expected_epoch: restored.page_epoch,
+    });
+    assert.equal(concurrent.ok, true, JSON.stringify(concurrent));
+    assert.equal(Buffer.from(concurrent.result.data_base64, 'base64').toString(),
+      'selected-concurrent');
+    assert.equal(backgroundBlobMarkers, 1,
+      'a background tab started a Blob download during the approved direct transfer');
+    assert.deepEqual(temporaryDownloadFiles(), [], 'the ambient Blob left no artifact');
+    const stillShared = (await call('state')).result;
+    assert.equal(stillShared.active_tab_id, hashPage.active_tab_id);
+    assert.equal(stillShared.tabs.length, 2, 'only the known background tab remains');
+    const afterBackground = (await call('tab_close', {
+      tab_id: background.active_tab_id, expected_epoch: stillShared.page_epoch,
+    })).result;
+    assert.equal(afterBackground.tabs.length, 1);
+
+    const stalePage = (await call('navigate', {
+      url: base + '/stale-response', expected_epoch: afterBackground.page_epoch,
+    })).result;
+    await call('history', { direction: 'reload', expected_epoch: stalePage.page_epoch });
+    assert.equal(staleResponseRequests, 2);
+    const beforeHash = (await call('state')).result;
+    await call('eval', {
+      code: 'location.hash = "#after-no-document"',
+      expected_epoch: beforeHash.page_epoch, expected_url: base + '/stale-response',
+    });
+    const afterHash = (await call('state')).result;
+    assert.equal(afterHash.url, base + '/stale-response#after-no-document');
+    const preservedPolicy = await call('download', {
+      selector: '#small', expected_epoch: afterHash.page_epoch,
+    });
+    assert.equal(preservedPolicy.ok, true, JSON.stringify(preservedPolicy));
+    assert.deepEqual(Buffer.from(preservedPolicy.result.data_base64, 'base64'), bytes);
+
+    const racePage = (await call('navigate', {
+      url: base + '/race', expected_epoch: afterHash.page_epoch,
+    })).result;
+    const race = await call('download', { selector: '#race', expected_epoch: racePage.page_epoch });
+    assert.equal(race.ok, true, JSON.stringify(race));
+    assert.equal(Buffer.from(race.result.data_base64, 'base64').toString(), 'selected-download');
+    assert.equal(raceAutoMarkers, 0, 'page timer did not claim the selected same-URL download');
+    assert.match((await call('dom')).result.snapshot, /Selected/);
+    assert.equal((await call('screenshot')).ok, true);
+
+    // Neither in-flight nor completed same-URL bytes may claim the private frame.
+    let sharedPage = racePage;
+    for (const [kind, started] of [['inflight', inflightStarted], ['completed', completedFinished]]) {
+      sharedPage = (await call('navigate', {
+        url: base + `/prior-${kind}`, expected_epoch: sharedPage.page_epoch,
+      })).result;
+      await Promise.race([started, new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`ambient ${kind} download did not start`)), 5_000))]);
+      if (kind === 'completed') await new Promise(resolve => setTimeout(resolve, 100));
+      const selected = await call('download', {
+        selector: '#selected', expected_epoch: sharedPage.page_epoch,
+      });
+      assert.equal(selected.ok, true, JSON.stringify(selected));
+      assert.equal(Buffer.from(selected.result.data_base64, 'base64').toString(), `selected-${kind}`);
+      assert.equal(priorRequests[kind], 2, 'selected click started its own request');
+      const unchanged = (await call('state')).result;
+      assert.equal(unchanged.page_epoch, sharedPage.page_epoch);
+      assert.equal(unchanged.active_tab_id, sharedPage.active_tab_id);
+      assert.equal(unchanged.tabs.length, 1, 'private page did not enter shared tabs');
+      assert.match((await call('dom')).result.snapshot, /Selected/);
+      assert.equal((await call('screenshot')).ok, true);
+    }
+
+    const sandboxPage = (await call('navigate', {
+      url: base + '/sandbox-page', expected_epoch: sharedPage.page_epoch,
+    })).result;
+    const sandbox = await call('download', {
+      selector: '#sandbox', expected_epoch: sandboxPage.page_epoch,
+    });
+    assert.equal(sandbox.code, 'download_unverifiable', JSON.stringify(sandbox));
+    assert.equal(sandboxRequests, 0, 'synthetic page did not bypass source CSP sandbox');
+
+    const unsolicited = (await call('navigate', {
+      url: base + '/unsolicited-page', expected_epoch: sandboxPage.page_epoch,
+    })).result;
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(unsolicitedRequests, 1);
+    assert.deepEqual(temporaryDownloadFiles(), [], 'unsolicited download artifact was deleted');
+    assert.equal((await call('state')).result.page_epoch, unsolicited.page_epoch);
+    const tamperedPage = (await call('navigate', {
+      url: base + '/eval-spoof', expected_epoch: unsolicited.page_epoch,
+    })).result;
+    const tampered = await call('download', {
+      selector: '#small', expected_epoch: tamperedPage.page_epoch,
+    });
+    if (tampered.ok) {
+      assert.deepEqual(Buffer.from(tampered.result.data_base64, 'base64'), bytes,
+        'download bytes came from the actual selected href');
+    } else {
+      assert.equal(tampered.code, 'download_unverifiable', JSON.stringify(tampered));
+    }
+    assert.equal(spoofedRequests, 0, 'page eval/JSON hooks cannot authorize a forged href');
+    assert.equal((await call('close')).result.closed, true);
+    if (host.exitCode === null) await once(host, 'exit');
+    assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
+
+    // Failed cleanup/private-page creation must retire with no temp artifact.
+    for (const mode of ['cleanup', 'reject', 'timeout']) {
+      const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
+        [path.join(__dirname, 'host.cjs')], {
+          env: {
+            ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
+            BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+            BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+            BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
+            BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
+            BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS: mode === 'reject' ? '500' : '0',
+          },
+          stdio: ['pipe', 'pipe', 'inherit'],
+        });
+      const retiringPending = new Map();
+      let retiringId = 1;
+      const retiringLines = readline.createInterface({ input: retiringHost.stdout });
+      retiringLines.on('line', line => {
+        const message = JSON.parse(line);
+        if (message.event) return;
+        const resolve = retiringPending.get(message.id);
+        if (resolve) { retiringPending.delete(message.id); resolve(message); }
+      });
+      const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
+        const id = retiringId++;
+        const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
+        retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
+        retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+      });
+      try {
+        const initial = (await retiringCall('state')).result;
+        const ready = (await retiringCall('navigate', {
+          url: base + '/', expected_epoch: initial.page_epoch,
+        })).result;
+        const startedAt = performance.now();
+        const result = await retiringCall('download', {
+          selector: mode === 'cleanup' ? '#hanging' : '#small',
+          expected_epoch: ready.page_epoch,
+        });
+        assert.equal(result.code, mode === 'reject' ? 'download_failed' : 'download_timeout',
+          `${mode}: ${JSON.stringify(result)}`);
+        assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
+        if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
+        assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
+        assert.deepEqual(fs.readdirSync(tempRoot), [], `${mode} removed private download files`);
+      } finally {
+        retiringLines.close();
+        retiringHost.stdin.destroy();
+        retiringHost.kill();
+      }
+    }
+  } finally {
+    host.stdin.end();
+    host.kill();
+    fixture.closeAllConnections();
+    fixture.close();
+    await once(fixture, 'close');
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('popup and explicit tabs keep active DOM, frames, and epochs on one page', async () => {
+  let popupDownloadRequests = 0;
+  const fixture = http.createServer((request, response) => {
+    if (request.url === '/popup-file') popupDownloadRequests++;
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     if (request.url === '/one') {
       response.end('<title>One</title><button id="popup" onclick="window.open(\'/two\', \'_blank\')">Open Two</button><main>One page</main>');
     } else if (request.url === '/two') {
-      response.end('<title>Two</title><main>Two page</main>');
+      response.end('<title>Two</title><main>Two page</main><a id="popup-download" href="/popup-file" download>Download</a>');
     } else {
       response.end('<title>Three</title><main>Three page</main>');
     }
@@ -206,6 +837,13 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(popupDom.active_tab_id, popupId);
     assert.match(popupDom.html, /Two page/);
     assert.doesNotMatch(popupDom.html, /One page/);
+    const popupDownload = await call('download', {
+      selector: '#popup-download', expected_epoch: popupState.page_epoch,
+    });
+    assert.equal(popupDownload.code, 'download_unverifiable', JSON.stringify(popupDownload));
+    assert.equal(popupDownloadRequests, 0, 'popup response policy was not proven');
+    assert.equal((await call('state')).result.tabs.length, 2,
+      'private download page did not enter the shared tab registry');
     const popupEval = await call('eval', {
       expected_epoch: popupState.page_epoch, expected_url: base + '/two',
       code: '({popup: document.title})',
