@@ -398,6 +398,95 @@ test('one isolated page supplies DOM, screenshot, and interactive changes withou
   }
 });
 
+test('real Chromium keeps current JPEG frames after a rapid viewport then navigation when screencast stalls', async () => {
+  const fixture = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end(request.url === '/alpha'
+      ? '<title>Alpha recovery</title><main>Alpha recovery page</main>'
+      : '<title>Beta recovery</title><main>Beta recovery page</main>');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const base = `http://127.0.0.1:${fixture.address().port}`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
+    [path.join(__dirname, 'host.cjs')], {
+      env: { ...process.env, NODE_ENV: 'test', BAMBOO_BROWSER_TEST_SUPPRESS_SCREENCAST_FRAMES: '1' },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+  const pending = new Map();
+  const frames = [];
+  let nextId = 1;
+  readline.createInterface({ input: host.stdout }).on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event === 'frame') { frames.push(message); return; }
+    if (message.event) return;
+    const resolve = pending.get(message.id);
+    if (resolve) { pending.delete(message.id); resolve(message); }
+  });
+  const call = (action, args = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timed out`)); }, 10_000);
+    pending.set(id, message => { clearTimeout(timeout); resolve(message); });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+  });
+  const waitForFrame = async (tabId, epoch, after) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const frame = frames.find(candidate => candidate.active_tab_id === tabId &&
+        candidate.page_epoch === epoch && candidate.frame_seq > after);
+      if (frame) return frame;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error(`no current JPEG for epoch ${epoch}`);
+  };
+  try {
+    const initial = (await call('state')).result;
+    const alpha = await call('navigate', { url: base + '/alpha', expected_epoch: initial.page_epoch });
+    assert.equal(alpha.ok, true);
+    const alphaFrame = await waitForFrame(alpha.result.active_tab_id, alpha.result.page_epoch, 0);
+    const resized = await call('viewport', {
+      width: 640, height: 480, expected_epoch: alpha.result.page_epoch,
+    });
+    assert.equal(resized.ok, true);
+    const beta = await call('navigate', {
+      url: base + '/beta', expected_epoch: resized.result.page_epoch,
+    });
+    assert.equal(beta.ok, true);
+    assert.equal(beta.result.active_tab_id, alpha.result.active_tab_id);
+    assert.notEqual(beta.result.page_epoch, resized.result.page_epoch);
+    const betaFrame = await waitForFrame(beta.result.active_tab_id, beta.result.page_epoch, alphaFrame.frame_seq);
+    const jpeg = Buffer.from(betaFrame.data, 'base64');
+    assert.ok(jpeg.length > 1_000);
+    assert.deepEqual(jpeg.subarray(0, 2), Buffer.from([0xff, 0xd8]));
+    assert.deepEqual([betaFrame.viewport_width, betaFrame.viewport_height], [640, 480]);
+    const state = (await call('state')).result;
+    assert.equal(state.page_epoch, beta.result.page_epoch);
+    assert.equal(state.active_tab_id, beta.result.active_tab_id);
+    assert.equal(state.url, base + '/beta');
+    const dom = (await call('dom')).result;
+    assert.equal(dom.page_epoch, beta.result.page_epoch);
+    assert.equal(dom.active_tab_id, beta.result.active_tab_id);
+    assert.match(dom.snapshot, /Beta recovery/);
+    const screenshot = (await call('screenshot')).result;
+    assert.equal(screenshot.page_epoch, beta.result.page_epoch);
+    assert.equal(screenshot.active_tab_id, beta.result.active_tab_id);
+    assert.ok(Buffer.from(screenshot.data, 'base64').length > 1_000);
+    // The bounded restart budget eventually uses paced stills while Chromium's
+    // normal callbacks are intentionally suppressed. A static page must still
+    // update the pollable frame sequence in this degraded mode.
+    const next = await waitForFrame(beta.result.active_tab_id, beta.result.page_epoch, betaFrame.frame_seq);
+    assert.ok(next.frame_seq > betaFrame.frame_seq);
+    assert.ok(frames.slice(frames.indexOf(betaFrame)).every(frame => frame.page_epoch === beta.result.page_epoch));
+    const exited = once(host, 'exit');
+    assert.equal((await call('close')).ok, true);
+    await exited;
+  } finally {
+    host.stdin.end();
+    if (host.exitCode === null) host.kill();
+    fixture.close();
+    await once(fixture, 'close');
+  }
+});
+
 test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
   const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
   const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);

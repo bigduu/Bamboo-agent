@@ -285,6 +285,175 @@ async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
 
 #[actix_web::test]
 #[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_frame_route_recovers_after_viewport_then_navigation() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let alpha = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /alpha "));
+                let body: &[u8] = if alpha {
+                    b"<!doctype html><title>Alpha recovery</title><main>Alpha recovery page</main>"
+                } else {
+                    b"<!doctype html><title>Beta recovery</title><main>Beta recovery page</main>"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-frame-route-recovery";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let tab_id = opened["active_tab_id"].as_str().unwrap();
+
+    let alpha = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/alpha"),
+                "expected_epoch":opened["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha.status(), StatusCode::OK);
+    let alpha: Value = test::read_body_json(alpha).await;
+    let alpha_frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha_frame.status(), StatusCode::OK);
+    let alpha_seq: u64 = alpha_frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let resized = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/viewport"))
+            .set_json(json!({"width":640,"height":480,"expected_epoch":alpha["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resized.status(), StatusCode::OK);
+    let resized: Value = test::read_body_json(resized).await;
+    let beta = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/beta"),
+                "expected_epoch":resized["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(beta.status(), StatusCode::OK);
+    let beta: Value = test::read_body_json(beta).await;
+    assert_eq!(beta["active_tab_id"], tab_id);
+    assert_ne!(beta["page_epoch"], resized["page_epoch"]);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], tab_id);
+    assert_eq!(dom["page_epoch"], beta["page_epoch"]);
+    assert!(dom["snapshot"].as_str().unwrap().contains("Beta recovery"));
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(screenshot.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        screenshot.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    assert!(test::read_body(screenshot).await.starts_with(&[0xff, 0xd8]));
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(frame.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        frame.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    let beta_seq: u64 = frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(beta_seq > alpha_seq);
+    assert!(test::read_body(frame).await.starts_with(&[0xff, 0xd8]));
+
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+    fixture.abort();
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
 async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_response() {
     use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
     use bamboo_agent_core::Session;
