@@ -1523,7 +1523,16 @@ async function boundedDownload(args, deadlineAt = Date.now() + DOWNLOAD_ACTION_B
     await downloadDeadline(cdp.send('Emulation.setScriptExecutionDisabled', { value: true }),
       workDeadlineAt);
     await downloadDeadline(new Promise(resolve => setTimeout(resolve, 25)), workDeadlineAt);
-    const link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    let link;
+    try {
+      link = await inspectDownloadLink(cdp, args.selector, 'inspect', workDeadlineAt);
+    } catch (error) {
+      // Only a failed initial inspection can enter the script-Blob path.
+      // Later failures may follow a private click/request; retrying the same
+      // selector could act on a different DOM node in the shared page.
+      if (error?.code === 'download_unverifiable') error.scriptFallbackEligible = true;
+      throw error;
+    }
     await downloadDeadline(withPinnedTarget(args, async handle => {
       checkEpoch(args);
       if (await handle.ownerFrame() !== tab.page.mainFrame()) {
@@ -2772,10 +2781,12 @@ async function command(action, args = {}) {
       try {
         return await boundedDownload(args, deadlineAt);
       } catch (error) {
-        if (error?.code !== 'download_unverifiable' || retireAfterReply) throw error;
-        // The direct path never clicks the shared page. A non-link target may
-        // instead be a supported synchronous script Blob producer. The Blob
-        // helper rejects native links, so failed direct links stay rejected.
+        if (error?.code !== 'download_unverifiable' ||
+            error.scriptFallbackEligible !== true || retireAfterReply) throw error;
+        // Initial inspection failed before any private navigation or download
+        // request. The Blob helper independently requires a unique non-link
+        // target; a direct attempt that progressed past inspection never
+        // authorizes a second click after a same-epoch DOM replacement.
         return boundedScriptBlobDownload(args, deadlineAt);
       }
     }

@@ -433,10 +433,31 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let privateResourceRequests = 0;
   const privateResourceTypes = [];
   let directHtmlRequests = 0;
+  let swappedPrivateRequests = 0;
+  let swappedButtonClicks = 0;
+  let swappedPageApplied = 0;
+  let swapReadyResponse;
+  let resolveSwapReady;
+  const swapReadyWaiting = new Promise(resolve => { resolveSwapReady = resolve; });
   let spoofedRequests = 0;
   const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
   const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/swap-ready') {
+      swapReadyResponse = response;
+      resolveSwapReady();
+      return;
+    }
+    if (request.url === '/swap-html') {
+      swappedPrivateRequests++;
+      swapReadyResponse?.end('ready');
+      swapReadyResponse = undefined;
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<title>Rejected private document</title>');
+      return;
+    }
+    if (request.url === '/swap-applied') swappedPageApplied++;
+    if (request.url === '/swap-click') swappedButtonClicks++;
     if (request.url === '/mark-auto') {
       raceAutoMarkers++;
       raceMarked = true;
@@ -603,6 +624,10 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     }
     if (request.url === '/script-eval-spoof') {
       response.end('<button id="script-eval-spoof" onclick="document.querySelector(\'output\').textContent=\'clicked\';const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'spoof\']));a.download=\'spoof.bin\';a.click()">Spoof</button><output>not clicked</output><script>window.eval=()=>()=>\'{"status":"matched"}\'</script>');
+      return;
+    }
+    if (request.url === '/swap-source') {
+      response.end('<a id="swap" href="/swap-html" download>Selected link</a><output>not clicked</output><script>fetch("/swap-ready").then(()=>{const button=document.createElement("button");button.id="swap";button.onclick=()=>{document.querySelector("output").textContent="clicked";const a=document.createElement("a");a.href=window.URL.createObjectURL(new Blob(["wrong-action"]));a.download="wrong.bin";a.click();fetch("/swap-click")};document.querySelector("#swap").replaceWith(button);fetch("/swap-applied")})</script>');
       return;
     }
     if (request.url === '/script-helper-tamper') {
@@ -1030,8 +1055,23 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(evalSpoof.result, undefined);
     assert.match((await call('dom')).result.html, /<output>not clicked<\/output>/,
       'eval tampering must not authorize a click on the source page');
+    const swapPage = (await call('navigate', {
+      url: base + '/swap-source', expected_epoch: evalSpoofPage.page_epoch,
+    })).result;
+    await swapReadyWaiting;
+    const swappedDirect = await call('download', {
+      selector: '#swap', expected_epoch: swapPage.page_epoch,
+    });
+    assert.equal(swappedPrivateRequests, 1,
+      'the selected direct link reached the private response gate');
+    assert.equal(swappedPageApplied, 1,
+      'the source selector changed after the private request was attempted');
+    assert.equal(swappedDirect.code, 'download_unverifiable', JSON.stringify(swappedDirect));
+    assert.equal(swappedDirect.result, undefined);
+    assert.equal(swappedButtonClicks, 0, 'a rejected direct download cannot click a replacement script button');
+    assert.match((await call('dom')).result.html, /<output>not clicked<\/output>/);
     const nativeRacePage = (await call('navigate', {
-      url: base + '/script-native-race', expected_epoch: evalSpoofPage.page_epoch,
+      url: base + '/script-native-race', expected_epoch: swapPage.page_epoch,
     })).result;
     const nativeRace = await call('download', {
       selector: '#script-native-race', expected_epoch: nativeRacePage.page_epoch,
