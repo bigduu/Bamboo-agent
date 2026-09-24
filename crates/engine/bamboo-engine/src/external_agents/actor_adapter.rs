@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bamboo_agent_core::tools::tool_start_arguments_for_display;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::poison::PoisonRecover;
-use bamboo_domain::SessionInboxClaim;
+use bamboo_domain::{HookResult, SessionInboxClaim};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -2490,6 +2490,35 @@ fn validate_actor_event_batch(
 const MAX_DISPLAY_CALLS: usize = 4_096;
 const MAX_NESTED_DISPLAY_DEPTH: usize = 8;
 const MAX_DISPLAY_ID_BYTES: usize = 256;
+const MAX_DISPLAY_HOOK_RESULT_DEPTH: usize = 16;
+
+fn hook_result_for_display(result: HookResult, depth: usize) -> Option<HookResult> {
+    if depth >= MAX_DISPLAY_HOOK_RESULT_DEPTH {
+        return None;
+    }
+    Some(match result {
+        HookResult::Continue => HookResult::Continue,
+        HookResult::Mutated => HookResult::Mutated,
+        HookResult::Allow => HookResult::Allow,
+        HookResult::Ask => HookResult::Ask,
+        HookResult::Deny { .. } => HookResult::Deny {
+            reason: "Hook denied".into(),
+        },
+        HookResult::InjectContext { .. } => HookResult::InjectContext {
+            text: "Hook context hidden".into(),
+        },
+        HookResult::WithContext { result, .. } => HookResult::WithContext {
+            result: Box::new(hook_result_for_display(*result, depth + 1)?),
+            text: "Hook context hidden".into(),
+        },
+        HookResult::Suspend { .. } => HookResult::Suspend {
+            reason: "Hook suspended".into(),
+        },
+        HookResult::Abort { .. } => HookResult::Abort {
+            reason: "Hook aborted".into(),
+        },
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DisplayCallKind {
@@ -2507,6 +2536,7 @@ struct DisplayCall {
 #[derive(Default)]
 struct ActorEventDisplay {
     calls: HashMap<String, DisplayCall>,
+    hook_names: HashMap<String, usize>,
     children: HashMap<(String, String), Box<ActorEventDisplay>>,
     // Shared by every nested child: a per-level cap alone permits an
     // exponential number of identities across an actor event tree.
@@ -2582,6 +2612,7 @@ impl ActorEventDisplay {
             .store(MAX_DISPLAY_CALLS + 1, Ordering::Relaxed);
         self.overflowed = true;
         self.calls.clear();
+        self.hook_names.clear();
         self.nested_overflowed = true;
         self.children.clear();
     }
@@ -2660,6 +2691,22 @@ impl ActorEventDisplay {
             .get(id)
             .filter(|call| call.started)
             .map(|call| call.kind)
+    }
+
+    fn display_hook_name(&mut self, hook_name: &str) -> Option<String> {
+        if self.overflowed || hook_name.is_empty() || hook_name.len() > MAX_DISPLAY_ID_BYTES {
+            self.fail_closed();
+            return None;
+        }
+        if let Some(index) = self.hook_names.get(hook_name) {
+            return Some(format!("actor-hook-{index}"));
+        }
+        if !self.reserve_identity() {
+            return None;
+        }
+        let index = self.hook_names.len() + 1;
+        self.hook_names.insert(hook_name.to_string(), index);
+        Some(format!("actor-hook-{index}"))
     }
 
     fn project(&mut self, event: AgentEvent, depth: usize) -> Option<AgentEvent> {
@@ -2815,6 +2862,30 @@ impl ActorEventDisplay {
                     auto_approved,
                     summary,
                     error,
+                }
+            }
+            AgentEvent::HookLifecycle {
+                hook_name,
+                point,
+                phase,
+                duration_ms,
+                decision,
+            } => {
+                let Some(decision) = hook_result_for_display(decision, 0) else {
+                    self.fail_closed();
+                    return None;
+                };
+                let hook_name = self.display_hook_name(&hook_name)?;
+                let phase = match phase.as_str() {
+                    "completed" | "started" | "error" => phase,
+                    _ => "event".into(),
+                };
+                AgentEvent::HookLifecycle {
+                    hook_name,
+                    point,
+                    phase,
+                    duration_ms,
+                    decision,
                 }
             }
             AgentEvent::ChildApprovalRequested {
@@ -4459,6 +4530,292 @@ mod tests {
             assert_eq!(starts[1], ("Read", &read_args));
             assert!(!format!("{events:?}").contains("private"));
         }
+    }
+
+    #[tokio::test]
+    async fn actor_hook_lifecycle_hides_every_decision_text_across_event_batch_and_nested_stream() {
+        let session_id = "actor-hook-display";
+        let private = "private-selector-url-filename-response";
+        let hook_name = format!("audit-{private}");
+        let hook = |duration_ms, phase: &str, decision| AgentEvent::HookLifecycle {
+            hook_name: hook_name.clone(),
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: phase.into(),
+            duration_ms,
+            decision,
+        };
+        let decisions = [
+            HookResult::Deny {
+                reason: private.into(),
+            },
+            HookResult::InjectContext {
+                text: private.into(),
+            },
+            HookResult::WithContext {
+                result: Box::new(HookResult::WithContext {
+                    result: Box::new(HookResult::Deny {
+                        reason: private.into(),
+                    }),
+                    text: private.into(),
+                }),
+                text: private.into(),
+            },
+            HookResult::Suspend {
+                reason: private.into(),
+            },
+            HookResult::Abort {
+                reason: private.into(),
+            },
+        ];
+        let originals = decisions.to_vec();
+        let batch_events = [
+            hook(2, "completed", decisions[1].clone()),
+            hook(3, "completed", decisions[2].clone()),
+            hook(4, "completed", decisions[3].clone()),
+        ]
+        .into_iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+        let batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.into(),
+                parent_session_id: Some("permission-parent".into()),
+                root_session_id: session_id.into(),
+            }),
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: Some(session_id.into()),
+            first_seq: 1,
+            last_seq: batch_events.len() as u64,
+            qos: bamboo_subagent::ActorEventQos::classify(&batch_events[0]),
+            events: batch_events,
+        };
+        let nested = AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: "child".into(),
+            event: Box::new(hook(5, "completed", decisions[4].clone())),
+        };
+        let raw = serde_json::to_string(&originals).unwrap();
+        assert!(raw.contains(private));
+
+        let (outcome, _session, forwarded, _) = drive_permission_handshake_frames(
+            session_id,
+            [
+                permission_posture_frame(session_id, 7),
+                actor_event_frame(hook(1, private, decisions[0].clone())),
+                ChildFrame::EventBatch { batch },
+                actor_event_frame(nested),
+                completed_actor_frame(),
+            ],
+            expected_default_permission_posture(7),
+        )
+        .await;
+        assert_eq!(outcome.unwrap().as_deref(), Some("done"));
+        let wire = serde_json::to_string(&forwarded).unwrap();
+        assert!(
+            !wire.contains(private),
+            "private hook text reached SSE: {wire}"
+        );
+
+        let hooks = forwarded
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::HookLifecycle {
+                    hook_name,
+                    point,
+                    phase,
+                    duration_ms,
+                    decision,
+                } => Some((hook_name, point, phase, duration_ms, decision)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hooks.len(), 4);
+        assert!(hooks.iter().all(|(name, point, _, _, _)| {
+            name == &&"actor-hook-1".to_string()
+                && **point == bamboo_domain::AgentHookPoint::BeforeToolExecution
+        }));
+        assert_eq!(hooks[0].2, "event");
+        assert_eq!(hooks[1].2, "completed");
+        assert_eq!(*hooks[0].3, 1);
+        assert_eq!(*hooks[3].3, 4);
+        assert!(matches!(hooks[0].4, HookResult::Deny { reason } if reason == "Hook denied"));
+        assert!(
+            matches!(hooks[1].4, HookResult::InjectContext { text } if text == "Hook context hidden")
+        );
+        assert!(
+            matches!(hooks[2].4, HookResult::WithContext { result, text }
+            if text == "Hook context hidden" && matches!(result.as_ref(),
+                HookResult::WithContext { result, text }
+                    if text == "Hook context hidden" && matches!(result.as_ref(),
+                        HookResult::Deny { reason } if reason == "Hook denied")))
+        );
+        assert!(matches!(hooks[3].4, HookResult::Suspend { reason } if reason == "Hook suspended"));
+        assert!(forwarded.iter().any(|event| matches!(event,
+            AgentEvent::SubAgentEvent { event, .. }
+                if matches!(event.as_ref(), AgentEvent::HookLifecycle {
+                    hook_name, duration_ms: 5,
+                    decision: HookResult::Abort { reason }, ..
+                } if hook_name == "actor-hook-1" && reason == "Hook aborted")
+        )));
+    }
+
+    #[test]
+    fn actor_hook_display_depth_and_identity_limits_fail_closed() {
+        let mut display = ActorEventDisplay::default();
+        let mut deep = HookResult::Allow;
+        for _ in 0..=MAX_DISPLAY_HOOK_RESULT_DEPTH {
+            deep = HookResult::WithContext {
+                result: Box::new(deep),
+                text: "private-download-bytes".into(),
+            };
+        }
+        let event = |hook_name: String, decision| AgentEvent::HookLifecycle {
+            hook_name,
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: "completed".into(),
+            duration_ms: 7,
+            decision,
+        };
+        assert!(display.project(event("deep".into(), deep), 0).is_none());
+        assert!(display.overflowed);
+        assert!(display
+            .project(
+                event(
+                    "private-download-bytes".into(),
+                    HookResult::Deny {
+                        reason: "private-download-bytes".into(),
+                    },
+                ),
+                0,
+            )
+            .is_none());
+
+        let mut oversized = ActorEventDisplay::default();
+        assert!(oversized
+            .project(
+                event("x".repeat(MAX_DISPLAY_ID_BYTES + 1), HookResult::Allow),
+                0,
+            )
+            .is_none());
+        assert!(oversized.overflowed);
+
+        // A new actor connection gets a fresh opaque alias, never the raw
+        // hook name. Repeated names keep the same alias until the shared
+        // identity budget is exhausted, then the stream fails closed.
+        let mut reconnected = ActorEventDisplay::default();
+        let private = "private-download-bytes";
+        for _ in 0..2 {
+            let projected = reconnected
+                .project(event(private.into(), HookResult::Allow), 0)
+                .unwrap();
+            assert!(
+                matches!(projected, AgentEvent::HookLifecycle { hook_name, .. }
+                if hook_name == "actor-hook-1")
+            );
+        }
+        assert_eq!(reconnected.identities.load(Ordering::Relaxed), 1);
+        for index in 1..MAX_DISPLAY_CALLS {
+            assert!(reconnected
+                .project(event(format!("hook-{index}"), HookResult::Allow), 0)
+                .is_some());
+        }
+        assert!(reconnected
+            .project(event("overflow-private".into(), HookResult::Allow), 0)
+            .is_none());
+        assert!(reconnected.overflowed);
+        assert!(reconnected.hook_names.is_empty());
+    }
+
+    #[test]
+    fn actor_hook_display_preserves_nontext_decision_kinds() {
+        for result in [
+            HookResult::Continue,
+            HookResult::Mutated,
+            HookResult::Allow,
+            HookResult::Ask,
+        ] {
+            assert_eq!(hook_result_for_display(result.clone(), 0), Some(result));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_actor_hook_events_never_fall_back_to_raw_display() {
+        let session_id = "actor-malformed-hook";
+        let private = "private-download-selector";
+        let original = AgentEvent::HookLifecycle {
+            hook_name: "audit".into(),
+            point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+            phase: "completed".into(),
+            duration_ms: 9,
+            decision: HookResult::Deny {
+                reason: private.into(),
+            },
+        };
+        let mut invalid = serde_json::to_value(&original).unwrap();
+        invalid["decision"]["type"] = serde_json::json!("unknown_decision");
+        let nested = AgentEvent::SubAgentEvent {
+            parent_session_id: "parent".into(),
+            child_session_id: "child".into(),
+            event: Box::new(original),
+        };
+        let mut invalid_nested = serde_json::to_value(nested).unwrap();
+        invalid_nested["event"]["decision"]["type"] = serde_json::json!("unknown_decision");
+        let batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.into(),
+                parent_session_id: Some("permission-parent".into()),
+                root_session_id: session_id.into(),
+            }),
+            activation_id: None,
+            execution_epoch: 0,
+            source_node_id: None,
+            source_actor_id: Some(session_id.into()),
+            first_seq: 1,
+            last_seq: 1,
+            qos: bamboo_subagent::ActorEventQos::classify(&invalid),
+            events: vec![invalid.clone()],
+        };
+        for frame in [
+            ChildFrame::Event {
+                event: invalid.clone(),
+            },
+            ChildFrame::EventBatch { batch },
+            ChildFrame::Event {
+                event: invalid_nested,
+            },
+        ] {
+            let (outcome, _session, forwarded, _) = drive_permission_handshake_frames(
+                session_id,
+                [permission_posture_frame(session_id, 7), frame],
+                expected_default_permission_posture(7),
+            )
+            .await;
+            let error = outcome.unwrap_err().to_string();
+            assert!(error.contains("malformed AgentEvent"), "{error}");
+            assert!(!error.contains(private));
+            assert!(!serde_json::to_string(&forwarded).unwrap().contains(private));
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut session = Session::new("legacy-hook", "model");
+        let mut handshake = PermissionPostureHandshake::NotRequired;
+        let mut display = ActorEventDisplay::default();
+        process_actor_event(
+            invalid,
+            false,
+            &mut handshake,
+            None,
+            None,
+            &mut session,
+            &event_tx,
+            &mut display,
+        )
+        .await
+        .unwrap();
+        assert!(display.overflowed);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
