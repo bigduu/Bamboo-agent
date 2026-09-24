@@ -550,10 +550,19 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const redirected = await call('download', { selector: '#redirect', expected_epoch: epoch });
     assert.equal(redirected.ok, true, JSON.stringify(redirected));
     assert.equal(Buffer.from(redirected.result.data_base64, 'base64').toString(), 'redirected-bytes');
+    assert.equal(redirected.result.sha256,
+      createHash('sha256').update('redirected-bytes').digest('hex'));
     const redirected307 = await call('download', { selector: '#redirect-307', expected_epoch: epoch });
     assert.equal(redirected307.ok, true, JSON.stringify(redirected307));
     assert.equal(Buffer.from(redirected307.result.data_base64, 'base64').toString(), 'redirected-bytes');
+    assert.equal(redirected307.result.sha256, redirected.result.sha256);
     assert.equal(redirectedRequests, 2, 'both verified chains reached the terminal attachment');
+    const afterRedirects = (await call('state')).result;
+    assert.equal(afterRedirects.page_epoch, epoch);
+    assert.equal(afterRedirects.active_tab_id, ready.active_tab_id);
+    assert.equal(afterRedirects.tabs.length, 1, 'private redirect page did not join shared tabs');
+    assert.match((await call('dom')).result.snapshot, /Page remains open/);
+    assert.equal((await call('screenshot')).ok, true);
     for (const selector of ['#meta', '#credentials', '#loop']) {
       const denied = await call('download', { selector, expected_epoch: epoch });
       assert.equal(denied.code, 'download_unverifiable', JSON.stringify(denied));
