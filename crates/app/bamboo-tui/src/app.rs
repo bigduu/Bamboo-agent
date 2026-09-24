@@ -2756,15 +2756,6 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
         return "[browser arguments unavailable]".to_string();
     };
-    if args.get("data_base64").is_some() {
-        return serde_json::json!({"action":"set_file_input","input":"[redacted]"}).to_string();
-    }
-    if let Some(action) = focused_browser_action(tool_name, &args) {
-        return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
-    }
-    if args.get("action").and_then(serde_json::Value::as_str) == Some("select_option") {
-        return serde_json::json!({"action":"select_option","selection":"[redacted]"}).to_string();
-    }
     if is_browser_download_args(tool_name, &args) {
         let mut display = serde_json::json!({"action":"download"});
         if let Some(epoch) = args
@@ -2774,6 +2765,15 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
             display["expected_epoch"] = serde_json::json!(epoch);
         }
         return display.to_string();
+    }
+    if args.get("data_base64").is_some() {
+        return serde_json::json!({"action":"set_file_input","input":"[redacted]"}).to_string();
+    }
+    if let Some(action) = focused_browser_action(tool_name, &args) {
+        return serde_json::json!({"action":action,"input":"[redacted]"}).to_string();
+    }
+    if args.get("action").and_then(serde_json::Value::as_str) == Some("select_option") {
+        return serde_json::json!({"action":"select_option","selection":"[redacted]"}).to_string();
     }
     raw.to_string()
 }
@@ -17244,6 +17244,7 @@ mod question_tests {
             "selector":"a[data-secret='private-selector']",
             "expected_epoch":17,
             "extra":{"secret":"private-extra"},
+            "data_base64":"private-arg-base64",
         });
         let result = serde_json::json!({
             "page_epoch":17,
@@ -17295,6 +17296,7 @@ mod question_tests {
             for private in [
                 "private-selector",
                 "private-extra",
+                "private-arg-base64",
                 "private-before-start",
                 "private-after-start",
                 "private-url",

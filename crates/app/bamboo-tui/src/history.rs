@@ -555,6 +555,7 @@ mod tests {
             "selector":"a[data-secret='private-selector']",
             "expected_epoch":17,
             "extra":{"secret":"private-extra"},
+            "data_base64":"private-arg-base64",
         })
         .to_string();
         let result = serde_json::json!({
@@ -581,6 +582,7 @@ mod tests {
             for private in [
                 "private-selector",
                 "private-extra",
+                "private-arg-base64",
                 "private-filename",
                 "private-digest",
                 "private-base64",

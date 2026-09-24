@@ -55,11 +55,6 @@ fn tool_start_arguments_for_display(
         .next()
         .is_some_and(|name| name.eq_ignore_ascii_case("browser"));
     if browser
-        && (args.get("action").and_then(serde_json::Value::as_str) == Some("set_file_input")
-            || args.get("data_base64").is_some())
-    {
-        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
-    } else if browser
         && args
             .get("action")
             .and_then(serde_json::Value::as_str)
@@ -73,6 +68,11 @@ fn tool_start_arguments_for_display(
             display["expected_epoch"] = serde_json::json!(epoch);
         }
         display
+    } else if browser
+        && (args.get("action").and_then(serde_json::Value::as_str) == Some("set_file_input")
+            || args.get("data_base64").is_some())
+    {
+        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
     } else {
         args.clone()
     }
@@ -670,6 +670,12 @@ mod tests {
         assert_eq!(tool_start_arguments_for_display("browser", &args), display);
         assert_eq!(
             tool_start_arguments_for_display("default::browser", &args),
+            display
+        );
+        let mut poisoned = args.clone();
+        poisoned["data_base64"] = serde_json::json!("private-file-bytes");
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &poisoned),
             display
         );
         assert_eq!(args, original);

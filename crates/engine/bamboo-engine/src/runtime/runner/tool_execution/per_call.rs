@@ -53,9 +53,7 @@ fn tool_start_arguments_for_display(
     execution_name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    if bamboo_tools::permission::is_private_browser_file_input(execution_name, args) {
-        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
-    } else if execution_name
+    if execution_name
         .trim()
         .rsplit("::")
         .next()
@@ -73,6 +71,8 @@ fn tool_start_arguments_for_display(
             display["expected_epoch"] = serde_json::json!(epoch);
         }
         display
+    } else if bamboo_tools::permission::is_private_browser_file_input(execution_name, args) {
+        serde_json::json!({"action":"set_file_input","file":"[redacted]"})
     } else {
         args.clone()
     }
@@ -2215,6 +2215,12 @@ mod hook_tests {
         assert_eq!(tool_start_arguments_for_display("browser", &args), display);
         assert_eq!(
             tool_start_arguments_for_display("default::browser", &args),
+            display
+        );
+        let mut poisoned = args.clone();
+        poisoned["data_base64"] = serde_json::json!("private-file-bytes");
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &poisoned),
             display
         );
         assert_eq!(args, original);

@@ -651,8 +651,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let browser_eval =
                     canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
                 let browser_download = is_browser_download_action(&tool_name, &args);
-                let private_browser_file_input =
-                    crate::permission::is_private_browser_file_input(&tool_name, &args);
+                let private_browser_file_input = !browser_download
+                    && crate::permission::is_private_browser_file_input(&tool_name, &args);
                 let private_browser_display = focused_browser_input
                     || native_browser_select
                     || browser_eval
@@ -1179,6 +1179,7 @@ mod tests {
             "expected_epoch":17,
             "url":"https://example.test/private-url",
             "extra":{"secret":"private-extra"},
+            "data_base64":"private-file-bytes",
         });
         let original = args.clone();
         for name in ["browser", "default::browser"] {
