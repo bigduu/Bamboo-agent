@@ -121,6 +121,15 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let hangingClosed = 0;
   let raceAutoMarkers = 0;
   let raceMarked = false;
+  const priorRequests = { inflight: 0, completed: 0 };
+  let priorInflightStarted;
+  let priorCompletedFinished;
+  let smallReferer;
+  let namedReferer;
+  let smallRequests = 0;
+  let sandboxRequests = 0;
+  const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
+  const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
     if (request.url === '/mark-auto') {
       raceAutoMarkers++;
@@ -137,13 +146,46 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       raceMarked = false;
       return;
     }
+    const priorKind = /^\/prior-(inflight|completed)-file$/.exec(request.url)?.[1];
+    if (priorKind) {
+      const requestIndex = ++priorRequests[priorKind];
+      if (priorKind === 'inflight' && requestIndex === 1) priorInflightStarted();
+      const send = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="prior.bin"',
+        });
+        response.end(`${requestIndex === 1 ? 'ambient' : 'selected'}-${priorKind}`,
+          priorKind === 'completed' && requestIndex === 1 ? priorCompletedFinished : undefined);
+      };
+      if (priorKind === 'inflight' && requestIndex === 1) setTimeout(send, 800);
+      else send();
+      return;
+    }
     if (request.url === '/small' || request.url === '/unsolicited') {
       if (request.url === '/unsolicited') unsolicitedRequests++;
+      else { smallReferer = request.headers.referer; smallRequests++; }
       response.writeHead(200, {
         'content-type': 'application/octet-stream',
         'content-disposition': 'attachment; filename="../private.bin"',
       });
       response.end(bytes);
+      return;
+    }
+    if (request.url === '/named-file') {
+      namedReferer = request.headers.referer;
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.end('named-by-anchor');
+      return;
+    }
+    if (request.url === '/sandbox-file') sandboxRequests++;
+    if (request.url === '/sandbox-page') {
+      response.writeHead(200, [
+        ['content-type', 'text/html'],
+        ['Content-Security-Policy', "default-src 'self'"], ['content-security-policy', 'sandbox allow-scripts'],
+      ]);
+      response.end('<a id="sandbox" href="/sandbox-file" download>Blocked</a>');
       return;
     }
     if (request.url === '/exact-limit' || request.url === '/over-limit') {
@@ -195,7 +237,9 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       setTimeout(() => response.destroy(), 100);
       return;
     }
-    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy-report-only': 'sandbox' });
     if (request.url === '/unsolicited-page') {
       response.end('<main>Unsolicited page</main><script>setTimeout(() => { const link = document.createElement("a"); link.href = "/unsolicited"; document.body.append(link); link.click(); }, 100)</script>');
       return;
@@ -204,7 +248,13 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       response.end('<a id="race" href="/race-file" download="race.bin">Selected</a><script>const race=document.querySelector("#race");const original=race.getAttribute.bind(race);race.getAttribute=name=>{if(name==="href"&&!race.dataset.armed){race.dataset.armed="1";setTimeout(async()=>{await fetch("/mark-auto");const link=document.createElement("a");link.href="/race-file";document.body.append(link);link.click()},80)}return original(name)}</script>');
       return;
     }
-    response.end('<a id="small" href="/small">Small</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
+    if (request.url === '/prior-inflight' || request.url === '/prior-completed') {
+      const href = request.url === '/prior-inflight'
+        ? '/prior-inflight-file' : '/prior-completed-file';
+      response.end(`<a id="selected" href="${href}" download="prior.bin">Selected</a><script>setTimeout(()=>{const a=document.createElement("a");a.href="${href}";a.download="prior.bin";document.body.append(a);a.click()},100)</script>`);
+      return;
+    }
+    response.end('<a id="small" href="/small">Small</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -251,6 +301,14 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(first.result.byte_count, bytes.length);
     assert.equal(first.result.sha256, createHash('sha256').update(bytes).digest('hex'));
     assert.deepEqual(Buffer.from(first.result.data_base64, 'base64'), bytes);
+    assert.equal(smallReferer, undefined, 'private request never adds a forbidden Referer');
+    const named = await call('download', { selector: '#named', expected_epoch: epoch });
+    assert.equal(named.ok, true, JSON.stringify(named));
+    assert.equal(named.result.filename, 'chosen.txt');
+    assert.equal(namedReferer, undefined);
+    const hidden = await call('download', { selector: '#hidden', expected_epoch: epoch });
+    assert.equal(hidden.code, 'download_unverifiable', JSON.stringify(hidden));
+    assert.equal(smallRequests, 1, 'hidden target did not start a private request');
     assert.deepEqual(temporaryDownloadFiles(), [], 'successful download artifact was deleted');
     assert.equal((await call('download', { selector: '#small', expected_epoch: initial.page_epoch })).code, 'stale_epoch');
 
@@ -309,8 +367,40 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.match((await call('dom')).result.snapshot, /Selected/);
     assert.equal((await call('screenshot')).ok, true);
 
+    // Neither in-flight nor completed same-URL bytes may claim the private frame.
+    let sharedPage = racePage;
+    for (const [kind, started] of [['inflight', inflightStarted], ['completed', completedFinished]]) {
+      sharedPage = (await call('navigate', {
+        url: base + `/prior-${kind}`, expected_epoch: sharedPage.page_epoch,
+      })).result;
+      await Promise.race([started, new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`ambient ${kind} download did not start`)), 5_000))]);
+      if (kind === 'completed') await new Promise(resolve => setTimeout(resolve, 100));
+      const selected = await call('download', {
+        selector: '#selected', expected_epoch: sharedPage.page_epoch,
+      });
+      assert.equal(selected.ok, true, JSON.stringify(selected));
+      assert.equal(Buffer.from(selected.result.data_base64, 'base64').toString(), `selected-${kind}`);
+      assert.equal(priorRequests[kind], 2, 'selected click started its own request');
+      const unchanged = (await call('state')).result;
+      assert.equal(unchanged.page_epoch, sharedPage.page_epoch);
+      assert.equal(unchanged.active_tab_id, sharedPage.active_tab_id);
+      assert.equal(unchanged.tabs.length, 1, 'private page did not enter shared tabs');
+      assert.match((await call('dom')).result.snapshot, /Selected/);
+      assert.equal((await call('screenshot')).ok, true);
+    }
+
+    const sandboxPage = (await call('navigate', {
+      url: base + '/sandbox-page', expected_epoch: sharedPage.page_epoch,
+    })).result;
+    const sandbox = await call('download', {
+      selector: '#sandbox', expected_epoch: sandboxPage.page_epoch,
+    });
+    assert.equal(sandbox.code, 'download_unverifiable', JSON.stringify(sandbox));
+    assert.equal(sandboxRequests, 0, 'synthetic page did not bypass source CSP sandbox');
+
     const unsolicited = (await call('navigate', {
-      url: base + '/unsolicited-page', expected_epoch: racePage.page_epoch,
+      url: base + '/unsolicited-page', expected_epoch: sandboxPage.page_epoch,
     })).result;
     await new Promise(resolve => setTimeout(resolve, 450));
     assert.equal(unsolicitedRequests, 1);
@@ -320,54 +410,54 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     if (host.exitCode === null) await once(host, 'exit');
     assert.deepEqual(fs.readdirSync(tempRoot), [], 'host removed its temporary download directory');
 
-    // Force cleanup to overrun its reserved slice in a real Chromium host.
-    // The old process must exit so Rust can retire the session and its TMPDIR.
-    const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
-      [path.join(__dirname, 'host.cjs')], {
-        env: {
-          ...process.env,
-          NODE_ENV: 'test',
-          BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
-          BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: '2000',
-          TMPDIR: tempRoot,
-        },
-        stdio: ['pipe', 'pipe', 'inherit'],
+    // Failed cleanup/private-page creation must retire with no temp artifact.
+    for (const mode of ['cleanup', 'reject', 'timeout']) {
+      const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
+        [path.join(__dirname, 'host.cjs')], {
+          env: {
+            ...process.env, NODE_ENV: 'test', TMPDIR: tempRoot,
+            BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+            BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
+            BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
+          },
+          stdio: ['pipe', 'pipe', 'inherit'],
+        });
+      const retiringPending = new Map();
+      let retiringId = 1;
+      const retiringLines = readline.createInterface({ input: retiringHost.stdout });
+      retiringLines.on('line', line => {
+        const message = JSON.parse(line);
+        if (message.event) return;
+        const resolve = retiringPending.get(message.id);
+        if (resolve) { retiringPending.delete(message.id); resolve(message); }
       });
-    const retiringPending = new Map();
-    let retiringId = 1;
-    const retiringLines = readline.createInterface({ input: retiringHost.stdout });
-    retiringLines.on('line', line => {
-      const message = JSON.parse(line);
-      if (message.event) return;
-      const resolve = retiringPending.get(message.id);
-      if (resolve) { retiringPending.delete(message.id); resolve(message); }
-    });
-    const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
-      const id = retiringId++;
-      const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
-      retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
-      retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
-    });
-    try {
-      const retiredInitial = (await retiringCall('state')).result;
-      const retiredReady = (await retiringCall('navigate', {
-        url: base + '/', expected_epoch: retiredInitial.page_epoch,
-      })).result;
-      const retirementStartedAt = performance.now();
-      const retiredDownload = await retiringCall('download', {
-        selector: '#hanging', expected_epoch: retiredReady.page_epoch,
+      const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
+        const id = retiringId++;
+        const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
+        retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
+        retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
       });
-      const retirementElapsedMs = performance.now() - retirementStartedAt;
-      assert.equal(retiredDownload.code, 'download_timeout', JSON.stringify(retiredDownload));
-      assert.ok(retirementElapsedMs <= 5_500,
-        `download cleanup exceeded its total 5-second test budget: ${retirementElapsedMs}ms`);
-      if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
-      assert.notEqual(retiringHost.exitCode, null, 'timed-out cleanup retired the old host');
-      assert.deepEqual(fs.readdirSync(tempRoot), [], 'retired host removed its temporary download directory');
-    } finally {
-      retiringLines.close();
-      retiringHost.stdin.destroy();
-      retiringHost.kill();
+      try {
+        const initial = (await retiringCall('state')).result;
+        const ready = (await retiringCall('navigate', {
+          url: base + '/', expected_epoch: initial.page_epoch,
+        })).result;
+        const startedAt = performance.now();
+        const result = await retiringCall('download', {
+          selector: mode === 'cleanup' ? '#hanging' : '#small',
+          expected_epoch: ready.page_epoch,
+        });
+        assert.equal(result.code, mode === 'reject' ? 'download_failed' : 'download_timeout',
+          `${mode}: ${JSON.stringify(result)}`);
+        assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
+        if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
+        assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
+        assert.deepEqual(fs.readdirSync(tempRoot), [], `${mode} removed private download files`);
+      } finally {
+        retiringLines.close();
+        retiringHost.stdin.destroy();
+        retiringHost.kill();
+      }
     }
   } finally {
     host.stdin.end();
@@ -380,12 +470,14 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
 });
 
 test('popup and explicit tabs keep active DOM, frames, and epochs on one page', async () => {
+  let popupDownloadRequests = 0;
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/popup-file') popupDownloadRequests++;
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     if (request.url === '/one') {
       response.end('<title>One</title><button id="popup" onclick="window.open(\'/two\', \'_blank\')">Open Two</button><main>One page</main>');
     } else if (request.url === '/two') {
-      response.end('<title>Two</title><main>Two page</main>');
+      response.end('<title>Two</title><main>Two page</main><a id="popup-download" href="/popup-file" download>Download</a>');
     } else {
       response.end('<title>Three</title><main>Three page</main>');
     }
@@ -452,6 +544,13 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(popupDom.active_tab_id, popupId);
     assert.match(popupDom.html, /Two page/);
     assert.doesNotMatch(popupDom.html, /One page/);
+    const popupDownload = await call('download', {
+      selector: '#popup-download', expected_epoch: popupState.page_epoch,
+    });
+    assert.equal(popupDownload.code, 'download_unverifiable', JSON.stringify(popupDownload));
+    assert.equal(popupDownloadRequests, 0, 'popup response policy was not proven');
+    assert.equal((await call('state')).result.tabs.length, 2,
+      'private download page did not enter the shared tab registry');
     const popupEval = await call('eval', {
       expected_epoch: popupState.page_epoch, expected_url: base + '/two',
       code: '({popup: document.title})',
