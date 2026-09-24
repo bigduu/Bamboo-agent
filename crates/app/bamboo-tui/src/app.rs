@@ -2637,7 +2637,7 @@ pub struct PermissionQuestion {
 
 /// Mirror the server's private browser resource boundary for presentation.
 /// TUI API types are intentionally independent of the server permission crate.
-pub(crate) fn is_browser_display_tool_name(tool_name: &str) -> bool {
+fn is_browser_display_tool_name(tool_name: &str) -> bool {
     tool_name
         .trim()
         .rsplit("::")
@@ -2671,12 +2671,6 @@ fn is_private_browser_resource(tool_name: &str, resource: &str) -> bool {
                 && id
                     .bytes()
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        }),
-        (Some("download"), Some(rest)) => rest.strip_prefix("css:").is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }),
         _ => false,
     }
@@ -2756,16 +2750,6 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
         return "[browser arguments unavailable]".to_string();
     };
-    if is_browser_download_args(tool_name, &args) {
-        let mut display = serde_json::json!({"action":"download"});
-        if let Some(epoch) = args
-            .get("expected_epoch")
-            .and_then(serde_json::Value::as_u64)
-        {
-            display["expected_epoch"] = serde_json::json!(epoch);
-        }
-        return display.to_string();
-    }
     if args.get("data_base64").is_some() {
         return serde_json::json!({"action":"set_file_input","input":"[redacted]"}).to_string();
     }
@@ -2776,44 +2760,6 @@ pub(crate) fn tool_arguments_for_display(tool_name: &str, raw: &str) -> String {
         return serde_json::json!({"action":"select_option","selection":"[redacted]"}).to_string();
     }
     raw.to_string()
-}
-
-fn is_browser_download_args(tool_name: &str, args: &serde_json::Value) -> bool {
-    is_browser_display_tool_name(tool_name)
-        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
-}
-
-pub(crate) fn is_browser_download_display_call(tool_name: &str, arguments: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .is_some_and(|args| is_browser_download_args(tool_name, &args))
-}
-
-pub(crate) fn browser_download_result_for_display(raw: &str, success: bool) -> String {
-    let pending = serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .is_some_and(|payload| {
-            payload.get("status").and_then(serde_json::Value::as_str)
-                == Some("awaiting_permission_approval")
-                || payload.get("permission_request").is_some()
-        });
-    if pending {
-        "Browser download awaiting permission approval"
-    } else if success {
-        "Browser download completed"
-    } else {
-        "Browser download failed"
-    }
-    .to_string()
-}
-
-fn has_download_result_key(raw: &str) -> bool {
-    if !raw.trim_start().starts_with('{') {
-        return false;
-    }
-    const KEY: &str = "\"data_base64\"";
-    raw.match_indices(KEY)
-        .any(|(start, _)| raw[start + KEY.len()..].trim_start().starts_with(':'))
 }
 
 fn has_select_result_key(raw: &str) -> bool {
@@ -2871,9 +2817,6 @@ pub(crate) fn tool_complete_result_for_display(
         if raw.contains("pending_dialog") || has_select_result_key(raw) {
             return "Browser result unavailable".to_string();
         }
-        if has_download_result_key(raw) {
-            return "Browser download result hidden".to_string();
-        }
         return "Tool result hidden".to_string();
     }
     let browser = is_browser_display_tool_name(tool_name);
@@ -2883,13 +2826,6 @@ pub(crate) fn tool_complete_result_for_display(
         {
             "Browser input awaiting permission approval".to_string()
         } else if browser && (raw.contains("pending_dialog") || has_select_result_key(raw)) {
-            "Browser result unavailable".to_string()
-        } else if browser && has_download_result_key(raw) {
-            "Browser download result hidden".to_string()
-        } else if browser && raw.trim_start().starts_with('{') {
-            // A truncated JSON result may end before data_base64 appears,
-            // leaving a private filename or URL in its prefix. Snapshot text
-            // has its own non-JSON envelope and remains visible below.
             "Browser result unavailable".to_string()
         } else {
             raw.to_string()
@@ -2914,8 +2850,6 @@ pub(crate) fn tool_complete_result_for_display(
         "Browser input awaiting permission approval".to_string()
     } else if browser && payload.get("selected_values").is_some() {
         "Browser options selected".to_string()
-    } else if browser && payload.get("data_base64").is_some() {
-        "Browser download completed".to_string()
     } else {
         raw.to_string()
     }
@@ -11804,8 +11738,7 @@ impl App {
                     .unclassified_tool_tokens
                     .remove(&tool_call_id)
                     .unwrap_or_default();
-                let private_browser_output = is_browser_eval_tool_name(&tool_name)
-                    || is_browser_download_args(&tool_name, &arguments);
+                let private_eval = is_browser_eval_tool_name(&tool_name);
                 self.record_activity(
                     ActivityKind::Tool,
                     NoticeLevel::Info,
@@ -11823,7 +11756,7 @@ impl App {
                     // independent UI state survive the reordering.
                     tool.tool_name = tool_name;
                     tool.arguments = arguments;
-                    if private_browser_output {
+                    if private_eval {
                         tool.stream_output.clear();
                     } else {
                         tool.stream_output.push_str(&buffered_tokens);
@@ -11841,7 +11774,7 @@ impl App {
                         tool_name,
                         arguments,
                         result: None,
-                        stream_output: if private_browser_output {
+                        stream_output: if private_eval {
                             String::new()
                         } else {
                             buffered_tokens
@@ -11858,11 +11791,6 @@ impl App {
             } => {
                 self.chat.unclassified_tool_tokens.remove(&tool_call_id);
                 let success = result.success;
-                let private_download =
-                    self.find_tool_mut(&tool_call_id, false)
-                        .is_some_and(|tool| {
-                            is_browser_download_display_call(&tool.tool_name, &tool.arguments)
-                        });
                 let activity_name = self
                     .terminal_tool_name(&tool_call_id)
                     .map(str::to_string)
@@ -11873,9 +11801,7 @@ impl App {
                     .tools
                     .iter()
                     .any(|tool| tool.id == tool_call_id);
-                let result = if private_download {
-                    browser_download_result_for_display(&result.result, success)
-                } else if !success && is_browser_eval_tool_name(&activity_name) {
+                let result = if !success && is_browser_eval_tool_name(&activity_name) {
                     "Browser page JavaScript failed".to_string()
                 } else if !success && activity_name == tool_call_id {
                     match tool_complete_result_for_display(&activity_name, &result.result, true)
@@ -11970,11 +11896,6 @@ impl App {
                 error,
             } => {
                 self.chat.unclassified_tool_tokens.remove(&tool_call_id);
-                let private_download =
-                    self.find_tool_mut(&tool_call_id, false)
-                        .is_some_and(|tool| {
-                            is_browser_download_display_call(&tool.tool_name, &tool.arguments)
-                        });
                 let activity_name = self
                     .terminal_tool_name(&tool_call_id)
                     .map(str::to_string)
@@ -11988,9 +11909,7 @@ impl App {
                 if self.chat.run_status.phase.is_terminal() && !typed_known {
                     return Ok(());
                 }
-                let error = if private_download {
-                    "Browser download failed".to_string()
-                } else if is_browser_eval_tool_name(&activity_name) {
+                let error = if is_browser_eval_tool_name(&activity_name) {
                     "Browser page JavaScript failed".to_string()
                 } else if activity_name == tool_call_id {
                     "Tool failed".to_string()
@@ -12045,34 +11964,10 @@ impl App {
                 summary,
                 error,
             } => {
-                let browser_action = self
-                    .find_tool_mut(&tool_call_id, false)
-                    .and_then(|tool| {
-                        serde_json::from_str::<serde_json::Value>(&tool.arguments).ok()
-                    })
-                    .and_then(|args| {
-                        args.get("action")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                let private_download = is_browser_display_tool_name(&tool_name)
-                    && browser_action.as_deref() == Some("download");
-                let browser_unclassified =
-                    is_browser_display_tool_name(&tool_name) && browser_action.is_none();
                 let (summary, error) = if is_browser_eval_tool_name(&tool_name) {
                     (
                         summary.map(|_| "Browser page JavaScript activity".to_string()),
                         error.map(|_| "Browser page JavaScript failed".to_string()),
-                    )
-                } else if private_download {
-                    (
-                        summary.map(|_| "Browser download activity".to_string()),
-                        error.map(|_| "Browser download failed".to_string()),
-                    )
-                } else if browser_unclassified {
-                    (
-                        summary.map(|_| "Browser activity".to_string()),
-                        error.map(|_| "Browser action failed".to_string()),
                     )
                 } else {
                     (summary, error)
@@ -12109,9 +12004,7 @@ impl App {
                     .unclassified_tool_tokens
                     .remove(&tool_call_id)
                     .unwrap_or_default();
-                let private_browser_output = is_browser_eval_tool_name(&tool_name)
-                    || private_download
-                    || browser_unclassified;
+                let private_eval = is_browser_eval_tool_name(&tool_name);
                 let detail = elapsed_ms
                     .map(|elapsed| format!(" ({elapsed}ms)"))
                     .unwrap_or_default();
@@ -12139,7 +12032,7 @@ impl App {
                         if tc.tool_name == "unknown" {
                             tc.tool_name = tool_name;
                         }
-                        if private_browser_output {
+                        if private_eval {
                             tc.stream_output.clear();
                         } else {
                             tc.stream_output.push_str(&buffered_tokens);
@@ -12152,7 +12045,7 @@ impl App {
                             tc.error = Some(e);
                         }
                     }
-                } else if !private_browser_output && !buffered_tokens.is_empty() {
+                } else if !private_eval && !buffered_tokens.is_empty() {
                     self.chat
                         .unclassified_tool_tokens
                         .insert(tool_call_id.clone(), buffered_tokens);
@@ -12620,34 +12513,15 @@ impl App {
                 }
                 self.chat.run_status.tool_token(tool_call_id.clone());
                 let known_name = self.terminal_tool_name(&tool_call_id).map(str::to_string);
-                let browser_action = self
-                    .find_tool_mut(&tool_call_id, false)
-                    .and_then(|tool| {
-                        serde_json::from_str::<serde_json::Value>(&tool.arguments).ok()
-                    })
-                    .and_then(|args| {
-                        args.get("action")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                let known_browser = known_name
-                    .as_deref()
-                    .is_some_and(is_browser_display_tool_name);
-                let private_download =
-                    known_browser && browser_action.as_deref() == Some("download");
-                let unresolved_browser = known_browser && browser_action.is_none();
                 let known_ordinary = known_name
                     .as_deref()
-                    .is_some_and(|name| !is_browser_eval_tool_name(name))
-                    && !private_download
-                    && !unresolved_browser;
-                if known_name.as_deref().is_some_and(is_browser_eval_tool_name) || private_download
-                {
+                    .is_some_and(|name| !is_browser_eval_tool_name(name));
+                if known_name.as_deref().is_some_and(is_browser_eval_tool_name) {
                     self.chat.unclassified_tool_tokens.remove(&tool_call_id);
                     if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                         tool.stream_output.clear();
                     }
-                } else if known_name.is_some() && !unresolved_browser {
+                } else if known_name.is_some() {
                     if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                         tool.stream_output.push_str(&content);
                     }
@@ -16949,23 +16823,6 @@ mod question_tests {
         assert_eq!(permission.display_resource(), "<redacted>");
         assert!(!permission.inspector_text().contains("private-fingerprint"));
 
-        let download_fingerprint = "a".repeat(64);
-        let download_resource = format!("browser:17:download:css:{download_fingerprint}");
-        for tool_name in ["browser", "default::browser"] {
-            permission.request.tool_name = tool_name.to_string();
-            permission.request.resource = download_resource.clone();
-            permission.request.suggested_matchers[0].value = download_resource.clone();
-            assert_eq!(permission.display_resource(), "<redacted>");
-            assert!(!permission.inspector_text().contains(&download_fingerprint));
-            permission.inspect_target = Some(PermissionInspectTarget::Matcher {
-                decision: PermissionDecisionKind::AllowSession,
-                matcher_index: 0,
-            });
-            assert!(!permission.inspector_text().contains(&download_fingerprint));
-            permission.inspect_target = Some(PermissionInspectTarget::Request);
-            assert_eq!(permission.request.resource, download_resource);
-        }
-
         let child = ChildApprovalQuestion {
             parent_session_id: "parent".to_string(),
             child_session_id: "child".to_string(),
@@ -16997,18 +16854,6 @@ mod question_tests {
         assert!(!namespaced_child
             .inspector_text()
             .contains("private-fingerprint"));
-        for tool_name in ["browser", "default::browser"] {
-            let download_child = ChildApprovalQuestion {
-                tool_name: tool_name.to_string(),
-                resource: download_resource.clone(),
-                ..namespaced_child.clone()
-            };
-            assert_eq!(download_child.display_resource(), "<redacted>");
-            assert!(!download_child
-                .inspector_text()
-                .contains(&download_fingerprint));
-            assert_eq!(download_child.resource, download_resource);
-        }
     }
 
     #[test]
@@ -17238,160 +17083,6 @@ mod question_tests {
     }
 
     #[test]
-    fn browser_download_live_events_hide_selector_tokens_result_and_errors() {
-        let args = serde_json::json!({
-            "action":"download",
-            "selector":"a[data-secret='private-selector']",
-            "expected_epoch":17,
-            "extra":{"secret":"private-extra"},
-            "data_base64":"private-arg-base64",
-        });
-        let result = serde_json::json!({
-            "page_epoch":17,
-            "active_tab_id":"tab-1",
-            "url":"https://example.test/private-url",
-            "filename":"private-filename.bin",
-            "byte_count":12,
-            "sha256":"private-digest",
-            "data_base64":"private-base64",
-        })
-        .to_string();
-        for tool_name in ["browser", "default::browser"] {
-            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-            app.chat.streaming = true;
-            app.handle_sse_event(AgentEvent::ToolToken {
-                tool_call_id: "download-call".to_string(),
-                content: "private-before-start".to_string(),
-            })
-            .unwrap();
-            app.handle_sse_event(AgentEvent::ToolStart {
-                tool_call_id: "download-call".to_string(),
-                tool_name: tool_name.to_string(),
-                arguments: args.clone(),
-            })
-            .unwrap();
-            app.handle_sse_event(AgentEvent::ToolToken {
-                tool_call_id: "download-call".to_string(),
-                content: "private-after-start".to_string(),
-            })
-            .unwrap();
-            app.handle_sse_event(AgentEvent::ToolComplete {
-                tool_call_id: "download-call".to_string(),
-                result: ToolResult {
-                    success: true,
-                    result: result.clone(),
-                },
-            })
-            .unwrap();
-            let displayed = &app.chat.current_tool_calls[0];
-            assert_eq!(
-                displayed.arguments,
-                serde_json::json!({"action":"download","expected_epoch":17}).to_string()
-            );
-            assert_eq!(
-                displayed.result.as_deref(),
-                Some("Browser download completed")
-            );
-            assert!(displayed.stream_output.is_empty());
-            for private in [
-                "private-selector",
-                "private-extra",
-                "private-arg-base64",
-                "private-before-start",
-                "private-after-start",
-                "private-url",
-                "private-filename",
-                "private-digest",
-                "private-base64",
-            ] {
-                assert!(!format!("{displayed:?}{:?}", app.notifications).contains(private));
-            }
-
-            let mut failed = App::new(BambooClient::new("http://127.0.0.1:0"));
-            failed.chat.streaming = true;
-            failed
-                .handle_sse_event(AgentEvent::ToolStart {
-                    tool_call_id: "download-error".to_string(),
-                    tool_name: tool_name.to_string(),
-                    arguments: args.clone(),
-                })
-                .unwrap();
-            failed
-                .handle_sse_event(AgentEvent::ToolLifecycle {
-                    tool_call_id: "download-error".to_string(),
-                    tool_name: tool_name.to_string(),
-                    phase: "error".to_string(),
-                    elapsed_ms: Some(7),
-                    is_mutating: true,
-                    auto_approved: false,
-                    summary: Some("private-summary".to_string()),
-                    error: Some("private-lifecycle-error".to_string()),
-                })
-                .unwrap();
-            failed
-                .handle_sse_event(AgentEvent::ToolError {
-                    tool_call_id: "download-error".to_string(),
-                    error: "private-tool-error".to_string(),
-                })
-                .unwrap();
-            let displayed = &failed.chat.current_tool_calls[0];
-            assert_eq!(displayed.error.as_deref(), Some("Browser download failed"));
-            let rendered = format!("{displayed:?}{:?}", failed.notifications);
-            for private in [
-                "private-selector",
-                "private-summary",
-                "private-lifecycle-error",
-                "private-tool-error",
-            ] {
-                assert!(!rendered.contains(private));
-            }
-        }
-        assert!(args.to_string().contains("private-selector"));
-        assert!(result.contains("private-base64"));
-    }
-
-    #[test]
-    fn browser_download_result_fallback_never_renders_base64() {
-        let raw = r#"{"data_base64":"private-base64","byte_count":12}"#;
-        let malformed = r#"{"data_base64":"private-base64""#;
-        for tool_name in ["browser", "default::browser"] {
-            assert_eq!(
-                tool_complete_result_for_display(tool_name, raw, false),
-                "Browser download completed"
-            );
-            assert_eq!(
-                tool_complete_result_for_display(tool_name, malformed, false),
-                "Browser download result hidden"
-            );
-        }
-        assert_eq!(
-            tool_complete_result_for_display("unknown", malformed, true),
-            "Browser download result hidden"
-        );
-        assert_eq!(
-            browser_download_result_for_display(
-                r#"{"status":"awaiting_permission_approval","question":"private-selector"}"#,
-                true,
-            ),
-            "Browser download awaiting permission approval"
-        );
-        assert_eq!(
-            browser_download_result_for_display("private-error", false),
-            "Browser download failed"
-        );
-        let truncated_before_bytes = r#"{"filename":"private-name","url":"https://private.test/""#;
-        assert_eq!(
-            tool_complete_result_for_display("default::browser", truncated_before_bytes, false),
-            "Browser result unavailable"
-        );
-        let snapshot = "page_epoch: 17\n- paragraph '{\"data_base64\":\"example\"}'";
-        assert_eq!(
-            tool_complete_result_for_display("browser", snapshot, false),
-            snapshot
-        );
-    }
-
-    #[test]
     fn browser_file_input_events_and_permission_inspector_hide_file_bytes() {
         let args = serde_json::json!({
             "action":"set_file_input","selector":"#private-upload",
@@ -17509,73 +17200,6 @@ mod question_tests {
         assert!(!rendered.contains("Allow for session"), "{rendered}");
         assert!(!rendered.contains("Allow globally"), "{rendered}");
         assert!(!rendered.contains("private"), "{rendered}");
-    }
-
-    #[test]
-    fn browser_download_pending_modal_offers_only_usable_one_shot_choices() {
-        use ratatui::{backend::TestBackend, Terminal};
-
-        let mut request = sample_permission_request(
-            "download-chat",
-            "download-call",
-            vec![
-                PermissionDecisionKind::AllowOnce,
-                PermissionDecisionKind::DenyOnce,
-            ],
-        );
-        request.tool_name = "browser".to_string();
-        request.permission_type = PermissionType::BrowserInteraction;
-        request.resource = "[redacted]".to_string();
-        request.operation_summary = "Download from selected browser element".to_string();
-        request.suggested_matchers.clear();
-        let pending = PendingQuestion {
-            has_pending_question: true,
-            question: "Approve browser download?".to_string(),
-            tool_call_id: Some("download-call".to_string()),
-            tool_name: Some("browser".to_string()),
-            interaction_kind: Some(PendingInteractionKind::Permission),
-            permission_request: Some(request),
-            tool_arguments: Some(serde_json::json!({"action":"download","expected_epoch":17})),
-            ..PendingQuestion::default()
-        };
-        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.chat.session_id = Some("download-chat".to_string());
-        app.pending_question = Some(ActiveQuestion::from_pending(
-            "download:approval".to_string(),
-            "download-chat".to_string(),
-            &pending,
-            String::new(),
-        ));
-        let ActiveQuestionKind::Permission(permission) =
-            &app.pending_question.as_ref().unwrap().kind
-        else {
-            panic!("typed browser download permission")
-        };
-        assert!(permission.request.suggested_matchers.is_empty());
-        let choice = build_permission_decision(
-            &permission.request,
-            PermissionDecisionKind::AllowOnce,
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(choice.request_id, "download-call");
-        assert_eq!(choice.matcher_id, None);
-        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
-        terminal
-            .draw(|frame| crate::ui::render(frame, &app))
-            .unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Allow once"), "{rendered}");
-        assert!(rendered.contains("Deny once"), "{rendered}");
-        assert!(!rendered.contains("Allow for session"), "{rendered}");
-        assert!(!rendered.contains("Allow globally"), "{rendered}");
     }
 
     #[test]
