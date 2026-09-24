@@ -55,6 +55,24 @@ fn tool_start_arguments_for_display(
 ) -> serde_json::Value {
     if bamboo_tools::permission::is_private_browser_file_input(execution_name, args) {
         serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+    } else if execution_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        && args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| action.eq_ignore_ascii_case("download"))
+    {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = args
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        display
     } else {
         args.clone()
     }
@@ -2180,6 +2198,24 @@ mod hook_tests {
         assert_eq!(
             tool_start_arguments_for_display("browser", &args),
             serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+    }
+
+    #[test]
+    fn download_tool_start_is_display_only_and_never_carries_selector_or_extras() {
+        let args = serde_json::json!({
+            "action":"download","selector":"a[data-secret='private']",
+            "expected_epoch":17,"url":"https://private.example/file",
+            "nested":{"filename":"private.txt"},
+        });
+        let original = args.clone();
+        let display = serde_json::json!({"action":"download","expected_epoch":17});
+        assert_eq!(tool_start_arguments_for_display("browser", &args), display);
+        assert_eq!(
+            tool_start_arguments_for_display("default::browser", &args),
+            display
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);

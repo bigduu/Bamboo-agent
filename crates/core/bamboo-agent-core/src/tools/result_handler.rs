@@ -59,6 +59,20 @@ fn tool_start_arguments_for_display(
             || args.get("data_base64").is_some())
     {
         serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+    } else if browser
+        && args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| action.eq_ignore_ascii_case("download"))
+    {
+        let mut display = serde_json::json!({"action":"download"});
+        if let Some(epoch) = args
+            .get("expected_epoch")
+            .and_then(serde_json::Value::as_u64)
+        {
+            display["expected_epoch"] = serde_json::json!(epoch);
+        }
+        display
     } else {
         args.clone()
     }
@@ -639,6 +653,24 @@ mod tests {
         assert_eq!(
             tool_start_arguments_for_display("default::browser", &args),
             serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+    }
+
+    #[test]
+    fn browser_download_start_event_hides_selector_and_extras_without_changing_args() {
+        let args = serde_json::json!({
+            "action":"download","selector":"a[data-secret='private']",
+            "expected_epoch":17,"url":"https://private.example/file",
+            "nested":{"filename":"private.txt"},
+        });
+        let original = args.clone();
+        let display = serde_json::json!({"action":"download","expected_epoch":17});
+        assert_eq!(tool_start_arguments_for_display("browser", &args), display);
+        assert_eq!(
+            tool_start_arguments_for_display("default::browser", &args),
+            display
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
