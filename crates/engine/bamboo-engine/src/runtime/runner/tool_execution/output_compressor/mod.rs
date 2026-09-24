@@ -9,6 +9,7 @@ pub(crate) mod scenarios;
 pub(crate) mod tee;
 
 use super::per_call::ToolExecutionOutcome;
+use bamboo_agent_core::tools::parse_tool_args_best_effort;
 
 // ── Context Pressure ─────────────────────────────────────────────────────────
 
@@ -422,11 +423,11 @@ pub(super) async fn maybe_compress(
                 .rsplit("::")
                 .next()
                 .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
-                && serde_json::from_str::<serde_json::Value>(args_json)
-                    .ok()
-                    .is_some_and(|args| {
-                        args.get("action").and_then(serde_json::Value::as_str) == Some("download")
-                    });
+                && parse_tool_args_best_effort(args_json)
+                    .0
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("download");
             if result.success
                 && browser_download
                 && serde_json::from_str::<serde_json::Value>(&result.result)
@@ -680,20 +681,33 @@ mod tests {
             tool_duration: std::time::Duration::ZERO,
         };
         for tool_name in ["browser", "default::browser"] {
-            let output =
-                maybe_compress(tool_name, args, "test-session", outcome(), 128, None, None).await;
-            let result = output.result.unwrap();
-            assert!(
-                !result.success,
-                "an over-budget download must not look successful"
-            );
-            let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-            assert_eq!(
-                payload["error"],
-                "download_result_exceeds_tool_output_budget"
-            );
-            assert_eq!(payload["limit_tokens"], 128);
-            assert!(payload.get("data_base64").is_none());
+            for arguments in [
+                args,
+                r##"{"action":"download","selector":"#link","expected_epoch":17"##,
+            ] {
+                let output = maybe_compress(
+                    tool_name,
+                    arguments,
+                    "test-session",
+                    outcome(),
+                    128,
+                    None,
+                    None,
+                )
+                .await;
+                let result = output.result.unwrap();
+                assert!(
+                    !result.success,
+                    "an over-budget download must not look successful"
+                );
+                let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_eq!(
+                    payload["error"],
+                    "download_result_exceeds_tool_output_budget"
+                );
+                assert_eq!(payload["limit_tokens"], 128);
+                assert!(payload.get("data_base64").is_none());
+            }
         }
 
         let unlimited = maybe_compress("browser", args, "test-session", outcome(), 0, None, None)
@@ -721,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_budget_downloads_open_the_three_failure_circuit() {
-        let args = r##"{"action":"download","selector":"#link","expected_epoch":17}"##;
+        let args = r##"{"action":"download","selector":"#link","expected_epoch":17"##;
         let call = ToolCall {
             id: "download-call".into(),
             tool_type: "function".into(),
