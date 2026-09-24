@@ -100,6 +100,18 @@ impl NativeToolEventDisplay {
                 tool_name,
                 arguments,
             } => {
+                // A call ID is unique within one runner round. If another
+                // start or a late terminal frame reuses it, its identity is
+                // ambiguous until the next RunnerProgress boundary.
+                if self.calls.contains_key(&tool_call_id) {
+                    self.calls
+                        .insert(tool_call_id.clone(), CallIdentity::UnknownBrowser);
+                    return AgentEvent::ToolStart {
+                        tool_call_id,
+                        tool_name: "tool".to_string(),
+                        arguments: json!({"arguments":"[redacted]"}),
+                    };
+                }
                 // The namespace is model-supplied and can itself contain a
                 // private selector or URL. Outward browser identity is fixed.
                 let display_tool_name = if is_browser(&tool_name) {
@@ -147,13 +159,15 @@ impl NativeToolEventDisplay {
                 tool_call_id,
                 result,
             } => {
-                let result = match self.calls.remove(&tool_call_id) {
+                let result = match self.calls.get(&tool_call_id) {
                     Some(CallIdentity::Other(_)) => result,
                     Some(CallIdentity::Download) => {
                         ToolResult::text(result.success, "Browser download result hidden")
                     }
                     _ => ToolResult::text(result.success, "Tool result hidden"),
                 };
+                self.calls
+                    .insert(tool_call_id.clone(), CallIdentity::UnknownBrowser);
                 AgentEvent::ToolComplete {
                     tool_call_id,
                     result,
@@ -163,11 +177,13 @@ impl NativeToolEventDisplay {
                 tool_call_id,
                 error,
             } => {
-                let error = match self.calls.remove(&tool_call_id) {
+                let error = match self.calls.get(&tool_call_id) {
                     Some(CallIdentity::Other(_)) => error,
                     Some(CallIdentity::Download) => "Browser download error hidden".to_string(),
                     _ => "Tool error hidden".to_string(),
                 };
+                self.calls
+                    .insert(tool_call_id.clone(), CallIdentity::UnknownBrowser);
                 AgentEvent::ToolError {
                     tool_call_id,
                     error,
@@ -183,16 +199,25 @@ impl NativeToolEventDisplay {
                 summary,
                 error,
             } => {
-                let display_tool_name = if is_browser(&tool_name) {
-                    "browser".to_string()
-                } else {
-                    tool_name.clone()
-                };
                 let known_other = matches!(
                     self.calls.get(&tool_call_id),
                     Some(CallIdentity::Other(name))
                         if name.eq_ignore_ascii_case(canonical_tool_name(&tool_name))
                 );
+                let display_tool_name = if known_other {
+                    tool_name.clone()
+                } else if is_browser(&tool_name) {
+                    "browser".to_string()
+                } else {
+                    "tool".to_string()
+                };
+                let phase = if known_other
+                    || matches!(phase.as_str(), "begin" | "finished" | "error" | "cancelled")
+                {
+                    phase
+                } else {
+                    "activity".to_string()
+                };
                 // A lifecycle from another tool with a reused call ID must
                 // not inherit an earlier ordinary tool's display authority.
                 if matches!(self.calls.get(&tool_call_id), Some(CallIdentity::Other(_)))
@@ -351,6 +376,68 @@ mod tests {
         });
         let reused = display.project(complete("across-rounds", secret));
         assert!(!serde_json::to_string(&reused).unwrap().contains(secret));
+
+        display.project(start(
+            "duplicate",
+            "browser",
+            json!({"action":"download","selector":secret}),
+        ));
+        let second_start = display.project(start("duplicate", "Read", json!({"path":secret})));
+        assert!(!serde_json::to_string(&second_start)
+            .unwrap()
+            .contains(secret));
+        let token = display.project(AgentEvent::ToolToken {
+            tool_call_id: "duplicate".into(),
+            content: secret.into(),
+        });
+        assert!(!serde_json::to_string(&token).unwrap().contains(secret));
+        let completed = display.project(complete("duplicate", secret));
+        assert!(!serde_json::to_string(&completed).unwrap().contains(secret));
+        let after_terminal = display.project(start("duplicate", "Read", json!({"path":secret})));
+        assert!(!serde_json::to_string(&after_terminal)
+            .unwrap()
+            .contains(secret));
+        display.project(AgentEvent::RunnerProgress {
+            session_id: "chat".into(),
+            round_count: 3,
+        });
+        display.project(start("duplicate", "Read", json!({"path":"readme.md"})));
+        assert!(
+            matches!(display.project(complete("duplicate", "ordinary after round")), AgentEvent::ToolComplete { result, .. } if result.result == "ordinary after round")
+        );
+    }
+
+    #[test]
+    fn unknown_lifecycle_hides_private_name_and_phase() {
+        let secret = "private-download-namespace-and-phase";
+        let mut display = NativeToolEventDisplay::default();
+        let event = display.project(AgentEvent::ToolLifecycle {
+            tool_call_id: "missing".into(),
+            tool_name: format!("{secret}::Read"),
+            phase: secret.into(),
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: Some(secret.into()),
+            error: Some(secret.into()),
+        });
+        assert!(!serde_json::to_string(&event).unwrap().contains(secret));
+        assert!(
+            matches!(event, AgentEvent::ToolLifecycle { tool_name, phase, .. } if tool_name == "tool" && phase == "activity")
+        );
+
+        display.project(start("download", "browser", json!({"action":"download"})));
+        let event = display.project(AgentEvent::ToolLifecycle {
+            tool_call_id: "download".into(),
+            tool_name: "browser".into(),
+            phase: secret.into(),
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: Some(secret.into()),
+            error: Some(secret.into()),
+        });
+        assert!(!serde_json::to_string(&event).unwrap().contains(secret));
     }
 
     #[test]
