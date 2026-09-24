@@ -2637,7 +2637,7 @@ pub struct PermissionQuestion {
 
 /// Mirror the server's private browser resource boundary for presentation.
 /// TUI API types are intentionally independent of the server permission crate.
-fn is_browser_display_tool_name(tool_name: &str) -> bool {
+pub(crate) fn is_browser_display_tool_name(tool_name: &str) -> bool {
     tool_name
         .trim()
         .rsplit("::")

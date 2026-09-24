@@ -6,9 +6,9 @@
 
 use crate::api::types::HistoryMessage;
 use crate::app::{
-    browser_download_result_for_display, is_browser_download_display_call,
-    is_browser_eval_tool_name, tool_arguments_for_display, tool_complete_result_for_display,
-    ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay,
+    browser_download_result_for_display, is_browser_display_tool_name,
+    is_browser_download_display_call, is_browser_eval_tool_name, tool_arguments_for_display,
+    tool_complete_result_for_display, ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay,
 };
 
 /// Map a session's raw history (`GET /api/v1/history/{id}`) into the chat
@@ -133,6 +133,19 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         && is_browser_eval_tool_name(&tc.tool_name)
                     {
                         "Browser page JavaScript failed".to_string()
+                    } else if is_browser_display_tool_name(&tc.tool_name)
+                        && tc.arguments == "[browser arguments unavailable]"
+                    {
+                        // The original call may have been auto-repaired before
+                        // execution, but its projected arguments do not prove
+                        // which browser action ran. Never render an untrusted
+                        // result or error under that ambiguous identity.
+                        if msg.tool_success == Some(false) {
+                            "Browser action failed"
+                        } else {
+                            "Browser result unavailable"
+                        }
+                        .to_string()
                     } else if is_browser_download_display_call(&tc.tool_name, &tc.arguments) {
                         browser_download_result_for_display(
                             &msg.content,
@@ -620,6 +633,62 @@ mod tests {
         }
         assert!(args.contains("private-selector"));
         assert!(result.contains("private-base64"));
+    }
+
+    #[test]
+    fn unparseable_browser_history_hides_terminal_bytes_without_hiding_valid_snapshots() {
+        for tool_name in ["browser", "default::browser"] {
+            let malformed = "{\"action\":\"download\",";
+            for (success, raw, expected) in [
+                (
+                    false,
+                    "private-selector https://private.test/file",
+                    "Browser action failed",
+                ),
+                (
+                    true,
+                    "{\"filename\":\"private.bin\",\"data_base64\":\"private-bytes\"}",
+                    "Browser result unavailable",
+                ),
+                (
+                    true,
+                    "private plain-text result",
+                    "Browser result unavailable",
+                ),
+            ] {
+                let out = map_history(vec![
+                    assistant("", vec![("browser-call", tool_name, malformed)]),
+                    tool("browser-call", raw, Some(success)),
+                ]);
+                let displayed = &out[0].tool_calls[0];
+                assert_eq!(displayed.arguments, "[browser arguments unavailable]");
+                if success {
+                    assert_eq!(displayed.result.as_deref(), Some(expected));
+                } else {
+                    assert_eq!(displayed.error.as_deref(), Some(expected));
+                }
+                assert!(!format!("{displayed:?}").contains("private"));
+            }
+
+            let snapshot = "page_epoch: 17\n- heading: Visible snapshot";
+            let out = map_history(vec![
+                assistant(
+                    "",
+                    vec![("snapshot-call", tool_name, r#"{"action":"snapshot"}"#)],
+                ),
+                tool("snapshot-call", snapshot, Some(true)),
+            ]);
+            assert_eq!(out[0].tool_calls[0].result.as_deref(), Some(snapshot));
+        }
+
+        let out = map_history(vec![
+            assistant("", vec![("read-call", "Read", "{invalid")]),
+            tool("read-call", "ordinary result", Some(true)),
+        ]);
+        assert_eq!(
+            out[0].tool_calls[0].result.as_deref(),
+            Some("ordinary result")
+        );
     }
 
     #[test]
