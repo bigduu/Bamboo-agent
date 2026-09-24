@@ -1179,15 +1179,34 @@ async function scriptBlobCommand(cdp, operation, selector, deadlineAt) {
   return result;
 }
 
-async function guardDirectDownload(attempt, cdp, nativeDownloadAttribute, deadlineAt) {
-  let requestId;
-  let responseSeen = false;
+function verifiedDownloadUrl(value, previousUrl) {
+  if (typeof value !== 'string' || !value || value.length > 2_048 || /[\x00-\x1f\x7f]/.test(value)) return null;
+  try {
+    const url = new URL(value, previousUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password ||
+        (previousUrl?.startsWith('https://') && url.protocol !== 'https:')) return null;
+    url.hash = '';
+    return url.href.length <= 2_048 ? url.href : null;
+  } catch { return null; }
+}
+
+function downloadResponseHeader(event, name) {
+  if (!Array.isArray(event.responseHeaders)) return null;
+  const values = event.responseHeaders.filter(header =>
+    header && typeof header.name === 'string' && header.name.toLowerCase() === name);
+  return values.length === 1 && typeof values[0].value === 'string' ? values[0].value : null;
+}
+
+async function observeDownloadRedirects(attempt, cdp, initialUrl, nativeDownloadAttribute, deadlineAt) {
+  let current;
+  let hops = 0;
   let failed = false;
   let enabled = true;
   let disablePromise;
   const pending = new Set();
   const reject = () => {
     failed = true;
+    attempt.verifiedFinalUrl = null;
     attempt.resolveUnverifiable();
   };
   const disable = until => {
@@ -1199,44 +1218,59 @@ async function guardDirectDownload(attempt, cdp, nativeDownloadAttribute, deadli
     return downloadDeadline(disablePromise, until);
   };
   const onPaused = event => {
+    const requestUrl = verifiedDownloadUrl(event.request?.url);
     const responseStage = Number.isInteger(event.responseStatusCode);
-    let allowed = !failed && attempt.accepting && event.frameId === attempt.frameId &&
-      event.resourceType === 'Document' && event.request?.method === 'GET' &&
-      event.request.url === attempt.expectedUrl;
-    if (allowed && !responseStage) {
-      allowed = !requestId && !event.redirectedRequestId;
-      if (allowed) requestId = event.requestId;
-    } else if (allowed) {
-      const headers = event.responseHeaders;
-      const contentTypes = Array.isArray(headers) ? headers.filter(header =>
-        header?.name?.toLowerCase() === 'content-type') : [];
-      const dispositions = Array.isArray(headers) ? headers.filter(header =>
-        header?.name?.toLowerCase() === 'content-disposition') : [];
-      const refresh = Array.isArray(headers) && headers.some(header =>
-        header?.name?.toLowerCase() === 'refresh');
-      const type = contentTypes.length === 1 ? contentTypes[0].value : '';
-      const disposition = dispositions.length === 1 ? dispositions[0].value : '';
-      // Only release Fetch when Chromium cannot render a document that may
-      // create child requests. Direct HTML and ambiguous inline content stay
-      // paused, then fail before the renderer sees their response bodies.
-      const nativeDownload = /^\s*attachment\s*(?:;|$)/i.test(disposition) ||
-        nativeDownloadAttribute || /^\s*application\/octet-stream\s*(?:;|$)/i.test(type);
-      allowed = !responseSeen && requestId === event.requestId &&
-        [200, 206].includes(event.responseStatusCode) && !refresh &&
-        typeof type === 'string' && type.length > 0 &&
-        !/^\s*(?:text\/html|application\/xhtml\+xml)\s*(?:;|$)/i.test(type) && nativeDownload;
-      if (allowed) responseSeen = true;
+    let finalResponse = false;
+    if (failed || !attempt.accepting || event.frameId !== attempt.frameId ||
+        event.resourceType !== 'Document' || event.request?.method !== 'GET' || !requestUrl) {
+      reject();
+    } else if (!responseStage) {
+      if (!current) {
+        if (event.redirectedRequestId || requestUrl !== initialUrl) reject();
+      } else if (!current.redirectUrl || event.redirectedRequestId !== current.id ||
+                 requestUrl !== current.redirectUrl) {
+        reject();
+      }
+      if (!failed) current = { id: event.requestId, url: requestUrl, responseSeen: false };
+    } else if (!current || current.id !== event.requestId || current.url !== requestUrl ||
+               current.responseSeen) {
+      reject();
+    } else {
+      current.responseSeen = true;
+      const status = event.responseStatusCode;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const next = verifiedDownloadUrl(downloadResponseHeader(event, 'location'), current.url);
+        if (!next || ++hops > 5) reject();
+        else current.redirectUrl = next;
+      } else {
+        const type = downloadResponseHeader(event, 'content-type');
+        const disposition = downloadResponseHeader(event, 'content-disposition');
+        const refresh = Array.isArray(event.responseHeaders) && event.responseHeaders.some(header =>
+          typeof header?.name === 'string' && header.name.toLowerCase() === 'refresh');
+        // Keep all terminal documents paused until their headers prove they
+        // cannot render HTML or load resources in the private page. Redirects
+        // receive no exception to the direct-download policy.
+        const nativeDownload = /^\s*attachment\s*(?:;|$)/i.test(disposition || '') ||
+          (nativeDownloadAttribute && new URL(current.url).origin === new URL(initialUrl).origin) ||
+          /^\s*application\/octet-stream\s*(?:;|$)/i.test(type || '');
+        if (![200, 206].includes(status) || refresh || !type ||
+            /^\s*(?:text\/html|application\/xhtml\+xml)\s*(?:;|$)/i.test(type) ||
+            !nativeDownload || attempt.verifiedFinalUrl) {
+          reject();
+        } else {
+          attempt.verifiedFinalUrl = current.url;
+          finalResponse = true;
+        }
+      }
     }
-    if (!allowed) reject();
-    const method = !allowed ? 'Fetch.failRequest' :
+    const method = failed ? 'Fetch.failRequest' :
       responseStage ? 'Fetch.continueResponse' : 'Fetch.continueRequest';
     const params = method === 'Fetch.failRequest'
       ? { requestId: event.requestId, errorReason: 'BlockedByClient' }
       : { requestId: event.requestId };
-    const terminal = allowed && responseStage;
     const continuation = downloadDeadline(cdp.send(method, params), deadlineAt)
       .then(async () => {
-        if (terminal && !failed) {
+        if (finalResponse && !failed) {
           await disable(deadlineAt);
           attempt.resolveVerified();
         }
@@ -1371,12 +1405,11 @@ function onDownloadWillBegin(event) {
     return;
   }
   if (attempt?.accepting && event.frameId === attempt.frameId &&
-      event.url !== attempt.expectedUrl) {
-    // A redirect cannot be attributed without a verified request chain.
+      event.url !== attempt.verifiedFinalUrl) {
     attempt.resolveUnverifiable();
   }
   if (!attempt?.accepting || attempt.guid || event.frameId !== attempt.frameId ||
-      event.url !== attempt.expectedUrl) {
+      event.url !== attempt.verifiedFinalUrl) {
     cancelDownloadGuid(event.guid);
     return;
   }
@@ -1411,11 +1444,11 @@ function onDownloadProgress(event) {
 function onPageDownload(page, download) {
   const attempt = activeDownloadAttempt;
   if (attempt?.mode === 'script_blob') attempt.nativeDownloadObserved = true;
-  if (attempt?.accepting && attempt.page === page && download.url() !== attempt.expectedUrl) {
+  if (attempt?.accepting && attempt.page === page && download.url() !== attempt.verifiedFinalUrl) {
     attempt.resolveUnverifiable();
   }
   if (!attempt?.accepting || attempt.page !== page || attempt.download ||
-      download.url() !== attempt.expectedUrl) {
+      download.url() !== attempt.verifiedFinalUrl) {
     const cleanup = download.cancel().catch(() => {})
       .then(() => download.delete().catch(() => {}));
     orphanDownloads.add(cleanup);
@@ -1467,7 +1500,7 @@ async function boundedDownload(args, deadlineAt = Date.now() + DOWNLOAD_ACTION_B
     accepting: false,
     download: null,
     guid: null,
-    expectedUrl: null,
+    verifiedFinalUrl: null,
     oversized: false,
     terminal: false,
     downloadPromise: new Promise(resolve => { resolveDownload = resolve; }),
@@ -1609,8 +1642,10 @@ async function boundedDownload(args, deadlineAt = Date.now() + DOWNLOAD_ACTION_B
       const frameTree = await downloadDeadline(privateCdp.send('Page.getFrameTree'), workDeadlineAt);
       attempt.page = transientPage;
       attempt.frameId = frameTree.frameTree.frame.id;
-      attempt.expectedUrl = href;
-      closeGuard = await guardDirectDownload(attempt, privateCdp,
+      if (verifiedDownloadUrl(href) !== href) {
+        throw downloadError('download_unverifiable', 'browser download requires a safe HTTP(S) link');
+      }
+      closeGuard = await observeDownloadRedirects(attempt, privateCdp, href,
         link.download !== null && documentUrl.origin === new URL(href).origin, workDeadlineAt);
       checkEpoch(args);
       if (activeTabId !== tab.id || tab.page.url() !== sharedUrl) throw staleEpochError();
