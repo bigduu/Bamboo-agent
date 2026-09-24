@@ -78,6 +78,20 @@ fn tool_start_arguments_for_display(
     }
 }
 
+fn tool_start_name_for_display(tool_name: &str, args: &serde_json::Value) -> String {
+    if tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
+    {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
 fn trim_end_whitespace_in_place(value: &mut String) {
     let trimmed_len = value.trim_end_matches(char::is_whitespace).len();
     value.truncate(trimmed_len);
@@ -518,7 +532,7 @@ async fn execute_sub_actions_with_persistence(
         let _ = event_tx
             .send(AgentEvent::ToolStart {
                 tool_call_id: action.id.clone(),
-                tool_name: action.function.name.clone(),
+                tool_name: tool_start_name_for_display(&action.function.name, &args),
                 arguments: tool_start_arguments_for_display(&action.function.name, &args),
             })
             .await;
@@ -656,6 +670,10 @@ mod tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("default::browser", &args),
+            "default::browser"
+        );
     }
 
     #[test]
@@ -680,6 +698,11 @@ mod tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("private-selector::browser", &args),
+            "browser"
+        );
+        assert_eq!(tool_start_name_for_display("other", &args), "other");
     }
 
     struct StaticExecutor {

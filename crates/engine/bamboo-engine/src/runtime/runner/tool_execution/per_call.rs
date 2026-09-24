@@ -78,6 +78,20 @@ fn tool_start_arguments_for_display(
     }
 }
 
+fn tool_start_name_for_display(tool_name: &str, args: &serde_json::Value) -> String {
+    if tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("download")
+    {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
 pub(super) struct ToolExecutionOnlyContext<'a> {
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
@@ -238,7 +252,7 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.session_id,
         ctx.round,
         ctx.tool_call.id,
-        ctx.tool_call.function.name,
+        tool_start_name_for_display(&ctx.tool_call.function.name, &args),
         raw_arguments.len()
     );
 
@@ -249,7 +263,7 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.round_id,
         AgentEvent::ToolStart {
             tool_call_id: ctx.tool_call.id.clone(),
-            tool_name: ctx.tool_call.function.name.clone(),
+            tool_name: tool_start_name_for_display(&ctx.tool_call.function.name, &args),
             arguments: tool_start_arguments_for_display(execution_name, &args),
         },
     )
@@ -2341,6 +2355,10 @@ mod hook_tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("default::browser", &args),
+            "default::browser"
+        );
     }
 
     #[test]
@@ -2365,6 +2383,11 @@ mod hook_tests {
         );
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("private-selector::browser", &args),
+            "browser"
+        );
+        assert_eq!(tool_start_name_for_display("other", &args), "other");
     }
 
     #[tokio::test]

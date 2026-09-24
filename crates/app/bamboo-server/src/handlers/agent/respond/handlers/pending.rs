@@ -531,6 +531,9 @@ pub async fn get_pending_question(
                         // Keep the exact request registered for receipt matching,
                         // but do not send its private resource to approval UIs.
                         request.resource = "[redacted]".to_string();
+                        if browser_download {
+                            request.tool_name = "browser".to_string();
+                        }
                         request.operation_summary = if dialog_response {
                             "Answer pending browser dialog"
                         } else if private_browser_file_input {
@@ -586,7 +589,7 @@ pub async fn get_pending_question(
                 "options": pending.options,
                 "allow_custom": pending.allow_custom,
                 "tool_call_id": pending.tool_call_id,
-                "tool_name": pending.tool_name,
+                "tool_name": if browser_download { "browser" } else { pending.tool_name.as_str() },
                 "source": pending.source,
                 "interaction_kind": interaction.kind.as_str(),
                 "permission_request": permission_request_for_display,
@@ -1225,7 +1228,10 @@ mod http_tests {
                 .await
                 .expect("app state"),
         );
-        for (index, tool_name) in ["browser", "default::browser"].into_iter().enumerate() {
+        for (index, tool_name) in ["browser", "default::browser", "private-selector::browser"]
+            .into_iter()
+            .enumerate()
+        {
             let session_id = format!("download-private-display-{index}");
             let tool_call_id = format!("download-private-call-{index}");
             let args = serde_json::json!({
@@ -1275,6 +1281,8 @@ mod http_tests {
                 .expect("response body");
             let body: Value = serde_json::from_slice(&body).expect("response JSON");
             assert_eq!(body["question"], "Approve browser download?");
+            assert_eq!(body["tool_name"], "browser");
+            assert_eq!(body["permission_request"]["tool_name"], "browser");
             assert_eq!(
                 body["tool_arguments"],
                 serde_json::json!({"action":"download","expected_epoch":17})
@@ -1306,6 +1314,12 @@ mod http_tests {
                 pending_tool_arguments_exact(&session, &tool_call_id),
                 Some(args)
             );
+            assert_eq!(
+                persisted_permission_request(&session, &tool_call_id)
+                    .expect("authoritative request")
+                    .tool_name,
+                tool_name
+            );
         }
     }
 
@@ -1318,9 +1332,12 @@ mod http_tests {
                 .expect("app state"),
         );
         let resource = format!("browser:17:download:css:{}", "a".repeat(64));
-        for tool_name in ["browser", "default::browser"] {
+        for (tool_index, tool_name) in ["browser", "default::browser", "private-selector::browser"]
+            .into_iter()
+            .enumerate()
+        {
             for (case, raw_arguments) in [("missing", None), ("malformed", Some("{private"))] {
-                let session_id = format!("download-{tool_name}-{case}");
+                let session_id = format!("download-{tool_index}-{case}");
                 let tool_call_id = format!("download-{case}-call");
                 let mut request = permission_request(&session_id, &tool_call_id);
                 request.tool_name = tool_name.to_string();
@@ -1375,6 +1392,8 @@ mod http_tests {
                     }
                 );
                 assert_eq!(body["permission_request"]["resource"], "[redacted]");
+                assert_eq!(body["tool_name"], "browser");
+                assert_eq!(body["permission_request"]["tool_name"], "browser");
                 assert_eq!(
                     body["permission_request"]["allowed_decisions"],
                     serde_json::json!(["allow_once", "deny_once"])
