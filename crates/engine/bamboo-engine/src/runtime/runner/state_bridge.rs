@@ -31,7 +31,6 @@ fn adopt_root_tool_authority(session: &mut Session, latest: &Session) -> Result<
 fn ordinary_root_uses_tool_authority_proof(session: &Session) -> bool {
     session.kind == bamboo_domain::SessionKind::Root
         && session.parent_session_id.is_none()
-        && session.id != bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
         && session.authority_identity.is_ordinary()
 }
 
@@ -1040,8 +1039,8 @@ mod tests {
         ));
         storage.save_session(&persisted).await.unwrap();
 
-        let mut running = Session::new("legacy-same-mode", "model");
-        running.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        let mut running = persisted.clone();
+        running.messages.clear();
         let mut runtime_state = AgentRuntimeState::new("run");
         refresh_tool_boundary_authorities(&mut running, &mut runtime_state, Some(&storage))
             .await
@@ -1129,13 +1128,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_sdk_root_cannot_adopt_a_recreated_root_lifetime() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let mut old = Session::new("recreated-sdk-root", "model");
+        old.agent_runtime_state = Some(AgentRuntimeState::new("old-run"));
+        store.save_session(&old).await.unwrap();
+        assert!(store.delete_session(&old.id).await.unwrap());
+
+        let mut replacement = store
+            .recreate_root_session(&old.id, "new-model")
+            .await
+            .unwrap();
+        assert_ne!(replacement.created_at, old.created_at);
+        replacement.agent_runtime_state = Some(AgentRuntimeState::new("new-run"));
+        store.save_session(&replacement).await.unwrap();
+        let storage: Arc<dyn Storage> = store;
+
+        let old_birth = old.created_at;
+        let mut running = old;
+        let error = ensure_initial_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect_err("pre-provider proof must reject the old SDK snapshot");
+        assert!(error.to_string().contains("Root tool authority"));
+        assert!(
+            refresh_round_root_tool_authority(&mut running, Some(&storage))
+                .await
+                .is_err(),
+            "subsequent catalog refresh must reject the same stale lifetime"
+        );
+        let mut runtime_state = AgentRuntimeState::new("old-run");
+        let error =
+            refresh_tool_boundary_authorities(&mut running, &mut runtime_state, Some(&storage))
+                .await
+                .expect_err("pre-dispatch proof must reject the old SDK snapshot");
+        assert!(error.to_string().contains("Root tool authority"));
+        assert_eq!(running.created_at, old_birth);
+        assert_eq!(runtime_state.run_id, "old-run");
+    }
+
+    #[tokio::test]
     async fn default_supervisor_skips_ordinary_root_round_proof_refresh() {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
         let mut supervisor = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
         supervisor.set_last_run_status("succeeded");
         refresh_round_root_tool_authority(&mut supervisor, Some(&storage))
             .await
             .expect("Supervisor management proof belongs to its separate slice");
+    }
+
+    #[tokio::test]
+    async fn ordinary_root_at_reserved_id_still_refreshes_before_provider() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut running = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        let mut latest = running.clone();
+        latest.set_root_orchestration_only(true).unwrap();
+        storage.save_session(&latest).await.unwrap();
+
+        refresh_round_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect("ordinary identity at the reserved ID still needs durable proof");
+        assert!(running.root_orchestration_only_enabled());
+        assert!(!running.allows_model_tool_execution("Bash"));
     }
 
     struct TestPersistence(Arc<dyn Storage>);
