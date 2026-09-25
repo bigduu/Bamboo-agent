@@ -449,6 +449,15 @@ pub async fn get_child_action(
         "latest_user_message",
         &mut truncated_fields,
     );
+    let guidance = bounded_overview_field(
+        Some(compute_status_guidance(
+            status.as_deref(),
+            runner_info.as_ref(),
+            child.has_pending_injected_messages(),
+        )),
+        "guidance",
+        &mut truncated_fields,
+    );
 
     Ok(json!({
         "child_session_id": child.id,
@@ -476,7 +485,7 @@ pub async fn get_child_action(
         "last_event_at": runner_info.as_ref().and_then(|r| r.last_event_at.map(|t| t.to_rfc3339())),
         "round_count": runner_info.as_ref().map(|r| r.round_count).unwrap_or(0),
         "has_pending_injected_messages": child.has_pending_injected_messages(),
-        "guidance": compute_status_guidance(status.as_deref(), runner_info.as_ref(), child.has_pending_injected_messages()),
+        "guidance": guidance,
         "truncated_fields": truncated_fields,
         "inspection_hint": "This overview contains metadata and bounded previews, not the child transcript. Use view=messages for paginated previews and view=result for bounded final-answer slices.",
     }))

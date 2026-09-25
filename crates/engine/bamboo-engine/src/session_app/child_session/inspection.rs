@@ -66,6 +66,16 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Imported transcripts can contain arbitrary message ids. Keep the public
+/// lookup handle and content cursor bounded while preserving ordinary ids.
+fn inspection_message_id(message: &Message) -> String {
+    if message.id.len() <= 128 && !message.id.starts_with("sha256:") {
+        message.id.clone()
+    } else {
+        format!("sha256:{}", sha256(message.id.as_bytes()))
+    }
+}
+
 fn update_field(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
@@ -185,7 +195,7 @@ fn message_page(
                 .collect();
             json!({
                 "index": start + relative_index,
-                "message_id": message.id,
+                "message_id": inspection_message_id(message),
                 "role": role_name(&message.role),
                 "phase": message.phase.as_ref().map(|phase| phase.as_str()),
                 "created_at": message.created_at.to_rfc3339(),
@@ -244,7 +254,7 @@ fn content_slice(
                     .messages
                     .get(message_index)
                     .ok_or_else(invalid_cursor)?;
-                if message.id != cursor_message_id
+                if inspection_message_id(message) != cursor_message_id
                     || sha256(message.content.as_bytes()) != content_sha256
                 {
                     return Err(invalid_cursor());
@@ -287,12 +297,13 @@ fn content_slice(
             let index = child
                 .messages
                 .iter()
-                .position(|message| message.id == id)
+                .position(|message| inspection_message_id(message) == id)
                 .ok_or_else(|| ChildSessionError::NotFound(id.to_string()))?;
             (index, 0, None)
         }
     };
     let message = &child.messages[index];
+    let inspection_id = inspection_message_id(message);
     if result && !matches!(message.role, Role::Assistant) {
         return Err(invalid_cursor());
     }
@@ -312,7 +323,7 @@ fn content_slice(
             child_session_id: child.id.clone(),
             result,
             message_index: index,
-            message_id: message.id.clone(),
+            message_id: inspection_id.clone(),
             content_sha256: digest.clone(),
             offset: end,
         })
@@ -330,7 +341,7 @@ fn content_slice(
         "child_session_id": child.id,
         "view": if result { "result" } else { "message" },
         "available": true,
-        "message_id": message.id,
+        "message_id": inspection_id,
         "message_index": index,
         "role": role_name(&message.role),
         "last_run_status": if result { child.last_run_status() } else { None },
@@ -512,6 +523,24 @@ mod tests {
             content_slice(&child, false, Some(&message_id), Some(cursor), Some(99)),
             Err(ChildSessionError::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn imported_long_message_id_uses_a_bounded_retrieval_handle() {
+        let mut child = child();
+        let mut message = Message::user("evidence".repeat(1000));
+        message.id = "untrusted-id".repeat(1000);
+        child.add_message(message);
+        let page = message_page(&child, None, Some(1)).unwrap();
+        let handle = page["messages"][0]["message_id"].as_str().unwrap();
+        assert!(handle.starts_with("sha256:"));
+        assert!(handle.len() < 128);
+        assert!(!page.to_string().contains(&child.messages[0].id));
+        let slice = content_slice(&child, false, Some(handle), None, Some(8)).unwrap();
+        assert_eq!(slice["message_id"], handle);
+        let cursor = slice["next_cursor"].as_str().unwrap();
+        assert!(cursor.len() < MAX_CURSOR_BYTES);
+        assert!(content_slice(&child, false, Some(handle), Some(cursor), Some(8)).is_ok());
     }
 
     #[test]
