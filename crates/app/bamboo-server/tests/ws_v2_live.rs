@@ -567,6 +567,19 @@ async fn message_channel_replays_safe_text_and_controls_over_live_websocket() {
     assert!(committed["seq"].as_u64() > terminal["seq"].as_u64());
 
     send_json(&mut conn, json!({"type": "unsubscribe", "ch": ch})).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.state.session_watchers.has_watcher(sid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unsubscribe must stop the message forwarder");
+    // A frame already written to the socket before unsubscribe was processed
+    // may still be unread. Drain it before asserting the new subscription's
+    // first frame is its authoritative snapshot.
+    while let Ok(Some(_)) =
+        tokio::time::timeout(Duration::from_millis(100), next_envelope(&mut conn)).await
+    {}
     visible.start("visible-2".into(), chrono::Utc::now());
     visible.append("after reconnect".into());
     send_json(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
