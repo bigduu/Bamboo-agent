@@ -151,12 +151,27 @@ pub async fn get_session(
                         %error,
                         "failed to load authoritative session detail"
                     );
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                    {
+                        return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": "session_authority_unavailable",
+                                "message": "Session authority could not be verified; recover the session before retrying",
+                            },
+                            "session_id": session_id,
+                        })));
+                    }
                     return Ok(crate::error::json_error(
                         actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to load session detail",
                     ));
                 }
             };
+            summary.root_orchestration_only =
+                Some(durable_session.root_orchestration_only_enabled());
             let selected_catalog = durable_session
                 .metadata
                 .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY)
@@ -476,6 +491,43 @@ mod pagination_http_tests {
         assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(body["error"]["message"], "Session not found");
         assert_eq!(body["session_id"], "does-not-exist");
+    }
+
+    #[actix_web::test]
+    async fn session_detail_reports_unavailable_root_authority_instead_of_cached_mode() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut root = Session::new("root-proof-unavailable", "model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.storage.save_session(&root).await.unwrap();
+        let proof = state
+            .session_store
+            .sessions_root_dir()
+            .join(&root.id)
+            .join("root-tool-authority.json");
+        tokio::fs::write(&proof, b"{").await.unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/root-proof-unavailable")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_unavailable");
     }
 
     #[actix_web::test]

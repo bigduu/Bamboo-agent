@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
 /// * `root_orchestration_prompt` - Explicit root-only delegation guidance selection
+/// * `root_orchestration_only` - Explicit Root tool authority selection
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
@@ -31,6 +32,10 @@ pub struct ChatRequest {
     /// omission keeps the Session's prior selection.
     #[serde(default)]
     pub root_orchestration_prompt: Option<bool>,
+    /// Set `true` or `false` to change the durable Root tool surface;
+    /// omission keeps the prior selection. Child sessions cannot set it.
+    #[serde(default)]
+    pub root_orchestration_only: Option<bool>,
     #[serde(default)]
     pub workspace_path: Option<String>,
     #[serde(default)]
@@ -110,6 +115,7 @@ mod tests {
         assert!(req.system_prompt.is_none());
         assert!(req.images.is_none());
         assert!(req.root_orchestration_prompt.is_none());
+        assert!(req.root_orchestration_only.is_none());
     }
 
     #[test]
@@ -122,6 +128,18 @@ mod tests {
             serde_json::from_str(r#"{"message":"continue","root_orchestration_prompt":false}"#)
                 .expect("disable selection");
         assert_eq!(disabled.root_orchestration_prompt, Some(false));
+    }
+
+    #[test]
+    fn root_orchestration_only_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_only":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_only, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_only":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_only, Some(false));
     }
 
     #[test]
@@ -184,6 +202,7 @@ mod tests {
             system_prompt: None,
             enhance_prompt: None,
             root_orchestration_prompt: None,
+            root_orchestration_only: None,
             workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,
