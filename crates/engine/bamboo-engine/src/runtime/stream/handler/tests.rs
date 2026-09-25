@@ -161,8 +161,85 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let reasoning_event = event_rx.recv().await.expect("missing reasoning event");
     assert!(matches!(reasoning_event, AgentEvent::ReasoningToken { .. }));
 
+    let start_event = event_rx
+        .recv()
+        .await
+        .expect("missing visible-message start");
+    let identity = output
+        .visible_message
+        .as_ref()
+        .expect("visible token must create a stable identity");
+    assert!(matches!(
+        start_event,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == identity.message_id && created_at == identity.created_at
+    ));
+
     let token_event = event_rx.recv().await.expect("missing token event");
-    assert!(matches!(token_event, AgentEvent::Token { .. }));
+    assert!(matches!(token_event, AgentEvent::Token { content } if content == "hi"));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn visible_message_start_is_emitted_once_before_multiple_tokens() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::Token("hello".to_string())),
+        Ok(LLMChunk::Token(" world".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-visible-identity",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.content, "hello world");
+    assert!(output.visible_message.is_some());
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::VisibleMessageStart { .. })
+    ));
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::Token { content }) if content == "hello"
+    ));
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::Token { content }) if content == " world"
+    ));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn reasoning_only_stream_has_no_visible_message_identity() {
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ReasoningToken("private".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-reasoning-only",
+    )
+    .await
+    .unwrap();
+
+    assert!(output.visible_message.is_none());
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::ReasoningToken { content }) if content == "private"
+    ));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
 }
 
 #[tokio::test]
@@ -196,6 +273,12 @@ async fn provider_native_sideband_is_accumulated_without_emitting_ui_events() {
 
     assert_eq!(output.provider_transcript_items, vec![item]);
     assert_eq!(output.content, "visible");
+    let identity = output.visible_message.expect("visible identity");
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::VisibleMessageStart { message_id, created_at })
+            if message_id == identity.message_id && created_at == identity.created_at
+    ));
     assert!(matches!(
         event_rx.recv().await,
         Some(AgentEvent::Token { content }) if content == "visible"

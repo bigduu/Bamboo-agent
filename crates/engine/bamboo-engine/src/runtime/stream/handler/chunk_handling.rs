@@ -28,8 +28,27 @@ pub(super) async fn handle_chunk_result(
             Ok(())
         }
         Ok(LLMChunk::Token(token)) => {
+            if token.is_empty() {
+                return Ok(());
+            }
+            let visible_message_start = state.ensure_visible_message();
             state.append_token(&token);
             if let Some(event_tx) = event_tx {
+                if let Some(identity) = visible_message_start {
+                    if event_tx
+                        .send(AgentEvent::VisibleMessageStart {
+                            message_id: identity.message_id,
+                            created_at: identity.created_at,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "[{}] event channel closed; dropping visible-message start",
+                            session_id,
+                        );
+                    }
+                }
                 // `send().await` applies proper backpressure: it only yields
                 // (waiting for capacity) while a subscriber is present, and
                 // returns `Err` solely when the receiver has been dropped

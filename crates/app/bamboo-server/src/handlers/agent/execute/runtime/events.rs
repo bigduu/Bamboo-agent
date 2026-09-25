@@ -9,6 +9,15 @@ use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
+fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Complete { .. } => Some("complete"),
+        AgentEvent::Cancelled { .. } => Some("cancelled"),
+        AgentEvent::Error { .. } => Some("error"),
+        _ => None,
+    }
+}
+
 /// Returns true for events that carry critical state a late subscriber must see.
 ///
 /// These are cached on the runner and replayed when an SSE client connects
@@ -53,7 +62,7 @@ pub(crate) fn spawn_event_forwarder(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
-            let publication = {
+            let (publication, visible_messages) = {
                 let runners = state.agent_runners.read().await;
                 let Some(runner) = runners
                     .get(&session_id)
@@ -63,11 +72,34 @@ pub(crate) fn spawn_event_forwarder(
                 };
                 state.account_sink.record(Some(&session_id), &started_event);
                 let _ = session_tx.send(started_event);
-                runner.event_publication.clone()
+                (
+                    runner.event_publication.clone(),
+                    runner.visible_messages.clone(),
+                )
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
             let mut tool_event_display = NativeToolEventDisplay::default();
             while let Some(event) = mpsc_rx.recv().await {
+                match &event {
+                    AgentEvent::VisibleMessageStart {
+                        message_id,
+                        created_at,
+                    } => {
+                        if !publication.publish(|| {
+                            visible_messages.start(message_id.clone(), created_at.to_owned())
+                        }) {
+                            return;
+                        }
+                        continue;
+                    }
+                    AgentEvent::VisibleMessageDiscard { message_id } => {
+                        if !publication.publish(|| visible_messages.discard(message_id)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 let event = tool_event_display.project(event);
                 let event = bamboo_engine::external_agents::live::approval_event_for_display(event);
                 let lifecycle_id = match &event {
@@ -124,10 +156,31 @@ pub(crate) fn spawn_event_forwarder(
                 } else {
                     let is_history_commit =
                         matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+                    let visible_token = match &event {
+                        AgentEvent::Token { content } => Some(content.clone()),
+                        _ => None,
+                    };
+                    let round_count = match &event {
+                        AgentEvent::RunnerProgress { round_count, .. } => Some(*round_count),
+                        _ => None,
+                    };
+                    let terminal_reason = visible_terminal_reason(&event);
                     if !publication.publish(|| {
+                        if let Some(round_count) = round_count {
+                            visible_messages.begin_round(round_count);
+                        }
+                        if let Some(content) = visible_token {
+                            visible_messages.append(content);
+                        }
                         let route_session_id = event.session_id().unwrap_or(&session_id);
                         state.account_sink.record(Some(route_session_id), &event);
                         let _ = session_tx.send(event);
+                        if let Some(reason) = terminal_reason {
+                            visible_messages.mark_terminal(reason);
+                        }
+                        if is_history_commit {
+                            visible_messages.history_committed();
+                        }
                     }) {
                         return;
                     }
@@ -290,6 +343,114 @@ mod tests {
         assert!(registry[id].last_activity_at().is_some());
         drop(registry);
         drop(input);
+    }
+
+    #[tokio::test]
+    async fn server_forwarder_keeps_internal_message_markers_off_the_session_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            actix_web::web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let id = "server-visible-message";
+        let sender = state.get_session_event_sender(id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await;
+        let run_id = current_run_id(&state, id).await;
+        let (input, events) = mpsc::channel(8);
+        let mut barrier =
+            spawn_event_forwarder(state.clone(), id.into(), run_id, events, sender, None);
+        let visible = state.agent_runners.read().await[id]
+            .visible_messages
+            .clone();
+        let (mut visible_receiver, _) = visible.subscribe_with_snapshot();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        input
+            .send(AgentEvent::VisibleMessageStart {
+                message_id: "visible-1".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Token {
+                content: "public text".into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Complete { .. }
+        ));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    visible_receiver.recv().await.unwrap().kind,
+                    bamboo_engine::execution::VisibleMessageEventKind::Terminal { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("terminal replay event");
+        let (_, before_commit) = visible.subscribe_with_snapshot();
+        assert_eq!(before_commit.messages.len(), 1);
+        assert_eq!(before_commit.messages[0].id, "visible-1");
+        assert_eq!(before_commit.messages[0].content, "public text");
+        assert_eq!(before_commit.terminal.as_deref(), Some("complete"));
+
+        assert!(timeout(
+            Duration::from_secs(5),
+            barrier.send_and_wait(&input, id.into())
+        )
+        .await
+        .expect("history commit barrier"));
+        let (_, after_commit) = visible.subscribe_with_snapshot();
+        assert!(after_commit.messages.is_empty());
+        assert!(after_commit.history_committed);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(
+                    !matches!(
+                        event,
+                        AgentEvent::VisibleMessageStart { .. }
+                            | AgentEvent::VisibleMessageDiscard { .. }
+                    ),
+                    "internal markers must not be broadcast"
+                );
+                if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("history commit on the session stream");
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

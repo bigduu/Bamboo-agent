@@ -26,7 +26,7 @@ use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
-use crate::runtime::stream::handler::StreamHandlingOutput;
+use crate::runtime::stream::handler::{StreamHandlingOutput, VisibleMessageIdentity};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
@@ -587,12 +587,15 @@ async fn commit_sticky_fallback_discovery_round(
         .as_ref()
         .and_then(|_| stream_output.reasoning_signature.clone());
     let tool_calls = stream_output.tool_calls;
-    let mut assistant = Message::assistant_with_reasoning(
-        stream_output.content,
-        Some(tool_calls.clone()),
-        reasoning,
-    )
-    .with_reasoning_signature(reasoning_signature);
+    let mut assistant = assistant_with_visible_identity(
+        Message::assistant_with_reasoning(
+            stream_output.content,
+            Some(tool_calls.clone()),
+            reasoning,
+        )
+        .with_reasoning_signature(reasoning_signature),
+        stream_output.visible_message,
+    );
     assistant.never_compress = true;
     assistant.metadata = Some(serde_json::json!({
         "runtime_kind": STICKY_DISCOVERY_RUNTIME_KIND,
@@ -758,8 +761,11 @@ async fn commit_openai_client_tool_search_round(
     let reasoning_signature = reasoning
         .as_ref()
         .and_then(|_| stream_output.reasoning_signature.clone());
-    let message = Message::assistant_with_reasoning(stream_output.content, None, reasoning)
-        .with_reasoning_signature(reasoning_signature);
+    let message = assistant_with_visible_identity(
+        Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+            .with_reasoning_signature(reasoning_signature),
+        stream_output.visible_message,
+    );
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
     commit_assistant_message(session, message, &mut provider_items)?;
@@ -1957,6 +1963,16 @@ fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLo
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
+fn assistant_with_visible_identity(
+    message: Message,
+    visible_message: Option<VisibleMessageIdentity>,
+) -> Message {
+    match visible_message {
+        Some(identity) => identity.apply_to(message),
+        None => message,
+    }
+}
+
 fn commit_assistant_message(
     session: &mut Session,
     message: Message,
@@ -2036,6 +2052,7 @@ fn record_no_tool_calls_round_completed(
 #[allow(clippy::too_many_arguments)]
 async fn handle_no_tool_calls_with_native(
     content: String,
+    visible_message: Option<VisibleMessageIdentity>,
     reasoning: Option<String>,
     reasoning_signature: Option<String>,
     prompt_tokens: u64,
@@ -2063,10 +2080,11 @@ async fn handle_no_tool_calls_with_native(
     // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
     // assistant message was appended).
     let add_message_before_gold = config.goal_loop_active();
-    let mut deferred_assistant_message = Some(
+    let mut deferred_assistant_message = Some(assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
-    );
+        visible_message,
+    ));
     let mut native_items = Some(provider_transcript_items);
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
@@ -2268,6 +2286,7 @@ async fn handle_no_tool_calls(
 ) -> Result<TurnOutcome, AgentError> {
     handle_no_tool_calls_with_native(
         content,
+        None,
         reasoning,
         reasoning_signature,
         prompt_tokens,
@@ -2313,12 +2332,15 @@ async fn handle_tool_calls_path(
     let mut native_items = Some(stream_output.provider_transcript_items.clone());
     commit_assistant_message(
         session,
-        Message::assistant_with_reasoning(
-            stream_output.content,
-            Some(stream_output.tool_calls.clone()),
-            reasoning,
-        )
-        .with_reasoning_signature(reasoning_signature),
+        assistant_with_visible_identity(
+            Message::assistant_with_reasoning(
+                stream_output.content,
+                Some(stream_output.tool_calls.clone()),
+                reasoning,
+            )
+            .with_reasoning_signature(reasoning_signature),
+            stream_output.visible_message,
+        ),
         &mut native_items,
     )?;
 
@@ -2988,10 +3010,21 @@ async fn run_pipeline_inner(
                         // feed the partial assistant turn back into the next
                         // provider request or leave duplicate failed attempts in
                         // the durable transcript.
-                        crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
+                        if let Some(message_id) = crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
                             session,
                             attempt_tail_message_id.as_deref(),
-                        );
+                        ) {
+                            if event_tx
+                                .send(AgentEvent::VisibleMessageDiscard { message_id })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "[{}] event channel closed; visible retry rollback was not broadcast",
+                                    state.session_id,
+                                );
+                            }
+                        }
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                         tracing::warn!(
                             "[{}] Turn {} LLM call failed (attempt {}/{}): {}. Retrying in {}ms",
@@ -3163,6 +3196,7 @@ async fn run_pipeline_inner(
                     .unwrap_or_else(|| state.model_name.clone());
                 match handle_no_tool_calls_with_native(
                     stream_output.content,
+                    stream_output.visible_message,
                     reasoning,
                     reasoning_signature,
                     llm_output.prompt_tokens,
@@ -3295,10 +3329,21 @@ async fn run_pipeline_inner(
                 }
                 Err(error) => {
                     if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
-                        crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
+                        if let Some(message_id) = crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
                             session,
                             attempt_tail_message_id.as_deref(),
-                        );
+                        ) {
+                            if event_tx
+                                .send(AgentEvent::VisibleMessageDiscard { message_id })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "[{}] event channel closed; visible post-LLM retry rollback was not broadcast",
+                                    state.session_id,
+                                );
+                            }
+                        }
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                         tracing::warn!(
                             "[{}] Turn {} post-LLM handling failed (attempt {}/{}): {}. Retrying in {}ms",
@@ -3824,15 +3869,15 @@ fn heuristic_complexity(
 mod tests {
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
-        apply_successful_explicit_activation, build_guardian_review_prompt,
-        build_openai_client_tool_search_outputs, check_run_budget_exceeded,
-        commit_assistant_message, commit_openai_client_tool_search_round,
-        commit_sticky_fallback_discovery_round, effective_callable_set_for_round,
-        is_child_spawn_call, is_overflow_recoverable, is_terminal_child_status,
-        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
-        maybe_suspend_for_outstanding_bash, scope_discovered_gateway_schema,
-        should_retry_turn_error, sticky_fallback_definition_delta, sticky_fallback_tool_result,
-        sticky_result_definition_values, suspend_to_wait_for_bash,
+        apply_successful_explicit_activation, assistant_with_visible_identity,
+        build_guardian_review_prompt, build_openai_client_tool_search_outputs,
+        check_run_budget_exceeded, commit_assistant_message,
+        commit_openai_client_tool_search_round, commit_sticky_fallback_discovery_round,
+        effective_callable_set_for_round, is_child_spawn_call, is_overflow_recoverable,
+        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
+        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
+        scope_discovered_gateway_schema, should_retry_turn_error, sticky_fallback_definition_delta,
+        sticky_fallback_tool_result, sticky_result_definition_values, suspend_to_wait_for_bash,
         validate_explicit_activation_first_step, validated_sticky_fallback_loaded_tool_names,
     };
     use crate::project_context::{
@@ -3868,6 +3913,27 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn visible_identity_is_reused_by_persisted_assistant_message() {
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-09-22T19:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let identity = crate::runtime::stream::handler::VisibleMessageIdentity {
+            message_id: "stable-visible-message".to_string(),
+            created_at,
+        };
+
+        let message = assistant_with_visible_identity(
+            Message::assistant("visible text", None),
+            Some(identity),
+        );
+
+        assert_eq!(message.id, "stable-visible-message");
+        assert_eq!(message.created_at, created_at);
+        assert_eq!(message.content, "visible text");
+        assert_eq!(message.role, bamboo_agent_core::Role::Assistant);
+    }
 
     fn pending_explicit_session() -> Session {
         let mut session = Session::new("explicit-gate", "model");
@@ -4947,6 +5013,7 @@ mod tests {
 
         let stream_output = crate::runtime::stream::handler::StreamHandlingOutput {
             response_id: Some("resp_client_search".to_string()),
+            visible_message: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_signature: None,
@@ -7729,6 +7796,7 @@ mod tests {
         fn attempt(input: u64, output: u64, tool_calls: Vec<&str>) -> StreamHandlingOutput {
             StreamHandlingOutput {
                 response_id: None,
+                visible_message: None,
                 content: "x".to_string(),
                 reasoning_content: String::new(),
                 reasoning_signature: None,
@@ -7814,6 +7882,7 @@ mod tests {
 
         let mut output = StreamHandlingOutput {
             response_id: None,
+            visible_message: None,
             content: "answer".to_string(),
             reasoning_content: "thought".to_string(),
             reasoning_signature: None,
@@ -7869,6 +7938,7 @@ mod tests {
 
         let output = StreamHandlingOutput {
             response_id: None,
+            visible_message: None,
             content: "answer".to_string(),
             reasoning_content: String::new(),
             reasoning_signature: None,
@@ -9311,6 +9381,7 @@ mod tests {
     fn stream_output_with_tool_call(call: ToolCall) -> StreamHandlingOutput {
         StreamHandlingOutput {
             response_id: None,
+            visible_message: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_signature: None,
@@ -9659,6 +9730,7 @@ mod tests {
         // mid-turn summarization fires right after it — and fails transiently.
         let stream_output = StreamHandlingOutput {
             response_id: None,
+            visible_message: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_signature: None,
