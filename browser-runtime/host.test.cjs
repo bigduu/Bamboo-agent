@@ -1296,16 +1296,23 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
   };
   try {
     const initial = (await call('state')).result;
-    assert.equal(initial.tabs.length, 1);
+    assert.deepEqual(initial.tabs, []);
+    assert.equal(initial.active_tab_id, null);
+    assert.equal(initial.url, '');
+    assert.equal((await call('navigate', {
+      url: 'file:///tmp/secret', expected_epoch: initial.page_epoch,
+    })).code, 'invalid_url');
+    assert.deepEqual((await call('state')).result.tabs, []);
     assert.equal((await call('tab_activate', {
       tab_id: 'A'.repeat(10000), expected_epoch: initial.page_epoch,
     })).code, 'invalid_request');
     assert.equal((await call('tab_close', {
       tab_id: 'A'.repeat(24), expected_epoch: initial.page_epoch,
     })).code, 'invalid_request');
-    const firstId = initial.active_tab_id;
-    assert.equal(initial.tabs[0].tab_id, firstId);
     const first = (await call('navigate', { url: base + '/one', expected_epoch: initial.page_epoch })).result;
+    const firstId = first.active_tab_id;
+    assert.equal(first.tabs.length, 1);
+    assert.equal(first.tabs[0].tab_id, firstId);
     const firstFrame = await waitForFrame(firstId, 0, first.page_epoch);
     assert.equal(firstFrame.page_epoch, first.page_epoch);
     const popup = await call('click_selector', { selector: '#popup', expected_epoch: first.page_epoch });
@@ -1392,10 +1399,21 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.notEqual(closedActive.page_epoch, switching.page_epoch);
     assert.match((await call('dom')).result.html, /One page/);
     const lastClosed = (await call('tab_close', { tab_id: firstId, expected_epoch: closedActive.page_epoch })).result;
-    assert.equal(lastClosed.tabs.length, 1);
-    assert.notEqual(lastClosed.active_tab_id, firstId);
-    assert.equal(lastClosed.url, 'about:blank');
-    let bounded = lastClosed;
+    assert.deepEqual(lastClosed.tabs, []);
+    assert.equal(lastClosed.active_tab_id, null);
+    assert.equal(lastClosed.url, '');
+    assert.equal((await call('dom')).code, 'stale_epoch');
+    const reopened = (await call('tab_create', {
+      url: base + '/one', expected_epoch: lastClosed.page_epoch,
+    })).result;
+    assert.equal(reopened.tabs.length, 1);
+    assert.equal(reopened.url, base + '/one');
+    assert.notEqual(reopened.active_tab_id, firstId);
+    assert.equal((await call('tab_create', {
+      url: 'file:///tmp/secret', expected_epoch: reopened.page_epoch,
+    })).code, 'invalid_url');
+    assert.equal((await call('state')).result.tabs.length, 1);
+    let bounded = reopened;
     for (let count = 1; count < 8; count++) {
       bounded = (await call('tab_create', { expected_epoch: bounded.page_epoch })).result;
     }
@@ -2462,13 +2480,15 @@ test('bounded page eval changes the same DOM and rejects stale or unsafe results
   });
   try {
     const initial = (await call('state')).result;
+    assert.deepEqual(initial.tabs, []);
+    const blankTab = (await call('tab_create', { expected_epoch: initial.page_epoch })).result;
     const blank = await call('eval', {
-      expected_epoch: initial.page_epoch, expected_url: 'about:blank', code: '({blank: true})',
+      expected_epoch: blankTab.page_epoch, expected_url: 'about:blank', code: '({blank: true})',
     });
     assert.equal(blank.ok, true, JSON.stringify(blank));
     assert.deepEqual(blank.result.value, { blank: true });
     const prepatchedUrl = `${url}prepatched`;
-    const prepatched = (await call('navigate', { url: prepatchedUrl, expected_epoch: initial.page_epoch })).result;
+    const prepatched = (await call('navigate', { url: prepatchedUrl, expected_epoch: blankTab.page_epoch })).result;
     const prepatchedResult = await call('eval', {
       expected_epoch: prepatched.page_epoch, expected_url: prepatchedUrl, code: '({actual: 11})',
     });

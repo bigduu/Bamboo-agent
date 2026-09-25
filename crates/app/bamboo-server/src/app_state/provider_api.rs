@@ -378,10 +378,7 @@ mod tests {
             state.browser.state(other).await.unwrap()["page_epoch"],
             other_state["page_epoch"]
         );
-        assert_eq!(
-            state.browser.state(other).await.unwrap()["url"],
-            "about:blank"
-        );
+        assert_eq!(state.browser.state(other).await.unwrap()["url"], "");
 
         let stale_url = dispatch("document.title", epoch, &format!("{url}other"));
         let mut context = ToolExecutionContext::none(&stale_url.id);
