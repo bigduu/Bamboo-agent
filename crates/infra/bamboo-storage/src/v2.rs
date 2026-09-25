@@ -43,6 +43,7 @@ use bamboo_domain::{
     SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
+mod actor_directory;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -1678,6 +1679,8 @@ impl SessionStoreV2 {
                     || sidecar.kind != main.kind
                     || sidecar.root_session_id != main.root_session_id
                     || sidecar.parent_session_id != main.parent_session_id
+                    || sidecar.spawn_depth != main.spawn_depth
+                    || sidecar.created_at != main.created_at
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -4889,7 +4892,7 @@ async fn durable_copy_file(source: &Path, target: &Path) -> io::Result<u64> {
 /// temp contents and the published directory entry are both synchronized
 /// before this returns. Windows uses a true replace-existing primitive, never
 /// the target-loss-prone remove-then-rename fallback.
-async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
     let tmp = path.with_extension(format!("durable.tmp.{}", Uuid::new_v4()));
