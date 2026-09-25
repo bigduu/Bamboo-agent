@@ -414,6 +414,7 @@ impl SessionStoreV2 {
                 serde_json::to_vec_pretty(&session).map_err(|error| invalid(error.to_string()))?;
             durable_atomic_write(&staging.join("session.json"), &bytes).await?;
             durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            Self::write_staged_root_tool_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
             self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;
             atomic_rename(&staging, &destination).await?;

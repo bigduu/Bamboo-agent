@@ -4,6 +4,97 @@
 use super::*;
 use bamboo_domain::SessionAuthorityConflict;
 
+pub(super) const ROOT_TOOL_AUTHORITY_PROOF_FILE: &str = "root-tool-authority.json";
+const ROOT_TOOL_AUTHORITY_PROOF_MIGRATION_MARKER: &str = ".root_tool_authority_proof_v1";
+const ROOT_TOOL_AUTHORITY_PROOF_MAX_BYTES: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProofState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RootToolProofFault {
+    Prepared,
+    Runtime,
+    Main,
+    Committed,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RootToolAuthorityProof {
+    version: u32,
+    state: ProofState,
+    id: String,
+    created_at: DateTime<Utc>,
+    authority_identity: SessionAuthorityIdentity,
+    root_orchestration_only: bool,
+    root_tool_authority_revision: u64,
+}
+
+impl RootToolAuthorityProof {
+    fn from_session(session: &Session, state: ProofState) -> Self {
+        Self {
+            version: 1,
+            state,
+            id: session.id.clone(),
+            created_at: session.created_at,
+            authority_identity: session.authority_identity.clone(),
+            root_orchestration_only: session.root_orchestration_only,
+            root_tool_authority_revision: session.root_tool_authority_revision,
+        }
+    }
+
+    fn matches(&self, session: &Session) -> bool {
+        self.version == 1
+            && self.id == session.id
+            && self.created_at == session.created_at
+            && self.authority_identity == session.authority_identity
+            && self.root_orchestration_only == session.root_orchestration_only
+            && self.root_tool_authority_revision == session.root_tool_authority_revision
+    }
+}
+
+/// Deserialize only the Root authority fields. Tool boundaries compare the
+/// canonical pair without allocating the possibly large message transcript.
+#[derive(Deserialize)]
+struct RootToolAuthorityMain {
+    id: String,
+    created_at: DateTime<Utc>,
+    #[serde(default)]
+    kind: SessionKind,
+    #[serde(default)]
+    root_session_id: String,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    spawn_depth: u32,
+    #[serde(default)]
+    authority_identity: SessionAuthorityIdentity,
+    #[serde(default)]
+    root_orchestration_only: bool,
+    #[serde(default)]
+    root_tool_authority_revision: u64,
+}
+
+impl From<&Session> for RootToolAuthorityMain {
+    fn from(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            created_at: session.created_at,
+            kind: session.kind,
+            root_session_id: session.root_session_id.clone(),
+            parent_session_id: session.parent_session_id.clone(),
+            spawn_depth: session.spawn_depth,
+            authority_identity: session.authority_identity.clone(),
+            root_orchestration_only: session.root_orchestration_only,
+            root_tool_authority_revision: session.root_tool_authority_revision,
+        }
+    }
+}
+
 fn conflict(message: impl Into<String>) -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
@@ -44,11 +135,335 @@ async fn empty_creation_layout(directory: &Path) -> io::Result<bool> {
 }
 
 impl SessionStoreV2 {
+    /// A missing rebuildable index row is not proof that a deterministic Root
+    /// directory is absent. Keep an incomplete legacy Root visible as a
+    /// recovery error instead of silently reporting a nonexistent Session.
+    pub(super) async fn ensure_no_unindexed_root(&self, id: &str) -> io::Result<()> {
+        validate_session_id(id)?;
+        let directory = self.sessions_dir.join(id);
+        match fs::symlink_metadata(&directory).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(conflict(format!("canonical Root directory: {error}"))),
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(conflict("canonical Root placement is invalid"));
+            }
+            Ok(_) => {}
+        }
+        // A revocation can leave the physical directory behind until deletion
+        // reconciliation. Its ordinary lifetime helper reads the full main
+        // transcript, so use the bounded sidecar and committed proof here.
+        // Missing authority beside a retained main remains a recovery error.
+        if let Some(cutoff) = self
+            .root_revocation(id)
+            .await
+            .map_err(|error| conflict(error.to_string()))?
+        {
+            let main_exists = regular_file_exists(&directory.join("session.json")).await?;
+            let side = Self::read_runtime_sidecar_at(&directory.join(RUNTIME_SIDECAR_FILE), id)
+                .await
+                .map_err(|error| conflict(error.to_string()))?;
+            if let Some(side) = side {
+                if side.id != id {
+                    return Err(conflict("revoked Root sidecar identity mismatch"));
+                }
+                self.validate_root_tool_proof(&side).await?;
+                if side.created_at <= cutoff {
+                    return Ok(());
+                }
+            } else if !main_exists {
+                return Ok(());
+            }
+        }
+        Err(conflict(
+            "Root index is missing while canonical files require recovery",
+        ))
+    }
+    pub(super) fn maybe_fail_root_tool_proof(&self, fault: RootToolProofFault) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut pending = self
+                .root_tool_proof_fault
+                .lock()
+                .expect("Root tool proof fault lock");
+            if pending.as_ref() == Some(&fault) {
+                *pending = None;
+                return Err(other_io_error(format!(
+                    "injected Root tool proof fault: {fault:?}"
+                )));
+            }
+        }
+        #[cfg(not(test))]
+        let _ = fault;
+        Ok(())
+    }
+    async fn read_root_tool_proof(&self, id: &str) -> io::Result<RootToolAuthorityProof> {
+        let path = self
+            .sessions_dir
+            .join(id)
+            .join(ROOT_TOOL_AUTHORITY_PROOF_FILE);
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| conflict(format!("canonical Root authority proof: {error}")))?;
+        if !metadata.file_type().is_file() || metadata.len() > ROOT_TOOL_AUTHORITY_PROOF_MAX_BYTES {
+            return Err(conflict("canonical Root authority proof is invalid"));
+        }
+        let bytes = fs::read(&path)
+            .await
+            .map_err(|error| conflict(format!("canonical Root authority proof: {error}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| conflict(format!("invalid canonical Root authority proof: {error}")))
+    }
+
+    pub(super) async fn validate_root_tool_proof(&self, side: &Session) -> io::Result<()> {
+        if side.kind != SessionKind::Root
+            || side.parent_session_id.is_some()
+            || side.spawn_depth != 0
+            || (!side.root_session_id.is_empty() && side.root_session_id != side.id)
+            || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
+        {
+            return Err(conflict("canonical Root authority proof identity mismatch"));
+        }
+        let proof = self.read_root_tool_proof(&side.id).await?;
+        if proof.state != ProofState::Committed || !proof.matches(side) {
+            return Err(conflict(
+                "canonical Root authority proof is pending or stale",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_root_tool_proof_at(
+        directory: &Path,
+        session: &Session,
+        state: ProofState,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        durable_atomic_write(&directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE), &bytes).await
+    }
+
+    /// Staging directories are unpublished until both Session files and this
+    /// committed proof are durable. They need no visible prepared state.
+    pub(super) async fn write_staged_root_tool_proof(
+        directory: &Path,
+        session: &Session,
+    ) -> io::Result<()> {
+        if session.kind == SessionKind::Root {
+            Self::write_root_tool_proof_at(directory, session, ProofState::Committed).await?;
+        }
+        Ok(())
+    }
+
+    /// A selection publishes a durable Prepared marker before the sidecar and
+    /// main writes. Any interrupted phase is unavailable to operational reads.
+    pub(super) async fn prepare_root_tool_proof_for_full_save(
+        &self,
+        directory: &Path,
+        incoming: &Session,
+    ) -> io::Result<bool> {
+        if incoming.kind != SessionKind::Root {
+            return Ok(false);
+        }
+        let path = directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE);
+        if regular_file_exists(&path).await? {
+            let current = self.read_root_tool_proof(&incoming.id).await?;
+            if current.state == ProofState::Committed && current.matches(incoming) {
+                return Ok(false);
+            }
+        }
+        Self::write_root_tool_proof_at(directory, incoming, ProofState::Prepared).await?;
+        Ok(true)
+    }
+
+    pub(super) async fn commit_root_tool_proof_after_full_save(
+        directory: &Path,
+        incoming: &Session,
+        prepared: bool,
+    ) -> io::Result<()> {
+        if prepared {
+            Self::write_root_tool_proof_at(directory, incoming, ProofState::Committed).await?;
+        }
+        Ok(())
+    }
+
+    /// Upgrade pre-proof V2 Roots once, before serving requests. A missing
+    /// sidecar, corrupt pair, or existing damaged proof is never reconstructed.
+    /// Subsequent boots trust only the durable marker and each Root's proof;
+    /// otherwise loss of a newer proof could be mistaken for a fresh upgrade.
+    pub(super) async fn migrate_root_tool_authority_proofs(
+        &self,
+        publish_marker: bool,
+    ) -> io::Result<()> {
+        let marker = self
+            .bamboo_home_dir
+            .join(ROOT_TOOL_AUTHORITY_PROOF_MIGRATION_MARKER);
+        match fs::symlink_metadata(&marker).await {
+            Ok(metadata) if metadata.file_type().is_file() => return Ok(()),
+            Ok(_) => return Err(conflict("Root authority proof migration marker is invalid")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut roots = fs::read_dir(&self.sessions_dir).await?;
+        while let Some(entry) = roots.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let Ok(id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if validate_session_id(&id).is_err() {
+                continue;
+            }
+            let directory = entry.path();
+            match fs::symlink_metadata(directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE)).await {
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let pair = async {
+                let main_path = directory.join("session.json");
+                let side_path = directory.join(RUNTIME_SIDECAR_FILE);
+                if !regular_file_exists(&main_path).await?
+                    || !regular_file_exists(&side_path).await?
+                {
+                    return Err(conflict("legacy Root canonical pair is incomplete"));
+                }
+                let main_bytes = fs::read(main_path).await?;
+                let side_bytes = fs::read(side_path).await?;
+                let main: Session = serde_json::from_slice(&main_bytes)?;
+                let side: Session = serde_json::from_slice(&side_bytes)?;
+                Self::validate_root_tool_authority_pair(
+                    &RootToolAuthorityMain::from(&main),
+                    &side,
+                )?;
+                // An old sidecar-first full save may have stopped before main
+                // publication. Do not turn that incomplete selection, especially
+                // an explicit disable, into a committed proof during upgrade.
+                if main.root_tool_authority_revision != side.root_tool_authority_revision
+                    || main.root_orchestration_only != side.root_orchestration_only
+                {
+                    return Err(conflict("legacy Root tool selection is incomplete"));
+                }
+                Ok::<Session, io::Error>(side)
+            }
+            .await;
+            match pair {
+                Ok(side) if side.id == id => {
+                    Self::write_root_tool_proof_at(&directory, &side, ProofState::Committed)
+                        .await?;
+                }
+                Ok(_) => {
+                    tracing::warn!(session_id = %id, "Root authority proof migration skipped misplaced Root")
+                }
+                Err(error) => {
+                    tracing::warn!(session_id = %id, %error, "Root authority proof migration skipped unavailable Root")
+                }
+            }
+        }
+        if publish_marker {
+            durable_atomic_write(&marker, b"root-tool-authority-proof-v1\n").await?;
+        }
+        Ok(())
+    }
+
+    /// A Root with an unavailable runtime sidecar has no provable live tool
+    /// authority. Legacy main-only Roots remain visible in the index, but
+    /// operational reads must report a recovery error instead of reopening
+    /// their possibly stale unrestricted main snapshot.
+    pub(super) async fn validate_root_tool_authority_overlay(
+        &self,
+        requested_id: &str,
+        main: &Session,
+        side: Option<&Session>,
+    ) -> io::Result<()> {
+        validate_session_id(requested_id)?;
+        if main.id != requested_id || side.is_some_and(|side| side.id != requested_id) {
+            return Err(conflict(
+                "canonical Session ID does not match requested placement",
+            ));
+        }
+        if main.kind != SessionKind::Root {
+            let root_placement = match fs::symlink_metadata(self.sessions_dir.join(requested_id))
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(conflict(format!("canonical Root directory: {error}"))),
+            };
+            if root_placement || side.is_some_and(|side| side.kind == SessionKind::Root) {
+                return Err(conflict("canonical Root placement claims Child identity"));
+            }
+            return Ok(());
+        }
+        let side = side.ok_or_else(|| conflict("canonical runtime file is missing or corrupt"))?;
+        Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)?;
+        self.validate_root_tool_proof(side).await
+    }
+
+    fn validate_root_tool_authority_pair(
+        main: &RootToolAuthorityMain,
+        side: &Session,
+    ) -> io::Result<()> {
+        if main.kind != SessionKind::Root
+            || main.parent_session_id.is_some()
+            || main.spawn_depth != 0
+            || (!main.root_session_id.is_empty() && main.root_session_id != main.id)
+            || (main.root_orchestration_only && main.root_tool_authority_revision == 0)
+            || side.id != main.id
+            || side.kind != SessionKind::Root
+            || side.parent_session_id.is_some()
+            || side.spawn_depth != 0
+            || (!side.root_session_id.is_empty() && side.root_session_id != side.id)
+            || side.created_at != main.created_at
+            || side.authority_identity != main.authority_identity
+            || side.root_tool_authority_revision < main.root_tool_authority_revision
+            || (side.root_tool_authority_revision == main.root_tool_authority_revision
+                && side.root_orchestration_only != main.root_orchestration_only)
+            || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
+        {
+            return Err(conflict(
+                "canonical Root tool authority is stale or inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Operational control-plane loads use only the bounded runtime sidecar
+    /// and committed proof. The main transcript is checked on full loads.
+    pub(super) async fn validate_root_tool_authority_against_proof(
+        &self,
+        requested_id: &str,
+        side: &Session,
+    ) -> io::Result<()> {
+        validate_session_id(requested_id)?;
+        if side.id != requested_id {
+            return Err(conflict(
+                "runtime sidecar does not match the requested Session",
+            ));
+        }
+        if side.kind != SessionKind::Root {
+            // A Root's physical directory is durable identity evidence even if
+            // its runtime JSON claims to be a Child. Genuine children live
+            // under sessions/<root>/children/<child>, never sessions/<child>.
+            match fs::symlink_metadata(self.sessions_dir.join(requested_id)).await {
+                Ok(_) => return Err(conflict("canonical Root sidecar claims Child identity")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(conflict(format!("canonical Root directory: {error}"))),
+            }
+            return Ok(());
+        }
+        let path = self.sessions_dir.join(requested_id).join("session.json");
+        if !regular_file_exists(&path).await? {
+            return Err(conflict("canonical main file is missing"));
+        }
+        self.validate_root_tool_proof(side).await
+    }
+
     /// The caller holds either the ordinary per-session writer lock or the
     /// exclusive Task/lifecycle boundary that excludes all ordinary writers.
     /// A missing sidecar beside an existing main file is ambiguous: it may be
-    /// legacy, or may have lost a newer Project revision. History readers may
-    /// fall back to main, but no writer may republish that fallback as authority.
+    /// legacy, or may have lost a newer Project or tool revision. Operational
+    /// readers and writers both reject that ambiguous Root state.
     pub(super) async fn validate_root_context_for_save(
         &self,
         incoming: &Session,
@@ -72,6 +487,9 @@ impl SessionStoreV2 {
         full: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
+        if incoming.root_orchestration_only && incoming.root_tool_authority_revision == 0 {
+            return Err(conflict("Root tool authority has no selection revision"));
+        }
         supervisor::validate_identity(incoming).map_err(|error| conflict(error.to_string()))?;
         self.validate_root_lifetime_for_write(incoming).await?;
         let directory = self.sessions_dir.join(&incoming.id);
@@ -132,9 +550,44 @@ impl SessionStoreV2 {
                 "writer does not match the durable Root creation identity",
             ));
         }
+        self.validate_root_tool_proof(&current).await?;
+        if full && has_main {
+            // A full save already serializes the transcript and must not
+            // replace damaged or stale canonical history from a caller's
+            // snapshot. Only runtime-only paths skip this large read.
+            let bytes = fs::read(directory.join("session.json"))
+                .await
+                .map_err(|error| conflict(format!("canonical main file: {error}")))?;
+            let main: Session = serde_json::from_slice(&bytes)
+                .map_err(|error| conflict(format!("invalid canonical main: {error}")))?;
+            Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(&main), &current)?;
+        }
         if incoming.metadata_version < current.metadata_version {
             return Err(conflict(
                 "metadata revision regressed; reload before saving",
+            ));
+        }
+        if (current.root_orchestration_only && current.root_tool_authority_revision == 0)
+            || incoming.root_tool_authority_revision < current.root_tool_authority_revision
+        {
+            return Err(conflict("Root tool authority revision regressed"));
+        }
+        if !full && incoming.root_tool_authority_revision != current.root_tool_authority_revision {
+            return Err(conflict(
+                "Root tool authority selection requires a full Session save",
+            ));
+        }
+        if incoming.root_orchestration_only != current.root_orchestration_only {
+            if current.root_tool_authority_revision.checked_add(1)
+                != Some(incoming.root_tool_authority_revision)
+            {
+                return Err(conflict(
+                    "Root tool authority change requires the next revision",
+                ));
+            }
+        } else if incoming.root_tool_authority_revision != current.root_tool_authority_revision {
+            return Err(conflict(
+                "Root tool authority revision changed without a selection",
             ));
         }
         if incoming.project_id_meta() != current.project_id_meta()
@@ -146,7 +599,8 @@ impl SessionStoreV2 {
         }
         if !has_main
             && (incoming.metadata_version != current.metadata_version
-                || incoming.project_id_meta() != current.project_id_meta())
+                || incoming.project_id_meta() != current.project_id_meta()
+                || incoming.root_tool_authority_revision != current.root_tool_authority_revision)
         {
             return Err(conflict(
                 "completing a partial Root cannot advance its context",

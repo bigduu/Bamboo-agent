@@ -19,6 +19,7 @@ pub mod runtime_metadata_access;
 pub mod runtime_state;
 pub mod supervisor_management;
 pub mod task;
+pub mod tool_authority;
 pub mod tool_types;
 pub mod types;
 
@@ -43,5 +44,6 @@ pub use runtime_metadata::SessionRuntimeMetadata;
 pub use runtime_state::*;
 pub use supervisor_management::*;
 pub use task::*;
+pub use tool_authority::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;

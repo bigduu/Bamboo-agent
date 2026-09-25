@@ -147,6 +147,10 @@ struct MainIdentity {
     authority_identity: SessionAuthorityIdentity,
     #[serde(default)]
     supervisor_management: Option<SupervisorManagementState>,
+    #[serde(default)]
+    root_orchestration_only: bool,
+    #[serde(default)]
+    root_tool_authority_revision: u64,
 }
 
 impl SessionStoreV2 {
@@ -209,9 +213,15 @@ impl SessionStoreV2 {
             || side.spawn_depth != 0
             || main.authority_identity != side.authority_identity
             || main.created_at != side.created_at
+            || (main.root_orchestration_only && main.root_tool_authority_revision == 0)
+            || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
+            || side.root_tool_authority_revision < main.root_tool_authority_revision
+            || (side.root_tool_authority_revision == main.root_tool_authority_revision
+                && side.root_orchestration_only != main.root_orchestration_only)
         {
             return Err(invalid("canonical Root identity mismatch"));
         }
+        self.validate_root_tool_proof(&side).await?;
         side.root_session_id = id.to_string();
         side.messages.clear();
         side.clear_stale_root_token_budget();
@@ -334,6 +344,7 @@ impl SessionStoreV2 {
                 .map_err(|error| other_io_error(error.to_string()))?;
             durable_atomic_write(&staging.join("session.json"), &bytes).await?;
             durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            Self::write_staged_root_tool_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
             self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;
             atomic_rename(&staging, &destination).await?;

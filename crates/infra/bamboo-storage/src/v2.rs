@@ -1052,6 +1052,8 @@ pub struct SessionStoreV2 {
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
     #[cfg(test)]
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
+    #[cfg(test)]
+    root_tool_proof_fault: std::sync::Mutex<Option<root_context::RootToolProofFault>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1350,6 +1352,8 @@ impl SessionStoreV2 {
             full_save_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_publication_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            root_tool_proof_fault: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -1365,12 +1369,17 @@ impl SessionStoreV2 {
         {
             let _lifecycle = storage.lock_session_lifecycle_exclusive().await?;
             let _runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+            // Upgrade old valid Root pairs before journal recovery invokes the
+            // strict sidecar writer. Scan again afterward for any Root a copy
+            // recovery completed, then publish the one-shot migration marker.
+            storage.migrate_root_tool_authority_proofs(false).await?;
             storage
                 .recover_all_runtime_task_transactions_locked()
                 .await?;
             storage
                 .recover_all_session_copy_transactions_locked()
                 .await?;
+            storage.migrate_root_tool_authority_proofs(true).await?;
             storage.reconcile_root_revocations().await?;
         }
 
@@ -1586,7 +1595,7 @@ impl SessionStoreV2 {
                 return None;
             }
         };
-        let main: Session = match serde_json::from_str(&raw) {
+        let mut main: Session = match serde_json::from_str(&raw) {
             Ok(session) => session,
             Err(error) => {
                 tracing::warn!("index rebuild: skipping corrupt session {id}: {error}");
@@ -1610,6 +1619,21 @@ impl SessionStoreV2 {
                 }
             };
         if let Err(error) = supervisor::validate_overlay(&main, sidecar.as_ref()) {
+            tracing::warn!("index rebuild: skipping invalid authority for {id}: {error}");
+            return None;
+        }
+        if let Err(error) = self
+            .validate_root_tool_authority_overlay(id, &main, sidecar.as_ref())
+            .await
+        {
+            // Preserve a valid Root's lookup row so direct reads report the
+            // concrete recovery conflict. Never project an unverified runtime
+            // sidecar into the rebuildable index.
+            if main.kind == SessionKind::Root && main.id == id {
+                tracing::warn!("index rebuild: Root {id} is unavailable: {error}");
+                main.clear_stale_root_token_budget();
+                return Some(main);
+            }
             tracing::warn!("index rebuild: skipping invalid authority for {id}: {error}");
             return None;
         }
@@ -1694,6 +1718,8 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
+        self.validate_root_tool_authority_overlay(id, &main, sidecar.as_ref())
+            .await?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -2230,6 +2256,8 @@ impl SessionStoreV2 {
         let sidecar =
             Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), session_id).await?;
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
+        self.validate_root_tool_authority_overlay(session_id, &main, sidecar.as_ref())
+            .await?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         if session.id != session_id || session.kind != SessionKind::Root {
@@ -2488,19 +2516,27 @@ impl SessionStoreV2 {
             // Only canonical Root absence permits its normal control-plane read.
         }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
+            self.validate_root_tool_authority_against_proof(session_id, &side)
+                .await?;
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
+            self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         };
         let raw = match fs::read_to_string(path).await {
             Ok(raw) => raw,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.ensure_no_unindexed_root(session_id).await?;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
+        self.validate_root_tool_authority_overlay(session_id, &session, None)
+            .await?;
         if !self.session_lifetime_is_live(&session).await? {
             return Ok(None);
         }
@@ -3783,11 +3819,11 @@ impl SessionStoreV2 {
 
     /// One-shot migration of legacy Child sidecars (`runtime.json`).
     ///
-    /// Loading already tolerates a missing sidecar (it falls back to the embedded
-    /// control-plane in `session.json`). A main-only Root is indistinguishable
-    /// from a Root that lost a newer Project revision, so it remains readable
-    /// but cannot be reconstructed here. Its canonical runtime must be restored
-    /// before any mutation; this migration cannot establish that authority.
+    /// Child loading tolerates a missing sidecar by falling back to the
+    /// embedded control-plane in `session.json`. A main-only Root is
+    /// indistinguishable from one that lost a newer Project or tool revision,
+    /// so operational Root reads and writes reject it. Its canonical runtime
+    /// must be restored; this migration cannot establish that authority.
     ///
     /// Idempotent and cheap on later boots: guarded by a marker file, and any
     /// session that already has a sidecar is skipped. Returns the number of
@@ -4380,6 +4416,7 @@ impl SessionStoreV2 {
         let session_json =
             serde_json::to_vec_pretty(copied).map_err(|error| other_io_error(error.to_string()))?;
         durable_atomic_write(&staging_dir.join("session.json"), &session_json).await?;
+        Self::write_staged_root_tool_proof(staging_dir, copied).await?;
         // Flush the staging directory after its children/attachments are all
         // complete, before its name is published under `sessions/`.
         sync_parent_directory_entry(&staging_dir.join("session.json")).await?;
@@ -4975,9 +5012,11 @@ impl SessionStoreV2 {
     async fn load_session_unlocked(&self, session_id: &str) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
         let Some(path) = self.session_json_path(session_id).await? else {
+            self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         };
         if !path.exists() {
+            self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         }
         let raw = fs::read_to_string(path).await?;
@@ -4988,6 +5027,8 @@ impl SessionStoreV2 {
         }
         let sidecar = self.read_runtime_sidecar(session_id).await?;
         supervisor::validate_overlay(&session, sidecar.as_ref())?;
+        self.validate_root_tool_authority_overlay(session_id, &session, sidecar.as_ref())
+            .await?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
         session.clear_stale_root_token_budget();
@@ -5080,8 +5121,25 @@ impl Storage for SessionStoreV2 {
             .await;
 
         let filesystem_started = Instant::now();
+        let root_proof_prepared = self
+            .prepare_root_tool_proof_for_full_save(&abs_dir, session)
+            .await?;
+        if root_proof_prepared {
+            self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Prepared)?;
+        }
         durable_atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        if root_proof_prepared {
+            self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Runtime)?;
+        }
         durable_atomic_write(&path, &session_bytes).await?;
+        if root_proof_prepared {
+            self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Main)?;
+        }
+        Self::commit_root_tool_proof_after_full_save(&abs_dir, session, root_proof_prepared)
+            .await?;
+        if root_proof_prepared {
+            self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Committed)?;
+        }
         let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
@@ -5171,6 +5229,39 @@ impl Storage for SessionStoreV2 {
         self.validate_child_project_for_write(session, false, Some(&rel))
             .await?;
         self.reject_regressing_runtime_task(session).await?;
+        if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
+            let index_bytes = fs::read(&self.index_path).await?;
+            let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
+                .map_err(|error| other_io_error(format!("invalid sessions index: {error}")))?;
+            let globally_indexed = global_index.sessions.get(&session.id).is_some_and(|entry| {
+                entry.kind == SessionKind::Root
+                    && entry.root_session_id == session.id
+                    && entry.rel_path == Self::root_rel_path(&session.id)
+            });
+            if !globally_indexed {
+                // A cold, indexless Root may be damaged. Check its complete pair
+                // before publishing even a runtime checkpoint. The established
+                // indexed path remains bounded independently of transcript size.
+                self.load_authoritative_root_session(&session.id)
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(format!(
+                                "Root canonical index recovery unavailable: {error}"
+                            )),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(
+                                "Root canonical index recovery is missing".into(),
+                            ),
+                        )
+                    })?;
+            }
+        }
         let abs_dir = self.abs_path_from_rel(&rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
@@ -5213,7 +5304,15 @@ impl Storage for SessionStoreV2 {
                 // and a merely stale local index remain transcript-independent.
                 let authoritative = self
                     .load_authoritative_root_session(&session.id)
-                    .await?
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(format!(
+                                "Root canonical index recovery unavailable: {error}"
+                            )),
+                        )
+                    })?
                     .ok_or_else(|| {
                         other_io_error("runtime Root disappeared during index repair")
                     })?;
@@ -7089,16 +7188,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_sidecar_is_ignored_and_session_still_loads() -> io::Result<()> {
+    async fn corrupt_child_sidecar_is_ignored_and_session_still_loads() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
-        let s = session_with_history("sc-4", 2, "run-A");
+        let parent = Session::new("sc-parent", "test-model");
+        storage.save_session(&parent).await?;
+        let mut s = Session::new_child("sc-4", &parent.id, "test-model", "child");
+        s.add_message(Message::user("msg-0"));
+        s.add_message(Message::user("msg-1"));
+        s.agent_runtime_state = Some(AgentRuntimeState::new("run-A"));
         storage.save_session(&s).await?;
 
         // Corrupt the sidecar.
         let sidecar_path = storage.runtime_json_path("sc-4").await?.unwrap();
         tokio::fs::write(&sidecar_path, b"{ not valid json").await?;
 
-        // Session still loads from session.json; corrupt sidecar is ignored.
+        // A Child still loads from session.json; its corrupt sidecar is ignored.
         let loaded = storage.load_session("sc-4").await?.unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
@@ -7727,10 +7831,10 @@ mod tests {
             })
             .await?;
         assert!(storage.get_index_entry(&session.id).await.is_none());
-        assert!(
-            storage.load_session(&session.id).await?.is_none(),
-            "ordinary lookup trusts the missing rebuildable index"
-        );
+        let error = storage.load_session(&session.id).await.unwrap_err();
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
 
         let recovered = storage
             .recover_root_session_from_disk(&session.id)
@@ -8322,8 +8426,10 @@ mod tests {
         let source = Session::new("copy-source", "model");
         storage.save_session(&source).await?;
         let source_dir = storage.sessions_root_dir().join(&source.id);
+        let main_path = source_dir.join("session.json");
+        let before_main = fs::read(&main_path).await?;
 
-        fs::write(source_dir.join("session.json"), b"not-json").await?;
+        fs::write(&main_path, b"not-json").await?;
         let error = storage
             .copy_session(&source.id, "copy-main-corrupt")
             .await
@@ -8331,7 +8437,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(storage.get_index_entry("copy-main-corrupt").await.is_none());
 
-        storage.save_session(&source).await?;
+        // A corrupt Root main cannot be republished from runtime alone.
+        // Restore independently recorded bytes before testing sidecar damage.
+        fs::write(&main_path, before_main).await?;
         fs::write(source_dir.join(RUNTIME_SIDECAR_FILE), b"not-json").await?;
         let error = storage
             .copy_session(&source.id, "copy-sidecar-corrupt")

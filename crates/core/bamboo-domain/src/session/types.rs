@@ -21,6 +21,10 @@ fn default_title_generated() -> bool {
     true
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Message role in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -757,6 +761,12 @@ pub struct Session {
     /// to detect when their session struct holds stale UI metadata.
     #[serde(default)]
     pub metadata_version: u64,
+    /// Host-selected Root execution authority, independent of prompt guidance.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub root_orchestration_only: bool,
+    /// CAS fence for changing Root execution authority across Store instances.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub root_tool_authority_revision: u64,
     #[serde(default)]
     pub kind: SessionKind,
     /// Trusted identity; raw metadata and ordinary persistence cannot assign it.
@@ -898,6 +908,8 @@ impl Session {
             title_version: 0,
             title_generated: false,
             metadata_version: 0,
+            root_orchestration_only: false,
+            root_tool_authority_revision: 0,
             kind: SessionKind::Root,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
@@ -986,6 +998,8 @@ impl Session {
             title_version: 0,
             title_generated: true,
             metadata_version: 0,
+            root_orchestration_only: false,
+            root_tool_authority_revision: 0,
             kind: SessionKind::Child,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
