@@ -743,6 +743,64 @@ async fn collect_until_completed_with_budget(
     }
 }
 
+#[tokio::test]
+async fn queue_commit_then_producer_abort_publishes_start_once_before_completion() {
+    let mut harness = build_harness(Arc::new(CompletedProvider), vec![], &[]).await;
+    let scheduler = crate::runtime::execution::spawn::SpawnScheduler::new(harness.ctx.clone());
+    // `prepare_child_launch` needs this map. Holding it parks the producer
+    // after queue admission but before Start publication.
+    let held_senders = harness.ctx.session_event_senders.write().await;
+    let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+    let job = SpawnJob {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        model: "gpt-5".to_string(),
+        disabled_tools: None,
+    };
+    let producer = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            scheduler
+                .enqueue_announced_with_gate(job, Some("Child session".into()), Some(&gate))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !gate.is_committed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queue entry must commit before aborting producer");
+    producer.abort();
+    assert!(producer.await.unwrap_err().is_cancelled());
+    drop(held_senders);
+
+    let events = collect_until_completed(&mut harness.parent_rx).await;
+    let starts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::SubAgentStarted { child_session_id, .. }
+                    if child_session_id == &harness.child_session_id
+            )
+        })
+        .count();
+    let completed = events.iter().position(|event| {
+        matches!(
+            event,
+            AgentEvent::SubAgentCompleted { child_session_id, .. }
+                if child_session_id == &harness.child_session_id
+        )
+    });
+    assert_eq!(
+        starts, 1,
+        "the worker must publish one fallback Start: {events:?}"
+    );
+    assert!(completed.is_some_and(|index| index > 0), "{events:?}");
+}
+
 // ---------------------------------------------------------------------------
 // S-T2.1 — run_child_spawn integration: ordering + persisted status
 // ---------------------------------------------------------------------------

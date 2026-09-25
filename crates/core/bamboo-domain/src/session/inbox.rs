@@ -747,6 +747,8 @@ impl Default for SessionInboxLimits {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionInboxError {
+    #[error("session message admission was cancelled before the durable commit")]
+    AdmissionCancelled,
     #[error("session inbox target not found: {0}")]
     TargetNotFound(String),
     #[error("session inbox payload is {actual} bytes, limit is {limit}")]
@@ -767,6 +769,18 @@ pub trait SessionInboxPort: Send + Sync {
         &self,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError>;
+
+    /// Check the caller's cancellation gate at the durable inbox publication
+    /// point. Backends without an integrated commit fence fail closed.
+    async fn deliver_with_gate(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _gate: &super::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "cancellation-aware SessionInbox admission is unsupported".into(),
+        ))
+    }
 
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks

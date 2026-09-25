@@ -5,17 +5,18 @@
 //! events forwarded to the parent session stream.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
+use bamboo_domain::{AdmissionCommit, AdmissionGate, RuntimeSessionPersistence, SessionInboxPort};
 use bamboo_llm::ProviderModelRouter;
 
 use crate::runtime::Agent;
@@ -32,6 +33,13 @@ pub struct SpawnJob {
     /// Tool names to hide from the LLM schema for this child session.
     /// Computed from the child's `subagent_type` profile policy.
     pub disabled_tools: Option<Vec<String>>,
+}
+
+struct QueuedSpawnJob {
+    job: SpawnJob,
+    title: Option<String>,
+    announcement_ready: oneshot::Receiver<()>,
+    start_published: Arc<AtomicBool>,
 }
 
 /// Optional application-layer preparation for a child run launched through
@@ -128,13 +136,13 @@ impl SpawnContext {
 
 #[derive(Clone)]
 pub struct SpawnScheduler {
-    tx: mpsc::Sender<SpawnJob>,
+    tx: mpsc::Sender<QueuedSpawnJob>,
     ctx: SpawnContext,
 }
 
 impl SpawnScheduler {
     pub fn new(ctx: SpawnContext) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SpawnJob>(128);
+        let (tx, mut rx) = mpsc::channel::<QueuedSpawnJob>(128);
         let worker_ctx = ctx.clone();
 
         // The worker loop is a single point of failure for ALL child spawning:
@@ -145,20 +153,49 @@ impl SpawnScheduler {
         // worker alive, and still publishes a terminal error completion so the
         // waiting parent is woken instead of stranded.
         tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
+            while let Some(QueuedSpawnJob {
+                job,
+                title,
+                announcement_ready,
+                start_published,
+            }) = rx.recv().await
+            {
                 let job_ctx = worker_ctx.clone();
                 let job_for_panic = job.clone();
                 let handle = tokio::spawn(async move {
+                    // The producer publishes Start before returning to the
+                    // tool. If it is aborted after queue admission, the worker
+                    // publishes Start before any child execution/completion.
+                    if needs_fallback_start(announcement_ready, &start_published).await {
+                        Self::prepare_child_launch(&job_ctx, &job).await;
+                        job_ctx
+                            .replayable_event_publisher()
+                            .publish(
+                                &job.parent_session_id,
+                                AgentEvent::SubAgentStarted {
+                                    parent_session_id: job.parent_session_id.clone(),
+                                    child_session_id: job.child_session_id.clone(),
+                                    title,
+                                },
+                            )
+                            .await;
+                    }
                     if let Err(err) = run_spawn_job(job_ctx, job).await {
                         tracing::warn!("spawn job failed: {}", err);
                     }
+                    Ok(())
                 });
-                if let Err(join_error) = handle.await {
+                let failure = match handle.await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("child spawn panicked: {error}"),
+                };
+                {
                     tracing::error!(
                         parent_session_id = %job_for_panic.parent_session_id,
                         child_session_id = %job_for_panic.child_session_id,
-                        error = %join_error,
-                        "spawn job panicked; publishing terminal error completion"
+                        error = %failure,
+                        "admitted spawn job failed; publishing terminal error completion"
                     );
                     let publisher = worker_ctx.replayable_event_publisher();
                     publish_child_completion_parts(
@@ -167,7 +204,7 @@ impl SpawnScheduler {
                         job_for_panic.parent_session_id.clone(),
                         job_for_panic.child_session_id.clone(),
                         "error".to_string(),
-                        Some(format!("child spawn panicked: {join_error}")),
+                        Some(failure),
                     )
                     .await;
                 }
@@ -198,22 +235,43 @@ impl SpawnScheduler {
         job: SpawnJob,
         title: Option<String>,
     ) -> Result<(), String> {
-        let ctx = self.ctx.clone();
+        match self.enqueue_announced_with_gate(job, title, None).await? {
+            AdmissionCommit::Committed(()) | AdmissionCommit::AlreadyCommitted => Ok(()),
+            AdmissionCommit::Cancelled => unreachable!("an ungated launch cannot be cancelled"),
+        }
+    }
+
+    pub async fn enqueue_announced_with_gate(
+        &self,
+        job: SpawnJob,
+        title: Option<String>,
+        gate: Option<&AdmissionGate>,
+    ) -> Result<AdmissionCommit<()>, String> {
         let preparation_job = job.clone();
-        reserve_prepare_and_send(&self.tx, job, async move {
-            Self::prepare_child_launch(&ctx, &preparation_job).await;
-            ctx.replayable_event_publisher()
-                .publish(
-                    &preparation_job.parent_session_id,
-                    AgentEvent::SubAgentStarted {
-                        parent_session_id: preparation_job.parent_session_id.clone(),
-                        child_session_id: preparation_job.child_session_id.clone(),
-                        title,
-                    },
-                )
-                .await;
-        })
-        .await
+        match reserve_and_send(&self.tx, job, title.clone(), gate).await? {
+            AdmissionCommit::Committed((announce_ready, start_published)) => {
+                Self::prepare_child_launch(&self.ctx, &preparation_job).await;
+                self.ctx
+                    .replayable_event_publisher()
+                    .publish(
+                        &preparation_job.parent_session_id,
+                        AgentEvent::SubAgentStarted {
+                            parent_session_id: preparation_job.parent_session_id.clone(),
+                            child_session_id: preparation_job.child_session_id.clone(),
+                            title,
+                        },
+                    )
+                    .await;
+                // From publication through the acknowledgement there is no
+                // await. A dropped producer after this point must not make
+                // the worker publish a duplicate Start.
+                start_published.store(true, Ordering::SeqCst);
+                let _ = announce_ready.send(());
+                Ok(AdmissionCommit::Committed(()))
+            }
+            AdmissionCommit::AlreadyCommitted => Ok(AdmissionCommit::AlreadyCommitted),
+            AdmissionCommit::Cancelled => Ok(AdmissionCommit::Cancelled),
+        }
     }
 
     /// Publish replayable parent-session state through the scheduler's shared
@@ -264,6 +322,13 @@ impl SpawnScheduler {
     }
 }
 
+async fn needs_fallback_start(
+    announcement_ready: oneshot::Receiver<()>,
+    start_published: &AtomicBool,
+) -> bool {
+    announcement_ready.await.is_err() && !start_published.load(Ordering::SeqCst)
+}
+
 fn invoke_child_run_launch_hook(
     hook: Option<&Arc<dyn ChildRunLaunchHook>>,
     job: &SpawnJob,
@@ -284,20 +349,54 @@ fn invoke_child_run_launch_hook(
     }
 }
 
-/// Reserve queue capacity before polling observer setup. A closed scheduler
-/// therefore cannot start a relay/observer for a child that will never launch.
-async fn reserve_prepare_and_send(
-    tx: &mpsc::Sender<SpawnJob>,
+/// The queue send is the admission commit. The cancellation fence and send run
+/// in one synchronous critical section after capacity is reserved. Observer
+/// setup and `SubAgentStarted` run only for a committed queue entry, before
+/// the child execution starts.
+async fn reserve_and_send(
+    tx: &mpsc::Sender<QueuedSpawnJob>,
     job: SpawnJob,
-    preparation: impl std::future::Future<Output = ()>,
-) -> Result<(), String> {
-    let permit = tx
-        .reserve()
-        .await
-        .map_err(|_| "spawn scheduler is not running".to_string())?;
-    preparation.await;
-    permit.send(job);
-    Ok(())
+    title: Option<String>,
+    gate: Option<&AdmissionGate>,
+) -> Result<AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>, String> {
+    if let Some(gate) = gate {
+        if gate.is_committed() {
+            return Ok(AdmissionCommit::AlreadyCommitted);
+        }
+        if gate.is_cancelled() {
+            return Ok(AdmissionCommit::Cancelled);
+        }
+    }
+    let permit = match gate {
+        Some(gate) => tokio::select! {
+            biased;
+            _ = gate.cancelled() => return Ok(AdmissionCommit::Cancelled),
+            permit = tx.reserve() => permit,
+        },
+        None => tx.reserve().await,
+    }
+    .map_err(|_| "spawn scheduler is not running".to_string())?;
+    let (announce_ready, announcement_ready) = oneshot::channel();
+    let start_published = Arc::new(AtomicBool::new(false));
+    let queued = QueuedSpawnJob {
+        job,
+        title,
+        announcement_ready,
+        start_published: start_published.clone(),
+    };
+    match gate {
+        Some(gate) => gate.commit(|| {
+            permit.send(queued);
+            Ok((announce_ready, start_published))
+        }),
+        None => {
+            permit.send(queued);
+            Ok(AdmissionCommit::Committed((
+                announce_ready,
+                start_published,
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -541,15 +640,109 @@ mod launch_hook_tests {
     async fn closed_scheduler_does_not_prepare_phantom_launch() {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let preparations = Arc::new(AtomicUsize::new(0));
-        let preparations_for_future = preparations.clone();
-
-        let result = reserve_prepare_and_send(&tx, job(), async move {
-            preparations_for_future.fetch_add(1, Ordering::SeqCst);
-        })
-        .await;
+        let result = reserve_and_send(&tx, job(), None, None).await;
 
         assert_eq!(result.unwrap_err(), "spawn scheduler is not running");
-        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_queue_capacity_never_sends() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_, announcement_ready) = oneshot::channel();
+        tx.send(QueuedSpawnJob {
+            job: job(),
+            title: None,
+            announcement_ready,
+            start_published: Arc::new(AtomicBool::new(false)),
+        })
+        .await
+        .unwrap();
+        let gate = Arc::new(AdmissionGate::default());
+        let waiting = {
+            let tx = tx.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move { reserve_and_send(&tx, job(), None, Some(&gate)).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        gate.cancel_if_pending();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(200), waiting)
+                .await
+                .expect("cancellation must wake without freeing queue capacity")
+                .unwrap()
+                .unwrap(),
+            AdmissionCommit::Cancelled
+        ));
+        rx.recv().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_queue_gate_does_not_enqueue_a_duplicate_job() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let gate = AdmissionGate::default();
+        assert!(matches!(
+            reserve_and_send(&tx, job(), None, Some(&gate))
+                .await
+                .unwrap(),
+            AdmissionCommit::Committed(_)
+        ));
+        assert!(matches!(
+            reserve_and_send(&tx, job(), None, Some(&gate))
+                .await
+                .unwrap(),
+            AdmissionCommit::AlreadyCommitted
+        ));
+        rx.recv().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn producer_drop_after_start_publication_does_not_require_fallback_start() {
+        let (announce_ready, announcement_ready) = oneshot::channel::<()>();
+        let start_published = Arc::new(AtomicBool::new(false));
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let senders = Arc::new(RwLock::new(HashMap::new()));
+        let (sender, mut receiver) = broadcast::channel(4);
+        senders.write().await.insert("parent".to_string(), sender);
+        let publisher = super::super::session_events::ReplayableSessionEventPublisher::new(
+            runners, senders, None,
+        );
+        // Reproduce the precise post-publish, pre-ack producer loss: the
+        // worker observes a closed announcement channel, but Start is already
+        // in the replayable event stream.
+        publisher
+            .publish(
+                "parent",
+                AgentEvent::SubAgentStarted {
+                    parent_session_id: "parent".to_string(),
+                    child_session_id: "child".to_string(),
+                    title: None,
+                },
+            )
+            .await;
+        start_published.store(true, Ordering::SeqCst);
+        drop(announce_ready);
+        assert!(!needs_fallback_start(announcement_ready, &start_published).await);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AgentEvent::SubAgentStarted { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let (announce_ready, announcement_ready) = oneshot::channel::<()>();
+        let start_published = AtomicBool::new(false);
+        drop(announce_ready);
+        assert!(needs_fallback_start(announcement_ready, &start_published).await);
     }
 }

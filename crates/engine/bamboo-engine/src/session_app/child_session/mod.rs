@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::Session;
+use bamboo_domain::{AdmissionCommit, AdmissionGate};
 use std::collections::HashMap;
 
 mod actions;
@@ -86,13 +87,17 @@ pub struct ChildRunnerInfo {
 
 /// Result of a logical parent→child delivery.
 ///
-/// Both variants mean the envelope is already durable. `ActivationPending`
-/// preserves the enqueue-success/wake-failure distinction so a tool caller can
-/// report success and let restart recovery retry the durable activation instead
-/// of generating a second message id.
+/// Every variant means the envelope is already durable. `ActivationPending`
+/// has a durable eligibility watermark and restart recovery can retry it.
+/// `ActivationAuthorizationPending` has no such watermark, so the same
+/// operation must be retried and may not be reported as restart-recoverable.
 #[derive(Debug)]
 pub enum ChildSessionMessageDelivery {
     Activated(crate::SessionMessengerReceipt),
+    ActivationAuthorizationPending {
+        delivery: bamboo_domain::SessionInboxReceipt,
+        error: String,
+    },
     ActivationPending {
         delivery: bamboo_domain::SessionInboxReceipt,
         error: String,
@@ -268,6 +273,30 @@ pub trait ChildSessionPort: Send + Sync {
             "logical SessionMessenger is not configured for this runtime".to_string(),
         ))
     }
+    /// The gate is checked at the durable SessionInbox rename, not when this
+    /// asynchronous port call begins. Implementations without that boundary
+    /// must fail closed for gated deliveries.
+    async fn send_session_message_with_gate(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+        gate: Option<&AdmissionGate>,
+    ) -> Result<ChildSessionMessageDelivery, ChildSessionError> {
+        if gate.is_some() {
+            return Err(ChildSessionError::Execution(
+                "cancellation-aware SessionInbox admission is unsupported".into(),
+            ));
+        }
+        self.send_session_message(
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+        )
+        .await
+    }
     /// Commit the live parent's posture plus a validated workspace when
     /// reusing a resident. Persistence happens before the runtime workspace is
     /// published, so a failed save cannot move tools onto an uncommitted path.
@@ -325,6 +354,22 @@ pub trait ChildSessionPort: Send + Sync {
         parent: &Session,
         child: &Session,
     ) -> Result<(), ChildSessionError>;
+    /// Admit one child job at the scheduler's synchronous queue send. Repeating
+    /// with a committed gate must not enqueue the job again.
+    async fn admit_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&AdmissionGate>,
+    ) -> Result<AdmissionCommit<()>, ChildSessionError> {
+        if gate.is_some() {
+            return Err(ChildSessionError::Execution(
+                "cancellation-aware child job admission is unsupported".into(),
+            ));
+        }
+        self.enqueue_child_run(parent, child).await?;
+        Ok(AdmissionCommit::Committed(()))
+    }
     async fn cancel_child_run_and_wait(&self, child_id: &str) -> Result<(), ChildSessionError>;
     async fn delete_child_session(
         &self,

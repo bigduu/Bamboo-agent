@@ -729,7 +729,7 @@ pub async fn send_message_to_child_action(
         interrupt_running,
         idempotency_key,
         wait_if_queued,
-        &|| true,
+        None,
     )
     .await
 }
@@ -744,7 +744,7 @@ pub async fn send_message_to_child_action_with_gate(
     interrupt_running: Option<bool>,
     idempotency_key: Option<&str>,
     wait_if_queued: bool,
-    begin_delivery: &(dyn Fn() -> bool + Send + Sync),
+    admission_gate: Option<&bamboo_domain::AdmissionGate>,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(&parent.id, &child_session_id)
@@ -761,16 +761,27 @@ pub async fn send_message_to_child_action_with_gate(
 
     let mut is_running = port.is_child_running(&child.id).await;
     let should_interrupt = interrupt_running.unwrap_or(false);
+    let mut delivery_gate = admission_gate;
 
     if is_running && should_interrupt {
         // Interrupting an existing run is itself an irreversible part of this
         // delivery. Once it starts, the owner must finish preparing the new
         // message even if the caller disappears.
-        if !begin_delivery() {
-            return Err(ChildSessionError::Execution(
-                "SubAgent tool cancelled before child delivery".to_string(),
-            ));
+        if let Some(gate) = admission_gate {
+            match gate.commit(|| Ok::<(), ChildSessionError>(()))? {
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    return Err(ChildSessionError::Execution(
+                        "SubAgent tool cancelled before child interruption".to_string(),
+                    ));
+                }
+                bamboo_domain::AdmissionCommit::Committed(())
+                | bamboo_domain::AdmissionCommit::AlreadyCommitted => {}
+            }
         }
+        // The stop is the first irreversible effect, so this branch has
+        // committed its owner before that call. A second Inbox gate would see
+        // an already-committed operation rather than a message receipt.
+        delivery_gate = None;
         port.cancel_child_run_and_wait(&child.id).await?;
         child = port
             .load_child_for_parent(&parent.id, &child_session_id)
@@ -813,7 +824,7 @@ pub async fn send_message_to_child_action_with_gate(
                 });
             }
         }
-        if !begin_delivery() {
+        if delivery_gate.is_some_and(bamboo_domain::AdmissionGate::is_cancelled) {
             let error = ChildSessionError::Execution(
                 "SubAgent tool cancelled before child delivery".to_string(),
             );
@@ -823,10 +834,28 @@ pub async fn send_message_to_child_action_with_gate(
                 error
             });
         }
-        let delivery = match port
-            .send_session_message(&parent.id, &child.id, &message, idempotency_key)
-            .await
-        {
+        let send = port.send_session_message_with_gate(
+            &parent.id,
+            &child.id,
+            &message,
+            idempotency_key,
+            delivery_gate,
+        );
+        // The detached owner must not hold a newly armed parent wait while a
+        // pre-commit inbox lock or temp write remains blocked. The durable
+        // rename runs synchronously under this same gate; after it commits,
+        // cancellation cannot win this select and activation keeps its owner.
+        let delivery = match delivery_gate {
+            Some(gate) => tokio::select! {
+                biased;
+                _ = gate.cancelled() => Err(ChildSessionError::Execution(
+                    "SubAgent tool cancelled before child delivery".to_string(),
+                )),
+                result = send => result,
+            },
+            None => send.await,
+        };
+        let delivery = match delivery {
             Ok(delivery) => delivery,
             Err(error) if armed_wait && !had_wait => {
                 return Err(rollback_failed_wait_launch(port, &parent.id, &child.id, error).await);
@@ -864,6 +893,16 @@ pub async fn send_message_to_child_action_with_gate(
                 "Message is durable; activation is pending and will be retried from the inbox watermark.",
                 Some(error),
             ),
+            super::ChildSessionMessageDelivery::ActivationAuthorizationPending {
+                delivery,
+                error,
+            } => (
+                delivery,
+                None,
+                "activation_retry_required",
+                "Message is durable, but activation authorization was not persisted. The same message ID must be retried; restart alone cannot wake this delivery.",
+                Some(error),
+            ),
         };
         if armed_wait && !had_wait && status != "queued" {
             port.rollback_parent_wait_for_child(&parent.id, &child.id)
@@ -887,8 +926,10 @@ pub async fn send_message_to_child_action_with_gate(
 
     // Explicit `auto_run=false` on an idle child retains its historical
     // draft-only behavior. All runnable/live delivery paths above converge on
-    // SessionMessenger and never rewrite a snapshot to enqueue.
-    if !begin_delivery() {
+    // SessionMessenger and never rewrite a snapshot to enqueue. The draft's
+    // multi-file Session save still needs its own final-commit cancellation
+    // fence (#1328); this fast check only avoids work already cancelled here.
+    if delivery_gate.is_some_and(bamboo_domain::AdmissionGate::is_cancelled) {
         return Err(ChildSessionError::Execution(
             "SubAgent tool cancelled before child delivery".to_string(),
         ));

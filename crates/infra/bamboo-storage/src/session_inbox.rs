@@ -53,6 +53,8 @@ pub struct FileSessionInbox {
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
     #[cfg(test)]
     followup_authority_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    admission_commit_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl FileSessionInbox {
@@ -63,6 +65,8 @@ impl FileSessionInbox {
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             followup_authority_pause: None,
+            #[cfg(test)]
+            admission_commit_pause: None,
         }
     }
 
@@ -509,6 +513,7 @@ impl FileSessionInbox {
         &self,
         envelope: &SessionMessageEnvelope,
         _lifecycle: &crate::v2::SessionLifecycleReadGuard,
+        gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         envelope
             .validate()
@@ -531,6 +536,16 @@ impl FileSessionInbox {
         if let Some(receipt) = Self::existing_receipt(&dir, envelope).await? {
             return Ok(receipt);
         }
+        if let Some(gate) = gate {
+            if gate.is_cancelled() {
+                return Err(SessionInboxError::AdmissionCancelled);
+            }
+            if gate.is_committed() {
+                return Err(SessionInboxError::Storage(
+                    "committed inbox admission has no matching durable receipt".into(),
+                ));
+            }
+        }
         let mailbox = Mailbox::at(&dir);
         let current = Self::valid_queue_entries(&dir, "new").await?.len()
             + Self::valid_queue_entries(&dir, "cur").await?.len();
@@ -542,10 +557,37 @@ impl FileSessionInbox {
         }
 
         let generation = Self::next_generation(&dir).await?;
-        mailbox
-            .deliver(&Self::wrapper(envelope, generation))
-            .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        if gate.is_some() {
+            if let Some((entered, release)) = &self.admission_commit_pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        let wrapper = Self::wrapper(envelope, generation);
+        match gate {
+            Some(gate) => match mailbox
+                .deliver_with_gate(&wrapper, gate)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            {
+                bamboo_domain::AdmissionCommit::Committed(_) => {}
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    return Err(SessionInboxError::AdmissionCancelled);
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    return Err(SessionInboxError::Storage(
+                        "committed inbox admission has no matching durable receipt".into(),
+                    ));
+                }
+            },
+            None => {
+                mailbox
+                    .deliver(&wrapper)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            }
+        }
         Ok(SessionInboxReceipt {
             id: envelope.id.clone(),
             generation,
@@ -573,7 +615,18 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let lifecycle = self.lock_lifecycle().await?;
-        self.deliver_with_lifecycle_held(envelope, &lifecycle).await
+        self.deliver_with_lifecycle_held(envelope, &lifecycle, None)
+            .await
+    }
+
+    async fn deliver_with_gate(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let lifecycle = self.lock_lifecycle().await?;
+        self.deliver_with_lifecycle_held(envelope, &lifecycle, Some(gate))
+            .await
     }
 
     async fn deliver_supervisor_followup(
@@ -604,7 +657,7 @@ impl SessionInboxPort for FileSessionInbox {
         // Never call public deliver here: a queued lifecycle writer would make
         // that nested shared acquisition deadlock. This is the same adapter,
         // operation lock, semantic receipt and Maildir transaction as deliver.
-        self.deliver_with_lifecycle_held(envelope, authority.lifecycle())
+        self.deliver_with_lifecycle_held(envelope, authority.lifecycle(), None)
             .await
     }
 
@@ -1035,6 +1088,58 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_inbox_commit_publishes_no_message_after_restart() {
+        let (_temp, sessions, mut inbox) = fixture(SessionInboxLimits::default()).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        inbox.admission_commit_pause = Some((entered.clone(), release.clone()));
+        let inbox = Arc::new(inbox);
+        let envelope = SessionMessageEnvelope::user_input("session-1", "cancel me");
+        let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+        let delivery = {
+            let inbox = inbox.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move { inbox.deliver_with_gate(&envelope, &gate).await })
+        };
+        entered.notified().await;
+        gate.cancel_if_pending();
+        release.notify_one();
+        assert!(matches!(
+            delivery.await.unwrap(),
+            Err(SessionInboxError::AdmissionCancelled)
+        ));
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        let backlog = reopened.inspect("session-1").await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert_eq!(backlog.activation_generation, 0);
+        let dir = reopened.inbox_dir("session-1").await.unwrap().join("new");
+        let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_gate_reuses_exact_receipt_after_retry_and_restart() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let envelope = SessionMessageEnvelope::user_input("session-1", "once");
+        let gate = bamboo_domain::AdmissionGate::default();
+        let first = inbox.deliver_with_gate(&envelope, &gate).await.unwrap();
+        gate.cancel_if_pending();
+        assert!(gate.is_committed());
+        assert_eq!(
+            inbox.deliver_with_gate(&envelope, &gate).await.unwrap(),
+            first
+        );
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        assert_eq!(
+            reopened.deliver_with_gate(&envelope, &gate).await.unwrap(),
+            first
+        );
+        let backlog = reopened.inspect("session-1").await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert_eq!(backlog.generation, first.generation);
     }
 
     #[tokio::test]

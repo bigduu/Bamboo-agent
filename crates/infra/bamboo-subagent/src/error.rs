@@ -51,6 +51,37 @@ impl StoreError {
 /// The temp name is hidden (`.`-prefixed) and unique so concurrent writers and directory
 /// scanners (e.g. mailbox `drain`) skip it.
 pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    match atomic_write_with_gate(path, bytes, None).await? {
+        bamboo_domain::AdmissionCommit::Committed(()) => Ok(()),
+        _ => unreachable!("ungated atomic write always commits"),
+    }
+}
+
+struct HiddenTempCleanup(std::path::PathBuf);
+
+impl Drop for HiddenTempCleanup {
+    fn drop(&mut self) {
+        // The gated writer owns this guard for its entire blocking write, even
+        // if the awaiting async future is dropped. Hidden temp files are never
+        // delivered messages.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+pub(crate) async fn atomic_write_with_gate(
+    path: &Path,
+    bytes: &[u8],
+    gate: Option<&bamboo_domain::AdmissionGate>,
+) -> Result<bamboo_domain::AdmissionCommit<()>> {
+    atomic_write_with_gate_inner(path, bytes, gate, None).await
+}
+
+async fn atomic_write_with_gate_inner(
+    path: &Path,
+    bytes: &[u8],
+    gate: Option<&bamboo_domain::AdmissionGate>,
+    before_commit: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<bamboo_domain::AdmissionCommit<()>> {
     use tokio::io::AsyncWriteExt;
 
     let dir = path
@@ -62,19 +93,105 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{stem}.tmp.{}", uuid::Uuid::new_v4()));
+    if let Some(gate) = gate {
+        let gate = bamboo_domain::AdmissionGate::clone(gate);
+        let path = path.to_path_buf();
+        let bytes = bytes.to_vec();
+        // The task owns both temp creation and cleanup. Dropping the awaiting
+        // future cannot race an in-flight async create/write that recreates a
+        // hidden temp after its cleanup guard has already run.
+        return tokio::task::spawn_blocking(move || {
+            use std::io::Write;
 
-    {
-        let mut f = tokio::fs::File::create(&tmp)
-            .await
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(bytes)
-            .await
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
+            let _cleanup = HiddenTempCleanup(tmp.clone());
+            if gate.is_cancelled() {
+                return Ok(bamboo_domain::AdmissionCommit::Cancelled);
+            }
+            let mut file = std::fs::File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
+            file.write_all(&bytes)
+                .map_err(|e| StoreError::io(&tmp, e))?;
+            file.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+            drop(file);
+            if let Some(before_commit) = before_commit {
+                before_commit();
+            }
+            gate.commit(|| std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e)))
+        })
+        .await
+        .map_err(|error| StoreError::Invalid(format!("inbox write task failed: {error}")))?;
     }
 
+    let _cleanup = HiddenTempCleanup(tmp.clone());
+    {
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        file.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
+    }
     tokio::fs::rename(&tmp, path)
         .await
         .map_err(|e| StoreError::io(path, e))?;
-    Ok(())
+    Ok(bamboo_domain::AdmissionCommit::Committed(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[tokio::test]
+    async fn cancelled_after_fsync_before_rename_cleans_hidden_temp_after_awaiter_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("visible.json");
+        let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let before_commit: Arc<dyn Fn() + Send + Sync> = {
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                entered.notify_one();
+                let (lock, condvar) = &*release;
+                let released = lock.lock().unwrap();
+                drop(condvar.wait_while(released, |released| !*released).unwrap());
+            })
+        };
+        let writing = {
+            let gate = gate.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                atomic_write_with_gate_inner(
+                    &target,
+                    b"durable bytes",
+                    Some(&gate),
+                    Some(before_commit),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("writer must flush the hidden temp before rename");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+
+        gate.cancel_if_pending();
+        writing.abort();
+        assert!(writing.await.unwrap_err().is_cancelled());
+        let (lock, condvar) = &*release;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::fs::read_dir(temp.path()).unwrap().count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached writer must clean its hidden temp");
+        assert!(!target.exists());
+        assert!(gate.is_cancelled());
+    }
 }

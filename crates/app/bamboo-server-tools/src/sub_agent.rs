@@ -2,46 +2,21 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use uuid::Uuid;
 
 type SynchronousLaunchLocks = Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>;
 
-const LAUNCH_PENDING: u8 = 0;
-const LAUNCH_COMMITTING: u8 = 1;
-const LAUNCH_CANCELLED: u8 = 2;
-
 #[derive(Default)]
-struct LaunchGate(AtomicU8);
+struct LaunchGate(bamboo_domain::AdmissionGate);
 
 impl LaunchGate {
     fn cancel_if_pending(&self) {
-        let _ = self.0.compare_exchange(
-            LAUNCH_PENDING,
-            LAUNCH_CANCELLED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        self.0.cancel_if_pending();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == LAUNCH_CANCELLED
-    }
-
-    fn begin_commit(&self) -> bool {
-        match self.0.compare_exchange(
-            LAUNCH_PENDING,
-            LAUNCH_COMMITTING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) | Err(LAUNCH_COMMITTING) => true,
-            Err(LAUNCH_CANCELLED) => false,
-            Err(_) => unreachable!("launch gate has an unknown state"),
-        }
+        self.0.is_cancelled()
     }
 }
 
@@ -338,43 +313,83 @@ async fn enqueue_waiting_child(
             .await,
         ));
     }
-    if launch_gate.is_some_and(|gate| !gate.begin_commit()) {
-        let error = cancelled_launch_error();
-        if had_wait {
-            return Err(tool_error_from_child_session(error));
+    let admit = sessions.admit_child_run(parent, &child, launch_gate.map(|gate| &gate.0));
+    let admission = match launch_gate {
+        Some(gate) => tokio::select! {
+            biased;
+            _ = gate.0.cancelled() => Ok(bamboo_domain::AdmissionCommit::Cancelled),
+            result = admit => result,
+        },
+        None => admit.await,
+    };
+    let error = match admission {
+        Ok(bamboo_domain::AdmissionCommit::Committed(()))
+        | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => return Ok(()),
+        Ok(bamboo_domain::AdmissionCommit::Cancelled) => cancelled_launch_error(),
+        Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
+            tracing::warn!(child_session_id, %error, "child job was admitted despite a later port error");
+            return Ok(());
         }
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
-        return Err(tool_error_from_child_session(
-            child_session::rollback_failed_wait_launch(
-                sessions,
-                &parent.id,
-                child_session_id,
-                error,
-            )
-            .await,
-        ));
+        Err(error) => error,
+    };
+    // A confirmed scheduler rejection leaves the prepared child pending.
+    // The end-of-turn safety net treats pending as active and would arm a new
+    // orphan wait. Mark this run as retryable terminal failure first. Preserve
+    // any wait that a different operation already owned.
+    if had_wait {
+        return Err(tool_error_from_child_session(error));
     }
-    if let Err(error) = sessions.enqueue_child_run(parent, &child).await {
-        // A confirmed scheduler rejection leaves the prepared child pending.
-        // The end-of-turn safety net treats pending as active and would arm a
-        // new orphan wait. Mark this run as a retryable terminal failure first.
-        // If another operation already owned this child's wait, preserve its
-        // state: this failed enqueue did not acquire that wait entry.
-        if had_wait {
-            return Err(tool_error_from_child_session(error));
+    let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+    Err(tool_error_from_child_session(
+        child_session::rollback_failed_wait_launch(sessions, &parent.id, child_session_id, error)
+            .await,
+    ))
+}
+
+/// Background launches have no explicit parent wait to compensate, but a
+/// prepared Child must become terminal when its queue admission is cancelled
+/// or rejected so the parent's end-of-turn orphan scan cannot arm one later.
+async fn enqueue_background_child(
+    sessions: &dyn ChildSessionPort,
+    parent: &bamboo_agent_core::Session,
+    child_session_id: &str,
+    launch_gate: Option<&LaunchGate>,
+) -> Result<(), ToolError> {
+    let child = sessions
+        .load_child_for_parent(&parent.id, child_session_id)
+        .await
+        .map_err(tool_error_from_child_session)?;
+    let admit = sessions.admit_child_run(parent, &child, launch_gate.map(|gate| &gate.0));
+    let admission = match launch_gate {
+        Some(gate) => tokio::select! {
+            biased;
+            _ = gate.0.cancelled() => Ok(bamboo_domain::AdmissionCommit::Cancelled),
+            result = admit => result,
+        },
+        None => admit.await,
+    };
+    match admission {
+        Ok(bamboo_domain::AdmissionCommit::Committed(()))
+        | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => Ok(()),
+        Ok(bamboo_domain::AdmissionCommit::Cancelled) => {
+            let error = mark_failed_child_enqueue(
+                sessions,
+                parent,
+                child_session_id,
+                cancelled_launch_error(),
+            )
+            .await;
+            Err(tool_error_from_child_session(error))
         }
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
-        return Err(tool_error_from_child_session(
-            child_session::rollback_failed_wait_launch(
-                sessions,
-                &parent.id,
-                child_session_id,
-                error,
-            )
-            .await,
-        ));
+        Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
+            tracing::warn!(child_session_id, %error, "background child job was admitted despite a later port error");
+            Ok(())
+        }
+        Err(error) => {
+            let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+            Err(tool_error_from_child_session(error))
+        }
     }
-    Ok(())
 }
 
 async fn mark_failed_child_enqueue(
@@ -770,15 +785,10 @@ impl Tool for SubAgentTool {
         // port. Their internal durable-admission boundary is tracked by #1313.
         let action = args.get("action").and_then(serde_json::Value::as_str);
         let owns_launch = match action.unwrap_or("create") {
-            "create" => {
-                args.get("auto_run")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true)
-                    && args
-                        .get("wait")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-            }
+            "create" => args
+                .get("auto_run")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
             "update" => args
                 .get("auto_run")
                 .and_then(serde_json::Value::as_bool)
@@ -1099,6 +1109,7 @@ impl SubAgentTool {
                             .await
                             .map_err(tool_error_from_child_session)?;
                         require_resident_project_identity(parent_project_id.as_ref(), &child)?;
+                        let mut resident_delivery_gate = launch_gate.as_deref();
 
                         // A resident processes tasks serially. If it is still running
                         // a previous task, stop it first: otherwise `reset` would
@@ -1108,14 +1119,26 @@ impl SubAgentTool {
                         // before picking it up (the task would never execute). After
                         // cancel the resident is idle, so both paths apply cleanly.
                         if self.sessions.is_child_running(&existing_id).await {
-                            if launch_gate
-                                .as_ref()
-                                .is_some_and(|gate| !gate.begin_commit())
-                            {
-                                return Err(tool_error_from_child_session(
-                                    cancelled_launch_error(),
-                                ));
+                            if let Some(gate) = resident_delivery_gate {
+                                match gate
+                                    .0
+                                    .commit(|| Ok::<(), std::convert::Infallible>(()))
+                                    .unwrap_or_else(|never| match never {})
+                                {
+                                    bamboo_domain::AdmissionCommit::Cancelled => {
+                                        return Err(tool_error_from_child_session(
+                                            cancelled_launch_error(),
+                                        ));
+                                    }
+                                    bamboo_domain::AdmissionCommit::Committed(())
+                                    | bamboo_domain::AdmissionCommit::AlreadyCommitted => {}
+                                }
                             }
+                            // Stopping the old run is the first irreversible
+                            // effect. The detached owner must finish delivery,
+                            // and this spent gate cannot guard another queue
+                            // or Inbox admission.
+                            resident_delivery_gate = None;
                             self.sessions
                                 .cancel_child_run_and_wait(&existing_id)
                                 .await
@@ -1212,11 +1235,6 @@ impl SubAgentTool {
                                 &prompt,
                                 assignment_background.as_deref(),
                             );
-                            let begin_delivery = || {
-                                launch_gate
-                                    .as_ref()
-                                    .is_none_or(|gate| gate.begin_commit())
-                            };
                             let delivery = child_session::send_message_to_child_action_with_gate(
                                 self.sessions.as_ref(),
                                 &parent,
@@ -1226,7 +1244,7 @@ impl SubAgentTool {
                                 Some(false),
                                 Some(ctx.tool_call_id.as_ref()),
                                 requested_wait,
-                                &begin_delivery,
+                                resident_delivery_gate.map(|gate| &gate.0),
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1274,19 +1292,17 @@ impl SubAgentTool {
                                         &parent,
                                         &existing_id,
                                         ctx.tool_call_id.as_ref(),
-                                        launch_gate.as_deref(),
+                                        resident_delivery_gate,
                                     )
                                     .await?;
                                 } else {
-                                    let child = self
-                                        .sessions
-                                        .load_child_for_parent(&parent.id, &existing_id)
-                                        .await
-                                        .map_err(tool_error_from_child_session)?;
-                                    self.sessions
-                                        .enqueue_child_run(&parent, &child)
-                                        .await
-                                        .map_err(tool_error_from_child_session)?;
+                                    enqueue_background_child(
+                                        self.sessions.as_ref(),
+                                        &parent,
+                                        &existing_id,
+                                        resident_delivery_gate,
+                                    )
+                                    .await?;
                                 }
                             }
                             requested_wait
@@ -1336,7 +1352,9 @@ impl SubAgentTool {
                                 model_ref_override,
                                 runtime_metadata,
                                 read_only: false,
-                                auto_run: should_auto_run && !requested_wait,
+                                // Both synchronous and background launches use
+                                // the same guarded admission after this save.
+                                auto_run: false,
                                 reasoning_effort: effective_reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
                                 resident_name: resident_name.clone(),
@@ -1360,6 +1378,14 @@ impl SubAgentTool {
                                 &parent,
                                 &result.child_session_id,
                                 ctx.tool_call_id.as_ref(),
+                                launch_gate.as_deref(),
+                            )
+                            .await?;
+                        } else if should_auto_run {
+                            enqueue_background_child(
+                                self.sessions.as_ref(),
+                                &parent,
+                                &result.child_session_id,
                                 launch_gate.as_deref(),
                             )
                             .await?;
@@ -1632,7 +1658,7 @@ impl SubAgentTool {
                     }
                     if launch_gate
                         .as_ref()
-                        .is_some_and(|gate| !gate.begin_commit())
+                        .is_some_and(|gate| gate.is_cancelled())
                     {
                         if !had_wait {
                             self.sessions
@@ -1692,11 +1718,6 @@ impl SubAgentTool {
                 interrupt_running,
             } => {
                 let should_auto_run = auto_run.unwrap_or(true);
-                let begin_delivery = || {
-                    launch_gate
-                        .as_ref()
-                        .is_none_or(|gate| gate.begin_commit())
-                };
                 let result = child_session::send_message_to_child_action_with_gate(
                     self.sessions.as_ref(),
                     &parent,
@@ -1706,7 +1727,7 @@ impl SubAgentTool {
                     interrupt_running,
                     Some(ctx.tool_call_id.as_ref()),
                     should_auto_run,
-                    &begin_delivery,
+                    launch_gate.as_deref().map(|gate| &gate.0),
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;

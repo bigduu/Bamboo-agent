@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{atomic_write, Result, StoreError};
+use crate::error::{atomic_write, atomic_write_with_gate, Result, StoreError};
 
 /// Idempotency key for a delivered message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -212,6 +212,31 @@ impl Mailbox {
         // atomic_write puts its temp in new/ as a hidden `.`-file that drain skips.
         atomic_write(&self.new_dir().join(&name), &bytes).await?;
         Ok(msg.id.clone())
+    }
+
+    /// The same Maildir delivery with a cancellation fence on the final
+    /// temp-file rename. A cancelled attempt publishes no visible message.
+    pub async fn deliver_with_gate(
+        &self,
+        msg: &InboxMessage,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        let bytes = serde_json::to_vec_pretty(msg).map_err(|e| StoreError::decode(&self.dir, e))?;
+        let nanos = msg.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+        let name = format!("{nanos:020}-{}.json", msg.id.0);
+        Ok(
+            match atomic_write_with_gate(&self.new_dir().join(name), &bytes, Some(gate)).await? {
+                bamboo_domain::AdmissionCommit::Committed(()) => {
+                    bamboo_domain::AdmissionCommit::Committed(msg.id.clone())
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    bamboo_domain::AdmissionCommit::AlreadyCommitted
+                }
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    bamboo_domain::AdmissionCommit::Cancelled
+                }
+            },
+        )
     }
 
     // ---- receiver side (single reader = the actor) ------------------------
