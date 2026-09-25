@@ -1286,7 +1286,15 @@ mod tests {
 
         for code in ["for (;;) {}", "new Promise(() => {})"] {
             let opened = browser.open("eval-hung-chat").await.unwrap();
-            let epoch = opened["page_epoch"].as_u64().unwrap();
+            let created = browser
+                .command(
+                    "eval-hung-chat",
+                    "tab_create",
+                    json!({"expected_epoch":opened["page_epoch"]}),
+                )
+                .await
+                .unwrap();
+            let epoch = created["page_epoch"].as_u64().unwrap();
             if let Some(previous_epoch) = previous_epoch {
                 assert_ne!(epoch, previous_epoch);
             }
