@@ -2490,7 +2490,7 @@ impl SessionStoreV2 {
             // Only canonical Root absence permits its normal control-plane read.
         }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
-            self.validate_root_tool_authority_against_main(&side)
+            self.validate_root_tool_authority_against_main(session_id, &side)
                 .await?;
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }

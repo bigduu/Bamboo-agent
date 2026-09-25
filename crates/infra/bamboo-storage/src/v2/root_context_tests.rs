@@ -313,6 +313,73 @@ async fn restored_stale_valid_root_sidecar_cannot_reopen_or_overwrite_tool_autho
 }
 
 #[tokio::test]
+async fn root_control_plane_rejects_child_kind_and_foreign_id_sidecars_after_reopen() {
+    for foreign_id in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let first = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut selected = root();
+        selected.set_root_orchestration_only(true).unwrap();
+        first.save_session(&selected).await.unwrap();
+
+        let child = Session::new_child_of("genuine-child", &selected, "model", "child");
+        first.save_session(&child).await.unwrap();
+        let runtime = directory(&first, &selected.id).join(RUNTIME_SIDECAR_FILE);
+        if foreign_id {
+            let mut other = Session::new("other-root", "model");
+            other.set_root_orchestration_only(true).unwrap();
+            first.save_session(&other).await.unwrap();
+            fs::copy(
+                directory(&first, &other.id).join(RUNTIME_SIDECAR_FILE),
+                &runtime,
+            )
+            .await
+            .unwrap();
+        } else {
+            let bytes = fs::read(&runtime).await.unwrap();
+            let mut side: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            side["kind"] = serde_json::json!("child");
+            fs::write(&runtime, serde_json::to_vec(&side).unwrap())
+                .await
+                .unwrap();
+        }
+        first.flush_search_index().await;
+        drop(first);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        for error in [
+            reopened.load_session(&selected.id).await.unwrap_err(),
+            reopened
+                .load_runtime_control_plane(&selected.id)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                "foreign_id={foreign_id}: {error:?}"
+            );
+        }
+        assert_eq!(
+            reopened
+                .load_runtime_control_plane(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            SessionKind::Child
+        );
+        reopened.flush_search_index().await;
+        drop(reopened);
+        home.close().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn project_changes_require_exactly_the_next_revision() {
     let initial = root();
     let fixture = Fixture::new(&initial, false).await;

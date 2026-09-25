@@ -129,13 +129,27 @@ impl SessionStoreV2 {
     /// parseable sidecar has not regressed behind the canonical main file.
     pub(super) async fn validate_root_tool_authority_against_main(
         &self,
+        requested_id: &str,
         side: &Session,
     ) -> io::Result<()> {
+        validate_session_id(requested_id)?;
+        if side.id != requested_id {
+            return Err(conflict(
+                "runtime sidecar does not match the requested Session",
+            ));
+        }
         if side.kind != SessionKind::Root {
+            // A Root's physical directory is durable identity evidence even if
+            // its runtime JSON claims to be a Child. Genuine children live
+            // under sessions/<root>/children/<child>, never sessions/<child>.
+            match fs::symlink_metadata(self.sessions_dir.join(requested_id)).await {
+                Ok(_) => return Err(conflict("canonical Root sidecar claims Child identity")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(conflict(format!("canonical Root directory: {error}"))),
+            }
             return Ok(());
         }
-        validate_session_id(&side.id)?;
-        let path = self.sessions_dir.join(&side.id).join("session.json");
+        let path = self.sessions_dir.join(requested_id).join("session.json");
         if !regular_file_exists(&path).await? {
             return Err(conflict("canonical main file is missing"));
         }
@@ -239,7 +253,7 @@ impl SessionStoreV2 {
             ));
         }
         if has_main {
-            self.validate_root_tool_authority_against_main(&current)
+            self.validate_root_tool_authority_against_main(&incoming.id, &current)
                 .await?;
         }
         if incoming.metadata_version < current.metadata_version {
