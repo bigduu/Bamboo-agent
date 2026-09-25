@@ -44,6 +44,7 @@ use bamboo_domain::{
 };
 
 mod actor_directory;
+mod child_project;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -5048,6 +5049,8 @@ impl Storage for SessionStoreV2 {
             .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_full_save(session).await?;
+        self.validate_child_project_for_write(session, true, None)
+            .await?;
         self.reject_regressing_runtime_task(session).await?;
 
         let mut stages = SaveStageDurations::default();
@@ -5165,6 +5168,8 @@ impl Storage for SessionStoreV2 {
             .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_save(session).await?;
+        self.validate_child_project_for_write(session, false, Some(&rel))
+            .await?;
         self.reject_regressing_runtime_task(session).await?;
         let abs_dir = self.abs_path_from_rel(&rel);
         let mut stages = SaveStageDurations::default();
