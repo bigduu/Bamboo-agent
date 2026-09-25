@@ -157,6 +157,12 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
             .set_permission_mode(disk_mode);
     }
 
+    // A host may tighten Root authority during the prior round's final tool.
+    // Refresh its bounded durable proof before prompt/catalog construction so
+    // the next provider request cannot advertise an already-revoked tool.
+    super::state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref())
+        .await?;
+
     ensure_not_cancelled(
         cancel_token,
         metrics_collector,
