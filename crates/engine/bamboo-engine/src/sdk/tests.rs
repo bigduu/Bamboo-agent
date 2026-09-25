@@ -1180,6 +1180,41 @@ async fn fast_child_completion_automatically_starts_parent_successor() {
         .await
         .expect("the parent successor must reach its provider without a watchdog");
     assert!(saw_final_response.load(Ordering::SeqCst));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let settled = harness
+                .agent_runners
+                .read()
+                .await
+                .get(&harness.parent_session_id)
+                .is_some_and(|runner| {
+                    !matches!(runner.status, crate::execution::AgentStatus::Running)
+                });
+            if settled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parent successor must finish through the real runner lifecycle");
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.last_run_status().as_deref(), Some("completed"));
+    assert!(parent
+        .messages
+        .iter()
+        .any(|message| message.content == "parent resumed"));
+    let backlog = harness
+        .inbox
+        .inspect(&harness.parent_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.pending + backlog.claimed, 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 

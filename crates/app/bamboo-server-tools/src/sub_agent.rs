@@ -2,10 +2,65 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 use uuid::Uuid;
 
 type SynchronousLaunchLocks = Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+const LAUNCH_PENDING: u8 = 0;
+const LAUNCH_COMMITTING: u8 = 1;
+const LAUNCH_CANCELLED: u8 = 2;
+
+#[derive(Default)]
+struct LaunchGate(AtomicU8);
+
+impl LaunchGate {
+    fn cancel_if_pending(&self) {
+        let _ = self.0.compare_exchange(
+            LAUNCH_PENDING,
+            LAUNCH_CANCELLED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == LAUNCH_CANCELLED
+    }
+
+    fn begin_commit(&self) -> bool {
+        match self.0.compare_exchange(
+            LAUNCH_PENDING,
+            LAUNCH_COMMITTING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(LAUNCH_COMMITTING) => true,
+            Err(LAUNCH_CANCELLED) => false,
+            Err(_) => unreachable!("launch gate has an unknown state"),
+        }
+    }
+}
+
+struct CancelPendingLaunch {
+    gate: Arc<LaunchGate>,
+    armed: bool,
+}
+
+impl Drop for CancelPendingLaunch {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.cancel_if_pending();
+        }
+    }
+}
+
+fn cancelled_launch_error() -> ChildSessionError {
+    ChildSessionError::Execution("SubAgent tool cancelled before child delivery".to_string())
+}
 
 struct SynchronousLaunchGuard {
     locks: SynchronousLaunchLocks,
@@ -231,6 +286,7 @@ async fn enqueue_waiting_child(
     parent: &bamboo_agent_core::Session,
     child_session_id: &str,
     tool_call_id: &str,
+    launch_gate: Option<&LaunchGate>,
 ) -> Result<(), ToolError> {
     let child = sessions
         .load_child_for_parent(&parent.id, child_session_id)
@@ -256,6 +312,26 @@ async fn enqueue_waiting_child(
         if had_wait {
             return Err(tool_error_from_child_session(error));
         }
+        // The child was persisted as pending while the synchronous launch was
+        // prepared, but it was never enqueued. Make it terminal before the
+        // parent runner's end-of-turn safety net scans active child sessions.
+        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+        return Err(tool_error_from_child_session(
+            child_session::rollback_failed_wait_launch(
+                sessions,
+                &parent.id,
+                child_session_id,
+                error,
+            )
+            .await,
+        ));
+    }
+    if launch_gate.is_some_and(|gate| !gate.begin_commit()) {
+        let error = cancelled_launch_error();
+        if had_wait {
+            return Err(tool_error_from_child_session(error));
+        }
+        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
         return Err(tool_error_from_child_session(
             child_session::rollback_failed_wait_launch(
                 sessions,
@@ -430,6 +506,7 @@ fn require_resident_project_identity(
 // Tool struct
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct SubAgentTool {
     /// Child-session CRUD/lifecycle operations (load/save/run/cancel/…).
     sessions: Arc<dyn ChildSessionPort>,
@@ -650,6 +727,58 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        // The owner outlives a cancelled caller so an in-flight registration or
+        // delivery can be resolved. The gate prevents a new launch when the
+        // caller's cancellation wins before entering the scheduler or Inbox
+        // port. Their internal durable-admission boundary is tracked by #1313.
+        let action = args.get("action").and_then(serde_json::Value::as_str);
+        let owns_launch = match action.unwrap_or("create") {
+            "create" => {
+                args.get("auto_run")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+                    && args
+                        .get("wait")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+            }
+            "update" => args
+                .get("auto_run")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "run" | "send_message" => true,
+            _ => false,
+        };
+        if owns_launch {
+            let owner = self.clone();
+            let gate = Arc::new(LaunchGate::default());
+            let mut cancel_on_drop = CancelPendingLaunch {
+                gate: gate.clone(),
+                armed: true,
+            };
+            let result =
+                tokio::spawn(async move { owner.invoke_inner(args, ctx, Some(gate)).await })
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
+                    })?;
+            cancel_on_drop.armed = false;
+            return result;
+        }
+        self.invoke_inner(args, ctx, None).await
+    }
+}
+
+impl SubAgentTool {
+    async fn invoke_inner(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+        launch_gate: Option<Arc<LaunchGate>>,
+    ) -> Result<ToolOutcome, ToolError> {
+        if launch_gate.as_ref().is_some_and(|gate| gate.is_cancelled()) {
+            return Err(tool_error_from_child_session(cancelled_launch_error()));
+        }
         let parent_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
         })?;
@@ -893,6 +1022,14 @@ impl Tool for SubAgentTool {
                         // before picking it up (the task would never execute). After
                         // cancel the resident is idle, so both paths apply cleanly.
                         if self.sessions.is_child_running(&existing_id).await {
+                            if launch_gate
+                                .as_ref()
+                                .is_some_and(|gate| !gate.begin_commit())
+                            {
+                                return Err(tool_error_from_child_session(
+                                    cancelled_launch_error(),
+                                ));
+                            }
                             self.sessions
                                 .cancel_child_run_and_wait(&existing_id)
                                 .await
@@ -989,7 +1126,12 @@ impl Tool for SubAgentTool {
                                 &prompt,
                                 assignment_background.as_deref(),
                             );
-                            let delivery = child_session::send_message_to_child_action(
+                            let begin_delivery = || {
+                                launch_gate
+                                    .as_ref()
+                                    .is_none_or(|gate| gate.begin_commit())
+                            };
+                            let delivery = child_session::send_message_to_child_action_with_gate(
                                 self.sessions.as_ref(),
                                 &parent,
                                 existing_id.clone(),
@@ -998,6 +1140,7 @@ impl Tool for SubAgentTool {
                                 Some(false),
                                 Some(ctx.tool_call_id.as_ref()),
                                 requested_wait,
+                                &begin_delivery,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1045,6 +1188,7 @@ impl Tool for SubAgentTool {
                                         &parent,
                                         &existing_id,
                                         ctx.tool_call_id.as_ref(),
+                                        launch_gate.as_deref(),
                                     )
                                     .await?;
                                 } else {
@@ -1130,6 +1274,7 @@ impl Tool for SubAgentTool {
                                 &parent,
                                 &result.child_session_id,
                                 ctx.tool_call_id.as_ref(),
+                                launch_gate.as_deref(),
                             )
                             .await?;
                         }
@@ -1344,6 +1489,7 @@ impl Tool for SubAgentTool {
                         &parent,
                         &child_session_id,
                         ctx.tool_call_id.as_ref(),
+                        launch_gate.as_deref(),
                     )
                     .await?;
                 }
@@ -1372,6 +1518,7 @@ impl Tool for SubAgentTool {
                         &parent,
                         &child_session_id,
                         ctx.tool_call_id.as_ref(),
+                        launch_gate.as_deref(),
                     )
                     .await?;
                 } else {
@@ -1393,6 +1540,9 @@ impl Tool for SubAgentTool {
                                 .iter()
                                 .any(|id| id == &child_session_id)
                         });
+                    if launch_gate.as_ref().is_some_and(|gate| gate.is_cancelled()) {
+                        return Err(tool_error_from_child_session(cancelled_launch_error()));
+                    }
                     if !had_wait {
                         self.sessions
                             .register_parent_wait_for_child(
@@ -1402,6 +1552,18 @@ impl Tool for SubAgentTool {
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
+                    }
+                    if launch_gate
+                        .as_ref()
+                        .is_some_and(|gate| !gate.begin_commit())
+                    {
+                        if !had_wait {
+                            self.sessions
+                                .rollback_parent_wait_for_child(&parent.id, &child_session_id)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                        }
+                        return Err(tool_error_from_child_session(cancelled_launch_error()));
                     }
                     let terminal = self
                         .sessions
@@ -1453,7 +1615,12 @@ impl Tool for SubAgentTool {
                 interrupt_running,
             } => {
                 let should_auto_run = auto_run.unwrap_or(true);
-                let result = child_session::send_message_to_child_action(
+                let begin_delivery = || {
+                    launch_gate
+                        .as_ref()
+                        .is_none_or(|gate| gate.begin_commit())
+                };
+                let result = child_session::send_message_to_child_action_with_gate(
                     self.sessions.as_ref(),
                     &parent,
                     child_session_id.clone(),
@@ -1462,6 +1629,7 @@ impl Tool for SubAgentTool {
                     interrupt_running,
                     Some(ctx.tool_call_id.as_ref()),
                     should_auto_run,
+                    &begin_delivery,
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;

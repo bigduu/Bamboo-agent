@@ -441,6 +441,10 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).save_runtime_session(session).await
     }
 
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        (**self).save_finalized_runtime_session(session).await
+    }
+
     async fn seed_runtime_activation(&self, session: &mut Session) -> io::Result<()> {
         (**self).seed_runtime_activation(session).await
     }

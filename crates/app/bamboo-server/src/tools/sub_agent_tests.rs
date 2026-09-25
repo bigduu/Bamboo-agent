@@ -112,6 +112,9 @@ struct RecordingActivation {
     failures_remaining: AtomicUsize,
     delegate: StdRwLock<Option<Arc<dyn SessionActivationPort>>>,
     forced_disposition: StdRwLock<Option<SessionActivationDisposition>>,
+    pause_next: AtomicBool,
+    activation_entered: tokio::sync::Notify,
+    release_activation: tokio::sync::Notify,
 }
 
 impl RecordingActivation {
@@ -136,6 +139,10 @@ impl SessionActivationPort for RecordingActivation {
         inbox_generation: u64,
     ) -> Result<SessionActivationDisposition, SessionActivationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.pause_next.swap(false, Ordering::SeqCst) {
+            self.activation_entered.notify_one();
+            self.release_activation.notified().await;
+        }
         if self
             .failures_remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -147,7 +154,7 @@ impl SessionActivationPort for RecordingActivation {
                 "injected activation failure".to_string(),
             ));
         }
-        if let Some(disposition) = self.forced_disposition.read().unwrap().clone() {
+        if let Some(disposition) = *self.forced_disposition.read().unwrap() {
             return Ok(disposition);
         }
         let delegate = self.delegate.read().unwrap().clone();
@@ -422,8 +429,13 @@ struct WaitOrderPort {
     fail_launch: AtomicBool,
     checked_launches: AtomicUsize,
     hold_first_enqueue: AtomicBool,
+    hold_wait_after_persist: AtomicBool,
+    fail_wait_after_persist: AtomicBool,
     first_enqueue_entered: tokio::sync::Notify,
     release_first_enqueue: tokio::sync::Notify,
+    wait_persisted: tokio::sync::Notify,
+    release_wait: tokio::sync::Notify,
+    last_wait_child_id: StdRwLock<Option<String>>,
     skip_successful_enqueue: AtomicBool,
     parent_load_count: AtomicUsize,
     clear_wait_after_second_parent_load: AtomicBool,
@@ -437,8 +449,13 @@ impl WaitOrderPort {
             fail_launch: AtomicBool::new(false),
             checked_launches: AtomicUsize::new(0),
             hold_first_enqueue: AtomicBool::new(false),
+            hold_wait_after_persist: AtomicBool::new(false),
+            fail_wait_after_persist: AtomicBool::new(false),
             first_enqueue_entered: tokio::sync::Notify::new(),
             release_first_enqueue: tokio::sync::Notify::new(),
+            wait_persisted: tokio::sync::Notify::new(),
+            release_wait: tokio::sync::Notify::new(),
+            last_wait_child_id: StdRwLock::new(None),
             skip_successful_enqueue: AtomicBool::new(false),
             parent_load_count: AtomicUsize::new(0),
             clear_wait_after_second_parent_load: AtomicBool::new(false),
@@ -609,9 +626,20 @@ impl ChildSessionPort for WaitOrderPort {
         child_session_id: &str,
         tool_call_id: Option<&str>,
     ) -> Result<(), ChildSessionError> {
+        *self.last_wait_child_id.write().unwrap() = Some(child_session_id.to_string());
         self.inner
             .register_parent_wait_for_child(parent_session_id, child_session_id, tool_call_id)
-            .await
+            .await?;
+        if self.hold_wait_after_persist.swap(false, Ordering::SeqCst) {
+            self.wait_persisted.notify_one();
+            self.release_wait.notified().await;
+        }
+        if self.fail_wait_after_persist.swap(false, Ordering::SeqCst) {
+            return Err(ChildSessionError::Execution(
+                "injected parent wait acknowledgement failure".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn rollback_parent_wait_for_child(
@@ -1097,6 +1125,262 @@ async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
             "{action} must roll back only its own child wait"
         );
     }
+}
+
+#[tokio::test]
+async fn cancelled_synchronous_launch_still_compensates_a_rejected_enqueue() {
+    for action in ["create", "update", "run"] {
+        let harness = build_test_harness().await;
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        port.hold_first_enqueue.store(true, Ordering::SeqCst);
+        let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let parent_id = harness.parent_session_id.clone();
+        let entered = port.first_enqueue_entered.notified();
+        let outer = tokio::spawn(async move {
+            invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("launch owner must reach enqueue with durable wait armed");
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        port.release_first_enqueue.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let parent = harness
+                    .storage
+                    .load_session(&harness.parent_session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let wait_cleared = parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| state.waiting_for_children.as_ref())
+                    .is_none();
+                let active = harness
+                    .adapter
+                    .active_child_ids(&harness.parent_session_id)
+                    .await;
+                if wait_cleared && active.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{action} cancellation stranded a pending child or wait"));
+        assert_eq!(port.checked_launches.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
+    for action in ["create", "update", "run", "send_message"] {
+        let harness = build_test_harness().await;
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        port.hold_wait_after_persist.store(true, Ordering::SeqCst);
+        let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let parent_id = harness.parent_session_id.clone();
+        let wait_persisted = port.wait_persisted.notified();
+        let outer = tokio::spawn(async move {
+            invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_persisted)
+            .await
+            .expect("parent wait must be persisted before cancellation");
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        port.release_wait.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let parent = harness
+                    .storage
+                    .load_session(&harness.parent_session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let wait_cleared = parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| state.waiting_for_children.as_ref())
+                    .is_none();
+                if wait_cleared {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{action} cancellation did not clear its durable wait"));
+        assert_eq!(port.checked_launches.load(Ordering::SeqCst), 0);
+        assert!(harness
+            .adapter
+            .active_child_ids(&harness.parent_session_id)
+            .await
+            .is_empty());
+        if action != "send_message" {
+            let child_id = port.last_wait_child_id.read().unwrap().clone().unwrap();
+            let child = harness
+                .storage
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                child.last_run_status().as_deref(),
+                Some("error"),
+                "{action} left its prepared child non-terminal"
+            );
+        }
+        let child_backlog = harness
+            .session_inbox
+            .inspect(&harness.child_session_id)
+            .await
+            .unwrap();
+        assert_eq!(child_backlog.generation, 0, "{action} delivered a message");
+        let parent_backlog = harness
+            .session_inbox
+            .inspect(&harness.parent_session_id)
+            .await
+            .unwrap();
+        assert_eq!(parent_backlog.generation, 0, "{action} enqueued a child");
+    }
+}
+
+#[tokio::test]
+async fn failed_parent_wait_acknowledgement_marks_prepared_child_terminal() {
+    let harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.fail_wait_after_persist.store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port.clone(), harness.adapter.clone());
+    let error = invoke_completed(
+        &tool,
+        synchronous_launch_args(
+            "create",
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        ),
+        subagent_test_ctx(&harness.parent_session_id, "failed-wait-ack"),
+    )
+    .await
+    .expect_err("uncertain wait acknowledgement must not launch child");
+    assert!(error
+        .to_string()
+        .contains("injected parent wait acknowledgement failure"));
+    assert_eq!(port.checked_launches.load(Ordering::SeqCst), 0);
+    assert!(harness
+        .adapter
+        .active_child_ids(&harness.parent_session_id)
+        .await
+        .is_empty());
+    let child_id = port.last_wait_child_id.read().unwrap().clone().unwrap();
+    let child = harness
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.last_run_status().as_deref(), Some("error"));
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+}
+
+#[tokio::test]
+async fn cancelled_send_message_finishes_activation_failure_after_inbox_admission() {
+    let harness = build_test_harness().await;
+    harness.activation.pause_next.store(true, Ordering::SeqCst);
+    harness.activation.fail_next();
+    let tool = Arc::new(SubAgentTool::new(
+        harness.adapter.clone(),
+        harness.adapter.clone(),
+    ));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let entered = harness.activation.activation_entered.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "action": "send_message",
+                "child_session_id": child_id,
+                "message": "retry after the activation failure"
+            }),
+            subagent_test_ctx(&parent_id, "cancelled-send-message"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("message must reach activation after durable inbox admission");
+    let admitted = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(admitted.generation, 1);
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+    harness.activation.release_activation.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("activation failure after caller cancellation must clear unsatisfiable wait");
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.generation, 1);
+    assert_eq!(backlog.pending + backlog.claimed, 1);
 }
 
 // -----------------------------------------------------------------------

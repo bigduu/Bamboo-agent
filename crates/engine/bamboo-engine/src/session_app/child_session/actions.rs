@@ -663,6 +663,32 @@ pub async fn send_message_to_child_action(
     idempotency_key: Option<&str>,
     wait_if_queued: bool,
 ) -> Result<serde_json::Value, ChildSessionError> {
+    send_message_to_child_action_with_gate(
+        port,
+        parent,
+        child_session_id,
+        message,
+        auto_run,
+        interrupt_running,
+        idempotency_key,
+        wait_if_queued,
+        &|| true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_message_to_child_action_with_gate(
+    port: &dyn ChildSessionPort,
+    parent: &Session,
+    child_session_id: String,
+    message: String,
+    auto_run: Option<bool>,
+    interrupt_running: Option<bool>,
+    idempotency_key: Option<&str>,
+    wait_if_queued: bool,
+    begin_delivery: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(&parent.id, &child_session_id)
         .await?;
@@ -680,6 +706,14 @@ pub async fn send_message_to_child_action(
     let should_interrupt = interrupt_running.unwrap_or(false);
 
     if is_running && should_interrupt {
+        // Interrupting an existing run is itself an irreversible part of this
+        // delivery. Once it starts, the owner must finish preparing the new
+        // message even if the caller disappears.
+        if !begin_delivery() {
+            return Err(ChildSessionError::Execution(
+                "SubAgent tool cancelled before child delivery".to_string(),
+            ));
+        }
         port.cancel_child_run_and_wait(&child.id).await?;
         child = port
             .load_child_for_parent(&parent.id, &child_session_id)
@@ -721,6 +755,16 @@ pub async fn send_message_to_child_action(
                     rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
                 });
             }
+        }
+        if !begin_delivery() {
+            let error = ChildSessionError::Execution(
+                "SubAgent tool cancelled before child delivery".to_string(),
+            );
+            return Err(if armed_wait && !had_wait {
+                rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+            } else {
+                error
+            });
         }
         let delivery = match port
             .send_session_message(&parent.id, &child.id, &message, idempotency_key)
@@ -787,6 +831,11 @@ pub async fn send_message_to_child_action(
     // Explicit `auto_run=false` on an idle child retains its historical
     // draft-only behavior. All runnable/live delivery paths above converge on
     // SessionMessenger and never rewrite a snapshot to enqueue.
+    if !begin_delivery() {
+        return Err(ChildSessionError::Execution(
+            "SubAgent tool cancelled before child delivery".to_string(),
+        ));
+    }
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
     child.set_last_run_status("pending");
     child.clear_last_run_error();
