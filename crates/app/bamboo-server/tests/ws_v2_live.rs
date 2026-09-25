@@ -520,6 +520,55 @@ async fn subscribe_event_unsubscribe_roundtrip() {
     server.stop().await;
 }
 
+#[actix_web::test]
+async fn message_channel_replays_safe_text_and_controls_over_live_websocket() {
+    let server = TestServer::start(|_| {}).await;
+    let sid = "child_message_live";
+    let mut session = bamboo_agent_core::Session::new(sid, "test-model");
+    register_session(&server.state, &mut session).await;
+    set_runner_status(&server.state, sid, AgentStatus::Running).await;
+    let visible = server.state.agent_runners.read().await[sid]
+        .visible_messages
+        .clone();
+    visible.start("visible-1".into(), chrono::Utc::now());
+    visible.append("before".into());
+
+    let mut conn = connect_local(&server).await;
+    let ch = format!("message.{sid}");
+    send_json(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
+    let snapshot = next_envelope(&mut conn).await.expect("safe snapshot");
+    assert_eq!(snapshot["ch"], ch);
+    assert_eq!(snapshot["event"]["type"], "snapshot");
+    assert_eq!(snapshot["event"]["messages"][0]["content"], "before");
+
+    server
+        .state
+        .get_session_event_sender(sid)
+        .await
+        .send(AgentEvent::ReasoningToken {
+            content: "PRIVATE_REASONING".into(),
+        })
+        .ok();
+    visible.append(" after".into());
+    let delta = next_envelope(&mut conn).await.expect("visible delta");
+    assert_eq!(delta["event"]["type"], "delta");
+    assert_eq!(delta["event"]["offset"], 6);
+    assert_eq!(delta["event"]["content"], " after");
+    assert!(!delta.to_string().contains("PRIVATE_REASONING"));
+
+    visible.mark_terminal("complete");
+    let terminal = next_envelope(&mut conn).await.expect("terminal control");
+    assert_eq!(terminal["control"]["type"], "terminal");
+    visible.history_committed();
+    let committed = next_envelope(&mut conn)
+        .await
+        .expect("history commit control");
+    assert_eq!(committed["control"]["type"], "history_committed");
+    assert!(committed["seq"].as_u64() > terminal["seq"].as_u64());
+
+    server.stop().await;
+}
+
 /// A frontend may keep the parent session open while independently opening a
 /// child session. Full-fidelity child tokens must stay on `agent.{child}`; the
 /// parent receives only lifecycle projection events. This is the network half
