@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_grandchild_rejects_middle_parent_project_aba(
+    async fn active_grandchild_cannot_observe_middle_parent_project_rebind(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let home = tempfile::tempdir()?;
         let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
@@ -1098,27 +1098,42 @@ mod tests {
         store.save_session(&root).await?;
         store.save_session(&child).await?;
         store.save_session(&grandchild).await?;
+        let stale_store = SessionStoreV2::new(home.path().to_path_buf()).await?;
         let now = Utc::now();
         let activation = store
             .claim_activation(&claim(&grandchild.id, "run", "host", now))
             .await?;
-        for project in ["project-b", "project-a"] {
-            child.set_project_id_meta(project);
-            child.metadata_version += 1;
-            store.save_runtime_state(&child).await?;
-        }
+        child.set_project_id_meta("project-b");
+        child.metadata_version += 1;
+        assert_eq!(
+            stale_store
+                .save_runtime_state(&child)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store.save_session(&child).await.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(
             store
-                .validate_fence(&activation.fence(), now)
-                .await
-                .unwrap_err(),
-            ActorDirectoryError::ProjectTransitionBlocked
+                .load_session(&child.id)
+                .await?
+                .unwrap()
+                .project_id_meta()
+                .as_deref(),
+            Some("project-a")
         );
+        let restarted = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        restarted.validate_fence(&activation.fence(), now).await?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn active_child_rejects_its_own_project_aba() -> Result<(), Box<dyn std::error::Error>> {
+    async fn active_child_cannot_rebind_its_own_project() -> Result<(), Box<dyn std::error::Error>>
+    {
         let home = tempfile::tempdir()?;
         let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
         let mut root = Session::new("own-aba-root", "model");
@@ -1131,18 +1146,13 @@ mod tests {
         let activation = store
             .claim_activation(&claim(&child.id, "run", "host", now))
             .await?;
-        for project in ["project-b", "project-a"] {
-            child.set_project_id_meta(project);
-            child.metadata_version += 1;
-            store.save_runtime_state(&child).await?;
-        }
+        child.set_project_id_meta("project-b");
+        child.metadata_version += 1;
         assert_eq!(
-            store
-                .validate_fence(&activation.fence(), now)
-                .await
-                .unwrap_err(),
-            ActorDirectoryError::ProjectTransitionBlocked
+            store.save_runtime_state(&child).await.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
+        store.validate_fence(&activation.fence(), now).await?;
         Ok(())
     }
 

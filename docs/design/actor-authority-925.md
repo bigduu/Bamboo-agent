@@ -28,9 +28,10 @@ index hints. A Child claim also checks its complete saved parent chain up to
 the Root, including current Project identity and adjacent depth. Each saved
 ancestor birth and metadata revision is retained in the Child actor record,
 so a previously observed ancestor re-creation cannot revive an old activation
-fence. Project A-to-B-to-A changes are fenced when each Project write advances
-`metadata_version`; the Child write gap is tracked in #1317. A deleted middle Child therefore
-cannot leave a claimable grandchild behind. This
+fence. Root Project A-to-B-to-A changes are fenced when each Project write
+advances `metadata_version`; Child Project identity is immutable after its first
+durable V2 save (#1317). A deleted middle Child therefore cannot leave a
+claimable grandchild behind. This
 first-slice safety check scans Root directories on each authority operation;
 a future durable unique-id registry could replace that cost. The sidecar is
 not a second Session store and contains no transcript, broker endpoint,
@@ -44,17 +45,22 @@ while it is live, all authority operations return a Project transition conflict
 without modifying the old sidecar or lease. The authority also records the
 last observed own and ancestor `metadata_version` values: an unseen gap of two
 or more revisions while active is blocked even if the Project now matches,
-because the Project could have changed away and back. `metadata_version` also
-covers title and pin changes, so two unrelated UI updates can conservatively
-block a live activation. More importantly, V2 currently enforces the Project
-revision contract only for Roots. A Child full/runtime save can change Project
-twice without advancing its metadata version; #1317 must close that separate
-write boundary before this is a complete Project ABA fence. This currently
-affects only the new authority seam, which has no production activation caller.
-A Project-specific epoch or guarded Project write boundary is required before
-that caller is connected. The current
+because the Root Project could have changed away and back. `metadata_version`
+also covers title and pin changes, so two unrelated UI updates can
+conservatively block a live activation. The V2 Child full and runtime save
+boundaries reject Project changes under the per-Session writer lock, including
+stale writers in another Store. First full saves also scan physical Root trees
+under that same lock to reject a reused Child id in a different tree before
+the global index can move. The current
 runtime has no integrated cancellation/reconciliation caller for a blocked
 live activation yet.
+
+This writer guard prevents new cross-tree Child id collisions. It does not
+repair histories that already contain two physical Children with the same id:
+their ordinary full saves can still move the global index between paths.
+ActorDirectory rejects activation for that ambiguous id until those on-disk
+Sessions are repaired. The guard scans Root trees only on first Child save,
+not on every high-frequency runtime checkpoint.
 
 Every authority operation holds the existing lifecycle, runtime sidecar, and
 exact Session maintenance locks in that order. The maintenance lock includes a
