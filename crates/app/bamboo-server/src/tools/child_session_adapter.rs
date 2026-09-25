@@ -102,6 +102,31 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    fn child_spawn_job(parent: &Session, child: &Session) -> Result<SpawnJob, ChildSessionError> {
+        let model = if child.model.trim().is_empty() {
+            parent.model.clone()
+        } else {
+            child.model.clone()
+        };
+        if model.trim().is_empty() {
+            return Err(ChildSessionError::Execution(
+                "child model is empty and parent model is unavailable".to_string(),
+            ));
+        }
+        let disabled_tools = child
+            .metadata
+            .get("disabled_tools")
+            .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
+            .filter(|set| !set.is_empty())
+            .map(|set| set.into_iter().collect::<Vec<String>>());
+        Ok(SpawnJob {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child.id.clone(),
+            model,
+            disabled_tools,
+        })
+    }
+
     /// Shared tail of the two child-save methods: map the persist error and
     /// refresh the in-memory cache. The two public methods differ ONLY in which
     /// persistence call they make (adopting vs authoritative); everything after
@@ -794,6 +819,27 @@ impl ChildSessionPort for ChildSessionAdapter {
         bamboo_engine::session_app::child_session::ChildSessionMessageDelivery,
         ChildSessionError,
     > {
+        self.send_session_message_with_gate(
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    async fn send_session_message_with_gate(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<
+        bamboo_engine::session_app::child_session::ChildSessionMessageDelivery,
+        ChildSessionError,
+    > {
         let messenger = self.session_messenger.as_ref().ok_or_else(|| {
             ChildSessionError::Execution(
                 "logical SessionMessenger is not configured for this runtime".to_string(),
@@ -825,7 +871,7 @@ impl ChildSessionPort for ChildSessionAdapter {
             attempt: None,
             correlation_id: None,
         };
-        match messenger.send(envelope).await {
+        match messenger.send_with_gate(envelope, gate).await {
             Ok(receipt) => Ok(
                 bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::Activated(
                     receipt,
@@ -835,6 +881,14 @@ impl ChildSessionPort for ChildSessionAdapter {
                 receipt, source, ..
             }) => Ok(
                 bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::ActivationPending {
+                    delivery: receipt,
+                    error: source.to_string(),
+                },
+            ),
+            Err(bamboo_engine::SessionMessengerError::ActivationEligibility {
+                receipt, source, ..
+            }) => Ok(
+                bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::ActivationAuthorizationPending {
                     delivery: receipt,
                     error: source.to_string(),
                 },
@@ -895,29 +949,6 @@ impl ChildSessionPort for ChildSessionAdapter {
         parent: &Session,
         child: &Session,
     ) -> Result<(), ChildSessionError> {
-        let model = if child.model.trim().is_empty() {
-            parent.model.clone()
-        } else {
-            child.model.clone()
-        };
-        if model.trim().is_empty() {
-            return Err(ChildSessionError::Execution(
-                "child model is empty and parent model is unavailable".to_string(),
-            ));
-        }
-
-        // Per-child tool denylist: persisted onto the child session by
-        // `create_child_action` (JSON in metadata). Most sub-agents are full
-        // agents and carry none; a read-only Guardian reviewer carries a
-        // denylist here so the worker trims its toolset. `SpawnJob` wants a
-        // `Vec<String>`, so collect the set.
-        let disabled_tools = child
-            .metadata
-            .get("disabled_tools")
-            .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
-            .filter(|set| !set.is_empty())
-            .map(|set| set.into_iter().collect::<Vec<String>>());
-
         // NOTE: enqueue only *runs* the child in the background. Registering the
         // parent's wait (which suspends the parent) is now an explicit, separate
         // step so the model can spawn several children without each one
@@ -925,18 +956,29 @@ impl ChildSessionPort for ChildSessionAdapter {
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
         self.scheduler
             .enqueue_announced(
-                SpawnJob {
-                    parent_session_id: parent.id.clone(),
-                    child_session_id: child.id.clone(),
-                    model,
-                    disabled_tools,
-                },
+                Self::child_spawn_job(parent, child)?,
                 Some(child.title.clone()),
             )
             .await
             .map_err(ChildSessionError::Execution)?;
 
         Ok(())
+    }
+
+    async fn admit_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        self.scheduler
+            .enqueue_announced_with_gate(
+                Self::child_spawn_job(parent, child)?,
+                Some(child.title.clone()),
+                gate,
+            )
+            .await
+            .map_err(ChildSessionError::Execution)
     }
 
     async fn cancel_child_run_and_wait(

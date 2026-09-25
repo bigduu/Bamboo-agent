@@ -111,6 +111,18 @@ pub enum SessionMessengerError {
         #[source]
         source: SessionActivationError,
     },
+    /// Delivery is durable, but the activation watermark did not persist.
+    /// Startup cannot infer permission to run from admission alone; a caller
+    /// must retry this exact envelope until the watermark is committed.
+    #[error(
+        "message {receipt_id} was delivered but activation eligibility was not persisted: {source}"
+    )]
+    ActivationEligibility {
+        receipt_id: String,
+        receipt: SessionInboxReceipt,
+        #[source]
+        source: SessionInboxError,
+    },
     #[error("session store failure: {0}")]
     Storage(String),
 }
@@ -275,6 +287,7 @@ impl SessionMessenger {
             | SessionMessengerError::TargetNotFound(_) => {
                 self.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
             }
+            SessionMessengerError::Inbox(SessionInboxError::AdmissionCancelled) => {}
             SessionMessengerError::Inbox(SessionInboxError::PayloadTooLarge { .. }) => {
                 self.metrics
                     .payload_too_large
@@ -286,13 +299,22 @@ impl SessionMessenger {
             SessionMessengerError::Inbox(_) | SessionMessengerError::Storage(_) => {
                 self.metrics.storage_failed.fetch_add(1, Ordering::Relaxed);
             }
-            SessionMessengerError::Activation { .. } => {}
+            SessionMessengerError::Activation { .. }
+            | SessionMessengerError::ActivationEligibility { .. } => {}
         }
     }
 
     pub async fn admit(
         &self,
         envelope: SessionMessageEnvelope,
+    ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
+        self.admit_with_gate(envelope, None).await
+    }
+
+    pub async fn admit_with_gate(
+        &self,
+        envelope: SessionMessageEnvelope,
+        gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
         let started = Instant::now();
         if let Err(error) = self.validate_relationship(&envelope).await {
@@ -306,7 +328,11 @@ impl SessionMessenger {
             return Err(error);
         }
 
-        let delivery = match self.inbox.deliver(&envelope).await {
+        let delivery = match gate {
+            Some(gate) => self.inbox.deliver_with_gate(&envelope, gate).await,
+            None => self.inbox.deliver(&envelope).await,
+        };
+        let delivery = match delivery {
             Ok(receipt) => receipt,
             Err(error) => {
                 let error = SessionMessengerError::Inbox(error);
@@ -360,12 +386,10 @@ impl SessionMessenger {
             self.metrics
                 .activation_failed
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(SessionMessengerError::Activation {
+            return Err(SessionMessengerError::ActivationEligibility {
                 receipt_id: admission.delivery.id.to_string(),
                 receipt: admission.delivery.clone(),
-                source: SessionActivationError::Internal(format!(
-                    "persist activation watermark: {error}"
-                )),
+                source: error,
             });
         }
         self.activate_prepared(admission).await
@@ -455,7 +479,15 @@ impl SessionMessenger {
         &self,
         envelope: SessionMessageEnvelope,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
-        let admission = self.admit(envelope).await?;
+        self.send_with_gate(envelope, None).await
+    }
+
+    pub async fn send_with_gate(
+        &self,
+        envelope: SessionMessageEnvelope,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        let admission = self.admit_with_gate(envelope, gate).await?;
         self.activate(&admission).await
     }
 }
@@ -473,6 +505,76 @@ mod tests {
 
     struct RecordingActivation {
         calls: tokio::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    struct FailEligibilityOnce {
+        inner: Arc<FileSessionInbox>,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SessionInboxPort for FailEligibilityOnce {
+        async fn deliver(
+            &self,
+            envelope: &SessionMessageEnvelope,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            self.inner.deliver(envelope).await
+        }
+
+        async fn deliver_with_gate(
+            &self,
+            envelope: &SessionMessageEnvelope,
+            gate: &bamboo_domain::AdmissionGate,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            self.inner.deliver_with_gate(envelope, gate).await
+        }
+
+        async fn mark_activation_eligible(
+            &self,
+            target_session_id: &str,
+            generation: u64,
+            policy: SessionActivationPolicy,
+        ) -> Result<(), SessionInboxError> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(SessionInboxError::Storage(
+                    "injected activation watermark failure".into(),
+                ));
+            }
+            self.inner
+                .mark_activation_eligible(target_session_id, generation, policy)
+                .await
+        }
+
+        async fn claim(
+            &self,
+            target_session_id: &str,
+            limit: usize,
+        ) -> Result<Vec<bamboo_domain::SessionInboxClaim>, SessionInboxError> {
+            self.inner.claim(target_session_id, limit).await
+        }
+
+        async fn was_admitted(
+            &self,
+            target_session_id: &str,
+            id: &SessionMessageId,
+        ) -> Result<bool, SessionInboxError> {
+            self.inner.was_admitted(target_session_id, id).await
+        }
+
+        async fn ack(
+            &self,
+            target_session_id: &str,
+            claim: &bamboo_domain::SessionInboxClaim,
+        ) -> Result<(), SessionInboxError> {
+            self.inner.ack(target_session_id, claim).await
+        }
+
+        async fn inspect(
+            &self,
+            target_session_id: &str,
+        ) -> Result<bamboo_domain::SessionInboxBacklog, SessionInboxError> {
+            self.inner.inspect(target_session_id).await
+        }
     }
 
     #[async_trait]
@@ -551,6 +653,62 @@ mod tests {
             &[("child".to_string(), 1)]
         );
         assert_eq!(messenger.metrics().snapshot().delivered, 1);
+    }
+
+    #[tokio::test]
+    async fn committed_delivery_without_watermark_reports_exact_retry_required() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let root = Session::new("root", "model");
+        let mut child = Session::new("child", "model");
+        child.kind = bamboo_domain::SessionKind::Child;
+        child.parent_session_id = Some("root".to_string());
+        child.root_session_id = "root".to_string();
+        store.save_session(&root).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        let inbox = Arc::new(FailEligibilityOnce {
+            inner: Arc::new(FileSessionInbox::new(
+                store.clone(),
+                SessionInboxLimits::default(),
+            )),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+        });
+        let activation = Arc::new(RecordingActivation {
+            calls: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let messenger = SessionMessenger::new(store.clone(), inbox, activation.clone());
+        let envelope = peer("root", "child", "watermark-failure");
+        let gate = bamboo_domain::AdmissionGate::default();
+
+        let receipt = match messenger
+            .send_with_gate(envelope.clone(), Some(&gate))
+            .await
+            .unwrap_err()
+        {
+            SessionMessengerError::ActivationEligibility { receipt, .. } => receipt,
+            error => panic!("expected retry-required classification: {error}"),
+        };
+        assert!(gate.is_committed());
+        assert!(activation.calls.lock().await.is_empty());
+        let reopened = FileSessionInbox::new(store, SessionInboxLimits::default());
+        let backlog = reopened.inspect("child").await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert_eq!(backlog.activation_generation, 0);
+        assert_eq!(backlog.generation, receipt.generation);
+
+        let retried = messenger
+            .send_with_gate(envelope, Some(&gate))
+            .await
+            .unwrap();
+        assert_eq!(retried.delivery, receipt);
+        assert_eq!(activation.calls.lock().await.len(), 1);
+        let reopened = reopened.inspect("child").await.unwrap();
+        assert_eq!(reopened.activation_generation, receipt.generation);
+        assert_eq!(reopened.pending + reopened.claimed, 1);
     }
 
     #[tokio::test]
