@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{Session, SessionKind};
 use crate::ProjectId;
 
-pub const ACTOR_DIRECTORY_SCHEMA_VERSION: u32 = 1;
+pub const ACTOR_DIRECTORY_SCHEMA_VERSION: u32 = 2;
 
 /// A stable logical address. It is always exactly Session.id.
 pub type ActorId = String;
@@ -59,6 +59,15 @@ pub struct ActorPlacementRef {
     pub lease_id: String,
 }
 
+/// One saved ancestor identity and revision in a Child's authority chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorAncestorObservation {
+    pub actor_id: ActorId,
+    pub session_created_at: DateTime<Utc>,
+    pub metadata_version: u64,
+}
+
 /// Versioned projection of durable Session identity plus logical lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,9 +79,12 @@ pub struct ActorSession {
     pub parent_actor_id: Option<ActorId>,
     pub root_actor_id: ActorId,
     pub project_id: Option<String>,
-    /// Last observed Root metadata revision. A Project change advances this
-    /// revision exactly once at the Session write boundary. Child actors use 0.
+    /// Last observed revision of this Session's own metadata. A Project
+    /// change advances this revision exactly once at the Session boundary.
     pub observed_metadata_version: u64,
+    /// Direct parent first, Root last. Storage stamps this from the strict
+    /// durable lineage before publishing a Child's authority record.
+    pub ancestor_observations: Vec<ActorAncestorObservation>,
     pub spawn_depth: u32,
     pub state: ActorLogicalState,
     pub current_attempt: u64,
@@ -129,11 +141,8 @@ impl ActorSession {
             parent_actor_id,
             root_actor_id: root_id.to_string(),
             project_id,
-            observed_metadata_version: if session.kind == SessionKind::Root {
-                session.metadata_version
-            } else {
-                0
-            },
+            observed_metadata_version: session.metadata_version,
+            ancestor_observations: Vec::new(),
             spawn_depth: session.spawn_depth,
             state: ActorLogicalState::Cold,
             current_attempt: 0,
@@ -257,14 +266,26 @@ impl ActorDirectoryEntry {
                 .is_some_and(|id| id.parse::<ProjectId>().is_err())
             || match self.actor.parent_actor_id.as_deref() {
                 None => {
-                    self.actor.spawn_depth != 0 || self.actor.root_actor_id != self.actor.actor_id
+                    self.actor.spawn_depth != 0
+                        || self.actor.root_actor_id != self.actor.actor_id
+                        || !self.actor.ancestor_observations.is_empty()
                 }
                 Some(parent) => {
                     !valid_actor_id(parent)
                         || parent == self.actor.actor_id
                         || self.actor.root_actor_id == self.actor.actor_id
-                        || self.actor.observed_metadata_version != 0
                         || self.actor.spawn_depth == 0
+                        || self.actor.ancestor_observations.len() != self.actor.spawn_depth as usize
+                        || self
+                            .actor
+                            .ancestor_observations
+                            .first()
+                            .is_none_or(|ancestor| ancestor.actor_id != parent)
+                        || self
+                            .actor
+                            .ancestor_observations
+                            .last()
+                            .is_none_or(|ancestor| ancestor.actor_id != self.actor.root_actor_id)
                 }
             }
             || self

@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use bamboo_domain::{
     ActorActivation, ActorActivationClaim, ActorActivationFence, ActorActivationFinish,
-    ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryError, ActorDirectoryPort,
-    ActorLogicalState, ActorSession,
+    ActorActivationStatus, ActorAncestorObservation, ActorDirectoryEntry, ActorDirectoryError,
+    ActorDirectoryPort, ActorLogicalState, ActorSession,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::{durable_atomic_write, validate_session_id, SessionStoreV2, SessionsIndex};
+use super::{durable_atomic_write, validate_session_id, SessionStoreV2};
 
 const ACTOR_AUTHORITY_FILE: &str = "actor-authority.json";
 const ACTOR_INITIALIZED_FILE: &str = "actor-authority.initialized.json";
@@ -172,40 +172,76 @@ impl SessionStoreV2 {
         }
     }
 
-    /// The process-local index is only a hint. Another Store may publish a
-    /// Session after this instance was constructed, or a crash may leave the
-    /// canonical Session durable before its rebuildable global index entry.
+    /// Resolve every valid on-disk candidate while holding the actor's file
+    /// lock. Cached and global indexes can each point to one of two physical
+    /// Sessions with the same id; trusting either would split activation
+    /// authority between Store instances. The scan rejects that ambiguity.
     async fn actor_authority_location(
         &self,
         actor_id: &str,
     ) -> Result<(String, PathBuf), ActorDirectoryError> {
         validate_session_id(actor_id).map_err(storage)?;
-        if let Some(cached) = self.resolve_rel_path(actor_id).await {
-            if let Some(rel) = self.indexed_actor_rel_path(actor_id, &cached).await? {
-                let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
-                return Ok((rel, path));
-            }
-        }
-        match fs::read(&self.index_path).await {
-            Ok(bytes) => {
-                if let Ok(current) = serde_json::from_slice::<SessionsIndex>(&bytes) {
-                    if let Some(indexed) = current.sessions.get(actor_id) {
-                        if let Some(rel) = self
-                            .indexed_actor_rel_path(actor_id, &indexed.rel_path)
-                            .await?
-                        {
-                            let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
-                            return Ok((rel, path));
-                        }
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(storage(error)),
-        }
         let rel = self.scan_actor_rel_path(actor_id).await?;
         let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
         Ok((rel, path))
+    }
+
+    /// A Child's own Session file is insufficient authority: deleting a
+    /// middle Child currently leaves its nested descendants on disk. Verify
+    /// the complete parent chain, root identity, depth and Project before
+    /// publishing or accepting any activation sidecar for the descendant.
+    async fn validate_actor_lineage(
+        &self,
+        actor: &ActorSession,
+    ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        let mut current = actor.clone();
+        let mut lineage = Vec::new();
+        while let Some(parent_id) = current.parent_actor_id.clone() {
+            let root_id = &current.root_actor_id;
+            let (expected_rel, kind) = if parent_id == *root_id {
+                (
+                    Self::root_rel_path(&parent_id),
+                    bamboo_domain::SessionKind::Root,
+                )
+            } else {
+                (
+                    Self::child_rel_path(root_id, &parent_id),
+                    bamboo_domain::SessionKind::Child,
+                )
+            };
+            let actual_rel = self.scan_actor_rel_path(&parent_id).await?;
+            if actual_rel != expected_rel {
+                return Err(ActorDirectoryError::InvalidIdentity);
+            }
+            let parent = self
+                .load_session_from_dir_strict(
+                    &self.abs_path_from_rel(&expected_rel),
+                    &parent_id,
+                    kind,
+                    root_id,
+                )
+                .await
+                .map_err(storage)?
+                .ok_or_else(|| ActorDirectoryError::NotFound(parent_id.clone()))?;
+            let parent = ActorSession::from_session(&parent)?;
+            if parent.root_actor_id != *root_id
+                || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
+                || parent.project_id != current.project_id
+                || parent.session_created_at > current.session_created_at
+            {
+                return Err(ActorDirectoryError::InvalidIdentity);
+            }
+            lineage.push(ActorAncestorObservation {
+                actor_id: parent.actor_id.clone(),
+                session_created_at: parent.session_created_at,
+                metadata_version: parent.observed_metadata_version,
+            });
+            current = parent;
+        }
+        if current.actor_id != actor.root_actor_id || current.spawn_depth != 0 {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
+        Ok(lineage)
     }
 
     async fn read_or_create_actor_entry(
@@ -225,7 +261,8 @@ impl SessionStoreV2 {
         if session.id != actor_id {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
-        let expected = ActorSession::from_session(&session)?;
+        let mut expected = ActorSession::from_session(&session)?;
+        expected.ancestor_observations = self.validate_actor_lineage(&expected).await?;
         let marker_path = directory.join(ACTOR_INITIALIZED_FILE);
         let marker = match Self::regular_actor_file(&marker_path).await? {
             true => {
@@ -276,30 +313,52 @@ impl SessionStoreV2 {
             }
             false => return Err(ActorDirectoryError::Corrupt),
         };
-        if kind == bamboo_domain::SessionKind::Root {
-            let observed = entry.actor.observed_metadata_version;
-            let current = expected.observed_metadata_version;
-            if current < observed {
+        let project_changed = entry.actor.project_id != expected.project_id;
+        if kind == bamboo_domain::SessionKind::Child && project_changed {
+            // Unlike a Root, a saved Child cannot be rebound to another
+            // Project after its identity was first published.
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
+        let observed = entry.actor.observed_metadata_version;
+        let current = expected.observed_metadata_version;
+        if current < observed
+            || entry.actor.ancestor_observations.len() != expected.ancestor_observations.len()
+        {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
+        let mut lineage_changed = false;
+        let mut lineage_gap = false;
+        for (previous, latest) in entry
+            .actor
+            .ancestor_observations
+            .iter()
+            .zip(&expected.ancestor_observations)
+        {
+            if previous.actor_id != latest.actor_id
+                || previous.session_created_at != latest.session_created_at
+                || latest.metadata_version < previous.metadata_version
+            {
                 return Err(ActorDirectoryError::InvalidIdentity);
             }
-            let project_changed = entry.actor.project_id != expected.project_id;
-            if entry.actor.state == ActorLogicalState::Active
-                && (project_changed || current - observed >= 2)
-            {
-                // One Root metadata revision with the same Project cannot
-                // contain a Project ABA: each Project change must advance the
-                // durable metadata revision once. A larger unseen gap could
-                // hide a change away and back, so keep the old fence blocked.
-                return Err(ActorDirectoryError::ProjectTransitionBlocked);
-            }
-            if project_changed || current != observed {
-                entry.actor.project_id = expected.project_id;
-                entry.actor.observed_metadata_version = current;
-                entry.revision = checked_next(entry.revision)?;
-                self.write_actor_entry(path, &entry).await?;
-            }
-        } else if entry.actor.project_id != expected.project_id {
-            return Err(ActorDirectoryError::InvalidIdentity);
+            let delta = latest.metadata_version - previous.metadata_version;
+            lineage_changed |= delta > 0;
+            lineage_gap |= delta >= 2;
+        }
+        if entry.actor.state == ActorLogicalState::Active
+            && (project_changed || current - observed >= 2 || lineage_gap)
+        {
+            // A same-Project gap of two revisions could conceal an A→B→A
+            // rebind in this Actor or any ancestor. One unseen revision
+            // cannot conceal that round trip when save boundaries enforce
+            // version increments for Project changes.
+            return Err(ActorDirectoryError::ProjectTransitionBlocked);
+        }
+        if project_changed || current != observed || lineage_changed {
+            entry.actor.project_id = expected.project_id;
+            entry.actor.observed_metadata_version = current;
+            entry.actor.ancestor_observations = expected.ancestor_observations;
+            entry.revision = checked_next(entry.revision)?;
+            self.write_actor_entry(path, &entry).await?;
         }
         Ok(entry)
     }
@@ -940,6 +999,179 @@ mod tests {
             .claim_activation(&claim(&orphan.id, "run", "host", Utc::now()))
             .await?;
         assert_eq!(activation.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphaned_nested_child_cannot_publish_activation_authority(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let root = Session::new("lineage-root", "model");
+        let child = Session::new_child_of("lineage-child", &root, "model", "Child");
+        let grandchild = Session::new_child_of("lineage-grandchild", &child, "model", "Grandchild");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        store.save_session(&grandchild).await?;
+
+        assert!(store.delete_session(&child.id).await?);
+        assert!(store.load_session(&child.id).await?.is_none());
+        assert!(store.load_session(&grandchild.id).await?.is_some());
+        assert_eq!(
+            store
+                .claim_activation(&claim(&grandchild.id, "run", "host", Utc::now()))
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::NotFound(child.id.clone())
+        );
+        assert!(!home
+            .path()
+            .join("sessions/lineage-root/children/lineage-grandchild/actor-authority.json")
+            .exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_physical_actor_id_fails_closed_across_stale_stores(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let first = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let origin = Session::new("origin", "model");
+        let child = Session::new_child_of("same", &origin, "model", "Child");
+        first.save_session(&origin).await?;
+        first.save_session(&child).await?;
+        let stale = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        first.save_session(&Session::new("same", "model")).await?;
+
+        for store in [&first, &stale] {
+            assert_eq!(
+                store
+                    .claim_activation(&claim("same", "run", "host", Utc::now()))
+                    .await
+                    .unwrap_err(),
+                ActorDirectoryError::Corrupt
+            );
+        }
+        assert!(!home
+            .path()
+            .join("sessions/origin/children/same/actor-authority.json")
+            .exists());
+        assert!(!home
+            .path()
+            .join("sessions/same/actor-authority.json")
+            .exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_project_must_match_its_current_parent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("project-lineage-root", "model");
+        root.set_project_id_meta("project-a");
+        let mut child = Session::new_child_of("project-lineage-child", &root, "model", "Child");
+        child.set_project_id_meta("project-b");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        assert_eq!(
+            store
+                .claim_activation(&claim(&child.id, "run", "host", Utc::now()))
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::InvalidIdentity
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_grandchild_rejects_middle_parent_project_aba(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("aba-root", "model");
+        root.set_project_id_meta("project-a");
+        let mut child = Session::new_child_of("aba-child", &root, "model", "Child");
+        child.set_project_id_meta("project-a");
+        let mut grandchild = Session::new_child_of("aba-grandchild", &child, "model", "Grandchild");
+        grandchild.set_project_id_meta("project-a");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        store.save_session(&grandchild).await?;
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&grandchild.id, "run", "host", now))
+            .await?;
+        for project in ["project-b", "project-a"] {
+            child.set_project_id_meta(project);
+            child.metadata_version += 1;
+            store.save_runtime_state(&child).await?;
+        }
+        assert_eq!(
+            store
+                .validate_fence(&activation.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_child_rejects_its_own_project_aba() -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("own-aba-root", "model");
+        root.set_project_id_meta("project-a");
+        let mut child = Session::new_child_of("own-aba-child", &root, "model", "Child");
+        child.set_project_id_meta("project-a");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&child.id, "run", "host", now))
+            .await?;
+        for project in ["project-b", "project-a"] {
+            child.set_project_id_meta(project);
+            child.metadata_version += 1;
+            store.save_runtime_state(&child).await?;
+        }
+        assert_eq!(
+            store
+                .validate_fence(&activation.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recreated_middle_parent_cannot_revive_grandchild_fence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let root = Session::new("birth-root", "model");
+        let child = Session::new_child_of("birth-child", &root, "model", "Child");
+        let grandchild = Session::new_child_of("birth-grandchild", &child, "model", "Grandchild");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        store.save_session(&grandchild).await?;
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&grandchild.id, "run", "host", now))
+            .await?;
+        assert!(store.delete_session(&child.id).await?);
+        let mut replacement = Session::new_child_of(&child.id, &root, "model", "Replacement");
+        replacement.created_at = child.created_at + Duration::seconds(1);
+        store.save_session(&replacement).await?;
+        assert_eq!(
+            store
+                .validate_fence(&activation.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::InvalidIdentity
+        );
         Ok(())
     }
 

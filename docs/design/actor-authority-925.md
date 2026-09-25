@@ -21,9 +21,19 @@ after that publication and an independent durable
 `ActorActivation`. A missing sidecar with an existing marker is corrupt, never
 an invitation to restart at attempt zero. A crash between the Cold record and
 marker can complete initialization only while the record is still inert.
-An independent Store with a stale process index reads the current disk index or
-scans the exact Session directory tree under the same Session lock. The sidecar
-is not a second Session store and contains no transcript, broker endpoint,
+An independent Store with a stale process index scans the durable Session
+directory tree under the same actor lock. The scan rejects two physical
+Sessions with the same ActorId, even when different Stores cache different
+index hints. A Child claim also checks its complete saved parent chain up to
+the Root, including current Project identity and adjacent depth. Each saved
+ancestor birth and metadata revision is retained in the Child actor record,
+so a previously observed ancestor re-creation cannot revive an old activation
+fence. Project A-to-B-to-A changes are fenced when each Project write advances
+`metadata_version`; the Child write gap is tracked in #1317. A deleted middle Child therefore
+cannot leave a claimable grandchild behind. This
+first-slice safety check scans Root directories on each authority operation;
+a future durable unique-id registry could replace that cost. The sidecar is
+not a second Session store and contains no transcript, broker endpoint,
 credential, PID, container id, or worker mailbox.
 
 Root Project identity may first bind or change after Session creation. While
@@ -32,13 +42,17 @@ a higher authority revision before another activation can be claimed. A live
 activation retains the Project at claim time. If the Session's Project changes
 while it is live, all authority operations return a Project transition conflict
 without modifying the old sidecar or lease. The authority also records the
-last observed Root `metadata_version`: an unseen gap of two or more revisions
-while active is blocked even if the Project now matches, because the Project
-could have changed away and back. `metadata_version` also covers title and
-pin changes, so two unrelated UI updates can conservatively block a live
-activation. This currently affects only the new authority seam, which has no
-production activation caller. A Project-specific epoch or guarded Project
-write boundary is required before that caller is connected. The current
+last observed own and ancestor `metadata_version` values: an unseen gap of two
+or more revisions while active is blocked even if the Project now matches,
+because the Project could have changed away and back. `metadata_version` also
+covers title and pin changes, so two unrelated UI updates can conservatively
+block a live activation. More importantly, V2 currently enforces the Project
+revision contract only for Roots. A Child full/runtime save can change Project
+twice without advancing its metadata version; #1317 must close that separate
+write boundary before this is a complete Project ABA fence. This currently
+affects only the new authority seam, which has no production activation caller.
+A Project-specific epoch or guarded Project write boundary is required before
+that caller is connected. The current
 runtime has no integrated cancellation/reconciliation caller for a blocked
 live activation yet.
 
@@ -69,5 +83,10 @@ across all paths. Legacy `deploy_agent` convergence and scheduling belong to
 
 Focused tests cover Session-before-activation, restart continuity, competing
 independent store owners, expired retry and stale fences, retirement, malformed
-or mismatched authority, stale index recovery, Project reassignment, missing
-sidecar/marker recovery, and invalid state-machine records.
+or mismatched authority, stale index recovery, duplicate physical IDs, orphaned
+descendants, observed ancestor re-creation, Project lineage and reassignment,
+missing sidecar/marker recovery, and invalid state-machine records. A Child
+first inspected only after its parent was deleted and recreated with the same
+id has no earlier ancestor birth record; this slice rejects a later-born
+parent by timestamp, while #1318 will put an exact durable incarnation binding
+in the Child Session creation record before remote clocks are in scope.
