@@ -4480,6 +4480,219 @@ async fn get_returns_runner_diagnostics() {
     assert!(payload.get("guidance").is_some());
 }
 
+fn child_inspection_ctx(parent_session_id: &str) -> ToolCtx {
+    ToolExecutionContext {
+        executing_supervisor: None,
+        session_id: Some(parent_session_id),
+        root_session_id: None,
+        tool_call_id: "tool_call_inspect_child",
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    }
+    .to_tool_ctx()
+}
+
+async fn inspect_child(
+    tool: &SubAgentTool,
+    parent_session_id: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    let result = invoke_completed(tool, args, child_inspection_ctx(parent_session_id))
+        .await
+        .expect("authorized child inspection");
+    serde_json::from_str(&result.result).expect("inspection JSON")
+}
+
+#[tokio::test]
+async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let answer = "汉字🙂résumé\n".repeat(1600);
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.add_message(Message::assistant(answer.clone(), None));
+    child
+        .metadata
+        .insert("assignment_prompt".into(), "任务".repeat(4000));
+    harness.storage.save_session(&child).await.unwrap();
+
+    let overview = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({"action": "get", "child_session_id": harness.child_session_id}),
+    )
+    .await;
+    assert!(overview["prompt"].as_str().unwrap().len() <= 2048);
+    assert!(overview["truncated_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "prompt"));
+    assert!(overview["inspection_hint"]
+        .as_str()
+        .unwrap()
+        .contains("metadata"));
+
+    let messages = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "limit": 2,
+        }),
+    )
+    .await;
+    assert_eq!(messages["messages"].as_array().unwrap().len(), 2);
+    assert!(messages["next_cursor"].is_string());
+    assert!(
+        messages["messages"][0]["content_preview"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= 512
+    );
+
+    let first_result = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "result",
+            "max_bytes": 113,
+        }),
+    )
+    .await;
+    assert_eq!(first_result["available"], true);
+    assert!(first_result["next_cursor"].is_string());
+    assert!(first_result["text"].as_str().unwrap().len() <= 113);
+
+    // Re-open the durable V2 store with a fresh adapter/tool, as a server
+    // restart would. The old in-memory cache cannot supply any next slice.
+    let bamboo_home = harness.workspace_path.parent().unwrap().to_path_buf();
+    let reopened_store = Arc::new(SessionStoreV2::new(bamboo_home).await.unwrap());
+    let reopened_storage: Arc<dyn Storage> = reopened_store.clone();
+    let reopened_adapter = Arc::new(ChildSessionAdapter {
+        session_store: reopened_store,
+        storage: reopened_storage.clone(),
+        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(reopened_storage)),
+        session_messenger: None,
+        scheduler: harness.adapter.scheduler.clone(),
+        sessions_cache: Arc::default(),
+        agent_runners: Arc::new(RwLock::new(HashMap::new())),
+        session_event_senders: Arc::new(RwLock::new(HashMap::new())),
+        subagent_model_resolver: None,
+        config: harness.adapter.config.clone(),
+        project_store: harness.adapter.project_store.clone(),
+        workspace_resolver: harness.adapter.workspace_resolver.clone(),
+        parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+    });
+    let reopened_tool = SubAgentTool::new(reopened_adapter.clone(), reopened_adapter);
+    let message_next = inspect_child(
+        &reopened_tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "cursor": messages["next_cursor"],
+            "limit": 2,
+        }),
+    )
+    .await;
+    assert_eq!(message_next["messages"][0]["index"], 2);
+
+    let mut reassembled = first_result["text"].as_str().unwrap().to_string();
+    let mut cursor = first_result["next_cursor"].as_str().map(str::to_string);
+    while let Some(next) = cursor {
+        let page = inspect_child(
+            &reopened_tool,
+            &harness.parent_session_id,
+            json!({
+                "action": "get",
+                "child_session_id": harness.child_session_id,
+                "view": "result",
+                "cursor": next,
+                "max_bytes": 113,
+            }),
+        )
+        .await;
+        assert!(page["text"].as_str().unwrap().len() <= 113);
+        reassembled.push_str(page["text"].as_str().unwrap());
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+    }
+    assert_eq!(reassembled, answer);
+}
+
+#[tokio::test]
+async fn child_inspection_only_allows_the_direct_parent() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let nested_parent = Session::new_child_of("nested-parent", &root, "gpt-5", "Nested parent");
+    let mut grandchild = Session::new_child_of("grandchild", &nested_parent, "gpt-5", "Grandchild");
+    grandchild.add_message(Message::assistant("nested answer", None));
+    harness.storage.save_session(&nested_parent).await.unwrap();
+    harness.storage.save_session(&grandchild).await.unwrap();
+
+    let root_error = invoke_completed(
+        &harness.tool,
+        json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
+        child_inspection_ctx(&harness.parent_session_id),
+    )
+    .await
+    .unwrap_err();
+    assert!(root_error.to_string().contains("does not belong to parent"));
+
+    let nested = inspect_child(
+        &harness.tool,
+        &nested_parent.id,
+        json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
+    )
+    .await;
+    assert_eq!(nested["text"], "nested answer");
+
+    let wrong_cursor = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "limit": 1,
+        }),
+    )
+    .await;
+    let cursor_error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "get",
+            "child_session_id": grandchild.id,
+            "view": "messages",
+            "cursor": wrong_cursor["next_cursor"],
+        }),
+        child_inspection_ctx(&nested_parent.id),
+    )
+    .await
+    .unwrap_err();
+    assert!(cursor_error.to_string().contains("invalid or stale"));
+}
+
 #[tokio::test]
 async fn create_returns_duration_hint() {
     let harness = build_test_harness().await;

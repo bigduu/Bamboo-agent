@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 mod actions;
 mod helpers;
+mod inspection;
 
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ pub use helpers::{
     normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
     replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
 };
+pub use inspection::inspect_child_action;
 
 // ---------------------------------------------------------------------------
 // Error type
