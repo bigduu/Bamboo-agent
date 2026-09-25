@@ -89,6 +89,46 @@ struct SuccessorRecordingProvider {
     successor_match_count: Arc<AtomicUsize>,
 }
 
+/// Observes the real parent execution launched after a completed child clears
+/// a durable synchronous wait. The provider must see the hidden child result.
+struct ChildOutcomeRecordingProvider {
+    calls: Arc<AtomicUsize>,
+    outcome_seen: Arc<Notify>,
+    saw_final_response: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LLMProvider for ChildOutcomeRecordingProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_final_response.store(
+            messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("Child final response:\nfast child reply")
+                    && message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("runtime_kind"))
+                        .and_then(|kind| kind.as_str())
+                        == Some("child_completion_resume")
+            }),
+            Ordering::SeqCst,
+        );
+        self.outcome_seen.notify_one();
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("parent resumed".to_string())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
 #[async_trait]
 impl LLMProvider for SuccessorRecordingProvider {
     async fn chat_stream(
@@ -1047,6 +1087,100 @@ async fn activation_watermark_wait_gap_defers_then_reserves_same_generation_once
     })
     .await
     .expect("dropping an unpublished activation must roll back its reservation");
+}
+
+#[tokio::test]
+async fn fast_child_completion_automatically_starts_parent_successor() {
+    use crate::execution::{ChildCompletion, ChildCompletionHandler};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let outcome_seen = Arc::new(Notify::new());
+    let saw_final_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ChildOutcomeRecordingProvider {
+        calls: calls.clone(),
+        outcome_seen: outcome_seen.clone(),
+        saw_final_response: saw_final_response.clone(),
+    });
+    let harness = build_terminal_delivery_harness(provider, None, None).await;
+    let now = chrono::Utc::now();
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut runtime = AgentRuntimeState::new("parent-wait-fast-child");
+    runtime.status = AgentStatusState::Suspended;
+    runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_children".to_string(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: None,
+    });
+    let mut wait = WaitingForChildrenState::for_children(
+        vec![harness.child_session_id.clone()],
+        ChildWaitPolicy::All,
+        now,
+    );
+    wait.registered_by_tool_call_id = Some("fast-child-launch".to_string());
+    runtime.waiting_for_children = Some(wait);
+    parent.agent_runtime_state = Some(runtime);
+    parent.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "waiting_for_children".to_string(),
+    );
+    parent.set_last_run_status("suspended");
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.add_message(Message::assistant("fast child reply", None));
+    child.set_last_run_status("completed");
+    harness.storage.save_session(&child).await.unwrap();
+
+    let completion = ChildCompletion {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        status: "completed".to_string(),
+        error: None,
+        completed_at: now,
+    };
+    let coordinator = harness.coordinator.clone();
+    let completion_task = tokio::spawn(async move {
+        coordinator.on_child_completed(completion).await;
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.reservation_entered.notified(),
+    )
+    .await
+    .expect("child completion must request a real parent successor");
+    let cleared = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cleared
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+    assert!(!cleared.metadata.contains_key("runtime.suspend_reason"));
+    assert_eq!(harness.reservations.load(Ordering::SeqCst), 1);
+
+    harness.allow_reservation.notify_one();
+    completion_task.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), outcome_seen.notified())
+        .await
+        .expect("the parent successor must reach its provider without a watchdog");
+    assert!(saw_final_response.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
