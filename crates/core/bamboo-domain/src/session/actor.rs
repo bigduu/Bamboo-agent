@@ -70,6 +70,9 @@ pub struct ActorSession {
     pub parent_actor_id: Option<ActorId>,
     pub root_actor_id: ActorId,
     pub project_id: Option<String>,
+    /// Last observed Root metadata revision. A Project change advances this
+    /// revision exactly once at the Session write boundary. Child actors use 0.
+    pub observed_metadata_version: u64,
     pub spawn_depth: u32,
     pub state: ActorLogicalState,
     pub current_attempt: u64,
@@ -79,7 +82,7 @@ pub struct ActorSession {
 }
 
 impl ActorSession {
-    /// Project immutable identity from a Session that has already been saved.
+    /// Derive stable actor identity and current Project context from a saved Session.
     pub fn from_session(session: &Session) -> Result<Self, ActorDirectoryError> {
         let actor_id = session.id.as_str();
         let root_id = session.root_session_id.as_str();
@@ -110,13 +113,15 @@ impl ActorSession {
                 Some(parent.clone())
             }
         };
-        let project_id = session.project_id_meta();
-        if project_id
-            .as_ref()
-            .is_some_and(|id| id.parse::<ProjectId>().is_err())
-        {
-            return Err(ActorDirectoryError::InvalidIdentity);
-        }
+        let project_id = session
+            .project_id_meta()
+            .map(|id| {
+                id.trim()
+                    .parse::<ProjectId>()
+                    .map(ProjectId::into_string)
+                    .map_err(|_| ActorDirectoryError::InvalidIdentity)
+            })
+            .transpose()?;
         Ok(Self {
             schema_version: ACTOR_DIRECTORY_SCHEMA_VERSION,
             actor_id: actor_id.to_string(),
@@ -124,6 +129,11 @@ impl ActorSession {
             parent_actor_id,
             root_actor_id: root_id.to_string(),
             project_id,
+            observed_metadata_version: if session.kind == SessionKind::Root {
+                session.metadata_version
+            } else {
+                0
+            },
             spawn_depth: session.spawn_depth,
             state: ActorLogicalState::Cold,
             current_attempt: 0,
@@ -139,7 +149,6 @@ impl ActorSession {
                 && self.session_created_at == expected.session_created_at
                 && self.parent_actor_id == expected.parent_actor_id
                 && self.root_actor_id == expected.root_actor_id
-                && self.project_id == expected.project_id
                 && self.spawn_depth == expected.spawn_depth
         })
     }
@@ -173,6 +182,9 @@ pub struct ActorActivation {
     pub lease_owner: String,
     pub lease_epoch: u64,
     pub lease_expires_at: DateTime<Utc>,
+    /// Project identity at claim time; a later cold Root reassignment does not
+    /// relabel the completed activation's authority.
+    pub project_id: Option<String>,
     pub inbox_generation: u64,
     pub placement_ref: Option<ActorPlacementRef>,
     pub status: ActorActivationStatus,
@@ -238,6 +250,11 @@ impl ActorDirectoryEntry {
             || self.revision == 0
             || !valid_actor_id(&self.actor.actor_id)
             || !valid_actor_id(&self.actor.root_actor_id)
+            || self
+                .actor
+                .project_id
+                .as_ref()
+                .is_some_and(|id| id.parse::<ProjectId>().is_err())
             || match self.actor.parent_actor_id.as_deref() {
                 None => {
                     self.actor.spawn_depth != 0 || self.actor.root_actor_id != self.actor.actor_id
@@ -246,6 +263,7 @@ impl ActorDirectoryEntry {
                     !valid_actor_id(parent)
                         || parent == self.actor.actor_id
                         || self.actor.root_actor_id == self.actor.actor_id
+                        || self.actor.observed_metadata_version != 0
                         || self.actor.spawn_depth == 0
                 }
             }
@@ -276,6 +294,12 @@ impl ActorDirectoryEntry {
                     || activation.activation_id.is_empty()
                     || activation.run_id.trim().is_empty()
                     || activation.lease_owner.trim().is_empty()
+                    || activation
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|id| id.parse::<ProjectId>().is_err())
+                    || (activation.status.is_live()
+                        && activation.project_id != self.actor.project_id)
                     || activation
                         .placement_ref
                         .as_ref()
@@ -348,6 +372,8 @@ pub enum ActorDirectoryError {
     NotFound(String),
     #[error("actor Session identity is invalid or changed")]
     InvalidIdentity,
+    #[error("Root Project context changed or cannot be proven stable while an activation is live")]
+    ProjectTransitionBlocked,
     #[error("actor authority record is malformed, unsupported, or inconsistent")]
     Corrupt,
     #[error("actor activation is already owned by another live attempt")]
@@ -438,6 +464,9 @@ mod tests {
         let mut moved = grandchild.clone();
         moved.parent_session_id = Some("sibling".into());
         assert!(!actor.matches_session(&moved));
+        let mut rebound = grandchild.clone();
+        rebound.set_project_id_meta("project-a");
+        assert!(actor.matches_session(&rebound));
     }
 
     #[test]

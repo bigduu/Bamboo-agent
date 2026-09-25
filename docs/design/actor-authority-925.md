@@ -16,9 +16,31 @@ Session with the same public id cannot inherit an older activation lease.
 `SessionStoreV2` persists `actor-authority.json` beside the Session. A claim
 first proves the Session is durably present and its main/runtime identity pair
 is consistent, then durably publishes a Cold authority record if missing. Only
-after that publication may it publish a Reserved `ActorActivation`. The sidecar
+after that publication and an independent durable
+`actor-authority.initialized.json` marker may it publish a Reserved
+`ActorActivation`. A missing sidecar with an existing marker is corrupt, never
+an invitation to restart at attempt zero. A crash between the Cold record and
+marker can complete initialization only while the record is still inert.
+An independent Store with a stale process index reads the current disk index or
+scans the exact Session directory tree under the same Session lock. The sidecar
 is not a second Session store and contains no transcript, broker endpoint,
 credential, PID, container id, or worker mailbox.
+
+Root Project identity may first bind or change after Session creation. While
+the actor is Cold or terminal, its Project projection is updated durably with
+a higher authority revision before another activation can be claimed. A live
+activation retains the Project at claim time. If the Session's Project changes
+while it is live, all authority operations return a Project transition conflict
+without modifying the old sidecar or lease. The authority also records the
+last observed Root `metadata_version`: an unseen gap of two or more revisions
+while active is blocked even if the Project now matches, because the Project
+could have changed away and back. `metadata_version` also covers title and
+pin changes, so two unrelated UI updates can conservatively block a live
+activation. This currently affects only the new authority seam, which has no
+production activation caller. A Project-specific epoch or guarded Project
+write boundary is required before that caller is connected. The current
+runtime has no integrated cancellation/reconciliation caller for a blocked
+live activation yet.
 
 Every authority operation holds the existing lifecycle, runtime sidecar, and
 exact Session maintenance locks in that order. The maintenance lock includes a
@@ -47,4 +69,5 @@ across all paths. Legacy `deploy_agent` convergence and scheduling belong to
 
 Focused tests cover Session-before-activation, restart continuity, competing
 independent store owners, expired retry and stale fences, retirement, malformed
-or mismatched authority, and invalid state-machine records.
+or mismatched authority, stale index recovery, Project reassignment, missing
+sidecar/marker recovery, and invalid state-machine records.

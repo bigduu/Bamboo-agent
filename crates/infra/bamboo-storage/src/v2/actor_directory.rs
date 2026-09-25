@@ -5,7 +5,7 @@
 //! It is never derived from a physical worker or broker mailbox.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bamboo_domain::{
@@ -14,12 +14,24 @@ use bamboo_domain::{
     ActorLogicalState, ActorSession,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::{durable_atomic_write, SessionStoreV2};
+use super::{durable_atomic_write, validate_session_id, SessionStoreV2, SessionsIndex};
 
 const ACTOR_AUTHORITY_FILE: &str = "actor-authority.json";
+const ACTOR_INITIALIZED_FILE: &str = "actor-authority.initialized.json";
+
+/// Independent evidence that an authority record was fully initialized before
+/// the first claim. Losing the mutable sidecar must never restart attempt 0.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActorInitializedMarker {
+    schema_version: u32,
+    actor_id: String,
+    session_created_at: DateTime<Utc>,
+}
 
 fn storage(error: io::Error) -> ActorDirectoryError {
     ActorDirectoryError::Storage(error.to_string())
@@ -72,29 +84,139 @@ impl<T> Mutation<T> {
 }
 
 impl SessionStoreV2 {
-    async fn actor_authority_path(
+    async fn regular_actor_directory(path: &Path) -> Result<bool, ActorDirectoryError> {
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+            Ok(_) => Err(ActorDirectoryError::Corrupt),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(storage(error)),
+        }
+    }
+
+    async fn regular_actor_file(path: &Path) -> Result<bool, ActorDirectoryError> {
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => Err(ActorDirectoryError::Corrupt),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(storage(error)),
+        }
+    }
+
+    /// Verify each path component before trusting an index hint. A missing
+    /// main file may be a stale rebuildable index entry; a symlink is corrupt.
+    async fn indexed_actor_rel_path(
         &self,
         actor_id: &str,
-    ) -> Result<std::path::PathBuf, ActorDirectoryError> {
-        let rel = self
-            .resolve_rel_path(actor_id)
-            .await
-            .ok_or_else(|| ActorDirectoryError::NotFound(actor_id.to_string()))?;
-        Ok(self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE))
+        rel: &str,
+    ) -> Result<Option<String>, ActorDirectoryError> {
+        let (kind, root_id) =
+            Self::copy_source_identity_from_rel(actor_id, rel).map_err(storage)?;
+        if !Self::regular_actor_directory(&self.sessions_dir).await?
+            || !Self::regular_actor_directory(&self.sessions_dir.join(&root_id)).await?
+        {
+            return Ok(None);
+        }
+        if kind == bamboo_domain::SessionKind::Child
+            && (!Self::regular_actor_directory(&self.sessions_dir.join(&root_id).join("children"))
+                .await?
+                || !Self::regular_actor_directory(&self.abs_path_from_rel(rel)).await?)
+        {
+            return Ok(None);
+        }
+        let main = self.abs_path_from_rel(rel).join("session.json");
+        if !Self::regular_actor_file(&main).await? {
+            return Ok(None);
+        }
+        Ok(Some(rel.to_string()))
+    }
+
+    async fn scan_actor_rel_path(&self, actor_id: &str) -> Result<String, ActorDirectoryError> {
+        if !Self::regular_actor_directory(&self.sessions_dir).await? {
+            return Err(ActorDirectoryError::NotFound(actor_id.to_string()));
+        }
+        let mut candidates = Vec::new();
+        let root_rel = Self::root_rel_path(actor_id);
+        if self
+            .indexed_actor_rel_path(actor_id, &root_rel)
+            .await?
+            .is_some()
+        {
+            candidates.push(root_rel);
+        }
+        let mut roots = fs::read_dir(&self.sessions_dir).await.map_err(storage)?;
+        while let Some(root) = roots.next_entry().await.map_err(storage)? {
+            if !root.file_type().await.map_err(storage)?.is_dir() {
+                continue;
+            }
+            let Some(root_id) = root.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if validate_session_id(&root_id).is_err() {
+                continue;
+            }
+            let child_rel = Self::child_rel_path(&root_id, actor_id);
+            if self
+                .indexed_actor_rel_path(actor_id, &child_rel)
+                .await?
+                .is_some()
+            {
+                candidates.push(child_rel);
+                if candidates.len() > 1 {
+                    return Err(ActorDirectoryError::Corrupt);
+                }
+            }
+        }
+        match candidates.pop() {
+            Some(rel) => Ok(rel),
+            None => Err(ActorDirectoryError::NotFound(actor_id.to_string())),
+        }
+    }
+
+    /// The process-local index is only a hint. Another Store may publish a
+    /// Session after this instance was constructed, or a crash may leave the
+    /// canonical Session durable before its rebuildable global index entry.
+    async fn actor_authority_location(
+        &self,
+        actor_id: &str,
+    ) -> Result<(String, PathBuf), ActorDirectoryError> {
+        validate_session_id(actor_id).map_err(storage)?;
+        if let Some(cached) = self.resolve_rel_path(actor_id).await {
+            if let Some(rel) = self.indexed_actor_rel_path(actor_id, &cached).await? {
+                let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
+                return Ok((rel, path));
+            }
+        }
+        match fs::read(&self.index_path).await {
+            Ok(bytes) => {
+                if let Ok(current) = serde_json::from_slice::<SessionsIndex>(&bytes) {
+                    if let Some(indexed) = current.sessions.get(actor_id) {
+                        if let Some(rel) = self
+                            .indexed_actor_rel_path(actor_id, &indexed.rel_path)
+                            .await?
+                        {
+                            let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
+                            return Ok((rel, path));
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage(error)),
+        }
+        let rel = self.scan_actor_rel_path(actor_id).await?;
+        let path = self.abs_path_from_rel(&rel).join(ACTOR_AUTHORITY_FILE);
+        Ok((rel, path))
     }
 
     async fn read_or_create_actor_entry(
         &self,
         actor_id: &str,
+        rel: &str,
         path: &Path,
     ) -> Result<ActorDirectoryEntry, ActorDirectoryError> {
-        let index = self
-            .get_index_entry(actor_id)
-            .await
-            .ok_or_else(|| ActorDirectoryError::NotFound(actor_id.to_string()))?;
         let (kind, root_id) =
-            Self::copy_source_identity_from_rel(actor_id, &index.rel_path).map_err(storage)?;
-        let directory = self.abs_path_from_rel(&index.rel_path);
+            Self::copy_source_identity_from_rel(actor_id, rel).map_err(storage)?;
+        let directory = self.abs_path_from_rel(rel);
         let session = self
             .load_session_from_dir_strict(&directory, actor_id, kind, &root_id)
             .await
@@ -104,8 +226,24 @@ impl SessionStoreV2 {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
         let expected = ActorSession::from_session(&session)?;
-        let entry = match fs::symlink_metadata(path).await {
-            Ok(metadata) if metadata.file_type().is_file() => {
+        let marker_path = directory.join(ACTOR_INITIALIZED_FILE);
+        let marker = match Self::regular_actor_file(&marker_path).await? {
+            true => {
+                let bytes = fs::read(&marker_path).await.map_err(storage)?;
+                let marker: ActorInitializedMarker =
+                    serde_json::from_slice(&bytes).map_err(|_| ActorDirectoryError::Corrupt)?;
+                if marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+                    || marker.actor_id != actor_id
+                    || marker.session_created_at != expected.session_created_at
+                {
+                    return Err(ActorDirectoryError::Corrupt);
+                }
+                Some(marker)
+            }
+            false => None,
+        };
+        let mut entry = match Self::regular_actor_file(path).await? {
+            true => {
                 let raw = fs::read(path).await.map_err(storage)?;
                 let entry: ActorDirectoryEntry =
                     serde_json::from_slice(&raw).map_err(|_| ActorDirectoryError::Corrupt)?;
@@ -113,19 +251,71 @@ impl SessionStoreV2 {
                 if !entry.actor.matches_session(&session) {
                     return Err(ActorDirectoryError::InvalidIdentity);
                 }
+                if marker.is_none() {
+                    // Only the fully inert first publication can survive a
+                    // crash before marker durability. A prior claim without
+                    // independent evidence must never be silently adopted.
+                    if entry.actor.current_attempt != 0
+                        || entry.actor.state != ActorLogicalState::Cold
+                        || entry.activation.is_some()
+                    {
+                        return Err(ActorDirectoryError::Corrupt);
+                    }
+                    self.write_actor_marker(&marker_path, &expected).await?;
+                }
                 entry
             }
-            Ok(_) => return Err(ActorDirectoryError::Corrupt),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            false if marker.is_none() => {
                 // The Session was durably visible before this publication. A
-                // crash here leaves an inert Cold actor, never an unowned Run.
-                let entry = ActorDirectoryEntry::new(expected);
+                // crash before the marker leaves an inert Cold actor. No claim
+                // is returned until BOTH files have been durably published.
+                let entry = ActorDirectoryEntry::new(expected.clone());
                 self.write_actor_entry(path, &entry).await?;
+                self.write_actor_marker(&marker_path, &expected).await?;
                 entry
             }
-            Err(error) => return Err(storage(error)),
+            false => return Err(ActorDirectoryError::Corrupt),
         };
+        if kind == bamboo_domain::SessionKind::Root {
+            let observed = entry.actor.observed_metadata_version;
+            let current = expected.observed_metadata_version;
+            if current < observed {
+                return Err(ActorDirectoryError::InvalidIdentity);
+            }
+            let project_changed = entry.actor.project_id != expected.project_id;
+            if entry.actor.state == ActorLogicalState::Active
+                && (project_changed || current - observed >= 2)
+            {
+                // One Root metadata revision with the same Project cannot
+                // contain a Project ABA: each Project change must advance the
+                // durable metadata revision once. A larger unseen gap could
+                // hide a change away and back, so keep the old fence blocked.
+                return Err(ActorDirectoryError::ProjectTransitionBlocked);
+            }
+            if project_changed || current != observed {
+                entry.actor.project_id = expected.project_id;
+                entry.actor.observed_metadata_version = current;
+                entry.revision = checked_next(entry.revision)?;
+                self.write_actor_entry(path, &entry).await?;
+            }
+        } else if entry.actor.project_id != expected.project_id {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
         Ok(entry)
+    }
+
+    async fn write_actor_marker(
+        &self,
+        path: &Path,
+        actor: &ActorSession,
+    ) -> Result<(), ActorDirectoryError> {
+        let marker = ActorInitializedMarker {
+            schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+            actor_id: actor.actor_id.clone(),
+            session_created_at: actor.session_created_at,
+        };
+        let bytes = serde_json::to_vec(&marker).map_err(|_| ActorDirectoryError::Corrupt)?;
+        durable_atomic_write(path, &bytes).await.map_err(storage)
     }
 
     async fn write_actor_entry(
@@ -162,8 +352,10 @@ impl SessionStoreV2 {
             .acquire_session_maintenance_lock(actor_id)
             .await
             .map_err(storage)?;
-        let path = self.actor_authority_path(actor_id).await?;
-        let mut entry = self.read_or_create_actor_entry(actor_id, &path).await?;
+        let (rel, path) = self.actor_authority_location(actor_id).await?;
+        let mut entry = self
+            .read_or_create_actor_entry(actor_id, &rel, &path)
+            .await?;
         let Mutation { value, changed } = operation(&mut entry)?;
         if changed {
             entry.revision = checked_next(entry.revision)?;
@@ -233,6 +425,7 @@ impl ActorDirectoryPort for SessionStoreV2 {
                 lease_owner: claim.lease_owner.clone(),
                 lease_epoch,
                 lease_expires_at: claim.lease_expires_at,
+                project_id: entry.actor.project_id.clone(),
                 inbox_generation: claim.inbox_generation,
                 placement_ref: claim.placement_ref.clone(),
                 status: ActorActivationStatus::Reserved,
@@ -701,6 +894,252 @@ mod tests {
                 .unwrap_err(),
             ActorDirectoryError::InvalidIdentity
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_opened_before_creation_discovers_root_and_child_from_durable_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let writer = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let stale_reader = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let root = Session::new("late-root", "model");
+        let child = Session::new_child_of("late-child", &root, "model", "Child");
+        writer.save_session(&root).await?;
+        writer.save_session(&child).await?;
+        assert!(stale_reader.get_index_entry("late-child").await.is_none());
+        assert_eq!(
+            stale_reader.ensure_actor("late-root").await?.actor.actor_id,
+            root.id
+        );
+        assert_eq!(
+            stale_reader
+                .ensure_actor("late-child")
+                .await?
+                .actor
+                .parent_actor_id,
+            Some(root.id.clone())
+        );
+
+        // Simulate a crash after a new Session's files became durable but
+        // before the global rebuildable index was published.
+        let orphan = Session::new_child_of("late-orphan", &root, "model", "Orphan");
+        writer.save_session(&orphan).await?;
+        let index_path = home.path().join("sessions.json");
+        let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&index_path).await?)?;
+        index["sessions"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&orphan.id);
+        fs::write(index_path, serde_json::to_vec(&index)?).await?;
+        assert_eq!(
+            stale_reader.ensure_actor(&orphan.id).await?.actor.actor_id,
+            orphan.id
+        );
+        let activation = stale_reader
+            .claim_activation(&claim(&orphan.id, "run", "host", Utc::now()))
+            .await?;
+        assert_eq!(activation.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_project_rebinds_only_when_no_activation_is_live(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("project-root", "model");
+        store.save_session(&root).await?;
+        let original = store.ensure_actor(&root.id).await?;
+        root.set_project_id_meta(" project-first ");
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        let bound = store.inspect_actor(&root.id).await?;
+        assert_eq!(bound.actor.project_id.as_deref(), Some("project-first"));
+        assert_eq!(bound.revision, original.revision + 1);
+        root.set_project_id_meta("project-second");
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        let reassigned = store.inspect_actor(&root.id).await?;
+        assert_eq!(
+            reassigned.actor.project_id.as_deref(),
+            Some("project-second")
+        );
+        assert_eq!(reassigned.revision, bound.revision + 1);
+        let now = Utc::now();
+        let active = store
+            .claim_activation(&claim(&root.id, "run", "host", now))
+            .await?;
+        assert_eq!(active.project_id.as_deref(), Some("project-second"));
+
+        root.set_project_id_meta("project-third");
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        let sidecar = home
+            .path()
+            .join("sessions/project-root/actor-authority.json");
+        let before = fs::read(&sidecar).await?;
+        assert_eq!(
+            store.inspect_actor(&root.id).await.unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        assert_eq!(
+            store
+                .validate_fence(&active.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        assert_eq!(fs::read(&sidecar).await?, before);
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert_eq!(
+            reopened.inspect_actor(&root.id).await.unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_project_aba_cannot_revive_an_old_active_fence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("project-aba", "model");
+        root.set_project_id_meta("project-a");
+        store.save_session(&root).await?;
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&root.id, "run", "host", now))
+            .await?;
+        let sidecar = home
+            .path()
+            .join("sessions/project-aba/actor-authority.json");
+        let before = fs::read(&sidecar).await?;
+
+        for project in ["project-b", "project-a"] {
+            root.set_project_id_meta(project);
+            root.metadata_version += 1;
+            store.save_runtime_state(&root).await?;
+        }
+        assert_eq!(
+            store
+                .validate_fence(&activation.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        assert_eq!(fs::read(&sidecar).await?, before);
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert_eq!(
+            reopened.inspect_actor(&root.id).await.unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_root_allows_one_ui_revision_but_blocks_ambiguous_ui_gap(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("project-ui", "model");
+        root.set_project_id_meta("project-a");
+        store.save_session(&root).await?;
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&root.id, "run", "host", now))
+            .await?;
+
+        root.title = "One title change".into();
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        store.validate_fence(&activation.fence(), now).await?;
+        let observed = store.inspect_actor(&root.id).await?;
+        assert_eq!(observed.actor.observed_metadata_version, 1);
+        let sidecar = home.path().join("sessions/project-ui/actor-authority.json");
+        let before = fs::read(&sidecar).await?;
+
+        root.pinned = true;
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        root.title = "Another title change".into();
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        assert_eq!(
+            store
+                .validate_fence(&activation.fence(), now)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::ProjectTransitionBlocked
+        );
+        assert_eq!(fs::read(&sidecar).await?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialized_marker_prevents_lost_sidecar_from_resetting_attempt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        store
+            .save_session(&Session::new("marker-root", "model"))
+            .await?;
+        let sidecar = home
+            .path()
+            .join("sessions/marker-root/actor-authority.json");
+        let marker = home
+            .path()
+            .join("sessions/marker-root/actor-authority.initialized.json");
+        store.ensure_actor("marker-root").await?;
+        assert!(sidecar.is_file() && marker.is_file());
+
+        // Interrupted initial publication may leave only an inert Cold file.
+        fs::remove_file(&marker).await?;
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert_eq!(
+            reopened
+                .ensure_actor("marker-root")
+                .await?
+                .actor
+                .current_attempt,
+            0
+        );
+        assert!(marker.is_file());
+        reopened
+            .claim_activation(&claim("marker-root", "run", "host", Utc::now()))
+            .await?;
+        let marker_bytes = fs::read(&marker).await?;
+        fs::remove_file(&marker).await?;
+        assert_eq!(
+            reopened.inspect_actor("marker-root").await.unwrap_err(),
+            ActorDirectoryError::Corrupt
+        );
+        fs::write(&marker, marker_bytes).await?;
+        fs::remove_file(&sidecar).await?;
+        let lost = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert_eq!(
+            lost.inspect_actor("marker-root").await.unwrap_err(),
+            ActorDirectoryError::Corrupt
+        );
+        assert_eq!(
+            lost.claim_activation(&claim("marker-root", "retry", "host", Utc::now()))
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::Corrupt
+        );
+        assert!(!sidecar.exists());
+
+        store
+            .save_session(&Session::new("direct-claim", "model"))
+            .await?;
+        let direct = store
+            .claim_activation(&claim("direct-claim", "run", "host", Utc::now()))
+            .await?;
+        assert_eq!(direct.attempt, 1);
+        assert!(home
+            .path()
+            .join("sessions/direct-claim/actor-authority.initialized.json")
+            .is_file());
         Ok(())
     }
 }
