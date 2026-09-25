@@ -39,11 +39,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 
 use bamboo_agent_core::AgentEvent;
 use bamboo_engine::events::change_feed::ChangeEvent;
 use bamboo_engine::events::journal;
+use bamboo_engine::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+};
 
 use actix_web::web;
 
@@ -171,6 +175,350 @@ impl AgentSeq {
     pub(crate) fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::Relaxed) + 1
     }
+}
+
+#[derive(Debug, Serialize)]
+struct MessageWireItem {
+    id: String,
+    content: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<VisibleAssistantMessage> for MessageWireItem {
+    fn from(message: VisibleAssistantMessage) -> Self {
+        Self {
+            id: message.id,
+            content: message.content,
+            created_at: message.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MessageSnapshotWire {
+    r#type: &'static str,
+    version: u64,
+    messages: Vec<MessageWireItem>,
+    history_committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessageEventWire {
+    Started {
+        version: u64,
+        message_id: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+    Delta {
+        version: u64,
+        message_id: String,
+        offset: usize,
+        content: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+    Discarded {
+        version: u64,
+        message_id: String,
+    },
+}
+
+fn message_snapshot_value(snapshot: VisibleMessageSnapshot) -> serde_json::Value {
+    serde_json::to_value(MessageSnapshotWire {
+        r#type: "snapshot",
+        version: snapshot.version,
+        messages: snapshot.messages.into_iter().map(Into::into).collect(),
+        history_committed: snapshot.history_committed,
+        terminal: snapshot.terminal,
+    })
+    .unwrap_or(serde_json::Value::Null)
+}
+
+fn message_event_value(event: VisibleMessageEvent) -> Option<serde_json::Value> {
+    let wire = match event.kind {
+        VisibleMessageEventKind::Started {
+            message_id,
+            created_at,
+        } => MessageEventWire::Started {
+            version: event.version,
+            message_id,
+            created_at,
+        },
+        VisibleMessageEventKind::Delta {
+            message_id,
+            offset,
+            content,
+            created_at,
+        } => MessageEventWire::Delta {
+            version: event.version,
+            message_id,
+            offset,
+            content,
+            created_at,
+        },
+        VisibleMessageEventKind::Discarded { message_id } => MessageEventWire::Discarded {
+            version: event.version,
+            message_id,
+        },
+        VisibleMessageEventKind::Terminal { .. } | VisibleMessageEventKind::HistoryCommitted => {
+            return None
+        }
+    };
+    serde_json::to_value(wire).ok()
+}
+
+fn history_committed_control(version: u64) -> serde_json::Value {
+    serde_json::json!({ "type": "history_committed", "version": version })
+}
+
+struct MessageSource {
+    run_id: String,
+    receiver: broadcast::Receiver<VisibleMessageEvent>,
+    last_version: u64,
+}
+
+async fn current_message_source(
+    state: &web::Data<AppState>,
+    session_id: &str,
+) -> Option<(MessageSource, VisibleMessageSnapshot)> {
+    let runners = state.agent_runners.read().await;
+    let runner = runners.get(session_id)?;
+    let run_id = runner.run_id.clone();
+    let (receiver, snapshot) = runner.visible_messages.subscribe_with_snapshot();
+    let source = MessageSource {
+        run_id,
+        receiver,
+        last_version: snapshot.version,
+    };
+    Some((source, snapshot))
+}
+
+async fn emit_message_snapshot(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    snapshot: VisibleMessageSnapshot,
+) -> bool {
+    send_env(
+        out,
+        encoding,
+        ServerEnvelope::event(ch, seq.next(), message_snapshot_value(snapshot)),
+    )
+    .await
+}
+
+async fn emit_message_event(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    event: VisibleMessageEvent,
+) -> bool {
+    let version = event.version;
+    let env = match event.kind {
+        VisibleMessageEventKind::Terminal { reason } => {
+            ServerEnvelope::control(ch, seq.next(), terminal_control(&reason))
+        }
+        VisibleMessageEventKind::HistoryCommitted => {
+            ServerEnvelope::control(ch, seq.next(), history_committed_control(version))
+        }
+        kind => {
+            let Some(value) = message_event_value(VisibleMessageEvent { version, kind }) else {
+                return true;
+            };
+            ServerEnvelope::event(ch, seq.next(), value)
+        }
+    };
+    send_env(out, encoding, env).await
+}
+
+async fn replace_message_source(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+) -> Result<Option<MessageSource>, ()> {
+    match current_message_source(state, session_id).await {
+        Some((source, snapshot)) => {
+            if emit_message_snapshot(out, encoding, ch, seq, snapshot).await {
+                Ok(Some(source))
+            } else {
+                Err(())
+            }
+        }
+        None => {
+            let snapshot = VisibleMessageSnapshot {
+                version: 0,
+                messages: Vec::new(),
+                terminal: None,
+                // No runner is not evidence that its final history was saved.
+                history_committed: false,
+            };
+            if emit_message_snapshot(out, encoding, ch, seq, snapshot).await {
+                Ok(None)
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+enum MessageInput {
+    Visible(Result<VisibleMessageEvent, broadcast::error::RecvError>),
+    Generation(Result<Box<AgentEvent>, broadcast::error::RecvError>),
+}
+
+async fn receive_visible(
+    source: &mut Option<MessageSource>,
+) -> Result<VisibleMessageEvent, broadcast::error::RecvError> {
+    match source {
+        Some(source) => source.receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spawn a strictly message-only `message.{sid}` forwarder.
+pub(crate) fn spawn_message_forwarder(
+    state: web::Data<AppState>,
+    session_id: String,
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    mut generation_receiver: broadcast::Receiver<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+        let _watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+            state.session_watchers.clone(),
+            &session_id,
+        );
+        let mut source =
+            match replace_message_source(&state, &session_id, &out, encoding, &ch, &seq).await {
+                Ok(source) => source,
+                Err(()) => return,
+            };
+
+        loop {
+            let input = tokio::select! {
+                visible = receive_visible(&mut source) => MessageInput::Visible(visible),
+                generation = generation_receiver.recv() => {
+                    MessageInput::Generation(generation.map(Box::new))
+                },
+            };
+            match input {
+                MessageInput::Visible(Ok(event)) => {
+                    let generation_matches = {
+                        let runners = state.agent_runners.read().await;
+                        source.as_ref().is_some_and(|current| {
+                            runners
+                                .get(&session_id)
+                                .is_some_and(|runner| runner.run_id == current.run_id)
+                        })
+                    };
+                    if !generation_matches {
+                        source = match replace_message_source(
+                            &state,
+                            &session_id,
+                            &out,
+                            encoding,
+                            &ch,
+                            &seq,
+                        )
+                        .await
+                        {
+                            Ok(source) => source,
+                            Err(()) => return,
+                        };
+                        continue;
+                    }
+                    let Some(current) = source.as_mut() else {
+                        continue;
+                    };
+                    if event.version <= current.last_version {
+                        continue;
+                    }
+                    current.last_version = event.version;
+                    if !emit_message_event(&out, encoding, &ch, &seq, event).await {
+                        return;
+                    }
+                }
+                MessageInput::Visible(Err(broadcast::error::RecvError::Lagged(skipped)))
+                | MessageInput::Generation(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    if !send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(&ch, seq.next(), gap_control(skipped)),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    source = match replace_message_source(
+                        &state,
+                        &session_id,
+                        &out,
+                        encoding,
+                        &ch,
+                        &seq,
+                    )
+                    .await
+                    {
+                        Ok(source) => source,
+                        Err(()) => return,
+                    };
+                }
+                MessageInput::Visible(Err(broadcast::error::RecvError::Closed)) => {
+                    source = None;
+                    if !send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(&ch, seq.next(), gap_control(0)),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                MessageInput::Generation(Ok(event)) => {
+                    let AgentEvent::ExecutionStarted {
+                        run_id,
+                        session_id: started_session,
+                        ..
+                    } = event.as_ref()
+                    else {
+                        // Full-fidelity events are internal generation signals only.
+                        continue;
+                    };
+                    if started_session != &session_id {
+                        continue;
+                    }
+                    if source
+                        .as_ref()
+                        .is_some_and(|current| current.run_id == *run_id)
+                    {
+                        continue;
+                    }
+                    if let Some((next, snapshot)) =
+                        current_message_source(&state, &session_id).await
+                    {
+                        if next.run_id != *run_id {
+                            continue;
+                        }
+                        if !emit_message_snapshot(&out, encoding, &ch, &seq, snapshot).await {
+                            return;
+                        }
+                        source = Some(next);
+                    }
+                }
+                MessageInput::Generation(Err(broadcast::error::RecvError::Closed)) => return,
+            }
+        }
+    })
 }
 
 /// Spawn an `agent.{sid}` forwarder.
@@ -632,6 +980,93 @@ mod tests {
         assert_eq!(seq.next(), 3);
     }
 
+    #[test]
+    fn message_wire_schema_contains_only_visible_text_fields() {
+        let created_at = chrono::Utc::now();
+        let stream = bamboo_engine::VisibleMessageStream::new();
+        stream.start("message-1".to_string(), created_at);
+        stream.append("visible".to_string());
+        let (_receiver, snapshot) = stream.subscribe_with_snapshot();
+        let event = message_snapshot_value(snapshot);
+        assert_eq!(
+            event
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["history_committed", "messages", "type", "version"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let message = event["messages"][0].as_object().unwrap();
+        assert_eq!(
+            message
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["content", "created_at", "id"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        for forbidden in [
+            "reasoning",
+            "tool_calls",
+            "tool_result",
+            "metadata",
+            "content_parts",
+            "screenshot",
+            "approval",
+            "budget",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn message_delta_json_and_msgpack_use_the_same_safe_shape() {
+        let created_at = chrono::Utc::now();
+        let value = message_event_value(VisibleMessageEvent {
+            version: 9,
+            kind: VisibleMessageEventKind::Delta {
+                message_id: "message-1".to_string(),
+                offset: 3,
+                content: "ible".to_string(),
+                created_at,
+            },
+        })
+        .unwrap();
+        let envelope = ServerEnvelope::event("message.session-1", 2, value.clone());
+        let OutFrame::Binary(bytes) = envelope.encode(Encoding::Msgpack).unwrap() else {
+            panic!("msgpack must use binary frames");
+        };
+        let decoded: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded["event"], value);
+        let keys = decoded["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "content",
+                "created_at",
+                "message_id",
+                "offset",
+                "type",
+                "version"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+    }
+
     /// The live-skip predicate used in the feed handoff drops `seq <= cursor`
     /// and keeps `seq > cursor`, so the replay/live overlap is deduped without
     /// dropping anything past the cursor.
@@ -761,6 +1196,211 @@ mod tests {
         session.add_message(bamboo_agent_core::Message::assistant("done", None));
         state.save_session(&mut session).await;
         (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_replays_safe_snapshot_and_ignores_full_fidelity_events() {
+        let (state, _tmp) = test_state("message-live").await;
+        let (generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(32);
+        let visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("message-live".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+            runner
+                .visible_messages
+                .start("visible-1".to_string(), chrono::Utc::now());
+            runner.visible_messages.append("before".to_string());
+            runner.visible_messages.clone()
+        };
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let handle = spawn_message_forwarder(
+            state,
+            "message-live".to_string(),
+            out_tx,
+            Encoding::Json,
+            "message.message-live".to_string(),
+            generation_rx,
+        );
+
+        let snapshot = next_json(&mut out_rx).await;
+        assert_eq!(snapshot["event"]["type"], "snapshot");
+        assert_eq!(snapshot["event"]["messages"][0]["id"], "visible-1");
+        assert_eq!(snapshot["event"]["messages"][0]["content"], "before");
+
+        for event in [
+            AgentEvent::ReasoningToken {
+                content: "private reasoning".to_string(),
+            },
+            AgentEvent::ToolToken {
+                tool_call_id: "tool-1".to_string(),
+                content: "private tool output".to_string(),
+            },
+            AgentEvent::Token {
+                content: "unsafe generic token".to_string(),
+            },
+        ] {
+            generation_tx.send(event).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), out_rx.recv())
+                .await
+                .is_err(),
+            "full-fidelity events must never produce a message-channel frame"
+        );
+
+        visible.append(" after".to_string());
+        let delta = next_json(&mut out_rx).await;
+        assert_eq!(delta["event"]["type"], "delta");
+        assert_eq!(delta["event"]["message_id"], "visible-1");
+        assert_eq!(delta["event"]["offset"], 6);
+        assert_eq!(delta["event"]["content"], " after");
+
+        visible.mark_terminal("complete");
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(terminal["control"], terminal_control("complete"));
+        visible.history_committed();
+        let committed = next_json(&mut out_rx).await;
+        assert_eq!(committed["control"]["type"], "history_committed");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_does_not_claim_history_commit_without_a_runner() {
+        let (state, _tmp) = test_state("message-no-runner").await;
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            "message-no-runner".to_string(),
+            out_tx,
+            Encoding::Json,
+            "message.message-no-runner".to_string(),
+            generation_rx,
+        );
+
+        let snapshot = next_json(&mut out_rx).await;
+        assert_eq!(snapshot["event"]["type"], "snapshot");
+        assert_eq!(snapshot["event"]["history_committed"], false);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_drops_queued_text_from_a_replaced_runner() {
+        let session_id = "message-replaced-runner";
+        let (state, _tmp) = test_state(session_id).await;
+        let old_visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("old".into(), chrono::Utc::now());
+            runner.visible_messages.append("old text".into());
+            runner.visible_messages.clone()
+        };
+        let (generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state.clone(),
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let first = next_json(&mut out_rx).await;
+        assert_eq!(first["event"]["messages"][0]["content"], "old text");
+
+        let new_run_id = {
+            let mut runners = state.agent_runners.write().await;
+            let replacement = AgentRunner::new();
+            let new_run_id = replacement.run_id.clone();
+            replacement
+                .visible_messages
+                .start("new".into(), chrono::Utc::now());
+            replacement.visible_messages.append("new text".into());
+            runners.insert(session_id.to_string(), replacement);
+            new_run_id
+        };
+        old_visible.append(" STALE_PRIVATE_TEXT".into());
+        generation_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: new_run_id.clone(),
+                session_id: session_id.to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let replacement = next_json(&mut out_rx).await;
+        assert_eq!(replacement["event"]["type"], "snapshot");
+        assert_eq!(replacement["event"]["messages"][0]["content"], "new text");
+        assert!(!replacement.to_string().contains("STALE_PRIVATE_TEXT"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), out_rx.recv())
+                .await
+                .is_err(),
+            "a queued start must not duplicate the replacement snapshot"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_resnapshots_after_visible_channel_lag() {
+        let session_id = "message-lag-recovery";
+        let (state, _tmp) = test_state(session_id).await;
+        let visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("visible-1".into(), chrono::Utc::now());
+            runner.visible_messages.clone()
+        };
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let initial = next_json(&mut out_rx).await;
+        assert_eq!(initial["event"]["type"], "snapshot");
+
+        // The current-thread test does not yield while publishing, so the
+        // receiver must see a lagged ring rather than a partial token tail.
+        for _ in 0..1050 {
+            visible.append("x".into());
+        }
+        // A few deltas may already be in the outbound queue before the ring
+        // overflows; the forwarder must eventually announce the gap.
+        let mut gap = None;
+        for _ in 0..20 {
+            let frame = next_json(&mut out_rx).await;
+            if frame["control"]["type"] == "gap" {
+                gap = Some(frame);
+                break;
+            }
+            assert_eq!(frame["event"]["type"], "delta");
+        }
+        let gap = gap.expect("visible lag must be reported");
+        assert_eq!(gap["control"]["type"], "gap");
+        let recovered = next_json(&mut out_rx).await;
+        assert_eq!(recovered["event"]["type"], "snapshot");
+        assert_eq!(
+            recovered["event"]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1050
+        );
+        handle.abort();
     }
 
     /// Overflow a 4-slot ring with 10 events BEFORE the forwarder polls, so its
