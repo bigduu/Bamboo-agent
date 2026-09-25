@@ -104,6 +104,13 @@ pub enum ApprovalReplayDecision {
     /// original tool mutates state. Callers consume the marker and record a
     /// failed result, but must not emit `ToolStart` or enter the executor.
     BlockedByPlan(ToolExecutionSessionFlags),
+    /// The durable Root tool catalog no longer admits the resolved execution
+    /// owner. Callers consume the marker as a failed result without restoring
+    /// a remembered grant, emitting ToolStart, or entering the executor.
+    BlockedByRootToolAuthority,
+    /// The original execution owner is no longer registered. A legacy replay
+    /// consumes its stale marker as a failed result without entering a tool.
+    BlockedByUnavailableTool,
 }
 
 /// Exact history target of one approved tool replay.
@@ -291,7 +298,7 @@ pub fn validate_permission_replay_authority(
         target.request_generation(),
     )
     .map_err(|error| AgentError::Tool(error.into()))?;
-    if observation.is_some() {
+    if target.request_generation().is_some() {
         let approvals = validated_replay_approvals(session, target)?;
         if approvals.is_empty()
             || approvals
@@ -299,7 +306,7 @@ pub fn validate_permission_replay_authority(
                 .any(|approval| approval.request.tool_name != execution_name)
         {
             return Err(AgentError::Tool(
-                "Supervisor approval owner does not match dispatch".into(),
+                "permission replay approval owner does not match dispatch".into(),
             ));
         }
     }
@@ -653,7 +660,8 @@ pub fn repark_permission_replay(
 }
 
 /// Strictly reload and adopt the authoritative permission posture for an
-/// approved tool call.
+/// approved tool call. `execution_name` is the resolved exact execution owner,
+/// or `None` when a legacy call's owner is no longer registered.
 ///
 /// Storage errors, missing sessions, and malformed typed posture fail closed.
 /// This function does not touch the replay marker, so callers can retain it
@@ -663,7 +671,7 @@ pub async fn refresh_approval_replay_posture(
     storage: &dyn Storage,
     session: &mut Session,
     configured_mode: PermissionMode,
-    tool_name: &str,
+    execution_name: Option<&str>,
 ) -> Result<ApprovalReplayDecision, AgentError> {
     let latest = storage
         .load_runtime_control_plane(&session.id)
@@ -711,6 +719,17 @@ pub async fn refresh_approval_replay_posture(
         ));
     }
 
+    // A replay may arrive after this Root ID was deleted and recreated, or
+    // after a host narrowed its tool catalog. Validate the same durable birth
+    // and revision proof used by normal tool dispatch before any grant or
+    // replay-marker mutation.
+    session
+        .adopt_root_tool_authority_from(&latest)
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "authoritative approval replay Root tool authority failed closed: {error}"
+            ))
+        })?;
     if let Some(audit) = fresher_audit {
         audit.write_to(&mut session.metadata);
     }
@@ -722,7 +741,12 @@ pub async fn refresh_approval_replay_posture(
 
     let flags =
         ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
-    if flags.plan_read_only && !plan_mode_allows_tool(tool_name) {
+    let Some(execution_name) = execution_name else {
+        return Ok(ApprovalReplayDecision::BlockedByUnavailableTool);
+    };
+    if !session.allows_model_tool_execution(execution_name) {
+        Ok(ApprovalReplayDecision::BlockedByRootToolAuthority)
+    } else if flags.plan_read_only && !plan_mode_allows_tool(execution_name) {
         Ok(ApprovalReplayDecision::BlockedByPlan(flags))
     } else {
         Ok(ApprovalReplayDecision::Execute(flags))
@@ -922,17 +946,18 @@ mod tests {
             plan_file_path: None,
             status: PlanModeStatus::Exploring,
         });
+        let mut owned = session_with_mode("plan", SessionPermissionMode::Bypass);
+        owned.created_at = latest.created_at;
         let storage: Arc<dyn Storage> = Arc::new(ReplayStorage {
             session: RwLock::new(Some(latest)),
             fail_load: false,
         });
-        let mut owned = session_with_mode("plan", SessionPermissionMode::Bypass);
 
         let decision = refresh_approval_replay_posture(
             storage.as_ref(),
             &mut owned,
             PermissionMode::Default,
-            "Write",
+            Some("Write"),
         )
         .await
         .unwrap();
@@ -956,17 +981,18 @@ mod tests {
             (SessionPermissionMode::Bypass, true, false),
         ] {
             let latest = session_with_mode("flags", mode);
+            let mut owned = session_with_mode("flags", SessionPermissionMode::Default);
+            owned.created_at = latest.created_at;
             let storage: Arc<dyn Storage> = Arc::new(ReplayStorage {
                 session: RwLock::new(Some(latest)),
                 fail_load: false,
             });
-            let mut owned = session_with_mode("flags", SessionPermissionMode::Default);
 
             let decision = refresh_approval_replay_posture(
                 storage.as_ref(),
                 &mut owned,
                 PermissionMode::Default,
-                "Write",
+                Some("Write"),
             )
             .await
             .unwrap();
@@ -976,6 +1002,126 @@ mod tests {
             assert_eq!(flags.bypass_permissions, expected_bypass);
             assert_eq!(flags.auto_approve_permissions, expected_auto);
             assert!(!flags.plan_read_only);
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_root_tool_authority_blocks_denied_replay_owner() {
+        let mut owned = session_with_mode("root-replay", SessionPermissionMode::Auto);
+        let mut latest = owned.clone();
+        latest.set_root_orchestration_only(true).unwrap();
+        let storage = ReplayStorage {
+            session: RwLock::new(Some(latest)),
+            fail_load: false,
+        };
+
+        assert_eq!(
+            refresh_approval_replay_posture(
+                &storage,
+                &mut owned,
+                PermissionMode::Default,
+                Some("Write"),
+            )
+            .await
+            .unwrap(),
+            ApprovalReplayDecision::BlockedByRootToolAuthority
+        );
+        assert!(owned.root_orchestration_only_enabled());
+        assert!(matches!(
+            refresh_approval_replay_posture(
+                &storage,
+                &mut owned,
+                PermissionMode::Default,
+                Some("Read")
+            )
+            .await
+            .unwrap(),
+            ApprovalReplayDecision::Execute(_)
+        ));
+        assert_eq!(
+            refresh_approval_replay_posture(&storage, &mut owned, PermissionMode::Default, None)
+                .await
+                .unwrap(),
+            ApprovalReplayDecision::BlockedByUnavailableTool
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_or_corrupt_root_authority_keeps_replay_retryable() {
+        for invalid_birth in [true, false] {
+            let mut latest = session_with_mode("stale-root-replay", SessionPermissionMode::Auto);
+            let mut owned = latest.clone();
+            owned.metadata.insert(
+                crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+                "call-1".into(),
+            );
+            if invalid_birth {
+                latest.created_at += chrono::Duration::microseconds(1);
+            } else {
+                latest.root_orchestration_only = true;
+            }
+            let storage = ReplayStorage {
+                session: RwLock::new(Some(latest)),
+                fail_load: false,
+            };
+            let before = owned.clone();
+            let error = refresh_approval_replay_posture(
+                &storage,
+                &mut owned,
+                PermissionMode::Default,
+                Some("Write"),
+            )
+            .await
+            .expect_err("stale Root authority must fail closed");
+            assert!(error
+                .to_string()
+                .contains("Root tool authority failed closed"));
+            assert_eq!(owned.created_at, before.created_at);
+            assert_eq!(owned.metadata, before.metadata);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_v2_missing_or_corrupt_root_proof_keeps_replay_marker() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap();
+            let mut owned = session_with_mode("v2-root-replay", SessionPermissionMode::Auto);
+            owned.metadata.insert(
+                crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+                "call-1".into(),
+            );
+            store.save_session(&owned).await.unwrap();
+            let mut latest = owned.clone();
+            latest.set_root_orchestration_only(true).unwrap();
+            store.save_session(&latest).await.unwrap();
+            let proof = store
+                .sessions_root_dir()
+                .join(&owned.id)
+                .join("root-tool-authority.json");
+            if corrupt {
+                tokio::fs::write(&proof, b"{").await.unwrap();
+            } else {
+                tokio::fs::remove_file(&proof).await.unwrap();
+            }
+
+            let before = owned.clone();
+            let error = refresh_approval_replay_posture(
+                &store,
+                &mut owned,
+                PermissionMode::Default,
+                Some("Write"),
+            )
+            .await
+            .expect_err("invalid durable Root proof must fail closed");
+            assert!(error.to_string().contains("failed closed"));
+            assert_eq!(owned.metadata, before.metadata);
+            assert_eq!(
+                owned.root_tool_authority_revision,
+                before.root_tool_authority_revision
+            );
         }
     }
 
@@ -997,7 +1143,7 @@ mod tests {
                 &storage,
                 &mut owned,
                 PermissionMode::Default,
-                "Write",
+                Some("Write"),
             )
             .await
             .expect_err("unavailable durable posture must fail closed");
@@ -1080,6 +1226,33 @@ mod tests {
         .unwrap();
         assert!(restarted.is_scoped_session_granted(
             "replay",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+    }
+
+    #[test]
+    fn typed_replay_rejects_changed_execution_owner_before_restoring_grants() {
+        let session = approved_replay_session(
+            "generation-owner",
+            "git status",
+            PermissionDecisionKind::AllowOnce,
+        );
+        let target =
+            find_permission_replay_target(&session, "call-1", Some("generation-owner")).unwrap();
+        let restarted = PermissionConfig::new();
+        let error = restore_permission_replay_authorization(
+            &restarted,
+            &session,
+            &target,
+            "new_exact_custom_owner",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("approval owner"));
+        assert!(!restarted.consume_once_for_generation(
+            "replay",
+            "call-1",
+            "generation-owner",
             PermissionType::ExecuteCommand,
             "git status"
         ));

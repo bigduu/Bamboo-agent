@@ -145,6 +145,25 @@ impl SessionRepository {
             .await
     }
 
+    /// Persist a blocked approval replay before starting its successor. A
+    /// A save error may arrive after the rewritten result was committed. When
+    /// the save was attempted, evict the old approval from cache under the
+    /// same session lock so the next attempt reloads durable state.
+    pub async fn save_replay_resolution(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_runtime_and_publish(session, |saved, committed| {
+                if committed {
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                    );
+                } else {
+                    self.cache.remove(&saved.id);
+                }
+            })
+            .await
+    }
+
     /// Atomically mutate the latest durable runtime session and refresh the
     /// cache with the saved value. This is the safe path for narrow metadata
     /// indexes that can be updated concurrently with runner message writes.
@@ -706,6 +725,10 @@ mod tests {
         persisted: Mutex<Option<Session>>,
     }
 
+    struct AmbiguousReplaySaveStorage {
+        persisted: Mutex<Option<Session>>,
+    }
+
     #[async_trait::async_trait]
     impl Storage for MapStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
@@ -783,6 +806,24 @@ mod tests {
     impl Storage for FailingSaveStorage {
         async fn save_session(&self, _session: &Session) -> std::io::Result<()> {
             Err(std::io::Error::other("injected save failure"))
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.persisted.lock().unwrap().clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for AmbiguousReplaySaveStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.persisted.lock().unwrap() = Some(session.clone());
+            Err(std::io::Error::other(
+                "injected post-commit replay save error",
+            ))
         }
 
         async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
@@ -2015,6 +2056,64 @@ mod tests {
                 .model,
             "previous",
             "fallible inherent save must publish only after a durable commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_ambiguous_save_evicts_same_age_stale_approval_cache() {
+        let id = "blocked-replay-ambiguous-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(AmbiguousReplaySaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert!(!reloaded
+            .metadata
+            .contains_key(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_precommit_save_error_reloads_retryable_approval() {
+        let id = "blocked-replay-precommit-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(FailingSaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert_eq!(
+            reloaded
+                .metadata
+                .get(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("call-1")
         );
     }
 

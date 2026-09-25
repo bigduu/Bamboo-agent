@@ -677,12 +677,55 @@ async fn typed_alias_approved_replay_reaches_the_registered_bash_owner() {
 }
 
 #[tokio::test]
+async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
+    let (fixture, _, request) = Box::pin(alias_pending_fixture()).await;
+    let stale = fixture.approve(&request).await;
+    let mut latest = stale.clone();
+    latest.set_root_orchestration_only(true).unwrap();
+    fixture.store.save_session(&latest).await.unwrap();
+
+    let config = alias_config();
+    let agent = fixture.registered_agent(config.clone(), &["Bash"]);
+    let completed = events(agent.resume_stream(stale)).await;
+    assert!(!completed.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolLifecycle { .. }
+            | AgentEvent::ToolComplete { .. }
+            | AgentEvent::Error { .. }
+    )));
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(!config.consume_once_for_generation(
+        &request.session_id,
+        CALL,
+        &request.request_generation,
+        PermissionType::ExecuteCommand,
+        "current-command",
+    ));
+    let saved = fixture.reload(&request.session_id).await;
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
+    let result = saved
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+        .unwrap();
+    assert_eq!(result.tool_success, Some(false));
+    assert!(result.content.contains("Root orchestration policy blocked"));
+}
+
+#[tokio::test]
 async fn typed_alias_exact_custom_owner_cannot_borrow_bash_approval() {
     let (fixture, mut pending, request) = Box::pin(alias_pending_fixture()).await;
     let shadow = fixture.registered_agent(alias_config(), &["Bash", "execute_command"]);
     let before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     assert!(Box::pin(shadow.resume(&mut pending)).await.is_err());
-    let mut approved = fixture.approve(&request).await;
+    let mut approved = Box::pin(fixture.approve(&request)).await;
     assert!(Box::pin(shadow.resume(&mut approved)).await.is_err());
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
     assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), before);
@@ -1190,6 +1233,71 @@ struct FailReplaySave {
     attempts: AtomicUsize,
 }
 
+struct FailAfterBlockedCommit {
+    inner: Arc<LockedSessionStore>,
+    attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for FailAfterBlockedCommit {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await?;
+        if session.messages.iter().any(|message| {
+            message
+                .content
+                .starts_with("Root orchestration policy blocked")
+        }) && self.attempts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(std::io::Error::other("injected post-commit replay error"));
+        }
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+}
+
+#[tokio::test]
+async fn sdk_post_commit_blocked_save_error_reloads_consumed_approval_in_caller_snapshot() {
+    let fixture = Fixture::new().await;
+    let (mut pending, request) = parked("post-commit-blocked", true);
+    fixture.repo.save(&mut pending).await.unwrap();
+    let mut approved = fixture.approve(&request).await;
+    let mut latest = approved.clone();
+    latest.set_root_orchestration_only(true).unwrap();
+    fixture.store.save_session(&latest).await.unwrap();
+
+    let persistence = Arc::new(FailAfterBlockedCommit {
+        inner: fixture.persistence.clone(),
+        attempts: AtomicUsize::new(0),
+    });
+    let agent = fixture.agent(
+        Some(Arc::new(PermissionConfig::new())),
+        true,
+        false,
+        Some(persistence.clone()),
+    );
+    let error = Box::pin(agent.resume(&mut approved)).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected post-commit replay error"));
+    assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(!approved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    let durable = fixture.reload(&request.session_id).await;
+    assert_eq!(replay_state(&approved), replay_state(&durable));
+    assert_eq!(
+        result_message(&approved, "result-current")["tool_success"],
+        false
+    );
+    assert!(Box::pin(agent.resume(&mut approved)).await.is_ok());
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+}
+
 #[async_trait]
 impl RuntimeSessionPersistence for FailReplaySave {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
@@ -1284,6 +1392,9 @@ async fn output_repark_and_plan_save_failures_stop_provider_and_success_events()
             assert!(error
                 .to_string()
                 .contains("injected replay persistence failure"));
+            if plan {
+                assert_eq!(replay_state(&session), before);
+            }
         }
         assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(

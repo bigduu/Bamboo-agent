@@ -722,12 +722,15 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let executor = ctx.tools.clone();
                 let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
                     executor.owns_exact_tool(name)
-                })
-                .unwrap_or_else(|| tool_name.clone());
+                });
+                if replay_owner.is_none() && reexecute_request_generation.is_some() {
+                    tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
+                    return;
+                }
                 let executing_supervisor = match validate_permission_replay_authority(
                     &session,
                     &replay_target,
-                    &replay_owner,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
                 ) {
                     Ok(observation) => observation,
                     Err(error) => {
@@ -744,7 +747,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                     ctx.session_repo.storage().as_ref(),
                     &mut session,
                     configured_mode,
-                    &tool_name,
+                    replay_owner.as_deref(),
                 )
                 .await
                 {
@@ -759,6 +762,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                         return;
                     }
                 };
+                let blocked_by_tool_authority = matches!(
+                    decision,
+                    ApprovalReplayDecision::BlockedByRootToolAuthority
+                        | ApprovalReplayDecision::BlockedByUnavailableTool
+                );
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
                     .metadata
@@ -771,7 +779,22 @@ impl ResumeExecutionPort for ConnectResumePort {
                         ),
                         false,
                     ),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority => (
+                        format!(
+                            "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::BlockedByUnavailableTool => (
+                        format!(
+                            "Approved tool '{tool_name}' is no longer available; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
                     ApprovalReplayDecision::Execute(flags) => {
+                        let replay_owner = replay_owner
+                            .as_deref()
+                            .expect("Execute requires a registered execution owner");
                         let Some(permission_config) =
                             ctx.permission_checker.permission_config()
                         else {
@@ -786,7 +809,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             permission_config.as_ref(),
                             &session,
                             &replay_target,
-                            &replay_owner,
+                            replay_owner,
                         ) {
                             tracing::error!(
                                 %session_id,
@@ -813,7 +836,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             reexecute_request_generation.as_deref(),
                             executor.execute_exact_with_context_outcome(
                                 &tool_call,
-                                &replay_owner,
+                                replay_owner,
                                 ToolExecutionContext {
                                     executing_supervisor,
                                     session_id: Some(session.id.as_str()),
@@ -844,7 +867,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     &mut session,
                                     &replay_target,
                                     &tool_result,
-                                    &replay_owner,
+                                    replay_owner,
                                 ) {
                                     Ok(Some(reparked)) => {
                                         let _ = mpsc_tx
@@ -938,7 +961,15 @@ impl ResumeExecutionPort for ConnectResumePort {
                     );
                     return;
                 }
-                ctx.session_repo.save_and_cache(&mut session).await;
+                if blocked_by_tool_authority {
+                    if let Err(error) = ctx.session_repo.save_replay_resolution(&mut session).await
+                    {
+                        tracing::error!(%session_id, %error, "connect blocked approval replay result failed to persist; refusing to resume");
+                        return;
+                    }
+                } else {
+                    ctx.session_repo.save_and_cache(&mut session).await;
+                }
             } else {
                 tracing::error!(
                     %session_id,
@@ -1063,6 +1094,46 @@ mod tests {
             ));
             fixture.settled(usize::from(!corrupt), corrupt).await;
         }
+    }
+
+    #[tokio::test]
+    async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
+        use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
+        let fixture = Box::pin(Fixture::pending()).await;
+        fixture.prepare_workspace_catalog().await;
+        fixture.formal_approve().await;
+        let mut selected = fixture.reload().await;
+        selected.set_root_orchestration_only(true).unwrap();
+        fixture.state.storage.save_session(&selected).await.unwrap();
+
+        let ctx = supervisor_context(&fixture.state);
+        let session = fixture.reload().await;
+        let config = resolve_resume_config_snapshot(
+            &*ctx.config.read().await,
+            &ctx.provider_registry,
+            &session,
+            None,
+        );
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+            &ConnectResumePort { ctx },
+            &session.id,
+            config,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
+        ));
+        fixture.settled(0, false).await;
+        let saved = fixture.reload().await;
+        let result = saved
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert_eq!(result.tool_success, Some(false));
+        assert!(result.content.contains("Root orchestration policy blocked"));
     }
 
     #[tokio::test]
