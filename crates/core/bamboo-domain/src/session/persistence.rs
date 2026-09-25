@@ -134,6 +134,15 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
+    /// Persist a runner's final snapshot. Implementations with a per-session
+    /// lock should reconcile a tool-registered child wait against the latest
+    /// durable wait inside that lock: a child may finish after the runner's
+    /// last read but before this save. The default retains compatibility for
+    /// in-memory and test persisters without that concurrent completion path.
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        self.save_runtime_session(session).await
+    }
+
     /// Authoritatively seed one validated actor activation.
     ///
     /// Unlike an ordinary runtime save, the incoming RunSpec posture and its

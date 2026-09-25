@@ -614,6 +614,8 @@ fn apply_model_ref_override(
     Ok(())
 }
 
+/// Prepare an existing child for a fresh run without making it runnable. The
+/// caller must durably arm any synchronous parent wait before enqueueing it.
 pub async fn run_child_action(
     port: &dyn ChildSessionPort,
     parent: &Session,
@@ -642,8 +644,6 @@ pub async fn run_child_action(
     child.updated_at = Utc::now();
     port.save_child_session(&mut child).await?;
 
-    port.enqueue_child_run(parent, &child).await?;
-
     Ok(json!({
         "child_session_id": child.id,
         "status": "queued",
@@ -652,6 +652,7 @@ pub async fn run_child_action(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message_to_child_action(
     port: &dyn ChildSessionPort,
     parent: &Session,
@@ -660,6 +661,7 @@ pub async fn send_message_to_child_action(
     auto_run: Option<bool>,
     interrupt_running: Option<bool>,
     idempotency_key: Option<&str>,
+    wait_if_queued: bool,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(&parent.id, &child_session_id)
@@ -693,9 +695,43 @@ pub async fn send_message_to_child_action(
     // On an idle child, `auto_run=false` must retain the historical draft-only
     // behavior regardless of that otherwise-inert flag.
     if should_route_child_message_through_inbox(is_running, should_auto_run) {
-        let delivery = port
+        // An idle child's SessionInbox delivery can reserve and execute its
+        // activation inside send_session_message. Arm the parent's durable wait
+        // first, then remove it if delivery did not actually queue a new run.
+        // Live messages intentionally retain their non-suspending semantics.
+        let armed_wait = wait_if_queued && !is_running;
+        let had_wait = if armed_wait {
+            port.load_root_session(&parent.id)
+                .await?
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_some_and(|wait| wait.child_session_ids.iter().any(|id| id == &child.id))
+        } else {
+            false
+        };
+        if armed_wait {
+            if let Err(error) = port
+                .register_parent_wait_for_child(&parent.id, &child.id, idempotency_key)
+                .await
+            {
+                return Err(if had_wait {
+                    error
+                } else {
+                    rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+                });
+            }
+        }
+        let delivery = match port
             .send_session_message(&parent.id, &child.id, &message, idempotency_key)
-            .await?;
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(error) if armed_wait && !had_wait => {
+                return Err(rollback_failed_wait_launch(port, &parent.id, &child.id, error).await);
+            }
+            Err(error) => return Err(error),
+        };
         let (delivery, activation, status, note, activation_error) = match delivery {
             super::ChildSessionMessageDelivery::Activated(receipt) => {
                 let (status, note) = match receipt.activation {
@@ -728,6 +764,10 @@ pub async fn send_message_to_child_action(
                 Some(error),
             ),
         };
+        if armed_wait && !had_wait && status != "queued" {
+            port.rollback_parent_wait_for_child(&parent.id, &child.id)
+                .await?;
+        }
         return Ok(json!({
             "child_session_id": child.id,
             "status": status,
@@ -760,6 +800,25 @@ pub async fn send_message_to_child_action(
         "message_count": child.messages.len(),
         "note": "Follow-up message appended. Use action=run to execute the child session.",
     }))
+}
+
+/// Undo only this child's wait entry when a launch fails after the wait was
+/// armed. Keep the original failure visible even if compensation also fails.
+pub async fn rollback_failed_wait_launch(
+    port: &dyn ChildSessionPort,
+    parent_session_id: &str,
+    child_session_id: &str,
+    error: ChildSessionError,
+) -> ChildSessionError {
+    match port
+        .rollback_parent_wait_for_child(parent_session_id, child_session_id)
+        .await
+    {
+        Ok(()) => error,
+        Err(rollback_error) => ChildSessionError::Execution(format!(
+            "{error}; parent-wait rollback failed: {rollback_error}"
+        )),
+    }
 }
 
 fn should_route_child_message_through_inbox(is_running: bool, should_auto_run: bool) -> bool {

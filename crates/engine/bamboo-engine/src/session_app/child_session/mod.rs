@@ -17,9 +17,9 @@ mod tests;
 
 pub use actions::{
     assemble_session_tree, build_session_tree_action, cancel_child_action, create_child_action,
-    delete_child_action, get_child_action, list_children_action, run_child_action,
-    send_message_to_child_action, update_child_action, update_child_action_with_background,
-    SessionTreeNode,
+    delete_child_action, get_child_action, list_children_action, rollback_failed_wait_launch,
+    run_child_action, send_message_to_child_action, update_child_action,
+    update_child_action_with_background, SessionTreeNode,
 };
 pub use helpers::{
     append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
@@ -366,6 +366,21 @@ pub trait ChildSessionPort: Send + Sync {
         child_session_ids: &[String],
         policy: ChildWaitPolicy,
     ) -> Result<usize, ChildSessionError>;
+
+    /// Tool-registered explicit wait. Implementations must persist the tool
+    /// call ID with the wait so final runner saves can distinguish a completed
+    /// wait from an unpersisted runner-created safety-net wait.
+    async fn register_parent_wait_for_children_tagged(
+        &self,
+        _parent_session_id: &str,
+        _child_session_ids: &[String],
+        _policy: ChildWaitPolicy,
+        _tool_call_id: &str,
+    ) -> Result<usize, ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "tagged parent wait is not configured for this runtime".to_string(),
+        ))
+    }
 
     /// The parent's currently-active (non-terminal) child session ids.
     async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;

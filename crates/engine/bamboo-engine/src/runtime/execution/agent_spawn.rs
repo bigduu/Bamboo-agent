@@ -974,7 +974,10 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            let saved = agent.persistence().save_runtime_session(&mut session).await;
+            let saved = agent
+                .persistence()
+                .save_finalized_runtime_session(&mut session)
+                .await;
             let history_committed = saved.is_ok();
             let authority_conflict = saved.as_ref().err().is_some_and(|error| {
                 error

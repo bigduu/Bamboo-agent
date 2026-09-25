@@ -1,8 +1,30 @@
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
+
+type SynchronousLaunchLocks = Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+struct SynchronousLaunchGuard {
+    locks: SynchronousLaunchLocks,
+    parent_id: String,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for SynchronousLaunchGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // The map and this guard are the only holders when no peer is queued.
+        // Remove the idle slot so long-lived servers do not retain one mutex
+        // for every parent session that has ever launched a child.
+        self.locks.remove_if(&self.parent_id, |_, current| {
+            Arc::ptr_eq(current, &self.mutex) && Arc::strong_count(current) == 2
+        });
+    }
+}
 
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -201,6 +223,96 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
     })
 }
 
+/// The child must not become runnable until its synchronous parent's wait is
+/// durable. This is shared by create, update, and run; background fan-out keeps
+/// its existing enqueue-only path.
+async fn enqueue_waiting_child(
+    sessions: &dyn ChildSessionPort,
+    parent: &bamboo_agent_core::Session,
+    child_session_id: &str,
+    tool_call_id: &str,
+) -> Result<(), ToolError> {
+    let child = sessions
+        .load_child_for_parent(&parent.id, child_session_id)
+        .await
+        .map_err(tool_error_from_child_session)?;
+    let parent_before = sessions
+        .load_root_session(&parent.id)
+        .await
+        .map_err(tool_error_from_child_session)?;
+    let had_wait = parent_before
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_some_and(|wait| {
+            wait.child_session_ids
+                .iter()
+                .any(|id| id == child_session_id)
+        });
+    if let Err(error) = sessions
+        .register_parent_wait_for_child(&parent.id, child_session_id, Some(tool_call_id))
+        .await
+    {
+        if had_wait {
+            return Err(tool_error_from_child_session(error));
+        }
+        return Err(tool_error_from_child_session(
+            child_session::rollback_failed_wait_launch(
+                sessions,
+                &parent.id,
+                child_session_id,
+                error,
+            )
+            .await,
+        ));
+    }
+    if let Err(error) = sessions.enqueue_child_run(parent, &child).await {
+        // A confirmed scheduler rejection leaves the prepared child pending.
+        // The end-of-turn safety net treats pending as active and would arm a
+        // new orphan wait. Mark this run as a retryable terminal failure first.
+        // If another operation already owned this child's wait, preserve its
+        // state: this failed enqueue did not acquire that wait entry.
+        if had_wait {
+            return Err(tool_error_from_child_session(error));
+        }
+        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+        return Err(tool_error_from_child_session(
+            child_session::rollback_failed_wait_launch(
+                sessions,
+                &parent.id,
+                child_session_id,
+                error,
+            )
+            .await,
+        ));
+    }
+    Ok(())
+}
+
+async fn mark_failed_child_enqueue(
+    sessions: &dyn ChildSessionPort,
+    parent: &bamboo_agent_core::Session,
+    child_session_id: &str,
+    error: ChildSessionError,
+) -> ChildSessionError {
+    let status_update = async {
+        let mut child = sessions
+            .load_child_for_parent(&parent.id, child_session_id)
+            .await?;
+        child.set_last_run_status("error");
+        child.set_last_run_error(format!("Child launch failed: {error}"));
+        child.updated_at = chrono::Utc::now();
+        sessions.save_child_session(&mut child).await
+    }
+    .await;
+    match status_update {
+        Ok(()) => error,
+        Err(status_error) => ChildSessionError::Execution(format!(
+            "{error}; failed to persist terminal child launch status: {status_error}"
+        )),
+    }
+}
+
 pub(crate) fn waiting_for_children_tool_result(
     mut value: serde_json::Value,
 ) -> Result<ToolResult, ToolError> {
@@ -327,6 +439,10 @@ pub struct SubAgentTool {
     /// resolve a bare `create.model` id to a provider. `None` keeps the tool
     /// constructible without a live provider registry (tests, embedded use).
     catalog: Option<Arc<dyn ModelCatalogPort>>,
+    /// Serialize wait-owning calls on this tool instance from inspection
+    /// through launch/rollback. Two calls for the same child must not both
+    /// observe an absent wait and later undo each other's registration.
+    synchronous_launch_locks: SynchronousLaunchLocks,
 }
 
 impl SubAgentTool {
@@ -338,6 +454,7 @@ impl SubAgentTool {
             sessions,
             resolver,
             catalog: None,
+            synchronous_launch_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -572,6 +689,46 @@ impl Tool for SubAgentTool {
             .await
             .map_err(tool_error_from_child_session)?;
 
+        // The production Root tool is a shared instance. Keep its synchronous
+        // launch transactions sequential, including explicit `wait`, so a
+        // failed same-child launch cannot roll back another call's wait.
+        // Independent one-shot background creates retain concurrent fan-out;
+        // resident reuse is gated because it can target an existing child.
+        let owns_wait_or_launch = match &parsed {
+            SubAgentArgs::Create {
+                auto_run,
+                wait,
+                lifecycle,
+                ..
+            } => {
+                auto_run.unwrap_or(true)
+                    && (wait.unwrap_or(false) || lifecycle.as_deref() == Some("resident"))
+            }
+            SubAgentArgs::Update { auto_run, .. } => auto_run.unwrap_or(false),
+            SubAgentArgs::Run { .. } | SubAgentArgs::Wait { .. } => true,
+            SubAgentArgs::SendMessage { auto_run, .. } => auto_run.unwrap_or(true),
+            _ => false,
+        };
+        let _launch_guard = if owns_wait_or_launch {
+            let mutex = self
+                .synchronous_launch_locks
+                .entry(parent.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            // Construct the lease before awaiting the mutex so cancellation
+            // of a queued invocation still releases an otherwise idle slot.
+            let mut lease = SynchronousLaunchGuard {
+                locks: self.synchronous_launch_locks.clone(),
+                parent_id: parent.id.clone(),
+                mutex,
+                guard: None,
+            };
+            lease.guard = Some(lease.mutex.clone().lock_owned().await);
+            Some(lease)
+        } else {
+            None
+        };
+
         match parsed {
             SubAgentArgs::Create {
                 title,
@@ -682,6 +839,7 @@ impl Tool for SubAgentTool {
                 }
 
                 let should_auto_run = auto_run.unwrap_or(true);
+                let requested_wait = should_auto_run && wait.unwrap_or(false);
 
                 // Resident routing: `lifecycle="resident"` reuses the existing
                 // resident agent of the same `name` in this root tree (one stable
@@ -713,7 +871,7 @@ impl Tool for SubAgentTool {
                     None => None,
                 };
 
-                let (child_session_id, child_model, reused, child_reasoning_effort) =
+                let (child_session_id, child_model, reused, child_reasoning_effort, should_wait) =
                     if let Some(existing_id) = existing_resident {
                         // A resident is stable Project identity. A root may
                         // have been explicitly reassigned since this resident
@@ -823,7 +981,7 @@ impl Tool for SubAgentTool {
                             .and_then(|n| {
                                 child_session::render_forked_parent_context(&parent, n)
                             });
-                        if resident_context == "accumulate" {
+                        let wait_armed = if resident_context == "accumulate" {
                             let assignment = child_session::format_child_assignment_with_background(
                                 &title,
                                 &responsibility,
@@ -831,7 +989,7 @@ impl Tool for SubAgentTool {
                                 &prompt,
                                 assignment_background.as_deref(),
                             );
-                            child_session::send_message_to_child_action(
+                            let delivery = child_session::send_message_to_child_action(
                                 self.sessions.as_ref(),
                                 &parent,
                                 existing_id.clone(),
@@ -839,9 +997,31 @@ impl Tool for SubAgentTool {
                                 Some(should_auto_run),
                                 Some(false),
                                 Some(ctx.tool_call_id.as_ref()),
+                                requested_wait,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
+                            if !requested_wait {
+                                false
+                            } else {
+                                match delivery.get("status").and_then(|status| status.as_str()) {
+                                    Some("queued") => true,
+                                    Some("message_queued") => self
+                                        .sessions
+                                        .load_root_session(&parent.id)
+                                        .await
+                                        .map_err(tool_error_from_child_session)?
+                                        .agent_runtime_state
+                                        .as_ref()
+                                        .and_then(|state| state.waiting_for_children.as_ref())
+                                        .is_some_and(|wait| {
+                                            wait.child_session_ids
+                                                .iter()
+                                                .any(|id| id == &existing_id)
+                                        }),
+                                    _ => false,
+                                }
+                            }
                         } else {
                             child_session::update_child_action_with_background(
                                 self.sessions.as_ref(),
@@ -859,24 +1039,35 @@ impl Tool for SubAgentTool {
                             .await
                             .map_err(tool_error_from_child_session)?;
                             if should_auto_run {
-                                let child = self
-                                    .sessions
-                                    .load_child_for_parent(&parent.id, &existing_id)
-                                    .await
-                                    .map_err(tool_error_from_child_session)?;
-                                self.sessions
-                                    .enqueue_child_run(&parent, &child)
-                                    .await
-                                    .map_err(tool_error_from_child_session)?;
+                                if requested_wait {
+                                    enqueue_waiting_child(
+                                        self.sessions.as_ref(),
+                                        &parent,
+                                        &existing_id,
+                                        ctx.tool_call_id.as_ref(),
+                                    )
+                                    .await?;
+                                } else {
+                                    let child = self
+                                        .sessions
+                                        .load_child_for_parent(&parent.id, &existing_id)
+                                        .await
+                                        .map_err(tool_error_from_child_session)?;
+                                    self.sessions
+                                        .enqueue_child_run(&parent, &child)
+                                        .await
+                                        .map_err(tool_error_from_child_session)?;
+                                }
                             }
-                        }
+                            requested_wait
+                        };
                         let (model, child_reasoning_effort) = self
                             .sessions
                             .load_child_for_parent(&parent.id, &existing_id)
                             .await
                             .map(|child| (child.model, child.reasoning_effort))
                             .unwrap_or_default();
-                        (existing_id, model, true, child_reasoning_effort)
+                        (existing_id, model, true, child_reasoning_effort, wait_armed)
                     } else {
                         let child_id = Uuid::new_v4().to_string();
                         // Model precedence: explicit `model` arg > per-subagent_type
@@ -915,7 +1106,7 @@ impl Tool for SubAgentTool {
                                 model_ref_override,
                                 runtime_metadata,
                                 read_only: false,
-                                auto_run: should_auto_run,
+                                auto_run: should_auto_run && !requested_wait,
                                 reasoning_effort: effective_reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
                                 resident_name: resident_name.clone(),
@@ -930,15 +1121,29 @@ impl Tool for SubAgentTool {
                         )
                         .await
                         .map_err(tool_error_from_child_session)?;
+                        // In the synchronous path, make the child visible to
+                        // completion reconciliation before it can be launched.
+                        self.sessions.ensure_child_indexed(&result.child_session_id).await;
+                        if requested_wait {
+                            enqueue_waiting_child(
+                                self.sessions.as_ref(),
+                                &parent,
+                                &result.child_session_id,
+                                ctx.tool_call_id.as_ref(),
+                            )
+                            .await?;
+                        }
                         (
                             result.child_session_id,
                             result.model,
                             false,
                             effective_reasoning_effort,
+                            requested_wait,
                         )
                     };
 
-                // Ensure index entry is visible immediately (best-effort).
+                // Synchronous launches were indexed before enqueue; retain the
+                // original best-effort indexing for background creations too.
                 self.sessions.ensure_child_indexed(&child_session_id).await;
 
                 ctx.emit_tool_token(if reused {
@@ -952,14 +1157,6 @@ impl Tool for SubAgentTool {
                 // wait for THIS child and suspend now. Default (`wait=false`) runs
                 // the child in the background and returns immediately, so the
                 // parent can keep spawning; it suspends later via `action=wait`.
-                let should_wait = should_auto_run && wait.unwrap_or(false);
-                if should_wait {
-                    self.sessions
-                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
-                        .await
-                        .map_err(tool_error_from_child_session)?;
-                }
-
                 let status = if !should_auto_run {
                     "created"
                 } else if should_wait {
@@ -1073,7 +1270,12 @@ impl Tool for SubAgentTool {
 
                 let count = self
                     .sessions
-                    .register_parent_wait_for_children(&parent.id, &targets, policy)
+                    .register_parent_wait_for_children_tagged(
+                        &parent.id,
+                        &targets,
+                        policy,
+                        ctx.tool_call_id.as_ref(),
+                    )
                     .await
                     .map_err(tool_error_from_child_session)?;
 
@@ -1137,22 +1339,13 @@ impl Tool for SubAgentTool {
 
                 let should_auto_run = auto_run.unwrap_or(false);
                 if should_auto_run {
-                    let child = self
-                        .sessions
-                        .load_child_for_parent(&parent.id, &child_session_id)
-                        .await
-                        .map_err(tool_error_from_child_session)?;
-                    self.sessions
-                        .enqueue_child_run(&parent, &child)
-                        .await
-                        .map_err(tool_error_from_child_session)?;
-                    // Re-running an existing child keeps its synchronous "wait for
-                    // the answer" semantics: register the wait + suspend. (enqueue
-                    // itself no longer registers — that is now explicit.)
-                    self.sessions
-                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
-                        .await
-                        .map_err(tool_error_from_child_session)?;
+                    enqueue_waiting_child(
+                        self.sessions.as_ref(),
+                        &parent,
+                        &child_session_id,
+                        ctx.tool_call_id.as_ref(),
+                    )
+                    .await?;
                 }
 
                 if should_auto_run {
@@ -1173,11 +1366,84 @@ impl Tool for SubAgentTool {
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
-                // `run` keeps the synchronous retry semantics: wait for this child.
-                self.sessions
-                    .register_parent_wait_for_child(&parent.id, &child_session_id, None)
-                    .await
-                    .map_err(tool_error_from_child_session)?;
+                if result.get("status").and_then(|status| status.as_str()) == Some("queued") {
+                    enqueue_waiting_child(
+                        self.sessions.as_ref(),
+                        &parent,
+                        &child_session_id,
+                        ctx.tool_call_id.as_ref(),
+                    )
+                    .await?;
+                } else {
+                    // No launch is being performed, but preserve the existing
+                    // synchronous behavior for an already-running child. The
+                    // runner can finish between the running check and this
+                    // registration, so recheck durable terminality afterwards.
+                    let parent_before = self
+                        .sessions
+                        .load_root_session(&parent.id)
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+                    let had_wait = parent_before
+                        .agent_runtime_state
+                        .as_ref()
+                        .and_then(|state| state.waiting_for_children.as_ref())
+                        .is_some_and(|wait| {
+                            wait.child_session_ids
+                                .iter()
+                                .any(|id| id == &child_session_id)
+                        });
+                    if !had_wait {
+                        self.sessions
+                            .register_parent_wait_for_child(
+                                &parent.id,
+                                &child_session_id,
+                                Some(ctx.tool_call_id.as_ref()),
+                            )
+                            .await
+                            .map_err(tool_error_from_child_session)?;
+                    }
+                    let terminal = self
+                        .sessions
+                        .terminal_child_ids(&parent.id, std::slice::from_ref(&child_session_id))
+                        .await;
+                    let terminal_status = terminal
+                        .into_iter()
+                        .find(|(id, _)| id == &child_session_id)
+                        .map(|(_, status)| status);
+                    let terminal_status = match terminal_status {
+                        Some(status) => Some(status),
+                        None => self
+                            .sessions
+                            .load_child_for_parent(&parent.id, &child_session_id)
+                            .await
+                            .ok()
+                            .and_then(|child| child.last_run_status())
+                            .filter(|status| {
+                                matches!(
+                                    status.as_str(),
+                                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
+                                )
+                            }),
+                    };
+                    if let Some(status) = terminal_status {
+                        // Reuse an earlier call's durable wait without taking
+                        // ownership of it. Only undo a wait this call added.
+                        if !had_wait {
+                            self.sessions
+                                .rollback_parent_wait_for_child(&parent.id, &child_session_id)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                        }
+                        return tool_result(json!({
+                            "child_session_id": child_session_id,
+                            "status": "already_terminal",
+                            "last_run_status": status,
+                            "note": "The child finished while its existing run was being inspected; read its result instead of waiting for another completion.",
+                        }))
+                        .map(ToolOutcome::Completed);
+                    }
+                }
                 waiting_for_children_tool_result(result)
             }
             SubAgentArgs::SendMessage {
@@ -1195,6 +1461,7 @@ impl Tool for SubAgentTool {
                     auto_run,
                     interrupt_running,
                     Some(ctx.tool_call_id.as_ref()),
+                    should_auto_run,
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
@@ -1204,12 +1471,6 @@ impl Tool for SubAgentTool {
                         .and_then(|value| value.as_str())
                         .is_some_and(|status| status == "queued");
                 if queued {
-                    // Sending + running keeps synchronous semantics: wait for the
-                    // child's response. (enqueue no longer registers the wait.)
-                    self.sessions
-                        .register_parent_wait_for_child(&parent.id, &child_session_id, None)
-                        .await
-                        .map_err(tool_error_from_child_session)?;
                     waiting_for_children_tool_result(result)
                 } else {
                     tool_result(result)

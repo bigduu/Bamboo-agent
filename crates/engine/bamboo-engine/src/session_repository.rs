@@ -364,6 +364,19 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_finalized_runtime_and_publish(session, |saved, _| {
+                #[cfg(test)]
+                self.run_post_durable_hook("save_finalized_runtime_session", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
         self.persistence
             .seed_runtime_activation_and_publish(session, |saved, committed| {
@@ -1914,6 +1927,73 @@ mod tests {
                 .map(String::as_str),
             Some("[\"plan\"]")
         );
+    }
+
+    #[tokio::test]
+    async fn finalized_runtime_save_reconciles_late_child_completion_in_disk_and_cache() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "late-child-finalization";
+        let mut parent = Session::new(id, "model");
+        let mut runtime = AgentRuntimeState::new("parent-run");
+        runtime.status = AgentStatusState::Suspended;
+        let mut wait = WaitingForChildrenState::for_children(
+            vec!["child-1".to_string()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        );
+        wait.registered_by_tool_call_id = Some("tc_wait".to_string());
+        runtime.waiting_for_children = Some(wait);
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        parent.set_last_run_status("suspended");
+        storage.save_session(&parent).await.unwrap();
+        cache_put(&repo, &parent);
+
+        let mut stale_runner = parent.clone();
+        let mut completed = parent;
+        let completed_runtime = completed.agent_runtime_state.as_mut().unwrap();
+        completed_runtime.waiting_for_children = None;
+        completed_runtime.status = AgentStatusState::Idle;
+        completed_runtime.suspension = None;
+        completed.metadata.remove("runtime.suspend_reason");
+        let mut outcome = bamboo_agent_core::Message::user("completed child result");
+        outcome.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(outcome);
+        storage.save_session(&completed).await.unwrap();
+
+        bamboo_domain::RuntimeSessionPersistence::save_finalized_runtime_session(
+            &repo,
+            &mut stale_runner,
+        )
+        .await
+        .unwrap();
+
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("final snapshot published");
+        for saved in [&durable, &cached] {
+            assert!(saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .is_none());
+            assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+            assert!(saved
+                .messages
+                .iter()
+                .any(|message| message.content == "completed child result"));
+        }
     }
 
     #[tokio::test]

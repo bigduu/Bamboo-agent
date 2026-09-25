@@ -327,8 +327,7 @@ impl ChildSessionAdapter {
     }
 
     /// Explicitly register a parent wait for an arbitrary set of children with a
-    /// chosen policy. Used by the `SubAgent.wait` action (wait on all active
-    /// children) and the end-of-turn safety net. A single parent write.
+    /// chosen policy. A single parent write.
     ///
     /// Returns the number of children the wait now covers (0 means there was
     /// nothing to wait on and no wait was registered).
@@ -338,12 +337,44 @@ impl ChildSessionAdapter {
         child_session_ids: &[String],
         policy: ChildWaitPolicy,
     ) -> Result<usize, ChildSessionError> {
+        self.register_parent_wait_for_children_with_tag(
+            parent_session_id,
+            child_session_ids,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    pub async fn register_parent_wait_for_children_tagged(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+        tool_call_id: &str,
+    ) -> Result<usize, ChildSessionError> {
+        self.register_parent_wait_for_children_with_tag(
+            parent_session_id,
+            child_session_ids,
+            policy,
+            Some(tool_call_id),
+        )
+        .await
+    }
+
+    async fn register_parent_wait_for_children_with_tag(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+        tool_call_id: Option<&str>,
+    ) -> Result<usize, ChildSessionError> {
         if child_session_ids.is_empty() {
             return Ok(0);
         }
         let batch: Vec<(String, Option<String>)> = child_session_ids
             .iter()
-            .map(|id| (id.clone(), None))
+            .map(|id| (id.clone(), tool_call_id.map(str::to_string)))
             .collect();
         self.flush_parent_waits(parent_session_id, &batch, policy)
             .await?;
@@ -1055,6 +1086,23 @@ impl ChildSessionPort for ChildSessionAdapter {
             parent_session_id,
             child_session_ids,
             policy,
+        )
+        .await
+    }
+
+    async fn register_parent_wait_for_children_tagged(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+        tool_call_id: &str,
+    ) -> Result<usize, ChildSessionError> {
+        ChildSessionAdapter::register_parent_wait_for_children_tagged(
+            self,
+            parent_session_id,
+            child_session_ids,
+            policy,
+            tool_call_id,
         )
         .await
     }
