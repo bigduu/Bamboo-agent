@@ -163,9 +163,10 @@ fn child_completion_envelope(
             tail_start += 1;
         }
         let tail = &value[tail_start..];
+        let retrieval_view = if label == "error" { "error" } else { "result" };
         let summary = format!(
             "Child {label} exceeded the durable inline limit ({} UTF-8 bytes, sha256={digest}). \
-             Retrieve the full child transcript with SubAgent.get(child_session_id=\"{child_session_id}\").\
+             Read it in bounded slices with SubAgent.get(child_session_id=\"{child_session_id}\", view=\"{retrieval_view}\"); use view=\"messages\" for transcript previews.\
              \n\nBounded tail:\n{tail}",
             value.len()
         );
@@ -436,7 +437,7 @@ fn runtime_resume_message(
 
     body.push_str(
         "\n\nResume the parent task using this child result and continue from the previous plan. \
-         If you need the full child transcript, call SubAgent.get(child_session_id).",
+         If you need transcript evidence, call SubAgent.get(child_session_id, view=\"messages\") and follow its cursor; use view=\"message\" for a selected full message.",
     );
 
     let mut message = Message::user(body);
@@ -480,7 +481,7 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
         }
     }
     body.push_str(
-        "\n\nIf you need the full guardian transcript, call SubAgent.get(child_session_id).",
+        "\n\nIf you need guardian transcript evidence, call SubAgent.get(child_session_id, view=\"messages\") and follow its cursor.",
     );
 
     let mut message = Message::user(body);
@@ -3198,6 +3199,7 @@ mod tests {
         let stored = outcome.result.as_deref().unwrap();
         assert!(stored.contains("sha256="));
         assert!(stored.contains("SubAgent.get"));
+        assert!(stored.contains("view=\"result\""));
         assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
 
         // Retry-only completion timestamps and provider presentation do not
@@ -3218,6 +3220,20 @@ mod tests {
             &runtime_resume_message(&completion, 0, Some(&changed)),
         );
         assert_ne!(corrected.id, first.id);
+    }
+
+    #[test]
+    fn oversized_child_error_points_to_bounded_error_view() {
+        let mut completion = make_completion("error");
+        completion.error = Some("失败🙂".repeat(20_000));
+        let presentation = runtime_resume_message(&completion, 0, None);
+        let envelope = child_completion_envelope(&completion, Utc::now(), None, &presentation);
+        let SessionMessageBody::ChildOutcome(outcome) = envelope.body else {
+            panic!("typed child outcome");
+        };
+        let stored = outcome.error.expect("bounded error");
+        assert!(stored.contains("view=\"error\""));
+        assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
     }
 
     #[tokio::test]
