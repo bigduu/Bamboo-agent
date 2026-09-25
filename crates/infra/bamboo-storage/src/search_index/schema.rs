@@ -101,6 +101,16 @@ fn validate_fts(conn: &Connection) -> std::io::Result<()> {
     validate_fts_shape(conn, true)
 }
 
+fn has_v5_column(conn: &Connection) -> std::io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions_search')
+         WHERE name = 'source_revision')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
 fn validate_columns(
     conn: &Connection,
     table: &str,
@@ -375,6 +385,12 @@ fn migrate_v4(conn: &Connection) -> std::io::Result<()> {
     rebuild_fts(conn)
 }
 
+fn validate_v5(conn: &Connection) -> std::io::Result<()> {
+    validate_columns(conn, "sessions_search", SESSION_COLUMNS, true)?;
+    validate_columns(conn, "session_messages_search", MESSAGE_COLUMNS, true)?;
+    validate_fts(conn)
+}
+
 pub(super) fn initialize(conn: &mut Connection) -> std::io::Result<()> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -398,14 +414,18 @@ pub(super) fn initialize(conn: &mut Connection) -> std::io::Result<()> {
         None
     };
     match version.as_deref() {
+        Some("3" | "4") if has_v5_column(&tx)? => {
+            // A stale version row must not send an already migrated index
+            // through an older migration. Republish it only after validating
+            // every v5 table and FTS definition inside this transaction.
+            validate_v5(&tx)?;
+        }
         Some("3") => migrate_v3(&tx)?,
         Some("4") => migrate_v4(&tx)?,
         Some(VERSION) => {
-            validate_columns(&tx, "sessions_search", SESSION_COLUMNS, true)?;
-            validate_columns(&tx, "session_messages_search", MESSAGE_COLUMNS, true)?;
             // Validate before any IF NOT EXISTS creation so a partial v5
             // schema is rejected instead of silently creating an empty FTS.
-            validate_fts(&tx)?;
+            validate_v5(&tx)?;
         }
         None => {
             // Never overwrite an unversioned/partial owned schema as a new DB.
