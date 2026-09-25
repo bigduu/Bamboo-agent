@@ -356,7 +356,8 @@ async fn replace_message_source(
                 version: 0,
                 messages: Vec::new(),
                 terminal: None,
-                history_committed: true,
+                // No runner is not evidence that its final history was saved.
+                history_committed: false,
             };
             if emit_message_snapshot(out, encoding, ch, seq, snapshot).await {
                 Ok(None)
@@ -411,6 +412,30 @@ pub(crate) fn spawn_message_forwarder(
             };
             match input {
                 MessageInput::Visible(Ok(event)) => {
+                    let generation_matches = {
+                        let runners = state.agent_runners.read().await;
+                        source.as_ref().is_some_and(|current| {
+                            runners
+                                .get(&session_id)
+                                .is_some_and(|runner| runner.run_id == current.run_id)
+                        })
+                    };
+                    if !generation_matches {
+                        source = match replace_message_source(
+                            &state,
+                            &session_id,
+                            &out,
+                            encoding,
+                            &ch,
+                            &seq,
+                        )
+                        .await
+                        {
+                            Ok(source) => source,
+                            Err(()) => return,
+                        };
+                        continue;
+                    }
                     let Some(current) = source.as_mut() else {
                         continue;
                     };
@@ -478,24 +503,16 @@ pub(crate) fn spawn_message_forwarder(
                     {
                         continue;
                     }
-                    let next = match replace_message_source(
-                        &state,
-                        &session_id,
-                        &out,
-                        encoding,
-                        &ch,
-                        &seq,
-                    )
-                    .await
+                    if let Some((next, snapshot)) =
+                        current_message_source(&state, &session_id).await
                     {
-                        Ok(source) => source,
-                        Err(()) => return,
-                    };
-                    if next
-                        .as_ref()
-                        .is_some_and(|current| current.run_id == *run_id)
-                    {
-                        source = next;
+                        if next.run_id != *run_id {
+                            continue;
+                        }
+                        if !emit_message_snapshot(&out, encoding, &ch, &seq, snapshot).await {
+                            return;
+                        }
+                        source = Some(next);
                     }
                 }
                 MessageInput::Generation(Err(broadcast::error::RecvError::Closed)) => return,
@@ -1246,6 +1263,143 @@ mod tests {
         visible.history_committed();
         let committed = next_json(&mut out_rx).await;
         assert_eq!(committed["control"]["type"], "history_committed");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_does_not_claim_history_commit_without_a_runner() {
+        let (state, _tmp) = test_state("message-no-runner").await;
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            "message-no-runner".to_string(),
+            out_tx,
+            Encoding::Json,
+            "message.message-no-runner".to_string(),
+            generation_rx,
+        );
+
+        let snapshot = next_json(&mut out_rx).await;
+        assert_eq!(snapshot["event"]["type"], "snapshot");
+        assert_eq!(snapshot["event"]["history_committed"], false);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_drops_queued_text_from_a_replaced_runner() {
+        let session_id = "message-replaced-runner";
+        let (state, _tmp) = test_state(session_id).await;
+        let old_visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("old".into(), chrono::Utc::now());
+            runner.visible_messages.append("old text".into());
+            runner.visible_messages.clone()
+        };
+        let (generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state.clone(),
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let first = next_json(&mut out_rx).await;
+        assert_eq!(first["event"]["messages"][0]["content"], "old text");
+
+        let new_run_id = {
+            let mut runners = state.agent_runners.write().await;
+            let replacement = AgentRunner::new();
+            let new_run_id = replacement.run_id.clone();
+            replacement
+                .visible_messages
+                .start("new".into(), chrono::Utc::now());
+            replacement.visible_messages.append("new text".into());
+            runners.insert(session_id.to_string(), replacement);
+            new_run_id
+        };
+        old_visible.append(" STALE_PRIVATE_TEXT".into());
+        generation_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: new_run_id.clone(),
+                session_id: session_id.to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let replacement = next_json(&mut out_rx).await;
+        assert_eq!(replacement["event"]["type"], "snapshot");
+        assert_eq!(replacement["event"]["messages"][0]["content"], "new text");
+        assert!(!replacement.to_string().contains("STALE_PRIVATE_TEXT"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), out_rx.recv())
+                .await
+                .is_err(),
+            "a queued start must not duplicate the replacement snapshot"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_resnapshots_after_visible_channel_lag() {
+        let session_id = "message-lag-recovery";
+        let (state, _tmp) = test_state(session_id).await;
+        let visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("visible-1".into(), chrono::Utc::now());
+            runner.visible_messages.clone()
+        };
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let initial = next_json(&mut out_rx).await;
+        assert_eq!(initial["event"]["type"], "snapshot");
+
+        // The current-thread test does not yield while publishing, so the
+        // receiver must see a lagged ring rather than a partial token tail.
+        for _ in 0..1050 {
+            visible.append("x".into());
+        }
+        // A few deltas may already be in the outbound queue before the ring
+        // overflows; the forwarder must eventually announce the gap.
+        let mut gap = None;
+        for _ in 0..20 {
+            let frame = next_json(&mut out_rx).await;
+            if frame["control"]["type"] == "gap" {
+                gap = Some(frame);
+                break;
+            }
+            assert_eq!(frame["event"]["type"], "delta");
+        }
+        let gap = gap.expect("visible lag must be reported");
+        assert_eq!(gap["control"]["type"], "gap");
+        let recovered = next_json(&mut out_rx).await;
+        assert_eq!(recovered["event"]["type"], "snapshot");
+        assert_eq!(
+            recovered["event"]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1050
+        );
         handle.abort();
     }
 

@@ -345,6 +345,114 @@ mod tests {
         drop(input);
     }
 
+    #[tokio::test]
+    async fn server_forwarder_keeps_internal_message_markers_off_the_session_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            actix_web::web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let id = "server-visible-message";
+        let sender = state.get_session_event_sender(id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await;
+        let run_id = current_run_id(&state, id).await;
+        let (input, events) = mpsc::channel(8);
+        let mut barrier =
+            spawn_event_forwarder(state.clone(), id.into(), run_id, events, sender, None);
+        let visible = state.agent_runners.read().await[id]
+            .visible_messages
+            .clone();
+        let (mut visible_receiver, _) = visible.subscribe_with_snapshot();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        input
+            .send(AgentEvent::VisibleMessageStart {
+                message_id: "visible-1".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Token {
+                content: "public text".into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Token { .. }
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            AgentEvent::Complete { .. }
+        ));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    visible_receiver.recv().await.unwrap().kind,
+                    bamboo_engine::execution::VisibleMessageEventKind::Terminal { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("terminal replay event");
+        let (_, before_commit) = visible.subscribe_with_snapshot();
+        assert_eq!(before_commit.messages.len(), 1);
+        assert_eq!(before_commit.messages[0].id, "visible-1");
+        assert_eq!(before_commit.messages[0].content, "public text");
+        assert_eq!(before_commit.terminal.as_deref(), Some("complete"));
+
+        assert!(timeout(
+            Duration::from_secs(5),
+            barrier.send_and_wait(&input, id.into())
+        )
+        .await
+        .expect("history commit barrier"));
+        let (_, after_commit) = visible.subscribe_with_snapshot();
+        assert!(after_commit.messages.is_empty());
+        assert!(after_commit.history_committed);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(
+                    !matches!(
+                        event,
+                        AgentEvent::VisibleMessageStart { .. }
+                            | AgentEvent::VisibleMessageDiscard { .. }
+                    ),
+                    "internal markers must not be broadcast"
+                );
+                if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("history commit on the session stream");
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RecordedRequest {
         purpose: String,

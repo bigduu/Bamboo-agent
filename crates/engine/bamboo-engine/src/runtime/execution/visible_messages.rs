@@ -311,6 +311,38 @@ mod tests {
     }
 
     #[test]
+    fn multi_round_messages_survive_until_history_commit() {
+        let stream = VisibleMessageStream::new();
+        stream.begin_round(1);
+        stream.start("round-1".into(), Utc::now());
+        stream.append("first".into());
+        stream.begin_round(2);
+        stream.start("round-2".into(), Utc::now());
+        stream.append("second".into());
+
+        let (_, snapshot) = stream.subscribe_with_snapshot();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[0].round_count, 1);
+        assert_eq!(snapshot.messages[0].content, "first");
+        assert_eq!(snapshot.messages[1].round_count, 2);
+        assert_eq!(snapshot.messages[1].content, "second");
+    }
+
+    #[test]
+    fn failed_and_cancelled_terminal_reasons_remain_in_late_snapshots() {
+        for reason in ["error", "cancelled"] {
+            let stream = VisibleMessageStream::new();
+            stream.start("partial".into(), Utc::now());
+            stream.append("visible prefix".into());
+            stream.mark_terminal(reason);
+
+            let (_, snapshot) = stream.subscribe_with_snapshot();
+            assert_eq!(snapshot.terminal.as_deref(), Some(reason));
+            assert_eq!(snapshot.messages[0].content, "visible prefix");
+        }
+    }
+
+    #[test]
     fn history_commit_clears_text_only_after_control_is_emitted() {
         let stream = VisibleMessageStream::new();
         stream.start("message-1".into(), Utc::now());
