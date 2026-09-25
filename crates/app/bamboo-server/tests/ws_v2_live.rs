@@ -566,6 +566,20 @@ async fn message_channel_replays_safe_text_and_controls_over_live_websocket() {
     assert_eq!(committed["control"]["type"], "history_committed");
     assert!(committed["seq"].as_u64() > terminal["seq"].as_u64());
 
+    send_json(&mut conn, json!({"type": "unsubscribe", "ch": ch})).await;
+    visible.start("visible-2".into(), chrono::Utc::now());
+    visible.append("after reconnect".into());
+    send_json(&mut conn, json!({"type": "subscribe", "ch": ch})).await;
+    let reconnected = next_envelope(&mut conn)
+        .await
+        .expect("reconnected snapshot");
+    assert_eq!(reconnected["event"]["type"], "snapshot");
+    assert_eq!(reconnected["event"]["messages"][0]["id"], "visible-2");
+    assert_eq!(
+        reconnected["event"]["messages"][0]["content"],
+        "after reconnect"
+    );
+
     server.stop().await;
 }
 
