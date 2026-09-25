@@ -64,6 +64,7 @@ fn chat_request_blank_model_trims_to_empty() {
         project_id: None,
         system_prompt: None,
         enhance_prompt: None,
+        root_orchestration_prompt: None,
         workspace_path: None,
         selected_skill_ids: None,
         workflow_selection: None,

@@ -13,7 +13,7 @@
 //! Clearers remove from both planes symmetrically.
 
 use super::runtime_metadata::{keys, SessionRuntimeMetadata};
-use super::types::Session;
+use super::types::{Session, SessionKind};
 
 impl Session {
     /// Mutable handle to the typed runtime metadata, creating it on demand.
@@ -305,6 +305,57 @@ impl Session {
     }
 
     // ------------------------------------------------------------------
+    // root_orchestration_prompt
+    // ------------------------------------------------------------------
+
+    /// Host-selected delegation guidance is scoped to a genuine root Session.
+    /// An imported or malformed child cannot acquire it from inherited metadata.
+    pub fn root_orchestration_prompt_enabled(&self) -> bool {
+        self.kind == SessionKind::Root
+            && self.parent_session_id.is_none()
+            && self
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.root_orchestration_prompt)
+                .or_else(|| {
+                    self.metadata
+                        .get(keys::ROOT_ORCHESTRATION_PROMPT)
+                        .and_then(|value| value.parse::<bool>().ok())
+                })
+                .unwrap_or(false)
+    }
+
+    /// An explicit `false` clears the selection while preserving the default
+    /// serialization of ordinary roots. Omitted chat values leave it untouched.
+    pub fn set_root_orchestration_prompt_enabled(&mut self, enabled: bool) {
+        if self.kind != SessionKind::Root || self.parent_session_id.is_some() {
+            return;
+        }
+        let changed = self.root_orchestration_prompt_enabled() != enabled;
+        if enabled {
+            self.runtime_metadata_mut().root_orchestration_prompt = Some(true);
+            self.metadata.insert(
+                keys::ROOT_ORCHESTRATION_PROMPT.to_string(),
+                "true".to_string(),
+            );
+        } else {
+            if let Some(metadata) = self.runtime_metadata.as_mut() {
+                metadata.root_orchestration_prompt = None;
+            }
+            self.metadata.remove(keys::ROOT_ORCHESTRATION_PROMPT);
+            self.prune_runtime_metadata();
+        }
+        // A disabled enhancement must disappear from the next provider input,
+        // including old ledger snapshots. A new epoch also prevents an old
+        // native continuation from bypassing the changed prompt selection.
+        if changed && self.model_context_state.is_some() {
+            self.reset_model_context_epoch(
+                super::model_context::ModelContextResetReason::CacheScopeChanged,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
     // task_list_version / todo_list_version (string form)
     // ------------------------------------------------------------------
 
@@ -376,6 +427,38 @@ impl Session {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn root_orchestration_selection_survives_reload_but_never_applies_to_child() {
+        let mut root = Session::new("root-orchestration", "model");
+        assert!(!root.root_orchestration_prompt_enabled());
+        root.set_root_orchestration_prompt_enabled(true);
+        let stored = serde_json::to_string(&root).expect("serialize root");
+        let mut reloaded: Session = serde_json::from_str(&stored).expect("reload root");
+        assert!(reloaded.root_orchestration_prompt_enabled());
+        assert_eq!(
+            reloaded
+                .metadata
+                .get(keys::ROOT_ORCHESTRATION_PROMPT)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let mut child = Session::new_child_of("child", &reloaded, "model", "child");
+        child.set_root_orchestration_prompt_enabled(true);
+        assert!(!child.root_orchestration_prompt_enabled());
+
+        reloaded.set_root_orchestration_prompt_enabled(false);
+        assert!(!reloaded.root_orchestration_prompt_enabled());
+        assert!(!reloaded
+            .metadata
+            .contains_key(keys::ROOT_ORCHESTRATION_PROMPT));
+        assert!(reloaded
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.root_orchestration_prompt)
+            .is_none());
+    }
 
     /// Hand-written OLD-format session JSON: only the legacy `metadata` map,
     /// no `runtime_metadata` field. Includes a JSON-string

@@ -84,6 +84,8 @@ pub enum ContextBlockType {
     /// This is model-visible, but never an authorization input: runtime tools
     /// must continue to scope access from their host-provided execution context.
     SessionIdentity,
+    /// Explicit, root-only delegation guidance selected for this Session.
+    RootOrchestration,
     Workspace,
     /// Per-round Project-shared resource inventory. Project identity itself is
     /// carried by the stable Project marker in the system prompt.
@@ -116,6 +118,7 @@ impl ContextBlockType {
             Self::Base => "base",
             Self::CoreDirectives => "core_directives",
             Self::SessionIdentity => "session_identity",
+            Self::RootOrchestration => "root_orchestration",
             Self::Workspace => "workspace",
             Self::ProjectResources => "project_resources",
             Self::InstructionOverlay => "instruction_overlay",
