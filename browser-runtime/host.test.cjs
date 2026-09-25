@@ -1251,6 +1251,10 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
 test('popup and explicit tabs keep active DOM, frames, and epochs on one page', async () => {
   let popupDownloadRequests = 0;
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/connection-drop') {
+      request.socket.destroy();
+      return;
+    }
     if (request.url === '/popup-file') popupDownloadRequests++;
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     if (request.url === '/one') {
@@ -1377,9 +1381,24 @@ test('popup and explicit tabs keep active DOM, frames, and epochs on one page', 
     assert.equal(thirdFrame.page_epoch, third.page_epoch);
     assert.equal((await call('navigate', { url: 'file:///tmp/secret', expected_epoch: third.page_epoch })).code, 'invalid_url');
 
+    const beforeFailedCreate = (await call('tab_activate', {
+      tab_id: firstId, expected_epoch: third.page_epoch,
+    })).result;
+    const failedCreate = await call('tab_create', {
+      url: base + '/connection-drop', expected_epoch: beforeFailedCreate.page_epoch,
+    });
+    assert.equal(failedCreate.ok, false);
+    const restored = (await call('state')).result;
+    assert.equal(restored.active_tab_id, firstId,
+      'failed creation restores the tab that was active, even if it was not last');
+    assert.deepEqual(restored.tabs.map(tab => tab.tab_id), [firstId, thirdId]);
+    const backToThird = (await call('tab_activate', {
+      tab_id: thirdId, expected_epoch: restored.page_epoch,
+    })).result;
+
     // Queued stop/start operations from older activations must not interrupt
     // the final active tab's capture or emit frames for another tab afterward.
-    let switching = third;
+    let switching = backToThird;
     for (let count = 0; count < 12; count++) {
       const nextTabId = switching.active_tab_id === firstId ? thirdId : firstId;
       switching = (await call('tab_activate', {

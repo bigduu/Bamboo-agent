@@ -2754,6 +2754,7 @@ async function command(action, args = {}) {
         throw error;
       }
       var targetUrl = args.url === undefined ? null : checkUrl(args.url);
+      var previousActiveTabId = activeTabId;
       var createdPage = await context.newPage();
       adoptPage(createdPage);
       if (targetUrl) {
@@ -2761,6 +2762,8 @@ async function command(action, args = {}) {
           await createdPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
         } catch (error) {
           await createdPage.close().catch(() => {});
+          const previousTab = tabs.find(tab => tab.id === previousActiveTabId);
+          if (previousTab) activateTab(previousTab);
           throw error;
         }
       }
