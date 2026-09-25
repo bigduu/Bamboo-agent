@@ -144,55 +144,93 @@ fn child_completion_envelope(
     result: Option<String>,
     provider_message: &Message,
 ) -> SessionMessageEnvelope {
+    let envelope = build_child_completion_envelope(
+        completion,
+        wait_registered_at,
+        result.as_deref(),
+        provider_message,
+        false,
+    );
+    if serde_json::to_vec(&envelope).map_or(true, |bytes| {
+        bytes.len() > bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+    }) {
+        // UTF-8 byte caps do not bound JSON escaping or duplicate fields in
+        // ChildOutcome/provider metadata. Fall back to digest-only summaries
+        // before admission so an escaped or mixed result/error cannot strand
+        // the parent wait at the SessionInbox payload limit.
+        return build_child_completion_envelope(
+            completion,
+            wait_registered_at,
+            result.as_deref(),
+            provider_message,
+            true,
+        );
+    }
+    envelope
+}
+
+fn build_child_completion_envelope(
+    completion: &ChildCompletion,
+    wait_registered_at: chrono::DateTime<Utc>,
+    result: Option<&str>,
+    provider_message: &Message,
+    compact: bool,
+) -> SessionMessageEnvelope {
     fn bounded_terminal_field(
         label: &str,
         child_session_id: &str,
-        value: Option<String>,
-    ) -> (Option<String>, serde_json::Value, bool) {
+        value: Option<&str>,
+        compact: bool,
+    ) -> (Option<String>, serde_json::Value) {
         let Some(value) = value else {
-            return (None, serde_json::Value::Null, false);
+            return (None, serde_json::Value::Null);
         };
-        if value.len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES {
-            return (Some(value.clone()), serde_json::Value::String(value), false);
-        }
-        let digest = hex::encode(Sha256::digest(value.as_bytes()));
-        let mut tail_start = value
-            .len()
-            .saturating_sub(CHILD_COMPLETION_OVERSIZE_TAIL_BYTES);
-        while tail_start < value.len() && !value.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-        let tail = &value[tail_start..];
-        let retrieval_view = if label == "error" { "error" } else { "result" };
-        let summary = format!(
-            "Child {label} exceeded the durable inline limit ({} UTF-8 bytes, sha256={digest}). \
-             Read it in bounded slices with SubAgent.get(child_session_id=\"{child_session_id}\", view=\"{retrieval_view}\"); use view=\"messages\" for transcript previews.\
-             \n\nBounded tail:\n{tail}",
-            value.len()
-        );
-        (
-            Some(summary),
+        let oversized = value.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES;
+        let identity = if oversized {
             serde_json::json!({
                 "oversized": true,
                 "utf8_bytes": value.len(),
-                "sha256": digest,
-            }),
-            true,
-        )
+                "sha256": hex::encode(Sha256::digest(value.as_bytes())),
+            })
+        } else {
+            serde_json::Value::String(value.to_string())
+        };
+        if !oversized && !compact {
+            return (Some(value.to_string()), identity);
+        }
+        let digest = hex::encode(Sha256::digest(value.as_bytes()));
+        let retrieval_view = if label == "error" { "error" } else { "result" };
+        let mut summary = format!(
+            "Child {label} could not fit in the durable inline envelope ({} UTF-8 bytes, sha256={digest}). \
+             Read it in bounded slices with SubAgent.get(child_session_id=\"{child_session_id}\", view=\"{retrieval_view}\"); use view=\"messages\" for transcript previews.",
+            value.len()
+        );
+        if !compact {
+            let mut tail_start = value
+                .len()
+                .saturating_sub(CHILD_COMPLETION_OVERSIZE_TAIL_BYTES);
+            while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            summary.push_str("\n\nBounded tail:\n");
+            summary.push_str(&value[tail_start..]);
+        }
+        (Some(summary), identity)
     }
 
-    let (stored_result, result_identity, _result_oversized) =
-        bounded_terminal_field("result", &completion.child_session_id, result);
-    let (stored_error, error_identity, _error_oversized) = bounded_terminal_field(
+    let (stored_result, result_identity) =
+        bounded_terminal_field("result", &completion.child_session_id, result, compact);
+    let (stored_error, error_identity) = bounded_terminal_field(
         "error",
         &completion.child_session_id,
-        completion.error.clone(),
+        completion.error.as_deref(),
+        compact,
     );
     let mut bounded_provider_message = provider_message.clone();
     let provider_oversized = serde_json::to_vec(provider_message)
         .map(|bytes| bytes.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES)
         .unwrap_or(true);
-    if provider_oversized {
+    if provider_oversized || compact {
         let mut content = format!(
             "Runtime notification: child session `{}` finished with status `{}`.",
             completion.child_session_id, completion.status
@@ -207,6 +245,50 @@ fn child_completion_envelope(
         }
         bounded_provider_message.content = content;
         bounded_provider_message.content_parts = None;
+        // The runtime resume also carries the raw error in metadata. Bounding
+        // only its visible content leaves the durable inbox envelope oversized
+        // and strands the parent's wait when admission rejects it.
+        if compact {
+            let original = bounded_provider_message
+                .metadata
+                .as_ref()
+                .and_then(serde_json::Value::as_object);
+            let mut metadata = serde_json::Map::new();
+            for key in [
+                RUNTIME_RESUME_MESSAGE_HIDDEN_KEY,
+                RUNTIME_RESUME_MESSAGE_KIND_KEY,
+                "child_session_id",
+                "child_status",
+                "child_final_response_included",
+                "guardian_approved",
+            ] {
+                if let Some(value) = original.and_then(|metadata| metadata.get(key)) {
+                    metadata.insert(key.to_string(), value.clone());
+                }
+            }
+            if original.is_some_and(|metadata| metadata.contains_key("child_error")) {
+                metadata.insert(
+                    "child_error".to_string(),
+                    stored_error
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |error| {
+                            serde_json::Value::String(error.clone())
+                        }),
+                );
+            }
+            bounded_provider_message.metadata = Some(serde_json::Value::Object(metadata));
+        } else if let Some(child_error) = bounded_provider_message
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|metadata| metadata.get_mut("child_error"))
+        {
+            *child_error = stored_error
+                .as_ref()
+                .map_or(serde_json::Value::Null, |error| {
+                    serde_json::Value::String(error.clone())
+                });
+        }
     }
     let body = SessionMessageBody::ChildOutcome(SessionChildOutcome {
         child_session_id: completion.child_session_id.clone(),
@@ -3225,15 +3307,135 @@ mod tests {
     #[test]
     fn oversized_child_error_points_to_bounded_error_view() {
         let mut completion = make_completion("error");
-        completion.error = Some("失败🙂".repeat(20_000));
+        completion.error = Some("失败🙂".repeat(30_000));
         let presentation = runtime_resume_message(&completion, 0, None);
         let envelope = child_completion_envelope(&completion, Utc::now(), None, &presentation);
-        let SessionMessageBody::ChildOutcome(outcome) = envelope.body else {
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
             panic!("typed child outcome");
         };
-        let stored = outcome.error.expect("bounded error");
+        let stored = outcome.error.as_deref().expect("bounded error");
         assert!(stored.contains("view=\"error\""));
         assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let metadata_error = outcome
+            .provider_message
+            .as_ref()
+            .and_then(|provider| provider.metadata.get("child_error"))
+            .and_then(serde_json::Value::as_str)
+            .expect("bounded metadata error");
+        assert_eq!(metadata_error, stored);
+        assert!(!metadata_error.contains(&"失败🙂".repeat(30_000)));
+    }
+
+    #[test]
+    fn escaped_and_mixed_child_fields_fit_the_serialized_inbox_budget() {
+        let mut completion = make_completion("error");
+        completion.error = Some("\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES));
+        let result = "\n".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let wait_registered_at = Utc::now();
+        let presentation = runtime_resume_message(&completion, 0, Some(&result));
+        let envelope = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(result.clone()),
+            &presentation,
+        );
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("typed child outcome");
+        };
+        let error = outcome.error.as_deref().unwrap();
+        let stored_result = outcome.result.as_deref().unwrap();
+        assert!(error.contains("view=\"error\""));
+        assert!(stored_result.contains("view=\"result\""));
+        assert!(!error.contains("Bounded tail"));
+        assert!(!stored_result.contains("Bounded tail"));
+        assert_eq!(
+            outcome
+                .provider_message
+                .as_ref()
+                .and_then(|provider| provider.metadata.get("child_error"))
+                .and_then(serde_json::Value::as_str),
+            Some(error)
+        );
+        let retry = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(result),
+            &runtime_resume_message(&completion, 8, None),
+        );
+        assert_eq!(envelope.id, retry.id);
+    }
+
+    #[tokio::test]
+    async fn oversized_multibyte_child_error_is_durable_and_replayable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let parent_id = "large-error-parent";
+        store
+            .save_session(&Session::new(parent_id, "model"))
+            .await
+            .unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let mut completion = make_completion("error");
+        completion.parent_session_id = parent_id.to_string();
+        completion.error = Some("失败🙂".repeat(30_000));
+        let presentation = runtime_resume_message(&completion, 0, None);
+        let envelope = child_completion_envelope(&completion, Utc::now(), None, &presentation);
+        inbox.deliver(&envelope).await.unwrap();
+        completion.child_session_id = "escaped-error-child".to_string();
+        completion.error = Some("\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES));
+        let result = "\n".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let mixed = child_completion_envelope(
+            &completion,
+            Utc::now(),
+            Some(result.clone()),
+            &runtime_resume_message(&completion, 0, Some(&result)),
+        );
+        let receipt = inbox.deliver(&mixed).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                parent_id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+        drop(inbox);
+        drop(store);
+
+        let reopened_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let reopened = bamboo_storage::FileSessionInbox::new(
+            reopened_store,
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let claims = reopened.claim(parent_id, 2).await.unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].envelope.id, envelope.id);
+        assert_eq!(claims[1].envelope.id, mixed.id);
+        for claim in claims {
+            assert!(
+                serde_json::to_vec(&claim.envelope).unwrap().len()
+                    < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+            );
+        }
     }
 
     #[tokio::test]
