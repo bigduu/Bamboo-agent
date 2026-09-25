@@ -21,11 +21,6 @@ use bamboo_skills::{SkillManager, SkillStoreConfig};
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
 
-const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
-    "copilot_conclusion_with_options_enhancement_enabled";
-const ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT: &str =
-    "If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text.";
-
 struct StaticToolExecutor {
     schemas: Vec<ToolSchema>,
 }
@@ -955,7 +950,6 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
             "mcp__alpha__inspect",
             "mcp__beta__inspect",
             "Workspace",
-            "conclusion_with_options",
             "request_permissions",
         ]
         .into_iter()
@@ -984,11 +978,7 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Deferred, "{name}");
     }
-    for name in [
-        "Workspace",
-        "conclusion_with_options",
-        "request_permissions",
-    ] {
+    for name in ["Workspace", "request_permissions"] {
         assert_eq!(classes[name], CapabilityLoadingClass::HostOnly, "{name}");
     }
 
@@ -1007,11 +997,7 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert!(model_names.contains(name), "legacy projection lost {name}");
     }
-    for name in [
-        "Workspace",
-        "conclusion_with_options",
-        "request_permissions",
-    ] {
+    for name in ["Workspace", "request_permissions"] {
         assert!(!model_names.contains(name), "HostOnly leaked: {name}");
     }
 
@@ -1054,6 +1040,36 @@ fn progressive_effective_set_intersects_final_session_eligible_catalog() {
     assert!(!effective.contains_execution_name("Glob"));
     assert!(!effective.contains_execution_name("Workspace"));
     assert!(!effective.contains_execution_name("missing_tool"));
+}
+
+#[test]
+fn browser_eval_is_independently_deferred_from_ordinary_browser_controls() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("browser"), schema("browser_eval")],
+    };
+    let session = Session::new("progressive-browser-eval", "model");
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    assert_eq!(catalog.len(), 2);
+    assert!(catalog
+        .iter()
+        .all(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred));
+
+    let browser_only = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        ["browser"],
+    );
+    assert!(browser_only.contains_execution_name("browser"));
+    assert!(!browser_only.contains_execution_name("browser_eval"));
+
+    let eval_only = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        ["browser_eval"],
+    );
+    assert!(!eval_only.contains_execution_name("browser"));
+    assert!(eval_only.contains_execution_name("browser_eval"));
 }
 
 #[test]
@@ -1314,72 +1330,6 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         Some("value")
     );
     assert_eq!(session.metadata.len(), 1);
-}
-
-#[test]
-fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_disabled() {
-    let config = crate::runtime::config::AgentLoopConfig::default();
-    let tools = StaticToolExecutor {
-        schemas: vec![schema("conclusion_with_options")],
-    };
-    let session = Session::new("session-1", "model");
-
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    assert!(resolved
-        .iter()
-        .all(|schema| schema.function.name != "conclusion_with_options"));
-
-    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
-    let host_entry = catalog
-        .iter()
-        .find(|entry| entry.execution_name() == "conclusion_with_options")
-        .expect("host catalog keeps compatibility entry");
-    assert_eq!(
-        host_entry.schema().function.description,
-        "conclusion_with_options tool"
-    );
-    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
-    assert!(!host_entry
-        .schema()
-        .function
-        .description
-        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
-}
-
-#[test]
-fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_enabled() {
-    let config = crate::runtime::config::AgentLoopConfig::default();
-    let tools = StaticToolExecutor {
-        schemas: vec![schema("conclusion_with_options")],
-    };
-    let mut session = Session::new("session-1", "model");
-    session.metadata.insert(
-        COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-
-    let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    assert!(resolved
-        .iter()
-        .all(|schema| schema.function.name != "conclusion_with_options"));
-
-    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
-    let host_entry = catalog
-        .iter()
-        .find(|entry| entry.execution_name() == "conclusion_with_options")
-        .expect("host catalog keeps compatibility entry");
-    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
-    assert!(host_entry
-        .schema()
-        .function
-        .description
-        .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
-    assert!(host_entry
-        .schema()
-        .function
-        .description
-        .contains("conclusion"));
-    assert!(host_entry.schema().function.description.contains("OK"));
 }
 
 #[test]

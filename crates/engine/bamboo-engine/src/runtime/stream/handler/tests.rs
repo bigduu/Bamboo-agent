@@ -41,6 +41,85 @@ fn timeout_context(
     .allow_turn_retry_before_semantic_output()
 }
 
+#[derive(Clone, Default)]
+struct FinalizerWarnings {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct WarningFields(String);
+
+impl tracing::field::Visit for WarningFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for FinalizerWarnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            self.events.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finalized_browser_arguments_hide_private_invalid_json_in_logs() {
+    let private_args = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query""#;
+    for name in [
+        "browser_eval",
+        "default::browser_eval",
+        "browser",
+        "default::browser",
+    ] {
+        let stream = build_stream(vec![
+            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                id: "call_private".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: private_args.to_string(),
+                },
+            }])),
+            Ok(LLMChunk::Done),
+        ]);
+        let (event_tx, _) = mpsc::channel::<AgentEvent>(8);
+        let warnings = FinalizerWarnings::default();
+        let recorded = warnings.events.clone();
+        let output = {
+            let _guard = tracing::subscriber::set_default(warnings);
+            consume_llm_stream(
+                stream,
+                &event_tx,
+                &CancellationToken::new(),
+                "private-finalizer-test",
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(output.tool_calls[0].function.arguments, private_args);
+        let text = recorded.lock().unwrap().join("\n");
+        assert!(
+            text.contains("args_preview=") && text.contains("[redacted]"),
+            "{name}: {text}"
+        );
+        assert!(!text.contains("private-page-source"), "{name}: {text}");
+        assert!(!text.contains("private-query"), "{name}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     let stream = build_stream(vec![
@@ -377,6 +456,7 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
+                crate::token_usage_log::ContextManagementTelemetry::default(),
             );
             assert_eq!(log_record.output_tokens, expected_output);
             assert_eq!(log_record.thinking_tokens, expected_reasoning);
@@ -461,6 +541,7 @@ async fn provider_cache_reconciles_without_input_total_in_both_orders() {
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
+                crate::token_usage_log::ContextManagementTelemetry::default(),
             );
             assert_eq!(log_record.cache_creation_input_tokens, expected_creation);
             assert_eq!(log_record.cache_read_input_tokens, expected_read);
@@ -709,6 +790,54 @@ async fn stalled_stream_bootstrap_times_out_before_response_headers() {
     assert!(message.contains("last_transport_ms_ago=2000"));
     assert!(message.contains("last_semantic_ms_ago=never"));
     assert!(message.contains("retry_safe=true"));
+    assert!(timeout.last_http_retry().is_none());
+}
+
+#[tokio::test]
+async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "2")
+                .set_body_string("private provider response body"),
+        )
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/responses", server.uri());
+    let retry_config = bamboo_llm::retry::RetryConfig {
+        max_attempts: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    let context = timeout_context(1, 20, 20).begin_request();
+
+    let result = await_stream_bootstrap(
+        bamboo_llm::retry::send_with_retry(&retry_config, "test", || client.post(&url)),
+        &CancellationToken::new(),
+        "session-rate-limited-bootstrap",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected bootstrap StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+    assert!(timeout.retry_safe());
+    assert_eq!(
+        timeout.last_http_retry(),
+        Some((429, Duration::from_secs(2)))
+    );
+    let message = timeout.to_string();
+    assert!(message.contains("last_http_status=429, retry_delay_ms=2000"));
+    assert!(!message.contains("private provider response body"));
 }
 
 #[tokio::test(start_paused = true)]

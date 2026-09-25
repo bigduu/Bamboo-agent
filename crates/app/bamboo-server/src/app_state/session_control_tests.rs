@@ -6,7 +6,9 @@ use bamboo_agent_core::tools::{
     ExecutingSupervisorObservation, FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome,
     ToolSchema,
 };
-use bamboo_agent_core::{Message, Session, ToolExecutionContext};
+use bamboo_agent_core::{
+    Message, PendingQuestion, PendingQuestionSource, Session, ToolExecutionContext, ToolResult,
+};
 use bamboo_domain::{SessionActivationPolicy, SessionMessageEnvelope, SupervisorReference};
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMProvider, ProviderRegistry};
@@ -21,9 +23,7 @@ const TARGET: &str = "followup-runtime-target";
 const CALL: &str = "target-human-question";
 const STEER: &str = "supervisor followup unique content";
 
-// The compatibility conclusion tool is deliberately HostOnly. As in the
-// existing runner NeedsHuman regression, expose a fixture-only question name
-// while delegating the actual question behavior to the production tool.
+// Fixture-only pause tool for exercising the generic NeedsHuman transport.
 struct FixtureClarification;
 
 #[async_trait::async_trait]
@@ -35,12 +35,65 @@ impl Tool for FixtureClarification {
         "Ask the original target question"
     }
     fn parameters_schema(&self) -> Value {
-        bamboo_tools::tools::ConclusionWithOptionsTool::new().parameters_schema()
+        json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 2
+                }
+            },
+            "required": ["question", "options"],
+            "additionalProperties": false
+        })
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        bamboo_tools::tools::ConclusionWithOptionsTool::new()
-            .invoke(args, ctx)
-            .await
+        let question = args
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+            .ok_or_else(|| ToolError::InvalidArguments("question is required".into()))?
+            .to_string();
+        let options = args
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|option| !option.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if options.len() < 2 {
+            return Err(ToolError::InvalidArguments(
+                "at least two options are required".into(),
+            ));
+        }
+        Ok(ToolOutcome::NeedsHuman {
+            question: PendingQuestion {
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: self.name().to_string(),
+                question: question.clone(),
+                options: options.clone(),
+                allow_custom: true,
+                source: PendingQuestionSource::PauseTool,
+            },
+            result: ToolResult {
+                success: true,
+                result: json!({
+                    "status": "awaiting_user_input",
+                    "question": question,
+                    "options": options,
+                    "allow_custom": true
+                })
+                .to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            },
+        })
     }
 }
 
@@ -76,8 +129,7 @@ impl LLMProvider for Probe {
         }
         let mut chunks = Vec::new();
         if output.is_some() {
-            // The actual conclusion tool requires an assistant explanation
-            // before its question. Exercise that policy instead of disabling it.
+            // Preserve an assistant explanation before the pause tool call.
             chunks.push(Ok(bamboo_llm::LLMChunk::Token(
                 "The original task needs your decision before continuing.".into(),
             )));
@@ -193,12 +245,21 @@ impl Fixture {
 
     fn arm_question(&self, permission: bool, block: bool) {
         *self.probe.next.lock().unwrap() = Some(ToolCall {
-            id: CALL.into(), tool_type: "function".into(),
+            id: CALL.into(),
+            tool_type: "function".into(),
             function: FunctionCall {
-                name: if permission { "Bash" } else { "fixture_clarification" }.into(),
-                arguments: if permission { json!({"command":"echo followup-permission-probe"}) } else {
-                    json!({"question":"Which original option?", "options":["A","B"], "conclusion":{"summary":"Need original user choice", "mermaid":{"graph":"graph TD\nA-->B"}}})
-                }.to_string(),
+                name: if permission {
+                    "Bash"
+                } else {
+                    "fixture_clarification"
+                }
+                .into(),
+                arguments: if permission {
+                    json!({"command":"echo followup-permission-probe"})
+                } else {
+                    json!({"question":"Which original option?", "options":["A","B"]})
+                }
+                .to_string(),
             },
         });
         self.probe

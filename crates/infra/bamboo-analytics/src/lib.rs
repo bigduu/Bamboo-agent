@@ -35,10 +35,20 @@
 //! # Ok::<(), bamboo_analytics::AnalyticsError>(())
 //! ```
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use duckdb::Connection;
+use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use serde::Serialize;
+
+mod retrieval_rollout;
+
+pub use retrieval_rollout::{
+    render_retrieval_rollout_report, EvidenceKind, EvidenceSource, QueryClass,
+    RetrievalRolloutError, RetrievalRolloutReport, RetrievalRolloutSample, RolloutStrategy,
+    RETRIEVAL_ROLLOUT_SCHEMA_VERSION,
+};
 
 /// Relative cost of a cache-read token (vs normal input = 1.0).
 pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
@@ -54,6 +64,8 @@ pub const DEFAULT_TTL_SECONDS: f64 = 300.0;
 pub enum AnalyticsError {
     #[error("duckdb error: {0}")]
     Duck(#[from] duckdb::Error),
+    #[error("sqlite metrics error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("no token-usage files matched glob: {0}")]
     NoFiles(String),
 }
@@ -94,7 +106,7 @@ impl TokenUsageDb {
     pub fn open_glob(glob: &str) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let view = format!(
-            "CREATE VIEW token_usage AS SELECT * FROM read_json_auto('{}', \
+            "CREATE VIEW token_usage_raw AS SELECT * FROM read_json_auto('{}', \
              format='newline_delimited', union_by_name=true, ignore_errors=true, filename=true)",
             sql_quote(glob)
         );
@@ -105,6 +117,37 @@ impl TokenUsageDb {
             }
             return Err(error.into());
         }
+        let mut columns = HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info('token_usage_raw')")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for column in rows {
+                columns.insert(column?);
+            }
+        }
+        let optional_columns = [
+            ("cache_write_input_tokens", "NULL::BIGINT"),
+            ("context_management_strategy", "NULL::VARCHAR"),
+            ("model_context_epoch", "NULL::BIGINT"),
+            ("model_context_reset_reason", "NULL::VARCHAR"),
+            ("retrieval_archive_event_count", "NULL::BIGINT"),
+            ("latest_retrieval_archive_event_id", "NULL::VARCHAR"),
+            ("latest_retrieval_archive_trigger_type", "NULL::VARCHAR"),
+        ];
+        let missing = optional_columns
+            .into_iter()
+            .filter(|(name, _)| !columns.contains(*name))
+            .map(|(name, default)| format!("{default} AS {name}"))
+            .collect::<Vec<_>>();
+        let normalized = if missing.is_empty() {
+            "CREATE VIEW token_usage AS SELECT * FROM token_usage_raw".to_string()
+        } else {
+            format!(
+                "CREATE VIEW token_usage AS SELECT token_usage_raw.*, {} FROM token_usage_raw",
+                missing.join(", ")
+            )
+        };
+        conn.execute_batch(&normalized)?;
         Ok(Self { conn })
     }
 
@@ -293,6 +336,253 @@ impl TokenUsageDb {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    /// Aggregate provider-cache behavior by effective context strategy, model,
+    /// provider, and model-context epoch. Legacy rows remain visible under the
+    /// `unavailable` strategy with a null epoch rather than being mislabelled as
+    /// either strategy or epoch zero.
+    pub fn strategy_epoch_cache_health(&self) -> Result<Vec<StrategyEpochCacheHealth>> {
+        let sql = r#"
+            WITH normalized AS (
+                SELECT
+                    COALESCE(context_management_strategy, 'unavailable')::VARCHAR AS strategy,
+                    COALESCE(provider, '')::VARCHAR AS provider,
+                    COALESCE(model, '')::VARCHAR AS model,
+                    model_context_epoch::BIGINT AS model_context_epoch,
+                    COALESCE(session_id, '')::VARCHAR AS session_id,
+                    COALESCE(input_tokens, 0)::BIGINT AS input_tokens,
+                    COALESCE(output_tokens, 0)::BIGINT AS output_tokens,
+                    COALESCE(cache_read_input_tokens, 0)::BIGINT AS cache_read,
+                    COALESCE(cache_creation_input_tokens, 0)::BIGINT AS cache_creation,
+                    COALESCE(cache_write_input_tokens, 0)::BIGINT AS cache_write,
+                    CASE
+                        WHEN COALESCE(input_tokens, 0)
+                           + COALESCE(cache_read_input_tokens, 0)
+                           + COALESCE(cache_creation_input_tokens, 0) > 0
+                        THEN COALESCE(input_tokens, 0)
+                           + COALESCE(cache_read_input_tokens, 0)
+                           + COALESCE(cache_creation_input_tokens, 0)
+                        ELSE COALESCE(total_tokens, 0)
+                    END::BIGINT AS prompt_input_tokens,
+                    COALESCE(truncation_occurred, false) AS truncation_occurred,
+                    (COALESCE(budget_limit, 0) > 0
+                     AND COALESCE(total_tokens, 0) > COALESCE(budget_limit, 0)) AS budget_overflow
+                FROM token_usage
+            )
+            SELECT
+                strategy,
+                provider,
+                model,
+                model_context_epoch,
+                COUNT(DISTINCT session_id)::BIGINT AS sessions,
+                COUNT(*)::BIGINT AS calls,
+                COALESCE(SUM(prompt_input_tokens), 0)::BIGINT AS prompt_input_tokens,
+                COALESCE(SUM(input_tokens), 0)::BIGINT AS fresh_input_tokens,
+                COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
+                COALESCE(SUM(cache_read), 0)::BIGINT AS cache_read_tokens,
+                COALESCE(SUM(cache_creation), 0)::BIGINT AS cache_creation_tokens,
+                COALESCE(SUM(cache_write), 0)::BIGINT AS cache_write_tokens,
+                CASE WHEN COALESCE(SUM(prompt_input_tokens), 0) > 0
+                     THEN COALESCE(SUM(cache_read), 0)::DOUBLE
+                          / SUM(prompt_input_tokens)::DOUBLE
+                     ELSE 0 END::DOUBLE AS cached_fraction,
+                COALESCE(SUM(CASE WHEN truncation_occurred THEN 1 ELSE 0 END), 0)::BIGINT
+                    AS truncation_calls,
+                COALESCE(SUM(CASE WHEN budget_overflow THEN 1 ELSE 0 END), 0)::BIGINT
+                    AS budget_overflow_calls,
+                COALESCE(quantile_cont(prompt_input_tokens, 0.50), 0)::DOUBLE AS prompt_tokens_p50,
+                COALESCE(quantile_cont(prompt_input_tokens, 0.95), 0)::DOUBLE AS prompt_tokens_p95,
+                COALESCE(quantile_cont(prompt_input_tokens, 0.99), 0)::DOUBLE AS prompt_tokens_p99
+            FROM normalized
+            GROUP BY strategy, provider, model, model_context_epoch
+            ORDER BY strategy, provider, model, model_context_epoch NULLS FIRST
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StrategyEpochCacheHealth {
+                strategy: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                model_context_epoch: row.get(3)?,
+                sessions: row.get(4)?,
+                calls: row.get(5)?,
+                prompt_input_tokens: row.get(6)?,
+                fresh_input_tokens: row.get(7)?,
+                output_tokens: row.get(8)?,
+                cache_read_tokens: row.get(9)?,
+                cache_creation_tokens: row.get(10)?,
+                cache_write_tokens: row.get(11)?,
+                cached_fraction: row.get(12)?,
+                truncation_calls: row.get(13)?,
+                budget_overflow_calls: row.get(14)?,
+                prompt_tokens_p50: row.get(15)?,
+                prompt_tokens_p95: row.get(16)?,
+                prompt_tokens_p99: row.get(17)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The first completed provider call observed in each reset epoch, plus the
+    /// following call when present. This uses the explicit epoch/reset fields;
+    /// it never guesses a boundary from `segments_removed`.
+    pub fn context_boundary_calls(&self) -> Result<Vec<ContextBoundaryCall>> {
+        let sql = r#"
+            WITH calls AS (
+                SELECT
+                    COALESCE(session_id, '')::VARCHAR AS session_id,
+                    COALESCE(ts, '')::VARCHAR AS ts,
+                    COALESCE(context_management_strategy, 'unavailable')::VARCHAR AS strategy,
+                    model_context_epoch::BIGINT AS model_context_epoch,
+                    model_context_reset_reason::VARCHAR AS reset_reason,
+                    retrieval_archive_event_count::BIGINT AS retrieval_archive_event_count,
+                    latest_retrieval_archive_event_id::VARCHAR AS latest_retrieval_archive_event_id,
+                    latest_retrieval_archive_trigger_type::VARCHAR AS latest_retrieval_archive_trigger_type,
+                    COALESCE(message_count, 0)::BIGINT AS message_count,
+                    COALESCE(filename, '')::VARCHAR AS filename,
+                    COALESCE(input_tokens, 0)::BIGINT AS input_tokens,
+                    COALESCE(output_tokens, 0)::BIGINT AS output_tokens,
+                    COALESCE(cache_read_input_tokens, 0)::BIGINT AS cache_read,
+                    COALESCE(cache_creation_input_tokens, 0)::BIGINT AS cache_creation,
+                    COALESCE(cache_write_input_tokens, 0)::BIGINT AS cache_write,
+                    CASE
+                        WHEN COALESCE(input_tokens, 0)
+                           + COALESCE(cache_read_input_tokens, 0)
+                           + COALESCE(cache_creation_input_tokens, 0) > 0
+                        THEN COALESCE(input_tokens, 0)
+                           + COALESCE(cache_read_input_tokens, 0)
+                           + COALESCE(cache_creation_input_tokens, 0)
+                        ELSE COALESCE(total_tokens, 0)
+                    END::BIGINT AS prompt_input_tokens,
+                    COALESCE(truncation_occurred, false) AS truncation_occurred,
+                    (COALESCE(budget_limit, 0) > 0
+                     AND COALESCE(total_tokens, 0) > COALESCE(budget_limit, 0)) AS budget_overflow
+                FROM token_usage
+            ), ordered AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id, model_context_epoch
+                        ORDER BY ts, message_count, filename
+                    ) AS epoch_call_ordinal,
+                    LEAD(cache_read) OVER (
+                        PARTITION BY session_id, model_context_epoch
+                        ORDER BY ts, message_count, filename
+                    ) AS next_cache_read,
+                    LEAD(cache_creation) OVER (
+                        PARTITION BY session_id, model_context_epoch
+                        ORDER BY ts, message_count, filename
+                    ) AS next_cache_creation
+                FROM calls
+            )
+            SELECT
+                session_id,
+                ts,
+                strategy,
+                model_context_epoch,
+                reset_reason,
+                retrieval_archive_event_count,
+                latest_retrieval_archive_event_id,
+                latest_retrieval_archive_trigger_type,
+                prompt_input_tokens,
+                input_tokens,
+                output_tokens,
+                cache_read,
+                cache_creation,
+                cache_write,
+                truncation_occurred,
+                budget_overflow,
+                next_cache_read,
+                next_cache_creation
+            FROM ordered
+            WHERE epoch_call_ordinal = 1
+              AND model_context_epoch IS NOT NULL
+              AND reset_reason IS NOT NULL
+            ORDER BY session_id, model_context_epoch, ts
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ContextBoundaryCall {
+                session_id: row.get(0)?,
+                ts: row.get(1)?,
+                strategy: row.get(2)?,
+                model_context_epoch: row.get(3)?,
+                reset_reason: row.get(4)?,
+                retrieval_archive_event_count: row.get(5)?,
+                latest_retrieval_archive_event_id: row.get(6)?,
+                latest_retrieval_archive_trigger_type: row.get(7)?,
+                prompt_input_tokens: row.get(8)?,
+                fresh_input_tokens: row.get(9)?,
+                output_tokens: row.get(10)?,
+                cache_read_tokens: row.get(11)?,
+                cache_creation_tokens: row.get(12)?,
+                cache_write_tokens: row.get(13)?,
+                truncation_occurred: row.get(14)?,
+                budget_overflow: row.get(15)?,
+                next_cache_read_tokens: row.get(16)?,
+                next_cache_creation_tokens: row.get(17)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+/// Read the existing `metrics.db` tool-call table without adding a second
+/// runtime writer. No tool arguments, query text, results, paths, or errors are
+/// selected by this report.
+pub fn session_history_tool_metrics(metrics_db: &Path) -> Result<HistoryToolMetrics> {
+    let conn = SqliteConnection::open_with_flags(metrics_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT success, \
+                CASE WHEN completed_at IS NULL THEN NULL \
+                     ELSE CAST(ROUND((julianday(completed_at) - julianday(started_at)) \
+                                     * 86400000.0) AS INTEGER) END \
+         FROM tool_call_metrics \
+         WHERE tool_name = 'session_history_current' \
+         ORDER BY started_at, tool_call_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    let mut calls = 0u64;
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    let mut incomplete = 0u64;
+    let mut latencies = Vec::new();
+    for row in rows {
+        let (success, latency_ms) = row?;
+        calls += 1;
+        match success {
+            Some(value) if value > 0 => succeeded += 1,
+            Some(_) => failed += 1,
+            None => incomplete += 1,
+        }
+        if let Some(latency_ms) = latency_ms.and_then(|value| u64::try_from(value).ok()) {
+            latencies.push(latency_ms);
+        }
+    }
+    latencies.sort_unstable();
+    let completed = succeeded + failed;
+    Ok(HistoryToolMetrics {
+        calls,
+        succeeded,
+        failed,
+        incomplete,
+        success_rate: (completed > 0).then(|| succeeded as f64 / completed as f64),
+        latency_ms_p50: nearest_rank_u64(&latencies, 0.50),
+        latency_ms_p95: nearest_rank_u64(&latencies, 0.95),
+        latency_ms_p99: nearest_rank_u64(&latencies, 0.99),
+    })
+}
+
+fn nearest_rank_u64(sorted: &[u64], percentile: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (percentile * sorted.len() as f64).ceil() as usize;
+    sorted.get(rank.saturating_sub(1)).copied()
 }
 
 /// One LLM call's cache picture. See [`TokenUsageDb::round_cache_health`].
@@ -358,6 +648,65 @@ pub struct PauseSurvival {
     pub cache_read_after: i64,
 }
 
+/// Provider-cache aggregate for one effective strategy/model/provider/epoch.
+#[derive(Debug, Clone, Serialize)]
+pub struct StrategyEpochCacheHealth {
+    pub strategy: String,
+    pub provider: String,
+    pub model: String,
+    pub model_context_epoch: Option<i64>,
+    pub sessions: i64,
+    pub calls: i64,
+    pub prompt_input_tokens: i64,
+    pub fresh_input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cached_fraction: f64,
+    pub truncation_calls: i64,
+    pub budget_overflow_calls: i64,
+    pub prompt_tokens_p50: f64,
+    pub prompt_tokens_p95: f64,
+    pub prompt_tokens_p99: f64,
+}
+
+/// First completed call in a reset epoch and its immediate warm successor.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextBoundaryCall {
+    pub session_id: String,
+    pub ts: String,
+    pub strategy: String,
+    pub model_context_epoch: i64,
+    pub reset_reason: String,
+    pub retrieval_archive_event_count: Option<i64>,
+    pub latest_retrieval_archive_event_id: Option<String>,
+    pub latest_retrieval_archive_trigger_type: Option<String>,
+    pub prompt_input_tokens: i64,
+    pub fresh_input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub truncation_occurred: bool,
+    pub budget_overflow: bool,
+    pub next_cache_read_tokens: Option<i64>,
+    pub next_cache_creation_tokens: Option<i64>,
+}
+
+/// Aggregate from the existing `metrics.db` `tool_call_metrics` table.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HistoryToolMetrics {
+    pub calls: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub incomplete: u64,
+    pub success_rate: Option<f64>,
+    pub latency_ms_p50: Option<u64>,
+    pub latency_ms_p95: Option<u64>,
+    pub latency_ms_p99: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +725,17 @@ mod tests {
         writeln!(f, r#"{{"ts":"2026-06-15T00:11:00Z","session_id":"s1","model":"m","provider":"anthropic","message_count":6,"cache_creation_input_tokens":3000,"cache_read_input_tokens":4000,"input_tokens":2000,"output_tokens":80,"thinking_tokens":0,"system_tokens":5000,"summary_tokens":2000,"window_tokens":0,"total_tokens":9000,"max_context_tokens":200000,"budget_limit":180000,"prompt_cached_tool_outputs":0,"prompt_cached_tool_tokens_saved":0,"truncation_occurred":false,"segments_removed":12}}"#).unwrap();
         // Round 4: the cold round right after compaction.
         writeln!(f, r#"{{"ts":"2026-06-15T00:12:00Z","session_id":"s1","model":"m","provider":"anthropic","message_count":8,"cache_creation_input_tokens":1000,"cache_read_input_tokens":9000,"input_tokens":500,"output_tokens":90,"thinking_tokens":0,"system_tokens":5000,"summary_tokens":2000,"window_tokens":0,"total_tokens":10000,"max_context_tokens":200000,"budget_limit":180000,"prompt_cached_tool_outputs":0,"prompt_cached_tool_tokens_saved":0,"truncation_occurred":false,"segments_removed":0}}"#).unwrap();
+    }
+
+    fn write_mixed_schema_fixture(home: &Path) {
+        let sdir = home.join("sessions").join("mixed");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let mut f = std::fs::File::create(sdir.join("token-usage.jsonl")).unwrap();
+        writeln!(f, r#"{{"ts":"2026-06-15T00:00:00Z","session_id":"mixed","model":"m","provider":"anthropic","message_count":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":0,"input_tokens":500,"output_tokens":10,"total_tokens":1000,"budget_limit":900,"truncation_occurred":false,"segments_removed":0}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-06-15T00:01:00Z","session_id":"mixed","model":"m","provider":"anthropic","message_count":4,"cache_creation_input_tokens":900,"cache_read_input_tokens":100,"cache_write_input_tokens":40,"input_tokens":1000,"output_tokens":20,"total_tokens":2000,"budget_limit":1800,"truncation_occurred":true,"segments_removed":0,"context_management_strategy":"summary","model_context_epoch":1,"model_context_reset_reason":"compression","retrieval_archive_event_count":0}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-06-15T00:02:00Z","session_id":"mixed","model":"m","provider":"anthropic","message_count":6,"cache_creation_input_tokens":100,"cache_read_input_tokens":800,"cache_write_input_tokens":20,"input_tokens":100,"output_tokens":30,"total_tokens":1000,"budget_limit":1800,"truncation_occurred":false,"segments_removed":0,"context_management_strategy":"summary","model_context_epoch":1,"model_context_reset_reason":"compression","retrieval_archive_event_count":0}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-06-15T00:03:00Z","session_id":"mixed","model":"m","provider":"anthropic","message_count":8,"cache_creation_input_tokens":700,"cache_read_input_tokens":200,"cache_write_input_tokens":30,"input_tokens":600,"output_tokens":40,"total_tokens":1500,"budget_limit":1800,"truncation_occurred":false,"segments_removed":0,"context_management_strategy":"retrieval_window","model_context_epoch":2,"model_context_reset_reason":"compression","retrieval_archive_event_count":1,"latest_retrieval_archive_event_id":"archive-1","latest_retrieval_archive_trigger_type":"auto"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-06-15T00:04:00Z","session_id":"mixed","model":"m","provider":"anthropic","message_count":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":900,"cache_write_input_tokens":10,"input_tokens":100,"output_tokens":50,"total_tokens":1100,"budget_limit":1800,"truncation_occurred":false,"segments_removed":0,"context_management_strategy":"retrieval_window","model_context_epoch":2,"model_context_reset_reason":"compression","retrieval_archive_event_count":1,"latest_retrieval_archive_event_id":"archive-1","latest_retrieval_archive_trigger_type":"auto"}}"#).unwrap();
     }
 
     #[test]
@@ -433,6 +793,109 @@ mod tests {
         assert!((pauses[0].gap_seconds - 600.0).abs() < 1e-6);
         // Cache read stayed non-zero across the pause → 1h TTL survived.
         assert_eq!(pauses[0].cache_read_after, 10000);
+    }
+
+    #[test]
+    fn legacy_only_strategy_epoch_is_explicitly_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path());
+        let db = TokenUsageDb::open_home(tmp.path()).unwrap();
+
+        let rows = db.strategy_epoch_cache_health().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].strategy, "unavailable");
+        assert_eq!(rows[0].model_context_epoch, None);
+        assert!(db.context_boundary_calls().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixed_schema_groups_epochs_and_finds_explicit_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mixed_schema_fixture(tmp.path());
+        let db = TokenUsageDb::open_home(tmp.path()).unwrap();
+
+        let rows = db.strategy_epoch_cache_health().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].strategy, "retrieval_window");
+        assert_eq!(rows[0].model_context_epoch, Some(2));
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].cache_read_tokens, 1100);
+        assert_eq!(rows[1].strategy, "summary");
+        assert_eq!(rows[1].model_context_epoch, Some(1));
+        assert_eq!(rows[1].truncation_calls, 1);
+        assert_eq!(rows[1].budget_overflow_calls, 1);
+        assert_eq!(rows[2].strategy, "unavailable");
+        assert_eq!(rows[2].model_context_epoch, None);
+
+        let boundaries = db.context_boundary_calls().unwrap();
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].strategy, "summary");
+        assert_eq!(boundaries[0].model_context_epoch, 1);
+        assert_eq!(boundaries[0].cache_read_tokens, 100);
+        assert_eq!(boundaries[0].next_cache_read_tokens, Some(800));
+        assert_eq!(boundaries[1].strategy, "retrieval_window");
+        assert_eq!(
+            boundaries[1].latest_retrieval_archive_event_id.as_deref(),
+            Some("archive-1")
+        );
+        assert_eq!(boundaries[1].next_cache_read_tokens, Some(900));
+    }
+
+    #[test]
+    fn context_boundary_warm_call_never_crosses_into_the_next_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sdir = tmp.path().join("sessions").join("boundary-only");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let mut file = std::fs::File::create(sdir.join("token-usage.jsonl")).unwrap();
+        for row in [
+            r#"{"ts":"2026-06-15T00:00:00Z","session_id":"boundary-only","model":"m","provider":"anthropic","message_count":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":0,"input_tokens":500,"output_tokens":10,"total_tokens":1000,"budget_limit":1800,"truncation_occurred":false,"segments_removed":0,"context_management_strategy":"summary","model_context_epoch":1,"model_context_reset_reason":"compression","retrieval_archive_event_count":0}"#,
+            r#"{"ts":"2026-06-15T00:01:00Z","session_id":"boundary-only","model":"m","provider":"anthropic","message_count":4,"cache_creation_input_tokens":700,"cache_read_input_tokens":100,"input_tokens":700,"output_tokens":20,"total_tokens":1500,"budget_limit":1800,"truncation_occurred":false,"segments_removed":0,"context_management_strategy":"retrieval_window","model_context_epoch":2,"model_context_reset_reason":"compression","retrieval_archive_event_count":1}"#,
+        ] {
+            writeln!(file, "{row}").unwrap();
+        }
+
+        let db = TokenUsageDb::open_home(tmp.path()).unwrap();
+        let boundaries = db.context_boundary_calls().unwrap();
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].model_context_epoch, 1);
+        assert_eq!(boundaries[0].next_cache_read_tokens, None);
+        assert_eq!(boundaries[0].next_cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn existing_history_tool_metrics_are_read_without_tool_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metrics.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tool_call_metrics (
+                tool_call_id TEXT PRIMARY KEY,
+                round_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                success INTEGER,
+                error TEXT
+             );
+             INSERT INTO tool_call_metrics VALUES
+               ('a','r','s','session_history_current','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.010Z',1,NULL),
+               ('b','r','s','session_history_current','2026-01-01T00:00:01.000Z','2026-01-01T00:00:01.020Z',0,'redacted by query'),
+               ('c','r','s','session_history_current','2026-01-01T00:00:02.000Z',NULL,NULL,NULL),
+               ('d','r','s','Read','2026-01-01T00:00:03.000Z','2026-01-01T00:00:03.001Z',1,NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let metrics = session_history_tool_metrics(&path).unwrap();
+        assert_eq!(metrics.calls, 3);
+        assert_eq!(metrics.succeeded, 1);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.incomplete, 1);
+        assert_eq!(metrics.success_rate, Some(0.5));
+        assert_eq!(metrics.latency_ms_p50, Some(10));
+        assert_eq!(metrics.latency_ms_p95, Some(20));
+        assert_eq!(metrics.latency_ms_p99, Some(20));
     }
 
     #[test]

@@ -159,6 +159,8 @@ pub use bamboo_engine::execution::runner_state::{AgentRunner, AgentStatus};
 /// | `metrics_service` | Usage metrics collection | Yes (Arc) |
 /// | `agent_runners` | Active agent executions | Yes (RwLock) |
 pub struct AppState {
+    /// Shared, process-owned browser pages used by the workbench and root agent.
+    pub browser: Arc<crate::browser::BrowserManager>,
     /// Application data directory (configured via `BAMBOO_DATA_DIR`; default `${HOME}/.bamboo`)
     pub app_data_dir: PathBuf,
 

@@ -30,7 +30,7 @@ pub(crate) fn bounded_thinking_budget(
     max_output_tokens: Option<u32>,
 ) -> Option<u32> {
     let target = match effort {
-        ReasoningEffort::Low => return None,
+        ReasoningEffort::Disabled | ReasoningEffort::Low => return None,
         ReasoningEffort::Medium => 1_024,
         ReasoningEffort::High => 4_096,
         ReasoningEffort::Xhigh => 8_192,
@@ -41,7 +41,9 @@ pub(crate) fn bounded_thinking_budget(
     };
 
     let ratio_cap = match effort {
-        ReasoningEffort::Low => unreachable!("low returned before budget calculation"),
+        ReasoningEffort::Disabled | ReasoningEffort::Low => {
+            unreachable!("disabled/low returned before budget calculation")
+        }
         ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::Xhigh => total / 2,
         ReasoningEffort::Max => ((u64::from(total) * 3) / 4) as u32,
     };
@@ -221,6 +223,7 @@ mod bounded_thinking_budget_tests {
 
     #[test]
     fn roomy_or_unspecified_limits_keep_the_canonical_targets() {
+        assert_eq!(budget(ReasoningEffort::Disabled, None), None);
         assert_eq!(budget(ReasoningEffort::Xhigh, None), Some(8_192));
         assert_eq!(budget(ReasoningEffort::Max, None), Some(16_384));
         assert_eq!(budget(ReasoningEffort::Max, Some(32_000)), Some(16_384));

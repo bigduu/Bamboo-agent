@@ -2,6 +2,738 @@ use actix_web::http::{header, StatusCode};
 use actix_web::{test, web, App};
 use tempfile::tempdir;
 
+#[actix_web::test]
+async fn browser_routes_require_access_and_an_existing_chat_session() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".into(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".into()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    for (method, uri) in [
+        ("PUT", "/api/v1/browser/sessions/missing"),
+        ("GET", "/api/v1/browser/sessions/missing"),
+        ("DELETE", "/api/v1/browser/sessions/missing"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/activate"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/close"),
+        ("POST", "/api/v1/browser/sessions/missing/navigate"),
+        ("POST", "/api/v1/browser/sessions/missing/history"),
+        ("POST", "/api/v1/browser/sessions/missing/viewport"),
+        ("POST", "/api/v1/browser/sessions/missing/input"),
+        ("POST", "/api/v1/browser/sessions/missing/dialog"),
+        ("GET", "/api/v1/browser/sessions/missing/dom"),
+        ("GET", "/api/v1/browser/sessions/missing/frame"),
+        ("GET", "/api/v1/browser/sessions/missing/screenshot"),
+    ] {
+        let request = match method {
+            "PUT" => test::TestRequest::put(),
+            "POST" => test::TestRequest::post(),
+            "DELETE" => test::TestRequest::delete(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .peer_addr("198.51.100.7:3000".parse().unwrap())
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({}))
+        .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    // Reuse the same route tree with access disabled to check the handler's
+    // existing-session guard separately from the account access middleware.
+    app_state.config.write().await.access_control = None;
+
+    for uri in [
+        "/api/v1/browser/sessions/missing",
+        "/api/v1/browser/sessions/missing/dom",
+        "/api/v1/browser/sessions/missing/frame",
+        "/api/v1/browser/sessions/missing/screenshot",
+    ] {
+        let request = test::TestRequest::get().uri(uri).to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let open = test::TestRequest::put()
+        .uri("/api/v1/browser/sessions/missing")
+        .set_json(serde_json::json!({}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, open).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    for uri in [
+        "/api/v1/browser/sessions/missing/tabs",
+        "/api/v1/browser/sessions/missing/tabs/activate",
+        "/api/v1/browser/sessions/missing/tabs/close",
+    ] {
+        let body = if uri.ends_with("/tabs") {
+            serde_json::json!({"expected_epoch":1})
+        } else {
+            serde_json::json!({"expected_epoch":1,"tab_id":"missing"})
+        };
+        let request = test::TestRequest::post()
+            .uri(uri)
+            .set_json(body)
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+
+    let missing_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/missing/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(24),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, missing_dialog).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Reject malformed opaque IDs before dispatching to a browser host. This
+    // also bounds IDs that enter request logs and permission resources.
+    let mut session = bamboo_agent_core::Session::new("known-browser-chat", "test-model");
+    app_state.save_and_cache_session(&mut session).await;
+    for path in ["activate", "close"] {
+        for tab_id in [
+            "short".to_string(),
+            "AAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "a".repeat(10_000),
+        ] {
+            let uri = format!("/api/v1/browser/sessions/known-browser-chat/tabs/{path}");
+            let request = test::TestRequest::post()
+                .uri(&uri)
+                .set_json(serde_json::json!({"tab_id":tab_id,"expected_epoch":1}))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+    }
+    let invalid_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/known-browser-chat/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(10_000),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, invalid_dialog).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-tab-route-integration";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let first_tab = opened["active_tab_id"].as_str().unwrap().to_string();
+    assert_eq!(opened["tabs"].as_array().unwrap().len(), 1);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let second_tab = created["active_tab_id"].as_str().unwrap().to_string();
+    let created_epoch = created["page_epoch"].to_string();
+    assert_ne!(first_tab, second_tab);
+    assert_eq!(created["tabs"].as_array().unwrap().len(), 2);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], second_tab);
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(
+        screenshot.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        screenshot
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(screenshot).await.len() > 1000);
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(
+        frame.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        frame
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(frame).await.len() > 1000);
+
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":first_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let activated: Value = test::read_body_json(activated).await;
+    assert_eq!(activated["active_tab_id"], first_tab);
+    assert_ne!(activated["page_epoch"], created["page_epoch"]);
+
+    let stale = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/close"))
+            .set_json(json!({"tab_id":second_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_frame_route_recovers_after_viewport_then_navigation() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let alpha = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /alpha "));
+                let body: &[u8] = if alpha {
+                    b"<!doctype html><title>Alpha recovery</title><main>Alpha recovery page</main>"
+                } else {
+                    b"<!doctype html><title>Beta recovery</title><main>Beta recovery page</main>"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-frame-route-recovery";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let tab_id = opened["active_tab_id"].as_str().unwrap();
+
+    let alpha = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/alpha"),
+                "expected_epoch":opened["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha.status(), StatusCode::OK);
+    let alpha: Value = test::read_body_json(alpha).await;
+    let alpha_frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha_frame.status(), StatusCode::OK);
+    let alpha_seq: u64 = alpha_frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let resized = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/viewport"))
+            .set_json(json!({"width":640,"height":480,"expected_epoch":alpha["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resized.status(), StatusCode::OK);
+    let resized: Value = test::read_body_json(resized).await;
+    let beta = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/beta"),
+                "expected_epoch":resized["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(beta.status(), StatusCode::OK);
+    let beta: Value = test::read_body_json(beta).await;
+    assert_eq!(beta["active_tab_id"], tab_id);
+    assert_ne!(beta["page_epoch"], resized["page_epoch"]);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], tab_id);
+    assert_eq!(dom["page_epoch"], beta["page_epoch"]);
+    assert!(dom["snapshot"].as_str().unwrap().contains("Beta recovery"));
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(screenshot.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        screenshot.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    assert!(test::read_body(screenshot).await.starts_with(&[0xff, 0xd8]));
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(frame.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        frame.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    let beta_seq: u64 = frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(beta_seq > alpha_seq);
+    assert!(test::read_body(frame).await.starts_with(&[0xff, 0xd8]));
+
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+    fixture.abort();
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_response() {
+    use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let background = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /background "));
+                let body: &[u8] = if background {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"setTimeout(() => { alert('Background dialog'); document.querySelector('output').textContent='background answered' }, 1200)\">Schedule</button><output>idle</output>"
+                } else {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"alert('Private dialog');document.querySelector('output').textContent='answered'\">Ask</button><output>idle</output>"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    for session_id in ["dialog-owner", "dialog-other"] {
+        let mut session = Session::new(session_id, "test-model");
+        state.save_and_cache_session(&mut session).await;
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = "/api/v1/browser/sessions/dialog-owner";
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let foreground_tab_id = opened["active_tab_id"].as_str().unwrap().to_string();
+    let navigated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(
+                json!({"url":format!("http://{address}/"),"expected_epoch":opened["page_epoch"]}),
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(navigated.status(), StatusCode::OK);
+    let navigated: Value = test::read_body_json(navigated).await;
+    let epoch = navigated["page_epoch"].as_u64().unwrap();
+
+    let click = |epoch| {
+        test::TestRequest::post()
+            .uri(&format!("{base}/input"))
+            .set_json(json!({"kind":"click","x":50,"y":35,"expected_epoch":epoch}))
+            .to_request()
+    };
+    let pending = test::call_service(&app, click(epoch)).await;
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending: Value = test::read_body_json(pending).await;
+    let dialog_id = pending["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_eq!(pending["pending_dialog"]["type"], "alert");
+    assert_eq!(pending["pending_dialog"]["message"], "Private dialog");
+    assert_eq!(pending["pending_dialog"]["page_epoch"], epoch);
+
+    let state_response =
+        test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+    assert_eq!(state_response.status(), StatusCode::OK);
+    let browser_state: Value = test::read_body_json(state_response).await;
+    assert_eq!(browser_state["pending_dialog"]["dialog_id"], dialog_id);
+    assert_eq!(
+        test::call_service(&app, click(epoch)).await.status(),
+        StatusCode::CONFLICT
+    );
+    for path in ["dom", "screenshot"] {
+        let blocked = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{base}/{path}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(blocked).await;
+        assert_eq!(body["error"]["code"], "dialog_pending");
+    }
+    let tool = crate::tools::browser::BrowserTool::new(state.browser.clone());
+    let mut owner_read_ctx = ToolCtx::none("dialog-test");
+    owner_read_ctx.session_id = Some(Arc::from("dialog-owner"));
+    assert!(tool
+        .invoke(json!({"action":"snapshot"}), owner_read_ctx)
+        .await
+        .is_err_and(|error| error.to_string().contains("use browser tabs")));
+    let wrong = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":"0".repeat(24),"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::CONFLICT);
+
+    // The HTTP handler serializes omitted text as null. The host must accept
+    // that as an absent prompt value for alert/confirm responses.
+    let accepted = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":dialog_id,"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted: Value = test::read_body_json(accepted).await;
+    assert!(accepted.get("pending_dialog").is_none());
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert!(dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>answered</output>"));
+
+    let second = test::call_service(&app, click(epoch)).await;
+    let second: Value = test::read_body_json(second).await;
+    let second_id = second["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_ne!(second_id, dialog_id);
+    let mut other_ctx = ToolCtx::none("dialog-test");
+    other_ctx.session_id = Some(Arc::from("dialog-other"));
+    assert!(tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            other_ctx
+        )
+        .await
+        .is_err());
+    let owner_state = state.browser.state("dialog-owner").await.unwrap();
+    assert_eq!(owner_state["pending_dialog"]["dialog_id"], second_id);
+    let mut owner_ctx = ToolCtx::none("dialog-test");
+    owner_ctx.session_id = Some(Arc::from("dialog-owner"));
+    let result = tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            owner_ctx,
+        )
+        .await
+        .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("browser dialog did not complete")
+    };
+    let result: Value = serde_json::from_str(&result.result).unwrap();
+    assert!(result.get("pending_dialog").is_none());
+    assert_eq!(result["page_epoch"], epoch);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":result["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let background_tab_id = created["active_tab_id"].as_str().unwrap().to_string();
+    let background = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({"url":format!("http://{address}/background"),"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background.status(), StatusCode::OK);
+    let background: Value = test::read_body_json(background).await;
+    let scheduled =
+        test::call_service(&app, click(background["page_epoch"].as_u64().unwrap())).await;
+    assert_eq!(scheduled.status(), StatusCode::OK);
+    let scheduled: Value = test::read_body_json(scheduled).await;
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":foreground_tab_id,"expected_epoch":scheduled["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let mut background_pending: Value = test::read_body_json(activated).await;
+    for _ in 0..50 {
+        if background_pending.get("pending_dialog").is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+        background_pending = test::read_body_json(response).await;
+    }
+    assert_eq!(background_pending["active_tab_id"], foreground_tab_id);
+    assert_eq!(
+        background_pending["pending_dialog"]["tab_id"],
+        background_tab_id
+    );
+    assert_eq!(
+        background_pending["pending_dialog"]["page_epoch"],
+        background_pending["page_epoch"]
+    );
+    let answered = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({
+                "dialog_id":background_pending["pending_dialog"]["dialog_id"],
+                "accept":true,"expected_epoch":background_pending["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(answered.status(), StatusCode::OK);
+    let answered: Value = test::read_body_json(answered).await;
+    assert_eq!(answered["active_tab_id"], foreground_tab_id);
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":background_tab_id,"expected_epoch":answered["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let background_dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background_dom.status(), StatusCode::OK);
+    let background_dom: Value = test::read_body_json(background_dom).await;
+    assert!(background_dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>background answered</output>"));
+
+    state.browser.close("dialog-owner").await.unwrap();
+    state.browser.close("dialog-other").await.unwrap();
+    fixture.abort();
+}
+
 use super::{configure_routes, configure_routes_with_rate_limiting};
 use crate::AppState;
 use bamboo_config::AccessControlConfig;

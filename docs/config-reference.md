@@ -216,7 +216,10 @@ TLS termination — no ACME/auto-cert). All overridable per-invocation with
   globally.
 - `hooks.image_fallback` — how image parts are handled when the effective
   model/path is text-only (drop, OCR-replace, etc. — see
-  `ImageFallbackHookConfig`).
+  `ImageFallbackHookConfig`). `ViewImage` returns a base64 multimodal image by
+  default; with this hook enabled in `vision` mode, Bamboo asks the configured
+  vision model (or its configured fallback) for a textual description before
+  the next model turn.
 - `lifecycle_hooks` — config-driven command or external `.js`/`.py`/`.sh`/
   `.ps1`/`.bat` script handlers for session, prompt, tool, compaction, and
   notification events. It lives in `hooks.json`; see the
@@ -657,7 +660,7 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 With no matching user or provider value, Bamboo falls back to a global default
-of 1M total context / 128K output. There is deliberately **no built-in
+of 1M total context / 32K per-request output allowance. There is deliberately **no built-in
 per-model table**, so stale hard-coded model names cannot override live
 provider metadata.
 
@@ -712,7 +715,6 @@ for Docker/CI/secret-manager deploys):
 | `BAMBOO_CORS_ALLOW_ORIGINS` | CORS allowlist. |
 | `BAMBOO_ENABLE_DEV_ENDPOINTS` | Gate dev-only HTTP endpoints. |
 | `BAMBOO_WS_AUTH_DEADLINE_MS` | WS v2 auth handshake timeout. |
-| `BAMBOO_WEB_SEARCH_ENDPOINTS` | Ordered, comma-separated absolute HTTP(S) endpoints used by `WebSearch`. Each endpoint receives a `POST` form with the `q` field; the first recognized HTML/Lite response wins. Defaults to DuckDuckGo's HTML endpoint followed by its Lite endpoint. |
 
 **Workspace / paths:**
 
@@ -729,7 +731,6 @@ for Docker/CI/secret-manager deploys):
 |---|---|
 | `BAMBOO_LLM_MAX_RETRIES` / `BAMBOO_LLM_RETRY_BASE_DELAY_MS` / `BAMBOO_LLM_RETRY_MAX_DELAY_MS` | LLM HTTP request retry policy. |
 | `BAMBOO_RESPONSES_DEBUG` / `BAMBOO_RESPONSES_DEBUG_FILE` | Dump raw OpenAI Responses API traffic to a file for debugging. |
-| `BAMBOO_JS_REPL_NODE_PATH` | Node binary used by the `js_repl` tool. |
 | `BAMBOO_PYTHON` | Python interpreter override. |
 
 **Windows-specific:** `BAMBOO_WINDOWS_BASH_PATH`, `BAMBOO_WINDOWS_CMD_TRACE`

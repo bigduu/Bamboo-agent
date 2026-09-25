@@ -32,10 +32,8 @@ pub fn canonical_tool_name(name: &str) -> String {
 pub fn guide_exposure_for_tool_name(name: &str) -> ToolGuideExposure {
     match canonical_tool_name(name).as_str() {
         // Lower-frequency or specialized tools stay discoverable by default.
-        "Sleep" | "NotebookEdit" | "js_repl" | "WebFetch" | "WebSearch" | "memory"
-        | "scheduler" | "SubAgent" | "session_history" | "ExitPlanMode" => {
-            ToolGuideExposure::Expandable
-        }
+        "Sleep" | "ViewImage" | "WebFetch" | "memory" | "scheduler" | "SubAgent"
+        | "session_history" | "ExitPlanMode" => ToolGuideExposure::Expandable,
         _ => ToolGuideExposure::Full,
     }
 }
@@ -150,10 +148,8 @@ where
 pub fn expandable_tool_short_description(name: &str) -> Option<&'static str> {
     match canonical_tool_name(name).as_str() {
         "Sleep" => Some("Pause briefly when waiting for an external state change before polling again."),
-        "NotebookEdit" => Some("Edit notebook cells by replace/insert/delete."),
-        "js_repl" => Some("Execute JavaScript code using Node.js with top-level await support."),
+        "ViewImage" => Some("Load a local PNG, JPEG, GIF, or WebP for multimodal inspection or configured vision-model description."),
         "WebFetch" => Some("Fetch a webpage by URL when you need cleaned page text from a known target."),
-        "WebSearch" => Some("Search the web with optional domain allow/block filters."),
         "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
         "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
         "SubAgent" => Some("Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work."),
@@ -173,10 +169,8 @@ pub fn discoverable_tool_short_description(name: &str) -> Option<&'static str> {
 pub fn list_discoverable_tools() -> Vec<&'static str> {
     vec![
         "Sleep",
-        "NotebookEdit",
-        "js_repl",
+        "ViewImage",
         "WebFetch",
-        "WebSearch",
         "memory",
         "scheduler",
         "SubAgent",

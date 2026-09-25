@@ -935,6 +935,7 @@ name = "bamboo-analytics"
 version = "0.0.0"
 dependencies = [
  "duckdb",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1075,6 +1076,7 @@ dependencies = [
  "globset",
  "hex",
  "http 1.5.0",
+ "imagesize",
  "libc",
  "mockall",
  "parking_lot",
@@ -1084,6 +1086,7 @@ dependencies = [
  "rust_ocr",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",
@@ -1267,17 +1270,23 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "bamboo-llm",
+ "base64 0.23.1",
  "chrono",
  "dashmap",
+ "hex",
+ "hmac",
  "libc",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-bash",
  "url",
@@ -1408,6 +1417,7 @@ dependencies = [
  "governor",
  "hex",
  "http 1.5.0",
+ "libc",
  "mockall",
  "native-tls",
  "notify",
@@ -1590,7 +1600,6 @@ dependencies = [
  "dirs",
  "futures",
  "globset",
- "parking_lot",
  "regex",
  "reqwest",
  "serde",
@@ -1605,7 +1614,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
- "wiremock",
 ]
 
 [[package]]
@@ -3797,6 +3805,12 @@ dependencies = [
  "icu_normalizer",
  "icu_properties",
 ]
+
+[[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
 
 [[package]]
 name = "impl-more"

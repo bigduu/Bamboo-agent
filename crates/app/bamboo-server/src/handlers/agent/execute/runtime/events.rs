@@ -4,6 +4,7 @@ use tracing::Instrument;
 
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::NativeToolEventDisplay;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
@@ -65,7 +66,10 @@ pub(crate) fn spawn_event_forwarder(
                 runner.event_publication.clone()
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
+            let mut tool_event_display = NativeToolEventDisplay::default();
             while let Some(event) = mpsc_rx.recv().await {
+                let event = tool_event_display.project(event);
+                let event = bamboo_engine::external_agents::live::approval_event_for_display(event);
                 let lifecycle_id = match &event {
                     AgentEvent::WorkflowActivated { event_id, .. }
                     | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
@@ -693,6 +697,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_download_events_are_private_before_session_broadcast() {
+        use bamboo_agent_core::ToolResult;
+        use bamboo_domain::tool_types::ToolResultImage;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = actix_web::web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "native-download-display";
+        let sender = state.get_session_event_sender(session_id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            session_id,
+            &sender,
+        )
+        .await;
+        let (input, events) = mpsc::channel(8);
+        spawn_event_forwarder(
+            state.clone(),
+            session_id.into(),
+            current_run_id(&state, session_id).await,
+            events,
+            sender,
+            None,
+        );
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+
+        let private = "private-selector-url-filename-and-bytes";
+        input.send(AgentEvent::ToolStart {
+            tool_call_id: "download-1".into(),
+            tool_name: "default::browser".into(),
+            arguments: json!({"action":"download","selector":private,"expected_epoch":12,"url":private}),
+        }).await.unwrap();
+        input
+            .send(AgentEvent::ToolToken {
+                tool_call_id: "download-1".into(),
+                content: private.into(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolLifecycle {
+                tool_call_id: "download-1".into(),
+                tool_name: "browser".into(),
+                phase: "error".into(),
+                elapsed_ms: Some(2),
+                is_mutating: false,
+                auto_approved: false,
+                summary: Some(private.into()),
+                error: Some(private.into()),
+            })
+            .await
+            .unwrap();
+        let authoritative = ToolResult {
+            success: false,
+            result: private.into(),
+            display_preference: Some(private.into()),
+            images: vec![ToolResultImage {
+                mime_type: "image/png".into(),
+                data: private.into(),
+            }],
+        };
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "download-1".into(),
+                result: authoritative.clone(),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolStart {
+                tool_call_id: "read-1".into(),
+                tool_name: "Read".into(),
+                arguments: json!({"path":"readme.md"}),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::ToolComplete {
+                tool_call_id: "read-1".into(),
+                result: ToolResult::text(true, "ordinary Read result"),
+            })
+            .await
+            .unwrap();
+        input
+            .send(AgentEvent::HookLifecycle {
+                hook_name: private.into(),
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                phase: private.into(),
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny {
+                    reason: private.into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let mut visible = Vec::new();
+        for _ in 0..7 {
+            visible.push(
+                timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        for event in &visible[..4] {
+            assert!(!serde_json::to_string(event).unwrap().contains(private));
+        }
+        assert!(
+            matches!(&visible[3], AgentEvent::ToolComplete { result, .. }
+            if !result.success && result.images.is_empty() && result.display_preference.is_none()
+                && result.result == "Browser download result hidden")
+        );
+        assert!(
+            matches!(&visible[5], AgentEvent::ToolComplete { result, .. }
+            if result.result == "ordinary Read result")
+        );
+        assert!(!serde_json::to_string(&visible[6])
+            .unwrap()
+            .contains(private));
+        assert!(matches!(
+            &visible[6],
+            AgentEvent::HookLifecycle {
+                point: bamboo_domain::AgentHookPoint::BeforeToolExecution,
+                duration_ms: 7,
+                decision: bamboo_domain::HookResult::Deny { .. },
+                ..
+            }
+        ));
+        assert!(!visible[6].is_durable_change());
+        assert!(!visible[6].is_replayable_session_state());
+        assert_eq!(
+            authoritative.result, private,
+            "model-facing result remains unchanged"
+        );
+        assert_eq!(authoritative.images[0].data, private);
+    }
+
+    #[tokio::test]
     async fn delayed_server_forwarder_cannot_publish_after_successor_reservation() {
         let temp_dir = tempfile::tempdir().unwrap();
         let state = actix_web::web::Data::new(
@@ -764,7 +915,7 @@ mod tests {
         }
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        let (session_tx, mut session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
         let mut history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
@@ -797,6 +948,7 @@ mod tests {
                 .await,
             "history barrier must be durably published before the producer continues"
         );
+        let private = "private-download-selector";
         mpsc_tx
             .send(AgentEvent::ChildApprovalChanged {
                 parent_session_id: "parent-session".into(),
@@ -805,10 +957,10 @@ mod tests {
                 request_id: "req-1".into(),
                 version: 2,
                 status: "approved".into(),
-                reason: None,
-                tool_name: "Bash".into(),
-                permission: "execute".into(),
-                resource: "/tmp/x".into(),
+                reason: Some(private.into()),
+                tool_name: "default::browser".into(),
+                permission: private.into(),
+                resource: format!("browser:17:download:css:{private}"),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 resolved_at: Some("2026-01-01T00:00:01Z".into()),
             })
@@ -842,6 +994,16 @@ mod tests {
             journaled[4].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
+        assert!(!serde_json::to_string(&journaled[4].event)
+            .unwrap()
+            .contains(private));
+        let broadcast = std::iter::from_fn(|| session_rx.try_recv().ok())
+            .find(|event| matches!(event, AgentEvent::ChildApprovalChanged { .. }))
+            .expect("child approval reached the live session stream");
+        assert!(!serde_json::to_string(&broadcast).unwrap().contains(private));
+        let runners = state.agent_runners.read().await;
+        let replay = &runners[session_id].last_critical_events;
+        assert!(!serde_json::to_string(replay).unwrap().contains(private));
         // Sequence numbers are monotonic and 1-based.
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);

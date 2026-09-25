@@ -26,12 +26,12 @@ pub struct RetrievalWindowPolicy {
     pub target_usage_percent: u8,
 }
 
-/// Provider-aware token accounting supplied to the pure planner.
+/// Provider-prepared token estimates supplied to the pure planner.
 ///
 /// Most persisted text messages can be estimated directly. Messages containing
-/// images cannot: attachment references are resolved and image token costs are
-/// provider-specific. Callers that have prepared the provider request can
-/// replace the complete token cost of any message by its stable message ID.
+/// images need a model-visible image estimate rather than tokenizing attachment
+/// URLs or base64 text. Callers that prepared the request can replace the whole
+/// message estimate by its stable message ID.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrievalWindowTokenAccounting {
     /// Provider-visible prompt/tool tokens outside `Session.messages` that
@@ -63,8 +63,8 @@ pub struct RetrievalWindowCandidatePlan {
     /// Versioned digest of every token-relevant active message field and its
     /// order at planning time.
     pub active_state_sha256: String,
-    /// Versioned digest of the fixed prompt cost and complete provider-prepared
-    /// message token override map used by this exact plan.
+    /// Versioned digest of the fixed prompt cost and provider-prepared message
+    /// token estimate overrides used by this plan.
     pub token_accounting_sha256: String,
     /// Active message plus fixed prompt tokens before candidate selection.
     pub active_tokens_before: u32,
@@ -87,7 +87,7 @@ pub struct RetrievalWindowCandidatePlan {
     pub boundary_reclaimable_tokens: u32,
     /// Tokens contributed by active system messages.
     pub system_message_tokens: u32,
-    /// Active messages whose complete cost came from provider-aware accounting.
+    /// Active messages whose cost came from provider-prepared estimates.
     pub provider_message_token_override_count: usize,
     /// Active message tokens that cannot be selected by this plan.
     pub protected_active_tokens: u32,
@@ -1523,7 +1523,7 @@ fn count_provider_visible_message_tokens(
     // Provider lowering differs by role: some adapters replace `content` with
     // these parts, while tool-result adapters can expose both. Text can be
     // counted conservatively here. Image cost depends on provider preparation
-    // and attachment resolution, so it must come from a complete message-level
+    // and attachment resolution, so it must come from a whole-message estimate
     // override rather than the persisted URL text.
     if let Some(parts) = message.content_parts.as_deref() {
         for part in parts {

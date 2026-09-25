@@ -762,8 +762,9 @@ impl AppState {
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_codex_tokens(
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_live_config_and_codex_tokens(
                 &config_snapshot,
+                config.clone(),
                 Some(approval_registry.clone()),
                 Some(parent_approval_reviewer),
                 permission_checker.permission_config(),
@@ -966,6 +967,17 @@ impl AppState {
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
         );
+        let browser = Arc::new(crate::browser::BrowserManager::default());
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(crate::tools::BrowserTool::new(browser.clone())),
+            ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(crate::tools::BrowserEvalTool::new(browser.clone())),
+            ));
 
         child_completion_coordinator
             .set_root_tools(tools.clone())
@@ -1117,6 +1129,7 @@ impl AppState {
                 account_sink.clone(),
             );
         Ok(Self {
+            browser,
             app_data_dir: bamboo_home_dir,
             memory_store,
             tool_event_publisher,

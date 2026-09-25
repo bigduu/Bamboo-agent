@@ -41,12 +41,24 @@ impl OverlayToolExecutor {
         let args_raw = call.function.arguments.trim();
         let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
+            // A repaired JSON warning contains a preview of the arguments.
+            // Browser calls can carry typed input or in-memory file bytes, and
+            // browser_eval can carry page source. A repaired preview must not
+            // reach logs, including for namespaced calls resolved here.
+            let private_browser = ["browser", "browser_eval"]
+                .iter()
+                .any(|name| self.overlay.name().eq_ignore_ascii_case(name));
+            let warning_for_log = if private_browser {
+                "[redacted]"
+            } else {
+                warning.as_str()
+            };
             tracing::warn!(
                 "Overlay tool argument parsing fallback applied: tool_call_id={}, tool_name={}, args_len={}, warning={}",
                 call.id,
                 call.function.name,
                 args_raw.len(),
-                warning
+                warning_for_log
             );
         }
         args
@@ -295,6 +307,31 @@ mod tests {
             _ctx: ToolExecutionContext<'_>,
         ) -> Result<ToolResult, ToolError> {
             self.execute(call).await
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    struct BrowserPermissionGate;
+
+    #[async_trait]
+    impl ToolExecutor for BrowserPermissionGate {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("the overlay owns browser calls")
+        }
+
+        async fn check_permissions_for_resolved(
+            &self,
+            _call: &ToolCall,
+            execution_name: &str,
+            args: &serde_json::Value,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            bamboo_tools::permission::check_permissions(execution_name, args)
+                .map_err(|_| ToolError::InvalidArguments("invalid browser arguments".into()))?;
+            Ok(None)
         }
 
         fn list_tools(&self) -> Vec<ToolSchema> {
@@ -947,13 +984,14 @@ mod tests {
     /// a test can prove WHICH value the overlay passed through: the threaded
     /// pre-parsed value, or a re-parse of the raw string.
     struct ArgsRecordingOverlayTool {
+        name: &'static str,
         seen: std::sync::Arc<StdMutex<Option<serde_json::Value>>>,
     }
 
     #[async_trait]
     impl Tool for ArgsRecordingOverlayTool {
         fn name(&self) -> &str {
-            "memory"
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -985,6 +1023,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct WarnCounter {
         warns: std::sync::Arc<AtomicUsize>,
+        events: std::sync::Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct EventFields(String);
+
+    impl tracing::field::Visit for EventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
     }
 
     impl tracing::Subscriber for WarnCounter {
@@ -999,6 +1047,9 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             if *event.metadata().level() == tracing::Level::WARN {
                 self.warns.fetch_add(1, Ordering::SeqCst);
+                let mut fields = EventFields::default();
+                event.record(&mut fields);
+                self.events.lock().unwrap().push(fields.0);
             }
         }
         fn enter(&self, _s: &tracing::span::Id) {}
@@ -1014,7 +1065,10 @@ mod tests {
         let seen = std::sync::Arc::new(StdMutex::new(None));
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "memory",
+                seen: seen.clone(),
+            }),
         );
 
         // Distinctive parsed value; raw args are deliberately broken so a re-parse
@@ -1054,7 +1108,10 @@ mod tests {
         let seen = std::sync::Arc::new(StdMutex::new(None));
         let overlay = OverlayToolExecutor::new(
             std::sync::Arc::new(BaseExecutor),
-            std::sync::Arc::new(ArgsRecordingOverlayTool { seen: seen.clone() }),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "memory",
+                seen: seen.clone(),
+            }),
         );
 
         let call = make_call_with_args("memory", "{ this is not valid json");
@@ -1079,6 +1136,128 @@ mod tests {
             warns.load(Ordering::SeqCst),
             1,
             "the malformed-args fallback must warn exactly once when it actually parses"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_eval_overlay_reparse_warning_hides_page_source_and_url() {
+        let raw = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query","expected_epoch":1"#;
+        for name in ["browser_eval", "default::browser_eval"] {
+            let seen = std::sync::Arc::new(StdMutex::new(None));
+            let overlay = OverlayToolExecutor::new(
+                std::sync::Arc::new(BaseExecutor),
+                std::sync::Arc::new(ArgsRecordingOverlayTool {
+                    name: "browser_eval",
+                    seen: seen.clone(),
+                }),
+            );
+            let call = make_call_with_args(name, raw);
+            let counter = WarnCounter::default();
+            let events = counter.events.clone();
+            {
+                let _guard = tracing::subscriber::set_default(counter);
+                overlay
+                    .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+                    .await
+                    .expect("repaired overlay call should run");
+            }
+            assert_eq!(
+                seen.lock().unwrap().as_ref().unwrap()["code"],
+                "private-page-source"
+            );
+            let event = events.lock().unwrap().join("\n");
+            assert!(event.contains("warning=[redacted]"), "{event}");
+            assert!(!event.contains("private-page-source"), "{event}");
+            assert!(!event.contains("private-query"), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_file_input_overlay_hides_repaired_preview_and_keeps_wire_budget() {
+        let seen = std::sync::Arc::new(StdMutex::new(None));
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(BaseExecutor),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "browser",
+                seen: seen.clone(),
+            }),
+        );
+        let payload = "cHJpdmF0ZS1ieXRlcw==";
+        for name in ["browser", "default::browser"] {
+            let raw = format!(
+                "{{\"action\":\"set_file_input\",\"selector\":\"#upload\",\"filename\":\"private.txt\",\"mime_type\":\"text/plain\",\"data_base64\":\"{payload}\",\"expected_epoch\":17"
+            );
+            let call = make_call_with_args(name, &raw);
+            let counter = WarnCounter::default();
+            let events = counter.events.clone();
+            {
+                let _guard = tracing::subscriber::set_default(counter);
+                overlay
+                    .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+                    .await
+                    .expect("repaired overlay call should run");
+            }
+            let parsed = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(parsed["data_base64"], payload);
+            assert!(bamboo_tools::permission::validate_browser_file_input(&parsed).is_ok());
+            let event = events.lock().unwrap().join("\n");
+            assert!(event.contains("warning=[redacted]"), "{event}");
+            assert!(!event.contains(payload), "{event}");
+            assert!(!event.contains("private.txt"), "{event}");
+        }
+
+        let poisoned_seen = std::sync::Arc::new(StdMutex::new(None));
+        let gated = OverlayToolExecutor::new(
+            std::sync::Arc::new(BrowserPermissionGate),
+            std::sync::Arc::new(ArgsRecordingOverlayTool {
+                name: "browser",
+                seen: poisoned_seen.clone(),
+            }),
+        );
+        let poisoned_raw = format!(
+            "{{\"action\":\"click\",\"selector\":\"#buy\",\"data_base64\":\"{payload}\",\"expected_epoch\":17"
+        );
+        let call = make_call_with_args("default::browser", &poisoned_raw);
+        let counter = WarnCounter::default();
+        let events = counter.events.clone();
+        {
+            let _guard = tracing::subscriber::set_default(counter);
+            assert!(gated
+                .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+                .await
+                .is_err());
+        }
+        assert!(poisoned_seen.lock().unwrap().is_none());
+        let event = events.lock().unwrap().join("\n");
+        assert!(event.contains("warning=[redacted]"), "{event}");
+        assert!(!event.contains(payload), "{event}");
+
+        let base64 = format!("{}==", "A".repeat((1024_usize * 1024).div_ceil(3) * 4 - 2));
+        let valid = json!({
+            "action":"set_file_input", "selector":"#upload", "filename":"sample.bin",
+            "mime_type":"application/octet-stream", "data_base64":base64,
+            "expected_epoch":17,
+        });
+        assert!(bamboo_tools::permission::validate_browser_file_input(&valid).is_ok());
+        let call = make_call_with_args("browser", &valid.to_string());
+        overlay
+            .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+            .await
+            .expect("one mebibyte file input must reach the overlay");
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["data_base64"],
+            valid["data_base64"]
+        );
+
+        let oversized = json!({"action":"set_file_input","data_base64":"A".repeat(1_405_000)});
+        let call = make_call_with_args("browser", &oversized.to_string());
+        assert!(overlay
+            .execute_with_context(&call, ToolExecutionContext::none(&call.id))
+            .await
+            .is_err());
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["data_base64"],
+            valid["data_base64"]
         );
     }
 }

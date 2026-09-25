@@ -732,6 +732,7 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
             target.default_work_area = source.default_work_area.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
+            target.context_management = source.context_management.clone();
             target.extra = source.extra.clone();
         }
         SectionId::Providers => {

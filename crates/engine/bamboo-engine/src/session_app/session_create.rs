@@ -64,8 +64,14 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     } else {
         persist_legacy_model_provider(&mut session, input.model.as_deref(), None);
     }
-    session.reasoning_effort =
-        resolve_reasoning_effort(input.reasoning_effort, config.default_reasoning_effort);
+    session.reasoning_effort = resolve_reasoning_effort(
+        input.reasoning_effort,
+        input
+            .model_ref
+            .as_ref()
+            .and_then(|model_ref| model_ref.reasoning_effort)
+            .or(config.default_reasoning_effort),
+    );
     if let Some(gold_config_json) = trimmed_non_empty(input.gold_config_json.as_deref()) {
         session
             .metadata
@@ -346,7 +352,10 @@ mod tests {
             title_generated: None,
             system_prompt: None,
             model: Some("ignored-compat-model".to_string()),
-            model_ref: Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet")),
+            model_ref: Some(
+                ProviderModelRef::new("anthropic", "claude-3-7-sonnet")
+                    .with_reasoning_effort(ReasoningEffort::High),
+            ),
             reasoning_effort: None,
             gold_config_json: None,
             workspace_path: None,
@@ -357,8 +366,12 @@ mod tests {
         assert_eq!(session.model, "claude-3-7-sonnet");
         assert_eq!(
             session.model_ref,
-            Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet"))
+            Some(
+                ProviderModelRef::new("anthropic", "claude-3-7-sonnet")
+                    .with_reasoning_effort(ReasoningEffort::High)
+            )
         );
+        assert_eq!(session.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(
             session.metadata.get("provider_name").map(String::as_str),
             Some("anthropic")

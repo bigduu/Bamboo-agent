@@ -6,7 +6,7 @@
 
 ### 本地优先的 AI agent 运行时，Rust 编写。
 
-**持久记忆、22 个内置工具、skills、MCP、workflows、schedules —— 统一在 HTTP + WebSocket + SSE API 之后。**
+**持久记忆、19 个内置工具、skills、MCP、workflows、schedules —— 统一在 HTTP + WebSocket + SSE API 之后。**
 既能作为服务器运行，也能把同一套 agent loop 作为 Rust crate 嵌入。数据始终留在你自己机器上。
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
@@ -33,7 +33,7 @@ Bamboo 是一个能在你自己电脑上运行的 AI 助理"大脑"。它不只�
 |---|---|
 | 🧠 **记忆系统** | 会话便签、由 Jiandu 持有的派生 Dream 快照和跨会话持久记忆，支持自动生成 Dream 与后台整理（gardener） |
 | 🗜️ **上下文压缩** | 滚动摘要 + 近窗保留的混合压缩，超大工具输出自动裁剪，按模型上下文窗口预算执行 |
-| 🛠️ **内置工具** | 22 个内置工具：文件、搜索、Shell、Web、计划模式、任务、权限请求等 |
+| 🛠️ **内置工具** | 19 个内置工具：文件、图片、搜索、Shell、网页抓取、任务、权限请求等 |
 | 🎯 **技能系统** | 可选/可发现的技能，按请求提示做轻量选择，含内置 docx / pdf / pptx / xlsx / skill-creator |
 | 🔌 **MCP 扩展** | Model Context Protocol 客户端，挂接外部工具服务器 |
 | ⏰ **工作流与调度** | 声明式工作流装载 + cron 风格的调度触发引擎 |
@@ -56,7 +56,7 @@ graph TD
   ENG --> CMP[bamboo-compression<br/>token budgeting, summarizer, limits]
   ENG --> SKILLS[bamboo-skills<br/>selection, access control, runtime metadata]
   ENG --> MCP[bamboo-mcp<br/>MCP client: manager, protocol, transports, tool_index]
-  ENG --> TOOLS[bamboo-tools<br/>22 built-in tools, registry, guides, permissions]
+  ENG --> TOOLS[bamboo-tools<br/>19 built-in tools, registry, guides, permissions]
   ENG --> INFRA[bamboo-infrastructure<br/>config, LLM providers, session store]
   SRV --> INFRA
   TOOLS --> INFRA
@@ -101,7 +101,7 @@ Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会�
 
 - `counter` — 通过 tiktoken BPE 或启发式估算计 token（`TiktokenTokenCounter` / `HeuristicTokenCounter`）。
 - `segmenter` — 分段时保持工具调用的原子性（不会把一次 tool call 拆散）。
-- `limits` — **刻意不内置 per-model 表**。`model_limits.json` 中的显式用户覆盖优先于 provider 运行时元数据；两者都没有时回落到全局默认 **1M 输入+输出总上下文 / 128K 输出**。构建 prompt 时会从总窗口预留输出额度和 tokenizer 安全余量，root session 每轮都会重新读取当前实例目录下的覆盖文件。
+- `limits` — **刻意不内置 per-model 表**。`model_limits.json` 中的显式用户覆盖优先于 provider 运行时元数据；两者都没有时回落到全局默认 **1M 输入+输出总上下文 / 每轮 32K 输出预留**。构建 prompt 时会从总窗口预留输出额度和 tokenizer 安全余量，root session 每轮都会重新读取当前实例目录下的覆盖文件。
 - `summarizer` / `preparation` — 构建压缩计划、生成摘要消息、按预算准备上下文（`prepare_hybrid_context`），并能估算 prompt cache 节省。
 - **超大输出处理** — 工具产生的超大输出在 `bamboo-tools/output_manager.rs` 处会被裁剪/管理，避免一次性塞爆上下文。
 
@@ -115,7 +115,7 @@ Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会�
 
 ### 工具、工作流、调度、MCP
 
-- **工具**（`bamboo-tools`，**22 个内置**，在 `executor.rs::register_builtin_tools` 注册）：`Bash`、`BashOutput`、`KillShell`、`Read`、`Write`、`Edit`、`NotebookEdit`、`Glob`、`Grep`、`GetFileInfo`、`Workspace`、`WebFetch`、`WebSearch`、`JsRepl`、`Task`、`Sleep`、`EnterPlanMode`、`ExitPlanMode`、`RequestPermissions`、`SessionNote`、`ConclusionWithOptions` 等。工具带**使用指南（guides）**注入运行时、**权限/策略感知**执行路径，以及并行执行支持（`parallel.rs`）。
+- **工具**（`bamboo-tools`，**19 个内置**，在 `executor.rs::register_builtin_tools` 注册）：`Bash`、`BashInput`、`BashOutput`、`KillShell`、`Read`、`Write`、`Edit`、`Glob`、`Grep`、`GetFileInfo`、`ViewImage`、`Workspace`、`WebFetch`、`Task`、`Sleep`、`ExitPlanMode`、`request_permissions`、`session_note`、`update_goal`。工具带**使用指南（guides）**注入运行时、**权限/策略感知**执行路径，以及并行执行支持（`parallel.rs`）。
 - **工作流** — 声明式装载（`bamboo-server/src/workflow/loader.rs`），通过 `/bamboo/workflows` 暴露。
 - **调度** — cron 风格的触发引擎与存储（`bamboo-server/src/schedules/`：`manager`、`trigger_engine`、`session_factory`、`store`）。
 - **MCP** — Model Context Protocol 客户端（`crates/infra/bamboo-mcp/`：`manager`、`protocol`、`transports`、`tool_index`），通过 `/mcp`、`/servers` 路由管理外部工具服务器。

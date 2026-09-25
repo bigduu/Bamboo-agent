@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// These values are surfaced to clients and can be mapped to provider-specific
 /// request parameters where supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    Disabled,
     Low,
     Medium,
     High,
@@ -33,6 +35,7 @@ impl ReasoningEffort {
     pub fn parse(value: &str) -> Option<Self> {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
+            "none" => Some(Self::Disabled),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -45,6 +48,7 @@ impl ReasoningEffort {
     /// Return the canonical lowercase representation (provider-agnostic).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Disabled => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -56,7 +60,7 @@ impl ReasoningEffort {
     /// Return the provider/model-appropriate wire-format string.
     ///
     /// Different model families expect different reasoning effort values:
-    /// - **GPT-5.6 family**: `low`, `medium`, `high`, `xhigh`, `max`
+    /// - **GPT-5.6 family**: `none`, `low`, `medium`, `high`, `xhigh`, `max`
     /// - **Other OpenAI-compatible models**: `low`, `medium`, `high`, `xhigh`
     ///   (`max` → `xhigh` until the model advertises/supports it)
     /// - **Gemini**: `low`, `medium`, `high` (`xhigh`/`max` → `high`)
@@ -68,6 +72,7 @@ impl ReasoningEffort {
 
         if Self::is_gemini_model(&model_lower) {
             return match self {
+                Self::Disabled => "none",
                 Self::Low => "low",
                 Self::Medium => "medium",
                 Self::High | Self::Xhigh | Self::Max => "high",
@@ -100,6 +105,10 @@ mod tests {
 
     #[test]
     fn parse_lowercase_variants() {
+        assert_eq!(
+            ReasoningEffort::parse("none"),
+            Some(ReasoningEffort::Disabled)
+        );
         assert_eq!(ReasoningEffort::parse("low"), Some(ReasoningEffort::Low));
         assert_eq!(
             ReasoningEffort::parse("medium"),
@@ -182,6 +191,7 @@ mod tests {
 
     #[test]
     fn as_str_returns_lowercase() {
+        assert_eq!(ReasoningEffort::Disabled.as_str(), "none");
         assert_eq!(ReasoningEffort::Low.as_str(), "low");
         assert_eq!(ReasoningEffort::Medium.as_str(), "medium");
         assert_eq!(ReasoningEffort::High.as_str(), "high");
@@ -191,6 +201,9 @@ mod tests {
 
     #[test]
     fn serde_serializes_to_lowercase() {
+        let disabled = serde_json::to_string(&ReasoningEffort::Disabled).unwrap();
+        assert_eq!(disabled, "\"none\"");
+
         let low = serde_json::to_string(&ReasoningEffort::Low).unwrap();
         assert_eq!(low, "\"low\"");
 
@@ -209,6 +222,9 @@ mod tests {
 
     #[test]
     fn serde_deserializes_from_lowercase() {
+        let disabled: ReasoningEffort = serde_json::from_str("\"none\"").unwrap();
+        assert_eq!(disabled, ReasoningEffort::Disabled);
+
         let low: ReasoningEffort = serde_json::from_str("\"low\"").unwrap();
         assert_eq!(low, ReasoningEffort::Low);
 
@@ -298,6 +314,10 @@ mod tests {
 
     #[test]
     fn wire_format_gpt_models_use_openai_values() {
+        assert_eq!(
+            ReasoningEffort::Disabled.to_wire_format("gpt-5.6-sol"),
+            "none"
+        );
         assert_eq!(ReasoningEffort::Low.to_wire_format("gpt-4o"), "low");
         assert_eq!(ReasoningEffort::Medium.to_wire_format("gpt-4o"), "medium");
         assert_eq!(ReasoningEffort::High.to_wire_format("gpt-4o"), "high");

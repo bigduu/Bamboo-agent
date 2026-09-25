@@ -928,8 +928,6 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         // fallible hook, attachment and message write in this request succeeds.
         workflow_selection: None,
         orchestration_opt_in: req.orchestration_opt_in,
-        copilot_conclusion_with_options_enhancement_enabled: req
-            .copilot_conclusion_with_options_enhancement_enabled,
         data_dir,
     };
 

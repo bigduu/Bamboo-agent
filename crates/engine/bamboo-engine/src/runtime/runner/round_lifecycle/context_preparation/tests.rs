@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
-    emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    mark_manual_archive_request_consumed, maybe_apply_host_context_compression,
-    pending_manual_archive_request, prepare_round_context, surface_manual_archive_rejection,
-    LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
+    effective_context_pressure_strategy, emit_context_pressure_notification,
+    enforce_model_context_ledger_retention, mark_manual_archive_request_consumed,
+    maybe_apply_host_context_compression, pending_manual_archive_request, prepare_round_context,
+    surface_manual_archive_rejection, LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -3457,16 +3457,18 @@ async fn retrieval_window_post_archive_projection_failure_discards_staged_state(
     .await
     .expect_err("expanded retained request must fail before checkpoint");
 
-    assert!(error.to_string().contains("exact retained request exceeds"));
+    assert!(error
+        .to_string()
+        .contains("estimated retained request exceeds"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
     assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn retrieval_window_native_image_without_complete_cost_fails_before_mutation() {
+async fn retrieval_window_archives_older_turns_with_native_image_estimate() {
     let mut session = retrieval_window_session("retrieval-image-cost");
-    session.messages.push(Message::user_with_parts(
+    let image = Message::user_with_parts(
         "latest image evidence",
         vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
@@ -3477,14 +3479,19 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         .into_iter()
         .map(Into::into)
         .collect(),
-    ));
-    let before = serde_json::to_vec(&session).unwrap();
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
-    let config = retrieval_window_config(persistence);
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
     let tool_schemas = vec![retrieval_history_tool_schema()];
     let llm = noop_llm();
 
-    let error = prepare_round_context(
+    let prepared = prepare_round_context(
         &mut session,
         &config,
         "test-model",
@@ -3494,11 +3501,150 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
         None,
     )
     .await
-    .expect_err("provider-native image cost must fail closed");
+    .expect("native images should be estimated for retrieval planning");
 
-    assert!(error.to_string().contains("active image message"));
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
+async fn retrieval_window_native_image_below_trigger_does_not_archive() {
+    let mut session = Session::new("retrieval-image-below-trigger", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    let image = Message::user_with_parts(
+        "inspect the image",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-below-trigger",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("a low-usage image request should not require archival capability");
+
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| { message.id == image_id && message.content_parts.is_some() }));
+}
+
+#[test]
+fn retrieval_window_image_estimate_ignores_base64_length() {
+    let counter = TiktokenTokenCounter::default();
+    let image_message = |encoded: &str, detail: &str| {
+        Message::user_with_parts(
+            "inspect the image",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:image/png;base64,{encoded}"),
+                    detail: Some(detail.to_string()),
+                },
+            }]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )
+    };
+    let short = image_message("AA==", "high");
+    let long = image_message(&"A".repeat(40_000), "high");
+    let original_with_dimensions = image_message(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/C1cAAAAASUVORK5CYII=",
+        "original",
+    );
+    let original_without_dimensions = image_message("AA==", "original");
+    let image_tokens = |message: &Message| {
+        super::provider_prepared_message_tokens(message, &counter)
+            .saturating_sub(counter.count_message(message))
+    };
+
+    assert_eq!(image_tokens(&short), 1_844);
+    assert_eq!(image_tokens(&long), image_tokens(&short));
+    assert_eq!(image_tokens(&original_with_dimensions), 1);
+    assert_eq!(image_tokens(&original_without_dimensions), 10_000);
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_recovery_archives_with_native_image() {
+    let mut session = retrieval_window_session("retrieval-image-overflow");
+    let image = Message::user_with_parts(
+        "latest image evidence",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    );
+    let image_id = image.id.clone();
+    session.messages.push(image);
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let llm = noop_llm();
+
+    let recovered = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-overflow",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("provider overflow should archive older turns around the active image");
+
+    assert!(recovered);
+    assert!(session.messages.iter().any(|message| {
+        message.id == image_id && !message.compressed && message.content_parts.is_some()
+    }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
 }
 
 #[tokio::test]
@@ -5667,7 +5813,11 @@ fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
 
     // Drive 10 rounds at the same pressure level.
     for _ in 0..10 {
-        emit_context_pressure_notification(&mut session, Some(&event_tx));
+        emit_context_pressure_notification(
+            &mut session,
+            Some(&event_tx),
+            ContextManagementStrategy::Summary,
+        );
     }
     drop(event_tx);
 
@@ -5680,7 +5830,7 @@ fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
     // Dedup state persists across rounds in metadata.
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"warning".to_string())
+        Some(&"summary:warning".to_string())
     );
 }
 
@@ -5693,14 +5843,26 @@ fn context_pressure_notification_refires_only_on_level_transition() {
 
     // Round 1: 80% warning -> emits.
     session.token_usage = Some(pressure_usage(80_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 2: still 80% warning -> deduped, no re-fire.
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 3: drops to 50% (below threshold) -> clears stored level, no fire.
     session.token_usage = Some(pressure_usage(50_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
     assert!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY).is_none(),
         "stored level should be cleared once pressure drops below threshold"
@@ -5708,14 +5870,26 @@ fn context_pressure_notification_refires_only_on_level_transition() {
 
     // Round 4: back to 80% warning -> re-fires (reset transition).
     session.token_usage = Some(pressure_usage(80_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 5: escalates to 95% critical -> level transition, fires again.
     session.token_usage = Some(pressure_usage(95_000, 100_000));
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
 
     // Round 6: still 95% critical -> deduped, no re-fire.
-    emit_context_pressure_notification(&mut session, Some(&event_tx));
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
     drop(event_tx);
 
     let levels = drain_pressure_notifications(&mut event_rx);
@@ -5731,6 +5905,125 @@ fn context_pressure_notification_refires_only_on_level_transition() {
     );
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"critical".to_string())
+        Some(&"summary:critical".to_string())
     );
+}
+
+#[test]
+fn context_pressure_notification_refires_when_strategy_changes_at_same_level() {
+    let mut session = Session::new("session-pressure-strategy-transition", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextPressureNotification { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].contains("compact_context"));
+    assert!(events[1].contains("session_history_current"));
+    assert_eq!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
+        Some(&"retrieval_window:warning".to_string())
+    );
+}
+
+#[test]
+fn context_pressure_notification_copy_is_strategy_aware() {
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let mut summary_session = Session::new("pressure-summary-copy", "test-model");
+    summary_session.token_usage = Some(pressure_usage(80_000, 100_000));
+    emit_context_pressure_notification(
+        &mut summary_session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
+    let AgentEvent::ContextPressureNotification {
+        message: summary_message,
+        ..
+    } = event_rx.try_recv().expect("summary pressure event")
+    else {
+        panic!("expected summary pressure event");
+    };
+    assert_eq!(
+        summary_message,
+        "Context window filling up (~80%). Consider using compact_context to compress older \
+         conversation history before auto-compression triggers."
+    );
+
+    for (total_tokens, expected_level) in [(80_000, "warning"), (95_000, "critical")] {
+        let mut retrieval_session =
+            Session::new(format!("pressure-retrieval-{expected_level}"), "test-model");
+        retrieval_session.token_usage = Some(pressure_usage(total_tokens, 100_000));
+        emit_context_pressure_notification(
+            &mut retrieval_session,
+            Some(&event_tx),
+            ContextManagementStrategy::RetrievalWindow,
+        );
+        let AgentEvent::ContextPressureNotification { level, message, .. } =
+            event_rx.try_recv().expect("retrieval pressure event")
+        else {
+            panic!("expected retrieval pressure event");
+        };
+        assert_eq!(level, expected_level);
+        assert!(message.contains("archiv"));
+        assert!(message.contains("session_history_current"));
+        assert!(message.contains("session_note"));
+        assert!(message.contains("decisions, paths, progress, and blockers"));
+        assert!(message.contains("Do not copy raw transcript"));
+        assert!(!message.contains("compact_context"));
+        assert!(!message.contains("Auto-compression"));
+    }
+}
+
+#[test]
+fn context_pressure_notification_reports_explicit_summary_fallback_for_summarized_session() {
+    let mut session = Session::new("pressure-summary-fallback", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "Existing summary",
+        8,
+        2_000,
+    ));
+    let context_management = ContextManagementConfig {
+        strategy: ContextManagementStrategy::RetrievalWindow,
+        retrieval_window: RetrievalWindowContextConfig {
+            fallback_strategy: ContextManagementFallbackStrategy::Summary,
+            ..RetrievalWindowContextConfig::default()
+        },
+    };
+    let effective_strategy = effective_context_pressure_strategy(&session, &context_management);
+    assert_eq!(effective_strategy, ContextManagementStrategy::Summary);
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+    emit_context_pressure_notification(&mut session, Some(&event_tx), effective_strategy);
+    let AgentEvent::ContextPressureNotification { message, .. } = event_rx
+        .try_recv()
+        .expect("summary fallback pressure event")
+    else {
+        panic!("expected summary fallback pressure event");
+    };
+    assert!(message.contains("auto-compression"));
+    assert!(message.contains("compact_context"));
+    assert!(!message.contains("Retrieval-window"));
+    assert!(!message.contains("session_history_current"));
 }

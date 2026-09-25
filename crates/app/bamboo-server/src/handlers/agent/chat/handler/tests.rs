@@ -3,8 +3,7 @@ use super::sync_runtime_workspace;
 use bamboo_agent_core::Session;
 
 use bamboo_engine::session_app::chat::{
-    clear_skill_runtime_state, resolve_base_prompt,
-    resolve_copilot_conclusion_with_options_enhancement, resolve_enhance_prompt,
+    clear_skill_runtime_state, resolve_base_prompt, resolve_enhance_prompt,
     resolve_selected_skill_ids, resolve_workspace_path,
 };
 
@@ -395,34 +394,6 @@ fn resolve_enhance_prompt_stores_and_clears_metadata() {
 
     resolve_enhance_prompt(&mut session, None);
     assert!(!session.metadata.contains_key("enhance_prompt"));
-}
-
-#[test]
-fn resolve_copilot_conclusion_with_options_enhancement_enabled_stores_and_clears_metadata() {
-    let mut session = Session::new("session-1", "model");
-
-    resolve_copilot_conclusion_with_options_enhancement(&mut session, Some(true));
-    assert_eq!(
-        session
-            .metadata
-            .get("copilot_conclusion_with_options_enhancement_enabled")
-            .map(String::as_str),
-        Some("true")
-    );
-
-    resolve_copilot_conclusion_with_options_enhancement(&mut session, Some(false));
-    assert_eq!(
-        session
-            .metadata
-            .get("copilot_conclusion_with_options_enhancement_enabled")
-            .map(String::as_str),
-        Some("false")
-    );
-
-    resolve_copilot_conclusion_with_options_enhancement(&mut session, None);
-    assert!(!session
-        .metadata
-        .contains_key("copilot_conclusion_with_options_enhancement_enabled"));
 }
 
 #[test]

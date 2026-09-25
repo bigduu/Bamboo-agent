@@ -24,7 +24,7 @@ use futures::StreamExt;
 
 use bamboo_agent_core::Message;
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_llm::{Config, LLMChunk, LLMProvider, LLMRequestOptions, ProviderModelRouter};
+use bamboo_llm::{Config, LLMChunk, LLMProvider, LLMRequestOptions};
 use bamboo_memory::auto_dream::{
     build_blob_split_prompt, build_dedup_prompt, parse_dedup_decision, parse_split_pieces,
 };
@@ -111,44 +111,19 @@ pub(crate) async fn collect_model_json(
     Ok(content)
 }
 
-/// Mirrors auto_dream's background-model resolution (ProviderModelRef when enabled,
-/// else `memory.background_model` / provider fast model). Returns `None` when no
-/// background model is configured — the gardener then skips without spending tokens.
+/// Resolve the shared background role, including its fast/chat fallback and
+/// optional role-level reasoning effort.
 pub(crate) fn resolve_background_model(
     ctx: &AutoDreamContext,
     config_snapshot: &Config,
 ) -> Option<(Arc<dyn LLMProvider>, String)> {
-    let provider_ref_enabled = config_snapshot.features.provider_model_ref;
-    let model_ref = if provider_ref_enabled {
-        config_snapshot
-            .defaults
-            .as_ref()
-            .and_then(|d| d.memory_background.as_ref())
-            .or_else(|| {
-                config_snapshot
-                    .defaults
-                    .as_ref()
-                    .and_then(|d| d.fast.as_ref())
-            })
-    } else {
-        None
-    };
-
-    if let Some(mr) = model_ref {
-        let router = ProviderModelRouter::new(ctx.provider_registry.clone());
-        match router.route(mr) {
-            Ok(routed) => Some((routed, mr.model.clone())),
-            Err(error) => {
-                tracing::warn!(
-                    target: GARDENER_TRACING_TARGET,
-                    event = "model_route_failed",
-                    "[gardener] failed to route background model ref '{}': {}",
-                    mr,
-                    error
-                );
-                None
-            }
-        }
+    if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
+        crate::model_config_helper::resolve_background_model(
+            config_snapshot,
+            config_snapshot.effective_default_provider(),
+            &ctx.provider_registry,
+        )
+        .map(|resolved| (resolved.provider, resolved.model_name))
     } else {
         config_snapshot
             .get_memory_background_model()

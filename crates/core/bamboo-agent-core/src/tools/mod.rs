@@ -121,8 +121,8 @@ pub use registry::{
 pub use result_handler::{
     execute_sub_actions, handle_tool_result_with_agentic_support,
     handle_tool_result_with_agentic_support_and_persistence, parse_tool_args,
-    parse_tool_args_best_effort, send_clarification_request, try_parse_agentic_result,
-    ToolHandlingOutcome, MAX_SUB_ACTIONS,
+    parse_tool_args_best_effort, send_clarification_request, tool_start_arguments_for_display,
+    try_parse_agentic_result, ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };
 pub use smart_code_review::SmartCodeReviewTool;
 pub use tool_runtime::{
@@ -146,6 +146,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "Grep",
     "WebFetch",
     "WebSearch",
+    "ViewImage",
     "Workspace",
     "BashOutput",
     "session_note",
@@ -194,7 +195,6 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "EnterPlanMode",
             "ExitPlanMode",
             "request_permissions",
-            "conclusion_with_options",
             "archive_context",
             "compact_context",
         ]

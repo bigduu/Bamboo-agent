@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
-    parse_tool_args_best_effort, ExecutingSupervisorObservation, ToolCall, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, tool_start_arguments_for_display, ExecutingSupervisorObservation,
+    ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
@@ -33,6 +34,33 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn parse_warning_log_details<'a>(
+    execution_name: &str,
+    raw_arguments: &str,
+    warning: &'a str,
+) -> (String, &'a str) {
+    if execution_name.eq_ignore_ascii_case("browser")
+        || execution_name.eq_ignore_ascii_case("browser_eval")
+    {
+        ("[redacted]".to_string(), "[redacted]")
+    } else {
+        (preview_for_log(raw_arguments, 180), warning)
+    }
+}
+
+fn tool_start_name_for_display(tool_name: &str) -> String {
+    if tool_name
+        .trim()
+        .rsplit("::")
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("browser"))
+    {
+        "browser".to_string()
+    } else {
+        tool_name.to_string()
+    }
 }
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
@@ -176,6 +204,8 @@ async fn execute_tool_call_only_with_execution_name(
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
+        let (args_preview, warning) =
+            parse_warning_log_details(execution_name, raw_arguments, &warning);
         tracing::warn!(
             "[{}][round:{}] Tool call arguments required fallback before ToolStart: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
             ctx.session_id,
@@ -183,7 +213,7 @@ async fn execute_tool_call_only_with_execution_name(
             ctx.tool_call.id,
             ctx.tool_call.function.name,
             raw_arguments.len(),
-            preview_for_log(raw_arguments, 180),
+            args_preview,
             warning
         );
     }
@@ -193,7 +223,7 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.session_id,
         ctx.round,
         ctx.tool_call.id,
-        ctx.tool_call.function.name,
+        tool_start_name_for_display(&ctx.tool_call.function.name),
         raw_arguments.len()
     );
 
@@ -204,8 +234,8 @@ async fn execute_tool_call_only_with_execution_name(
         ctx.round_id,
         AgentEvent::ToolStart {
             tool_call_id: ctx.tool_call.id.clone(),
-            tool_name: ctx.tool_call.function.name.clone(),
-            arguments: args.clone(),
+            tool_name: tool_start_name_for_display(&ctx.tool_call.function.name),
+            arguments: tool_start_arguments_for_display(execution_name, &args),
         },
     )
     .await;
@@ -286,8 +316,15 @@ async fn execute_tool_call_only_with_execution_name(
                 );
                 if ctx.session_flags.auto_approve_permissions {
                     permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
-                } else if let Some(outcome) =
-                    hook_ask_outcome(ctx.tool_call, ctx.config, session, runtime_state, &args).await
+                } else if let Some(outcome) = hook_ask_outcome(
+                    ctx.tool_call,
+                    execution_name,
+                    ctx.config,
+                    session,
+                    runtime_state,
+                    &args,
+                )
+                .await
                 {
                     let end_event = match &outcome.result {
                         Ok(_) => emitter
@@ -422,16 +459,71 @@ async fn execute_tool_call_only_with_execution_name(
 /// clarification/approval flow.
 async fn hook_ask_outcome(
     tool_call: &ToolCall,
+    execution_name: &str,
     config: &AgentLoopConfig,
     session: &Session,
     runtime_state: &AgentRuntimeState,
     args: &serde_json::Value,
 ) -> Option<ToolExecutionOutcome> {
     let tool_name = tool_call.function.name.trim().to_string();
-    let permission_context = bamboo_tools::permission::check_permissions(&tool_name, args)
-        .ok()
-        .flatten()
-        .and_then(|contexts| contexts.into_iter().next());
+    let browser_execution = execution_name.trim().eq_ignore_ascii_case("browser");
+    let focused_browser_input =
+        bamboo_tools::permission::is_focused_browser_input(execution_name, args);
+    let native_browser_select =
+        bamboo_tools::permission::is_native_browser_select(execution_name, args);
+    let browser_eval = execution_name.trim().eq_ignore_ascii_case("browser_eval");
+    let private_browser_file_input =
+        bamboo_tools::permission::is_private_browser_file_input(execution_name, args);
+    let private_browser_download = browser_execution
+        && args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| action.eq_ignore_ascii_case("download"));
+    let private_browser_approval = focused_browser_input
+        || native_browser_select
+        || browser_eval
+        || private_browser_file_input
+        || private_browser_download;
+    let private_check_error = if browser_eval {
+        "Browser page script permission check failed"
+    } else if private_browser_download {
+        "Browser download permission check failed"
+    } else if private_browser_file_input {
+        "Browser file input permission check failed"
+    } else if native_browser_select {
+        "Browser selection permission check failed"
+    } else if focused_browser_input {
+        "Focused browser input permission check failed"
+    } else {
+        "Browser permission check failed"
+    };
+    let permission_context = match bamboo_tools::permission::check_permissions(execution_name, args)
+    {
+        Ok(contexts) => contexts.and_then(|contexts| contexts.into_iter().next()),
+        Err(_) if browser_execution || private_browser_approval => {
+            return Some(ToolExecutionOutcome {
+                permission_replay_origin: None,
+                result: Err(private_check_error.to_string()),
+                needs_human: None,
+                post_tool_hook_eligible: false,
+                tool_duration: std::time::Duration::ZERO,
+            });
+        }
+        Err(_) => None,
+    };
+    if private_browser_approval && permission_context.is_none() {
+        return Some(ToolExecutionOutcome {
+            permission_replay_origin: None,
+            result: Err(private_check_error.to_string()),
+            needs_human: None,
+            post_tool_hook_eligible: false,
+            tool_duration: std::time::Duration::ZERO,
+        });
+    }
+    // Read-only browser actions can legitimately have no permission context.
+    // A hook Ask for those actions still reaches the parent, but arbitrary
+    // extra fields must never become its fallback approval resource.
+    let browser_without_context = browser_execution && permission_context.is_none();
     let (permission_type, resource, operation_summary, risk_level) =
         if let Some(permission) = permission_context {
             let risk_level = permission.risk_level();
@@ -445,7 +537,11 @@ async fn hook_ask_outcome(
             let permission_type = bamboo_tools::permission::PermissionType::ExecuteCommand;
             (
                 permission_type,
-                args.to_string(),
+                if browser_without_context {
+                    "[redacted]".to_string()
+                } else {
+                    args.to_string()
+                },
                 format!("Hook-requested review for {tool_name}"),
                 permission_type.risk_level(),
             )
@@ -456,14 +552,26 @@ async fn hook_ask_outcome(
         requested_mode,
         config.permission_mode.unwrap_or_default(),
     );
+    let approval_resource = if private_browser_approval || browser_without_context {
+        "[redacted]".to_string()
+    } else {
+        resource.clone()
+    };
+    // A namespace is model-supplied text. Keep the private download's outward
+    // tool identity fixed as well as its resource and matcher.
+    let approval_tool_name = if private_browser_download {
+        "browser".to_string()
+    } else {
+        tool_name.clone()
+    };
     let request = bamboo_tools::permission::PermissionRequest {
         request_id: tool_call.id.clone(),
         request_generation: bamboo_tools::permission::PermissionRequest::fresh_generation(),
         session_id: session.id.clone(),
         workspace_path: session.workspace_path_meta(),
-        tool_name: tool_name.clone(),
+        tool_name: approval_tool_name.clone(),
         permission_type,
-        resource: resource.clone(),
+        resource: approval_resource.clone(),
         operation_summary,
         risk_level,
         reason_code: bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk,
@@ -473,18 +581,19 @@ async fn hook_ask_outcome(
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
-        suggested_matchers: bamboo_tools::permission::conservative_matchers(
-            permission_type,
-            &resource,
-        ),
+        suggested_matchers: if private_browser_approval || browser_without_context {
+            Vec::new()
+        } else {
+            bamboo_tools::permission::conservative_matchers(permission_type, &resource)
+        },
     };
 
     if let Some(proxy) = bamboo_tools::current_approval_proxy() {
         let approved = proxy
             .request_approval(bamboo_tools::ApprovalAsk {
-                tool_name,
+                tool_name: approval_tool_name,
                 permission: permission_type.description().to_string(),
-                resource,
+                resource: approval_resource,
                 permission_request: Some(request),
             })
             .await;
@@ -917,6 +1026,20 @@ mod hook_tests {
         approve: bool,
     }
 
+    #[derive(Default)]
+    struct BrowserApprovalRecorder(Mutex<Vec<bamboo_tools::ApprovalAsk>>);
+
+    #[async_trait]
+    impl bamboo_tools::ApprovalProxy for BrowserApprovalRecorder {
+        async fn request_approval(&self, ask: bamboo_tools::ApprovalAsk) -> bool {
+            self.0
+                .lock()
+                .expect("browser approval record lock")
+                .push(ask);
+            false
+        }
+    }
+
     #[async_trait]
     impl bamboo_tools::ApprovalProxy for RecordingParentReviewer {
         async fn request_approval(&self, ask: bamboo_tools::ApprovalAsk) -> bool {
@@ -1192,6 +1315,25 @@ mod hook_tests {
                 .count(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_namespaced_browser_call_starts_with_fixed_display_name() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&["browser"]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable =
+            effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let mut call = probe_call("private-selector::browser");
+        call.function.arguments = "{malformed".to_string();
+        let _ = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStart { tool_name, arguments, .. }
+                if tool_name == "browser" && !arguments.to_string().contains("private-selector")
+        )));
+        assert_eq!(call.function.name, "private-selector::browser");
     }
 
     #[tokio::test]
@@ -1709,6 +1851,530 @@ mod hook_tests {
         assert!(outcome.result.is_ok());
         assert!(reviewer.seen.load(Ordering::SeqCst));
         assert!(tools.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn hook_ask_hides_focused_browser_resource_and_fails_closed_on_check_error() {
+        let config = AgentLoopConfig::default();
+        let session = Session::new("browser-hook-ask", "model");
+        let runtime_state = AgentRuntimeState::new(&session.id);
+        let reviewer = Arc::new(BrowserApprovalRecorder::default());
+        let reviewer_proxy: Arc<dyn bamboo_tools::ApprovalProxy> = reviewer.clone();
+        let key_args = serde_json::json!({
+            "action":"key",
+            "key":"private-key",
+            "expected_epoch":17,
+        });
+        let key_call = ToolCall {
+            id: "focused-key".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser".to_string(),
+                arguments: key_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &key_call,
+                "browser",
+                &config,
+                &session,
+                &runtime_state,
+                &key_args,
+            ),
+        )
+        .await
+        .expect("denied parent review returns a tool outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].resource, "[redacted]");
+        let request = asks[0]
+            .permission_request
+            .as_ref()
+            .expect("typed review request");
+        assert_eq!(request.resource, "[redacted]");
+        assert!(request.suggested_matchers.is_empty());
+        assert!(!format!("{:?}", asks[0]).contains("private-key"));
+        drop(asks);
+
+        let eval_args = serde_json::json!({
+            "code":"document.title = 'private-source'",
+            "expected_url":"https://example.com/?token=private-query",
+            "expected_epoch":17,
+        });
+        let eval_call = ToolCall {
+            id: "browser-eval".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser_eval".to_string(),
+                arguments: eval_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &eval_call,
+                "browser_eval",
+                &config,
+                &session,
+                &runtime_state,
+                &eval_args,
+            ),
+        )
+        .await
+        .expect("denied eval review returns a tool outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 2);
+        assert_eq!(asks[1].resource, "[redacted]");
+        let eval_request = asks[1].permission_request.as_ref().unwrap();
+        assert_eq!(eval_request.resource, "[redacted]");
+        assert!(eval_request.suggested_matchers.is_empty());
+        for secret in ["private-source", "private-query", "browser_eval:17:"] {
+            assert!(!format!("{:?}", asks[1]).contains(secret));
+        }
+        drop(asks);
+
+        let invalid_type_args = serde_json::json!({
+            "action":"type",
+            "text":"private browser input",
+            "expected_epoch":"invalid",
+        });
+        let invalid_type_call = ToolCall {
+            id: "focused-type-invalid".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "browser".to_string(),
+                arguments: invalid_type_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &invalid_type_call,
+                "browser",
+                &config,
+                &session,
+                &runtime_state,
+                &invalid_type_args,
+            ),
+        )
+        .await
+        .expect("invalid focused request fails closed");
+        assert!(
+            matches!(outcome.result, Err(ref error) if error == "Focused browser input permission check failed")
+        );
+        assert_eq!(
+            reviewer
+                .0
+                .lock()
+                .expect("browser approval record lock")
+                .len(),
+            2
+        );
+
+        // A namespaced model call resolves to canonical `browser` before hook
+        // Ask. Even malformed actions with private-looking fields must not
+        // fall back to a raw-arguments approval resource.
+        let execution_name = "browser";
+        for malformed_args in [
+            serde_json::json!({
+                "action":"select_options",
+                "selector":"select[data-private='account']",
+                "values":["private-option-value"],
+            }),
+            serde_json::json!({
+                "action":null,
+                "selector":"select[data-private='account']",
+                "values":["private-option-value"],
+            }),
+        ] {
+            let malformed_call = ToolCall {
+                id: "select-hook-ask-malformed".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "default::browser".to_string(),
+                    arguments: malformed_args.to_string(),
+                },
+            };
+            let outcome = bamboo_tools::with_approval_proxy(
+                Some(reviewer_proxy.clone()),
+                hook_ask_outcome(
+                    &malformed_call,
+                    &execution_name,
+                    &config,
+                    &session,
+                    &runtime_state,
+                    &malformed_args,
+                ),
+            )
+            .await
+            .expect("malformed browser action fails closed");
+            assert!(matches!(
+                outcome.result,
+                Err(ref error) if error == "Browser permission check failed"
+            ));
+            assert_eq!(
+                reviewer
+                    .0
+                    .lock()
+                    .expect("browser approval record lock")
+                    .len(),
+                2
+            );
+        }
+
+        let read_only_args = serde_json::json!({
+            "action":"snapshot",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+        });
+        let read_only_call = ToolCall {
+            id: "browser-hook-ask-read-only".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: read_only_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &read_only_call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &read_only_args,
+            ),
+        )
+        .await
+        .expect("read-only browser hook Ask reaches parent");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[2].resource, "[redacted]");
+        let request = asks[2]
+            .permission_request
+            .as_ref()
+            .expect("typed read-only review request");
+        assert_eq!(request.resource, "[redacted]");
+        assert!(request.suggested_matchers.is_empty());
+        for private in ["private-option-value", "data-private"] {
+            assert!(!format!("{:?}", asks[2]).contains(private));
+        }
+    }
+
+    #[test]
+    fn namespaced_browser_select_hook_ask_redacts_parent_request() {
+        let data_dir = tempfile::tempdir().expect("isolated Bamboo data dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("namespaced_browser_select_hook_ask_child")
+            .env("BAMBOO_DATA_DIR", data_dir.path())
+            .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+            .env("BAMBOO_SELECT_HOOK_ASK_TEST", "1")
+            .output()
+            .expect("run hook Ask child test");
+        assert!(output.status.success(), "isolated hook Ask test failed");
+    }
+
+    #[test]
+    fn browser_download_hook_ask_redacts_parent_request() {
+        let data_dir = tempfile::tempdir().expect("isolated Bamboo data dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("browser_download_hook_ask_child")
+            .env("BAMBOO_DATA_DIR", data_dir.path())
+            .env_remove("BAMBOO_CONFIG_ENCRYPTION_KEY")
+            .env("BAMBOO_DOWNLOAD_HOOK_ASK_TEST", "1")
+            .output()
+            .expect("run download hook Ask child test");
+        assert!(output.status.success(), "isolated hook Ask test failed");
+    }
+
+    #[tokio::test]
+    async fn browser_download_hook_ask_child() {
+        if std::env::var_os("BAMBOO_DOWNLOAD_HOOK_ASK_TEST").is_none() {
+            return;
+        }
+        let config = AgentLoopConfig::default();
+        let session = Session::new("browser-download-hook-ask", "model");
+        let runtime_state = AgentRuntimeState::new(&session.id);
+        let reviewer = Arc::new(BrowserApprovalRecorder::default());
+        let reviewer_proxy: Arc<dyn bamboo_tools::ApprovalProxy> = reviewer.clone();
+        let callable_set =
+            effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let secret = "a[data-private='account']";
+
+        for (index, name) in ["browser", "default::browser", "private-namespace::browser"]
+            .into_iter()
+            .enumerate()
+        {
+            let args = serde_json::json!({
+                "action":"download", "selector":secret, "expected_epoch":17,
+            });
+            let call = ToolCall {
+                id: format!("download-hook-ask-{index}"),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: args.to_string(),
+                },
+            };
+            let execution_name = if name == "private-namespace::browser" {
+                // Model aliases normally resolve before hook Ask; exercise a
+                // private namespace reaching the same canonical execution.
+                "browser".to_string()
+            } else {
+                callable_set
+                    .resolve_callable_reference(&call.function.name)
+                    .expect("browser resolves to the registered tool")
+            };
+            assert_eq!(execution_name, "browser");
+            let outcome = bamboo_tools::with_approval_proxy(
+                Some(reviewer_proxy.clone()),
+                hook_ask_outcome(
+                    &call,
+                    &execution_name,
+                    &config,
+                    &session,
+                    &runtime_state,
+                    &args,
+                ),
+            )
+            .await
+            .expect("parent review returns an outcome");
+            assert!(outcome.result.is_err());
+        }
+
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 3);
+        for ask in asks.iter() {
+            assert_eq!(ask.tool_name, "browser");
+            assert_eq!(ask.resource, "[redacted]");
+            let request = ask.permission_request.as_ref().unwrap();
+            assert_eq!(request.tool_name, "browser");
+            assert_eq!(request.resource, "[redacted]");
+            assert_eq!(
+                request.operation_summary,
+                "Download from selected browser element"
+            );
+            assert!(request.suggested_matchers.is_empty());
+            let display = format!("{ask:?}");
+            assert!(!display.contains(secret));
+            assert!(!display.contains("download:css:"));
+            assert!(!display.contains("private-namespace"));
+        }
+        drop(asks);
+
+        let malformed = serde_json::json!({
+            "action":"download", "selector":secret, "expected_epoch":17,
+            "url":"https://example.test/private-query",
+        });
+        let call = ToolCall {
+            id: "download-hook-ask-malformed".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: malformed.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &call,
+                "browser",
+                &config,
+                &session,
+                &runtime_state,
+                &malformed,
+            ),
+        )
+        .await
+        .expect("malformed download fails closed");
+        assert!(matches!(outcome.result,
+            Err(ref error) if error == "Browser download permission check failed"));
+        assert_eq!(
+            reviewer
+                .0
+                .lock()
+                .expect("browser approval record lock")
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_browser_select_hook_ask_child() {
+        if std::env::var_os("BAMBOO_SELECT_HOOK_ASK_TEST").is_none() {
+            return;
+        }
+        let config = AgentLoopConfig::default();
+        let session = Session::new("browser-select-hook-ask", "model");
+        let runtime_state = AgentRuntimeState::new(&session.id);
+        let reviewer = Arc::new(BrowserApprovalRecorder::default());
+        let reviewer_proxy: Arc<dyn bamboo_tools::ApprovalProxy> = reviewer.clone();
+        let args = serde_json::json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":17,
+        });
+        let call = ToolCall {
+            id: "select-hook-ask".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: args.to_string(),
+            },
+        };
+        let callable_set =
+            effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let execution_name = callable_set
+            .resolve_callable_reference(&call.function.name)
+            .expect("namespaced browser resolves to the registered tool");
+        assert_eq!(execution_name, "browser");
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy.clone()),
+            hook_ask_outcome(
+                &call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &args,
+            ),
+        )
+        .await
+        .expect("parent review returns an outcome");
+        assert!(outcome.result.is_err());
+        let asks = reviewer.0.lock().expect("browser approval record lock");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].tool_name, "default::browser");
+        assert_eq!(asks[0].resource, "[redacted]");
+        let request = asks[0]
+            .permission_request
+            .as_ref()
+            .expect("typed review request");
+        assert_eq!(
+            request.permission_type,
+            bamboo_tools::permission::PermissionType::BrowserInteraction
+        );
+        assert_eq!(request.resource, "[redacted]");
+        assert_eq!(request.operation_summary, "Select native browser options");
+        assert!(request.suggested_matchers.is_empty());
+        for private in ["private-option-value", "data-private", "options:"] {
+            assert!(!format!("{:?}", asks[0]).contains(private));
+        }
+        drop(asks);
+
+        let invalid_args = serde_json::json!({
+            "action":"select_option",
+            "selector":"select[data-private='account']",
+            "values":["private-option-value"],
+            "expected_epoch":"invalid",
+        });
+        let invalid_call = ToolCall {
+            id: "select-hook-ask-invalid".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "default::browser".to_string(),
+                arguments: invalid_args.to_string(),
+            },
+        };
+        let outcome = bamboo_tools::with_approval_proxy(
+            Some(reviewer_proxy),
+            hook_ask_outcome(
+                &invalid_call,
+                &execution_name,
+                &config,
+                &session,
+                &runtime_state,
+                &invalid_args,
+            ),
+        )
+        .await
+        .expect("invalid request fails closed");
+        assert!(matches!(
+            outcome.result,
+            Err(ref error) if error == "Browser selection permission check failed"
+        ));
+        assert_eq!(
+            reviewer
+                .0
+                .lock()
+                .expect("browser approval record lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_browser_tool_warning_hides_raw_preview_and_repair_message() {
+        for (tool_name, raw) in [
+            (
+                "browser",
+                r#"{"action":"type","text":"private browser input"#,
+            ),
+            ("browser_eval", r#"{"code":"private page source"#),
+        ] {
+            let (_, warning) = parse_tool_args_best_effort(raw);
+            let warning = warning.expect("malformed JSON warning");
+            assert!(warning.contains("private"));
+            let (preview, logged_warning) = parse_warning_log_details(tool_name, raw, &warning);
+            assert_eq!(preview, "[redacted]");
+            assert_eq!(logged_warning, "[redacted]");
+            let (ordinary_preview, ordinary_warning) =
+                parse_warning_log_details("probe", raw, &warning);
+            assert!(ordinary_preview.contains("private"));
+            assert_eq!(ordinary_warning, warning);
+        }
+    }
+
+    #[test]
+    fn file_input_tool_start_is_display_only_and_never_carries_file_bytes() {
+        let args = serde_json::json!({
+            "action":"set_file_input","selector":"#upload","filename":"private.txt",
+            "data_base64":"cHJpdmF0ZSBieXRlcw==",
+        });
+        let original = args.clone();
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &args),
+            serde_json::json!({"action":"set_file_input","file":"[redacted]"})
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(tool_start_name_for_display("default::browser"), "browser");
+    }
+
+    #[test]
+    fn download_tool_start_is_display_only_and_never_carries_selector_or_extras() {
+        let args = serde_json::json!({
+            "action":"download","selector":"a[data-secret='private']",
+            "expected_epoch":17,"url":"https://private.example/file",
+            "nested":{"filename":"private.txt"},
+        });
+        let original = args.clone();
+        let display = serde_json::json!({"action":"download","expected_epoch":17});
+        assert_eq!(tool_start_arguments_for_display("browser", &args), display);
+        assert_eq!(
+            tool_start_arguments_for_display("default::browser", &args),
+            display
+        );
+        let mut poisoned = args.clone();
+        poisoned["data_base64"] = serde_json::json!("private-file-bytes");
+        assert_eq!(
+            tool_start_arguments_for_display("browser", &poisoned),
+            display
+        );
+        assert_eq!(args, original);
+        assert_eq!(tool_start_arguments_for_display("other", &args), args);
+        assert_eq!(
+            tool_start_name_for_display("private-selector::browser"),
+            "browser"
+        );
+        assert_eq!(tool_start_name_for_display("other"), "other");
     }
 
     #[tokio::test]

@@ -24,6 +24,13 @@ Task-oriented, kept current with the shipped codebase.
 | [`security/KNOWN_VULNERABILITIES.md`](security/KNOWN_VULNERABILITIES.md) | Tracked `cargo audit` advisories and their resolution status. |
 | [`../examples/`](../examples/) | Compiling, runnable code — quickstart, streaming real event types, a custom tool, resuming a session, the `ExecuteRequest` escape hatch, connecting an MCP server, and a standalone public-protocol ToolEvent recorder plugin. Built in CI, so they can't silently drift from the real API. |
 
+## Evaluation evidence
+
+- [`evaluations/retrieval-window-rollout-v1.md`](evaluations/retrieval-window-rollout-v1.md)
+  records the privacy-safe paired aggregate evidence and explicit default-strategy
+  decision for retrieval-window context management. It is reproducible from the
+  versioned fixture with the `bamboo-analytics` `retrieval_rollout_report` example.
+
 ## Design notes (historical)
 
 [`design/`](design/) holds implementation plans and architecture RFCs written

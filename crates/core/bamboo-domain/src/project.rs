@@ -151,6 +151,11 @@ pub struct ProjectManifest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional user-defined sidebar grouping. Sections are derived from the
+    /// Projects that reference them, so an empty Section has no durable row of
+    /// its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
     #[serde(default)]
     pub status: ProjectStatus,
     /// Canonical user source/work folder used when an assigned session has no
@@ -191,6 +196,7 @@ impl ProjectManifest {
             id,
             name: name.into(),
             description,
+            section: None,
             status: ProjectStatus::Active,
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
@@ -223,6 +229,8 @@ pub struct ProjectIndexEntry {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
     pub status: ProjectStatus,
     #[serde(default)]
     pub project_path: Option<String>,
@@ -241,6 +249,7 @@ impl From<&ProjectManifest> for ProjectIndexEntry {
             id: manifest.id.clone(),
             name: manifest.name.clone(),
             description: manifest.description.clone(),
+            section: manifest.section.clone(),
             status: manifest.status,
             project_path: manifest.project_path.clone(),
             project_path_status: manifest.project_path_status,
@@ -381,6 +390,7 @@ mod tests {
         });
         let manifest: ProjectManifest = serde_json::from_value(value).unwrap();
         assert_eq!(manifest.status, ProjectStatus::Active);
+        assert!(manifest.section.is_none());
         assert!(manifest.project_path.is_none());
         assert_eq!(
             manifest.project_path_status,
