@@ -65,15 +65,17 @@ If a finding exceeds the assignment, pause that expansion and seek the user's ap
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
-    session.root_orchestration_prompt_enabled().then(|| {
-        ContextBlock::new(
-            ContextBlockType::RootOrchestration,
-            ContextBlockPriority::Critical,
-            ContextBlockStability::SessionStable,
-            "Root Delegation Mode",
-            ROOT_ORCHESTRATION_GUIDANCE,
-        )
-    })
+    (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
+        || {
+            ContextBlock::new(
+                ContextBlockType::RootOrchestration,
+                ContextBlockPriority::Critical,
+                ContextBlockStability::SessionStable,
+                "Root Delegation Mode",
+                ROOT_ORCHESTRATION_GUIDANCE,
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -90,6 +92,36 @@ fn root_orchestration_guidance_is_bounded_and_schema_independent() {
     }
     assert!(!ROOT_ORCHESTRATION_GUIDANCE.contains("\"action\""));
     assert!(!ROOT_ORCHESTRATION_GUIDANCE.contains("\"intent\""));
+}
+
+#[cfg(test)]
+#[test]
+fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
+    let mut root = Session::new("mode-only-root", "model");
+    assert!(!root.root_orchestration_prompt_enabled());
+    assert!(build_root_orchestration_context_block(&root).is_none());
+
+    root.set_root_orchestration_only(true)
+        .expect("ordinary Root may select orchestration-only mode");
+    let restored: Session =
+        serde_json::from_str(&serde_json::to_string(&root).expect("serialize selected Root"))
+            .expect("restore selected Root");
+    assert!(!restored.root_orchestration_prompt_enabled());
+    let guidance = build_root_orchestration_context_block(&restored)
+        .expect("durable orchestration-only mode supplies delegation guidance");
+    assert_eq!(guidance.block_type, ContextBlockType::RootOrchestration);
+    assert!(guidance.content.contains("delegate a read-only Plan"));
+
+    let child = Session::new_child_of("child", &restored, "model", "worker");
+    assert!(build_root_orchestration_context_block(&child).is_none());
+
+    let mut disabled = restored;
+    disabled
+        .set_root_orchestration_only(false)
+        .expect("Root may disable orchestration-only mode");
+    assert!(build_root_orchestration_context_block(&disabled).is_none());
+    disabled.set_root_orchestration_prompt_enabled(true);
+    assert!(build_root_orchestration_context_block(&disabled).is_some());
 }
 
 /// Build the single provider-visible Workspace block from authoritative

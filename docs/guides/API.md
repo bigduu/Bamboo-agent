@@ -51,6 +51,26 @@ covers child planning, progress checks, correction, scope control, and final
 evidence. Child sessions do not receive it. This prompt choice does not change
 tool permissions.
 
+Root sessions can also select `"root_orchestration_only": true`. This durable
+execution mode supplies the same delegation guidance even when
+`root_orchestration_prompt` is unset. It limits the Root to these nine exact
+tool execution identities: `SubAgent`, `Plan`, `Task`,
+`session_history_current`, `Read`, `Grep`, `Glob`, `GetFileInfo`, and
+`ViewImage`. Other tools, including shell and editing tools, are unavailable
+to that Root; delegated children retain their own tool authority. The mode and
+the prompt-only choice are independent.
+
+The `root_orchestration_only` field is optional. Omitting it on a follow-up
+preserves the Root's durable selection; sending `false` explicitly disables
+the limit. A Child cannot enable or clear it. A request that would combine
+orchestration-only mode with a selected Skill or Workflow, or with active legacy
+PlanMode, returns an API error before the chat turn is persisted. An explicit
+`false` permits switching to a Skill or Workflow in that follow-up. The
+authoritative value is returned as `root_orchestration_only` in
+`GET /api/v1/sessions/{session_id}`;
+clients should read that value after reload instead of treating a local choice
+as persisted state.
+
 **Response:** `201 Created`
 
 ```json

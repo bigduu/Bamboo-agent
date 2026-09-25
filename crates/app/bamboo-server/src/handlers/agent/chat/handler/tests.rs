@@ -493,6 +493,337 @@ mod optional_model_e2e {
         web::Data::new(AppState::new(temp_dir).await.expect("app state"))
     }
 
+    #[actix_web::test]
+    async fn root_tool_mode_chat_create_resume_conflict_disable_and_detail_are_durable() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = "root-tool-chat-selection";
+        let create = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "coordinate the task",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let list: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert!(list["sessions"][0].get("root_orchestration_only").is_none());
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["root_orchestration_only"], true);
+
+        let resume = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "check progress",
+                    "model": "test-model",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resume.status(), StatusCode::CREATED);
+        let before_conflict = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before_conflict.root_orchestration_only_enabled());
+
+        // A late attachment failure must not publish the requested loosening
+        // from the early session checkpoint.
+        let failed_disable = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "attachment is invalid",
+                    "model": "test-model",
+                    "root_orchestration_only": false,
+                    "images": [{"base64": "not-valid-base64%%%", "type": "image/png"}],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed_disable.status(), StatusCode::BAD_REQUEST);
+        let after_failed_disable = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(after_failed_disable.root_orchestration_only_enabled());
+        assert_eq!(
+            after_failed_disable.root_tool_authority_revision,
+            before_conflict.root_tool_authority_revision
+        );
+        assert_eq!(
+            after_failed_disable.messages.len(),
+            before_conflict.messages.len()
+        );
+
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let workflow_selection = serde_json::json!({
+            "id": review.id,
+            "source": review.source,
+            "revision": review.revision,
+            "args": {},
+        });
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after_conflict = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after_conflict.messages.len(),
+            before_conflict.messages.len()
+        );
+        assert_eq!(
+            after_conflict.root_tool_authority_revision,
+            before_conflict.root_tool_authority_revision
+        );
+
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "review the task",
+                    "model": "test-model",
+                    "root_orchestration_only": false,
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::CREATED);
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["root_orchestration_only"], false);
+
+        // Clearing an existing Workflow and selecting the narrow Root mode is
+        // allowed, but a failed turn must leave both old authorities intact.
+        let before_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
+        let failed_enable = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "attachment is invalid",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                    "selected_skill_ids": [],
+                    "images": [{"base64": "not-valid-base64%%%", "type": "image/png"}],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed_enable.status(), StatusCode::BAD_REQUEST);
+        let after_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!after_failed_enable.root_orchestration_only_enabled());
+        assert_eq!(
+            after_failed_enable.root_tool_authority_revision,
+            before_failed_enable.root_tool_authority_revision
+        );
+        assert_eq!(
+            workflow_runtime_metadata(&after_failed_enable),
+            workflow_runtime_metadata(&before_failed_enable)
+        );
+        assert_eq!(
+            after_failed_enable.messages.len(),
+            before_failed_enable.messages.len()
+        );
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_child_cannot_select_or_clear_it() {
+        let state = new_state().await;
+        let mut root = Session::new("root-tool-parent", "test-model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.save_and_cache_session(&mut root).await;
+        let mut child = Session::new_child_of("root-tool-child", &root, "test-model", "child");
+        state.save_and_cache_session(&mut child).await;
+        let child_before = state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        for enabled in [false, true] {
+            let rejected = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(serde_json::json!({
+                        "session_id": child.id,
+                        "message": "cannot select Root mode",
+                        "model": "test-model",
+                        "root_orchestration_only": enabled,
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            let rejected: Value = test::read_body_json(rejected).await;
+            assert_eq!(
+                rejected["error"]["code"],
+                "root_orchestration_requires_root"
+            );
+        }
+        let child_after = state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_after.messages.len(), child_before.messages.len());
+        assert_eq!(
+            child_after.root_tool_authority_revision,
+            child_before.root_tool_authority_revision
+        );
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_rejects_active_legacy_plan_before_persistence() {
+        let state = new_state().await;
+        let id = "root-tool-plan-conflict";
+        let mut root = Session::new(id, "test-model");
+        root.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState {
+            plan_mode: Some(bamboo_domain::PlanModeState {
+                entered_at: chrono::Utc::now(),
+                pre_permission_mode: "default".into(),
+                plan_file_path: None,
+                status: bamboo_domain::PlanModeStatus::Exploring,
+            }),
+            ..bamboo_domain::AgentRuntimeState::default()
+        });
+        state.save_and_cache_session(&mut root).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!after.root_orchestration_only_enabled());
+        assert_eq!(after.root_tool_authority_revision, 0);
+        assert!(after.messages.is_empty());
+        assert!(after
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|runtime| runtime.plan_mode.is_some()));
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_rejects_selected_skill_before_persistence() {
+        let state = new_state().await;
+        let id = "root-tool-skill-conflict";
+        let mut root = Session::new(id, "test-model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.save_and_cache_session(&mut root).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "selected_skill_ids": ["review"],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(after.root_orchestration_only_enabled());
+        assert_eq!(after.root_tool_authority_revision, 1);
+        assert!(after.messages.is_empty());
+        assert!(after.selected_skill_ids().is_none());
+    }
+
     async fn seed_active_instruction_workflow(
         state: &web::Data<AppState>,
         session_id: &str,

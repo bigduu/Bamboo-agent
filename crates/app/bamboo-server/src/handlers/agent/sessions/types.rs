@@ -124,6 +124,10 @@ pub struct SessionSummary {
     /// depend on an already-consumed account-feed event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_workflow: Option<SessionActiveWorkflow>,
+    /// Durable Root tool authority. Session detail sets this from the
+    /// authoritative record; index-only list rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestration_only: Option<bool>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -208,6 +212,7 @@ impl SessionSummary {
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
             active_workflow: None,
+            root_orchestration_only: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
@@ -666,6 +671,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -718,6 +724,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -857,6 +864,7 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,

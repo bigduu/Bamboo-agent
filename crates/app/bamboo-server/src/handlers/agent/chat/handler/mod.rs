@@ -454,6 +454,37 @@ impl WorkflowMetadataCheckpoint {
     }
 }
 
+/// A requested Root tool policy is part of the user turn, not the early
+/// session checkpoint. Preserve its previous durable value until the message
+/// and any attachments pass validation and the final turn is saved.
+struct RootToolAuthorityCheckpoint {
+    orchestration_only: bool,
+    revision: u64,
+    model_context_state: Option<bamboo_domain::ModelContextState>,
+}
+
+impl RootToolAuthorityCheckpoint {
+    fn capture(session: Option<&bamboo_agent_core::Session>) -> Self {
+        Self {
+            orchestration_only: session.is_some_and(|session| session.root_orchestration_only),
+            revision: session.map_or(0, |session| session.root_tool_authority_revision),
+            model_context_state: session.and_then(|session| session.model_context_state.clone()),
+        }
+    }
+
+    fn restore(&self, session: &mut bamboo_agent_core::Session) {
+        if session.root_orchestration_only != self.orchestration_only
+            || session.root_tool_authority_revision != self.revision
+        {
+            session.root_orchestration_only = self.orchestration_only;
+            session.root_tool_authority_revision = self.revision;
+            session
+                .model_context_state
+                .clone_from(&self.model_context_state);
+        }
+    }
+}
+
 fn workflow_transaction_metadata_key(key: &str) -> bool {
     key.starts_with("workflow.")
         || key.starts_with("skill_runtime_")
@@ -912,6 +943,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())
             .map(String::from),
         root_orchestration_prompt: req.root_orchestration_prompt,
+        root_orchestration_only: req.root_orchestration_only,
         // Preserve field presence. An omitted workspace must be resolved from
         // the fresh durable session after acquiring the lock, not from this
         // lock-free preflight snapshot.
@@ -963,6 +995,8 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     };
     let workflow_metadata_checkpoint =
         WorkflowMetadataCheckpoint::capture(authoritative_session.as_ref());
+    let root_tool_authority_checkpoint =
+        RootToolAuthorityCheckpoint::capture(authoritative_session.as_ref());
     let authoritative_workspace_present = authoritative_session.as_ref().is_some_and(|session| {
         session.workspace_path_meta().is_some()
             && session
@@ -1029,6 +1063,32 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
                     "error": crate::error::error_value(error)
                 }));
             }
+            Err(bamboo_engine::session_app::errors::ChatError::RootToolAuthority(error)) => {
+                let (status, code) = match error {
+                    bamboo_domain::RootToolAuthorityError::NotRoot => (
+                        actix_web::http::StatusCode::BAD_REQUEST,
+                        "root_orchestration_requires_root",
+                    ),
+                    bamboo_domain::RootToolAuthorityError::LegacyPlanActive
+                    | bamboo_domain::RootToolAuthorityError::WorkflowSelected => (
+                        actix_web::http::StatusCode::CONFLICT,
+                        "root_orchestration_incompatible_mode",
+                    ),
+                    bamboo_domain::RootToolAuthorityError::RevisionOverflow
+                    | bamboo_domain::RootToolAuthorityError::StaleSnapshot => (
+                        actix_web::http::StatusCode::CONFLICT,
+                        "root_orchestration_authority_conflict",
+                    ),
+                };
+                return HttpResponse::build(status).json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": code,
+                        "message": error.to_string(),
+                    },
+                    "session_id": session_id,
+                }));
+            }
             Err(bamboo_engine::session_app::errors::ChatError::InvalidProjectIdentity {
                 raw,
                 message,
@@ -1070,6 +1130,16 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .metadata
         .get(bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
         .is_some_and(|source| source == "startup");
+    if requested_workflow_selection.is_some() && session.root_orchestration_only_enabled() {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "root_orchestration_incompatible_mode",
+                "message": "Disable Root orchestration-only mode before selecting a Workflow",
+            },
+            "session_id": session_id,
+        }));
+    }
     if let Err(error) = state
         .project_context_resolver
         .refresh_session_prompt_read_only(&mut session)
@@ -1117,6 +1187,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // exact pre-request Workflow authority.
     let mut durable_base = session.clone();
     workflow_metadata_checkpoint.restore(&mut durable_base);
+    root_tool_authority_checkpoint.restore(&mut durable_base);
     if let Err(response) = save_and_cache_session_locked(state.as_ref(), &durable_base).await {
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
@@ -1157,6 +1228,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             }
             // Persist the hook checkpoint but never the rejected user message.
             workflow_metadata_checkpoint.restore(&mut session);
+            root_tool_authority_checkpoint.restore(&mut session);
             if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
                 return response;
             }
