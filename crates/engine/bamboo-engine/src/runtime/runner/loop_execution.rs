@@ -72,6 +72,8 @@ pub(crate) async fn run_agent_loop_with_config(
                     SessionStartSource::Startup
                 }
             });
+        super::state_bridge::ensure_initial_root_tool_authority(session, config.storage.as_ref())
+            .await?;
         let mut state: LoopRunState = initialize_loop_state(
             session,
             initial_message.as_str(),

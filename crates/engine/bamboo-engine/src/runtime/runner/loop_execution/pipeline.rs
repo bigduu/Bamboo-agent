@@ -574,6 +574,22 @@ fn sticky_fallback_tool_result(
     message
 }
 
+/// Discovery runs outside normal tool dispatch. Recheck the durable Root
+/// policy after the provider response and before returning any definitions or
+/// recording a discovery transcript, including when a Root tightened mid-round.
+async fn ensure_discovery_allowed(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+) -> Result<(), AgentError> {
+    state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref()).await?;
+    if session.root_orchestration_only_enabled() {
+        return Err(AgentError::Tool(
+            "capability discovery is outside this Root's tool authority".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn commit_sticky_fallback_discovery_round(
     stream_output: StreamHandlingOutput,
     session: &mut Session,
@@ -581,6 +597,7 @@ async fn commit_sticky_fallback_discovery_round(
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     browser_only: bool,
 ) -> Result<(), AgentError> {
+    ensure_discovery_allowed(session, config).await?;
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
     let reasoning_signature = reasoning
@@ -749,6 +766,7 @@ async fn commit_openai_client_tool_search_round(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
 ) -> Result<(), AgentError> {
+    ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
         config,
@@ -4608,6 +4626,49 @@ mod tests {
             .is_err()
         );
         assert_eq!(source.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mid_round_root_tightening_rejects_both_discovery_paths() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut running = Session::new("mid-round-discovery", "model");
+        let mut durable = running.clone();
+        storage.save_session(&durable).await.unwrap();
+        let config = AgentLoopConfig {
+            storage: Some(storage.clone()),
+            ..Default::default()
+        };
+        let tools = vec![loading_test_schema("Read"), loading_test_schema("Bash")];
+
+        // A provider request was already in flight when the host selected
+        // orchestration-only Root authority on the durable control plane.
+        durable.set_root_orchestration_only(true).unwrap();
+        storage.save_session(&durable).await.unwrap();
+
+        let sticky = stream_output_with_tool_call(activation_call(
+            "stale-discovery",
+            bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+            r#"{"query":"bash"}"#,
+        ));
+        let error =
+            commit_sticky_fallback_discovery_round(sticky, &mut running, &config, &tools, false)
+                .await
+                .expect_err("StickyFallback discovery must stop before transcript mutation");
+        assert!(error
+            .to_string()
+            .contains("outside this Root's tool authority"));
+        assert!(running.messages.is_empty());
+
+        let mut native = stream_output_with_tool_call(activation_call("unused", "Read", "{}"));
+        native.tool_calls.clear();
+        native.provider_transcript_items = vec![native_client_search_item()];
+        let error = commit_openai_client_tool_search_round(native, &mut running, &config, &tools)
+            .await
+            .expect_err("OpenAI client search must stop before returning definitions");
+        assert!(error
+            .to_string()
+            .contains("outside this Root's tool authority"));
+        assert!(running.messages.is_empty());
     }
 
     #[tokio::test]

@@ -18,6 +18,95 @@ const METADATA_KEY: &str = "agent.runtime.state";
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
+fn adopt_root_tool_authority(session: &mut Session, latest: &Session) -> Result<(), AgentError> {
+    session
+        .adopt_root_tool_authority_from(latest)
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "authoritative Root tool authority refresh failed closed: {error}"
+            ))
+        })
+}
+
+fn ordinary_root_uses_tool_authority_proof(session: &Session) -> bool {
+    session.kind == bamboo_domain::SessionKind::Root
+        && session.parent_session_id.is_none()
+        && session.authority_identity.is_ordinary()
+}
+
+/// Publish a genuinely new SDK Root through the Storage creation contract
+/// before the first provider round. Storage must reject an old snapshot from a
+/// deleted lifetime; a subsequent strict read binds the running snapshot to
+/// the durable authority. Server-created Roots are already present here.
+pub async fn ensure_initial_root_tool_authority(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+) -> Result<(), AgentError> {
+    if !ordinary_root_uses_tool_authority_proof(session) {
+        return Ok(());
+    }
+    let Some(storage) = storage else {
+        return Ok(());
+    };
+    let mut latest = storage
+        .load_runtime_control_plane(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "initial Root tool authority read failed closed: {error}"
+            ))
+        })?;
+    if latest.is_none() {
+        storage.save_session(session).await.map_err(|error| {
+            AgentError::Tool(format!(
+                "initial Root authority publication failed closed: {error}"
+            ))
+        })?;
+        latest = storage
+            .load_runtime_control_plane(&session.id)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "initial Root tool authority read failed closed: {error}"
+                ))
+            })?;
+    }
+    let latest = latest.ok_or_else(|| {
+        AgentError::Tool("initial Root tool authority read failed closed: session missing".into())
+    })?;
+    adopt_root_tool_authority(session, &latest)
+}
+
+/// Recheck an ordinary Root before constructing its next provider catalog.
+/// Tool-boundary checks protect execution, while this bounded control-plane
+/// read also removes tools that were revoked after the prior round's last call.
+/// The default Supervisor retains its separate management-proof path (#1324).
+pub async fn refresh_round_root_tool_authority(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+) -> Result<(), AgentError> {
+    if !ordinary_root_uses_tool_authority_proof(session) {
+        return Ok(());
+    }
+    let Some(storage) = storage else {
+        return Ok(());
+    };
+    let latest = storage
+        .load_runtime_control_plane(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "authoritative Root tool authority refresh failed closed: {error}"
+            ))
+        })?;
+    let latest = latest.ok_or_else(|| {
+        AgentError::Tool(
+            "authoritative Root tool authority refresh failed closed: session missing".to_string(),
+        )
+    })?;
+    adopt_root_tool_authority(session, &latest)
+}
+
 /// Read `AgentRuntimeState` from session.
 ///
 /// Tries the structured field first, falls back to the metadata key.
@@ -100,8 +189,8 @@ pub struct TurnBoundaryRefresh {
     pub disk_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
-/// Refresh only the authoritative permission posture at a tool-dispatch safe
-/// boundary.
+/// Refresh the authoritative permission posture and Root tool authority at a
+/// tool-dispatch safe boundary.
 ///
 /// Unlike [`refresh_turn_boundary_with_inbox`], this deliberately never merges
 /// messages, SessionInbox claims, or any other control-plane field. Sequential
@@ -110,7 +199,7 @@ pub struct TurnBoundaryRefresh {
 /// posture after an Auto -> Default transition would execute without the newly
 /// required approval. SDK/in-memory runtimes with no store retain their current
 /// posture.
-pub async fn refresh_tool_boundary_permission_posture(
+pub async fn refresh_tool_boundary_authorities(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
     storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
@@ -170,6 +259,7 @@ pub async fn refresh_tool_boundary_permission_posture(
     // Commit the coherent pair only after every fallible validation above. A
     // failed refresh leaves the owned snapshot untouched and dispatch never
     // enters the executor.
+    adopt_root_tool_authority(session, &latest)?;
     if let Some(audit) = fresher_audit {
         audit.write_to(&mut session.metadata);
     }
@@ -949,10 +1039,10 @@ mod tests {
         ));
         storage.save_session(&persisted).await.unwrap();
 
-        let mut running = Session::new("legacy-same-mode", "model");
-        running.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        let mut running = persisted.clone();
+        running.messages.clear();
         let mut runtime_state = AgentRuntimeState::new("run");
-        refresh_tool_boundary_permission_posture(&mut running, &mut runtime_state, Some(&storage))
+        refresh_tool_boundary_authorities(&mut running, &mut runtime_state, Some(&storage))
             .await
             .expect("same-mode legacy posture is not a transition to adopt");
 
@@ -965,6 +1055,148 @@ mod tests {
             "tool-boundary refresh must not merge durable messages mid-round"
         );
         assert!(bamboo_domain::PermissionAuditSnapshot::from_metadata(&running.metadata).is_none());
+    }
+
+    #[tokio::test]
+    async fn first_unpersisted_root_is_published_before_provider_round() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut fresh = Session::new("fresh-sdk-root", "model");
+        fresh.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        ensure_initial_root_tool_authority(&mut fresh, Some(&storage))
+            .await
+            .expect("new SDK Root is durably published first");
+        refresh_round_root_tool_authority(&mut fresh, Some(&storage))
+            .await
+            .expect("first provider round reads the published Root");
+        assert!(fresh.allows_model_tool_execution("Bash"));
+        assert!(storage
+            .load_runtime_control_plane(&fresh.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let mut runtime_state = AgentRuntimeState::new("run");
+        refresh_tool_boundary_authorities(&mut fresh, &mut runtime_state, Some(&storage))
+            .await
+            .expect("the saved control plane admits ordinary execution");
+
+        let mut selected = Session::new("selected-sdk-root", "model");
+        selected.set_root_orchestration_only(true).unwrap();
+        assert!(
+            refresh_round_root_tool_authority(&mut selected, Some(&storage))
+                .await
+                .is_err()
+        );
+
+        let mut resumed = Session::new("resumed-sdk-root", "model");
+        resumed.add_message(Message::assistant("prior round", None));
+        assert!(
+            refresh_round_root_tool_authority(&mut resumed, Some(&storage))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_early_root_cannot_be_recreated_by_initial_runtime_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let stale = Session::new("revoked-early-root", "model");
+        store.save_session(&stale).await.unwrap();
+        assert!(store.delete_session(&stale.id).await.unwrap());
+        let storage: Arc<dyn Storage> = store;
+        let mut running = stale;
+
+        let error = ensure_initial_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect_err("ordinary save must not revive a deleted Root lifetime");
+        assert!(error.to_string().contains("failed closed"));
+        assert!(storage
+            .load_runtime_control_plane(&running.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            refresh_round_root_tool_authority(&mut running, Some(&storage))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn old_sdk_root_cannot_adopt_a_recreated_root_lifetime() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let mut old = Session::new("recreated-sdk-root", "model");
+        old.agent_runtime_state = Some(AgentRuntimeState::new("old-run"));
+        store.save_session(&old).await.unwrap();
+        assert!(store.delete_session(&old.id).await.unwrap());
+
+        let mut replacement = store
+            .recreate_root_session(&old.id, "new-model")
+            .await
+            .unwrap();
+        assert_ne!(replacement.created_at, old.created_at);
+        replacement.agent_runtime_state = Some(AgentRuntimeState::new("new-run"));
+        store.save_session(&replacement).await.unwrap();
+        let storage: Arc<dyn Storage> = store;
+
+        let old_birth = old.created_at;
+        let mut running = old;
+        let error = ensure_initial_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect_err("pre-provider proof must reject the old SDK snapshot");
+        assert!(error.to_string().contains("Root tool authority"));
+        assert!(
+            refresh_round_root_tool_authority(&mut running, Some(&storage))
+                .await
+                .is_err(),
+            "subsequent catalog refresh must reject the same stale lifetime"
+        );
+        let mut runtime_state = AgentRuntimeState::new("old-run");
+        let error =
+            refresh_tool_boundary_authorities(&mut running, &mut runtime_state, Some(&storage))
+                .await
+                .expect_err("pre-dispatch proof must reject the old SDK snapshot");
+        assert!(error.to_string().contains("Root tool authority"));
+        assert_eq!(running.created_at, old_birth);
+        assert_eq!(runtime_state.run_id, "old-run");
+    }
+
+    #[tokio::test]
+    async fn default_supervisor_skips_ordinary_root_round_proof_refresh() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut supervisor = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        supervisor.set_last_run_status("succeeded");
+        refresh_round_root_tool_authority(&mut supervisor, Some(&storage))
+            .await
+            .expect("Supervisor management proof belongs to its separate slice");
+    }
+
+    #[tokio::test]
+    async fn ordinary_root_at_reserved_id_still_refreshes_before_provider() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut running = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        let mut latest = running.clone();
+        latest.set_root_orchestration_only(true).unwrap();
+        storage.save_session(&latest).await.unwrap();
+
+        refresh_round_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect("ordinary identity at the reserved ID still needs durable proof");
+        assert!(running.root_orchestration_only_enabled());
+        assert!(!running.allows_model_tool_execution("Bash"));
     }
 
     struct TestPersistence(Arc<dyn Storage>);
