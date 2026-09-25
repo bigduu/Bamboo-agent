@@ -120,6 +120,21 @@ async fn assert_context(store: &SessionStoreV2, expected: &Session) {
     );
 }
 
+async fn assert_root_read_unavailable(store: &SessionStoreV2, id: &str) {
+    for error in [
+        store.load_session(id).await.unwrap_err(),
+        store.load_runtime_control_plane(id).await.unwrap_err(),
+    ] {
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("canonical runtime file"));
+    }
+}
+
 #[tokio::test]
 async fn independent_stores_reject_stale_project_full_and_runtime_snapshots() {
     for authoritative_runtime in [false, true] {
@@ -146,6 +161,155 @@ async fn independent_stores_reject_stale_project_full_and_runtime_snapshots() {
         assert_context(&fixture.first, &current).await;
         fixture.finish().await;
     }
+}
+
+#[tokio::test]
+async fn independent_stores_cannot_undo_root_tool_authority_with_stale_snapshots() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let stale = fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut selected = stale.clone();
+    selected.set_root_orchestration_only(true).unwrap();
+    assert!(fixture.first.save_runtime_state(&selected).await.is_err());
+    fixture.first.save_session(&selected).await.unwrap();
+    assert!(fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .root_orchestration_only_enabled());
+
+    reject_without_writes(&fixture.second, &stale).await;
+    let mut same_revision_false = selected.clone();
+    same_revision_false.root_orchestration_only = false;
+    reject_without_writes(&fixture.second, &same_revision_false).await;
+
+    let mut disabled = fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    disabled.set_root_orchestration_only(false).unwrap();
+    assert!(fixture.second.save_runtime_state(&disabled).await.is_err());
+    fixture.second.save_session(&disabled).await.unwrap();
+    assert_eq!(disabled.root_tool_authority_revision, 2);
+    assert!(!fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .root_orchestration_only_enabled());
+    reject_without_writes(&fixture.first, &selected).await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn root_reads_fail_closed_after_runtime_sidecar_loss_or_corruption() {
+    for selected in [false, true] {
+        for corrupt in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            let mut session = root();
+            if selected {
+                session.set_root_orchestration_only(true).unwrap();
+            }
+            first.save_session(&session).await.unwrap();
+            first.flush_search_index().await;
+            drop(first);
+
+            let runtime = home
+                .path()
+                .join("sessions")
+                .join(&session.id)
+                .join(RUNTIME_SIDECAR_FILE);
+            if corrupt {
+                fs::write(&runtime, b"{invalid").await.unwrap();
+            } else {
+                fs::remove_file(&runtime).await.unwrap();
+            }
+            let reopened = SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            assert!(reopened.get_index_entry(&session.id).await.is_some());
+            for error in [
+                reopened.load_session(&session.id).await.unwrap_err(),
+                reopened
+                    .load_runtime_control_plane(&session.id)
+                    .await
+                    .unwrap_err(),
+                reopened
+                    .recover_root_session_from_disk(&session.id)
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                    "selected={selected}, corrupt={corrupt}: {error:?}"
+                );
+                assert!(error.to_string().contains("canonical runtime file"));
+            }
+            reopened.flush_search_index().await;
+            drop(reopened);
+            home.close().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_stale_valid_root_sidecar_cannot_reopen_or_overwrite_tool_authority() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let runtime = directory(&fixture.first, &initial.id).join(RUNTIME_SIDECAR_FILE);
+    let stale_runtime = fs::read(&runtime).await.unwrap();
+    let mut selected = initial.clone();
+    selected.set_root_orchestration_only(true).unwrap();
+    fixture.first.save_session(&selected).await.unwrap();
+    fs::write(&runtime, stale_runtime).await.unwrap();
+
+    for error in [
+        fixture.second.load_session(&initial.id).await.unwrap_err(),
+        fixture
+            .second
+            .load_runtime_control_plane(&initial.id)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("tool authority is stale"));
+    }
+    let before = files(&fixture.first, &initial.id).await;
+    for candidate in [&initial, &selected] {
+        for runtime_only in [false, true] {
+            let error = save(&fixture.second, candidate, runtime_only)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                "runtime={runtime_only}: {error:?}"
+            );
+            assert_eq!(files(&fixture.first, &initial.id).await, before);
+        }
+    }
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -305,7 +469,7 @@ async fn strict_root_authority_rejects_divergent_main_and_runtime_creation_times
 }
 
 #[tokio::test]
-async fn history_fallback_cannot_revive_missing_or_corrupt_root_runtime_authority() {
+async fn root_read_and_history_fallback_cannot_revive_missing_or_corrupt_runtime_authority() {
     for missing in [false, true] {
         let initial = root();
         let fixture = Fixture::new(&initial, false).await;
@@ -320,19 +484,13 @@ async fn history_fallback_cannot_revive_missing_or_corrupt_root_runtime_authorit
             fs::write(path, b"invalid runtime JSON").await.unwrap();
         }
 
-        let compatible = fixture
-            .second
-            .load_session(&initial.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_context(&fixture.second, &initial).await;
+        assert_root_read_unavailable(&fixture.second, &initial.id).await;
         assert!(fixture
             .second
             .load_root_authority(&initial.id)
             .await
             .is_err());
-        reject_without_writes(&fixture.second, &compatible).await;
+        reject_without_writes(&fixture.second, &initial).await;
         reject_without_writes(&fixture.second, &current).await;
         fixture.finish().await;
     }
@@ -392,7 +550,7 @@ async fn clear_rejects_unavailable_root_authority_before_deleting_attachments() 
         assert!(fixture.first.clear_session(&initial.id).await.is_err());
         assert_eq!(files(&fixture.first, &initial.id).await, before);
         assert_eq!(fs::read(attachment).await.unwrap(), b"Preserved attachment");
-        assert_context(&fixture.second, &initial).await;
+        assert_root_read_unavailable(&fixture.second, &initial.id).await;
         fixture.finish().await;
     }
 }
@@ -413,7 +571,7 @@ async fn migration_without_a_marker_cannot_reconstruct_missing_root_authority() 
     assert!(fixture.first.migrate_runtime_sidecars().await.is_err());
     assert_eq!(files(&fixture.first, &initial.id).await, before);
     assert!(!marker.exists());
-    assert_context(&fixture.second, &initial).await;
+    assert_root_read_unavailable(&fixture.second, &initial.id).await;
     fixture.finish().await;
 }
 
@@ -497,7 +655,7 @@ async fn task_cas_rejects_unavailable_root_authority_before_publishing_any_endpo
                 .unwrap(),
             child_runtime
         );
-        assert_context(&fixture.second, &original).await;
+        assert_root_read_unavailable(&fixture.second, &original.id).await;
         fixture.finish().await;
     }
 }
