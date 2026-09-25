@@ -1006,6 +1006,26 @@ fn is_terminal_child_status(status: &str) -> bool {
     )
 }
 
+/// The tool result may request suspension after a very fast child has already
+/// finished. The completion coordinator clears the durable wait and admits a
+/// resume while this parent runner is still finishing its round. In that case
+/// the persisted control plane wins over the stale tool-result marker: the
+/// runner must leave finalization unsuspended so the admitted resume can run.
+fn reconcile_child_wait_at_suspend(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    durable_wait: Option<WaitingForChildrenState>,
+) {
+    runtime_state.waiting_for_children = durable_wait;
+    if runtime_state.waiting_for_children.is_none() {
+        session.metadata.remove("runtime.suspend_reason");
+        runtime_state.suspension = None;
+        if runtime_state.status == AgentStatusState::Suspended {
+            runtime_state.status = AgentStatusState::Idle;
+        }
+    }
+}
+
 /// Runner primitive: durably suspend `session` to wait on a known set of child
 /// sessions, returning the canonical "stop the turn, do not send complete"
 /// outcome.
@@ -3474,8 +3494,11 @@ async fn run_pipeline_inner(
                 if let Some(storage) = config.storage.as_ref() {
                     if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
                         if let Some(runtime_state) = persisted.agent_runtime_state {
-                            state.runtime_state.waiting_for_children =
-                                runtime_state.waiting_for_children;
+                            reconcile_child_wait_at_suspend(
+                                session,
+                                &mut state.runtime_state,
+                                runtime_state.waiting_for_children,
+                            );
                         }
 
                         // If a very fast child completed before this suspended
@@ -3895,6 +3918,9 @@ mod tests {
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::{
         AgentError, AgentEvent, AgentHook, Message, Session, StreamTimeoutError, StreamTimeoutPhase,
+    };
+    use bamboo_domain::session::runtime_state::{
+        AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
     };
     use bamboo_domain::{
         AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, ProjectId,
@@ -8952,6 +8978,165 @@ mod tests {
         for s in ["running", "pending", "queued", ""] {
             assert!(!is_terminal_child_status(s), "{s} should be active");
         }
+    }
+
+    struct FastChildWaitProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for FastChildWaitProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![activation_call(
+                    "fast-wait-call",
+                    "WaitControl",
+                    "{}",
+                )])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct FastChildWaitExecutor(Arc<dyn Storage>);
+
+    struct ChildOutcomeConsumerProvider(Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ChildOutcomeConsumerProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.0.store(
+                messages
+                    .iter()
+                    .any(|message| message.content == "fast child outcome"),
+                Ordering::SeqCst,
+            );
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("continued after child".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for FastChildWaitExecutor {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> std::result::Result<
+            bamboo_agent_core::tools::ToolResult,
+            bamboo_agent_core::tools::ToolError,
+        > {
+            let mut durable = self.0.load_session("fast-parent").await.unwrap().unwrap();
+            let mut runtime = AgentRuntimeState::new("fast-parent");
+            runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                vec!["fast-child".to_string()],
+                ChildWaitPolicy::All,
+                chrono::Utc::now(),
+            ));
+            durable.agent_runtime_state = Some(runtime);
+            durable.metadata.insert(
+                "runtime.suspend_reason".to_string(),
+                "waiting_for_children".to_string(),
+            );
+            self.0.save_session(&durable).await.unwrap();
+
+            // Complete synchronously before returning the waiting-control
+            // result, matching a fast child that beats parent tool finalization.
+            durable
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .waiting_for_children = None;
+            durable.metadata.remove("runtime.suspend_reason");
+            let mut resume = Message::user("fast child outcome");
+            resume.metadata = Some(serde_json::json!({
+                "runtime_kind": "child_completion_resume"
+            }));
+            durable.add_message(resume);
+            self.0.save_session(&durable).await.unwrap();
+
+            Ok(bamboo_agent_core::tools::ToolResult {
+                success: true,
+                result: serde_json::json!({
+                    "runtime_control": "waiting_for_children"
+                })
+                .to_string(),
+                display_preference: Some("runtime_control:waiting_for_children".to_string()),
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![loading_test_schema("WaitControl")]
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_child_completion_reconciles_wait_and_preserves_outcome_for_successor() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut session = Session::new("fast-parent", "model");
+        session.agent_runtime_state = Some(AgentRuntimeState::new(&session.id));
+        storage.save_session(&session).await.unwrap();
+        let mut config = config_with_storage(storage.clone());
+        config.model_name = Some("model".to_string());
+        let mut state = e2e_loop_state(&session.id);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let sent_complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(FastChildWaitProvider),
+            Arc::new(FastChildWaitExecutor(storage.clone())),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("waiting-control round finalizes");
+
+        assert!(!sent_complete, "tool round hands the resume to a successor");
+        assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+        assert!(state.runtime_state.waiting_for_children.is_none());
+        assert!(state.runtime_state.suspension.is_none());
+        assert_eq!(state.runtime_state.status, AgentStatusState::Idle);
+        assert!(session.messages.iter().any(|message| {
+            message.content == "fast child outcome"
+                && message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("runtime_kind"))
+                    .and_then(|value| value.as_str())
+                    == Some("child_completion_resume")
+        }));
+
+        let outcome_seen = Arc::new(AtomicBool::new(false));
+        let continued = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(ChildOutcomeConsumerProvider(outcome_seen.clone())),
+            Arc::new(FastChildWaitExecutor(storage)),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("successor round consumes child completion");
+        assert!(continued, "successor round completes");
+        assert!(
+            outcome_seen.load(Ordering::SeqCst),
+            "successor provider must receive the child outcome"
+        );
     }
 
     /// Storage whose child index is configurable, for the safety-net tests.
