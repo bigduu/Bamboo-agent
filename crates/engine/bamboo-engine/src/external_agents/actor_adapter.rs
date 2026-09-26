@@ -1805,7 +1805,18 @@ impl ExternalChildRunner for ActorChildRunner {
                     assignment: assignment.clone(),
                     logical_session: Some(logical_identity_for_actor_run(session, job)),
                     project_id: project_id.clone(),
-                    reasoning_effort: None,
+                    // Creation/update already resolves the child's explicit
+                    // selection and own role preference into this field. Do
+                    // not infer effort from a possibly inherited model_ref.
+                    reasoning_effort: if !remote
+                        && matches!(self.executor, ExecutorSpec::BambooRuntime)
+                    {
+                        session
+                            .reasoning_effort
+                            .map(|effort| effort.as_str().to_owned())
+                    } else {
+                        None
+                    },
                     permission_policy: permission_policy.clone(),
                     messages,
                     activation_run_id: bound_activation_run_id.clone(),
