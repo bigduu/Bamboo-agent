@@ -171,6 +171,10 @@ enum SubAgentArgs {
         limit: Option<usize>,
         #[serde(default)]
         max_bytes: Option<usize>,
+        #[serde(default)]
+        expected_child_created_at: Option<String>,
+        #[serde(default)]
+        expected_assignment_sha256: Option<String>,
     },
     Update {
         child_session_id: String,
@@ -266,6 +270,20 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
         display_preference: Some("Collapsible".to_string()),
         images: Vec::new(),
     })
+}
+
+fn bounded_child_result(view: &str, value: serde_json::Value) -> Result<ToolResult, ToolError> {
+    let result = tool_result(value)?;
+    if result.result.len() <= child_session::MAX_CHILD_RESULT_BYTES
+        && serde_json::to_vec(&result)
+            .is_ok_and(|bytes| bytes.len() <= child_session::MAX_CHILD_RESULT_BYTES)
+    {
+        return Ok(result);
+    }
+    tool_result(child_session::unavailable_child_result(
+        view,
+        "result_budget_exceeded",
+    ))
 }
 
 /// The child must not become runnable until its synchronous parent's wait is
@@ -633,7 +651,7 @@ Use list/get to inspect existing children; plain get returns metadata, get with 
 /// the IDENTICAL schema to its own LLM — no drift between the real tool and the
 /// proxy.
 pub fn subagent_parameters_schema() -> serde_json::Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "action": {
@@ -648,8 +666,8 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "view": {
                 "type": "string",
-                "enum": ["overview", "messages", "message", "result", "error"],
-                "description": "For get: overview (default) is metadata only; messages returns bounded transcript previews; message reads one selected message; result reads the child's latest assistant answer; error reads the last run error. Content views return UTF-8 slices with next_cursor."
+                "enum": ["overview", "messages", "message", "result", "error", "result_binding", "typed_result"],
+                "description": "For get: overview (default) is metadata only; messages returns bounded transcript previews; message reads one selected message; result reads the child's latest assistant answer; error reads the last run error. Content views return UTF-8 slices with next_cursor. Required-packet result_binding discovers host birth/digest selectors; typed_result requires both selectors and returns a strict child-reported JSON report separately from durable snapshot observations (not verified evidence or a run receipt)."
             },
             "cursor": {
                 "type": "string",
@@ -776,7 +794,10 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
         },
         "required": ["action"],
         "additionalProperties": false
-    })
+    });
+    schema["properties"]["expected_child_created_at"] = json!({"type":"string", "description":"Only get view=typed_result: exact RFC3339 Child birth from context_packet create output or result_binding."});
+    schema["properties"]["expected_assignment_sha256"] = json!({"type":"string", "description":"Only get view=typed_result: exact 64 lowercase hex assignment digest from the same discovery."});
+    schema
 }
 
 #[async_trait]
@@ -872,6 +893,13 @@ impl SubAgentTool {
                 bamboo_domain::ChildContextPacketError::Budget.to_string(),
             ));
         }
+        let report_args = matches!(
+            args["view"].as_str(),
+            Some("result_binding" | "typed_result")
+        )
+        .then(|| args.clone());
+        let has_result_selectors = args.get("expected_child_created_at").is_some()
+            || args.get("expected_assignment_sha256").is_some();
         let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(if has_packet {
                 bamboo_domain::ChildContextPacketError::Invalid.to_string()
@@ -906,8 +934,31 @@ impl SubAgentTool {
             message_id,
             limit,
             max_bytes,
+            expected_child_created_at,
+            expected_assignment_sha256,
         } = &parsed
         {
+            if let Some(arguments) = report_args.as_ref() {
+                let view = view.as_deref().expect("report view");
+                let value = child_session::inspect_child_report_action(
+                    self.sessions.as_ref(),
+                    parent_session_id,
+                    child_session_id,
+                    view,
+                    arguments,
+                )
+                .await
+                .map_err(tool_error_from_child_session)?;
+                return bounded_child_result(view, value).map(ToolOutcome::Completed);
+            }
+            if has_result_selectors
+                || expected_child_created_at.is_some()
+                || expected_assignment_sha256.is_some()
+            {
+                return Err(ToolError::InvalidArguments(
+                    "result selectors require view=typed_result".into(),
+                ));
+            }
             let result = match view.as_deref().unwrap_or("overview") {
                 "overview" => {
                     if cursor.is_some()
@@ -1427,7 +1478,8 @@ impl SubAgentTool {
                                 .map_err(|error| ToolError::Execution(error.to_string()))?
                                 .ok_or_else(|| ToolError::Execution(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?;
                             packet_counts = Some(json!({"background_admitted": binding.payload.background.len(),
-                                "background_omitted": binding.payload.background_omitted}));
+                                "background_omitted": binding.payload.background_omitted,
+                                "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}));
                         }
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.
@@ -1962,6 +2014,8 @@ mod tests {
             "cursor",
             "description",
             "fork_last_messages",
+            "expected_child_created_at",
+            "expected_assignment_sha256",
             "interrupt_running",
             "lifecycle",
             "limit",

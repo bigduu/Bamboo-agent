@@ -250,6 +250,36 @@ impl ChildContextPacket {
 }
 
 impl ChildContextBinding {
+    /// Revalidate only recorded content facts against a current parent snapshot.
+    /// This is pure observation, not permission or a replacement assignment.
+    pub fn validate_parent_sources(&self, parent: &Session) -> Result<()> {
+        if self.payload.parent_session_id != parent.id
+            || self.payload.parent_created_at != parent.created_at
+        {
+            return Err(ChildContextPacketError::Invalid);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for source in &self.payload.sources {
+            let message = source_message(parent, &source.message_id)?;
+            if !seen.insert(&source.message_id)
+                || parent
+                    .messages
+                    .iter()
+                    .filter(|m| m.id == source.message_id)
+                    .count()
+                    != 1
+                || (source.required && (message.role != Role::User || !plain_source(message)))
+                || digest(
+                    b"bamboo/child-source-content/v1\0",
+                    message.content.as_bytes(),
+                ) != source.content_sha256
+            {
+                return Err(ChildContextPacketError::Invalid);
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         parent: &Session,
         child_id: &str,
@@ -496,6 +526,51 @@ mod tests {
         binding.install(&mut child).unwrap();
         child.add_message(binding.assignment_message());
         (child, binding)
+    }
+
+    #[test]
+    fn result_parent_sources_are_unique_exact_and_include_omitted_background() {
+        let mut parent = Session::new("parent", "model");
+        let mut user = Message::user("Required constraint");
+        user.id = "source".into();
+        let mut optional = Message::assistant("Optional".repeat(400), None);
+        optional.id = "optional".into();
+        parent.messages.extend([user, optional]);
+        let mut input = packet();
+        input.source_user_message_ids = vec!["source".into()];
+        input.background_message_ids = vec!["optional".into()];
+        let resolved = input.resolve(&parent, "task").unwrap();
+        assert_eq!(resolved.background_omitted, 1);
+        let binding =
+            ChildContextBinding::new(&parent, "child", resolved.required_brief.clone(), resolved)
+                .unwrap();
+        assert!(binding.validate_parent_sources(&parent).is_ok());
+        for index in 0..2 {
+            let mut changed = parent.clone();
+            changed.messages[index].content.push('!');
+            assert!(binding.validate_parent_sources(&changed).is_err());
+            let mut deleted = parent.clone();
+            deleted.messages.remove(index);
+            assert!(binding.validate_parent_sources(&deleted).is_err());
+            let mut duplicated = parent.clone();
+            duplicated.messages.push(parent.messages[index].clone());
+            assert!(binding.validate_parent_sources(&duplicated).is_err());
+        }
+        let mut changed = parent.clone();
+        changed.created_at += chrono::Duration::nanoseconds(1);
+        assert!(binding.validate_parent_sources(&changed).is_err());
+        changed = parent.clone();
+        changed.messages[0].role = Role::Assistant;
+        assert!(binding.validate_parent_sources(&changed).is_err());
+        changed = parent.clone();
+        changed.messages[1].role = Role::User;
+        assert!(binding.validate_parent_sources(&changed).is_ok()); // Optional role was never bound.
+        let mut duplicate = binding.clone();
+        duplicate
+            .payload
+            .sources
+            .push(binding.payload.sources[0].clone());
+        assert!(duplicate.validate_parent_sources(&parent).is_err());
     }
 
     #[test]
