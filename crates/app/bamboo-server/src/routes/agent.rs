@@ -238,6 +238,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::sessions::select_root_mode),
         )
         .route(
+            "/sessions/{session_id}/named-agent-profiles",
+            web::get().to(agent::named_agent_catalog::handler),
+        )
+        .route(
             "/sessions/{session_id}/root-mode-operations/{operation_id}/recover",
             web::post().to(agent::sessions::recover_root_mode),
         )

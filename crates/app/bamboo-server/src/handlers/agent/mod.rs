@@ -19,6 +19,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod messages;
 pub mod metrics;
+pub mod named_agent_catalog;
 pub mod notifications;
 pub mod plugin;
 pub mod projects;

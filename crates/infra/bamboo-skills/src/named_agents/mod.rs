@@ -1,10 +1,17 @@
-//! Bounded global named-agent definitions. This host-only catalog grants no authority.
+//! Bounded named-agent definitions. These host-only catalogs grant no authority.
 //!
 //! See `docs/design/named-agent-definitions-v1.md` for the file contract and
-//! platform boundary. Only [`NamedAgentCatalogMetadata`] is serializable.
+//! platform boundary. Only the public metadata projections are serializable.
 
 mod parser;
 mod reader;
+mod scoped;
+
+pub use scoped::{
+    NamedAgentProfileIdentity, NamedAgentProfileMetadata, NamedAgentProfileSource,
+    NamedAgentProfileStatus, ScopedNamedAgentCatalog, ScopedNamedAgentCatalogMetadata,
+    ScopedNamedAgentCatalogStatus,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -32,6 +39,13 @@ impl Default for NamedAgentLimits {
             max_publication_bytes: 1_048_576,
         }
     }
+}
+
+#[derive(Default)]
+struct ScanBudget {
+    candidates: usize,
+    entries: usize,
+    read_bytes: usize,
 }
 
 impl NamedAgentLimits {
@@ -208,6 +222,14 @@ impl NamedAgentCatalog {
 
     /// `data_root` must come from trusted host configuration, never a tool request.
     pub fn discover(data_root: &Path, limits: NamedAgentLimits) -> Self {
+        Self::discover_with_budget(data_root, limits, &mut ScanBudget::default())
+    }
+
+    fn discover_with_budget(
+        data_root: &Path,
+        limits: NamedAgentLimits,
+        budget: &mut ScanBudget,
+    ) -> Self {
         if !limits.valid() {
             return Self::rejected(NamedAgentDiagnosticCode::InvalidLimits);
         }
@@ -216,23 +238,22 @@ impl NamedAgentCatalog {
             Ok(None) => return Self::empty(),
             Err(code) => return Self::rejected(code),
         };
-        let candidates = match directory.candidates(limits) {
+        let candidates = match directory.candidates(limits, budget) {
             Ok(candidates) => candidates,
             Err(code) => return Self::rejected(code),
         };
         let mut definitions = Vec::new();
         let mut entries = Vec::new();
-        let mut read_bytes = 0usize;
         for candidate in candidates {
             let bytes = match directory.read(
                 &candidate,
                 limits.max_file_bytes,
-                limits.max_publication_bytes - read_bytes,
+                limits.max_publication_bytes - budget.read_bytes,
             ) {
                 Ok(bytes) => bytes,
                 Err((code, partial_read_bytes)) => {
-                    read_bytes += partial_read_bytes;
-                    if read_bytes > limits.max_publication_bytes
+                    budget.read_bytes += partial_read_bytes;
+                    if budget.read_bytes > limits.max_publication_bytes
                         || code == NamedAgentDiagnosticCode::AggregateLimitExceeded
                     {
                         return Self::rejected(NamedAgentDiagnosticCode::AggregateLimitExceeded);
@@ -242,8 +263,8 @@ impl NamedAgentCatalog {
                 }
             };
             // Count actual read lengths, including invalid sources, not stat sizes.
-            read_bytes += bytes.len();
-            if read_bytes > limits.max_publication_bytes {
+            budget.read_bytes += bytes.len();
+            if budget.read_bytes > limits.max_publication_bytes {
                 return Self::rejected(NamedAgentDiagnosticCode::AggregateLimitExceeded);
             }
             if bytes.len() > limits.max_file_bytes {
