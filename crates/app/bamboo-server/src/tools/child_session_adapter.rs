@@ -628,6 +628,17 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn validate_required_child_context_route(
+        &self,
+        runtime_metadata: &HashMap<String, String>,
+        subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        self.scheduler
+            .validate_required_child_context_route(runtime_metadata, subagent_type)
+            .await
+            .map_err(ChildSessionError::Execution)
+    }
+
     fn publish_child_workspace(
         &self,
         session_id: &str,

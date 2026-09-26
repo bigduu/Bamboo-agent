@@ -209,6 +209,18 @@ pub struct QueuedInjectedMessage {
 
 #[async_trait]
 pub trait ChildSessionPort: Send + Sync {
+    /// Opt-in required packets may only cross an explicitly supported fresh
+    /// local Bamboo worker route. Embeddings must prove support before persist.
+    async fn validate_required_child_context_route(
+        &self,
+        _runtime_metadata: &HashMap<String, String>,
+        _subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "required_child_context_unsupported: no supported built-in worker route".into(),
+        ))
+    }
+
     /// Validate and normalize the child's workspace before any child/session
     /// state is created. Server adapters override this with the authoritative
     /// Project registry ownership check; non-server embeddings still apply the
