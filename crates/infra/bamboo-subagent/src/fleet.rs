@@ -54,8 +54,11 @@ fn validate_required_capability(output: &[u8], capability: &str) -> TransportRes
     let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|_| {
         TransportError::Protocol("worker capability probe returned invalid JSON".into())
     })?;
-    if (capability == REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY
-        && report.provision_version != crate::provision::PROVISION_VERSION)
+    if (matches!(
+        capability,
+        REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY
+            | crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY
+    ) && report.provision_version != crate::provision::PROVISION_VERSION)
         || !report.supports(capability)
     {
         return Err(TransportError::Protocol(format!(
@@ -109,6 +112,14 @@ async fn ensure_provision_capabilities(
     worker_args: &[String],
     spec: &ProvisionSpec,
 ) -> TransportResult<()> {
+    if spec.capabilities.child_creation_identity {
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY,
+        )
+        .await?;
+    }
     if spec.capabilities.read_only_enforced() {
         require_typed_read_only_worker_capability(worker_bin, worker_args).await?;
     }
@@ -309,6 +320,25 @@ mod tests {
             .contains(TYPED_READ_ONLY_WORKER_CAPABILITY));
 
         assert!(validate_worker_capability_report(b"not-json").is_err());
+    }
+
+    #[test]
+    fn child_creation_requires_exact_schema_and_explicit_capability() {
+        let capability = crate::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY;
+        let mut report = WorkerCapabilityReport::current();
+        validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability).unwrap();
+        report.capabilities.retain(|entry| entry != capability);
+        assert!(
+            validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability)
+                .is_err()
+        );
+        report.capabilities.push(capability.into());
+        report.provision_version += 1;
+        assert!(
+            validate_required_capability(&serde_json::to_vec(&report).unwrap(), capability)
+                .is_err()
+        );
+        assert!(validate_required_capability(b"not-json", capability).is_err());
     }
 
     #[test]

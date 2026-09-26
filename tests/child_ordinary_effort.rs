@@ -367,6 +367,7 @@ async fn verify_reused_worker(home: &std::path::Path, base_url: &str, probe: &Pr
             .send(ParentFrame::Run(RunSpec {
                 assignment: format!("ORDINARY_WARM_RUN_{index}"),
                 logical_session: Some(LogicalSessionIdentity {
+                    creation: None,
                     // This is the supported pool reuse path: one live worker
                     // handles successive independent logical Child sessions.
                     session_id: format!("ordinary-warm-session-{index}"),

@@ -1303,6 +1303,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: logical_session_id.to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),
@@ -1486,6 +1487,7 @@ mod tests {
                 assert_eq!(
                     spec.logical_session,
                     Some(crate::proto::LogicalSessionIdentity {
+                        creation: None,
                         session_id: "logical-child".to_string(),
                         parent_session_id: Some("logical-parent".to_string()),
                         root_session_id: "logical-root".to_string(),
@@ -1516,6 +1518,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "wait".into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: "logical-child".to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),

@@ -10,6 +10,8 @@
 //! older worker can read a newer spec (new fields are skipped) and a newer worker can read
 //! an older spec (missing fields default). Parent and worker binaries need not be upgraded
 //! in lockstep.
+//! Authority-bearing required capabilities are an exception: the parent must
+//! receive their explicit capability acknowledgement before any provision.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +25,7 @@ pub const PROVISION_VERSION: u32 = 2;
 /// tool boundary, so the parent probes this capability before starting them.
 pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
 pub const REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY: &str = "required_child_context_v1";
+pub const CHILD_CREATION_IDENTITY_WORKER_CAPABILITY: &str = "durable_child_creation_identity_v1";
 
 /// Non-secret capability document printed by `bamboo subagent-worker
 /// --print-capabilities`. It is deliberately separate from `ProvisionSpec` so
@@ -41,6 +44,7 @@ impl WorkerCapabilityReport {
             capabilities: vec![
                 TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(),
                 REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string(),
+                CHILD_CREATION_IDENTITY_WORKER_CAPABILITY.to_string(),
             ],
         }
     }
@@ -124,6 +128,10 @@ pub struct ProvisionSpec {
 /// skills exactly as before.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Every logical Child Run must carry its authoritative host birth.
+    /// Older workers must acknowledge this before receiving a provision.
+    #[serde(default)]
+    pub child_creation_identity: bool,
     /// Host-authored immutable one-shot assignment. Requires an explicit probe;
     /// this content flag does not add tools or change permission authority.
     #[serde(default)]
@@ -571,6 +579,14 @@ impl ProvisionSpec {
     /// honor only `mcp_proxy`; fail closed here instead (D4 from the drift
     /// audit: this invariant was documented but never guarded).
     pub fn validate(&self) -> Result<()> {
+        if self.capabilities.child_creation_identity
+            && (!matches!(self.executor, ExecutorSpec::BambooRuntime)
+                || !matches!(self.placement, Placement::Local)
+                || (self.storage_dir.is_none()
+                    && !std::path::Path::new(&self.fabric_dir).is_absolute()))
+        {
+            return Err(StoreError::Invalid("Child creation identity requires a local Bamboo runtime and stable host cache root".into()));
+        }
         if self.capabilities.mcp.is_some() && self.capabilities.mcp_proxy.is_some() {
             return Err(StoreError::Invalid(
                 "capabilities.mcp and capabilities.mcp_proxy are mutually exclusive \
@@ -756,6 +772,7 @@ mod tests {
         // Round-trips with content.
         let mut s = spec();
         s.capabilities = Capabilities {
+            child_creation_identity: false,
             required_child_context: false,
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
             skills_dir: Some("/home/u/.bamboo/skills".into()),
