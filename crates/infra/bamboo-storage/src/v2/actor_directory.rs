@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_domain::{
@@ -18,7 +19,19 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::{durable_atomic_write, validate_session_id, SessionStoreV2};
+use super::{
+    durable_atomic_write_blocking, validate_session_id, RuntimeTaskTransactionReadGuard,
+    SessionLifecycleReadGuard, SessionStoreV2, SessionWriteGuard,
+};
+
+/// Every started filesystem job keeps the same physical and in-process locks
+/// alive, even when its async caller or Tokio runtime stops waiting. Field
+/// order releases the locks in reverse acquisition order.
+struct ActorAuthorityGuards {
+    _session: SessionWriteGuard,
+    _task: RuntimeTaskTransactionReadGuard,
+    _lifecycle: SessionLifecycleReadGuard,
+}
 
 const ACTOR_AUTHORITY_FILE: &str = "actor-authority.json";
 const ACTOR_INITIALIZED_FILE: &str = "actor-authority.initialized.json";
@@ -249,6 +262,7 @@ impl SessionStoreV2 {
         actor_id: &str,
         rel: &str,
         path: &Path,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<ActorDirectoryEntry, ActorDirectoryError> {
         let (kind, root_id) =
             Self::copy_source_identity_from_rel(actor_id, rel).map_err(storage)?;
@@ -298,7 +312,8 @@ impl SessionStoreV2 {
                     {
                         return Err(ActorDirectoryError::Corrupt);
                     }
-                    self.write_actor_marker(&marker_path, &expected).await?;
+                    self.write_actor_marker(&marker_path, &expected, guards)
+                        .await?;
                 }
                 entry
             }
@@ -307,8 +322,9 @@ impl SessionStoreV2 {
                 // crash before the marker leaves an inert Cold actor. No claim
                 // is returned until BOTH files have been durably published.
                 let entry = ActorDirectoryEntry::new(expected.clone());
-                self.write_actor_entry(path, &entry).await?;
-                self.write_actor_marker(&marker_path, &expected).await?;
+                self.write_actor_entry(path, &entry, guards).await?;
+                self.write_actor_marker(&marker_path, &expected, guards)
+                    .await?;
                 entry
             }
             false => return Err(ActorDirectoryError::Corrupt),
@@ -358,7 +374,7 @@ impl SessionStoreV2 {
             entry.actor.observed_metadata_version = current;
             entry.actor.ancestor_observations = expected.ancestor_observations;
             entry.revision = checked_next(entry.revision)?;
-            self.write_actor_entry(path, &entry).await?;
+            self.write_actor_entry(path, &entry, guards).await?;
         }
         Ok(entry)
     }
@@ -367,6 +383,7 @@ impl SessionStoreV2 {
         &self,
         path: &Path,
         actor: &ActorSession,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
         let marker = ActorInitializedMarker {
             schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
@@ -374,17 +391,44 @@ impl SessionStoreV2 {
             session_created_at: actor.session_created_at,
         };
         let bytes = serde_json::to_vec(&marker).map_err(|_| ActorDirectoryError::Corrupt)?;
-        durable_atomic_write(path, &bytes).await.map_err(storage)
+        self.write_actor_bytes(path, bytes, guards).await
     }
 
     async fn write_actor_entry(
         &self,
         path: &Path,
         entry: &ActorDirectoryEntry,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
         entry.validate()?;
         let bytes = serde_json::to_vec_pretty(entry).map_err(|_| ActorDirectoryError::Corrupt)?;
-        durable_atomic_write(path, &bytes).await.map_err(storage)
+        self.write_actor_bytes(path, bytes, guards).await
+    }
+
+    async fn write_actor_bytes(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
+        let path = path.to_path_buf();
+        let guards = Arc::clone(guards);
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            durable_atomic_write_blocking(&path, &bytes, |phase| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    return hook.visit(&path, phase);
+                }
+                let _ = phase;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| storage(io::Error::other(format!("join actor write: {error}"))))?
+        .map_err(storage)
     }
 
     async fn actor_transaction<T, F>(
@@ -399,26 +443,31 @@ impl SessionStoreV2 {
         // Same lock order as strict Session control-plane writes: lifecycle,
         // Task sidecar, then the exact Session maintenance/file lock. The last
         // lock spans read/CAS/durable rename, including independent processes.
-        let _lifecycle = self
+        let lifecycle = self
             .lock_session_lifecycle_shared()
             .await
             .map_err(storage)?;
-        let _task = self
+        let task = self
             .lock_runtime_task_sidecar_shared()
             .await
             .map_err(storage)?;
-        let _session = self
+        let session = self
             .acquire_session_maintenance_lock(actor_id)
             .await
             .map_err(storage)?;
+        let guards = Arc::new(ActorAuthorityGuards {
+            _session: session,
+            _task: task,
+            _lifecycle: lifecycle,
+        });
         let (rel, path) = self.actor_authority_location(actor_id).await?;
         let mut entry = self
-            .read_or_create_actor_entry(actor_id, &rel, &path)
+            .read_or_create_actor_entry(actor_id, &rel, &path, &guards)
             .await?;
         let Mutation { value, changed } = operation(&mut entry)?;
         if changed {
             entry.revision = checked_next(entry.revision)?;
-            self.write_actor_entry(&path, &entry).await?;
+            self.write_actor_entry(&path, &entry, &guards).await?;
         }
         Ok(value)
     }
