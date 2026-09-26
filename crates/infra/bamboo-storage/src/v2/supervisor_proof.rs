@@ -172,10 +172,27 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    async fn write_default_supervisor_proof(
+        &self,
+        directory: &Path,
+        session: &Session,
+        state: ProofState,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&SupervisorAuthorityProof::from_session(session, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        if bytes.len() as u64 > SUPERVISOR_PROOF_MAX_BYTES {
+            return Err(conflict("Supervisor proof exceeds bounded capacity"));
+        }
+        self.write_default_bytes(&directory.join(SUPERVISOR_PROOF_FILE), bytes, guards)
+            .await
+    }
+
     pub(super) async fn prepare_supervisor_proof_for_full_save(
         &self,
         directory: &Path,
         incoming: &Session,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<bool> {
         if !matches!(
             incoming.authority_identity,
@@ -187,17 +204,21 @@ impl SessionStoreV2 {
         if proof.state == ProofState::Committed && proof.matches(incoming) {
             return Ok(false);
         }
-        Self::write_proof_at(directory, incoming, ProofState::Prepared).await?;
+        self.write_default_supervisor_proof(directory, incoming, ProofState::Prepared, guards)
+            .await?;
         Ok(true)
     }
 
     pub(super) async fn commit_supervisor_proof_after_full_save(
+        &self,
         directory: &Path,
         incoming: &Session,
         prepared: bool,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         if prepared {
-            Self::write_proof_at(directory, incoming, ProofState::Committed).await?;
+            self.write_default_supervisor_proof(directory, incoming, ProofState::Committed, guards)
+                .await?;
         }
         Ok(())
     }

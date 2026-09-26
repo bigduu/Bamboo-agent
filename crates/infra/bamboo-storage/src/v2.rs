@@ -54,6 +54,10 @@ mod actor_snapshot_reader;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod actor_snapshot_tests;
 mod child_project;
+mod default_actor_context;
+#[cfg(test)]
+mod default_actor_context_tests;
+use default_actor_context::DefaultWriterGuards;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -1070,6 +1074,9 @@ pub struct SessionStoreV2 {
     supervisor_proof_fault: std::sync::Mutex<Option<supervisor_proof::SupervisorProofFault>>,
     #[cfg(test)]
     actor_write_hook: std::sync::Mutex<Option<Arc<actor_directory_lifetime_tests::ActorWriteHook>>>,
+    #[cfg(test)]
+    default_write_hook:
+        std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1376,6 +1383,8 @@ impl SessionStoreV2 {
             supervisor_proof_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             actor_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            default_write_hook: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -4499,16 +4508,19 @@ impl SessionStoreV2 {
 
     pub async fn clear_session(&self, session_id: &str) -> io::Result<bool> {
         validate_session_id(session_id)?;
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         self.recover_all_runtime_task_transactions_locked().await?;
         self.recover_all_session_copy_transactions_locked().await?;
+        let session_write = self.acquire_session_maintenance_lock(session_id).await?;
+        let guards = DefaultWriterGuards::exclusive(lifecycle, runtime_task, session_write);
 
         let Some(entry) = self.get_index_entry(session_id).await else {
             return Ok(false);
         };
         let rel_path = entry.rel_path.clone();
         let abs_dir = self.abs_path_from_rel(&rel_path);
+        self.check_default_actor_clear(&abs_dir).await?;
         let Some(mut session) = self
             .load_session_from_dir_strict(&abs_dir, session_id, entry.kind, &entry.root_session_id)
             .await?
@@ -4534,24 +4546,10 @@ impl SessionStoreV2 {
         session.conversation_summary = None;
         session.updated_at = Utc::now();
 
-        // Remove attachments on disk.
-        let attachments_dir = abs_dir.join("attachments");
-        match fs::remove_dir_all(&attachments_dir).await {
-            Ok(()) => sync_parent_directory_entry(&attachments_dir).await?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::create_dir_all(&attachments_dir).await?;
-        sync_parent_directory_entry(&attachments_dir).await?;
-
-        self.write_runtime_sidecar(&abs_dir, &session).await?;
-        let path = abs_dir.join("session.json");
-        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-        let bytes = serde_json::to_vec_pretty(&session)
-            .map_err(|error| other_io_error(error.to_string()))?;
-        fs::write(&tmp, bytes).await?;
-        atomic_rename(&tmp, &path).await?;
-        let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
+        // One started job owns cleanup and the resulting canonical files.
+        let (revision_path, revision) = self
+            .clear_default_session_files(&abs_dir, &session, &guards)
+            .await?;
         self.upsert_index_from_session_inner(&session, rel_path, false, Some(false))
             .await?;
         self.search_index_queue
@@ -5125,7 +5123,11 @@ impl SessionStoreV2 {
         &self,
         session: &Session,
         total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
+        let intended_rel = Self::default_writer_rel_path(session)?;
+        self.check_default_actor_context(session, &self.abs_path_from_rel(&intended_rel), true)
+            .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_full_save(session).await?;
         self.validate_child_project_for_write(session, true, None)
@@ -5134,7 +5136,7 @@ impl SessionStoreV2 {
 
         let mut stages = SaveStageDurations::default();
         let directory_started = Instant::now();
-        let rel_path = self.ensure_session_dirs(session).await?;
+        let rel_path = self.ensure_default_writer_dirs(session, guards).await?;
         let abs_dir = self.abs_path_from_rel(&rel_path);
         let path = abs_dir.join("session.json");
         stages.directory_preparation = directory_started.elapsed();
@@ -5160,39 +5162,48 @@ impl SessionStoreV2 {
 
         let filesystem_started = Instant::now();
         let root_proof_prepared = self
-            .prepare_root_tool_proof_for_full_save(&abs_dir, session)
+            .prepare_root_tool_proof_for_full_save(&abs_dir, session, guards)
             .await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Prepared)?;
         }
         let supervisor_proof_prepared = self
-            .prepare_supervisor_proof_for_full_save(&abs_dir, session)
+            .prepare_supervisor_proof_for_full_save(&abs_dir, session, guards)
             .await?;
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
         }
-        durable_atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, guards)
+            .await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Runtime)?;
         }
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
         }
-        durable_atomic_write(&path, &session_bytes).await?;
+        self.write_default_bytes(&path, session_bytes, guards)
+            .await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Main)?;
         }
-        Self::commit_root_tool_proof_after_full_save(&abs_dir, session, root_proof_prepared)
+        self.commit_root_tool_proof_after_full_save(&abs_dir, session, root_proof_prepared, guards)
             .await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Committed)?;
         }
-        Self::commit_supervisor_proof_after_full_save(&abs_dir, session, supervisor_proof_prepared)
-            .await?;
+        self.commit_supervisor_proof_after_full_save(
+            &abs_dir,
+            session,
+            supervisor_proof_prepared,
+            guards,
+        )
+        .await?;
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
-        let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
+        let (revision_path, revision) = self
+            .publish_default_search_revision(&abs_dir, guards)
+            .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
         let index_started = Instant::now();
@@ -5250,11 +5261,12 @@ impl Storage for SessionStoreV2 {
         // Deletion and trusted same-ID recreation hold the exclusive form.
         // Keep one Root birth stable from the authoritative load through the
         // completed operation proof, before taking runtime-task and writer locks.
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let _session_write = self
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
             .acquire_session_write_lock(&request.session_id, SaveKind::Full)
             .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
         let Some(mut session) = self.load_session_unlocked(&request.session_id).await? else {
             return Ok(RootModeOperationDecision::NotFound);
         };
@@ -5332,7 +5344,7 @@ impl Storage for SessionStoreV2 {
         session
             .record_root_mode_operation(receipt)
             .map_err(|error| other_io_error(error.to_string()))?;
-        self.save_session_after_lock(&session, total_started)
+        self.save_session_after_lock(&session, total_started, &guards)
             .await?;
         Ok(RootModeOperationDecision::Terminal(
             session
@@ -5388,11 +5400,14 @@ impl Storage for SessionStoreV2 {
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let _session_write = self
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
-        self.save_session_after_lock(session, total_started).await
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        self.save_session_after_lock(session, total_started, &guards)
+            .await
     }
 
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
@@ -5408,8 +5423,8 @@ impl Storage for SessionStoreV2 {
     async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
         // Fast path: write ONLY the small runtime sidecar (no messages), leaving
         // session.json — which carries the full conversation history — untouched.
-        // Ordinary sessions retain O(1) I/O in conversation length. Supervisor
-        // validation additionally reads main-file bytes to verify its identity.
+        // Legacy sessions retain O(1) I/O in conversation length. Initialized
+        // Actor protection compares actual durable context, including main birth.
         validate_session_id(&session.id)?;
         let mut rel = self.resolve_rel_path(&session.id).await;
         if rel.is_none() && session.kind == SessionKind::Root {
@@ -5438,9 +5453,13 @@ impl Storage for SessionStoreV2 {
             return self.save_session(session).await;
         };
         let total_started = Instant::now();
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let _session_write = self
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Runtime)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
+        self.check_default_actor_context(session, &self.abs_path_from_rel(&rel), false)
             .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_save(session).await?;
@@ -5487,8 +5506,10 @@ impl Storage for SessionStoreV2 {
         let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
+        let serialized_bytes = runtime_bytes.len();
         let filesystem_started = Instant::now();
-        atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
+            .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
         // Workspace and Project ownership are part of the list/index API
@@ -5518,8 +5539,8 @@ impl Storage for SessionStoreV2 {
             if !index_updated && session.kind == SessionKind::Root {
                 // Exceptional recovery of a globally missing index entry must
                 // preserve the real history count, not the caller's snapshot.
-                // Only this recovery path reads main; ordinary runtime saves
-                // and a merely stale local index remain transcript-independent.
+                // This index recovery reads main too. Legacy runtime saves
+                // without Actor authority retain the transcript-independent path.
                 let authoritative = self
                     .load_authoritative_root_session(&session.id)
                     .await
@@ -5545,7 +5566,7 @@ impl Storage for SessionStoreV2 {
             SaveKind::Runtime,
             total,
             stages,
-            runtime_bytes.len(),
+            serialized_bytes,
             session.messages.len(),
             index_entry_count,
         );
@@ -5554,7 +5575,7 @@ impl Storage for SessionStoreV2 {
             session_id = %session.id,
             save_type = "runtime",
             phase = "durable_commit",
-            serialized_bytes = runtime_bytes.len(),
+            serialized_bytes,
             message_count = session.messages.len(),
             index_entry_count,
             total_ms = total.as_millis() as u64,
