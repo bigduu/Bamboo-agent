@@ -139,7 +139,7 @@ enum SubAgentArgs {
         fork_last_messages: Option<usize>,
         /// Opt-in complete instructions for a fresh built-in local worker.
         #[serde(default)]
-        context_packet: Option<bamboo_domain::ChildContextPacket>,
+        context_packet: Option<Box<bamboo_domain::ChildContextPacket>>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -859,14 +859,25 @@ impl SubAgentTool {
 
         let has_packet = args.get("context_packet").is_some();
         if has_packet && !args["context_packet"].is_object() {
-            return Err(ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()));
+            return Err(ToolError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+            ));
         }
-        if has_packet && serde_json::to_vec(&args).map_or(true, |bytes| bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES) {
-            return Err(ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Budget.to_string()));
+        if has_packet
+            && serde_json::to_vec(&args).map_or(true, |bytes| {
+                bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES
+            })
+        {
+            return Err(ToolError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
         }
         let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(if has_packet { bamboo_domain::ChildContextPacketError::Invalid.to_string() }
-                else { format!("Invalid SubAgent args: {error}") })
+            ToolError::InvalidArguments(if has_packet {
+                bamboo_domain::ChildContextPacketError::Invalid.to_string()
+            } else {
+                format!("Invalid SubAgent args: {error}")
+            })
         })?;
 
         // `list_models` is read-only and session-independent.
@@ -1377,7 +1388,7 @@ impl SubAgentTool {
                             runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
                                 serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
                         }
-                        let result = child_session::create_child_action(
+                        let result = Box::pin(child_session::create_child_action(
                             self.sessions.as_ref(),
                             CreateChildInput {
                                 parent_session: parent.clone(),
@@ -1406,7 +1417,7 @@ impl SubAgentTool {
                                 // the last N parent messages into the child's brief.
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
                             },
-                        )
+                        ))
                         .await
                         .map_err(tool_error_from_child_session)?;
                         if context_packet.is_some() {

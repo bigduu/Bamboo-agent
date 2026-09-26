@@ -633,28 +633,10 @@ impl ChildSessionPort for ChildSessionAdapter {
         runtime_metadata: &HashMap<String, String>,
         subagent_type: &str,
     ) -> Result<(), ChildSessionError> {
-        let supported = {
-            let config = self.config.read().await;
-            let sub = config.subagents();
-            let resolved = bamboo_engine::external_agents::config::resolve_runtime_metadata(&config, subagent_type);
-            sub.worker_bin.is_none() && sub.worker_args.is_none()
-                && matches!(sub.executor.as_deref(), None | Some("bamboo_runtime"))
-                && !sub.remote_placements.iter().any(|placement| placement.role == subagent_type)
-                && !sub.schedulable_placements.iter().any(|placement| placement.role == subagent_type)
-                && ["runtime.kind", "external.protocol", "external.agent_id"].into_iter().all(|key|
-                    runtime_metadata.get(key) == resolved.get(key))
-                && resolved.get("runtime.kind").map(String::as_str) == Some("external")
-                && resolved.get("external.protocol").map(String::as_str) == Some("actor")
-                && resolved.get("external.agent_id").map(String::as_str) == Some("local-actor")
-        };
-        if !supported {
-            return Err(ChildSessionError::Execution("required_child_context_unsupported: built-in fresh local Bamboo worker required".into()));
-        }
-        let executable = std::env::current_exe().map_err(|_| ChildSessionError::Execution(
-            "required_child_context_unsupported: current executable unavailable".into()))?;
-        bamboo_subagent::fleet::require_worker_capability(&executable, &["subagent-worker".into()],
-            bamboo_subagent::provision::REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY).await
-            .map_err(|_| ChildSessionError::Execution("required_child_context_unsupported: worker capability unconfirmed".into()))
+        self.scheduler
+            .validate_required_child_context_route(runtime_metadata, subagent_type)
+            .await
+            .map_err(ChildSessionError::Execution)
     }
 
     fn publish_child_workspace(

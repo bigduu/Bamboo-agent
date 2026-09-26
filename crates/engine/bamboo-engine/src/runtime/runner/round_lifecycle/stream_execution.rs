@@ -1254,7 +1254,8 @@ pub(super) async fn execute_llm_stream(
     // with `previous_response_not_found`) nor kept in session metadata.
     let responses_policy = engine_responses_policy();
     let continuation_enabled = bamboo_domain::ChildContextBinding::from_session(session)
-        .map_err(|error| AgentError::Budget(error.to_string()))?.is_none()
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_none()
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let (mut prepared_envelope, previous_response_id, final_usage) = loop {
@@ -1301,7 +1302,14 @@ pub(super) async fn execute_llm_stream(
             }
         };
         let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-        let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        let mut request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        if bamboo_domain::ChildContextBinding::from_session(session)
+            .map_err(|error| AgentError::Budget(error.to_string()))?
+            .is_some()
+        {
+            request_input_limit =
+                request_input_limit.min(prepared_context.token_usage.budget_limit);
+        }
         if final_usage.input_tokens > request_input_limit
             || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
         {
@@ -1431,13 +1439,17 @@ pub(super) async fn execute_llm_stream(
     // the returned stream. This bounds proxies that accept the request but never
     // return response headers, a phase the per-frame watchdog cannot observe.
     if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(session)
-        .map_err(|error| AgentError::Budget(error.to_string()))? {
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+    {
         // Check the provider-bound IR after reconciliation/checkpoint/reprepare,
         // rather than treating a retained Session message as proof of delivery.
-        binding.validate_messages(&session.id, &prepared_envelope.ir.body_chat())
+        binding
+            .validate_messages(&session.id, &prepared_envelope.ir.body_chat())
             .map_err(|error| AgentError::Budget(error.to_string()))?;
         if prepared_envelope.ir.continuation.is_some() {
-            return Err(AgentError::Budget(bamboo_domain::ChildContextPacketError::Invalid.to_string()));
+            return Err(AgentError::Budget(
+                bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+            ));
         }
     }
     let stream = crate::runtime::stream::handler::await_stream_bootstrap(

@@ -72,6 +72,14 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// A narrow, pre-persistence compatibility check on the actual registered
+    /// runner. Unknown/custom routes fail closed for required one-shot packets.
+    async fn validate_required_child_context_route(
+        &self,
+        _session: &Session,
+    ) -> Result<(), String> {
+        Err("required_child_context_unsupported: no supported registered worker route".into())
+    }
     /// Returns true if this runner should handle the given child session.
     async fn should_handle(&self, session: &Session) -> bool;
 
@@ -141,6 +149,22 @@ pub struct SpawnScheduler {
 }
 
 impl SpawnScheduler {
+    pub async fn validate_required_child_context_route(
+        &self,
+        metadata: &HashMap<String, String>,
+        role: &str,
+    ) -> Result<(), String> {
+        let mut candidate = Session::new("required-context-preflight", "");
+        candidate.metadata = metadata.clone();
+        candidate
+            .metadata
+            .insert("subagent_type".into(), role.into());
+        self.ctx
+            .external_child_runner
+            .validate_required_child_context_route(&candidate)
+            .await
+    }
+
     pub fn new(ctx: SpawnContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<QueuedSpawnJob>(128);
         let worker_ctx = ctx.clone();

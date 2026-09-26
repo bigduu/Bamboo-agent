@@ -23,32 +23,71 @@ pub async fn create_child_action(
 
     // Resolve only from the durable parent, before constructing or persisting a
     // child. The observation is content identity, not task/permission CAS.
-    let required_context = if let Some(raw) = input.runtime_metadata.get(bamboo_domain::CHILD_PACKET_INPUT_KEY) {
-        if input.lifecycle.as_deref() == Some("resident") || input.context_fork.unwrap_or_default() > 0 {
-            return Err(ChildSessionError::InvalidArguments("required_child_context_unsupported: fresh one-shot only".into()));
+    let required_context = if let Some(raw) = input
+        .runtime_metadata
+        .get(bamboo_domain::CHILD_PACKET_INPUT_KEY)
+    {
+        if input.lifecycle.as_deref() == Some("resident")
+            || input.context_fork.unwrap_or_default() > 0
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "required_child_context_unsupported: fresh one-shot only".into(),
+            ));
         }
         if raw.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES {
-            return Err(ChildSessionError::InvalidArguments(bamboo_domain::ChildContextPacketError::Budget.to_string()));
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
         }
-        let packet: bamboo_domain::ChildContextPacket = serde_json::from_str(raw)
-            .map_err(|_| ChildSessionError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?;
-        if [&input.title, &input.responsibility, &input.subagent_type].into_iter()
-            .any(|text| text.lines().any(|line| line.len() > 2048)) {
-            return Err(ChildSessionError::InvalidArguments(bamboo_domain::ChildContextPacketError::Budget.to_string()));
+        let packet: bamboo_domain::ChildContextPacket =
+            serde_json::from_str(raw).map_err(|_| {
+                ChildSessionError::InvalidArguments(
+                    bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                )
+            })?;
+        if [&input.title, &input.responsibility, &input.subagent_type]
+            .into_iter()
+            .any(|text| text.lines().any(|line| line.len() > 2048))
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
         }
         let parent = port.load_root_session(&input.parent_session.id).await?;
         if parent.created_at != input.parent_session.created_at {
-            return Err(ChildSessionError::InvalidArguments("invalid_child_context_packet: parent lifetime changed".into()));
+            return Err(ChildSessionError::InvalidArguments(
+                "invalid_child_context_packet: parent lifetime changed".into(),
+            ));
         }
-        let resolved = packet.resolve(&parent, &input.assignment_prompt)
+        let resolved = packet
+            .resolve(&parent, &input.assignment_prompt)
             .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        if resolved.required_input_bytes
+            + input.title.len()
+            + input.responsibility.len()
+            + input.subagent_type.len()
+            > bamboo_domain::MAX_CHILD_REQUIRED_BYTES
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
+        }
         let assignment = format_child_assignment_with_background(
-            &input.title, &input.responsibility, &input.subagent_type, &resolved.required_brief, None);
-        let binding = bamboo_domain::ChildContextBinding::new(&parent, &input.child_id, assignment, resolved)
-            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
-        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type).await?;
+            &input.title,
+            &input.responsibility,
+            &input.subagent_type,
+            &resolved.required_brief,
+            None,
+        );
+        let binding =
+            bamboo_domain::ChildContextBinding::new(&parent, &input.child_id, assignment, resolved)
+                .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type)
+            .await?;
         Some(binding)
-    } else { None };
+    } else {
+        None
+    };
 
     let inherited_project_id =
         match crate::project_context::ProjectContextResolver::session_project_identity(
@@ -236,7 +275,9 @@ pub async fn create_child_action(
 
     // Apply runtime metadata (e.g. external agent routing).
     for (key, value) in input.runtime_metadata {
-        if key != bamboo_domain::CHILD_PACKET_INPUT_KEY { child.metadata.insert(key, value); }
+        if key != bamboo_domain::CHILD_PACKET_INPUT_KEY {
+            child.metadata.insert(key, value);
+        }
     }
 
     // Preserve the configured global custom template/fallback, then append the
@@ -287,10 +328,16 @@ pub async fn create_child_action(
         background.as_deref(),
     );
     if let Some(mut binding) = required_context {
-        binding.bind_host_budget(&child).map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
-        binding.install(&mut child).map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        binding
+            .bind_host_budget(&child)
+            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        binding
+            .install(&mut child)
+            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
         child.add_message(binding.assignment_message());
-        for message in binding.background_messages() { child.add_message(message); }
+        for message in binding.background_messages() {
+            child.add_message(message);
+        }
     } else {
         child.add_message(Message::user(assignment));
     }
@@ -603,6 +650,14 @@ pub async fn update_child_action_with_background(
 
     let should_refresh_assignment =
         responsibility.is_some() || prompt.is_some() || subagent_type.is_some();
+    if (should_refresh_assignment || assignment_background.is_some())
+        && bamboo_domain::ChildContextBinding::from_session(&child)
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+            .is_some()
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "required_child_context_unsupported: immutable assignment cannot be updated in place; create a new Child".into()));
+    }
 
     if title.is_none()
         && !should_refresh_assignment

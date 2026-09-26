@@ -38,7 +38,10 @@ impl WorkerCapabilityReport {
     pub fn current() -> Self {
         Self {
             provision_version: PROVISION_VERSION,
-            capabilities: vec![TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(), REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string()],
+            capabilities: vec![
+                TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(),
+                REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string(),
+            ],
         }
     }
 

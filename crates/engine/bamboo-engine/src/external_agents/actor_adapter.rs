@@ -531,6 +531,7 @@ pub struct ActorChildRunner {
     agent_id: String,
     worker_bin: PathBuf,
     worker_args: Vec<String>,
+    builtin_required_context_route: bool,
     fabric_dir: PathBuf,
     executor: ExecutorSpec,
     /// Per-provider credentials snapshotted from the parent config at build
@@ -696,6 +697,7 @@ impl ActorChildRunner {
             agent_id,
             worker_bin,
             worker_args,
+            builtin_required_context_route: false,
             fabric_dir,
             executor,
             credentials,
@@ -722,6 +724,12 @@ impl ActorChildRunner {
     /// Bind the AppState-owned live configuration. Child activations read this
     /// after a successful provider reload, so newly added/rotated provider
     /// credentials take effect without restarting Bamboo.
+    /// Only the built-in factory sets this from its immutable launch config.
+    pub(crate) fn with_builtin_required_context_route(mut self, supported: bool) -> Self {
+        self.builtin_required_context_route = supported;
+        self
+    }
+
     pub fn with_live_provider_config(
         mut self,
         config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
@@ -909,10 +917,17 @@ impl ActorChildRunner {
         spec: &ProvisionSpec,
     ) -> crate::runtime::runner::Result<PooledWorker> {
         if spec.capabilities.required_child_context {
-            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec).await
-                .map_err(|error| AgentError::LLM(format!("required-context worker spawn failed: {error}")))?;
+            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!("required-context worker spawn failed: {error}"))
+                })?;
             let mailbox_id = worker.record.agent_id.clone();
-            return Ok(PooledWorker { worker, mailbox_id, parked_at: None });
+            return Ok(PooledWorker {
+                worker,
+                mailbox_id,
+                parked_at: None,
+            });
         }
         self.ensure_pool_reaper();
         // Drain the bucket, skipping (and reaping) any worker whose process exited
@@ -1391,6 +1406,38 @@ impl ActorChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for ActorChildRunner {
+    async fn validate_required_child_context_route(&self, session: &Session) -> Result<(), String> {
+        let role = session
+            .metadata
+            .get("subagent_type")
+            .map(String::as_str)
+            .unwrap_or("worker");
+        let current = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.canonicalize().ok());
+        if !self.builtin_required_context_route
+            || !self.should_handle(session).await
+            || current.is_none()
+            || self.worker_bin.canonicalize().ok() != current
+            || self.worker_args != ["subagent-worker".to_string()]
+            || !matches!(self.executor, ExecutorSpec::BambooRuntime)
+            || self.bus.is_none()
+            || self.remote_placements.contains_key(role)
+            || self.schedulable_placements.contains_key(role)
+        {
+            return Err(
+                "required_child_context_unsupported: built-in fresh local Bamboo worker required"
+                    .into(),
+            );
+        }
+        bamboo_subagent::fleet::require_worker_capability(
+            &self.worker_bin,
+            &self.worker_args,
+            bamboo_subagent::provision::REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+        )
+        .await
+        .map_err(|_| "required_child_context_unsupported: worker capability unconfirmed".into())
+    }
     async fn should_handle(&self, session: &Session) -> bool {
         session.metadata.get("runtime.kind") == Some(&"external".to_string())
             && session.metadata.get("external.protocol") == Some(&"actor".to_string())
@@ -1424,7 +1471,9 @@ impl ExternalChildRunner for ActorChildRunner {
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let required_context = bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
-        let assignment = required_context.as_ref().map(|binding| binding.payload.required_assignment.clone())
+        let assignment = required_context
+            .as_ref()
+            .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
@@ -1432,13 +1481,9 @@ impl ExternalChildRunner for ActorChildRunner {
         spec.reusable = required_context.is_none();
         spec.capabilities.required_child_context = required_context.is_some();
         if required_context.is_some() {
-            let current = std::env::current_exe().ok().and_then(|path| path.canonicalize().ok());
-            if current.is_none() || self.worker_bin.canonicalize().ok() != current
-                || self.worker_args != ["subagent-worker".to_string()]
-                || !matches!(spec.executor, ExecutorSpec::BambooRuntime)
-                || !matches!(spec.placement, Placement::Local) {
-                return Err(AgentError::LLM("required_child_context_unsupported: built-in fresh local Bamboo worker required".into()));
-            }
+            self.validate_required_child_context_route(session)
+                .await
+                .map_err(AgentError::LLM)?;
         }
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
@@ -1790,13 +1835,25 @@ impl ExternalChildRunner for ActorChildRunner {
             // Recompute after claim reconciliation: a warm retry may have had a
             // canonical receipt whose transcript proof was restored above.
             let messages = if let Some(binding) = &required_context {
-                binding.validate_messages(&session.id, &session.messages)
+                binding
+                    .validate_messages(&session.id, &session.messages)
                     .map_err(|error| AgentError::Budget(error.to_string()))?;
-                session.messages.iter().map(serde_json::to_value)
+                session
+                    .messages
+                    .iter()
+                    .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|_| AgentError::Budget(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?
+                    .map_err(|_| {
+                        AgentError::Budget(
+                            bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                        )
+                    })?
             } else {
-                session.messages.iter().filter_map(|message| serde_json::to_value(message).ok()).collect()
+                session
+                    .messages
+                    .iter()
+                    .filter_map(|message| serde_json::to_value(message).ok())
+                    .collect()
             };
 
             if let Err(e) = client
@@ -1906,7 +1963,10 @@ impl ExternalChildRunner for ActorChildRunner {
             //     member (a wedged worker must not fail the run when the pool has others).
             //   - Remote: a FIXED endpoint has no alternative — fall through to a bounded
             //     WorkerUnresponsive error (far better than the previous infinite hang).
-            if attempt == 0 && matches!(result, Err(AgentError::WorkerUnresponsive(_))) {
+            if required_context.is_none()
+                && attempt == 0
+                && matches!(result, Err(AgentError::WorkerUnresponsive(_)))
+            {
                 match kind {
                     PlacementKind::Local => {
                         tracing::warn!(

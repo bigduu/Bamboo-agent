@@ -90,6 +90,17 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    async fn validate_required_child_context_route(
+        &self,
+        session: &bamboo_agent_core::Session,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            if runner.should_handle(session).await {
+                return runner.validate_required_child_context_route(session).await;
+            }
+        }
+        Err("required_child_context_unsupported: no matching registered worker route".into())
+    }
     async fn should_handle(&self, session: &bamboo_agent_core::Session) -> bool {
         for runner in &self.runners {
             if runner.should_handle(session).await {
@@ -441,6 +452,7 @@ fn build_local_actor_runner(
         sub.max_concurrent
             .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )
+    .with_builtin_required_context_route(sub.worker_bin.is_none() && sub.worker_args.is_none())
     .with_remote_placements(resolve_remote_placements(
         &sub.remote_placements,
         &config.cluster_fabric.nodes,
@@ -789,6 +801,57 @@ pub fn extract_provider_credentials(
 
 #[cfg(test)]
 mod codex_runtime_config_tests {
+    #[tokio::test]
+    async fn required_context_uses_registered_launch_snapshot_after_live_config_flip() {
+        let mut candidate = bamboo_agent_core::Session::new("preflight", "model");
+        candidate.metadata = super::super::config::resolve_runtime_metadata(
+            &bamboo_llm::Config::default(),
+            "worker",
+        );
+        candidate
+            .metadata
+            .insert("subagent_type".into(), "worker".into());
+        for kind in ["custom", "args", "codex", "remote"] {
+            let mut config = bamboo_llm::Config::default();
+            let sub = config.subagents_mut();
+            sub.broker = Some(bamboo_config::BrokerClientConfig {
+                endpoint: "ws://127.0.0.1:9998".into(),
+                token: "fixture".into(),
+                ..Default::default()
+            });
+            match kind {
+                "custom" => sub.worker_bin = Some("/bin/false".into()),
+                "args" => sub.worker_args = Some(vec!["subagent-worker".into()]),
+                "codex" => sub.executor = Some("codex".into()),
+                _ => sub
+                    .remote_placements
+                    .push(bamboo_config::RemoteActorPlacement {
+                        role: "worker".into(),
+                        endpoint: "ws://127.0.0.1:9999".into(),
+                        ..Default::default()
+                    }),
+            }
+            let live = std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
+            let runner = super::build_external_child_runner_with_live_config_and_codex_tokens(
+                &config,
+                live.clone(),
+                None,
+                None,
+                None,
+                None,
+            );
+            *live.write().await = bamboo_llm::Config::default();
+            let error = runner
+                .validate_required_child_context_route(&candidate)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("required_child_context_unsupported"),
+                "{kind}"
+            );
+        }
+    }
+
     use super::{
         codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_mode_name,
         codex_sandbox_name, codex_wire_api_name, subagent_executor_spec,

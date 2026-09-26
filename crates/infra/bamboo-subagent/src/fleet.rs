@@ -20,8 +20,8 @@ use tokio::time::{sleep, timeout, Instant};
 use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
 use crate::provision::{
-    ProvisionSpec, WorkerCapabilityReport, WorkerOwner, TYPED_READ_ONLY_WORKER_CAPABILITY,
-    REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+    ProvisionSpec, WorkerCapabilityReport, WorkerOwner, REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+    TYPED_READ_ONLY_WORKER_CAPABILITY,
 };
 use crate::transport::{TransportError, TransportResult};
 
@@ -56,7 +56,8 @@ fn validate_required_capability(output: &[u8], capability: &str) -> TransportRes
     })?;
     if (capability == REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY
         && report.provision_version != crate::provision::PROVISION_VERSION)
-        || !report.supports(capability) {
+        || !report.supports(capability)
+    {
         return Err(TransportError::Protocol(format!(
             "worker does not acknowledge required capability '{capability}'"
         )));
@@ -112,7 +113,12 @@ async fn ensure_provision_capabilities(
         require_typed_read_only_worker_capability(worker_bin, worker_args).await?;
     }
     if spec.capabilities.required_child_context {
-        require_worker_capability(worker_bin, worker_args, REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY).await?;
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+        )
+        .await?;
     }
     Ok(())
 }

@@ -66,7 +66,9 @@ pub async fn run() -> std::result::Result<(), String> {
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
     let provisioned_permission = spec.capabilities.permission_resolution()?;
-    if spec.capabilities.required_child_context && (spec.reusable || !matches!(spec.executor, ExecutorSpec::BambooRuntime)) {
+    if spec.capabilities.required_child_context
+        && (spec.reusable || !matches!(spec.executor, ExecutorSpec::BambooRuntime))
+    {
         return Err("required_child_context_unsupported: fresh Bamboo worker required".into());
     }
     if let Some(owner) = spec.owner.as_ref() {
@@ -1334,23 +1336,45 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 .no_human_approver = true;
         }
         let rehydrated: Vec<Message> = if self.required_child_context {
-            match run.messages.iter().cloned().map(serde_json::from_value::<Message>)
-                .collect::<Result<Vec<_>, _>>() {
+            match run
+                .messages
+                .iter()
+                .cloned()
+                .map(serde_json::from_value::<Message>)
+                .collect::<Result<Vec<_>, _>>()
+            {
                 Ok(messages) => messages,
-                Err(_) => return ChildOutcome::error(bamboo_domain::ChildContextPacketError::Invalid.to_string()),
+                Err(_) => {
+                    return ChildOutcome::error(
+                        bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                    )
+                }
             }
         } else {
-            run.messages.iter().filter_map(|value| serde_json::from_value::<Message>(value.clone()).ok()).collect()
+            run.messages
+                .iter()
+                .filter_map(|value| serde_json::from_value::<Message>(value.clone()).ok())
+                .collect()
         };
         if self.required_child_context {
-            let binding = match bamboo_domain::ChildContextBinding::from_messages(&session.id, &run.assignment, &rehydrated) {
+            let binding = match bamboo_domain::ChildContextBinding::from_messages(
+                &session.id,
+                &run.assignment,
+                &rehydrated,
+            ) {
                 Ok(binding) => binding,
                 Err(error) => return ChildOutcome::error(error.to_string()),
             };
-            if session.parent_session_id.as_deref() != Some(binding.payload.parent_session_id.as_str()) {
-                return ChildOutcome::error(bamboo_domain::ChildContextPacketError::Invalid.to_string());
+            if session.parent_session_id.as_deref()
+                != Some(binding.payload.parent_session_id.as_str())
+            {
+                return ChildOutcome::error(
+                    bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                );
             }
-            if let Err(error) = binding.install(&mut session) { return ChildOutcome::error(error.to_string()); }
+            if let Err(error) = binding.install(&mut session) {
+                return ChildOutcome::error(error.to_string());
+            }
         }
         if rehydrated.is_empty() {
             session.add_message(Message::user(run.assignment.clone()));
@@ -2241,6 +2265,90 @@ mod tests {
             confirmations.push(confirmation);
         }
         (outcome, confirmations)
+    }
+
+    fn required_packet_run(id: &str, tiny: bool) -> RunSpec {
+        let parent = Session::new("parent", "test-model");
+        let packet = bamboo_domain::ChildContextPacket {
+            version: 1,
+            objective: "required完整 🪷".into(),
+            constraints: vec!["do not expand".into()],
+            acceptance: vec!["evidence complete".into()],
+            non_goals: vec![],
+            necessary_user_instructions: vec![],
+            recorded_decisions: vec![],
+            source_user_message_ids: vec![],
+            background_message_ids: vec![],
+        };
+        let resolved = packet.resolve(&parent, "bounded task").unwrap();
+        let mut binding = bamboo_domain::ChildContextBinding::new(
+            &parent,
+            id,
+            resolved.required_brief.clone(),
+            resolved,
+        )
+        .unwrap();
+        let mut child = Session::new_child_of(id, &parent, "test-model", "packet");
+        child.token_budget = Some(bamboo_domain::TokenBudget::with_safety_margin(
+            if tiny { 128 } else { 32_000 },
+            64,
+            Default::default(),
+            0,
+        ));
+        binding.bind_host_budget(&child).unwrap();
+        let mut run = protocol_run(id, "packet-run", vec![]);
+        run.assignment = binding.payload.required_assignment.clone();
+        run.messages = vec![
+            serde_json::to_value(Message::system("system")).unwrap(),
+            serde_json::to_value(binding.assignment_message()).unwrap(),
+        ];
+        run
+    }
+
+    #[tokio::test]
+    async fn required_worker_installs_exact_budget_and_preserves_provider_assignment() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, mut executor, store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        executor.required_child_context = true;
+        let run = required_packet_run("packet-child", false);
+        let assignment = run.assignment.clone();
+        let (outcome, _) = execute_protocol_run(&executor, run).await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        let saved = store.load_session("packet-child").await.unwrap().unwrap();
+        assert_eq!(
+            saved.token_budget.as_ref().unwrap().max_context_tokens,
+            32_000
+        );
+        assert!(bamboo_domain::ChildContextBinding::from_session(&saved)
+            .unwrap()
+            .is_some());
+        assert!(provider.calls.lock().unwrap()[0]
+            .iter()
+            .any(|message| message.content == assignment));
+    }
+
+    #[tokio::test]
+    async fn required_worker_rejects_malformed_missing_modified_or_unfittable_before_provider() {
+        for damage in 0..4 {
+            let provider = Arc::new(RecordingWorkerProvider::default());
+            let (_temp, mut executor, _store, _inbox) =
+                worker_protocol_fixture(provider.clone()).await;
+            executor.required_child_context = true;
+            let mut run = required_packet_run("packet-child", damage == 3);
+            match damage {
+                0 => run.messages.push(serde_json::json!({"bad":"message"})),
+                1 => {
+                    run.messages.pop();
+                }
+                2 => {
+                    run.messages[1]["content"] = serde_json::json!("modified required instruction")
+                }
+                _ => {}
+            }
+            let (outcome, _) = execute_protocol_run(&executor, run).await;
+            assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Error);
+            assert!(provider.calls.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
