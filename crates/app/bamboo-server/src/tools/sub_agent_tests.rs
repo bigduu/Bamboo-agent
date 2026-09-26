@@ -1652,6 +1652,191 @@ async fn cancelled_send_message_finishes_activation_failure_after_inbox_admissio
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn plan_workspace_selection_uses_durable_metadata_and_current_project_default() {
+    use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .adapter
+        .load_root_session(&harness.parent_session_id)
+        .await
+        .unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let selected_path = selected
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    parent.workspace = Some(harness.workspace_path.to_string_lossy().into_owned());
+    parent.set_workspace_path_meta(&selected_path);
+    // A prior publication cache and legacy field cannot beat durable metadata.
+    bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        &parent.id,
+        harness.workspace_path.clone(),
+    );
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(path, selected_path);
+    assert_eq!(source, WorkspaceSource::Session);
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, Some(harness.workspace_path.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(path, harness.workspace_path.to_string_lossy());
+    assert_eq!(source, WorkspaceSource::Explicit);
+    parent.metadata.remove("workspace_path");
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(path, harness.workspace_path.to_string_lossy());
+    assert_eq!(source, WorkspaceSource::Session);
+
+    let project = harness
+        .project_store
+        .create_with_project_path("Plan Project", None, selected_path.as_str(), Vec::new())
+        .unwrap();
+    parent.set_project_id_meta(project.id.to_string());
+    parent.set_workspace_path_meta(&selected_path);
+    parent.metadata.insert(
+        WORKSPACE_SOURCE_METADATA_KEY.into(),
+        "project_default".into(),
+    );
+    let moved = tempfile::tempdir().unwrap();
+    let project = harness
+        .project_store
+        .update_with_project_path(
+            &project.id,
+            project.revision,
+            moved.path().to_str().unwrap(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(Some(path.as_str()), project.project_path.as_deref());
+    assert_eq!(source, WorkspaceSource::ProjectDefault);
+    // Assigned parents without durable metadata also use the current Project,
+    // even if an older legacy workspace field remains populated.
+    parent.metadata.remove("workspace_path");
+    parent.metadata.remove(WORKSPACE_SOURCE_METADATA_KEY);
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(Some(path.as_str()), project.project_path.as_deref());
+    assert_eq!(source, WorkspaceSource::ProjectDefault);
+}
+
+#[tokio::test]
+async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persistence() {
+    let harness = build_test_harness().await;
+    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+    let mut parent = harness
+        .adapter
+        .load_root_session(&harness.parent_session_id)
+        .await
+        .unwrap();
+    parent.workspace = None;
+    // Deliberately leave a cached fallback present: it supplies no authority.
+    bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        &parent.id,
+        harness.workspace_path.clone(),
+    );
+    let storage_dir = harness.workspace_path.parent().unwrap().join("storage");
+    let before = std::fs::read_dir(&storage_dir).unwrap().count();
+    let invalid = tempfile::NamedTempFile::new().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    harness
+        .project_store
+        .create_with_project_path(
+            "Foreign Plan Project",
+            None,
+            foreign.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .unwrap();
+    for workspace in [None, Some(invalid.path()), Some(foreign.path())] {
+        if let Some(path) = workspace {
+            parent.set_workspace_path_meta(path.to_string_lossy());
+        } else {
+            parent.metadata.remove("workspace_path");
+            if let Some(metadata) = parent.runtime_metadata.as_mut() {
+                metadata.workspace_path = None;
+            }
+        }
+        harness.storage.save_session(&parent).await.unwrap();
+        let error = invoke_plan_completed(
+            &tool,
+            json!({"task":"Inspect without writes"}),
+            subagent_test_ctx(&parent.id, "tc_invalid_plan_workspace"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_dir(&storage_dir).unwrap().count(),
+            before,
+            "invalid default must not persist a Child"
+        );
+        assert!(!harness
+            .storage
+            .load_session(&parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|runtime| runtime.waiting_for_children.is_some()));
+    }
+    // Explicit override remains subject to the same foreign ownership check.
+    let error = invoke_plan_completed(
+        &tool,
+        json!({"task":"Inspect", "workspace":foreign.path()}),
+        subagent_test_ctx(&parent.id, "tc_explicit_foreign_plan"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArguments(_)));
+    assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
+
+    // An assigned legacy path is not a canonical Project selection. Neither
+    // a relative cwd nor an older valid path repairs an unconfigured Project.
+    let unconfigured = harness
+        .project_store
+        .create("Unconfigured Plan Project", None)
+        .unwrap();
+    parent.set_project_id_meta(unconfigured.id.to_string());
+    parent.metadata.remove("workspace_path");
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    for legacy in [".", harness.workspace_path.to_str().unwrap()] {
+        parent.workspace = Some(legacy.into());
+        harness.storage.save_session(&parent).await.unwrap();
+        let error = invoke_plan_completed(
+            &tool,
+            json!({"task":"Inspect without writes"}),
+            subagent_test_ctx(&parent.id, "tc_assigned_legacy_plan"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert!(error.to_string().contains("project_path"), "{error}");
+        assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
+    }
+}
+
+#[tokio::test]
 async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_wait() {
     let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
         Box::pin(async move {
