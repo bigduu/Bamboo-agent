@@ -65,6 +65,8 @@ mod default_actor_context;
 mod default_actor_context_tests;
 #[cfg(test)]
 mod startup_sidecar_tests;
+#[cfg(test)]
+mod task_publication_lifetime_tests;
 use default_actor_context::DefaultWriterGuards;
 mod root_context;
 #[cfg(test)]
@@ -218,12 +220,19 @@ impl Drop for RuntimeTaskTransactionReadGuard {
     }
 }
 
+/// Clones retain the same exclusive process gate and physical file lock.
+/// A started filesystem job owns a clone independently of its async waiter.
+#[derive(Clone)]
 struct RuntimeTaskTransactionWriteGuard {
+    _lease: Arc<RuntimeTaskTransactionWriteLease>,
+}
+
+struct RuntimeTaskTransactionWriteLease {
     _process: OwnedRwLockWriteGuard<()>,
     file: std::fs::File,
 }
 
-impl Drop for RuntimeTaskTransactionWriteGuard {
+impl Drop for RuntimeTaskTransactionWriteLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
@@ -1090,6 +1099,8 @@ pub struct SessionStoreV2 {
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
     #[cfg(test)]
     migration_scan_pause: std::sync::Mutex<Option<startup_sidecar_tests::ScanPause>>,
+    #[cfg(test)]
+    task_write_hook: std::sync::Mutex<Option<Arc<task_publication_lifetime_tests::TaskWriteHook>>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1367,6 +1378,8 @@ impl SessionStoreV2 {
         let persistence_metrics = Arc::new(SessionPersistenceMetrics::default());
         let search_index_queue =
             SearchIndexQueue::new(search_index.clone(), persistence_metrics.clone());
+        #[cfg(test)]
+        let task_write_hook = task_publication_lifetime_tests::constructor_hook(&bamboo_home_dir);
         let storage = Self {
             bamboo_home_dir,
             sessions_dir,
@@ -1402,6 +1415,8 @@ impl SessionStoreV2 {
             default_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             migration_scan_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            task_write_hook: std::sync::Mutex::new(task_write_hook),
         };
 
         // Create and permission the private journal directory once at store
@@ -1423,7 +1438,7 @@ impl SessionStoreV2 {
             storage.migrate_root_tool_authority_proofs(false).await?;
             storage.migrate_supervisor_proof(false).await?;
             storage
-                .recover_all_runtime_task_transactions_locked()
+                .recover_all_runtime_task_transactions_locked(&_runtime_task)
                 .await?;
             storage
                 .recover_all_session_copy_transactions_locked()
@@ -1442,7 +1457,7 @@ impl SessionStoreV2 {
             let _lifecycle = storage.lock_session_lifecycle_exclusive().await?;
             let _runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
             storage
-                .recover_all_runtime_task_transactions_locked()
+                .recover_all_runtime_task_transactions_locked(&_runtime_task)
                 .await?;
             storage
                 .recover_all_session_copy_transactions_locked()
@@ -2121,8 +2136,10 @@ impl SessionStoreV2 {
             .await;
         let file = self.open_runtime_task_transaction_file(true).await?;
         Ok(RuntimeTaskTransactionWriteGuard {
-            _process: process,
-            file,
+            _lease: Arc::new(RuntimeTaskTransactionWriteLease {
+                _process: process,
+                file,
+            }),
         })
     }
 
@@ -2918,6 +2935,7 @@ impl SessionStoreV2 {
         &self,
         session: &Session,
         event: RuntimeTaskDurabilityEvent,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         validate_session_id(&session.id)?;
         let Some(rel) = self.resolve_rel_path(&session.id).await else {
@@ -2926,7 +2944,7 @@ impl SessionStoreV2 {
                 format!("session {} has no persisted runtime target", session.id),
             ));
         };
-        self.write_runtime_sidecar_durable(&self.abs_path_from_rel(&rel), session)
+        self.write_runtime_sidecar_durable(&self.abs_path_from_rel(&rel), session, guard)
             .await?;
         self.record_runtime_task_durability_event(event);
         Ok(())
@@ -3083,6 +3101,7 @@ impl SessionStoreV2 {
         &self,
         undo: &TaskControlPlaneUndo,
         fault: RuntimeTaskTransactionFault,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         self.maybe_fail_runtime_task_transaction(fault)?;
         let Some((abs_dir, mut current)) = self
@@ -3107,7 +3126,7 @@ impl SessionStoreV2 {
         };
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
             .await?;
-        self.write_runtime_sidecar_durable(&abs_dir, &current)
+        self.write_runtime_sidecar_durable(&abs_dir, &current, guard)
             .await?;
         self.record_runtime_task_durability_event(event);
         Ok(())
@@ -3116,12 +3135,14 @@ impl SessionStoreV2 {
     async fn rollback_runtime_task_journal(
         &self,
         journal: &RuntimeTaskTransactionJournal,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         let mut errors = Vec::new();
         if let Err(error) = self
             .restore_runtime_task_undo(
                 &journal.first,
                 RuntimeTaskTransactionFault::FirstRollbackWrite,
+                guard,
             )
             .await
         {
@@ -3131,6 +3152,7 @@ impl SessionStoreV2 {
             .restore_runtime_task_undo(
                 &journal.second,
                 RuntimeTaskTransactionFault::SecondRollbackWrite,
+                guard,
             )
             .await
         {
@@ -3150,6 +3172,7 @@ impl SessionStoreV2 {
         &self,
         path: &Path,
         journal: &RuntimeTaskTransactionJournal,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         let state = RuntimeTaskJournalMarkerState::from_path(path).ok_or_else(|| {
             io::Error::new(
@@ -3158,12 +3181,15 @@ impl SessionStoreV2 {
             )
         })?;
         if state != RuntimeTaskJournalMarkerState::Committed {
-            self.rollback_runtime_task_journal(journal).await?;
+            self.rollback_runtime_task_journal(journal, guard).await?;
         }
         self.remove_runtime_task_journal(path).await
     }
 
-    async fn recover_all_runtime_task_transactions_locked(&self) -> io::Result<()> {
+    async fn recover_all_runtime_task_transactions_locked(
+        &self,
+        guard: &RuntimeTaskTransactionWriteGuard,
+    ) -> io::Result<()> {
         let paths = self.runtime_task_journal_paths().await?;
         for path in paths {
             let journal = match self.read_runtime_task_journal(&path).await {
@@ -3174,7 +3200,10 @@ impl SessionStoreV2 {
                     return Err(error);
                 }
             };
-            if let Err(error) = self.recover_runtime_task_journal(&path, &journal).await {
+            if let Err(error) = self
+                .recover_runtime_task_journal(&path, &journal, guard)
+                .await
+            {
                 self.runtime_task_recovery_required
                     .store(true, Ordering::Release);
                 return Err(error);
@@ -3406,6 +3435,7 @@ impl SessionStoreV2 {
         &self,
         first_session_id: &str,
         second_session_id: &str,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         validate_session_id(first_session_id)?;
         validate_session_id(second_session_id)?;
@@ -3422,7 +3452,8 @@ impl SessionStoreV2 {
             if RuntimeTaskJournalMarkerState::from_path(&path)
                 == Some(RuntimeTaskJournalMarkerState::Committed)
             {
-                self.recover_runtime_task_journal(&path, &journal).await?;
+                self.recover_runtime_task_journal(&path, &journal, guard)
+                    .await?;
                 continue;
             }
             if journal.first.session_id != first_session_id
@@ -3438,7 +3469,10 @@ impl SessionStoreV2 {
                     second_session_id
                 )));
             }
-            if let Err(error) = self.recover_runtime_task_journal(&path, &journal).await {
+            if let Err(error) = self
+                .recover_runtime_task_journal(&path, &journal, guard)
+                .await
+            {
                 self.runtime_task_recovery_required
                     .store(true, Ordering::Release);
                 return Err(error);
@@ -3454,10 +3488,11 @@ impl SessionStoreV2 {
         _path: &Path,
         journal: &RuntimeTaskTransactionJournal,
         primary: io::Error,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         let primary_kind = primary.kind();
         let primary_message = primary.to_string();
-        match self.rollback_runtime_task_journal(journal).await {
+        match self.rollback_runtime_task_journal(journal, guard).await {
             Ok(()) => match self.remove_runtime_task_journal_family(journal).await {
                 Ok(()) => {
                     self.runtime_task_recovery_required
@@ -3491,6 +3526,7 @@ impl SessionStoreV2 {
         &self,
         original: &Session,
         updated: &Session,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<bool> {
         validate_session_id(&original.id)?;
         validate_session_id(&updated.id)?;
@@ -3537,6 +3573,7 @@ impl SessionStoreV2 {
         self.write_existing_runtime_sidecar_durable_unchecked(
             &committed,
             RuntimeTaskDurabilityEvent::SingleUpdatedSidecarPublished,
+            guard,
         )
         .await?;
         Ok(true)
@@ -3548,6 +3585,7 @@ impl SessionStoreV2 {
         first_updated: &Session,
         second_original: &Session,
         second_updated: &Session,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<bool> {
         for session in [
             first_original,
@@ -3678,7 +3716,7 @@ impl SessionStoreV2 {
             self.maybe_fail_runtime_task_transaction(RuntimeTaskTransactionFault::FirstUpdatedWrite)
         {
             return self
-                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error, guard)
                 .await
                 .map(|()| true);
         }
@@ -3686,11 +3724,12 @@ impl SessionStoreV2 {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &first_commit,
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                guard,
             )
             .await
         {
             return self
-                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error, guard)
                 .await
                 .map(|()| true);
         }
@@ -3703,7 +3742,7 @@ impl SessionStoreV2 {
             .maybe_fail_runtime_task_transaction(RuntimeTaskTransactionFault::SecondUpdatedWrite)
         {
             return self
-                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error, guard)
                 .await
                 .map(|()| true);
         }
@@ -3711,11 +3750,12 @@ impl SessionStoreV2 {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &second_commit,
                 RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+                guard,
             )
             .await
         {
             return self
-                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error, guard)
                 .await
                 .map(|()| true);
         }
@@ -3724,7 +3764,12 @@ impl SessionStoreV2 {
             Ok(()) => {}
             Err(RuntimeTaskJournalFinalizeError::Rollback(error)) => {
                 return self
-                    .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                    .fail_runtime_task_transaction_with_rollback(
+                        &journal_path,
+                        &journal,
+                        error,
+                        guard,
+                    )
                     .await
                     .map(|()| true);
             }
@@ -3845,13 +3890,28 @@ impl SessionStoreV2 {
         &self,
         abs_dir: &Path,
         session: &Session,
+        guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
         self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
         let bytes = serde_json::to_vec_pretty(&snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
-        durable_atomic_write(&path, &bytes).await
+        let guard = guard.clone();
+        #[cfg(test)]
+        let hook = self.task_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _task_guard = guard;
+            durable_atomic_write_blocking(&path, &bytes, |_phase| {
+                #[cfg(test)]
+                if let Some(hook) = hook.as_ref() {
+                    hook.visit(&path, _phase)?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| other_io_error(format!("join Task runtime publication job: {error}")))?
     }
 
     /// One-shot migration of legacy Child sidecars (`runtime.json`).
@@ -4367,7 +4427,8 @@ impl SessionStoreV2 {
         // exclusive claim freezes every cross-process source writer while we
         // read session.json/runtime.json and copy referenced attachments.
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         let Some(source_rel) = self.resolve_rel_path(source_id).await else {
             return Ok(None);
@@ -4600,7 +4661,8 @@ impl SessionStoreV2 {
         validate_session_id(session_id)?;
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&runtime_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         let session_write = self.acquire_session_maintenance_lock(session_id).await?;
         let guards = DefaultWriterGuards::exclusive(lifecycle, runtime_task, session_write);
@@ -4650,7 +4712,8 @@ impl SessionStoreV2 {
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
 
         // All decisions are index-only.
@@ -4767,7 +4830,8 @@ impl SessionStoreV2 {
     pub async fn dev_reset(&self) -> io::Result<()> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
 
         let deleted_search_sources = self
@@ -4829,7 +4893,8 @@ impl SessionStoreV2 {
     ) -> io::Result<bool> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         self.delete_session_recursive_locked(session_id, force)
             .await
@@ -5072,9 +5137,11 @@ pub(crate) async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> io::Resul
 enum DurableWritePhase {
     BeforeReplace,
     AfterReplace,
+    #[cfg(test)]
+    BeforeErrorCleanup,
 }
 
-/// Actor authority writes run the complete replacement in one blocking job.
+/// Owned authority and Task writes run the complete replacement in one blocking job.
 /// Its caller owns the lock holder across temp creation, sync, publication,
 /// directory sync and error cleanup; no filesystem subtask can outlive it.
 fn durable_atomic_write_blocking(
@@ -5125,6 +5192,8 @@ fn durable_atomic_write_blocking(
         Ok(())
     })();
     if result.is_err() {
+        #[cfg(test)]
+        let _ = publication_hook(DurableWritePhase::BeforeErrorCleanup);
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -5685,8 +5754,12 @@ impl Storage for SessionStoreV2 {
         second_session_id: &str,
     ) -> io::Result<()> {
         let _guard = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_runtime_task_transaction_for_pair_locked(first_session_id, second_session_id)
-            .await
+        self.recover_runtime_task_transaction_for_pair_locked(
+            first_session_id,
+            second_session_id,
+            &_guard,
+        )
+        .await
     }
 
     async fn save_task_control_plane_if_matches(
@@ -5695,8 +5768,9 @@ impl Storage for SessionStoreV2 {
         updated: &Session,
     ) -> io::Result<bool> {
         let _guard = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
-        self.save_runtime_task_control_plane_if_matches(original, updated)
+        self.recover_all_runtime_task_transactions_locked(&_guard)
+            .await?;
+        self.save_runtime_task_control_plane_if_matches(original, updated, &_guard)
             .await
     }
 
@@ -5711,6 +5785,7 @@ impl Storage for SessionStoreV2 {
         self.recover_runtime_task_transaction_for_pair_locked(
             &first_original.id,
             &second_original.id,
+            &_guard,
         )
         .await?;
         self.save_runtime_task_pair_transaction(
@@ -5718,6 +5793,7 @@ impl Storage for SessionStoreV2 {
             first_updated,
             second_original,
             second_updated,
+            &_guard,
         )
         .await
     }
@@ -5820,7 +5896,7 @@ mod tests {
         Ok((storage, temp_dir))
     }
 
-    fn transaction_task_list(root_id: &str, title: &str) -> TaskList {
+    pub(super) fn transaction_task_list(root_id: &str, title: &str) -> TaskList {
         let now = Utc::now();
         TaskList {
             session_id: root_id.to_string(),
@@ -5836,7 +5912,7 @@ mod tests {
         }
     }
 
-    async fn seed_runtime_task_transaction_pair(
+    pub(super) async fn seed_runtime_task_transaction_pair(
         storage: &SessionStoreV2,
     ) -> io::Result<(Session, Session, Session, Session)> {
         let root_id = "tx-root";
@@ -6412,6 +6488,7 @@ mod tests {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &child_updated,
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                &storage.lock_runtime_task_transaction_exclusive().await?,
             )
             .await?;
         if marker_state == RuntimeTaskJournalMarkerState::Committing {
@@ -6620,6 +6697,7 @@ mod tests {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &child_updated,
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                &storage.lock_runtime_task_transaction_exclusive().await?,
             )
             .await?;
 
@@ -6684,6 +6762,7 @@ mod tests {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &child_updated,
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                &storage.lock_runtime_task_transaction_exclusive().await?,
             )
             .await?;
 
@@ -6745,12 +6824,14 @@ mod tests {
             .write_existing_runtime_sidecar_durable_unchecked(
                 &child_updated,
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                &storage.lock_runtime_task_transaction_exclusive().await?,
             )
             .await?;
         storage
             .write_existing_runtime_sidecar_durable_unchecked(
                 &root_updated,
                 RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+                &storage.lock_runtime_task_transaction_exclusive().await?,
             )
             .await?;
         let committing = prepared.with_extension("committing");
