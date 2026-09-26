@@ -26,13 +26,25 @@ policy in the existing queue wrapper. Semantic ID, envelope, delivery generation
 and original activation intent remain unchanged. A later immediate Interrupt
 message cannot promote an earlier staged or Respect sibling.
 
-Owned mutation APIs finish in a detached Tokio job holding those locks. Caller
-future cancellation does not cancel that job; the operation may still commit,
-and an owned retry or permanent receipt supplies the outcome. The host must keep
-its Tokio runtime alive until mutation jobs finish. Runtime shutdown can abort
-async jobs and has not been fenced or tested here; shutdown/drain and final
-writer lifetime fences are prerequisites tracked by #1341. Production consumers
-must not opt in before those runtime ownership boundaries are implemented.
+Owned mutation APIs retain their detached Tokio transaction for caller-cancellation
+compatibility. In addition, every already-started filesystem mutation reached by
+owned claim/renew/ACK or inspection quarantine owns the original lifecycle shared,
+process operation and Inbox FileExt guards until its complete synchronous job ends
+(#1352). Owned setup also retains the already-acquired lifecycle/process scope
+through Inbox mkdir/open/lock acquisition; that same FD joins the final bundle.
+Guards release in reverse order. No mutation job reacquires them.
+
+Runtime shutdown may drop the async transaction and stop later phases. It does
+not guarantee whole-transaction completion: separate ACT/INT, wrapper/rotation
+and receipt/removal jobs retain their existing partial-state recovery rules. A
+lost response is unconfirmed, and exact retry or permanent receipt supplies the
+outcome. The private writer preserves file fsync, write-error cleanup, rename
+failure temp residue and no parent-directory fsync. Windows uses the existing
+true replace operation, without a remove-first gap.
+
+Compatible producers and ordinary mutation paths still require #1353. Runtime
+admission/renewal/writer release remain #1341; no production consumer opts in
+through this storage change.
 
 An unexpired lease belongs to its owner. The same owner's repeated claim returns
 the same incarnation without extending its expiry. `renew_owned` validates the
@@ -84,3 +96,14 @@ rotation, frozen v2 held-claim ACK behavior, staged messages and both policy
 orders. These are not process-kill experiments or evidence of exactly-once
 provider execution. Runtime queued/inflight renewal and writer/worker release
 fences belong to #1341.
+
+The focused native fixture parks actual std jobs, aborts callers and separately
+shuts down their runtimes. It observes the inner implementation scope Drop while
+independent lifecycle/Inbox FileExt probes and same-adapter process waiters remain
+blocked. Renew-versus-reclaim uses a genuinely expired successor after renewal
+and requires epoch2; ACK-first requires a terminal receipt and no epoch2;
+epoch2-first stale ACK makes no publication. Setup/deletion, header upgrade,
+wrapper/rotation, terminal retries, quarantine and failure cleanup reuse that
+bounded matrix. Executed platform/results must be reported separately from this
+source contract; these are not OS crash, remote parity or provider execution
+proofs.

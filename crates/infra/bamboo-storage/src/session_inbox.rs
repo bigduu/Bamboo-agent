@@ -38,7 +38,7 @@ const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "session_inbox_owned.rs"]
 mod owned;
-use owned::StoredLease;
+use owned::{AckAuthority, OwnedFilesystem, StoredLease};
 
 struct StoredInboxReceipt {
     delivery: SessionInboxReceipt,
@@ -91,6 +91,10 @@ pub struct FileSessionInbox {
     owned_ack_after_receipt_failure: bool,
     #[cfg(test)]
     owned_after_header_failure: bool,
+    #[cfg(test)]
+    owned_fs_hook: Option<owned::FilesystemHook>,
+    #[cfg(test)]
+    owned_scope_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl FileSessionInbox {
@@ -117,6 +121,10 @@ impl FileSessionInbox {
             owned_ack_after_receipt_failure: false,
             #[cfg(test)]
             owned_after_header_failure: false,
+            #[cfg(test)]
+            owned_fs_hook: None,
+            #[cfg(test)]
+            owned_scope_drop: None,
         }
     }
 
@@ -588,6 +596,22 @@ impl FileSessionInbox {
         dir: &Path,
         queue: &str,
     ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
+        Self::queue_entries(dir, queue, None).await
+    }
+
+    async fn owned_queue_entries(
+        dir: &Path,
+        queue: &str,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
+        Self::queue_entries(dir, queue, Some(filesystem)).await
+    }
+
+    async fn queue_entries(
+        dir: &Path,
+        queue: &str,
+        filesystem: Option<&OwnedFilesystem>,
+    ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
         let queue_dir = dir.join(queue);
         let mut reader = match tokio::fs::read_dir(&queue_dir).await {
             Ok(reader) => reader,
@@ -612,9 +636,14 @@ impl FileSessionInbox {
             }
             match Self::claim_generation(&name) {
                 Ok(generation) => valid.push((generation, name, entry.path())),
-                Err(error) => {
-                    Self::quarantine_claim(dir, &entry.path(), &error.to_string()).await?;
-                }
+                Err(error) => match filesystem {
+                    Some(filesystem) => {
+                        filesystem
+                            .quarantine(dir, &entry.path(), &error.to_string())
+                            .await?
+                    }
+                    None => Self::quarantine_claim(dir, &entry.path(), &error.to_string()).await?,
+                },
             }
         }
         Ok(valid)
@@ -880,8 +909,9 @@ impl FileSessionInbox {
         dir: &Path,
         target_session_id: &str,
         claim: &SessionInboxClaim,
-        expected_lease: Option<&StoredLease>,
+        authority: AckAuthority<'_>,
     ) -> Result<(), SessionInboxError> {
+        let expected_lease = authority.lease();
         let cur_path = dir.join("cur").join(&claim.claim_id);
         let bytes = match tokio::fs::read(&cur_path).await {
             Ok(bytes) => bytes,
@@ -981,15 +1011,14 @@ impl FileSessionInbox {
                 admitted_path.display()
             ))
         })?;
-        tokio::fs::create_dir_all(admitted_dir)
-            .await
-            .map_err(|error| {
-                SessionInboxError::Storage(format!(
-                    "create admitted receipt directory {}: {error}",
-                    admitted_dir.display()
-                ))
-            })?;
-        atomic_write(&admitted_path, &receipt)
+        authority.create_dir(admitted_dir).await.map_err(|error| {
+            SessionInboxError::Storage(format!(
+                "create admitted receipt directory {}: {error}",
+                admitted_dir.display()
+            ))
+        })?;
+        authority
+            .write(&admitted_path, &receipt)
             .await
             .map_err(|error| {
                 SessionInboxError::Storage(format!("persist admitted receipt: {error}"))
@@ -1002,7 +1031,7 @@ impl FileSessionInbox {
             ));
         }
 
-        match tokio::fs::remove_file(&cur_path).await {
+        match authority.remove(&cur_path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(SessionInboxError::Storage(format!(
@@ -1392,7 +1421,7 @@ impl SessionInboxPort for FileSessionInbox {
                 "owned Inbox ACK API required".into(),
             ));
         }
-        self.ack_unlocked(&dir, target_session_id, claim, None)
+        self.ack_unlocked(&dir, target_session_id, claim, AckAuthority::Legacy)
             .await
     }
 
@@ -2303,3 +2332,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "session_inbox_owned_lifetime_tests.rs"]
+mod owned_lifetime_tests;

@@ -58,8 +58,198 @@ fn invalid(message: &str) -> SessionInboxError {
     SessionInboxError::InvalidClaim(message.into())
 }
 
+// Field order releases the original Inbox FD, then process mutex, then lifecycle.
+struct OwnedScope {
+    _process: OwnedMutexGuard<()>,
+    _lifecycle: crate::v2::SessionLifecycleReadGuard,
+}
+struct OwnedGuards {
+    _file: FileOperationLock,
+    _scope: Arc<OwnedScope>,
+}
+
+#[cfg(test)]
+pub(super) type FilesystemHook = Arc<dyn Fn(&str, &Path) -> std::io::Result<()> + Send + Sync>;
+
+/// Private mutation capability: constructed only from the actual acquired guards.
+#[derive(Clone)]
+pub(super) struct OwnedFilesystem {
+    guards: Arc<OwnedGuards>,
+    #[cfg(test)]
+    hook: Option<FilesystemHook>,
+}
+
+impl OwnedFilesystem {
+    async fn job<T: Send + 'static>(
+        &self,
+        event: &'static str,
+        path: &Path,
+        job: impl FnOnce(&Self, &Path) -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        let filesystem = self.clone();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // This capture outlives cancellation of the async transaction itself.
+            let _guards = &filesystem.guards;
+            filesystem.observe(event, &path)?;
+            job(&filesystem, &path)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    fn observe(&self, _event: &str, _path: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook(_event, _path)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.job("mkdir", path, |_, path| std::fs::create_dir_all(path))
+            .await
+    }
+
+    pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let bytes = bytes.to_vec();
+        self.job("write", path, move |filesystem, path| {
+            use std::io::Write;
+            let temp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let result = (|| {
+                let mut file = File::create(&temp)?;
+                filesystem.observe("write_temp", path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()
+            })();
+            if let Err(error) = result {
+                // Keep the primary error and the existing best-effort cleanup contract.
+                #[cfg(test)]
+                let _ = filesystem.observe("write_cleanup", path);
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
+            filesystem.observe("replace", path)?;
+            replace(&temp, path)?;
+            filesystem.observe("after_replace", path)
+        })
+        .await
+    }
+
+    pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
+        self.job("remove", path, |_, path| std::fs::remove_file(path))
+            .await
+    }
+
+    async fn rotate(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let to = to.to_owned();
+        self.job("rotate", from, move |_, from| std::fs::rename(from, to))
+            .await
+    }
+
+    pub(super) async fn quarantine(
+        &self,
+        dir: &Path,
+        path: &Path,
+        reason: &str,
+    ) -> Result<(), SessionInboxError> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("claim has no filename"))?;
+        let corrupt = dir.join("corrupt");
+        let to = corrupt.join(name);
+        let reason = reason.to_owned();
+        self.job("quarantine", path, move |_, from| {
+            std::fs::create_dir_all(&corrupt)?;
+            match std::fs::rename(from, &to) {
+                Ok(()) => {
+                    tracing::warn!(path = %to.display(), reason, "quarantined malformed typed session inbox envelope");
+                    Ok(())
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }).await.map_err(|error| SessionInboxError::Storage(error.to_string()))
+    }
+}
+
+// Same replacement and residue contract as v2::atomic_write; no parent-dir fsync.
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The exact owned lease cannot be dispatched without its actual mutation scope.
+pub(super) enum AckAuthority<'a> {
+    Legacy,
+    Owned {
+        lease: &'a StoredLease,
+        filesystem: &'a OwnedFilesystem,
+    },
+}
+impl AckAuthority<'_> {
+    pub(super) fn lease(&self) -> Option<&StoredLease> {
+        match self {
+            Self::Legacy => None,
+            Self::Owned { lease, .. } => Some(lease),
+        }
+    }
+    pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+        match self {
+            Self::Legacy => tokio::fs::create_dir_all(path).await,
+            Self::Owned { filesystem, .. } => filesystem.create_dir(path).await,
+        }
+    }
+    pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Legacy => atomic_write(path, bytes).await,
+            Self::Owned { filesystem, .. } => filesystem.write(path, bytes).await,
+        }
+    }
+    pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
+        match self {
+            Self::Legacy => tokio::fs::remove_file(path).await,
+            Self::Owned { filesystem, .. } => filesystem.remove(path).await,
+        }
+    }
+}
+
+#[cfg(test)]
+struct ScopeDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+#[cfg(test)]
+impl Drop for ScopeDrop {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.0 {
+            dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Dropping the caller's JoinHandle leaves this job running with its locks.
-/// The Tokio runtime itself must outlive the job (see #1341).
+/// Runtime shutdown may stop later phases; each started filesystem job owns its locks.
 pub(super) async fn complete_owned<T: Send + 'static>(
     job: impl std::future::Future<Output = Result<T, SessionInboxError>> + Send + 'static,
 ) -> Result<T, SessionInboxError> {
@@ -69,6 +259,55 @@ pub(super) async fn complete_owned<T: Send + 'static>(
 }
 
 impl FileSessionInbox {
+    async fn owned_filesystem(
+        &self,
+        target: &str,
+    ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        let lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target).await?;
+        let process = self.lock_process(&dir).await;
+        let scope = Arc::new(OwnedScope {
+            _process: process,
+            _lifecycle: lifecycle,
+        });
+        let path = dir.clone();
+        #[cfg(test)]
+        let hook = self.owned_fs_hook.clone();
+        let guards = tokio::task::spawn_blocking(move || {
+            // Acquisition itself owns the already-acquired L/process scope.
+            let _scope = &scope;
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("acquire", &path)?;
+            }
+            std::fs::create_dir_all(&path)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path.join(OPERATION_LOCK_FILE))?;
+            file.lock_exclusive()?;
+            Ok::<_, std::io::Error>(Arc::new(OwnedGuards {
+                _file: FileOperationLock(file),
+                _scope: scope,
+            }))
+        })
+        .await
+        .map_err(|error| {
+            SessionInboxError::Storage(format!("join owned inbox lock task: {error}"))
+        })?
+        .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        Ok((
+            dir,
+            OwnedFilesystem {
+                guards,
+                #[cfg(test)]
+                hook: self.owned_fs_hook.clone(),
+            },
+        ))
+    }
+
     async fn watermark_version(dir: &Path, file: &str) -> Result<u32, SessionInboxError> {
         match tokio::fs::read_to_string(dir.join(file)).await {
             Ok(raw) => {
@@ -128,14 +367,18 @@ impl FileSessionInbox {
             .ok_or_else(|| invalid("owned watermark lacks interrupt snapshot"))
     }
 
-    async fn ensure_owned_format(&self, dir: &Path) -> Result<(), SessionInboxError> {
+    async fn ensure_owned_format(
+        &self,
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
         let enabled = Self::owned_enabled(dir).await?;
         if enabled && Self::watermark_version(dir, INTERRUPT_GENERATION_FILE).await? == 3 {
             return Ok(());
         }
         if !enabled {
             for queue in ["cur", "new"] {
-                for (_, _, path) in Self::valid_queue_entries(dir, queue).await? {
+                for (_, _, path) in Self::owned_queue_entries(dir, queue, filesystem).await? {
                     let (_, lease) = self.read_owned_transport(&path).await?;
                     if lease.is_some() {
                         return Err(invalid("owned lease requires v3 watermarks"));
@@ -158,7 +401,8 @@ impl FileSessionInbox {
                 interrupt_snapshot: (file == ACTIVATION_GENERATION_FILE).then_some(interrupt),
             })
             .map_err(|_| invalid("encode Inbox watermark"))?;
-            atomic_write(&dir.join(file), &bytes)
+            filesystem
+                .write(&dir.join(file), &bytes)
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
             #[cfg(test)]
@@ -239,6 +483,7 @@ impl FileSessionInbox {
         path: &Path,
         wrapper: &InboxMessage,
         lease: &StoredLease,
+        filesystem: &OwnedFilesystem,
     ) -> Result<(), SessionInboxError> {
         let mut value =
             serde_json::to_value(wrapper).map_err(|_| invalid("encode Inbox wrapper"))?;
@@ -249,7 +494,8 @@ impl FileSessionInbox {
         if bytes.len() > self.max_transport_bytes() {
             return Err(invalid("Inbox lease transport exceeds byte limit"));
         }
-        atomic_write(path, &bytes)
+        filesystem
+            .write(path, &bytes)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))
     }
@@ -298,18 +544,20 @@ impl FileSessionInbox {
         request: &SessionInboxLeaseRequest,
     ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
         let expires_at = request.expires_at()?;
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        Mailbox::at(&dir)
-            .ensure_dirs()
-            .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        self.ensure_owned_format(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        for queue in ["new", "cur", "corrupt"] {
+            filesystem
+                .create_dir(&dir.join(queue))
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        }
+        self.ensure_owned_format(&dir, &filesystem).await?;
         let prefix = Self::read_activation_generation(&dir).await?;
         let interrupt = Self::read_interrupt_generation(&dir).await?;
-        let mut entries = Self::valid_queue_entries(&dir, "cur").await?;
-        entries.extend(Self::valid_queue_entries(&dir, "new").await?);
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
         entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let mut result = Vec::new();
         for (generation, _, path) in entries {
@@ -338,7 +586,8 @@ impl FileSessionInbox {
                 {
                     return Err(invalid("Inbox terminal lease mismatch"));
                 }
-                tokio::fs::remove_file(&path)
+                filesystem
+                    .remove(&path)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
                 continue;
@@ -376,7 +625,8 @@ impl FileSessionInbox {
             let canonical = dir.join("cur").join(&name);
             // The unknown kind first fences an old already-held ACK at the
             // old path. Rename then fences it at the path boundary as well.
-            self.write_owned_transport(&path, &wrapper, &lease).await?;
+            self.write_owned_transport(&path, &wrapper, &lease, &filesystem)
+                .await?;
             #[cfg(test)]
             if self.owned_after_write_failure {
                 return Err(invalid("injected Inbox lease rename failure"));
@@ -388,7 +638,8 @@ impl FileSessionInbox {
                 {
                     return Err(invalid("Inbox lease incarnation already exists"));
                 }
-                tokio::fs::rename(&path, &canonical)
+                filesystem
+                    .rotate(&path, &canonical)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
             }
@@ -445,9 +696,9 @@ impl FileSessionInbox {
         if request.consumer != claim.lease.consumer {
             return Err(invalid("Inbox lease consumer mismatch"));
         }
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
         let (wrapper, mut stored) = self.current_owned(&dir, target, claim, request.now).await?;
         #[cfg(test)]
         if let Some((entered, release)) = &self.owned_renew_pause {
@@ -459,6 +710,7 @@ impl FileSessionInbox {
             &dir.join("cur").join(&claim.claim.claim_id),
             &wrapper,
             &stored,
+            &filesystem,
         )
         .await?;
         Self::owned_claim(
@@ -480,9 +732,9 @@ impl FileSessionInbox {
         if claim.claim.envelope.target_session_id != target {
             return Err(invalid("Inbox target mismatch"));
         }
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
         // Check the terminal proof first; an exact ACK retry remains terminal
         // even after the lease would expire. A stale epoch cannot borrow it.
         if let Some(receipt) = Self::admitted_receipt(&dir, &claim.claim.envelope).await? {
@@ -495,8 +747,17 @@ impl FileSessionInbox {
             {
                 return Err(invalid("Inbox terminal lease mismatch"));
             }
+            let lease = receipt.lease.as_ref().expect("validated terminal lease");
             return self
-                .ack_unlocked(&dir, target, &claim.claim, receipt.lease.as_ref())
+                .ack_unlocked(
+                    &dir,
+                    target,
+                    &claim.claim,
+                    AckAuthority::Owned {
+                        lease,
+                        filesystem: &filesystem,
+                    },
+                )
                 .await;
         }
         let (_, stored) = self.current_owned(&dir, target, claim, now).await?;
@@ -505,8 +766,16 @@ impl FileSessionInbox {
             entered.notify_one();
             release.notified().await;
         }
-        self.ack_unlocked(&dir, target, &claim.claim, Some(&stored))
-            .await
+        self.ack_unlocked(
+            &dir,
+            target,
+            &claim.claim,
+            AckAuthority::Owned {
+                lease: &stored,
+                filesystem: &filesystem,
+            },
+        )
+        .await
     }
 
     pub(super) async fn inspect_owned_impl(
@@ -515,11 +784,11 @@ impl FileSessionInbox {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<SessionInboxLeaseInspection>, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        let mut entries = Self::valid_queue_entries(&dir, "cur").await?;
-        entries.extend(Self::valid_queue_entries(&dir, "new").await?);
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
         entries.sort_by_key(|entry| entry.0);
         let mut result = Vec::new();
         for (generation, _, path) in entries {
