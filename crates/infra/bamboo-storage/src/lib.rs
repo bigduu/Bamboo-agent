@@ -19,7 +19,8 @@ pub use search_index::{SessionSearchIndex, SessionSearchMatch};
 pub use session_inbox::FileSessionInbox;
 pub use session_merge::{merge_save_session, LockedSessionStore};
 pub use v2::{
-    CleanupMode, CleanupResult, DurationMetricsSnapshot, SavePersistenceMetricsSnapshot,
+    ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend, CleanupMode,
+    CleanupResult, DurationMetricsSnapshot, SavePersistenceMetricsSnapshot,
     SessionCopyProjectionGuard, SessionIndexEntry, SessionPersistenceMetricsSnapshot,
     SessionPlacement, SessionStoreV2, SessionsIndex,
 };

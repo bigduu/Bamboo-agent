@@ -46,6 +46,10 @@ use bamboo_domain::{
 };
 
 mod actor_directory;
+mod actor_transcript;
+pub use actor_transcript::{
+    ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
+};
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
@@ -53,6 +57,8 @@ mod actor_snapshot;
 mod actor_snapshot_reader;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod actor_snapshot_tests;
+#[cfg(test)]
+mod actor_transcript_tests;
 mod child_project;
 mod default_actor_context;
 #[cfg(test)]
@@ -1077,6 +1083,9 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     actor_write_hook: std::sync::Mutex<Option<Arc<actor_directory_lifetime_tests::ActorWriteHook>>>,
     #[cfg(test)]
+    transcript_write_hook:
+        std::sync::Mutex<Option<Arc<actor_transcript_tests::TranscriptWriteHook>>>,
+    #[cfg(test)]
     default_write_hook:
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
     #[cfg(test)]
@@ -1387,6 +1396,8 @@ impl SessionStoreV2 {
             supervisor_proof_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             actor_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            transcript_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             default_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
