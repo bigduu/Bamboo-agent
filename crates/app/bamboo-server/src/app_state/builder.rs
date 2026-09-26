@@ -983,10 +983,11 @@ impl AppState {
             .set_root_tools(tools.clone())
             .await;
 
-        // Process restart recovery: only backlog covered by its producer's
-        // durable activation watermark requests a run. A child/Bash coordinator
-        // may intentionally stage sibling outcomes while a specific wait remains
-        // armed; admission by itself is not permission to execute.
+        // Restart recovers each immediate intent published with its message,
+        // even if no later wakeup/watermark write completed. The coordinator
+        // prefix remains separate: an immediate message never promotes an
+        // unauthorized staged child/Bash sibling. inspect and claim share the
+        // same durable eligibility rule.
         for entry in session_store.list_index_entries().await {
             match session_inbox.inspect(&entry.id).await {
                 Ok(backlog) if backlog.activation_pending() => {

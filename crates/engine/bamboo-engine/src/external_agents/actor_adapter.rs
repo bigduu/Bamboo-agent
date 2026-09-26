@@ -2222,17 +2222,6 @@ async fn claim_canonical_deliveries(
     if claims.is_empty() {
         return Ok(Vec::new());
     }
-    let interrupt_generation = binding
-        .inbox
-        .inspect(&session.id)
-        .await
-        .map_err(|error| {
-            AgentError::LLM(format!(
-                "inspect canonical SessionInbox activation policy for {}: {error}",
-                session.id
-            ))
-        })?
-        .interrupt_generation;
     let mut unconfirmed = Vec::with_capacity(claims.len());
     for claim in claims {
         if binding
@@ -2275,17 +2264,12 @@ async fn claim_canonical_deliveries(
                 })?;
             continue;
         }
-        let activation_policy = if claim.generation <= interrupt_generation {
-            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
-        } else {
-            bamboo_domain::SessionActivationPolicy::RespectSpecificWait
-        };
         let delivery = SessionMessageDelivery {
             target_session_id: session.id.clone(),
             envelope: claim.envelope.clone(),
             canonical_claim_generation: claim.generation,
             activation_run_id: activation_run_id.to_string(),
-            activation_policy,
+            activation_policy: claim.activation_policy,
         };
         deliveries.push((claim, delivery));
     }
@@ -3797,6 +3781,120 @@ mod tests {
             inbox,
             storage,
             persistence,
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_immediate_claims_keep_exact_policy_across_mixed_order_ack_and_restart() {
+        use bamboo_domain::{SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope};
+        for policies in [
+            [
+                SessionActivationPolicy::RespectSpecificWait,
+                SessionActivationPolicy::InterruptSpecificWait,
+            ],
+            [
+                SessionActivationPolicy::InterruptSpecificWait,
+                SessionActivationPolicy::RespectSpecificWait,
+            ],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let session_id = "actor-mixed-intent-policy";
+            store
+                .save_session(&Session::new(session_id, "model"))
+                .await
+                .unwrap();
+            let inbox = bamboo_storage::FileSessionInbox::new(store, SessionInboxLimits::default());
+            let staged = SessionMessageEnvelope::user_input(session_id, "staged sibling");
+            let staged_receipt = inbox.deliver(&staged).await.unwrap();
+            let mut sent = Vec::new();
+            for policy in policies {
+                let envelope = SessionMessageEnvelope::user_input(session_id, "immediate");
+                let receipt = inbox
+                    .deliver_with_activation_intent(&envelope, policy, None)
+                    .await
+                    .unwrap();
+                sent.push((envelope, policy, receipt));
+            }
+            let restarted = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                restarted.clone(),
+                SessionInboxLimits::default(),
+            ));
+            let binding = actor_binding(
+                restarted.clone(),
+                inbox.clone(),
+                Arc::new(bamboo_storage::LockedSessionStore::new(restarted.clone())),
+            );
+            let mut session = restarted.load_session(session_id).await.unwrap().unwrap();
+            let pairs = claim_canonical_deliveries(&binding, &mut session, "run-1", usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(pairs.len(), 2, "the staged sibling has no permission");
+            for ((claim, delivery), (envelope, policy, receipt)) in pairs.iter().zip(&sent) {
+                assert_eq!(claim.envelope.id, envelope.id);
+                assert_eq!(claim.generation, receipt.generation);
+                assert_eq!(claim.activation_policy, *policy);
+                assert_eq!(delivery.activation_policy, *policy);
+                checkpoint_and_ack_canonical_claim(&binding, &mut session, claim)
+                    .await
+                    .unwrap();
+            }
+            let restarted = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                restarted.clone(),
+                SessionInboxLimits::default(),
+            ));
+            let binding = actor_binding(
+                restarted.clone(),
+                inbox.clone(),
+                Arc::new(bamboo_storage::LockedSessionStore::new(restarted.clone())),
+            );
+            session = restarted.load_session(session_id).await.unwrap().unwrap();
+            for (envelope, policy, receipt) in &sent {
+                assert_eq!(
+                    inbox
+                        .deliver_with_activation_intent(envelope, *policy, None)
+                        .await
+                        .unwrap(),
+                    *receipt
+                );
+            }
+            assert!(
+                claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            inbox
+                .mark_activation_eligible(
+                    session_id,
+                    staged_receipt.generation,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            let pairs = claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0.envelope.id, staged.id);
+            assert_eq!(
+                pairs[0].1.activation_policy,
+                SessionActivationPolicy::RespectSpecificWait
+            );
         }
     }
 
