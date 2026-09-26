@@ -722,6 +722,85 @@ pub struct SessionInboxClaim {
     pub claim_id: String,
 }
 
+/// Caller-owned identity for the opt-in storage lease protocol. Runtime
+/// consumers must supply a fresh identity for each independent consumer.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionInboxConsumerId(String);
+
+impl SessionInboxConsumerId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for SessionInboxConsumerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SessionInboxConsumerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionInboxConsumerId(<opaque>)")
+    }
+}
+
+/// Durable storage authority, independent of transcript/provider authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInboxLeaseToken {
+    pub consumer: SessionInboxConsumerId,
+    pub epoch: u64,
+    pub expires_at: DateTime<Utc>,
+    pub incarnation: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInboxOwnedClaim {
+    pub claim: SessionInboxClaim,
+    pub lease: SessionInboxLeaseToken,
+}
+
+/// The caller supplies a trusted clock; no background expiry driver is implied.
+#[derive(Debug, Clone)]
+pub struct SessionInboxLeaseRequest {
+    pub consumer: SessionInboxConsumerId,
+    pub now: DateTime<Utc>,
+    pub duration: chrono::Duration,
+}
+
+impl SessionInboxLeaseRequest {
+    pub fn expires_at(&self) -> Result<DateTime<Utc>, SessionInboxError> {
+        if self.consumer.as_str().is_empty()
+            || self.consumer.as_str().len() > 128
+            || self.duration <= chrono::Duration::zero()
+            || self.duration > chrono::Duration::hours(1)
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "invalid Inbox lease request".into(),
+            ));
+        }
+        self.now
+            .checked_add_signed(self.duration)
+            .ok_or_else(|| SessionInboxError::InvalidClaim("Inbox lease expiry overflow".into()))
+    }
+}
+
+/// Bounded operational evidence, deliberately excluding identity and payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxLeaseInspection {
+    pub generation: u64,
+    pub epoch: u64,
+    pub expires_at: DateTime<Utc>,
+    pub expired: bool,
+    pub reclaim_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionInboxBacklog {
     pub pending: usize,
@@ -798,6 +877,55 @@ pub enum SessionInboxError {
 /// but every address is a stable logical session id.
 #[async_trait]
 pub trait SessionInboxPort: Send + Sync {
+    /// Irreversibly opt this queue into owned claims. Legacy claim/ACK APIs
+    /// must fail closed afterwards. This does not enable production expiry.
+    async fn claim_owned(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _active_run_id: Option<&str>,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    async fn renew_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _request: &SessionInboxLeaseRequest,
+    ) -> Result<SessionInboxOwnedClaim, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    /// Requires the caller's durable transcript checkpoint, just like `ack`.
+    /// Terminal retries require the exact lease identity; expiry cannot undo ACK.
+    async fn ack_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _now: DateTime<Utc>,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
+    async fn inspect_owned_leases(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<SessionInboxLeaseInspection>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox leases unsupported".into(),
+        ))
+    }
+
     async fn deliver(
         &self,
         envelope: &SessionMessageEnvelope,
