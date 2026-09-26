@@ -1136,6 +1136,17 @@ impl ChildExecutor for BambooRuntimeExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        // Validate before seeding any activation. Product thinking modes are
+        // not per-call efforts, and malformed supplied values must not default.
+        let reasoning_effort = match run.reasoning_effort.as_ref() {
+            Some(value) => match serde_json::from_value::<bamboo_domain::ReasoningEffort>(
+                serde_json::Value::String(value.clone()),
+            ) {
+                Ok(effort) => Some(effort),
+                Err(_) => return ChildOutcome::error("invalid RunSpec reasoning_effort"),
+            },
+            None => None,
+        };
         // Fresh activation snapshot in the worker's isolated store. Its id is
         // the DOMAIN logical Session id carried by RunSpec; process/mailbox/pool
         // identity is never used as persistence or routing identity.
@@ -1195,6 +1206,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // never replaces it. The host-provided prior conversation remains the
         // canonical activation snapshot.
         let mut session = Session::new(logical_session_id, self.model.clone().unwrap_or_default());
+        // Per-Run authority replaces the prior warm activation's selection;
+        // omission takes the existing ordinary default path, not a latched value.
+        session.reasoning_effort = reasoning_effort;
         if let Some(identity) = logical_identity {
             session.parent_session_id = identity.parent_session_id;
             session.root_session_id = if identity.root_session_id.trim().is_empty() {
@@ -1783,6 +1797,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
         if let Some(model) = self.model.clone() {
             builder = builder.model(model);
         }
+        if let Some(effort) = reasoning_effort {
+            builder = builder.reasoning_effort(effort);
+        }
         if let Some(disabled) = self.disabled_tools.clone() {
             builder = builder.disabled_tools(disabled);
         }
@@ -1953,12 +1970,29 @@ mod tests {
     #[derive(Default)]
     struct RecordingWorkerProvider {
         calls: std::sync::Mutex<Vec<Vec<Message>>>,
+        efforts: std::sync::Mutex<Vec<Option<bamboo_domain::ReasoningEffort>>>,
         hold: bool,
         started: tokio::sync::Notify,
     }
 
     #[async_trait]
     impl LLMProvider for RecordingWorkerProvider {
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&bamboo_llm::provider::LLMRequestOptions>,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.efforts
+                .lock()
+                .unwrap()
+                .push(options.and_then(|options| options.reasoning_effort));
+            self.chat_stream(messages, tools, max_output_tokens, model)
+                .await
+        }
+
         async fn chat_stream(
             &self,
             messages: &[Message],
@@ -2187,6 +2221,63 @@ mod tests {
             confirmations.push(confirmation);
         }
         (outcome, confirmations)
+    }
+
+    #[tokio::test]
+    async fn worker_effort_is_per_run_and_invalid_values_do_not_seed_or_call_provider() {
+        use bamboo_domain::ReasoningEffort;
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, executor, store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        for (index, effort) in [
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Disabled),
+            None,
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::Xhigh),
+            Some(ReasoningEffort::Max),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Pool reuse keeps the worker alive for different logical children.
+            // Repeated activation of one Child is a separate birth-identity gap.
+            let session_id = format!("effort-child-{index}");
+            let mut run = protocol_run(&session_id, &format!("run-{index}"), vec![]);
+            run.reasoning_effort = effort.map(|effort| effort.as_str().to_owned());
+            let (outcome, _) = execute_protocol_run(&executor, run).await;
+            assert_eq!(
+                outcome.status,
+                bamboo_subagent::TerminalStatus::Completed,
+                "run {index}: {:?}",
+                outcome.error
+            );
+            assert_eq!(*provider.efforts.lock().unwrap().last().unwrap(), effort);
+            let saved = store.load_session(&session_id).await.unwrap().unwrap();
+            assert_eq!(saved.reasoning_effort, effort);
+            assert_eq!(saved.kind, SessionKind::Child);
+            assert_eq!(
+                saved.root_thinking_mode(),
+                bamboo_domain::RootThinkingMode::Standard
+            );
+        }
+        let calls = provider.calls.lock().unwrap().len();
+        for invalid in ["ultra", "unknown", "", "Low", " low "] {
+            let mut run = protocol_run("invalid-effort-child", "invalid-run", vec![]);
+            run.reasoning_effort = Some(invalid.to_owned());
+            let (outcome, _) = execute_protocol_run(&executor, run).await;
+            assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Error);
+            assert_eq!(
+                outcome.error.as_deref(),
+                Some("invalid RunSpec reasoning_effort")
+            );
+            assert_eq!(provider.calls.lock().unwrap().len(), calls);
+            assert!(store
+                .load_session("invalid-effort-child")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]
