@@ -46,6 +46,8 @@ use bamboo_domain::{
 };
 
 mod actor_directory;
+#[cfg(test)]
+mod actor_directory_lifetime_tests;
 mod actor_snapshot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod actor_snapshot_reader;
@@ -1066,6 +1068,8 @@ pub struct SessionStoreV2 {
     root_tool_proof_fault: std::sync::Mutex<Option<root_context::RootToolProofFault>>,
     #[cfg(test)]
     supervisor_proof_fault: std::sync::Mutex<Option<supervisor_proof::SupervisorProofFault>>,
+    #[cfg(test)]
+    actor_write_hook: std::sync::Mutex<Option<Arc<actor_directory_lifetime_tests::ActorWriteHook>>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1370,6 +1374,8 @@ impl SessionStoreV2 {
             root_tool_proof_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             supervisor_proof_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            actor_write_hook: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -4972,6 +4978,68 @@ pub(crate) async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> io::Resul
         return Err(error);
     }
     sync_parent_directory_entry(path).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurableWritePhase {
+    BeforeReplace,
+    AfterReplace,
+}
+
+/// Actor authority writes run the complete replacement in one blocking job.
+/// Its caller owns the lock holder across temp creation, sync, publication,
+/// directory sync and error cleanup; no filesystem subtask can outlive it.
+fn durable_atomic_write_blocking(
+    path: &Path,
+    bytes: &[u8],
+    mut publication_hook: impl FnMut(DurableWritePhase) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension(format!("durable.tmp.{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        publication_hook(DurableWritePhase::BeforeReplace)?;
+        #[cfg(not(windows))]
+        std::fs::rename(&tmp, path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            let source: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        publication_hook(DurableWritePhase::AfterReplace)?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            path.parent()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?,
+        )?
+        .sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Durably remove an active recovery marker without relying on directory
