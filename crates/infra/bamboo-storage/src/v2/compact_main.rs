@@ -16,10 +16,11 @@ use serde_json::{value::RawValue, Value};
 
 pub(super) const MEMBER: &str = "_bamboo_main_authority";
 pub(super) const SECTION_CAP: usize = 512 * 1024;
-const PREFIX: &[u8] = b"{\"_bamboo_main_authority\":{\"version\":1,\"payload_bytes\":\"";
+pub(super) const PREFIX: &[u8] = b"{\"_bamboo_main_authority\":{\"version\":1,\"payload_bytes\":\"";
 const MIDDLE: &[u8] = b"\",\"payload\":";
 const CLOSE: &[u8] = b"},";
-const FRAME_BYTES: usize = PREFIX.len() + 10 + MIDDLE.len() + CLOSE.len();
+pub(super) const HEADER_BYTES: usize = PREFIX.len() + 10 + MIDDLE.len();
+const FRAME_BYTES: usize = HEADER_BYTES + CLOSE.len();
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid compact Main authority")
@@ -74,6 +75,28 @@ impl CompactMainAuthority {
             supervisor_management: session.supervisor_management.clone(),
             title_label: public_title(&session.title),
         }
+    }
+
+    /// Only the observed public-graph identity; no skipped flat-body grant.
+    pub(super) fn into_snapshot_session(self) -> Session {
+        let mut session = Session::new(self.id, "");
+        session.created_at = self.created_at;
+        session.title = self.title_label;
+        session.kind = self.kind;
+        session.parent_session_id = self.parent_session_id;
+        session.root_session_id = self.root_session_id;
+        session.spawn_depth = self.spawn_depth;
+        session.authority_identity = self.authority_identity;
+        session.metadata_version = self.metadata_version;
+        session.root_orchestration_only = self.root_orchestration_only;
+        session.root_tool_authority_revision = self.root_tool_authority_revision;
+        session.root_mode_transition_epoch = self.root_mode_transition_epoch;
+        session.root_mode_operations = self.root_mode_operations;
+        session.supervisor_management = self.supervisor_management;
+        if let Some(project) = self.project_id {
+            session.set_project_id_meta(project);
+        }
+        session
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -137,14 +160,14 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-/// The pure prefix decoder proves only the observed section. It does not check
-/// the flat suffix or acquire a retained FD; that consumer is a separate slice.
-pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactMainAuthority> {
-    if !bytes.starts_with(PREFIX) {
+/// Checked framing shared by full-buffer compatibility and retained-FD readers.
+/// This observes only the fixed header; callers enforce their own section budget.
+pub(super) fn section_length(header: &[u8]) -> io::Result<usize> {
+    if !header.starts_with(PREFIX) {
         return Err(invalid());
     }
     let digits_end = PREFIX.len().checked_add(10).ok_or_else(invalid)?;
-    let digits = bytes.get(PREFIX.len()..digits_end).ok_or_else(invalid)?;
+    let digits = header.get(PREFIX.len()..digits_end).ok_or_else(invalid)?;
     let mut length = 0usize;
     for digit in digits {
         if !digit.is_ascii_digit() {
@@ -155,16 +178,23 @@ pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactM
             .and_then(|n| n.checked_add((digit - b'0') as usize))
             .ok_or_else(invalid)?;
     }
-    let payload_start = digits_end.checked_add(MIDDLE.len()).ok_or_else(invalid)?;
-    let section_end = FRAME_BYTES.checked_add(length).ok_or_else(invalid)?;
+    if header.get(digits_end..HEADER_BYTES) != Some(MIDDLE) {
+        return Err(invalid());
+    }
+    FRAME_BYTES.checked_add(length).ok_or_else(invalid)
+}
+
+/// Proves only the observed section, never the unseen flat suffix.
+pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactMainAuthority> {
+    let section_end = section_length(bytes)?;
     if section_end > cap.min(SECTION_CAP)
-        || bytes.get(digits_end..payload_start) != Some(MIDDLE)
         || bytes.get(section_end - CLOSE.len()..section_end) != Some(CLOSE)
     {
         return Err(invalid());
     }
-    let payload_end = payload_start.checked_add(length).ok_or_else(invalid)?;
-    let raw = bytes.get(payload_start..payload_end).ok_or_else(invalid)?;
+    let raw = bytes
+        .get(HEADER_BYTES..section_end - CLOSE.len())
+        .ok_or_else(invalid)?;
     let value: UniqueValue = serde_json::from_slice(raw).map_err(|_| invalid())?;
     let authority: CompactMainAuthority =
         serde_json::from_value(value.0.clone()).map_err(|_| invalid())?;

@@ -111,6 +111,64 @@ impl Directory {
         Ok(entries)
     }
 
+    /// Main history is deliberately unobserved. All reads use this one opened
+    /// regular-file FD, without a buffered reader, suffix probe or reopen.
+    pub fn read_main_section(&self, budget: &mut ReadBudget) -> Result<Option<Vec<u8>>, Error> {
+        use super::compact_main::{HEADER_BYTES, PREFIX, SECTION_CAP};
+        budget.reads += 1;
+        if budget.reads > budget.limits.file_reads {
+            return Err(Error::BudgetExceeded);
+        }
+        let Some(mut file) = open_relative(&self.0, OsStr::new("session.json"), false)? else {
+            return Ok(None);
+        };
+        if !file
+            .metadata()
+            .map_err(|_| Error::StorageUnavailable)?
+            .is_file()
+        {
+            return Err(Error::InconsistentAuthority);
+        }
+        #[cfg(test)]
+        let hook = super::actor_snapshot_tests::main_read_hook(&file);
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.opened();
+        }
+        // Capture the remaining budget before any header debit. Comparing the
+        // total section against the post-header remainder would bill it twice.
+        let max = SECTION_CAP.min(budget.limits.file_bytes).min(
+            budget
+                .limits
+                .aggregate_read_bytes
+                .saturating_sub(budget.bytes),
+        );
+        #[cfg(test)]
+        let before = budget.bytes;
+        let result = (|| {
+            if max < HEADER_BYTES {
+                return Err(Error::BudgetExceeded);
+            }
+            let mut bytes = vec![0; HEADER_BYTES];
+            read_exact_counted(&mut file, &mut bytes[..PREFIX.len()], budget, Some(PREFIX))?;
+            read_exact_counted(&mut file, &mut bytes[PREFIX.len()..], budget, None)?;
+            let section_len = super::compact_main::section_length(&bytes)
+                .map_err(|_| Error::InconsistentAuthority)?;
+            if section_len > max {
+                return Err(Error::BudgetExceeded);
+            }
+            bytes.resize(section_len, 0);
+            read_exact_counted(&mut file, &mut bytes[HEADER_BYTES..], budget, None)?;
+            // The caller decodes this exact section once, including its close.
+            Ok(Some(bytes))
+        })();
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.finished(&mut file, budget.bytes - before);
+        }
+        result
+    }
+
     pub fn read(
         &self,
         name: &str,
@@ -140,6 +198,33 @@ impl Directory {
         }
         read_content(file, max, budget).map(Some)
     }
+}
+
+fn read_exact_counted(
+    file: &mut File,
+    mut destination: &mut [u8],
+    budget: &mut ReadBudget,
+    expected: Option<&[u8]>,
+) -> Result<(), Error> {
+    let mut offset = 0;
+    while !destination.is_empty() {
+        match file.read(destination) {
+            Ok(0) => return Err(Error::InconsistentAuthority),
+            Ok(count) => {
+                budget.bytes += count;
+                if expected
+                    .is_some_and(|prefix| destination[..count] != prefix[offset..offset + count])
+                {
+                    return Err(Error::UnsupportedAuthority);
+                }
+                offset += count;
+                destination = &mut destination[count..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(Error::StorageUnavailable),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn read_content(

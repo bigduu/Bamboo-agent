@@ -27,7 +27,8 @@ transaction exclusive guard for the entire actual read, including after a caller
 cancels the request. Pending Task or copy journals reject the entire view without
 repair. Main/runtime identity, Project, birth, Root proof, Supervisor proof when
 applicable, every direct-parent edge, depth, and actor-row ancestor observations
-must agree. Historical missing actor row + initialization marker stays unknown;
+must agree for the observed Main frame and separately read witnesses. Historical
+missing actor row + initialization marker stays unknown;
 losing one of the pair, stale observations, or inconsistent identity fails closed.
 
 The source root and all children must fit the budgets, even when selecting a
@@ -92,11 +93,41 @@ attempted file reads (including absent optional files), 512 KiB per source file,
 8 MiB aggregate actual reads, and 256 KiB final serialized payload. Root proof and
 initialization/revocation evidence additionally use 4 KiB ceilings; Supervisor
 proof uses 256 KiB. Internal callers may tighten ceilings, never raise them.
-Actual fd reads are capped and use one counted overflow byte to detect post-stat
-growth. Final payload size includes its identity. IDs are at most 256 bytes.
-The per-file and aggregate read ceilings also apply to the entire main Session
-file, including discarded history. A long transcript can therefore cause
-`budget_exceeded`; it is never silently omitted to publish a partial tree.
+Ancillary fd reads are capped and use one counted overflow byte to detect
+post-stat growth. Final payload size includes its identity. IDs are at most 256
+bytes. Main uses the accepted leading compact section: the entire section,
+including fixed framing, must fit the per-file and remaining aggregate budgets.
+The complete Main file can exceed 512 KiB; history is never read by this observer.
+Actual header and payload bytes, including partial reads, are counted once.
+The already-open regular-file FD ends at the declared section boundary; no suffix,
+EOF scan, growth probe, read-ahead or full-buffer fallback follows Main's close.
+Runtime/proof/row/marker/revocation reads retain their complete-file limits.
+
+## Compact observation boundary (#1339)
+
+This view validates the exact literal v1 prefix, ten decimal length digits,
+framing, closed 15-field typed payload and all readable witnesses listed above.
+Unsupported legacy, moved, escaped or unknown leading encodings fail explicitly
+with `unsupported_authority`; GET never prepares, repairs or upgrades a file.
+Malformed/truncated recognized framing or payload rejects the whole view.
+Existing full Main readers continue validating the complete JSON and matching
+present compact authority against the flat fields.
+
+A legal frame plus matching Runtime/proofs/rows is a public graph observation,
+not full Main integrity. This consumer cannot detect unseen flat-only birth or
+Project modifications, later duplicate members, an invalid suffix, private
+transcript corruption, or arbitrary replay/tampering invisible to that frame and
+its readable witnesses. Such files can yield the same public snapshot while the
+full compatibility reader rejects. A snapshot/ETag does not grant any action,
+file/context access or ContextRefs authority; #1343 remains a separate contract.
+
+The actual blocking read owns lifecycle Shared then Task Exclusive guards.
+Once started, caller abort or whole-runtime shutdown does not release them until
+the closure ends. It does not promise a queued job starts or an entire interrupted
+async transaction completes. Native fixtures preserve one 134-node tree while
+only growing private history, trace actual Main FD offsets, and use started-reader
+barriers with independent physical-lock/writer/reopen checks. Native execution
+and exact artifact receipts are required separately from source review.
 
 Typed static errors contain no source path or content: `invalid_selector` (400),
 `not_found` (404), `unauthorized_scope` (403), `budget_exceeded` (413),

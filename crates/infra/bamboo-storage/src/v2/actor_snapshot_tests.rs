@@ -80,9 +80,15 @@ impl Fixture {
         let path = self.directory(id).join(file);
         let mut value = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
         update(&mut value);
-        fs::write(path, serde_json::to_vec(&value).unwrap())
-            .await
-            .unwrap();
+        let bytes = if file == "session.json" {
+            // Intentionally changed authority still uses the host's coherent
+            // frame; otherwise this would only test unsupported legacy encoding.
+            compact_main::serialize_main(&serde_json::from_value::<Session>(value).unwrap())
+                .unwrap()
+        } else {
+            serde_json::to_vec(&value).unwrap()
+        };
+        fs::write(path, bytes).await.unwrap();
     }
 }
 
@@ -143,6 +149,51 @@ async fn complete_134_actor_tree_survives_restart_and_leaves_cold_authority_unkn
     assert!(selected.nodes.iter().all(
         |n| n.actor_id == parent.id || n.parent_actor_id.as_deref() == Some(parent.id.as_str())
     ));
+    let mut hooks = Vec::new();
+    for node in &first.nodes {
+        let mut session = f.store.load_session(&node.actor_id).await.unwrap().unwrap();
+        add_private_history(&mut session);
+        f.store.save_session(&session).await.unwrap();
+        let path = f.directory(&node.actor_id).join("session.json");
+        assert!(std::fs::metadata(&path).unwrap().len() > 512 * 1024);
+        hooks.push(MainReadHook::install(&path, false));
+    }
+    let before = durable_tree(&f.home);
+    let large = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(first, large); // Same births, metadata and opaque public identity.
+    assert_eq!(
+        selected,
+        f.snapshot(&parent.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap()
+    );
+    let reopened = SessionStoreV2::new(f.home.clone()).await.unwrap();
+    assert_eq!(
+        first,
+        reopened
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &f.root.id,
+                &f.root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap()
+    );
+    for (node, hook) in first.nodes.iter().zip(&hooks) {
+        let raw = std::fs::read(f.directory(&node.actor_id).join("session.json")).unwrap();
+        let section = compact_main::section_length(&raw).unwrap();
+        let trace = hook.traces();
+        assert_eq!(trace.len(), 3);
+        assert!(trace
+            .iter()
+            .all(|read| read.bytes == section && read.offset == section as u64));
+    }
+    assert_eq!(durable_tree(&f.home), before);
+    assert!(!serde_json::to_string(&large).unwrap().contains("PRIVATE"));
 }
 
 #[tokio::test]
@@ -274,8 +325,8 @@ async fn changed_birth_stale_row_and_missing_marker_fail_without_repair() {
     let parent = f.child("parent", &f.root).await;
     f.child("child", &parent).await;
     f.store.ensure_actor("child").await.unwrap();
-    // A coherent changed birth makes the initialized actor row stale, while
-    // a contradictory compact/flat Main is rejected as inconsistent earlier.
+    // A coherent changed observed Main-frame/Runtime birth makes the
+    // initialized actor's ancestor observation stale.
     let path = f.directory("parent").join("session.json");
     let mut main: Session = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
     main.created_at = f.root.created_at;
@@ -658,4 +709,644 @@ async fn unavailable_root_proof_and_revoked_birth_do_not_return_cached_tree() {
             .unwrap_err(),
         Error::NotFound
     );
+}
+
+// Hooks are keyed by the opened inode, not a path check/reopen. Production has
+// neither this registry nor the pause; every trace is from a real File read.
+use std::io::Seek;
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock, Weak};
+
+#[derive(Debug, Clone)]
+struct MainReadTrace {
+    bytes: usize,
+    offset: u64,
+}
+#[derive(Debug, Default)]
+struct MainReadState {
+    entered: bool,
+    released: bool,
+    trace: Vec<MainReadTrace>,
+}
+#[derive(Debug)]
+pub(super) struct MainReadHook {
+    pause: bool,
+    state: StdMutex<MainReadState>,
+    changed: Condvar,
+}
+type MainHooks = std::collections::HashMap<(u64, u64), Weak<MainReadHook>>;
+static MAIN_HOOKS: OnceLock<StdMutex<MainHooks>> = OnceLock::new();
+const MAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+pub(super) fn main_read_hook(file: &std::fs::File) -> Option<Arc<MainReadHook>> {
+    let metadata = file.metadata().unwrap();
+    MAIN_HOOKS
+        .get()?
+        .lock()
+        .unwrap()
+        .get(&(metadata.dev(), metadata.ino()))?
+        .upgrade()
+}
+impl MainReadHook {
+    fn install(path: &Path, pause: bool) -> Arc<Self> {
+        let metadata = std::fs::metadata(path).unwrap();
+        let hook = Arc::new(Self {
+            pause,
+            state: StdMutex::new(MainReadState::default()),
+            changed: Condvar::new(),
+        });
+        MAIN_HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert((metadata.dev(), metadata.ino()), Arc::downgrade(&hook));
+        hook
+    }
+    pub(super) fn opened(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.entered {
+            return;
+        }
+        state.entered = true;
+        self.changed.notify_all();
+        while self.pause && !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+    pub(super) fn finished(&self, file: &mut std::fs::File, bytes: usize) {
+        self.state.lock().unwrap().trace.push(MainReadTrace {
+            bytes,
+            offset: file.stream_position().unwrap(),
+        });
+        self.changed.notify_all();
+    }
+    fn entered(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timed) = self
+            .changed
+            .wait_timeout_while(state, MAIN_DEADLINE, |s| !s.entered)
+            .unwrap();
+        assert!(
+            state.entered && !timed.timed_out(),
+            "read closure never opened Main FD"
+        );
+    }
+    fn completed(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timed) = self
+            .changed
+            .wait_timeout_while(state, MAIN_DEADLINE, |s| s.trace.is_empty())
+            .unwrap();
+        assert!(
+            !state.trace.is_empty() && !timed.timed_out(),
+            "Main read never finished"
+        );
+    }
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+    fn traces(&self) -> Vec<MainReadTrace> {
+        self.state.lock().unwrap().trace.clone()
+    }
+}
+struct ReleaseMain(Arc<MainReadHook>);
+impl Drop for ReleaseMain {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn durable_tree(home: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, output: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                output.insert(path.clone(), vec![]);
+                walk(&path, output);
+            } else {
+                output.insert(
+                    path.clone(),
+                    Sha256::digest(std::fs::read(path).unwrap()).to_vec(),
+                );
+            }
+        }
+    }
+    let mut output = Default::default();
+    walk(&home.join("sessions"), &mut output);
+    output
+}
+
+fn add_private_history(session: &mut Session) {
+    use bamboo_domain::session::provider_transcript::{
+        ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+        ProviderTranscriptOrigin,
+    };
+    let user = bamboo_domain::Message::user("PRIVATE-MESSAGE".repeat(22_000));
+    let anchor = user.id.clone();
+    session.messages.push(user);
+    session.messages.push(bamboo_domain::Message::tool_result(
+        "private-call",
+        "PRIVATE-TOOL".repeat(16_000),
+    ));
+    let payloads = [
+        (
+            ProviderTranscriptAuthor::Model,
+            serde_json::json!({"type":"tool_search_call","id":"private-search-call","execution":"server",
+                "call_id":"private-search","status":"completed","arguments":{"query":"private-history"}}),
+        ),
+        (
+            ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({"type":"tool_search_output","id":"private-search-output","execution":"server",
+                "call_id":"private-search","status":"completed","tools":[{"type":"function","name":"private_fixture_tool"}]}),
+        ),
+        (
+            ProviderTranscriptAuthor::Model,
+            serde_json::json!({"type":"message","id":"private-native","role":"assistant","status":"completed",
+                "content":[{"type":"output_text","text":"PRIVATE-NATIVE".repeat(16_000),"annotations":[]}]}),
+        ),
+    ];
+    let items = payloads
+        .into_iter()
+        .map(|(author, payload)| {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        })
+        .collect();
+    session
+        .activate_provider_transcript_route(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            &"a".repeat(64),
+        )
+        .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, items)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn compact_main_budget_counts_each_framing_byte_once_and_stops_at_section() {
+    let f = Fixture::new().await;
+    let path = f.directory(&f.root.id).join("session.json");
+    let mut session = f.root.clone();
+    add_private_history(&mut session);
+    f.store.save_session(&session).await.unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let section = compact_main::section_length(&raw).unwrap();
+    let hook = MainReadHook::install(&path, false);
+    let dir = actor_snapshot_reader::Directory::open_absolute(&f.directory(&f.root.id)).unwrap();
+    // Seed an actual ancillary debit; the Main section exactly fills the rest.
+    std::fs::write(f.directory(&f.root.id).join("earlier"), b"paid").unwrap();
+    let limits = ActorSnapshotLimits {
+        aggregate_read_bytes: section + 4,
+        file_bytes: section,
+        ..ActorSnapshotLimits::default()
+    };
+    let mut budget = actor_snapshot_reader::ReadBudget::new(limits);
+    assert_eq!(
+        dir.read("earlier", 4, &mut budget).unwrap().unwrap(),
+        b"paid"
+    );
+    assert_eq!(
+        dir.read_main_section(&mut budget).unwrap().unwrap(),
+        raw[..section]
+    );
+    let trace = hook.traces();
+    assert_eq!((trace[0].bytes, trace[0].offset), (section, section as u64));
+    assert_eq!(
+        dir.read("earlier", 4, &mut budget).unwrap_err(),
+        Error::BudgetExceeded
+    );
+    for limits in [
+        ActorSnapshotLimits {
+            file_bytes: section - 1,
+            ..ActorSnapshotLimits::default()
+        },
+        ActorSnapshotLimits {
+            aggregate_read_bytes: section - 1,
+            ..ActorSnapshotLimits::default()
+        },
+    ] {
+        let mut budget = actor_snapshot_reader::ReadBudget::new(limits);
+        assert_eq!(
+            dir.read_main_section(&mut budget).unwrap_err(),
+            Error::BudgetExceeded
+        );
+    }
+    assert!(hook.traces()[1..]
+        .iter()
+        .all(|trace| trace.bytes == compact_main::HEADER_BYTES
+            && trace.offset == compact_main::HEADER_BYTES as u64));
+}
+
+#[tokio::test]
+async fn compact_observation_does_not_claim_unseen_flat_or_complete_json_integrity() {
+    let f = Fixture::new().await;
+    let baseline = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let path = f.directory(&f.root.id).join("session.json");
+    let raw = std::fs::read(&path).unwrap();
+    let end = compact_main::section_length(&raw).unwrap();
+    let mut flat: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    flat.as_object_mut().unwrap().remove(compact_main::MEMBER);
+    flat["created_at"] = serde_json::json!(Utc::now() + chrono::Duration::days(1));
+    flat["runtime_metadata"] = serde_json::json!({"project_id":"unseen-foreign"});
+    let flat = serde_json::to_vec(&flat).unwrap();
+    let mut damaged = raw[..end].to_vec();
+    damaged.extend_from_slice(&flat[1..]);
+    for bytes in [
+        damaged,
+        [raw[..end].to_vec(), b"invalid JSON suffix".to_vec()].concat(),
+    ] {
+        assert!(compact_main::validate_full_main(&bytes).is_err());
+        std::fs::write(&path, &bytes).unwrap();
+        let before = durable_tree(&f.home);
+        assert_eq!(
+            f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+                .await
+                .unwrap(),
+            baseline
+        );
+        assert_eq!(durable_tree(&f.home), before);
+    }
+}
+
+#[tokio::test]
+async fn compact_main_malformed_unsupported_missing_and_tight_caps_fail_without_writes() {
+    let f = Fixture::new().await;
+    let path = f.directory(&f.root.id).join("session.json");
+    let raw = std::fs::read(&path).unwrap();
+    let end = compact_main::section_length(&raw).unwrap();
+    let prefix = compact_main::PREFIX.len();
+    let mut bad_digit = raw.clone();
+    bad_digit[prefix] = b'x';
+    let mut huge = raw.clone();
+    huge[prefix..prefix + 10].copy_from_slice(b"9999999999");
+    let mut bad_middle = raw.clone();
+    bad_middle[prefix + 10] = b'!';
+    let mut bad_close = raw.clone();
+    bad_close[end - 1] = b'!';
+    let mut malformed = raw.clone();
+    malformed[compact_main::HEADER_BYTES] = 0xff;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&raw[compact_main::HEADER_BYTES..end - 2]).unwrap();
+    let frame = |payload: &[u8]| {
+        let mut bytes = compact_main::PREFIX.to_vec();
+        bytes.extend_from_slice(format!("{:010}", payload.len()).as_bytes());
+        bytes.extend_from_slice(&raw[prefix + 10..compact_main::HEADER_BYTES]);
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"},");
+        bytes
+    };
+    let mut missing = payload.clone();
+    missing.as_object_mut().unwrap().remove("project_id");
+    let mut unknown = payload.clone();
+    unknown["unknown"] = serde_json::json!(true);
+    let serialized = serde_json::to_vec(&payload).unwrap();
+    let mut duplicate = b"{\"id\":\"duplicate\",".to_vec();
+    duplicate.extend_from_slice(&serialized[1..]);
+    let mut nested_unknown = payload.clone();
+    nested_unknown["authority_identity"]["unknown"] = serde_json::json!(true);
+    let nested_duplicate = String::from_utf8(serialized.clone()).unwrap().replace(
+        "\"authority_identity\":{",
+        "\"authority_identity\":{\"kind\":\"ordinary\",",
+    );
+    let mut unsupported = raw.clone();
+    let version = unsupported
+        .windows(b"\"version\":1".len())
+        .position(|w| w == b"\"version\":1")
+        .unwrap();
+    unsupported[version + b"\"version\":".len()] = b'2';
+    for (bytes, error) in [
+        (bad_digit, Error::InconsistentAuthority),
+        (huge, Error::BudgetExceeded),
+        (bad_middle, Error::InconsistentAuthority),
+        (bad_close, Error::InconsistentAuthority),
+        (malformed, Error::InconsistentAuthority),
+        (
+            raw[..compact_main::HEADER_BYTES - 1].to_vec(),
+            Error::InconsistentAuthority,
+        ),
+        (raw[..end - 1].to_vec(), Error::InconsistentAuthority),
+        (
+            frame(&serde_json::to_vec(&missing).unwrap()),
+            Error::InconsistentAuthority,
+        ),
+        (
+            frame(&serde_json::to_vec(&unknown).unwrap()),
+            Error::InconsistentAuthority,
+        ),
+        (frame(&duplicate), Error::InconsistentAuthority),
+        (
+            frame(&serde_json::to_vec(&nested_unknown).unwrap()),
+            Error::InconsistentAuthority,
+        ),
+        (
+            frame(nested_duplicate.as_bytes()),
+            Error::InconsistentAuthority,
+        ),
+        (unsupported, Error::UnsupportedAuthority),
+        (b"{}".to_vec(), Error::UnsupportedAuthority),
+        (
+            serde_json::to_vec(&f.root).unwrap(),
+            Error::UnsupportedAuthority,
+        ),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        let before = durable_tree(&f.home);
+        assert_eq!(
+            f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+                .await
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(durable_tree(&f.home), before);
+    }
+    std::fs::remove_file(&path).unwrap();
+    let before = durable_tree(&f.home);
+    assert_eq!(
+        f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+            .await
+            .unwrap_err(),
+        Error::InconsistentAuthority
+    );
+    assert_eq!(durable_tree(&f.home), before);
+}
+
+#[tokio::test]
+async fn compact_main_retains_open_inode_after_filename_replace_and_counts_truncation() {
+    let f = Fixture::new().await;
+    let path = f.directory(&f.root.id).join("session.json");
+    let raw = std::fs::read(&path).unwrap();
+    let section = compact_main::section_length(&raw).unwrap();
+    let directory =
+        actor_snapshot_reader::Directory::open_absolute(&f.directory(&f.root.id)).unwrap();
+    let hook = MainReadHook::install(&path, true);
+    let _release = ReleaseMain(hook.clone());
+    let read = tokio::task::spawn_blocking(move || {
+        let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
+        directory.read_main_section(&mut budget).unwrap().unwrap()
+    });
+    let opened = hook.clone();
+    tokio::task::spawn_blocking(move || opened.entered())
+        .await
+        .unwrap();
+    std::fs::rename(&path, path.with_extension("retained")).unwrap();
+    symlink("/etc/passwd", &path).unwrap();
+    hook.release();
+    assert_eq!(read.await.unwrap(), raw[..section]);
+    assert_eq!(
+        (hook.traces()[0].bytes, hook.traces()[0].offset),
+        (section, section as u64)
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(path.with_extension("retained"), &path).unwrap();
+    let hook = MainReadHook::install(&path, true);
+    let _release = ReleaseMain(hook.clone());
+    let directory =
+        actor_snapshot_reader::Directory::open_absolute(&f.directory(&f.root.id)).unwrap();
+    let read = tokio::task::spawn_blocking(move || {
+        let mut budget = actor_snapshot_reader::ReadBudget::new(ActorSnapshotLimits::default());
+        directory.read_main_section(&mut budget)
+    });
+    let opened = hook.clone();
+    tokio::task::spawn_blocking(move || opened.entered())
+        .await
+        .unwrap();
+    // Already opened/stat'ed real file becomes shorter; partial bytes are paid.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len((section - 1) as u64)
+        .unwrap();
+    hook.release();
+    assert_eq!(
+        read.await.unwrap().unwrap_err(),
+        Error::InconsistentAuthority
+    );
+    assert_eq!(
+        (hook.traces()[0].bytes, hook.traces()[0].offset),
+        (section - 1, (section - 1) as u64)
+    );
+}
+
+fn assert_snapshot_physical_guards_held(home: &Path) {
+    for name in [
+        SESSION_LIFECYCLE_LOCK_FILE,
+        RUNTIME_TASK_TRANSACTION_LOCK_FILE,
+    ] {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.join(name))
+            .unwrap();
+        let result = FileExt::try_lock_exclusive(&file);
+        if result.is_ok() {
+            FileExt::unlock(&file).unwrap();
+        }
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+}
+fn competing_snapshot_writer(
+    store: Arc<SessionStoreV2>,
+    mut root: Session,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+    let (done, receiver) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        root.messages
+            .push(bamboo_domain::Message::user("after actual reader finished"));
+        runtime.block_on(store.save_session(&root)).unwrap();
+        done.send(()).unwrap();
+    });
+    (writer, receiver)
+}
+
+#[tokio::test]
+async fn compact_started_reader_keeps_actual_guards_after_caller_abort_then_writer_reopens() {
+    let f = Fixture::new().await;
+    let second = Arc::new(SessionStoreV2::new(f.home.clone()).await.unwrap());
+    let hook = MainReadHook::install(&f.directory(&f.root.id).join("session.json"), true);
+    let _release = ReleaseMain(hook.clone());
+    let (store, root) = (f.store.clone(), f.root.id.clone());
+    let reader = tokio::spawn(async move {
+        store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root,
+                &root,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+    });
+    let opened = hook.clone();
+    tokio::task::spawn_blocking(move || opened.entered())
+        .await
+        .unwrap();
+    reader.abort();
+    assert!(reader.await.unwrap_err().is_cancelled());
+    assert_snapshot_physical_guards_held(&f.home);
+    let (writer, done) = competing_snapshot_writer(second, f.root.clone());
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    hook.release();
+    done.recv_timeout(MAIN_DEADLINE).unwrap();
+    writer.join().unwrap();
+    hook.completed();
+    let reopened = SessionStoreV2::new(f.home.clone()).await.unwrap();
+    let saved = reopened.load_session(&f.root.id).await.unwrap().unwrap();
+    assert_eq!(
+        saved.messages.last().unwrap().content,
+        "after actual reader finished"
+    );
+    assert_eq!(saved.created_at, f.root.created_at);
+}
+
+#[test]
+fn compact_started_reader_keeps_guards_after_whole_runtime_shutdown() {
+    struct RequestDropped(std::sync::mpsc::Sender<()>);
+    impl Drop for RequestDropped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = runtime.block_on(Fixture::new());
+    let second = Arc::new(
+        runtime
+            .block_on(SessionStoreV2::new(f.home.clone()))
+            .unwrap(),
+    );
+    let hook = MainReadHook::install(&f.directory(&f.root.id).join("session.json"), true);
+    let _release = ReleaseMain(hook.clone());
+    let (dropped, observed) = std::sync::mpsc::channel();
+    let (store, root) = (f.store.clone(), f.root.id.clone());
+    let request = runtime.spawn(async move {
+        let _dropped = RequestDropped(dropped);
+        store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root,
+                &root,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+    });
+    hook.entered();
+    runtime.shutdown_background();
+    observed.recv_timeout(MAIN_DEADLINE).unwrap(); // The actual inner future dropped.
+    assert_snapshot_physical_guards_held(&f.home);
+    let (writer, done) = competing_snapshot_writer(second, f.root.clone());
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    hook.release();
+    done.recv_timeout(MAIN_DEADLINE).unwrap();
+    writer.join().unwrap();
+    hook.completed();
+    let independent = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    independent.block_on(async {
+        assert!(request.await.unwrap_err().is_cancelled());
+        let reopened = SessionStoreV2::new(f.home.clone()).await.unwrap();
+        let saved = reopened.load_session(&f.root.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.messages.last().unwrap().content,
+            "after actual reader finished"
+        );
+        assert_eq!(saved.created_at, f.root.created_at);
+    });
+}
+
+#[tokio::test]
+async fn compact_large_root_mode_and_supervisor_keep_existing_committed_proof_checks() {
+    let f = Fixture::new().await;
+    let supervisor = f
+        .store
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    for id in [&f.root.id, &supervisor.session_id] {
+        let mut session = f.store.load_session(id).await.unwrap().unwrap();
+        add_private_history(&mut session);
+        f.store.save_session(&session).await.unwrap();
+        let operation = RootModeOperationRequest {
+            session_id: id.clone(),
+            operation_id: format!("0:{}", Uuid::new_v4()),
+            birth_token: session.root_mode_birth_token(),
+            expected_epoch: 0,
+            requested_enabled: true,
+            action: RootModeOperationAction::Select,
+        };
+        assert!(matches!(
+            f.store.root_mode_operation(&operation).await.unwrap(),
+            RootModeOperationDecision::Terminal(_)
+        ));
+        let saved = f.store.load_session(id).await.unwrap().unwrap();
+        assert!(saved.root_orchestration_only);
+        assert_eq!(saved.root_mode_transition_epoch, 1);
+        assert_eq!(saved.root_mode_operations.len(), 1);
+        let dir = f.home.join("sessions").join(id);
+        assert!(std::fs::metadata(dir.join("session.json")).unwrap().len() > 512 * 1024);
+        let before = durable_tree(&f.home);
+        assert_eq!(
+            f.store
+                .actor_subtree_snapshot(
+                    ActorSnapshotPrincipal::host_owner(),
+                    id,
+                    id,
+                    ActorSnapshotLimits::default()
+                )
+                .await
+                .unwrap()
+                .nodes
+                .len(),
+            1
+        );
+        assert_eq!(durable_tree(&f.home), before);
+        // A readable proof mismatch still rejects; the Main optimization does
+        // not replace the committed Root/Supervisor consistency validators.
+        let proof = dir.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+        let original = std::fs::read(&proof).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(value["root_mode_transition_epoch"], 1);
+        value["root_mode_transition_epoch"] = serde_json::json!(99);
+        std::fs::write(&proof, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            f.store
+                .actor_subtree_snapshot(
+                    ActorSnapshotPrincipal::host_owner(),
+                    id,
+                    id,
+                    ActorSnapshotLimits::default()
+                )
+                .await
+                .unwrap_err(),
+            Error::StaleAuthority
+        );
+        std::fs::write(&proof, original).unwrap();
+    }
 }

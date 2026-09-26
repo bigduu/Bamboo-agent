@@ -3,8 +3,10 @@
 The V2 host writes a leading authority section and the existing flat Session in
 **one `session.json` replacement**. Runtime/proof/Task/Management lanes keep their
 existing representations and publication boundaries. This is a Main producer
-and full-reader compatibility slice; current Actor snapshots still read full
-Main. It introduces no prefix-only authorization or ContextRefs consumer.
+and full-reader compatibility slice. The separate #1339 Actor
+snapshot observer reads only the leading section while retaining its Runtime,
+proof, row and lineage checks. Neither slice introduces an action authorization
+or ContextRefs consumer.
 
 ## Fixed framing and closed payload
 
@@ -64,7 +66,7 @@ on caller cancellation or runtime shutdown, and adds no recovery journal.
 
 ## Full-reader compatibility and observation limits
 
-Every named V2 Main byte authority reader validates a present section against the
+The named V2 full-Main compatibility readers validate a present section against the
 flat authority fields before overlay/normalization, proof creation, index/cache
 publication or protected reconstruction. The compatibility pass skips private
 history allocations while checking full JSON syntax; each original consumer
@@ -82,5 +84,8 @@ an unseen suffix exists, is syntactically valid, or matches the flat birth/Proje
 A raw external writer changing flat authority while retaining a valid prefix is
 rejected by full compatibility; prefix observation alone cannot detect it. This
 is not a checksum/body certificate or a blanket mixed-writer integrity guarantee.
-The later retained-FD/no-history consumer (#1339) and ContextRefs (#1343) remain
-separate acceptance slices.
+The retained-FD/no-history consumer (#1339) explicitly accepts that narrower
+public observation boundary; its Main FD stops at the exact section end and its
+ancillary complete-file checks remain. Legacy absence is unsupported there,
+without GET migration or a full-history fallback. ContextRefs (#1343) remains a
+separate acceptance slice and cannot inherit an action grant from this view.
