@@ -103,6 +103,12 @@ fn compact_exact_whitelist_defaults_project_precedence_and_private_history() {
     }
     assert!(compact.len() < 4096);
     assert!(compact_main::decode_v1_section(compact, compact.len()).is_ok());
+    let projected = compact_main::decode_v1_section(compact, compact.len())
+        .unwrap()
+        .into_snapshot_session();
+    assert_eq!(section(&encoded(&projected)), compact);
+    assert!(projected.messages.is_empty());
+    assert!(!projected.metadata.contains_key("private.prompt"));
     assert!(compact_main::decode_v1_section(compact, compact.len() - 1).is_err());
     assert!(compact_main::validate_full_main(&raw).unwrap().is_some());
     session.runtime_metadata.as_mut().unwrap().project_id = None;
@@ -252,6 +258,10 @@ fn compact_max_management_receipts_preserve_tombstones_and_bound_rejects() {
     }
     let raw = encoded(&session);
     assert!(compact_main::validate_full_main(&raw).unwrap().is_some());
+    let projected = compact_main::decode_v1_section(section(&raw), raw.len())
+        .unwrap()
+        .into_snapshot_session();
+    assert_eq!(section(&encoded(&projected)), section(&raw));
     assert_eq!(
         payload(&raw)["root_mode_operations"]
             .as_array()
@@ -583,7 +593,7 @@ async fn compact_proof_migrations_and_legacy_supervisor_classification_never_min
 }
 
 #[tokio::test]
-async fn compact_actor_default_classifier_and_full_snapshot_reject_present_invalid_main() {
+async fn compact_actor_default_classifier_rejects_unseen_flat_tamper_snapshot_observes_frame() {
     use bamboo_domain::{
         ActorDirectoryPort, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
     };
@@ -599,7 +609,7 @@ async fn compact_actor_default_classifier_and_full_snapshot_reject_present_inval
         "metadata_version",
         json!(7),
     );
-    std::fs::write(directory.join("session.json"), damaged).unwrap();
+    std::fs::write(directory.join("session.json"), &damaged).unwrap();
     let before = files(&directory);
     assert!(store
         .check_default_actor_context(&session, &directory, true)
@@ -616,9 +626,14 @@ async fn compact_actor_default_classifier_and_full_snapshot_reject_present_inval
                 ActorSnapshotLimits::default()
             )
             .await
-            .unwrap_err(),
-        bamboo_domain::ActorSnapshotError::InconsistentAuthority
+            .unwrap()
+            .nodes[0]
+            .revision
+            .session_metadata_version,
+        session.metadata_version
     );
+    // The graph observer does not read the altered flat metadata version.
+    assert!(compact_main::validate_full_main(&damaged).is_err());
     assert_eq!(files(&directory), before);
 }
 

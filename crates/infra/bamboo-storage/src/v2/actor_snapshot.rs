@@ -198,11 +198,11 @@ mod supported {
         budget: &mut ReadBudget,
     ) -> Result<Source, Error> {
         let bytes = directory
-            .read("session.json", budget.limits.file_bytes, budget)?
+            .read_main_section(budget)?
             .ok_or(Error::InconsistentAuthority)?;
-        super::super::compact_main::validate_full_main(&bytes)
-            .map_err(|_| Error::InconsistentAuthority)?;
-        let main = decode::<Identity>(&bytes)?.session();
+        let main = super::super::compact_main::decode_v1_section(&bytes, budget.limits.file_bytes)
+            .map_err(|_| Error::InconsistentAuthority)?
+            .into_snapshot_session();
         let side = directory
             .read(RUNTIME_SIDECAR_FILE, budget.limits.file_bytes, budget)?
             .map(|bytes| decode::<Identity>(&bytes).map(Identity::session))
