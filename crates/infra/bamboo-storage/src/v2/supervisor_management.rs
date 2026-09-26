@@ -64,9 +64,9 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
 /// One retained instance of the existing authority lock set, never a durable
 /// grant or a second lifecycle protocol. Constructed only by the strict reader.
 pub(crate) struct SupervisorFollowupGuard {
-    lifecycle: SessionLifecycleReadGuard,
+    sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
-    _sessions: Vec<SessionWriteGuard>,
+    _lifecycle: SessionLifecycleReadGuard,
 }
 
 /// Management publication owns the existing locks, not a new authority grant.
@@ -83,9 +83,9 @@ impl Drop for SupervisorManagementGuards {
     }
 }
 
-impl SupervisorFollowupGuard {
-    pub(crate) fn lifecycle(&self) -> &SessionLifecycleReadGuard {
-        &self.lifecycle
+impl Drop for SupervisorFollowupGuard {
+    fn drop(&mut self) {
+        while let Some(_guard) = self.sessions.pop() {}
     }
 }
 
@@ -166,9 +166,9 @@ impl SessionStoreV2 {
             ));
         }
         Ok(SupervisorFollowupGuard {
-            lifecycle,
+            sessions,
             _task: task,
-            _sessions: sessions,
+            _lifecycle: lifecycle,
         })
     }
 

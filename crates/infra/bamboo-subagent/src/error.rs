@@ -101,21 +101,14 @@ async fn atomic_write_with_gate_inner(
         // future cannot race an in-flight async create/write that recreates a
         // hidden temp after its cleanup guard has already run.
         return tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-
-            let _cleanup = HiddenTempCleanup(tmp.clone());
-            if gate.is_cancelled() {
-                return Ok(bamboo_domain::AdmissionCommit::Cancelled);
-            }
-            let mut file = std::fs::File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
-            file.write_all(&bytes)
-                .map_err(|e| StoreError::io(&tmp, e))?;
-            file.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-            drop(file);
-            if let Some(before_commit) = before_commit {
-                before_commit();
-            }
-            gate.commit(|| std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e)))
+            write_hidden_temp_blocking(&path, &tmp, &bytes, Some(&gate), |phase, _| {
+                if phase == "maildir_replace" {
+                    if let Some(before_commit) = &before_commit {
+                        before_commit();
+                    }
+                }
+                Ok(())
+            })
         })
         .await
         .map_err(|error| StoreError::Invalid(format!("inbox write task failed: {error}")))?;
@@ -135,6 +128,53 @@ async fn atomic_write_with_gate_inner(
         .await
         .map_err(|e| StoreError::io(path, e))?;
     Ok(bamboo_domain::AdmissionCommit::Committed(()))
+}
+
+/// Complete synchronous Maildir writer for callers already inside their owned job.
+/// The gate linearizes permission only; the caller supplies physical ownership.
+pub(crate) fn atomic_write_with_gate_blocking(
+    path: &Path,
+    bytes: &[u8],
+    gate: Option<&bamboo_domain::AdmissionGate>,
+    observe: impl Fn(&str, &Path) -> std::io::Result<()>,
+) -> Result<bamboo_domain::AdmissionCommit<()>> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| StoreError::NotFound(format!("no parent dir for {}", path.display())))?;
+    std::fs::create_dir_all(dir).map_err(|e| StoreError::io(dir, e))?;
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let temp = dir.join(format!(".{stem}.tmp.{}", uuid::Uuid::new_v4()));
+    write_hidden_temp_blocking(path, &temp, bytes, gate, observe)
+}
+
+fn write_hidden_temp_blocking(
+    path: &Path,
+    temp: &Path,
+    bytes: &[u8],
+    gate: Option<&bamboo_domain::AdmissionGate>,
+    observe: impl Fn(&str, &Path) -> std::io::Result<()>,
+) -> Result<bamboo_domain::AdmissionCommit<()>> {
+    use std::io::Write;
+    let cleanup = HiddenTempCleanup(temp.to_owned());
+    let result = (|| {
+        if gate.is_some_and(bamboo_domain::AdmissionGate::is_cancelled) {
+            return Ok(bamboo_domain::AdmissionCommit::Cancelled);
+        }
+        let mut file = std::fs::File::create(temp).map_err(|e| StoreError::io(temp, e))?;
+        file.write_all(bytes).map_err(|e| StoreError::io(temp, e))?;
+        file.sync_all().map_err(|e| StoreError::io(temp, e))?;
+        drop(file);
+        observe("maildir_replace", path).map_err(|e| StoreError::io(path, e))?;
+        let rename = || std::fs::rename(temp, path).map_err(|e| StoreError::io(path, e));
+        match gate {
+            Some(gate) => gate.commit(rename),
+            None => rename().map(bamboo_domain::AdmissionCommit::Committed),
+        }
+    })();
+    // Observation cannot replace a primary error or suppress actual cleanup.
+    let _ = observe("maildir_cleanup", path);
+    drop(cleanup);
+    result
 }
 
 #[cfg(test)]

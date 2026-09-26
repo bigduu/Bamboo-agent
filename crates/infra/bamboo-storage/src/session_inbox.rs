@@ -38,7 +38,7 @@ const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "session_inbox_owned.rs"]
 mod owned;
-use owned::{AckAuthority, OwnedFilesystem, StoredLease};
+use owned::{AckAuthority, InboxAuthority, OwnedFilesystem, StoredLease};
 
 struct StoredInboxReceipt {
     delivery: SessionInboxReceipt,
@@ -251,9 +251,13 @@ impl FileSessionInbox {
         }
     }
 
-    async fn next_generation(dir: &Path) -> Result<u64, SessionInboxError> {
+    async fn next_generation(
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<u64, SessionInboxError> {
         let next = Self::read_generation(dir).await?.saturating_add(1);
-        atomic_write(&dir.join(GENERATION_FILE), next.to_string().as_bytes())
+        filesystem
+            .write(&dir.join(GENERATION_FILE), next.to_string().as_bytes())
             .await
             .map_err(|error| {
                 SessionInboxError::Storage(format!("persist inbox generation: {error}"))
@@ -302,6 +306,7 @@ impl FileSessionInbox {
         dir: &Path,
         generation: u64,
         versioned: bool,
+        filesystem: &OwnedFilesystem,
     ) -> Result<(), SessionInboxError> {
         let owned = Self::owned_enabled(dir).await?;
         let bytes = if versioned {
@@ -318,7 +323,8 @@ impl FileSessionInbox {
         } else {
             generation.to_string().into_bytes()
         };
-        atomic_write(&dir.join(ACTIVATION_GENERATION_FILE), &bytes)
+        filesystem
+            .write(&dir.join(ACTIVATION_GENERATION_FILE), &bytes)
             .await
             .map_err(|error| {
                 SessionInboxError::Storage(format!("persist inbox activation generation: {error}"))
@@ -355,10 +361,13 @@ impl FileSessionInbox {
         }
     }
 
-    async fn oldest_backlog_generation(dir: &Path) -> Result<Option<u64>, SessionInboxError> {
+    async fn oldest_backlog_generation(
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<Option<u64>, SessionInboxError> {
         let mut oldest = None;
         for queue in ["new", "cur"] {
-            for (generation, _, _) in Self::valid_queue_entries(dir, queue).await? {
+            for (generation, _, _) in Self::owned_queue_entries(dir, queue, filesystem).await? {
                 oldest = Some(oldest.map_or(generation, |current: u64| current.min(generation)));
             }
         }
@@ -744,6 +753,7 @@ impl FileSessionInbox {
         dir: &Path,
         requested: &SessionMessageEnvelope,
         requested_intent: Option<SessionInboxActivationIntent>,
+        filesystem: &OwnedFilesystem,
     ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
         if let Some(receipt) = Self::admitted_receipt(dir, requested).await? {
             if receipt.intent != requested_intent {
@@ -756,7 +766,9 @@ impl FileSessionInbox {
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
         for queue in ["new", "cur", "cancelled"] {
-            for (generation, _name, path) in Self::valid_queue_entries(dir, queue).await? {
+            for (generation, _name, path) in
+                Self::owned_queue_entries(dir, queue, filesystem).await?
+            {
                 let Ok(bytes) = tokio::fs::read(path).await else {
                     continue;
                 };
@@ -798,10 +810,12 @@ impl FileSessionInbox {
     async fn deliver_with_lifecycle_held(
         &self,
         envelope: &SessionMessageEnvelope,
-        _lifecycle: &crate::v2::SessionLifecycleReadGuard,
+        authority: InboxAuthority,
         gate: Option<&bamboo_domain::AdmissionGate>,
         intent: Option<SessionInboxActivationIntent>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
         envelope
             .validate()
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -814,13 +828,14 @@ impl FileSessionInbox {
             });
         }
 
-        let dir = self.inbox_dir(&envelope.target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        let (dir, filesystem) = self
+            .filesystem_with_authority(&envelope.target_session_id, authority)
+            .await?;
         // Enqueue idempotency is independent from consumer admission dedupe.
         // This closes the legacy-migration crash window (deliver succeeded,
         // source clear did not) without letting deterministic retries fill the
         // bounded backlog.
-        if let Some(receipt) = Self::existing_receipt(&dir, envelope, intent).await? {
+        if let Some(receipt) = Self::existing_receipt(&dir, envelope, intent, &filesystem).await? {
             if intent.is_some() && !Self::read_activation_watermark(&dir).await?.1 {
                 return Err(SessionInboxError::InvalidClaim(
                     "activation intent requires its v2 watermark".into(),
@@ -838,9 +853,12 @@ impl FileSessionInbox {
                 ));
             }
         }
-        let mailbox = Mailbox::at(&dir);
-        let current = Self::valid_queue_entries(&dir, "new").await?.len()
-            + Self::valid_queue_entries(&dir, "cur").await?.len();
+        let current = Self::owned_queue_entries(&dir, "new", &filesystem)
+            .await?
+            .len()
+            + Self::owned_queue_entries(&dir, "cur", &filesystem)
+                .await?
+                .len();
         if current >= self.limits.max_backlog {
             return Err(SessionInboxError::BacklogFull {
                 current,
@@ -848,7 +866,7 @@ impl FileSessionInbox {
             });
         }
 
-        let generation = Self::next_generation(&dir).await?;
+        let generation = Self::next_generation(&dir, &filesystem).await?;
         let wrapper = Self::wrapper(envelope, generation, intent);
         if intent.is_some() {
             let bytes = serde_json::to_vec_pretty(&wrapper).map_err(|_| {
@@ -865,7 +883,7 @@ impl FileSessionInbox {
                 // Fence v1-only readers/writers before publishing any intent.
                 // This preserves the existing coordinator permission exactly;
                 // cancellation may leave this safe upgrade without a message.
-                Self::write_activation_watermark(&dir, prefix, true).await?;
+                Self::write_activation_watermark(&dir, prefix, true, &filesystem).await?;
             }
         }
         #[cfg(test)]
@@ -875,27 +893,19 @@ impl FileSessionInbox {
                 release.notified().await;
             }
         }
-        match gate {
-            Some(gate) => match mailbox
-                .deliver_with_gate(&wrapper, gate)
-                .await
-                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
-            {
-                bamboo_domain::AdmissionCommit::Committed(_) => {}
-                bamboo_domain::AdmissionCommit::Cancelled => {
-                    return Err(SessionInboxError::AdmissionCancelled);
-                }
-                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
-                    return Err(SessionInboxError::Storage(
-                        "committed inbox admission has no matching durable receipt".into(),
-                    ));
-                }
-            },
-            None => {
-                mailbox
-                    .deliver(&wrapper)
-                    .await
-                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        match filesystem
+            .deliver(&dir, &wrapper, gate)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+        {
+            bamboo_domain::AdmissionCommit::Committed(_) => {}
+            bamboo_domain::AdmissionCommit::Cancelled => {
+                return Err(SessionInboxError::AdmissionCancelled)
+            }
+            bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                return Err(SessionInboxError::Storage(
+                    "committed inbox admission has no matching durable receipt".into(),
+                ))
             }
         }
         Ok(SessionInboxReceipt {
@@ -1118,8 +1128,13 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let lifecycle = self.lock_lifecycle().await?;
-        self.deliver_with_lifecycle_held(envelope, &lifecycle, None, None)
-            .await
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            None,
+            None,
+        )
+        .await
     }
 
     async fn deliver_with_gate(
@@ -1128,8 +1143,13 @@ impl SessionInboxPort for FileSessionInbox {
         gate: &bamboo_domain::AdmissionGate,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let lifecycle = self.lock_lifecycle().await?;
-        self.deliver_with_lifecycle_held(envelope, &lifecycle, Some(gate), None)
-            .await
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            Some(gate),
+            None,
+        )
+        .await
     }
 
     async fn deliver_with_activation_intent(
@@ -1141,7 +1161,7 @@ impl SessionInboxPort for FileSessionInbox {
         let lifecycle = self.lock_lifecycle().await?;
         self.deliver_with_lifecycle_held(
             envelope,
-            &lifecycle,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
             gate,
             Some(SessionInboxActivationIntent::new(policy)),
         )
@@ -1178,7 +1198,7 @@ impl SessionInboxPort for FileSessionInbox {
         // operation lock, semantic receipt and Maildir transaction as deliver.
         self.deliver_with_lifecycle_held(
             envelope,
-            authority.lifecycle(),
+            InboxAuthority::Supervisor { _guard: authority },
             None,
             Some(SessionInboxActivationIntent::new(
                 SessionActivationPolicy::RespectSpecificWait,
@@ -1193,9 +1213,9 @@ impl SessionInboxPort for FileSessionInbox {
         generation: u64,
         policy: SessionActivationPolicy,
     ) -> Result<(), SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
         let delivered_generation = Self::read_generation(&dir).await?;
         if generation == 0 || generation > delivered_generation {
             return Err(SessionInboxError::InvalidClaim(format!(
@@ -1209,7 +1229,7 @@ impl SessionInboxPort for FileSessionInbox {
         if policy == SessionActivationPolicy::InterruptSpecificWait {
             let current_interrupt = Self::read_interrupt_generation(&dir).await?;
             if generation > current_interrupt {
-                Self::write_interrupt_watermark(&dir, generation).await?;
+                Self::write_interrupt_watermark(&dir, generation, &filesystem).await?;
             }
         }
         let (current, versioned) = Self::read_activation_watermark(&dir).await?;
@@ -1220,7 +1240,7 @@ impl SessionInboxPort for FileSessionInbox {
                     "injected activation watermark write failure".into(),
                 ));
             }
-            Self::write_activation_watermark(&dir, generation, versioned).await?;
+            Self::write_activation_watermark(&dir, generation, versioned, &filesystem).await?;
         }
         Ok(())
     }
@@ -1429,10 +1449,10 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         target_session_id: &str,
     ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        let mut entries = Self::valid_queue_entries(&dir, "new").await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "new", &filesystem).await?;
         entries.sort_by_key(|entry| entry.0);
         let mut result = Vec::new();
         for (_, _, path) in entries {
@@ -1455,12 +1475,12 @@ impl SessionInboxPort for FileSessionInbox {
         target_session_id: &str,
         id: &SessionMessageId,
     ) -> Result<bool, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
         // The same operation lock protects claim and withdrawal across adapters.
         // Retain the original envelope as a permanent deduplication tombstone.
-        for (_, name, path) in Self::valid_queue_entries(&dir, "new").await? {
+        for (_, name, path) in Self::owned_queue_entries(&dir, "new", &filesystem).await? {
             let bytes = tokio::fs::read(&path)
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -1472,10 +1492,8 @@ impl SessionInboxPort for FileSessionInbox {
                 && envelope.is_guidance()
                 && envelope.target_session_id == target_session_id
             {
-                tokio::fs::create_dir_all(dir.join("cancelled"))
-                    .await
-                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-                tokio::fs::rename(path, dir.join("cancelled").join(name))
+                filesystem
+                    .cancel(&dir, &path, &name)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
                 return Ok(true);
@@ -1488,17 +1506,22 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         target_session_id: &str,
     ) -> Result<SessionInboxBacklog, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        let pending = Self::valid_queue_entries(&dir, "new").await?.len();
-        let claimed = Self::valid_queue_entries(&dir, "cur").await?.len();
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
+        let pending = Self::owned_queue_entries(&dir, "new", &filesystem)
+            .await?
+            .len();
+        let claimed = Self::owned_queue_entries(&dir, "cur", &filesystem)
+            .await?
+            .len();
         let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
         let interrupt_prefix = Self::read_interrupt_generation(&dir).await?;
         let mut activation_generation = prefix;
         let mut interrupt_generation = 0;
         for queue in ["new", "cur"] {
-            for (generation, _, path) in Self::valid_queue_entries(&dir, queue).await? {
+            for (generation, _, path) in Self::owned_queue_entries(&dir, queue, &filesystem).await?
+            {
                 let intent = self.queue_intent(&path, versioned).await?;
                 if Self::eligible(generation, prefix, intent) {
                     activation_generation = activation_generation.max(generation);
@@ -1521,7 +1544,7 @@ impl SessionInboxPort for FileSessionInbox {
             activation_generation,
             coordinator_generation: prefix,
             interrupt_generation,
-            oldest_generation: Self::oldest_backlog_generation(&dir).await?,
+            oldest_generation: Self::oldest_backlog_generation(&dir, &filesystem).await?,
         })
     }
 }
@@ -2336,3 +2359,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_inbox_owned_lifetime_tests.rs"]
 mod owned_lifetime_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_producer_lifetime_tests.rs"]
+mod producer_lifetime_tests;

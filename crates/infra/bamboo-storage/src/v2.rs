@@ -79,6 +79,7 @@ mod root_lifetime;
 mod root_lifetime_tests;
 mod supervisor;
 mod supervisor_management;
+pub(crate) use supervisor_management::SupervisorFollowupGuard;
 #[cfg(test)]
 mod supervisor_management_lifetime_tests;
 #[cfg(test)]
