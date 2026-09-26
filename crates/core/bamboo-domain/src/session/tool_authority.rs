@@ -2,6 +2,55 @@
 
 use super::{model_context::ModelContextResetReason, Session, SessionKind};
 
+/// Root product policy, independent of a model call's `ReasoningEffort`.
+/// Ultra delegates planning/execution and keeps verification at the Root.
+/// It is projected from existing durable Root authority, never persisted twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RootThinkingMode {
+    Standard,
+    Ultra,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("thinking_mode and root orchestration enabled selection conflict")]
+pub struct RootThinkingModeConflict;
+
+impl RootThinkingMode {
+    /// Optional DTO field: omission is allowed, explicit null is not a mode.
+    pub fn deserialize_selection<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <Self as serde::Deserialize>::deserialize(deserializer).map(Some)
+    }
+
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Ultra
+        } else {
+            Self::Standard
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self == Self::Ultra
+    }
+
+    /// Normalize canonical and legacy selectors before existing admission.
+    pub fn resolve_selection(
+        mode: Option<Self>,
+        enabled: Option<bool>,
+    ) -> Result<Option<bool>, RootThinkingModeConflict> {
+        if let (Some(mode), Some(enabled)) = (mode, enabled) {
+            if mode.enabled() != enabled {
+                return Err(RootThinkingModeConflict);
+            }
+        }
+        Ok(mode.map(Self::enabled).or(enabled))
+    }
+}
+
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
@@ -36,6 +85,10 @@ pub enum RootToolAuthorityError {
 }
 
 impl Session {
+    pub fn root_thinking_mode(&self) -> RootThinkingMode {
+        RootThinkingMode::from_enabled(self.root_orchestration_only_enabled())
+    }
+
     pub fn root_orchestration_only_enabled(&self) -> bool {
         self.kind == SessionKind::Root
             && self.parent_session_id.is_none()
@@ -140,6 +193,76 @@ impl Session {
 mod tests {
     use super::*;
     use crate::session::{AgentRuntimeState, ModelContextState, PlanModeState, PlanModeStatus};
+
+    #[test]
+    fn thinking_mode_is_a_derived_root_policy_independent_of_effort() {
+        use crate::ReasoningEffort;
+        let mut root = Session::new("ultra-root", "model");
+        root.reasoning_effort = Some(ReasoningEffort::Max);
+        root.set_root_orchestration_prompt_enabled(true);
+        assert_eq!(root.root_thinking_mode(), RootThinkingMode::Standard);
+        root.set_root_orchestration_only(true).unwrap();
+        let persisted = serde_json::to_value(&root).unwrap();
+        assert!(
+            persisted.get("thinking_mode").is_none(),
+            "no second persisted authority"
+        );
+        let reloaded: Session = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(reloaded.root_thinking_mode(), RootThinkingMode::Ultra);
+        assert_eq!(reloaded.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            persisted,
+            "projection never writes"
+        );
+        let mut child = Session::new_child_of("ultra-child", &reloaded, "model", "child");
+        assert_eq!(child.root_thinking_mode(), RootThinkingMode::Standard);
+        assert_eq!(child.reasoning_effort, None);
+        child.root_orchestration_only = true;
+        assert_eq!(
+            child.root_thinking_mode(),
+            RootThinkingMode::Standard,
+            "raw child bool has no authority"
+        );
+        assert_eq!(
+            child.set_root_orchestration_only(true),
+            Err(RootToolAuthorityError::NotRoot)
+        );
+        assert_eq!(
+            serde_json::to_string(&RootThinkingMode::Ultra).unwrap(),
+            "\"ultra\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RootThinkingMode>("\"standard\"").unwrap(),
+            RootThinkingMode::Standard
+        );
+        assert!(serde_json::from_str::<RootThinkingMode>("\"max\"").is_err());
+        assert!(serde_json::from_str::<ReasoningEffort>("\"ultra\"").is_err());
+    }
+
+    #[test]
+    fn canonical_and_legacy_thinking_selectors_share_one_boolean_request() {
+        assert_eq!(RootThinkingMode::resolve_selection(None, None), Ok(None));
+        for enabled in [false, true] {
+            let mode = RootThinkingMode::from_enabled(enabled);
+            assert_eq!(
+                RootThinkingMode::resolve_selection(Some(mode), None),
+                Ok(Some(enabled))
+            );
+            assert_eq!(
+                RootThinkingMode::resolve_selection(None, Some(enabled)),
+                Ok(Some(enabled))
+            );
+            assert_eq!(
+                RootThinkingMode::resolve_selection(Some(mode), Some(enabled)),
+                Ok(Some(enabled))
+            );
+            assert_eq!(
+                RootThinkingMode::resolve_selection(Some(mode), Some(!enabled)),
+                Err(RootThinkingModeConflict)
+            );
+        }
+    }
 
     #[test]
     fn root_selection_is_persistent_and_child_does_not_inherit_it() {

@@ -3,7 +3,7 @@
 use actix_web::{web, HttpResponse};
 use bamboo_domain::{
     RootModeOperationAction, RootModeOperationDecision, RootModeOperationOutcome,
-    RootModeOperationRequest,
+    RootModeOperationRequest, RootThinkingMode,
 };
 use serde::Deserialize;
 
@@ -13,7 +13,10 @@ use crate::app_state::AppState;
 pub struct RootModeOperationBody {
     birth_token: String,
     expected_epoch: u64,
-    enabled: bool,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "RootThinkingMode::deserialize_selection")]
+    thinking_mode: Option<RootThinkingMode>,
 }
 
 fn error(status: actix_web::http::StatusCode, code: &str, message: &str) -> HttpResponse {
@@ -55,6 +58,7 @@ fn operation_response(decision: RootModeOperationDecision, recovering: bool) -> 
                     "expected_epoch": receipt.expected_epoch,
                     "resulting_epoch": receipt.resulting_epoch,
                     "enabled_at_completion": receipt.enabled_at_completion,
+                    "thinking_mode_at_completion": RootThinkingMode::from_enabled(receipt.enabled_at_completion),
                     "root_tool_authority_revision": receipt.tool_authority_revision,
                 }))
         }
@@ -72,6 +76,7 @@ fn operation_response(decision: RootModeOperationDecision, recovering: bool) -> 
                 "expected_epoch": expected_epoch,
                 "current_epoch": current_epoch,
                 "current_enabled": current_enabled,
+                "current_thinking_mode": RootThinkingMode::from_enabled(current_enabled),
                 "root_tool_authority_revision": current_tool_revision,
             })),
         RootModeOperationDecision::FencedBySuccessor { .. } => error(
@@ -139,6 +144,24 @@ async fn run(
     action: RootModeOperationAction,
 ) -> HttpResponse {
     use actix_web::http::StatusCode;
+    let requested_enabled =
+        match RootThinkingMode::resolve_selection(body.thinking_mode, body.enabled) {
+            Ok(Some(enabled)) => enabled,
+            Ok(None) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_root_mode_operation",
+                    "Provide thinking_mode or enabled",
+                )
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "root_thinking_mode_conflict",
+                    "thinking_mode and enabled conflict",
+                )
+            }
+        };
     let (session_id, operation_id) = path.into_inner();
     if !bamboo_domain::root_mode_operation_id_matches_epoch(&operation_id, body.expected_epoch)
         || body.birth_token.len() != 64
@@ -158,7 +181,7 @@ async fn run(
         operation_id,
         birth_token: body.birth_token.clone(),
         expected_epoch: body.expected_epoch,
-        requested_enabled: body.enabled,
+        requested_enabled,
         action,
     };
     // The owned task survives an HTTP timeout. The V2 writer lock, proof and
@@ -221,6 +244,155 @@ mod tests {
     use crate::routes::configure_routes;
 
     use super::*;
+
+    #[actix_web::test]
+    async fn ultra_mode_reuses_terminal_proof_and_exposes_its_temporal_meaning() {
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().to_path_buf()).await.unwrap());
+        let mut root = Session::new("ultra-mode-http", "test-model");
+        root.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Max);
+        state.save_and_cache_session(&mut root).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let base = format!("/api/v1/sessions/{}", root.id);
+        let operation_id = format!("0:{}", uuid::Uuid::new_v4());
+        let operation = format!("{base}/root-mode-operations/{operation_id}");
+        let body = serde_json::json!({"birth_token": root.root_mode_birth_token(), "expected_epoch": 0, "thinking_mode": "ultra"});
+        let selected: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri(&operation)
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(selected["status"], "committed");
+        assert_eq!(selected["thinking_mode_at_completion"], "ultra");
+        assert!(selected.get("thinking_mode").is_none());
+        let restarted = web::Data::new(AppState::new(home.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(restarted.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let detail: Value =
+            test::call_and_read_body_json(&app, test::TestRequest::get().uri(&base).to_request())
+                .await;
+        assert_eq!(detail["session"]["thinking_mode"], "ultra");
+        assert_eq!(detail["session"]["reasoning_effort"], "max");
+        let next = format!("{base}/root-mode-operations/1:{}", uuid::Uuid::new_v4());
+        let standard = serde_json::json!({"birth_token": root.root_mode_birth_token(), "expected_epoch": 1, "thinking_mode": "standard", "enabled": false});
+        let changed: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri(&next)
+                .set_json(&standard)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(changed["thinking_mode_at_completion"], "standard");
+        // An old canonical request can recover using its legacy representation.
+        let legacy = serde_json::json!({"birth_token": root.root_mode_birth_token(), "expected_epoch": 0, "enabled": true});
+        let historical: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("{operation}/recover"))
+                .set_json(&legacy)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(historical["thinking_mode_at_completion"], "ultra");
+        let stale = format!(
+            "{base}/root-mode-operations/0:{}/recover",
+            uuid::Uuid::new_v4()
+        );
+        let successor: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri(&stale)
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(successor["status"], "fenced_by_successor");
+        assert_eq!(successor["current_thinking_mode"], "standard");
+        assert!(successor.get("thinking_mode_at_completion").is_none());
+        let durable_before = restarted
+            .storage
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for selector in [
+            serde_json::json!({}),
+            serde_json::json!({"thinking_mode": "ultra", "enabled": false}),
+            serde_json::json!({"thinking_mode": "max"}),
+            serde_json::json!({"thinking_mode": null, "enabled": true}),
+        ] {
+            let mut invalid = selector;
+            invalid["birth_token"] = root.root_mode_birth_token().into();
+            invalid["expected_epoch"] = 2.into();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!(
+                        "{base}/root-mode-operations/2:{}",
+                        uuid::Uuid::new_v4()
+                    ))
+                    .set_json(&invalid)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for mode in [
+            serde_json::json!("ultra"),
+            serde_json::json!("standard"),
+            Value::Null,
+            serde_json::json!(7),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&base)
+                    .set_json(serde_json::json!({"thinking_mode": mode, "title": "must not write"}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error: Value = test::read_body_json(response).await;
+            assert_eq!(error["error"]["code"], "root_mode_operation_required");
+        }
+        let durable_after = restarted
+            .storage
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(durable_after).unwrap(),
+            serde_json::to_value(durable_before).unwrap()
+        );
+        let detail: Value =
+            test::call_and_read_body_json(&app, test::TestRequest::get().uri(&base).to_request())
+                .await;
+        assert_eq!(detail["session"]["thinking_mode"], "standard");
+        assert_eq!(detail["session"]["reasoning_effort"], "max");
+        let mut child =
+            Session::new_child_of("ultra-mode-child-http", &root, "test-model", "child");
+        restarted.save_and_cache_session(&mut child).await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/root-mode-operations/0:{}", child.id, uuid::Uuid::new_v4()))
+            .set_json(serde_json::json!({"birth_token": child.root_mode_birth_token(), "expected_epoch":0, "thinking_mode":"ultra"})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = test::read_body_json(response).await;
+        assert_eq!(error["error"]["code"], "root_orchestration_requires_root");
+    }
 
     #[actix_web::test]
     async fn two_app_states_recover_only_after_cross_process_mode_commit() {

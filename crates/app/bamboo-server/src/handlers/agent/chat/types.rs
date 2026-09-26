@@ -1,4 +1,4 @@
-use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef};
+use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef, RootThinkingMode};
 use serde::{Deserialize, Serialize};
 
 /// Request payload for creating a new chat message.
@@ -36,6 +36,10 @@ pub struct ChatRequest {
     /// omission keeps the prior selection. Child sessions cannot set it.
     #[serde(default)]
     pub root_orchestration_only: Option<bool>,
+    /// Root product selection for first chat. Existing Roots use the
+    /// recoverable mode operation; per-call reasoning remains independent.
+    #[serde(default, deserialize_with = "RootThinkingMode::deserialize_selection")]
+    pub thinking_mode: Option<RootThinkingMode>,
     #[serde(default)]
     pub workspace_path: Option<String>,
     #[serde(default)]
@@ -203,6 +207,7 @@ mod tests {
             enhance_prompt: None,
             root_orchestration_prompt: None,
             root_orchestration_only: None,
+            thinking_mode: None,
             workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,

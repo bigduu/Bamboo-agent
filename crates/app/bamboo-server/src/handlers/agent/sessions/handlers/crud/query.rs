@@ -172,6 +172,8 @@ pub async fn get_session(
             };
             summary.root_orchestration_only =
                 Some(durable_session.root_orchestration_only_enabled());
+            summary.thinking_mode = Some(durable_session.root_thinking_mode());
+            summary.reasoning_effort = durable_session.reasoning_effort;
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
             {
