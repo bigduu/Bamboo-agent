@@ -117,6 +117,8 @@ impl Source {
         let side_bytes = regular_bytes(&directory.join(RUNTIME_SIDECAR_FILE))?;
         let record_bytes = regular_bytes(&directory.join("actor-authority.json"))?;
         let marker_bytes = regular_bytes(&directory.join("actor-authority.initialized.json"))?;
+        compact_main::validate_full_main(raw.as_bytes())
+            .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
         let mut main: Session = decode(raw.as_bytes())?;
         let mut side: Session = decode(&side_bytes)?;
         supervisor::validate_overlay(&main, Some(&side))?;
@@ -373,6 +375,8 @@ fn patched_main(raw: &str, request: &ActorTranscriptAppend, candidate: &Session)
         replacements.push((native, std::mem::take(&mut native_raw)));
     }
     let output = splice(raw, replacements)?;
+    compact_main::validate_full_main(output.as_bytes())
+        .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
     let committed: Session = decode(output.as_bytes())?;
     if encoded(&committed.messages)? != encoded(&candidate.messages)?
         || committed.provider_transcript != candidate.provider_transcript
@@ -469,6 +473,8 @@ impl SessionStoreV2 {
                 {
                     return Err(ActorTranscriptAppendError::InvalidSource);
                 }
+                compact_main::validate_full_main(&actual)
+                    .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
                 Ok(overlay_runtime_sidecar(
                     decode(&actual)?,
                     Some(decode(&source.side_bytes)?),

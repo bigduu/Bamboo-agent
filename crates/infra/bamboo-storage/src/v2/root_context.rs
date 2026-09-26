@@ -406,6 +406,7 @@ impl SessionStoreV2 {
                 }
                 let main_bytes = fs::read(main_path).await?;
                 let side_bytes = fs::read(side_path).await?;
+                compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
                 let side: Session = serde_json::from_slice(&side_bytes)?;
                 Self::validate_root_tool_authority_pair(
@@ -651,6 +652,8 @@ impl SessionStoreV2 {
             let bytes = fs::read(directory.join("session.json"))
                 .await
                 .map_err(|error| conflict(format!("canonical main file: {error}")))?;
+            compact_main::validate_full_main(&bytes)
+                .map_err(|error| conflict(error.to_string()))?;
             let main: Session = serde_json::from_slice(&bytes)
                 .map_err(|error| conflict(format!("invalid canonical main: {error}")))?;
             supervisor::validate_overlay(&main, Some(&current))

@@ -60,6 +60,9 @@ mod actor_snapshot_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
 mod child_project;
+mod compact_main;
+#[cfg(test)]
+mod compact_main_tests;
 mod default_actor_context;
 #[cfg(test)]
 mod default_actor_context_tests;
@@ -1667,6 +1670,10 @@ impl SessionStoreV2 {
                 return None;
             }
         };
+        if let Err(error) = compact_main::validate_full_main(raw.as_bytes()) {
+            tracing::warn!("index rebuild: skipping invalid compact Main for {id}: {error}");
+            return None;
+        }
         let mut main: Session = match serde_json::from_str(&raw) {
             Ok(session) => session,
             Err(error) => {
@@ -1729,6 +1736,7 @@ impl SessionStoreV2 {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        compact_main::validate_full_main(raw.as_bytes())?;
         let mut main: Session = serde_json::from_str(&raw).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2321,6 +2329,12 @@ impl SessionStoreV2 {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        compact_main::validate_full_main(raw.as_bytes()).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("invalid authoritative session.json: {error}"),
+            )
+        })?;
         // Unlike best-effort global-index rebuild, operation recovery must not
         // collapse an unreadable/corrupt authoritative result into "missing":
         // doing so could turn a repairable failure into terminal 410 truth.
@@ -2606,6 +2620,7 @@ impl SessionStoreV2 {
             }
             Err(error) => return Err(error),
         };
+        compact_main::validate_full_main(raw.as_bytes())?;
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
@@ -2690,6 +2705,7 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let raw = fs::read_to_string(&path).await?;
+        compact_main::validate_full_main(raw.as_bytes())?;
         let session: Session = serde_json::from_str(&raw).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -4024,6 +4040,10 @@ impl SessionStoreV2 {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
+        if let Err(error) = compact_main::validate_full_main(&raw) {
+            tracing::warn!(session_id = %entry.id, %error, "runtime migration skipped invalid compact Main");
+            return Ok(false);
+        }
         let mut session: Session = match serde_json::from_slice(&raw) {
             Ok(session) => session,
             Err(error) => {
@@ -4486,12 +4506,12 @@ impl SessionStoreV2 {
             target_id: new_id.to_string(),
         };
         let staging_dir = self.session_copy_staging_dir(&journal);
-        let journal_path = self.write_session_copy_journal(&journal).await?;
-
         let mut copied = copied_session_snapshot(&source, new_id);
         rewrite_attachment_session_urls(&mut copied, source_id, new_id);
+        let main_bytes = compact_main::serialize_main(&copied)?;
+        let journal_path = self.write_session_copy_journal(&journal).await?;
         let has_attachments = match self
-            .write_copied_session(&source_dir, &staging_dir, &target_dir, &copied)
+            .write_copied_session(&source_dir, &staging_dir, &target_dir, &copied, &main_bytes)
             .await
         {
             Ok(has_attachments) => has_attachments,
@@ -4577,6 +4597,7 @@ impl SessionStoreV2 {
         staging_dir: &Path,
         target_dir: &Path,
         copied: &Session,
+        main_bytes: &[u8],
     ) -> io::Result<bool> {
         fs::create_dir(staging_dir).await?;
         fs::create_dir(staging_dir.join("children")).await?;
@@ -4604,9 +4625,7 @@ impl SessionStoreV2 {
         let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         durable_atomic_write(&staging_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
-        let session_json =
-            serde_json::to_vec_pretty(copied).map_err(|error| other_io_error(error.to_string()))?;
-        durable_atomic_write(&staging_dir.join("session.json"), &session_json).await?;
+        durable_atomic_write(&staging_dir.join("session.json"), main_bytes).await?;
         Self::write_staged_root_tool_proof(staging_dir, copied).await?;
         Self::write_staged_supervisor_proof(staging_dir, copied).await?;
         // Flush the staging directory after its children/attachments are all
@@ -5271,6 +5290,7 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let raw = fs::read_to_string(path).await?;
+        compact_main::validate_full_main(raw.as_bytes())?;
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
         if !self.session_lifetime_is_live(&session).await? {
@@ -5301,6 +5321,12 @@ impl SessionStoreV2 {
         self.reject_regressing_runtime_task(session).await?;
 
         let mut stages = SaveStageDurations::default();
+        let serialization_started = Instant::now();
+        let session_bytes = compact_main::serialize_main(session)?;
+        let runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+            .map_err(|error| other_io_error(error.to_string()))?;
+        stages.serialization = serialization_started.elapsed();
+        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
         let directory_started = Instant::now();
         let rel_path = self.ensure_default_writer_dirs(session, guards).await?;
         let abs_dir = self.abs_path_from_rel(&rel_path);
@@ -5313,14 +5339,7 @@ impl SessionStoreV2 {
         // load-time overlay (sidecar wins for non-message fields) stays correct.
         // Writing session.json first could leave a stale sidecar that silently
         // reverts the just-saved control-plane on the next load.
-        let serialization_started = Instant::now();
-        let runtime_snapshot = runtime_sidecar_snapshot(session);
-        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
-            .map_err(|error| other_io_error(error.to_string()))?;
-        let session_bytes =
-            serde_json::to_vec_pretty(session).map_err(|e| other_io_error(e.to_string()))?;
-        stages.serialization = serialization_started.elapsed();
-        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+        // Both buffers were preflighted before this publisher prepared directories.
 
         #[cfg(any(test, feature = "test-utils"))]
         self.maybe_pause_full_save_before_filesystem_commit(&session.id)
@@ -8906,10 +8925,10 @@ mod tests {
             let path = source_dir.join(filename);
             let mut value: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).await?).map_err(io::Error::other)?;
-            value
-                .as_object_mut()
-                .expect("session snapshot object")
-                .remove("root_session_id");
+            let fields = value.as_object_mut().expect("session snapshot object");
+            // Actual legacy Main has no compact section; Runtime remains legacy.
+            fields.remove(compact_main::MEMBER);
+            fields.remove("root_session_id");
             fs::write(
                 path,
                 serde_json::to_vec_pretty(&value).map_err(io::Error::other)?,

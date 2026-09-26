@@ -119,9 +119,12 @@ async fn observe_file(path: &Path) -> ObservedFile {
     }
 }
 
-fn parse_session(file: &ObservedFile) -> Option<Session> {
+fn parse_session(file: &ObservedFile, main: bool) -> Option<Session> {
     match file {
         ObservedFile::Bytes(bytes) => {
+            if main {
+                compact_main::validate_full_main(bytes).ok()?;
+            }
             let mut session: Session = serde_json::from_slice(bytes).ok()?;
             // Same canonical legacy Root spelling accepted by strict V2 reads.
             if session.kind == SessionKind::Root && session.root_session_id.is_empty() {
@@ -214,11 +217,14 @@ impl SessionStoreV2 {
         // Main is the durable birth and history authority; runtime is the
         // actual published summary/compression/model context. No fallback to
         // embedded main context may authorize a protected reconstruction.
-        let main = parse_session(&observe_file(&directory.join("session.json")).await);
+        let main = parse_session(&observe_file(&directory.join("session.json")).await, true);
         if permits_unfenced_context(&record, &marker, main.as_ref()) {
             return Ok(());
         }
-        let side = parse_session(&observe_file(&directory.join(RUNTIME_SIDECAR_FILE)).await);
+        let side = parse_session(
+            &observe_file(&directory.join(RUNTIME_SIDECAR_FILE)).await,
+            false,
+        );
         let (Some(main), Some(side)) = (main, side) else {
             return Err(context_conflict());
         };
@@ -260,7 +266,7 @@ impl SessionStoreV2 {
         if permits_unfenced_context(&record, &marker, None) {
             return Ok(());
         }
-        let main = parse_session(&observe_file(&directory.join("session.json")).await);
+        let main = parse_session(&observe_file(&directory.join("session.json")).await, true);
         if permits_unfenced_context(&record, &marker, main.as_ref()) {
             Ok(())
         } else {
@@ -343,8 +349,7 @@ impl SessionStoreV2 {
         let directory = directory.to_path_buf();
         let runtime = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
             .map_err(|error| other_io_error(error.to_string()))?;
-        let main = serde_json::to_vec_pretty(session)
-            .map_err(|error| other_io_error(error.to_string()))?;
+        let main = compact_main::serialize_main(session)?;
         let revision_path = directory.join(SEARCH_INDEX_REVISION_FILE);
         let revision = Uuid::new_v4().to_string();
         let published_revision = revision.clone();

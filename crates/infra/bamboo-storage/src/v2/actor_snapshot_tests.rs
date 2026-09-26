@@ -274,12 +274,18 @@ async fn changed_birth_stale_row_and_missing_marker_fail_without_repair() {
     let parent = f.child("parent", &f.root).await;
     f.child("child", &parent).await;
     f.store.ensure_actor("child").await.unwrap();
-    for file in ["session.json", "runtime.json"] {
-        f.edit("parent", file, |v| {
-            v["created_at"] = serde_json::json!(f.root.created_at)
-        })
-        .await;
-    }
+    // A coherent changed birth makes the initialized actor row stale, while
+    // a contradictory compact/flat Main is rejected as inconsistent earlier.
+    let path = f.directory("parent").join("session.json");
+    let mut main: Session = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+    main.created_at = f.root.created_at;
+    fs::write(path, compact_main::serialize_main(&main).unwrap())
+        .await
+        .unwrap();
+    f.edit("parent", "runtime.json", |v| {
+        v["created_at"] = serde_json::json!(f.root.created_at)
+    })
+    .await;
     assert_eq!(
         f.snapshot("child", ActorSnapshotLimits::default())
             .await

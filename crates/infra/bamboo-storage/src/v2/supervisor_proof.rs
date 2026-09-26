@@ -300,6 +300,7 @@ impl SessionStoreV2 {
                 let pair = async {
                     let main_bytes = fs::read(directory.join("session.json")).await?;
                     let side_bytes = fs::read(directory.join(RUNTIME_SIDECAR_FILE)).await?;
+                    compact_main::validate_full_main(&main_bytes)?;
                     let main: Session = serde_json::from_slice(&main_bytes)?;
                     let side: Session = serde_json::from_slice(&side_bytes)?;
                     if main.id != DEFAULT_SUPERVISOR_SESSION_ID

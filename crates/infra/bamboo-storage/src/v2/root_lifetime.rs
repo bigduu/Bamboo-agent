@@ -136,6 +136,9 @@ impl SessionStoreV2 {
             let Some(bytes) = read_regular(&directory.join(name)).await? else {
                 continue;
             };
+            if name == "session.json" {
+                compact_main::validate_full_main(&bytes)?;
+            }
             let identity: RootBirth = serde_json::from_slice(&bytes)
                 .map_err(|error| invalid(format!("invalid Root deletion identity: {error}")))?;
             if identity.id != session_id
@@ -399,10 +402,12 @@ impl SessionStoreV2 {
             debug_assert_eq!(existing.created_at, full.created_at);
             return Ok(full);
         }
-        self.remove_revoked_root_directory(session_id).await?;
         let mut session = Session::new(session_id, initial_model.trim());
         session.created_at = self.fresh_root_birth(session_id).await?;
         session.updated_at = session.created_at;
+        let main_bytes = compact_main::serialize_main(&session)?;
+        let runtime_bytes = serde_json::to_vec_pretty(&session).map_err(io::Error::other)?;
+        self.remove_revoked_root_directory(session_id).await?;
         let staging = self
             .bamboo_home_dir
             .join(format!(".root-recreation-{}", Uuid::new_v4()));
@@ -411,10 +416,8 @@ impl SessionStoreV2 {
         let result = async {
             fs::create_dir(staging.join("children")).await?;
             fs::create_dir(staging.join("attachments")).await?;
-            let bytes =
-                serde_json::to_vec_pretty(&session).map_err(|error| invalid(error.to_string()))?;
-            durable_atomic_write(&staging.join("session.json"), &bytes).await?;
-            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            durable_atomic_write(&staging.join("session.json"), &main_bytes).await?;
+            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
             Self::write_staged_root_tool_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
             self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;

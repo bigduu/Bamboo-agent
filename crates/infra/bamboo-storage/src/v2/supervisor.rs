@@ -202,9 +202,10 @@ impl SessionStoreV2 {
             side.authority_identity,
             SessionAuthorityIdentity::Supervisor { .. }
         ) {
-            let main: MainIdentity =
-                serde_json::from_slice(&read_regular(&directory.join("session.json")).await?)
-                    .map_err(|_| invalid("invalid canonical session.json"))?;
+            let main_bytes = read_regular(&directory.join("session.json")).await?;
+            compact_main::validate_full_main(&main_bytes)?;
+            let main: MainIdentity = serde_json::from_slice(&main_bytes)
+                .map_err(|_| invalid("invalid canonical session.json"))?;
             validate_management(
                 &main.authority_identity,
                 main.supervisor_management.as_ref(),
@@ -269,6 +270,7 @@ impl SessionStoreV2 {
                 Err(error) if error.kind() == io::ErrorKind::NotFound)
             {
                 if let Ok(bytes) = read_regular(&directory.join("session.json")).await {
+                    compact_main::validate_full_main(&bytes)?;
                     if let Ok(main) = serde_json::from_slice::<Session>(&bytes) {
                         if main.id == DEFAULT_SUPERVISOR_SESSION_ID
                             && main.kind == SessionKind::Root
@@ -346,6 +348,8 @@ impl SessionStoreV2 {
         session.title = "Supervisor".to_string();
         session.title_generated = true;
         session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id };
+        let main_bytes = compact_main::serialize_main(&session)?;
+        let runtime_bytes = serde_json::to_vec_pretty(&session).map_err(io::Error::other)?;
         let staging = self
             .bamboo_home_dir
             .join(format!(".supervisor-bootstrap-{}", Uuid::new_v4()));
@@ -356,10 +360,8 @@ impl SessionStoreV2 {
         let result = async {
             fs::create_dir(staging.join("children")).await?;
             fs::create_dir(staging.join("attachments")).await?;
-            let bytes = serde_json::to_vec_pretty(&session)
-                .map_err(|error| other_io_error(error.to_string()))?;
-            durable_atomic_write(&staging.join("session.json"), &bytes).await?;
-            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            durable_atomic_write(&staging.join("session.json"), &main_bytes).await?;
+            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
             Self::write_staged_root_tool_proof(&staging, &session).await?;
             Self::write_staged_supervisor_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
