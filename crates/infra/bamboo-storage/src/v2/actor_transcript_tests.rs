@@ -257,8 +257,8 @@ async fn setup(
     std::fs::write(directory.join("attachments/unchanged.bin"), b"attachment").unwrap();
     let main = directory.join("session.json");
     let raw = std::fs::read_to_string(&main).unwrap().replacen(
-        '{',
-        "{\n\"future_control\": { \"number\":1e0, \"escaped\":\"\\u0061\" },",
+        '\n',
+        "\n\"future_control\": { \"number\":1e0, \"escaped\":\"\\u0061\" },",
         1,
     );
     std::fs::write(main, raw).unwrap();
@@ -302,6 +302,9 @@ async fn root_child_six_native_kinds_preserve_exact_raw_prefix_and_control_plane
             let directory = actor_dir(home.path(), child);
             let before = files(&directory);
             let original = std::str::from_utf8(before[0].as_ref().unwrap()).unwrap();
+            assert!(compact_main::validate_full_main(original.as_bytes())
+                .unwrap()
+                .is_some());
             // Unknown native keys and original group lexical JSON are also retained.
             let native_raw = raw_field(original, "provider_transcript");
             let decorated = native_raw.replacen('{', "{\"future_native\":1e0,", 1);
@@ -326,6 +329,13 @@ async fn root_child_six_native_kinds_preserve_exact_raw_prefix_and_control_plane
             let after = files(&directory);
             assert_eq!(&after[1..], &before[1..]);
             let published = std::str::from_utf8(after[0].as_ref().unwrap()).unwrap();
+            assert_eq!(
+                raw_field(published, compact_main::MEMBER),
+                raw_field(original, compact_main::MEMBER)
+            );
+            assert!(compact_main::validate_full_main(published.as_bytes())
+                .unwrap()
+                .is_some());
             assert_eq!(
                 raw_field(published, "future_control"),
                 raw_field(original, "future_control")
@@ -951,4 +961,67 @@ async fn before_replace_failure_is_unchanged_after_replace_and_readback_are_unco
         no_temps(&directory);
         released(&store);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_main_append_preserves_legacy_absence_and_rejects_initial_or_final_damage() {
+    for damage_at_barrier in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, _, req) = setup(home.path(), false, ProviderFamily::OpenAi).await;
+        let directory = actor_dir(home.path(), false);
+        let raw = std::fs::read_to_string(directory.join("session.json")).unwrap();
+        let compact = raw_field(&raw, compact_main::MEMBER);
+        // Trusted fault changes only the flat revision; valid prefix is retained.
+        let damaged = raw.replacen("\"metadata_version\": 0", "\"metadata_version\": 7", 1);
+        assert_ne!(damaged, raw);
+        assert_eq!(raw_field(&damaged, compact_main::MEMBER), compact);
+        if damage_at_barrier {
+            let hook = TranscriptWriteHook::install(
+                &store,
+                DurableWritePhase::BeforeReplace,
+                false,
+                false,
+            );
+            let _release = Release(hook.clone());
+            let append = tokio::spawn({
+                let store = store.clone();
+                async move { store.append_actor_transcript(req).await }
+            });
+            tokio::task::spawn_blocking({
+                let hook = hook.clone();
+                move || hook.entered()
+            })
+            .await
+            .unwrap();
+            std::fs::write(directory.join("session.json"), &damaged).unwrap();
+            let before = files(&directory);
+            hook.release();
+            assert!(matches!(
+                append.await.unwrap().unwrap_err(),
+                ActorTranscriptAppendError::InvalidSource
+            ));
+            assert_eq!(files(&directory), before);
+        } else {
+            std::fs::write(directory.join("session.json"), &damaged).unwrap();
+            assert!(matches!(
+                unchanged_rejection(&store, &directory, req).await,
+                ActorTranscriptAppendError::InvalidSource
+            ));
+        }
+        no_temps(&directory);
+    }
+    let home = tempfile::tempdir().unwrap();
+    let (store, _, _, req) = setup(home.path(), false, ProviderFamily::Anthropic).await;
+    let directory = actor_dir(home.path(), false);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("session.json")).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove(compact_main::MEMBER);
+    std::fs::write(
+        directory.join("session.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    store.append_actor_transcript(req).await.unwrap();
+    let raw = std::fs::read(directory.join("session.json")).unwrap();
+    assert!(compact_main::validate_full_main(&raw).unwrap().is_none());
 }

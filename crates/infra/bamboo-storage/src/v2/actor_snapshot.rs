@@ -200,6 +200,8 @@ mod supported {
         let bytes = directory
             .read("session.json", budget.limits.file_bytes, budget)?
             .ok_or(Error::InconsistentAuthority)?;
+        super::super::compact_main::validate_full_main(&bytes)
+            .map_err(|_| Error::InconsistentAuthority)?;
         let main = decode::<Identity>(&bytes)?.session();
         let side = directory
             .read(RUNTIME_SIDECAR_FILE, budget.limits.file_bytes, budget)?
@@ -315,15 +317,7 @@ mod supported {
         Ok(chain)
     }
 
-    fn public_title(title: &str) -> String {
-        title
-            .chars()
-            .filter(|c| {
-                !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
-            .take(160)
-            .collect()
-    }
+    use super::super::compact_main::public_title;
 
     #[derive(Deserialize)]
     struct Revocation {
