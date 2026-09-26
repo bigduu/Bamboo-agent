@@ -681,6 +681,21 @@ pub async fn handler(
 }
 
 async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> HttpResponse {
+    let root_mode_selection = match bamboo_domain::RootThinkingMode::resolve_selection(
+        req.thinking_mode,
+        req.root_orchestration_only,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "root_thinking_mode_conflict",
+                    "message": error.to_string(),
+                }
+            }));
+        }
+    };
     let session_id = request::resolve_session_id(req.session_id.as_deref());
     let (
         existing_session_found,
@@ -943,7 +958,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())
             .map(String::from),
         root_orchestration_prompt: req.root_orchestration_prompt,
-        root_orchestration_only: req.root_orchestration_only,
+        root_orchestration_only: root_mode_selection,
         // Preserve field presence. An omitted workspace must be resolved from
         // the fresh durable session after acquiring the lock, not from this
         // lock-free preflight snapshot.
@@ -996,7 +1011,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
-    if req.root_orchestration_only.is_some()
+    if root_mode_selection.is_some()
         && authoritative_session.as_ref().is_some_and(|session| {
             session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
         })

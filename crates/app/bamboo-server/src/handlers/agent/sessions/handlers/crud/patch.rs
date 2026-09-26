@@ -196,6 +196,16 @@ pub async fn patch_session(
     req: web::Json<PatchSessionRequest>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    if req.thinking_mode.is_some() {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "root_mode_operation_required",
+                "message": "Change Root thinking_mode with a recoverable mode operation before chat",
+            },
+            "session_id": session_id,
+        })));
+    }
     if req.permission_mode.is_some() && req.bypass_permissions.is_some() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value(

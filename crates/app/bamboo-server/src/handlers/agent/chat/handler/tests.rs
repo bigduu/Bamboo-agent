@@ -494,6 +494,123 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
+    async fn ultra_first_chat_is_independent_and_cannot_change_existing_or_child_authority() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for (id, selector, expected) in [
+            (
+                "ultra-first",
+                serde_json::json!({"thinking_mode": "ultra"}),
+                "ultra",
+            ),
+            (
+                "standard-first",
+                serde_json::json!({"thinking_mode": "standard"}),
+                "standard",
+            ),
+            ("ordinary-first", serde_json::json!({}), "standard"),
+            (
+                "legacy-ultra-first",
+                serde_json::json!({"root_orchestration_only": true}),
+                "ultra",
+            ),
+        ] {
+            let mut body = selector;
+            body["session_id"] = id.into();
+            body["message"] = "Preserve required constraints while coordinating".into();
+            body["model"] = "test-model".into();
+            body["reasoning_effort"] = "max".into();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED, "{id}");
+            let detail: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(detail["session"]["thinking_mode"], expected);
+            assert_eq!(detail["session"]["reasoning_effort"], "max");
+        }
+        let root_before = state
+            .storage
+            .load_session("ultra-first")
+            .await
+            .unwrap()
+            .unwrap();
+        for mode in ["standard", "ultra"] {
+            let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").set_json(serde_json::json!({"session_id":"ultra-first", "message":"must not admit", "model":"test-model", "thinking_mode":mode})).to_request()).await;
+            assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "root_mode_operation_required");
+        }
+        let root_after = state
+            .storage
+            .load_session("ultra-first")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_after.messages.len(), root_before.messages.len());
+        assert_eq!(
+            root_after.root_tool_authority_revision,
+            root_before.root_tool_authority_revision
+        );
+        for extra in [
+            serde_json::json!({"thinking_mode":"ultra", "root_orchestration_only":false}),
+            serde_json::json!({"thinking_mode":"max"}),
+            serde_json::json!({"reasoning_effort":"ultra"}),
+            serde_json::json!({"thinking_mode":null}),
+        ] {
+            let mut body = extra;
+            body["session_id"] = "invalid-ultra-first".into();
+            body["message"] = "must not create".into();
+            body["model"] = "test-model".into();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(state
+                .storage
+                .load_session("invalid-ultra-first")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut child =
+            Session::new_child_of("ultra-first-child", &root_after, "test-model", "child");
+        state.save_and_cache_session(&mut child).await;
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").set_json(serde_json::json!({"session_id":child.id, "message":"must not enable", "model":"test-model", "thinking_mode":"ultra"})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "root_orchestration_requires_root");
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{}", child.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["thinking_mode"], "standard");
+    }
+
+    #[actix_web::test]
     async fn root_tool_mode_chat_create_resume_conflict_disable_and_detail_are_durable() {
         let state = new_state().await;
         let app = test::init_service(
