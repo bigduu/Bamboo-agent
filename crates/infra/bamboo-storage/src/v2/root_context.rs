@@ -243,6 +243,38 @@ impl SessionStoreV2 {
     }
 
     pub(super) async fn validate_root_tool_proof(&self, side: &Session) -> io::Result<()> {
+        Self::validate_root_tool_proof_identity(side)?;
+        let proof = self.read_root_tool_proof(&side.id).await?;
+        Self::validate_root_tool_proof_value(side, proof)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_root_pair(main: &Session, side: &Session) -> io::Result<()> {
+        Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)
+    }
+
+    /// Pure validation for callers that already read the proof under their own
+    /// bounded capability/transaction boundary. This never opens or repairs files.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_root_proof(side: &Session, bytes: &[u8]) -> io::Result<()> {
+        let proof = serde_json::from_slice(bytes).map_err(|_| conflict("invalid proof"))?;
+        Self::validate_root_tool_proof_value(side, proof)
+    }
+
+    fn validate_root_tool_proof_value(
+        side: &Session,
+        proof: RootToolAuthorityProof,
+    ) -> io::Result<()> {
+        Self::validate_root_tool_proof_identity(side)?;
+        if proof.state != ProofState::Committed || !proof.matches(side) {
+            return Err(conflict(
+                "canonical Root authority proof is pending or stale",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_root_tool_proof_identity(side: &Session) -> io::Result<()> {
         if side.kind != SessionKind::Root
             || side.parent_session_id.is_some()
             || side.spawn_depth != 0
@@ -250,12 +282,6 @@ impl SessionStoreV2 {
             || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(conflict("canonical Root authority proof identity mismatch"));
-        }
-        let proof = self.read_root_tool_proof(&side.id).await?;
-        if proof.state != ProofState::Committed || !proof.matches(side) {
-            return Err(conflict(
-                "canonical Root authority proof is pending or stale",
-            ));
         }
         Ok(())
     }

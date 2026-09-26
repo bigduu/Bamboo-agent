@@ -3,6 +3,7 @@
 //! These handlers provide the core agent functionality including
 //! chat, execution, event streaming, session management, and MCP.
 
+pub mod actor_snapshot;
 pub mod bootstrap;
 pub mod browser;
 pub mod chat;

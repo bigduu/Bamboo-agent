@@ -1,6 +1,7 @@
 //! Bamboo session domain — Session, Message, Role, TaskList, and supporting types.
 
 pub mod actor;
+pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
@@ -27,6 +28,7 @@ pub mod types;
 
 // Re-exports for ergonomic access
 pub use actor::*;
+pub use actor_snapshot::*;
 pub use admission::*;
 pub use authority::*;
 pub use budget_types::{

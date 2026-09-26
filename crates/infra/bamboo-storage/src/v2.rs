@@ -46,6 +46,11 @@ use bamboo_domain::{
 };
 
 mod actor_directory;
+mod actor_snapshot;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod actor_snapshot_reader;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod actor_snapshot_tests;
 mod child_project;
 mod root_context;
 #[cfg(test)]
