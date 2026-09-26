@@ -4,6 +4,7 @@
 //! implementations. Concrete implementations live in infrastructure crates.
 
 use crate::session::types::Session;
+use crate::session::{RootModeOperationDecision, RootModeOperationRequest};
 use crate::{
     SupervisorBootstrapReceipt, SupervisorLinkObservation, SupervisorManagementReceipt,
     SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
@@ -16,6 +17,19 @@ use crate::{
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
+    /// A backend without this authority protocol fails closed.
+    async fn root_mode_operation(
+        &self,
+        request: &RootModeOperationRequest,
+    ) -> std::io::Result<RootModeOperationDecision> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support recoverable Root mode operations",
+        ))
+    }
+
     /// Trusted explicit recreation of a previously deleted Ordinary Root ID.
     /// The backend constructs a blank Root and assigns a fresh birth marker;
     /// callers cannot supply an old snapshot or choose its lifetime. Retrying

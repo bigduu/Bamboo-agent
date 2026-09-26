@@ -42,7 +42,7 @@ impl Session {
             && self.root_orchestration_only
     }
 
-    /// Called only by a host-owned chat selection, never by a model tool.
+    /// Called only by a host-owned selection, never by a model tool.
     pub fn set_root_orchestration_only(
         &mut self,
         enabled: bool,
@@ -118,12 +118,17 @@ impl Session {
             || latest.root_tool_authority_revision < self.root_tool_authority_revision
             || (latest.root_tool_authority_revision == self.root_tool_authority_revision
                 && latest.root_orchestration_only != self.root_orchestration_only)
+            || latest.root_mode_transition_epoch < self.root_mode_transition_epoch
+            || (latest.root_mode_transition_epoch == self.root_mode_transition_epoch
+                && latest.root_mode_operations != self.root_mode_operations)
         {
             return Err(RootToolAuthorityError::StaleSnapshot);
         }
         let changed = self.root_orchestration_only != latest.root_orchestration_only;
         self.root_orchestration_only = latest.root_orchestration_only;
         self.root_tool_authority_revision = latest.root_tool_authority_revision;
+        self.root_mode_transition_epoch = latest.root_mode_transition_epoch;
+        self.root_mode_operations = latest.root_mode_operations.clone();
         if changed && self.model_context_state.is_some() {
             self.reset_model_context_epoch(ModelContextResetReason::CacheScopeChanged);
         }

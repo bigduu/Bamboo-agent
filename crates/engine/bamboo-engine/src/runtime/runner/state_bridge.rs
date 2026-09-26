@@ -77,28 +77,30 @@ pub async fn ensure_initial_root_tool_authority(
     adopt_root_tool_authority(session, &latest)
 }
 
-/// Recheck an ordinary Root before constructing its next provider catalog.
-/// Tool-boundary checks protect execution, while this bounded control-plane
-/// read also removes tools that were revoked after the prior round's last call.
-/// The default Supervisor retains its separate management-proof path (#1324).
+/// Recheck a Root before constructing its next provider catalog. Tool-boundary
+/// checks protect execution, while this bounded control-plane read also removes
+/// tools that were revoked after the prior round's last call. A Supervisor uses
+/// its existing strict management-proof read, not the ordinary Root path.
 pub async fn refresh_round_root_tool_authority(
     session: &mut Session,
     storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
 ) -> Result<(), AgentError> {
-    if !ordinary_root_uses_tool_authority_proof(session) {
+    if session.kind != bamboo_domain::SessionKind::Root || session.parent_session_id.is_some() {
         return Ok(());
     }
     let Some(storage) = storage else {
         return Ok(());
     };
-    let latest = storage
-        .load_runtime_control_plane(&session.id)
-        .await
-        .map_err(|error| {
-            AgentError::Tool(format!(
-                "authoritative Root tool authority refresh failed closed: {error}"
-            ))
-        })?;
+    let latest_read = if session.authority_identity.is_ordinary() {
+        storage.load_runtime_control_plane(&session.id).await
+    } else {
+        storage.load_root_authority(&session.id).await
+    };
+    let latest = latest_read.map_err(|error| {
+        AgentError::Tool(format!(
+            "authoritative Root tool authority refresh failed closed: {error}"
+        ))
+    })?;
     let latest = latest.ok_or_else(|| {
         AgentError::Tool(
             "authoritative Root tool authority refresh failed closed: session missing".to_string(),
@@ -1172,16 +1174,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_supervisor_skips_ordinary_root_round_proof_refresh() {
-        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
-        let mut supervisor = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
-        supervisor.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
-            incarnation_id: uuid::Uuid::new_v4(),
-        };
-        supervisor.set_last_run_status("succeeded");
-        refresh_round_root_tool_authority(&mut supervisor, Some(&storage))
+    async fn active_supervisor_adopts_mode_before_next_provider_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        store
+            .get_or_create_default_supervisor("model")
             .await
-            .expect("Supervisor management proof belongs to its separate slice");
+            .unwrap();
+        let id = bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID;
+        let mut running = store.load_root_authority(id).await.unwrap().unwrap();
+        assert!(running.allows_model_tool_execution("Bash"));
+        let operation = bamboo_domain::RootModeOperationRequest {
+            session_id: id.to_string(),
+            operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+            birth_token: running.root_mode_birth_token(),
+            expected_epoch: 0,
+            requested_enabled: true,
+            action: bamboo_domain::RootModeOperationAction::Select,
+        };
+        assert!(matches!(
+            store.root_mode_operation(&operation).await.unwrap(),
+            bamboo_domain::RootModeOperationDecision::Terminal(_)
+        ));
+
+        let storage: Arc<dyn Storage> = store;
+        refresh_round_root_tool_authority(&mut running, Some(&storage))
+            .await
+            .expect("strict Supervisor management proof remains valid");
+        assert!(running.root_orchestration_only_enabled());
+        assert!(!running.allows_model_tool_execution("Bash"));
+        assert!(running.allows_model_tool_execution("SubAgent"));
+        assert_eq!(running.root_mode_transition_epoch, 1);
+        assert_eq!(running.root_mode_operations.len(), 1);
+        running.add_message(Message::assistant("Supervisor result", None));
+        let persistence =
+            std::sync::Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let repository =
+            crate::SessionRepository::new(std::sync::Arc::default(), storage.clone(), persistence);
+        repository.save(&mut running).await.unwrap();
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(durable.root_mode_transition_epoch, 1);
+        assert_eq!(
+            durable.messages.last().unwrap().content,
+            "Supervisor result"
+        );
     }
 
     #[tokio::test]
