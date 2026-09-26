@@ -853,7 +853,7 @@ impl ActorChildRunner {
         // Codex exec and app-server workers are not interchangeable.
         let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}cred={credential_revision}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}ro={}\u{1}gro={}\u{1}executor={executor}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}cred={credential_revision}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}ro={}\u{1}gro={}\u{1}ci={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
@@ -876,6 +876,7 @@ impl ActorChildRunner {
             // Preserve the legacy Guardian bit as a distinct fingerprint axis
             // during rolling upgrades even though both bits enforce read-only.
             caps.guardian_read_only,
+            caps.child_creation_identity,
         )
     }
 
@@ -1436,7 +1437,18 @@ impl ExternalChildRunner for ActorChildRunner {
             bamboo_subagent::provision::REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
         )
         .await
-        .map_err(|_| "required_child_context_unsupported: worker capability unconfirmed".into())
+        .map_err(|_| {
+            "required_child_context_unsupported: worker capability unconfirmed".to_string()
+        })?;
+        bamboo_subagent::fleet::require_worker_capability(
+            &self.worker_bin,
+            &self.worker_args,
+            bamboo_subagent::provision::CHILD_CREATION_IDENTITY_WORKER_CAPABILITY,
+        )
+        .await
+        .map_err(|_| {
+            "required_child_context_unsupported: worker birth capability unconfirmed".into()
+        })
     }
     async fn should_handle(&self, session: &Session) -> bool {
         session.metadata.get("runtime.kind") == Some(&"external".to_string())
@@ -1476,6 +1488,19 @@ impl ExternalChildRunner for ActorChildRunner {
             .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
+        let creation = if matches!(spec.placement, Placement::Local)
+            && matches!(spec.executor, ExecutorSpec::BambooRuntime)
+        {
+            let binding = session_inbox_runtime.as_ref().ok_or_else(|| {
+                AgentError::LLM(
+                    "child creation identity unavailable: canonical host Storage required".into(),
+                )
+            })?;
+            spec.capabilities.child_creation_identity = true;
+            Some(canonical_child_creation(binding, session, job).await?)
+        } else {
+            None
+        };
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
         // orphaned. Warm bus workers are pooled per fingerprint and reused.
         spec.reusable = required_context.is_none();
@@ -1856,11 +1881,33 @@ impl ExternalChildRunner for ActorChildRunner {
                     .collect()
             };
 
+            if let Some(expected) = creation.as_ref() {
+                let checked =
+                    canonical_child_creation(session_inbox_runtime.as_ref().unwrap(), session, job)
+                        .await;
+                if checked.as_ref().ok() != Some(expected) {
+                    if let (Some(binding), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        binding
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    actor.worker.kill().await;
+                    return Err(AgentError::LLM(
+                        "child creation identity changed before dispatch".into(),
+                    ));
+                }
+            }
+            let mut logical_identity = logical_identity_for_actor_run(session, job);
+            logical_identity.creation = creation.clone();
             if let Err(e) = client
                 .send(ParentFrame::Run(RunSpec {
                     // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                     assignment: assignment.clone(),
-                    logical_session: Some(logical_identity_for_actor_run(session, job)),
+                    logical_session: Some(logical_identity),
                     project_id: project_id.clone(),
                     // Creation/update already resolves the child's explicit
                     // selection and own role preference into this field. Do
@@ -1924,6 +1971,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 delivery_rx: &mut delivery_rx,
                 logical_session: session,
                 expected_permission_posture: expected_permission_posture.clone(),
+                expected_creation: creation.as_ref(),
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
                 activation_run_id: bound_activation_run_id.as_deref(),
                 execution_epoch,
@@ -2418,6 +2466,7 @@ struct ActorDriveContext<'a> {
     delivery_rx: &'a mut mpsc::UnboundedReceiver<u64>,
     logical_session: &'a mut Session,
     expected_permission_posture: Option<ExpectedPermissionPosture>,
+    expected_creation: Option<&'a bamboo_subagent::proto::ChildCreationIdentity>,
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
     activation_run_id: Option<&'a str>,
     execution_epoch: u64,
@@ -2517,6 +2566,7 @@ fn validate_actor_event_batch(
     activation_run_id: Option<&str>,
     execution_epoch: u64,
     expected_source_actor_id: &str,
+    expected_creation: Option<&bamboo_subagent::proto::ChildCreationIdentity>,
 ) -> Result<(), AgentError> {
     batch
         .validate()
@@ -2529,6 +2579,7 @@ fn validate_actor_event_batch(
     // in-memory Session, so comparing the batch directly with those raw fields
     // can reject the identity the host itself just dispatched.
     let expected_identity = LogicalSessionIdentity {
+        creation: expected_creation.cloned(),
         session_id: logical_session.id.clone(),
         parent_session_id: logical_session
             .parent_session_id
@@ -3179,6 +3230,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         delivery_rx,
         logical_session,
         expected_permission_posture,
+        expected_creation,
         session_inbox_runtime,
         activation_run_id,
         execution_epoch,
@@ -3243,6 +3295,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
+                        if expected_creation.is_some() {
+                            return Err(AgentError::LLM("worker omitted required Child creation event identity".into()));
+                        }
                         // Rolling-upgrade compatibility: old actors have no
                         // route/sequence metadata, but retain the same typed
                         // permission handshake and event validation.
@@ -3266,6 +3321,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             activation_run_id,
                             execution_epoch,
                             expected_source_actor_id,
+                            expected_creation,
                         )?;
                         if batch.last_seq < next_actor_event_seq {
                             continue;
@@ -3549,8 +3605,48 @@ fn project_id_for_actor_run(
     }
 }
 
+async fn canonical_child_creation(
+    binding: &SessionInboxRuntimeBinding,
+    session: &Session,
+    job: &SpawnJob,
+) -> Result<bamboo_subagent::proto::ChildCreationIdentity, AgentError> {
+    let conflict = || {
+        AgentError::LLM(
+            "child creation identity unavailable or changed in canonical host Storage".into(),
+        )
+    };
+    let current = binding
+        .storage
+        .load_session(&job.child_session_id)
+        .await
+        .map_err(|_| conflict())?
+        .ok_or_else(conflict)?;
+    if bamboo_domain::ActorSession::from_session(&current).is_err()
+        || bamboo_domain::ActorSession::from_session(session).is_err()
+        || current.kind != bamboo_domain::SessionKind::Child
+        || session.kind != current.kind
+        || current.id != session.id
+        || current.id != job.child_session_id
+        || current.parent_session_id.as_deref() != Some(job.parent_session_id.as_str())
+        || current.parent_session_id != session.parent_session_id
+        || current.root_session_id.trim().is_empty()
+        || current.root_session_id != session.root_session_id
+        || current.created_at != session.created_at
+        || current.spawn_depth != session.spawn_depth
+        || current.spawn_depth == 0
+        || project_id_for_actor_run(&current)? != project_id_for_actor_run(session)?
+    {
+        return Err(conflict());
+    }
+    Ok(bamboo_subagent::proto::ChildCreationIdentity {
+        created_at: current.created_at,
+        spawn_depth: current.spawn_depth,
+    })
+}
+
 fn logical_identity_for_actor_run(session: &Session, job: &SpawnJob) -> LogicalSessionIdentity {
     LogicalSessionIdentity {
+        creation: None,
         session_id: session.id.clone(),
         parent_session_id: session
             .parent_session_id
@@ -3878,6 +3974,62 @@ mod tests {
             storage,
             persistence,
         }
+    }
+
+    #[tokio::test]
+    async fn child_creation_requires_canonical_host_lifetime_not_cached_candidate() {
+        let (_temp, store, locked, inbox, parent, _claim) =
+            actor_inbox_fixture("creation-parent").await;
+        let mut child = Session::new_child_of("creation-child", &parent, "model", "child");
+        child.set_project_id_meta("creation-project");
+        store.save_session(&child).await.unwrap();
+        let binding = actor_binding(store.clone(), inbox, locked);
+        let job = SpawnJob {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child.id.clone(),
+            model: "model".into(),
+            disabled_tools: None,
+        };
+        let creation = canonical_child_creation(&binding, &child, &job)
+            .await
+            .unwrap();
+        assert_eq!(creation.created_at, child.created_at);
+        assert_eq!(creation.spawn_depth, child.spawn_depth);
+        for damage in 0..7 {
+            let mut held = child.clone();
+            match damage {
+                0 => held.created_at += chrono::Duration::nanoseconds(1),
+                1 => held.parent_session_id = Some("foreign-parent".into()),
+                2 => held.root_session_id = "foreign-root".into(),
+                3 => held.spawn_depth += 1,
+                4 => held.set_project_id_meta("foreign-project"),
+                5 => held.kind = bamboo_domain::SessionKind::Root,
+                _ => held.id = " creation-child ".into(),
+            }
+            assert!(
+                canonical_child_creation(&binding, &held, &job)
+                    .await
+                    .is_err(),
+                "damage {damage}"
+            );
+        }
+        store.delete_session(&child.id).await.unwrap();
+        assert!(canonical_child_creation(&binding, &child, &job)
+            .await
+            .is_err());
+        let mut replacement = Session::new_child_of(&child.id, &parent, "model", "replacement");
+        replacement.set_project_id_meta("creation-project");
+        assert_ne!(replacement.created_at, child.created_at);
+        store.save_session(&replacement).await.unwrap();
+        assert!(
+            canonical_child_creation(&binding, &child, &job)
+                .await
+                .is_err(),
+            "old held spec cannot adopt replacement birth"
+        );
+        canonical_child_creation(&binding, &replacement, &job)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4258,6 +4410,7 @@ mod tests {
         let session = Session::new_child("logical-child", "logical-parent", "model", "child");
         let mut batch = ActorEventBatch {
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: session.id.clone(),
                 parent_session_id: session.parent_session_id.clone(),
                 root_session_id: session.root_session_id.clone(),
@@ -4278,8 +4431,54 @@ mod tests {
             Some("activation-7"),
             11,
             "worker-a",
+            None,
         )
         .unwrap();
+
+        let creation = bamboo_subagent::proto::ChildCreationIdentity {
+            created_at: session.created_at,
+            spawn_depth: session.spawn_depth,
+        };
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+            Some(&creation)
+        )
+        .is_err());
+        batch.logical_session.as_mut().unwrap().creation = Some(creation.clone());
+        validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+            Some(&creation),
+        )
+        .unwrap();
+        batch
+            .logical_session
+            .as_mut()
+            .unwrap()
+            .creation
+            .as_mut()
+            .unwrap()
+            .created_at += chrono::Duration::nanoseconds(1);
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+            Some(&creation)
+        )
+        .is_err());
+        batch.logical_session.as_mut().unwrap().creation = None;
 
         batch.execution_epoch = 10;
         assert!(validate_actor_event_batch(
@@ -4289,6 +4488,7 @@ mod tests {
             Some("activation-7"),
             11,
             "worker-a",
+            None,
         )
         .unwrap_err()
         .to_string()
@@ -4302,6 +4502,7 @@ mod tests {
             Some("activation-7"),
             11,
             "worker-a",
+            None,
         )
         .unwrap_err()
         .to_string()
@@ -4319,6 +4520,7 @@ mod tests {
             Some("activation-7"),
             11,
             "worker-a",
+            None,
         )
         .unwrap_err()
         .to_string()
@@ -4336,6 +4538,7 @@ mod tests {
             Some("activation-7"),
             11,
             "worker-a",
+            None,
         )
         .unwrap_err()
         .to_string()
@@ -4371,6 +4574,7 @@ mod tests {
         let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
         let mut session = Session::new(session_id, "model");
         let result = drive(ActorDriveContext {
+            expected_creation: None,
             client: &mut link,
             parent_session_id: "permission-parent",
             child_session_id: session_id,
@@ -4772,6 +4976,7 @@ mod tests {
         .collect::<Vec<_>>();
         let batch = ActorEventBatch {
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: session_id.into(),
                 parent_session_id: Some("permission-parent".into()),
                 root_session_id: session_id.into(),
@@ -4958,6 +5163,7 @@ mod tests {
         invalid_nested["event"]["decision"]["type"] = serde_json::json!("unknown_decision");
         let batch = ActorEventBatch {
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: session_id.into(),
                 parent_session_id: Some("permission-parent".into()),
                 root_session_id: session_id.into(),
@@ -5039,6 +5245,7 @@ mod tests {
         ];
         let batch = ActorEventBatch {
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: session_id.into(),
                 parent_session_id: Some("permission-parent".into()),
                 root_session_id: session_id.into(),
@@ -5328,6 +5535,7 @@ mod tests {
             ChildFrame::EventBatch {
                 batch: ActorEventBatch {
                     logical_session: Some(LogicalSessionIdentity {
+                        creation: None,
                         session_id: session_id.into(),
                         parent_session_id: Some("permission-parent".into()),
                         root_session_id: session_id.into(),
@@ -5565,6 +5773,7 @@ mod tests {
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
         let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
         let result = drive(ActorDriveContext {
+            expected_creation: None,
             client: &mut link,
             parent_session_id: "parent",
             child_session_id: session_id,
@@ -6211,6 +6420,7 @@ mod tests {
             disabled_tools: None,
         };
         let expected = LogicalSessionIdentity {
+            creation: None,
             session_id: "logical-child-681".to_string(),
             parent_session_id: Some("logical-parent-681".to_string()),
             root_session_id: "logical-root-681".to_string(),
@@ -6306,6 +6516,20 @@ mod tests {
         // breaking the depth cap; or a bypass worker reused for a non-bypass one).
         let base_fp =
             ActorChildRunner::fingerprint(&spec_with("explorer", "p", "m", Some("/ws"), None));
+
+        let mut creation = spec_with("explorer", "p", "m", Some("/ws"), None);
+        creation.capabilities.child_creation_identity = true;
+        let typed = ActorChildRunner::fingerprint(&creation);
+        assert_ne!(
+            base_fp, typed,
+            "legacy worker pool cannot satisfy birth-required Run"
+        );
+        creation.identity.child_id = "different-logical-child".into();
+        assert_eq!(
+            typed,
+            ActorChildRunner::fingerprint(&creation),
+            "birth-required mode retains cross-Child pool reuse"
+        );
 
         let mut depth = spec_with("explorer", "p", "m", Some("/ws"), None);
         depth.identity.depth = 2;
@@ -6527,6 +6751,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             drive(ActorDriveContext {
+                expected_creation: None,
                 client: &mut link,
                 parent_session_id: "parent-reviewer",
                 child_session_id: "child-reviewer",
@@ -6591,6 +6816,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             drive(ActorDriveContext {
+                expected_creation: None,
                 client: &mut link,
                 parent_session_id: "parent-no-reviewer",
                 child_session_id: "child-no-reviewer",
@@ -6652,6 +6878,7 @@ mod tests {
         let mut logical_session = Session::new("child-x", "model");
         let mut link = SilentLink;
         let r = drive(ActorDriveContext {
+            expected_creation: None,
             client: &mut link,
             parent_session_id: "parent-x",
             child_session_id: "child-x",
@@ -6691,6 +6918,7 @@ mod tests {
         // Even a tiny timeout must NOT trip: the terminal frame arrives first and
         // disarms the watchdog.
         let r = drive(ActorDriveContext {
+            expected_creation: None,
             client: &mut link,
             parent_session_id: "parent-y",
             child_session_id: "child-y",

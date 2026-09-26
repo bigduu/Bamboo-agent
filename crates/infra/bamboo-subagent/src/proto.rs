@@ -83,6 +83,17 @@ pub struct LogicalSessionIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
+    /// Host-authored immutable Child birth. Missing only on legacy routes;
+    /// this is identity, not task or permission authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<ChildCreationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildCreationIdentity {
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -574,6 +585,34 @@ mod tests {
     }
 
     #[test]
+    fn logical_creation_is_atomic_and_preserves_exact_birth() {
+        let legacy = serde_json::json!({"session_id":"child", "parent_session_id":"parent", "root_session_id":"root"});
+        let mut identity: LogicalSessionIdentity = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(identity.creation.is_none());
+        assert_eq!(serde_json::to_value(&identity).unwrap(), legacy);
+        identity.creation = Some(ChildCreationIdentity {
+            created_at: "2026-09-26T01:02:03.123456789Z".parse().unwrap(),
+            spawn_depth: 3,
+        });
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            serde_json::from_value::<LogicalSessionIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        for creation in [
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z"}),
+            serde_json::json!({"spawn_depth":3}),
+            serde_json::json!({"created_at":"invalid", "spawn_depth":3}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":-1}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":3, "grant":true}),
+        ] {
+            let mut damaged = wire.clone();
+            damaged["creation"] = creation;
+            assert!(serde_json::from_value::<LogicalSessionIdentity>(damaged).is_err());
+        }
+    }
+
+    #[test]
     fn child_frames_round_trip() {
         let e = ChildFrame::Event {
             event: serde_json::json!({"type":"token","content":"hi"}),
@@ -582,6 +621,7 @@ mod tests {
         let batch = ChildFrame::EventBatch {
             batch: ActorEventBatch {
                 logical_session: Some(LogicalSessionIdentity {
+                    creation: None,
                     session_id: "child".into(),
                     parent_session_id: Some("parent".into()),
                     root_session_id: "root".into(),
@@ -814,6 +854,7 @@ mod tests {
         let spec = RunSpec {
             assignment: "work".into(),
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: "child".into(),
                 parent_session_id: Some("parent".into()),
                 root_session_id: "root".into(),

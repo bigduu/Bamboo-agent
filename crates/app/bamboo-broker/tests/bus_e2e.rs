@@ -71,6 +71,7 @@ async fn runner_style_child_run_over_the_bus_with_a_real_subprocess() {
     link.send(ParentFrame::Run(RunSpec {
         assignment: "ping pong".into(),
         logical_session: Some(LogicalSessionIdentity {
+            creation: None,
             session_id: "session-child-e2e".into(),
             parent_session_id: Some("session-parent-e2e".into()),
             root_session_id: "session-parent-e2e".into(),
@@ -345,6 +346,7 @@ async fn one_cluster_worker_multiplexes_200_concurrent_runs_end_to_end() {
             link.send(ParentFrame::Run(RunSpec {
                 assignment,
                 logical_session: Some(LogicalSessionIdentity {
+                    creation: None,
                     session_id: session_id.clone(),
                     parent_session_id: Some("parallel-root".into()),
                     root_session_id: "parallel-root".into(),
