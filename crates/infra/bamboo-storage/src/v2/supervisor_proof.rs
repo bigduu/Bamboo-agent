@@ -3,6 +3,7 @@
 //! operational readers require the matching canonical runtime sidecar and a
 //! real main file at the deterministic Root placement.
 
+use super::supervisor_management::SupervisorManagementGuards;
 use super::*;
 use bamboo_domain::{SessionAuthorityConflict, SupervisorManagementState};
 
@@ -226,27 +227,48 @@ impl SessionStoreV2 {
     pub(super) async fn prepare_supervisor_management_proof(
         &self,
         updated: &Session,
+        guards: &Arc<SupervisorManagementGuards>,
     ) -> io::Result<()> {
         let current = self.read_supervisor_proof().await?;
         if current.state != ProofState::Committed {
             return Err(conflict("canonical proof is pending"));
         }
-        Self::write_proof_at(
-            &self.sessions_dir.join(&updated.id),
-            updated,
-            ProofState::Prepared,
-        )
-        .await
+        self.write_management_supervisor_proof(updated, ProofState::Prepared, guards)
+            .await
     }
 
     pub(super) async fn commit_supervisor_management_proof(
         &self,
         updated: &Session,
+        guards: &Arc<SupervisorManagementGuards>,
     ) -> io::Result<()> {
-        Self::write_proof_at(
-            &self.sessions_dir.join(&updated.id),
-            updated,
-            ProofState::Committed,
+        self.write_management_supervisor_proof(updated, ProofState::Committed, guards)
+            .await
+    }
+
+    async fn write_management_supervisor_proof(
+        &self,
+        updated: &Session,
+        state: ProofState,
+        guards: &Arc<SupervisorManagementGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&SupervisorAuthorityProof::from_session(updated, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        if bytes.len() as u64 > SUPERVISOR_PROOF_MAX_BYTES {
+            return Err(conflict("Supervisor proof exceeds bounded capacity"));
+        }
+        let stage = match state {
+            ProofState::Prepared => SupervisorProofFault::Prepared,
+            ProofState::Committed => SupervisorProofFault::Committed,
+        };
+        self.write_management_bytes(
+            &self
+                .sessions_dir
+                .join(&updated.id)
+                .join(SUPERVISOR_PROOF_FILE),
+            bytes,
+            stage,
+            guards,
         )
         .await
     }
