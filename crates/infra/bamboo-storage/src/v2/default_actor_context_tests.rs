@@ -375,7 +375,7 @@ pub(super) struct DefaultWriteHook {
     wake: Condvar,
 }
 impl DefaultWriteHook {
-    fn install(
+    pub(super) fn install(
         store: &SessionStoreV2,
         file: &'static str,
         phase: DurableWritePhase,
@@ -410,7 +410,7 @@ impl DefaultWriteHook {
             Ok(())
         }
     }
-    fn wait(&self) {
+    pub(super) fn wait(&self) {
         let s = self.state.lock().unwrap();
         let (s, t) = self
             .wake
@@ -421,7 +421,7 @@ impl DefaultWriteHook {
             "actual filesystem job never reached barrier"
         );
     }
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.state.lock().unwrap().released = true;
         self.wake.notify_all();
     }

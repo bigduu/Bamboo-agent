@@ -57,6 +57,8 @@ mod child_project;
 mod default_actor_context;
 #[cfg(test)]
 mod default_actor_context_tests;
+#[cfg(test)]
+mod startup_sidecar_tests;
 use default_actor_context::DefaultWriterGuards;
 mod root_context;
 #[cfg(test)]
@@ -1077,6 +1079,8 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     default_write_hook:
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
+    #[cfg(test)]
+    migration_scan_pause: std::sync::Mutex<Option<startup_sidecar_tests::ScanPause>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1385,6 +1389,8 @@ impl SessionStoreV2 {
             actor_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             default_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            migration_scan_pause: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -3822,21 +3828,8 @@ impl SessionStoreV2 {
         })
     }
 
-    /// Write the runtime control-plane sidecar: a full session snapshot with the
-    /// (potentially huge) `messages` history cleared. This is what makes
-    /// runtime-only saves O(1) in conversation length.
-    async fn write_runtime_sidecar(&self, abs_dir: &Path, session: &Session) -> io::Result<()> {
-        self.validate_root_context_for_save(session).await?;
-        let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
-        let snapshot = runtime_sidecar_snapshot(session);
-        let bytes =
-            serde_json::to_vec_pretty(&snapshot).map_err(|e| other_io_error(e.to_string()))?;
-        atomic_write(&path, &bytes).await
-    }
-
     /// Task CAS/transaction replacement with a file+directory durability
-    /// boundary. Ordinary runtime saves intentionally keep the cheaper helper
-    /// above; only authoritative Task commits and recovery pay these fsyncs.
+    /// boundary.
     async fn write_runtime_sidecar_durable(
         &self,
         abs_dir: &Path,
@@ -3862,51 +3855,27 @@ impl SessionStoreV2 {
     /// session that already has a sidecar is skipped. Returns the number of
     /// sidecars created.
     pub async fn migrate_runtime_sidecars(&self) -> io::Result<usize> {
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let marker = self.bamboo_home_dir.join(RUNTIME_SIDECAR_MIGRATION_MARKER);
         if fs::try_exists(&marker).await.unwrap_or(false) {
             return Ok(0);
         }
 
+        // Index/marker observations route work; each candidate owns its final
+        // lifecycle -> Task -> Session boundary. No outer Task guard re-entry.
         let entries = self.list_index_entries().await;
         let mut migrated = 0usize;
         for entry in entries {
-            let abs_dir = self.abs_path_from_rel(&entry.rel_path);
-            let sidecar_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
-            if fs::try_exists(&sidecar_path).await.unwrap_or(false) {
-                continue;
-            }
-            let session_path = abs_dir.join("session.json");
-            // Read session.json directly (not load_session) — there is no sidecar
-            // to overlay yet, and we want the raw embedded control-plane.
-            let raw = match fs::read_to_string(&session_path).await {
-                Ok(raw) => raw,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            let session: Session = match serde_json::from_str(&raw) {
-                Ok(session) => session,
-                Err(error) => {
-                    tracing::warn!(
-                        "runtime sidecar migration: skipping unreadable session {}: {}",
-                        entry.id,
-                        error
-                    );
-                    continue;
+            #[cfg(test)]
+            {
+                let pause = self.migration_scan_pause.lock().unwrap().clone();
+                if let Some(pause) = pause.filter(|pause| pause.id == entry.id) {
+                    pause.reached.wait().await;
+                    pause.release.wait().await;
                 }
-            };
-            supervisor::validate_identity(&session)?;
-            if !matches!(
-                session.authority_identity,
-                SessionAuthorityIdentity::Ordinary
-            ) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cannot reconstruct missing Supervisor authority from session.json",
-                ));
             }
-            self.write_runtime_sidecar(&abs_dir, &session).await?;
-            migrated += 1;
+            if self.migrate_runtime_candidate(&entry).await? {
+                migrated += 1;
+            }
         }
 
         // Persist the marker last, atomically, so an interrupted migration simply
@@ -3919,6 +3888,116 @@ impl SessionStoreV2 {
             tracing::info!("runtime sidecar migration: created {migrated} sidecar(s)");
         }
         Ok(migrated)
+    }
+
+    async fn migrate_runtime_candidate(&self, entry: &SessionIndexEntry) -> io::Result<bool> {
+        // Reject an index escape before opening any hinted target. The hint is
+        // not authority for birth/lineage; compare against the locked raw main.
+        validate_session_id(&entry.id)?;
+        let (kind, root) = Self::copy_source_identity_from_rel(&entry.id, &entry.rel_path)?;
+        if entry.kind != kind || entry.root_session_id != root {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "migration index identity mismatch",
+            ));
+        }
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_guard = self.acquire_session_maintenance_lock(&entry.id).await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, task, session_guard);
+        let directory = self.abs_path_from_rel(&entry.rel_path);
+        match fs::symlink_metadata(&directory).await {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "migration target is not a real directory",
+                ))
+            }
+        }
+        let path = directory.join(RUNTIME_SIDECAR_FILE);
+        match fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.file_type().is_file() => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "migration sidecar is not a regular file",
+                ))
+            }
+        }
+        let main = directory.join("session.json");
+        match fs::symlink_metadata(&main).await {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "migration main is not a regular file",
+                ))
+            }
+        }
+        let raw = match fs::read(&main).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut session: Session = match serde_json::from_slice(&raw) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    "runtime sidecar migration: skipping unreadable session {}: {}",
+                    entry.id,
+                    error
+                );
+                return Ok(false);
+            }
+        };
+        if session.kind == SessionKind::Root && session.root_session_id.is_empty() {
+            session.root_session_id = session.id.clone();
+        }
+        if session.id != entry.id
+            || session.kind != kind
+            || session.root_session_id != root
+            || session.parent_session_id != entry.parent_session_id
+            || session.spawn_depth != entry.spawn_depth
+            || session.created_at != entry.created_at
+            || Self::default_writer_rel_path(&session)? != entry.rel_path
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "migration main creation identity mismatch",
+            ));
+        }
+        // Local typed identity validation; no Actor ensure, repair or lineage
+        // enumeration. Existing Root/Supervisor proof checks retain their gate.
+        bamboo_domain::ActorSession::from_session(&session).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "migration main lineage is invalid",
+            )
+        })?;
+        supervisor::validate_identity(&session)?;
+        if !matches!(
+            session.authority_identity,
+            SessionAuthorityIdentity::Ordinary
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot reconstruct missing Supervisor authority from session.json",
+            ));
+        }
+        self.validate_root_context_for_save(&session).await?;
+        self.check_actor_reconstruction(&session, &directory)
+            .await?;
+        let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&session))
+            .map_err(|error| other_io_error(error.to_string()))?;
+        self.write_default_bytes(&path, bytes, &guards).await?;
+        Ok(true)
     }
 
     /// Read the runtime sidecar (a Session snapshot with empty `messages`), if it

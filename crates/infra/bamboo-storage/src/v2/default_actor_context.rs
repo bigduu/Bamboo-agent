@@ -240,6 +240,21 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    // Missing runtime has no exact-context shortcut: only legacy or proven
+    // inert Cold authority can admit reconstruction from the actual main.
+    pub(super) async fn check_actor_reconstruction(
+        &self,
+        main: &Session,
+        directory: &Path,
+    ) -> io::Result<()> {
+        let (record, marker) = self.default_actor_observation(directory).await;
+        if permits_unfenced_context(&record, &marker, Some(main)) {
+            Ok(())
+        } else {
+            Err(context_conflict())
+        }
+    }
+
     pub(super) async fn check_default_actor_clear(&self, directory: &Path) -> io::Result<()> {
         let (record, marker) = self.default_actor_observation(directory).await;
         if permits_unfenced_context(&record, &marker, None) {
