@@ -56,7 +56,7 @@ fn checked_next(value: u64) -> Result<u64, ActorDirectoryError> {
         .ok_or(ActorDirectoryError::CounterOverflow)
 }
 
-fn current_live<'a>(
+pub(super) fn current_live<'a>(
     entry: &'a ActorDirectoryEntry,
     fence: &ActorActivationFence,
     now: DateTime<Utc>,
@@ -189,7 +189,7 @@ impl SessionStoreV2 {
     /// lock. Cached and global indexes can each point to one of two physical
     /// Sessions with the same id; trusting either would split activation
     /// authority between Store instances. The scan rejects that ambiguity.
-    async fn actor_authority_location(
+    pub(super) async fn actor_authority_location(
         &self,
         actor_id: &str,
     ) -> Result<(String, PathBuf), ActorDirectoryError> {
@@ -415,12 +415,18 @@ impl SessionStoreV2 {
         let guards = Arc::clone(guards);
         #[cfg(test)]
         let hook = self.actor_write_hook.lock().unwrap().clone();
+        #[cfg(test)]
+        let transcript_hook = self.transcript_write_hook.lock().unwrap().clone();
         tokio::task::spawn_blocking(move || {
             let _guards = guards;
             durable_atomic_write_blocking(&path, &bytes, |phase| {
                 #[cfg(test)]
                 if let Some(hook) = &hook {
                     return hook.visit(&path, phase);
+                }
+                #[cfg(test)]
+                if let Some(hook) = &transcript_hook {
+                    hook.visit(phase)?;
                 }
                 let _ = phase;
                 Ok(())
