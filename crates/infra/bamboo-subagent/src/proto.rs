@@ -96,6 +96,71 @@ pub struct ChildCreationIdentity {
     pub spawn_depth: u32,
 }
 
+/// Immutable one-shot native name ceiling. It is startup authority, not a
+/// persisted profile or a grant for workspace/network/secret access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeToolCeiling {
+    pub version: u32,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    // Explicit null means unassigned; omission is not an authority observation.
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub tools: Vec<String>,
+}
+
+fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ProjectId>, D::Error> {
+    Option::<ProjectId>::deserialize(deserializer)
+}
+
+impl NativeToolCeiling {
+    pub const NAMES: [&'static str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+    pub const MAX_BYTES: usize = 16 * 1024;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut candidate = bamboo_domain::Session::new(self.child_session_id.clone(), "");
+        candidate.kind = bamboo_domain::SessionKind::Child;
+        candidate.parent_session_id = Some(self.parent_session_id.clone());
+        candidate.root_session_id = self.root_session_id.clone();
+        candidate.created_at = self.created_at;
+        candidate.spawn_depth = self.spawn_depth;
+        if self.version != 1
+            || bamboo_domain::ActorSession::from_session(&candidate).is_err()
+            || self.tools.len() > Self::NAMES.len()
+            || self
+                .tools
+                .iter()
+                .any(|name| !Self::NAMES.contains(&name.as_str()))
+            || self.tools.windows(2).any(|pair| pair[0] >= pair[1])
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("native_tool_ceiling_invalid");
+        }
+        Ok(())
+    }
+
+    pub fn matches_run(&self, run: &RunSpec) -> bool {
+        self.validate().is_ok()
+            && run.project_id == self.project_id
+            && run.logical_session.as_ref().is_some_and(|identity| {
+                identity.session_id == self.child_session_id
+                    && identity.parent_session_id.as_deref()
+                        == Some(self.parent_session_id.as_str())
+                    && identity.root_session_id == self.root_session_id
+                    && identity.creation.as_ref().is_some_and(|creation| {
+                        creation.created_at == self.created_at
+                            && creation.spawn_depth == self.spawn_depth
+                    })
+            })
+    }
+}
+
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }

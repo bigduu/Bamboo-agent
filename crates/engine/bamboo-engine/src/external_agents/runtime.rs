@@ -12,6 +12,13 @@ use super::a2a_adapter::A2AExternalChildRunner;
 use super::actor_adapter::{ActorChildRunner, ChildApprovalReviewer, CodexRunTokenAuthority};
 use super::config::{parse_external_agents, ExternalAgentProtocol};
 
+/// Host-owned observation of its actual concrete tool surface at activation.
+/// The caller cannot submit a resolved ceiling through the public tool schema.
+#[async_trait]
+pub trait NativeToolCeilingSource: Send + Sync {
+    async fn observe(&self, session: &bamboo_domain::Session) -> Result<Vec<String>, String>;
+}
+
 fn codex_auth_mode_name(mode: bamboo_config::CodexAuthMode) -> String {
     match mode {
         bamboo_config::CodexAuthMode::Inherit => "inherit",
@@ -199,6 +206,7 @@ pub fn build_external_child_runner_with_codex_tokens(
         approval_reviewer,
         permission_config,
         codex_run_tokens,
+        None,
     )
 }
 
@@ -220,6 +228,30 @@ pub fn build_external_child_runner_with_live_config_and_codex_tokens(
         approval_reviewer,
         permission_config,
         codex_run_tokens,
+        None,
+    )
+}
+
+/// The server binds this to the same Builtin Arc and complete base routing
+/// chain assembled for this AppState, before applying the Root role fence.
+#[allow(clippy::too_many_arguments)]
+pub fn build_external_child_runner_with_native_tool_ceiling(
+    config: &Config,
+    live_provider_config: Arc<tokio::sync::RwLock<Config>>,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    native_tool_ceiling: Arc<dyn NativeToolCeilingSource>,
+) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_internal(
+        config,
+        Some(live_provider_config),
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+        codex_run_tokens,
+        Some(native_tool_ceiling),
     )
 }
 
@@ -230,6 +262,7 @@ fn build_external_child_runner_internal(
     approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    native_tool_ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
 ) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
@@ -245,6 +278,7 @@ fn build_external_child_runner_internal(
         permission_config.clone(),
         codex_run_tokens.clone(),
         live_provider_config.clone(),
+        native_tool_ceiling,
     ) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
@@ -415,6 +449,7 @@ fn build_local_actor_runner(
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
     live_provider_config: Option<Arc<tokio::sync::RwLock<Config>>>,
+    native_tool_ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = config.subagents();
 
@@ -465,7 +500,8 @@ fn build_local_actor_runner(
         endpoint: b.endpoint.clone(),
         token: b.token.clone(),
     }))
-    .with_codex_run_tokens(codex_run_tokens);
+    .with_codex_run_tokens(codex_run_tokens)
+    .with_native_tool_ceiling_source(native_tool_ceiling);
     if let Some(registry) = approval_registry {
         runner = runner.with_approval_registry(registry);
     }
