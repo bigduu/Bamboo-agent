@@ -221,6 +221,63 @@ pub trait ChildSessionPort: Send + Sync {
         ))
     }
 
+    /// Resolve a planner workspace from a freshly loaded durable parent, then
+    /// apply this port's existing Project/confinement validation. Selection is
+    /// explicit input, durable workspace metadata, or the current Project
+    /// default. Only unassigned legacy parents may use the old workspace field;
+    /// no process cwd, publication cache or global default supplies authority.
+    async fn resolve_child_workspace(
+        &self,
+        parent: &Session,
+        explicit_workspace: Option<&str>,
+    ) -> Result<(String, crate::project_context::WorkspaceSource), ChildSessionError> {
+        use crate::project_context::{
+            ProjectContextResolver, SessionProjectIdentity, WorkspaceSource,
+            WORKSPACE_SOURCE_METADATA_KEY,
+        };
+        let project_id = match ProjectContextResolver::session_project_identity(parent) {
+            SessionProjectIdentity::Assigned(project_id) => Some(project_id),
+            SessionProjectIdentity::Unassigned => None,
+            SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ChildSessionError::InvalidArguments(format!(
+                    "parent session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+        let explicit_workspace = explicit_workspace
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let (requested, source) = if let Some(path) = explicit_workspace {
+            (path.to_owned(), WorkspaceSource::Explicit)
+        } else if parent
+            .metadata
+            .get(WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str)
+            == Some(WorkspaceSource::ProjectDefault.as_str())
+        {
+            // A default-derived cached path cannot pin an older Project path.
+            (String::new(), WorkspaceSource::ProjectDefault)
+        } else if let Some(path) = parent.workspace_path_meta() {
+            (path, WorkspaceSource::Session)
+        } else if project_id.is_some() {
+            (String::new(), WorkspaceSource::ProjectDefault)
+        } else {
+            (
+                parent.workspace.clone().unwrap_or_default(),
+                WorkspaceSource::Session,
+            )
+        };
+        if requested.trim().is_empty() && project_id.is_none() {
+            return Err(ChildSessionError::InvalidArguments(
+                "child workspace must be a non-empty path".to_owned(),
+            ));
+        }
+        let path = self
+            .validate_child_workspace(project_id.as_ref(), &requested)
+            .await?;
+        Ok((path, source))
+    }
+
     /// Validate and normalize the child's workspace before any child/session
     /// state is created. Server adapters override this with the authoritative
     /// Project registry ownership check; non-server embeddings still apply the

@@ -239,52 +239,9 @@ impl Tool for PlanTool {
             ));
         }
 
-        let explicit_workspace = parsed
-            .workspace
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let workspace_was_explicit = explicit_workspace.is_some();
-        let parent_workspace_is_project_default = parent
-            .metadata
-            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
-            .map(String::as_str)
-            == Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str());
-        let requested_workspace = explicit_workspace
-            .or_else(|| {
-                (!parent_workspace_is_project_default)
-                    .then(|| parent.workspace.clone())
-                    .flatten()
-            })
-            .unwrap_or_default();
-        let parent_project_id =
-            match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
-                &parent,
-            ) {
-                bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
-                    Some(project_id)
-                }
-                bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
-                bamboo_engine::project_context::SessionProjectIdentity::Invalid {
-                    raw,
-                    message,
-                } => {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "parent session carries an invalid Project identity '{raw}': {message}"
-                    )));
-                }
-            };
-        let workspace_source = if workspace_was_explicit {
-            bamboo_engine::project_context::WorkspaceSource::Explicit
-        } else if parent_workspace_is_project_default
-            || (requested_workspace.is_empty() && parent_project_id.is_some())
-        {
-            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
-        } else {
-            bamboo_engine::project_context::WorkspaceSource::Session
-        };
-        let workspace = self
+        let (workspace, workspace_source) = self
             .sessions
-            .validate_child_workspace(parent_project_id.as_ref(), &requested_workspace)
+            .resolve_child_workspace(&parent, parsed.workspace.as_deref())
             .await
             .map_err(child_error)?;
 
