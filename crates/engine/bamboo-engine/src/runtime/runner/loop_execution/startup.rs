@@ -171,6 +171,12 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|prev| prev.no_human_approver);
+    // Preserve the incoming typed Child posture when rebuilding this run.
+    // Legacy metadata is not authority for granting read-only mode.
+    runtime_state.read_only = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|previous| previous.read_only);
     // Server-owned UserPromptSubmit runs before the engine loop and records
     // into the session state. Carry those current-turn checkpoints into the
     // fresh runner-owned state. This also preserves hook context/checkpoints
@@ -344,6 +350,43 @@ mod tests {
 
         assert_eq!(first.summarization_model_name.as_deref(), Some("sum-1"));
         assert_eq!(second.summarization_model_name.as_deref(), Some("sum-2"));
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_typed_read_only_without_legacy_metadata_grant() {
+        for prior in [Some(true), Some(false), None] {
+            let mut session = Session::new("read-only-startup", "model");
+            session.agent_runtime_state = prior.map(|read_only| {
+                let mut runtime = AgentRuntimeState::new("previous-run");
+                runtime.read_only = read_only;
+                runtime
+            });
+            let mut legacy = AgentRuntimeState::new("legacy-run");
+            legacy.read_only = true;
+            session.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(&legacy).unwrap(),
+            );
+            let tools = SuccessfulLoadSkill::default();
+            let config = AgentLoopConfig::default();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+            let loop_state =
+                initialize_loop_state(&mut session, "inspect only", &config, &tools, &event_tx)
+                    .await
+                    .expect("actual runner startup");
+
+            for runtime in [
+                &loop_state.runtime_state,
+                session
+                    .agent_runtime_state
+                    .as_ref()
+                    .expect("startup publishes typed runtime"),
+            ] {
+                assert_eq!(runtime.read_only, prior.unwrap_or(false), "prior={prior:?}");
+                assert_eq!(runtime.run_id, session.id, "fresh run identity");
+            }
+        }
     }
 
     #[tokio::test]

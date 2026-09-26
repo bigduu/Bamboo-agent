@@ -7,8 +7,10 @@ use std::sync::{
 use std::time::Duration;
 
 use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
+use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{ReasoningEffort, RootThinkingMode};
 use bamboo_server::app_state::{AppState, MemoryStore};
+use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -442,5 +444,23 @@ async fn verify_reused_worker(home: &std::path::Path, base_url: &str, probe: &Pr
         }
     }
     assert_eq!(successful_requests, 4);
+    let store = SessionStoreV2::new(home.join("warm-store"))
+        .await
+        .expect("independent terminal store handle");
+    for index in 0..4 {
+        let saved = store
+            .load_session(&format!("ordinary-warm-session-{index}"))
+            .await
+            .unwrap()
+            .expect("successful ordinary Child persisted");
+        assert!(
+            !saved
+                .agent_runtime_state
+                .as_ref()
+                .expect("ordinary terminal persists typed runtime")
+                .read_only,
+            "ordinary Child cannot acquire read-only posture during startup"
+        );
+    }
     spawned.kill().await;
 }
