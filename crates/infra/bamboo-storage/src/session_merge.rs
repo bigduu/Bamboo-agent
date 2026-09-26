@@ -2401,6 +2401,7 @@ mod tests {
 
     struct AuthoritySavePauseStorage {
         inner: Arc<SessionStoreV2>,
+        calls: std::sync::atomic::AtomicUsize,
         reached: tokio::sync::Barrier,
         release: tokio::sync::Barrier,
     }
@@ -2496,6 +2497,7 @@ mod tests {
             current.set_project_id_meta("project-b");
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });
@@ -2549,14 +2551,94 @@ mod tests {
             self.inner.delete_session(id).await
         }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.reached.wait().await;
             self.release.wait().await;
             self.inner.save_session(session).await
         }
         async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.reached.wait().await;
             self.release.wait().await;
             self.inner.save_runtime_state(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_claim_after_merge_read_rejects_once_without_cache_publication() {
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+        for runtime_only in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let mut stale = Session::new("actor-cache-race", "model");
+            stale.add_message(bamboo_domain::Message::user("durable"));
+            first.save_session(&stale).await.unwrap();
+            let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let id = stale.id.clone();
+            let cached = Arc::new(std::sync::Mutex::new(stale.clone()));
+            let publications = std::sync::atomic::AtomicUsize::new(0);
+            stale.conversation_summary =
+                Some(bamboo_domain::ConversationSummary::new("reject", 1, 1));
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |saved| {
+                            publications.fetch_add(1, Ordering::SeqCst);
+                            *cached.lock().unwrap() = saved.clone();
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |saved, _| {
+                            publications.fetch_add(1, Ordering::SeqCst);
+                            *cached.lock().unwrap() = saved.clone();
+                        })
+                        .await
+                }
+            };
+            let activate = async {
+                paused.reached.wait().await;
+                let now = chrono::Utc::now();
+                second
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: id.clone(),
+                        run_id: "claim".into(),
+                        lease_owner: "owner".into(),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, activate)
+            })
+            .await
+            .expect("real final save/activation race terminates");
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(!is_task_control_plane_save_conflict(&error));
+            assert!(!may_publish_runtime_result(&Err(error)));
+            assert_eq!(paused.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(publications.load(Ordering::SeqCst), 0);
+            assert!(cached.lock().unwrap().conversation_summary.is_none());
+            assert!(first
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_summary
+                .is_none());
         }
     }
 
@@ -2573,6 +2655,7 @@ mod tests {
             let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });
@@ -2620,6 +2703,7 @@ mod tests {
             let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
             let paused = Arc::new(AuthoritySavePauseStorage {
                 inner: first.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 reached: tokio::sync::Barrier::new(2),
                 release: tokio::sync::Barrier::new(2),
             });

@@ -308,12 +308,30 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    async fn write_default_root_tool_proof(
+        &self,
+        directory: &Path,
+        session: &Session,
+        state: ProofState,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        self.write_default_bytes(
+            &directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE),
+            bytes,
+            guards,
+        )
+        .await
+    }
+
     /// A selection publishes a durable Prepared marker before the sidecar and
     /// main writes. Any interrupted phase is unavailable to operational reads.
     pub(super) async fn prepare_root_tool_proof_for_full_save(
         &self,
         directory: &Path,
         incoming: &Session,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<bool> {
         if incoming.kind != SessionKind::Root {
             return Ok(false);
@@ -325,17 +343,21 @@ impl SessionStoreV2 {
                 return Ok(false);
             }
         }
-        Self::write_root_tool_proof_at(directory, incoming, ProofState::Prepared).await?;
+        self.write_default_root_tool_proof(directory, incoming, ProofState::Prepared, guards)
+            .await?;
         Ok(true)
     }
 
     pub(super) async fn commit_root_tool_proof_after_full_save(
+        &self,
         directory: &Path,
         incoming: &Session,
         prepared: bool,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         if prepared {
-            Self::write_root_tool_proof_at(directory, incoming, ProofState::Committed).await?;
+            self.write_default_root_tool_proof(directory, incoming, ProofState::Committed, guards)
+                .await?;
         }
         Ok(())
     }
