@@ -5894,3 +5894,415 @@ async fn create_sets_child_workspace() {
         "child workspace should be set from create args"
     );
 }
+
+fn child_report_fixture() -> serde_json::Value {
+    json!({"version":1,"outcome":"blocked","summary":"Reported claim 🪷",
+        "reported_evidence":[{"description":"Not host verified","reference":"/unreadable/reported/path","sha256":null}],
+        "reported_verification":[{"check":"focused check","reported_status":"unknown","details":""}],
+        "proposals":[],"blockers":["Need a decision"],"open_decisions":[]})
+}
+
+async fn required_result_harness() -> (
+    TestHarness,
+    Session,
+    Session,
+    bamboo_domain::ChildContextBinding,
+) {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut user = Message::user("Do not expand scope");
+    user.id = "required-source".into();
+    let mut background = Message::assistant("optional facts", None);
+    background.id = "optional-source".into();
+    parent.messages.extend([user, background]);
+    harness.storage.save_session(&parent).await.unwrap();
+    let packet = bamboo_domain::ChildContextPacket {
+        version: 1,
+        objective: "Report bounded result".into(),
+        constraints: vec![],
+        acceptance: vec!["Return the strict report".into()],
+        non_goals: vec![],
+        necessary_user_instructions: vec![],
+        recorded_decisions: vec![],
+        source_user_message_ids: vec!["required-source".into()],
+        background_message_ids: vec!["optional-source".into()],
+    };
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = packet.resolve(&parent, "Produce report").unwrap();
+    let binding = bamboo_domain::ChildContextBinding::new(
+        &parent,
+        &child.id,
+        resolved.required_brief.clone(),
+        resolved,
+    )
+    .unwrap();
+    binding.install(&mut child).unwrap();
+    child.messages = vec![
+        Message::system("Child"),
+        binding.assignment_message(),
+        Message::assistant(child_report_fixture().to_string(), None),
+    ];
+    child.set_last_run_status("completed");
+    harness.storage.save_session(&child).await.unwrap();
+    (harness, parent, child, binding)
+}
+fn result_args(child: &Session, binding: &bamboo_domain::ChildContextBinding) -> serde_json::Value {
+    json!({"action":"get","child_session_id":child.id,"view":"typed_result",
+        "expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256})
+}
+fn result_files(directory: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(path: &std::path::Path, result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, result);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                result.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut result = Default::default();
+    visit(directory, &mut result);
+    result
+}
+async fn assert_result_unavailable(h: &TestHarness, args: serde_json::Value, reason: &str) {
+    let directory = h.workspace_path.parent().unwrap().join("sessions");
+    let before = result_files(&directory);
+    let result = invoke_completed(&h.tool, args, child_inspection_ctx(&h.parent_session_id))
+        .await
+        .unwrap();
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+    let value: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(value["available"], false);
+    assert_eq!(value["reason"], reason);
+    assert!(value.get("child_report").is_none());
+    assert_eq!(result_files(&directory), before);
+}
+
+#[tokio::test]
+async fn typed_child_result_rejects_latest_nonfinal_without_older_winner() {
+    let (h, _, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    let value = inspect_child(&h.tool, &h.parent_session_id, args.clone()).await;
+    assert_eq!(value["child_report"]["outcome"], "blocked");
+    assert_eq!(value["host_observation"]["last_run_status"], "completed");
+    for variant in 0..10 {
+        let mut changed = child.clone();
+        match variant {
+            0 => changed.add_message(Message::assistant("Newest malformed report", None)),
+            1 => changed.add_message(Message::user("Later task")),
+            2 => {
+                changed.messages.last_mut().unwrap().phase =
+                    Some(bamboo_domain::MessagePhase::Commentary)
+            }
+            3 => changed.messages.last_mut().unwrap().compressed = true,
+            4 => changed.messages.last_mut().unwrap().compressed_by_event_id = Some("event".into()),
+            5 => changed.messages.last_mut().unwrap().compression_level = 1,
+            6 => changed.set_last_run_status("running"),
+            7 => changed.set_last_run_status("error"),
+            8 => {
+                changed.messages.last_mut().unwrap().content_parts =
+                    Some(vec![serde_json::from_value(
+                        json!({"type":"text","text":"extra"}),
+                    )
+                    .unwrap()])
+            }
+            _ => {
+                changed.messages.last_mut().unwrap().tool_calls =
+                    Some(vec![bamboo_agent_core::tools::ToolCall {
+                        id: "call".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "Read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }])
+            }
+        }
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(
+            &h,
+            args.clone(),
+            if variant == 0 {
+                "report_malformed"
+            } else {
+                "report_not_current_final"
+            },
+        )
+        .await;
+    }
+    let mut changed = child.clone();
+    changed.messages.retain(|m| m.role != Role::Assistant);
+    h.storage.save_session(&changed).await.unwrap();
+    assert_result_unavailable(&h, args, "report_absent").await;
+}
+
+#[tokio::test]
+async fn typed_child_result_checks_authority_selectors_and_durable_context() {
+    let (h, parent, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    for view in ["result_binding", "typed_result"] {
+        let foreign = invoke_completed(
+            &h.tool,
+            json!({"action":"get","child_session_id":child.id,"view":view,
+            "expected_assignment_sha256":"malformed"}),
+            child_inspection_ctx("foreign-root"),
+        )
+        .await
+        .unwrap_err();
+        assert!(foreign.to_string().contains("does not belong to parent"));
+    }
+    let nested = Session::new_child_of("result-nested", &parent, "model", "nested");
+    let grandchild = Session::new_child_of("result-grandchild", &nested, "model", "grandchild");
+    h.storage.save_session(&nested).await.unwrap();
+    h.storage.save_session(&grandchild).await.unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"action":"get","child_session_id":grandchild.id,"view":"typed_result",
+        "expected_child_created_at":"bad"}),
+        child_inspection_ctx(&parent.id)
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("does not belong to parent"));
+    for bad in [
+        json!({}),
+        json!({"expected_child_created_at":"bad","expected_assignment_sha256":"a".repeat(64)}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":"A".repeat(64)}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256,"cursor":null}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256,"parent_session_id":parent.id}),
+    ] {
+        let mut input = json!({"action":"get","child_session_id":child.id,"view":"typed_result"});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        assert!(
+            invoke_completed(&h.tool, input, child_inspection_ctx(&parent.id))
+                .await
+                .is_err()
+        );
+    }
+    let mut wrong = args.clone();
+    wrong["expected_child_created_at"] = json!(child.created_at + chrono::Duration::nanoseconds(1));
+    assert_result_unavailable(&h, wrong, "stale_result_selector").await;
+    wrong = args.clone();
+    wrong["expected_assignment_sha256"] = json!("a".repeat(64));
+    assert_result_unavailable(&h, wrong, "stale_result_selector").await;
+    let discovered = inspect_child(
+        &h.tool,
+        &parent.id,
+        json!({"action":"get","child_session_id":child.id,"view":"result_binding"}),
+    )
+    .await;
+    assert_eq!(discovered["assignment_sha256"], binding.assignment_sha256);
+    assert_eq!(discovered["child_created_at"], json!(child.created_at));
+    // Explicit trusted Store fault injection. Inspect must never repair it.
+    let runtime = h
+        .workspace_path
+        .parent()
+        .unwrap()
+        .join("sessions")
+        .join(&parent.id)
+        .join("children")
+        .join(&child.id)
+        .join("runtime.json");
+    let original = std::fs::read(&runtime).unwrap();
+    for (key, value, reason) in [
+        (
+            "child.context_packet.binding.v1",
+            json!("corrupt"),
+            "result_binding_invalid",
+        ),
+        ("lifecycle", json!("resident"), "typed_result_unsupported"),
+        ("project_id", json!("bad/path"), "stale_parent_context"),
+        ("project_id", json!("other-project"), "stale_parent_context"),
+    ] {
+        let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        raw["metadata"][key] = value;
+        std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_result_unavailable(&h, args.clone(), reason).await;
+    }
+    std::fs::write(&runtime, &original).unwrap();
+    for variant in 0..6 {
+        let mut changed = parent.clone();
+        match variant {
+            0 | 1 => changed.messages[variant].content.push('!'),
+            2 | 3 => {
+                changed.messages.remove(variant - 2);
+            }
+            _ => changed.messages.push(parent.messages[variant - 4].clone()),
+        }
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(&h, args.clone(), "stale_parent_context").await;
+    }
+    h.storage.save_session(&parent).await.unwrap();
+    let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    raw["created_at"] = json!(child.created_at + chrono::Duration::nanoseconds(1));
+    std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_result_unavailable(&h, args.clone(), "stale_result_selector").await;
+    for key in ["spawn_depth", "root_session_id"] {
+        let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        raw[key] = if key == "spawn_depth" {
+            json!(child.spawn_depth + 1)
+        } else {
+            json!("foreign-root")
+        };
+        std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_result_unavailable(&h, args.clone(), "stale_parent_context").await;
+    }
+    std::fs::write(&runtime, &original).unwrap();
+    // A coherent trusted replacement binding is still stale against the actual parent.
+    for variant in 0..2 {
+        use sha2::{Digest, Sha256};
+        let mut wrong_binding = binding.clone();
+        if variant == 0 {
+            wrong_binding.payload.parent_created_at += chrono::Duration::nanoseconds(1);
+        } else {
+            wrong_binding
+                .payload
+                .sources
+                .push(binding.payload.sources[0].clone());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"bamboo/immutable-child-assignment/v1\0");
+        digest.update(serde_json::to_vec(&wrong_binding.payload).unwrap());
+        wrong_binding.assignment_sha256 = hex::encode(digest.finalize());
+        let mut changed = child.clone();
+        wrong_binding.install(&mut changed).unwrap();
+        changed.messages[1] = wrong_binding.assignment_message();
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(
+            &h,
+            result_args(&changed, &wrong_binding),
+            "stale_parent_context",
+        )
+        .await;
+    }
+    h.storage.save_session(&child).await.unwrap();
+    let mut changed = child.clone();
+    let assignment = changed
+        .messages
+        .iter_mut()
+        .find(|m| m.id == binding.assignment_message().id)
+        .unwrap();
+    assignment.content.push('!');
+    h.storage.save_session(&changed).await.unwrap();
+    assert_result_unavailable(&h, args.clone(), "result_binding_invalid").await;
+    let main = runtime.with_file_name("session.json");
+    let original_main = std::fs::read(&main).unwrap();
+    std::fs::write(&main, b"not JSON").unwrap();
+    assert!(
+        invoke_completed(&h.tool, args.clone(), child_inspection_ctx(&parent.id))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("failed to load child")
+    );
+    std::fs::write(&main, &original_main).unwrap();
+    // A real same-ID recreation has coherent Main/Runtime birth, but cannot win an old selector.
+    h.storage.delete_session(&child.id).await.unwrap();
+    let mut replacement = Session::new_child_of(&child.id, &parent, "gpt-5", "replacement");
+    assert_ne!(replacement.created_at, child.created_at);
+    binding.install(&mut replacement).unwrap();
+    replacement.messages = vec![
+        binding.assignment_message(),
+        Message::assistant(child_report_fixture().to_string(), None),
+    ];
+    replacement.set_last_run_status("completed");
+    h.storage.save_session(&replacement).await.unwrap();
+    assert_result_unavailable(&h, args.clone(), "stale_result_selector").await;
+    h.storage.delete_session(&parent.id).await.unwrap();
+    h.storage
+        .recreate_root_session(&parent.id, "model")
+        .await
+        .unwrap();
+    assert!(
+        invoke_completed(&h.tool, args, child_inspection_ctx(&parent.id))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn typed_child_result_enforces_actual_double_escaped_tool_budget() {
+    let (h, _, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    let base = inspect_child(&h.tool, &h.parent_session_id, args.clone()).await;
+    let mut last_valid = 0;
+    let mut double_escaped_rejected = false;
+    for count in (1..1001).step_by(16) {
+        let mut report = child_report_fixture();
+        report["proposals"] = json!(vec!["\"".repeat(count); 3]);
+        assert!(report.to_string().len() <= 8192);
+        let mut changed = child.clone();
+        changed.messages.last_mut().unwrap().content = report.to_string();
+        h.storage.save_session(&changed).await.unwrap();
+        let result = invoke_completed(
+            &h.tool,
+            args.clone(),
+            child_inspection_ctx(&h.parent_session_id),
+        )
+        .await
+        .unwrap();
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert!(bytes.len() <= 8192);
+        let value: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        if value["available"] == true {
+            last_valid = bytes.len();
+        } else {
+            assert_eq!(value["reason"], "result_budget_exceeded");
+            let mut candidate = base.clone();
+            candidate["child_report"] = report;
+            assert!(
+                candidate.to_string().len() <= 8192,
+                "first compact JSON layer fits"
+            );
+            let unbounded = ToolResult {
+                success: true,
+                result: candidate.to_string(),
+                display_preference: Some("Collapsible".into()),
+                images: vec![],
+            };
+            assert!(serde_json::to_vec(&unbounded).unwrap().len() > 8192);
+            double_escaped_rejected = true;
+            break;
+        }
+    }
+    assert!(
+        last_valid >= 7900,
+        "near-boundary valid actual ToolResult: {last_valid}"
+    );
+    assert!(double_escaped_rejected);
+    let h = build_test_harness_with_storage(None, None, true).await;
+    assert_result_unavailable(
+        &h,
+        json!({"action":"get","child_session_id":h.child_session_id,"view":"result_binding"}),
+        "typed_result_unsupported",
+    )
+    .await;
+    for view in ["overview", "messages", "message", "result", "error"] {
+        assert!(invoke_completed(
+            &h.tool,
+            json!({"action":"get","child_session_id":h.child_session_id,"view":view,
+            "expected_assignment_sha256":null}),
+            child_inspection_ctx(&h.parent_session_id)
+        )
+        .await
+        .is_err());
+    }
+}

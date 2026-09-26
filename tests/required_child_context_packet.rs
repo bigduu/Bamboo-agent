@@ -13,7 +13,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -21,12 +21,16 @@ use std::{
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Case {
     Complete,
+    TypedReport,
     TinyBudget,
     HugeGuidance,
     Overflow,
     UnsupportedStartup,
 }
 impl Case {
+    fn normal_success(self) -> bool {
+        matches!(self, Self::Complete | Self::TypedReport)
+    }
     fn creates_child(self) -> bool {
         !matches!(self, Self::Overflow | Self::UnsupportedStartup)
     }
@@ -53,7 +57,10 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 wire.contains("Host guidance Host guidance")
             );
         }
-        (json!({"content":"REAL_CHILD_PACKET_EVIDENCE"}), "stop")
+        (
+            json!({"content": if probe.case == Case::TypedReport { typed_report().to_string() } else { "REAL_CHILD_PACKET_EVIDENCE".into() }}),
+            "stop",
+        )
     } else if body["model"] == "root-packet-test" && body["tools"].to_string().contains("SubAgent")
     {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
@@ -111,7 +118,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .expect("actual SubAgent.create persisted child")
                     .id
                     .clone();
-                if probe.case != Case::Complete {
+                if !probe.case.normal_success() {
                     let mut child = disk.load_session(&child_id).await.unwrap().unwrap();
                     let mut binding = ChildContextBinding::from_session(&child).unwrap().unwrap();
                     let tiny = probe.case == Case::TinyBudget;
@@ -216,7 +223,7 @@ async fn fixture(case: Case) {
     eprintln!("actual CLI case {case:?}");
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().canonicalize().unwrap();
-    let packet = ChildContextPacket {
+    let mut packet = ChildContextPacket {
         version: 1,
         objective: "Exact objective \"quoted\" \\ 🪷".into(),
         constraints: vec!["No commits, no task expansion".into()],
@@ -227,6 +234,12 @@ async fn fixture(case: Case) {
         source_user_message_ids: vec!["source-user".into()],
         background_message_ids: (0..10).map(|index| format!("background-{index}")).collect(),
     };
+    if case == Case::TypedReport {
+        packet.acceptance.push(format!(
+            "Return exactly this JSON report shape, without prose or fences: {}",
+            typed_report()
+        ));
+    }
     let probe = web::Data::new(Probe {
         case,
         workspace: data.clone(),
@@ -291,6 +304,9 @@ async fn fixture(case: Case) {
         "chat: {}",
         created.text().await.unwrap()
     );
+    // Stop the real host before fixture-only authoring so metadata refresh
+    // cannot race this cold store's load/save. Reopen it after the write.
+    drop(host);
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let mut parent = store.load_session("packet-root").await.unwrap().unwrap();
     for index in 0..10 {
@@ -300,9 +316,6 @@ async fn fixture(case: Case) {
     }
     parent.updated_at = chrono::Utc::now();
     store.save_session(&parent).await.unwrap();
-    // Fixture-only Root authoring must precede this host instance: execute
-    // intentionally reads its in-memory Session first. Reopen the real host.
-    drop(host);
     let mut host = start_host(&data, port);
     await_host(&mut host, &client, &base, &data).await;
     if case == Case::UnsupportedStartup {
@@ -443,6 +456,41 @@ async fn fixture(case: Case) {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("REAL_CHILD_PACKET_EVIDENCE")));
+        } else if case == Case::TypedReport {
+            assert_eq!(child.last_run_status().as_deref(), Some("completed"));
+            assert_eq!(child_requests.len(), 1);
+            assert!(binding
+                .payload
+                .required_assignment
+                .contains("reported_verification"));
+            assert!(
+                completed
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Tool)
+                    .any(|m| {
+                        serde_json::from_str::<Value>(&m.content).is_ok_and(|value| {
+                            value["context_packet"]["assignment_sha256"]
+                                == binding.assignment_sha256
+                                && value["context_packet"]["child_created_at"]
+                                    == json!(child.created_at)
+                        })
+                    }),
+                "create returns the actual reloaded Child selectors"
+            );
+            let stored = child
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Assistant)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored.content).unwrap(),
+                typed_report()
+            );
+            // Stop the real host before observing through a cold adapter/tool.
+            drop(host);
+            cold_typed_inspection(&data, &child, &binding, &stored.content).await;
         } else {
             assert!(
                 child_requests.is_empty(),
@@ -466,6 +514,7 @@ fn real_cli_required_packet_success_and_preprovider_failure_boundaries() {
             actix_web::rt::System::new().block_on(async {
                 for case in [
                     Case::Complete,
+                    Case::TypedReport,
                     Case::TinyBudget,
                     Case::HugeGuidance,
                     Case::Overflow,
@@ -478,4 +527,103 @@ fn real_cli_required_packet_success_and_preprovider_failure_boundaries() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+fn typed_report() -> Value {
+    json!({"version":1,"outcome":"blocked","summary":"Need an explicit decision 🪷",
+        "reported_evidence":[{"description":"A model claim, not verified","reference":"https://invalid.example/reported-only","sha256":null}],
+        "reported_verification":[{"check":"fixture","reported_status":"not_run","details":""}],
+        "proposals":[],"blockers":["Root must decide"],"open_decisions":[]})
+}
+async fn cold_typed_inspection(
+    data: &Path,
+    child: &bamboo_domain::Session,
+    binding: &ChildContextBinding,
+    content: &str,
+) {
+    use bamboo_agent::server::{
+        app_state::AppState,
+        tools::{ChildSessionAdapter, SubAgentTool},
+    };
+    use bamboo_agent_core::tools::{Tool, ToolExecutionContext, ToolOutcome};
+    use sha2::{Digest, Sha256};
+    let state = AppState::new(data.to_path_buf()).await.unwrap();
+    let adapter = Arc::new(ChildSessionAdapter::new(
+        state.session_store.clone(),
+        state.storage.clone(),
+        state.persistence.clone(),
+        state.spawn_scheduler.clone(),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+        None,
+        None,
+        state.config.clone(),
+    ));
+    let tool = SubAgentTool::new(adapter.clone(), adapter);
+    let files = [
+        data.join("sessions/packet-root/session.json"),
+        data.join("sessions/packet-root/runtime.json"),
+        data.join("sessions/packet-root/children")
+            .join(&child.id)
+            .join("session.json"),
+        data.join("sessions/packet-root/children")
+            .join(&child.id)
+            .join("runtime.json"),
+    ];
+    let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    for view in ["result_binding", "typed_result"] {
+        let mut args = json!({"action":"get","child_session_id":child.id,"view":view});
+        if view == "typed_result" {
+            args["expected_child_created_at"] = json!(child.created_at);
+            args["expected_assignment_sha256"] = json!(binding.assignment_sha256);
+        }
+        let ctx = ToolExecutionContext {
+            session_id: Some("packet-root"),
+            root_session_id: None,
+            tool_call_id: "cold-report",
+            executing_supervisor: None,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx();
+        let ToolOutcome::Completed(result) = tool.invoke(args, ctx).await.unwrap() else {
+            panic!("explicit read must complete");
+        };
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        let value: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(value["available"], true);
+        if view == "typed_result" {
+            assert_eq!(value["child_report"], typed_report());
+            assert_eq!(value["host_observation"]["last_run_status"], "completed");
+            assert_eq!(
+                value["host_observation"]["content_sha256"],
+                hex::encode(Sha256::digest(content.as_bytes()))
+            );
+            assert_eq!(
+                value["host_observation"]["child_created_at"],
+                json!(child.created_at)
+            );
+            assert_eq!(
+                value["host_observation"]["assignment_sha256"],
+                binding.assignment_sha256
+            );
+        } else {
+            assert_eq!(value["assignment_sha256"], binding.assignment_sha256);
+            assert_eq!(value["child_created_at"], json!(child.created_at));
+        }
+    }
+    assert_eq!(
+        files
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
 }
