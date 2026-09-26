@@ -77,6 +77,8 @@ mod root_lifetime_tests;
 mod supervisor;
 mod supervisor_management;
 #[cfg(test)]
+mod supervisor_management_lifetime_tests;
+#[cfg(test)]
 mod supervisor_management_tests;
 mod supervisor_proof;
 #[cfg(test)]
@@ -1090,6 +1092,9 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     supervisor_proof_fault: std::sync::Mutex<Option<supervisor_proof::SupervisorProofFault>>,
     #[cfg(test)]
+    management_write_hook:
+        std::sync::Mutex<Option<Arc<supervisor_management_lifetime_tests::ManagementWriteHook>>>,
+    #[cfg(test)]
     actor_write_hook: std::sync::Mutex<Option<Arc<actor_directory_lifetime_tests::ActorWriteHook>>>,
     #[cfg(test)]
     transcript_write_hook:
@@ -1407,6 +1412,8 @@ impl SessionStoreV2 {
             root_tool_proof_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             supervisor_proof_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            management_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             actor_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
