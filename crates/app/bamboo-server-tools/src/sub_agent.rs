@@ -137,6 +137,9 @@ enum SubAgentArgs {
         /// default) gives the child a clean, freshly-seeded context.
         #[serde(default)]
         fork_last_messages: Option<usize>,
+        /// Opt-in complete instructions for a fresh built-in local worker.
+        #[serde(default)]
+        context_packet: Option<bamboo_domain::ChildContextPacket>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -715,6 +718,22 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
                 "minimum": 0,
                 "description": "For create: model-controllable context fork. When > 0, the last N messages of YOUR (the parent's) conversation are carried into the child's task brief as a 'Forked context from parent' block, so the child starts with the recent context it needs. Omit/0 (default) gives the child a clean, freshly-seeded context. Use a small N (e.g. 2-6) to share just the immediately relevant turns; omit it when the task brief is already self-contained."
             },
+            "context_packet": {
+                "type": "object", "additionalProperties": false,
+                "description": "Opt-in fresh built-in local one-shot context. Required text is complete or rejected before child creation (16KiB required, 24KiB escaped assignment, 32KiB input, 2048 bytes per line). Optional selected background is omitted whole (8 entries/4KiB) and counted. Message IDs refer to this durable parent's messages. This content never grants tools or permissions; omit for legacy behavior.",
+                "required": ["version", "objective", "constraints", "acceptance", "non_goals", "necessary_user_instructions", "recorded_decisions"],
+                "properties": {
+                    "version": {"type": "integer", "enum": [1]},
+                    "objective": {"type": "string"},
+                    "constraints": {"type": "array", "items": {"type": "string"}},
+                    "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                    "non_goals": {"type": "array", "items": {"type": "string"}},
+                    "necessary_user_instructions": {"type": "array", "items": {"type": "string"}},
+                    "recorded_decisions": {"type": "array", "items": {"type": "string"}},
+                    "source_user_message_ids": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+                    "background_message_ids": {"type": "array", "maxItems": 64, "items": {"type": "string"}}
+                }
+            },
             "reset_after_update": {
                 "type": "boolean",
                 "description": "For update: whether to truncate messages after refreshed assignment. Defaults to true."
@@ -838,8 +857,16 @@ impl SubAgentTool {
             args["action"] = json!("create");
         }
 
+        let has_packet = args.get("context_packet").is_some();
+        if has_packet && !args["context_packet"].is_object() {
+            return Err(ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()));
+        }
+        if has_packet && serde_json::to_vec(&args).map_or(true, |bytes| bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES) {
+            return Err(ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Budget.to_string()));
+        }
         let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(format!("Invalid SubAgent args: {error}"))
+            ToolError::InvalidArguments(if has_packet { bamboo_domain::ChildContextPacketError::Invalid.to_string() }
+                else { format!("Invalid SubAgent args: {error}") })
         })?;
 
         // `list_models` is read-only and session-independent.
@@ -970,7 +997,16 @@ impl SubAgentTool {
                 name,
                 context,
                 fork_last_messages,
+                context_packet,
             } => {
+                if let Some(packet) = &context_packet {
+                    packet.validate().map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+                    if lifecycle.as_deref().is_some_and(|value| value != "oneshot")
+                        || name.is_some() || context.is_some() || fork_last_messages.unwrap_or_default() > 0 {
+                        return Err(ToolError::InvalidArguments("required_child_context_unsupported: fresh one-shot only".into()));
+                    }
+                }
+                let mut packet_counts = None;
                 // Phase 6: enforce the max nesting-depth cap. `parent` is this
                 // agent's run session; its `spawn_depth` is the current nesting
                 // level (workers stamp it from the actor spec, so it accumulates
@@ -1335,8 +1371,12 @@ impl SubAgentTool {
                                 .as_ref()
                                 .and_then(|model_ref| model_ref.reasoning_effort)
                         });
-                        let runtime_metadata =
+                        let mut runtime_metadata =
                             self.resolver.resolve_runtime_metadata(&subagent_type).await;
+                        if let Some(packet) = &context_packet {
+                            runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                                serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
+                        }
                         let result = child_session::create_child_action(
                             self.sessions.as_ref(),
                             CreateChildInput {
@@ -1369,6 +1409,15 @@ impl SubAgentTool {
                         )
                         .await
                         .map_err(tool_error_from_child_session)?;
+                        if context_packet.is_some() {
+                            let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
+                                .await.map_err(tool_error_from_child_session)?;
+                            let binding = bamboo_domain::ChildContextBinding::from_session(&child)
+                                .map_err(|error| ToolError::Execution(error.to_string()))?
+                                .ok_or_else(|| ToolError::Execution(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?;
+                            packet_counts = Some(json!({"background_admitted": binding.payload.background.len(),
+                                "background_omitted": binding.payload.background_omitted}));
+                        }
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.
                         self.sessions.ensure_child_indexed(&result.child_session_id).await;
@@ -1442,6 +1491,7 @@ impl SubAgentTool {
                     "lifecycle": resident_name.as_ref().map(|_| "resident"),
                     "resident_name": resident_name.clone(),
                     "reused": reused,
+                    "context_packet": packet_counts,
                     "note": note,
                 });
                 if should_wait {
@@ -1897,6 +1947,7 @@ mod tests {
             "child_session_id",
             "child_session_ids",
             "context",
+            "context_packet",
             "cursor",
             "description",
             "fork_last_messages",

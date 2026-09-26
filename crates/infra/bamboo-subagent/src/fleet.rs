@@ -21,6 +21,7 @@ use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
 use crate::provision::{
     ProvisionSpec, WorkerCapabilityReport, WorkerOwner, TYPED_READ_ONLY_WORKER_CAPABILITY,
+    REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
 };
 use crate::transport::{TransportError, TransportResult};
 
@@ -44,15 +45,20 @@ fn provision_for_local_spawn(spec: &ProvisionSpec) -> ProvisionSpec {
 
 const WORKER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
 fn validate_worker_capability_report(output: &[u8]) -> TransportResult<()> {
-    let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|error| {
-        TransportError::Protocol(format!(
-            "worker capability probe returned invalid JSON: {error}"
-        ))
+    validate_required_capability(output, TYPED_READ_ONLY_WORKER_CAPABILITY)
+}
+
+fn validate_required_capability(output: &[u8], capability: &str) -> TransportResult<()> {
+    let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|_| {
+        TransportError::Protocol("worker capability probe returned invalid JSON".into())
     })?;
-    if !report.supports(TYPED_READ_ONLY_WORKER_CAPABILITY) {
+    if (capability == REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY
+        && report.provision_version != crate::provision::PROVISION_VERSION)
+        || !report.supports(capability) {
         return Err(TransportError::Protocol(format!(
-            "worker does not acknowledge required capability '{TYPED_READ_ONLY_WORKER_CAPABILITY}'"
+            "worker does not acknowledge required capability '{capability}'"
         )));
     }
     Ok(())
@@ -64,6 +70,16 @@ fn validate_worker_capability_report(output: &[u8]) -> TransportResult<()> {
 async fn require_typed_read_only_worker_capability(
     worker_bin: &Path,
     worker_args: &[String],
+) -> TransportResult<()> {
+    require_worker_capability(worker_bin, worker_args, TYPED_READ_ONLY_WORKER_CAPABILITY).await
+}
+
+/// Probe a trusted local worker before creating a required-context child.
+/// Capability support is protocol compatibility, not loaded-build attestation.
+pub async fn require_worker_capability(
+    worker_bin: &Path,
+    worker_args: &[String],
+    capability: &str,
 ) -> TransportResult<()> {
     let mut probe = Command::new(worker_bin);
     probe.args(worker_args);
@@ -80,11 +96,11 @@ async fn require_typed_read_only_worker_capability(
         .map_err(TransportError::Io)?;
     if !output.status.success() {
         return Err(TransportError::Protocol(format!(
-            "worker capability probe failed with status {}; refusing typed read-only activation",
+            "worker capability probe failed with status {}; refusing required capability activation",
             output.status
         )));
     }
-    validate_worker_capability_report(&output.stdout)
+    validate_required_capability(&output.stdout, capability)
 }
 
 async fn ensure_provision_capabilities(
@@ -94,6 +110,9 @@ async fn ensure_provision_capabilities(
 ) -> TransportResult<()> {
     if spec.capabilities.read_only_enforced() {
         require_typed_read_only_worker_capability(worker_bin, worker_args).await?;
+    }
+    if spec.capabilities.required_child_context {
+        require_worker_capability(worker_bin, worker_args, REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY).await?;
     }
     Ok(())
 }

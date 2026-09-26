@@ -66,6 +66,9 @@ pub async fn run() -> std::result::Result<(), String> {
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
     let provisioned_permission = spec.capabilities.permission_resolution()?;
+    if spec.capabilities.required_child_context && (spec.reusable || !matches!(spec.executor, ExecutorSpec::BambooRuntime)) {
+        return Err("required_child_context_unsupported: fresh Bamboo worker required".into());
+    }
     if let Some(owner) = spec.owner.as_ref() {
         crate::process_owner::spawn_direct_owner_guard(
             owner.process_id,
@@ -370,6 +373,7 @@ pub struct BambooRuntimeExecutor {
     /// Whether this worker enforces the typed read-only child boundary through
     /// its host-provisioned tool denylist and ReadOnlyCommandChecker.
     read_only_child: bool,
+    required_child_context: bool,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -877,6 +881,7 @@ impl BambooRuntimeExecutor {
             spawn_depth: spec.identity.depth,
             provisioned_permission,
             read_only_child: spec.capabilities.read_only_enforced(),
+            required_child_context: spec.capabilities.required_child_context,
             permission_config,
             no_human_review,
             child_runner,
@@ -1314,11 +1319,25 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
                 .no_human_approver = true;
         }
-        let rehydrated: Vec<Message> = run
-            .messages
-            .iter()
-            .filter_map(|v| serde_json::from_value::<Message>(v.clone()).ok())
-            .collect();
+        let rehydrated: Vec<Message> = if self.required_child_context {
+            match run.messages.iter().cloned().map(serde_json::from_value::<Message>)
+                .collect::<Result<Vec<_>, _>>() {
+                Ok(messages) => messages,
+                Err(_) => return ChildOutcome::error(bamboo_domain::ChildContextPacketError::Invalid.to_string()),
+            }
+        } else {
+            run.messages.iter().filter_map(|value| serde_json::from_value::<Message>(value.clone()).ok()).collect()
+        };
+        if self.required_child_context {
+            let binding = match bamboo_domain::ChildContextBinding::from_messages(&session.id, &run.assignment, &rehydrated) {
+                Ok(binding) => binding,
+                Err(error) => return ChildOutcome::error(error.to_string()),
+            };
+            if session.parent_session_id.as_deref() != Some(binding.payload.parent_session_id.as_str()) {
+                return ChildOutcome::error(bamboo_domain::ChildContextPacketError::Invalid.to_string());
+            }
+            if let Err(error) = binding.install(&mut session) { return ChildOutcome::error(error.to_string()); }
+        }
         if rehydrated.is_empty() {
             session.add_message(Message::user(run.assignment.clone()));
         } else {
@@ -2031,6 +2050,7 @@ mod tests {
                 bamboo_domain::PermissionMode::Default,
             ),
             read_only_child: false,
+            required_child_context: false,
             permission_config: None,
             no_human_review: None,
             child_runner: None,

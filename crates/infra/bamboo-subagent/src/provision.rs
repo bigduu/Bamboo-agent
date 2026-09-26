@@ -22,6 +22,7 @@ pub const PROVISION_VERSION: u32 = 2;
 /// delivered. Older workers ignore the provision fields that carry the hard
 /// tool boundary, so the parent probes this capability before starting them.
 pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
+pub const REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY: &str = "required_child_context_v1";
 
 /// Non-secret capability document printed by `bamboo subagent-worker
 /// --print-capabilities`. It is deliberately separate from `ProvisionSpec` so
@@ -37,7 +38,7 @@ impl WorkerCapabilityReport {
     pub fn current() -> Self {
         Self {
             provision_version: PROVISION_VERSION,
-            capabilities: vec![TYPED_READ_ONLY_WORKER_CAPABILITY.to_string()],
+            capabilities: vec![TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(), REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string()],
         }
     }
 
@@ -120,6 +121,10 @@ pub struct ProvisionSpec {
 /// skills exactly as before.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Host-authored immutable one-shot assignment. Requires an explicit probe;
+    /// this content flag does not add tools or change permission authority.
+    #[serde(default)]
+    pub required_child_context: bool,
     /// Serialized MCP config — opaque to this leaf crate; the worker deserializes
     /// it into the domain `McpConfig`. Typically the portable (SSE /
     /// streamable-http) subset; host-bound stdio servers are excluded.
@@ -748,6 +753,7 @@ mod tests {
         // Round-trips with content.
         let mut s = spec();
         s.capabilities = Capabilities {
+            required_child_context: false,
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),
             skills_dir: Some("/home/u/.bamboo/skills".into()),
             mcp_proxy: None,

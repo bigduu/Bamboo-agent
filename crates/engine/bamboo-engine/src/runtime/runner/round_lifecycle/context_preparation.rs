@@ -2198,6 +2198,44 @@ pub(super) async fn prepare_round_context(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
+    if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))? {
+        // Required one-shot context has no lossy compression path. Project the
+        // complete final IR, then omit optional background only as whole units.
+        // Later rounds also fail closed when complete history no longer fits.
+        let mut model_session = session.clone();
+        model_session.token_budget = None;
+        let mut budget = super::token_budget::resolve_token_budget(&mut model_session, config, model_name, llm.as_ref()).await;
+        if let Some(host) = binding.payload.token_budget.as_ref() {
+            let input_limit = host.max_request_input_tokens().min(budget.max_request_input_tokens());
+            budget.max_output_tokens = budget.max_output_tokens.min(host.max_output_tokens);
+            budget.safety_margin = budget.safety_margin.max(host.safety_margin);
+            budget.max_context_tokens = budget.max_context_tokens.min(host.max_context_tokens)
+                .min(input_limit.saturating_add(budget.max_output_tokens).saturating_add(budget.safety_margin));
+        }
+        let counter = TiktokenTokenCounter::default();
+        let mut shadow = session.clone();
+        let mut omitted = 0usize;
+        loop {
+            let mut prepared_context = all_active_prepared_context(&shadow, &budget, &counter);
+            prepared_context.truncation_occurred = omitted > 0;
+            prepared_context.segments_removed = omitted;
+            binding.validate_messages(&session.id, &prepared_context.messages)
+                .map_err(|error| AgentError::Budget(error.to_string()))?;
+            let projected = super::stream_execution::project_request_usage(
+                session, &prepared_context, config, tool_schemas, model_name, llm).await?;
+            if projected.input_tokens <= budget.max_request_input_tokens()
+                && projected.ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES {
+                session.metadata.insert("child.context_packet.provider_background_omitted.v1".into(), omitted.to_string());
+                return Ok(PreparedRoundContext { prepared_context, budget });
+            }
+            let Some(index) = shadow.messages.iter().rposition(|message| binding.is_background(message)) else {
+                return Err(AgentError::Budget(bamboo_domain::ChildContextPacketError::Budget.to_string()));
+            };
+            shadow.messages.remove(index);
+            omitted += 1;
+        }
+    }
     let retrieval_window_enabled =
         config.context_management.strategy == ContextManagementStrategy::RetrievalWindow;
     let manual_archive_request = pending_manual_archive_request(session);

@@ -908,6 +908,12 @@ impl ActorChildRunner {
         key: &str,
         spec: &ProvisionSpec,
     ) -> crate::runtime::runner::Result<PooledWorker> {
+        if spec.capabilities.required_child_context {
+            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec).await
+                .map_err(|error| AgentError::LLM(format!("required-context worker spawn failed: {error}")))?;
+            let mailbox_id = worker.record.agent_id.clone();
+            return Ok(PooledWorker { worker, mailbox_id, parked_at: None });
+        }
         self.ensure_pool_reaper();
         // Drain the bucket, skipping (and reaping) any worker whose process exited
         // or crossed its idle deadline while parked. A live, fresh one is handed
@@ -1416,11 +1422,24 @@ impl ExternalChildRunner for ActorChildRunner {
         // fail-closed denies. Capturing at spawn pins the right bridge per run.
         let escalation = self.escalation_bridge.lock().recover_poison().clone();
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
-        let assignment = extract_assignment(session);
+        let required_context = bamboo_domain::ChildContextBinding::from_session(session)
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
+        let assignment = required_context.as_ref().map(|binding| binding.payload.required_assignment.clone())
+            .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
         // orphaned. Warm bus workers are pooled per fingerprint and reused.
-        spec.reusable = true;
+        spec.reusable = required_context.is_none();
+        spec.capabilities.required_child_context = required_context.is_some();
+        if required_context.is_some() {
+            let current = std::env::current_exe().ok().and_then(|path| path.canonicalize().ok());
+            if current.is_none() || self.worker_bin.canonicalize().ok() != current
+                || self.worker_args != ["subagent-worker".to_string()]
+                || !matches!(spec.executor, ExecutorSpec::BambooRuntime)
+                || !matches!(spec.placement, Placement::Local) {
+                return Err(AgentError::LLM("required_child_context_unsupported: built-in fresh local Bamboo worker required".into()));
+            }
+        }
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
         }
@@ -1770,11 +1789,15 @@ impl ExternalChildRunner for ActorChildRunner {
                 .collect::<VecDeque<_>>();
             // Recompute after claim reconciliation: a warm retry may have had a
             // canonical receipt whose transcript proof was restored above.
-            let messages = session
-                .messages
-                .iter()
-                .filter_map(|message| serde_json::to_value(message).ok())
-                .collect();
+            let messages = if let Some(binding) = &required_context {
+                binding.validate_messages(&session.id, &session.messages)
+                    .map_err(|error| AgentError::Budget(error.to_string()))?;
+                session.messages.iter().map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|_| AgentError::Budget(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?
+            } else {
+                session.messages.iter().filter_map(|message| serde_json::to_value(message).ok()).collect()
+            };
 
             if let Err(e) = client
                 .send(ParentFrame::Run(RunSpec {
@@ -1903,6 +1926,8 @@ impl ExternalChildRunner for ActorChildRunner {
         // workers are registry-managed — never ours to pool/kill, just drop.
         if remote {
             drop(actor);
+        } else if required_context.is_some() {
+            actor.worker.kill().await;
         } else {
             match &result {
                 Ok(_) => self.release_bus_worker(&pool_key, actor).await,
