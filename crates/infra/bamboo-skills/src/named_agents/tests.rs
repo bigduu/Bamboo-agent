@@ -524,7 +524,9 @@ mod filesystem {
         let displaced = fixture.root.with_extension("displaced");
         fs::rename(&fixture.root, &displaced).unwrap();
         symlink(&external.root, &fixture.root).unwrap();
-        let candidates = directory.candidates(NamedAgentLimits::default()).unwrap();
+        let candidates = directory
+            .candidates(NamedAgentLimits::default(), &mut ScanBudget::default())
+            .unwrap();
         assert_eq!(candidates, [std::ffi::OsString::from("same.md")]);
         let bytes = directory
             .read(OsStr::new("same.md"), 65_536, 1_048_576)
@@ -549,7 +551,9 @@ mod filesystem {
         let directory = reader::AgentDirectory::open(&fixture.root)
             .unwrap()
             .unwrap();
-        let candidates = directory.candidates(NamedAgentLimits::default()).unwrap();
+        let candidates = directory
+            .candidates(NamedAgentLimits::default(), &mut ScanBudget::default())
+            .unwrap();
         fs::remove_file(fixture.root.join("agents/same.md")).unwrap();
         symlink(
             external.root.join("agents/outside.md"),

@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-use super::{NamedAgentDiagnosticCode as Code, NamedAgentLimits};
+use super::{NamedAgentDiagnosticCode as Code, NamedAgentLimits, ScanBudget};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supported {
@@ -51,7 +51,11 @@ mod supported {
             }
         }
 
-        pub(crate) fn candidates(&self, limits: NamedAgentLimits) -> Result<Vec<OsString>, Code> {
+        pub(crate) fn candidates(
+            &self,
+            limits: NamedAgentLimits,
+            budget: &mut ScanBudget,
+        ) -> Result<Vec<OsString>, Code> {
             // fdopendir takes ownership of its fd; enumerate a duplicate of the
             // retained directory, never the configured path or /proc fd paths.
             let fd = self
@@ -72,7 +76,6 @@ mod supported {
             }
             let stream = DirectoryStream(pointer);
             let mut candidates = Vec::new();
-            let mut scanned = 0usize;
             loop {
                 // readdir's null result is either end-of-stream or an error.
                 // Clear errno for this thread immediately before the call.
@@ -89,13 +92,14 @@ mod supported {
                 if name == b"." || name == b".." {
                     continue;
                 }
-                scanned += 1;
-                if scanned > limits.max_scan_entries {
+                budget.entries += 1;
+                if budget.entries > limits.max_scan_entries {
                     return Err(Code::ScanLimitExceeded);
                 }
                 if name.ends_with(b".md") {
                     candidates.push(OsString::from_vec(name.to_vec()));
-                    if candidates.len() > limits.max_candidates {
+                    budget.candidates += 1;
+                    if budget.candidates > limits.max_candidates {
                         return Err(Code::CandidateLimitExceeded);
                     }
                 }
@@ -188,7 +192,11 @@ impl AgentDirectory {
         Err(Code::UnsupportedPlatform)
     }
 
-    pub(super) fn candidates(&self, _: NamedAgentLimits) -> Result<Vec<OsString>, Code> {
+    pub(super) fn candidates(
+        &self,
+        _: NamedAgentLimits,
+        _: &mut ScanBudget,
+    ) -> Result<Vec<OsString>, Code> {
         Err(Code::UnsupportedPlatform)
     }
 
