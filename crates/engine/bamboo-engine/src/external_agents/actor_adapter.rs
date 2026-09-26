@@ -532,6 +532,7 @@ pub struct ActorChildRunner {
     worker_bin: PathBuf,
     worker_args: Vec<String>,
     builtin_required_context_route: bool,
+    native_tool_ceiling: Option<Arc<dyn super::runtime::NativeToolCeilingSource>>,
     fabric_dir: PathBuf,
     executor: ExecutorSpec,
     /// Per-provider credentials snapshotted from the parent config at build
@@ -703,6 +704,7 @@ impl ActorChildRunner {
             credentials,
             default_provider,
             live_provider_config: None,
+            native_tool_ceiling: None,
             bus: None,
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -727,6 +729,14 @@ impl ActorChildRunner {
     /// Only the built-in factory sets this from its immutable launch config.
     pub(crate) fn with_builtin_required_context_route(mut self, supported: bool) -> Self {
         self.builtin_required_context_route = supported;
+        self
+    }
+
+    pub(crate) fn with_native_tool_ceiling_source(
+        mut self,
+        source: Option<Arc<dyn super::runtime::NativeToolCeilingSource>>,
+    ) -> Self {
+        self.native_tool_ceiling = source;
         self
     }
 
@@ -1416,7 +1426,8 @@ impl ExternalChildRunner for ActorChildRunner {
         let current = std::env::current_exe()
             .ok()
             .and_then(|path| path.canonicalize().ok());
-        if !self.builtin_required_context_route
+        if self.native_tool_ceiling.is_none()
+            || !self.builtin_required_context_route
             || !self.should_handle(session).await
             || current.is_none()
             || self.worker_bin.canonicalize().ok() != current
@@ -1439,6 +1450,15 @@ impl ExternalChildRunner for ActorChildRunner {
         .await
         .map_err(|_| {
             "required_child_context_unsupported: worker capability unconfirmed".to_string()
+        })?;
+        bamboo_subagent::fleet::require_worker_capability(
+            &self.worker_bin,
+            &self.worker_args,
+            bamboo_subagent::provision::NATIVE_TOOL_CEILING_WORKER_CAPABILITY,
+        )
+        .await
+        .map_err(|_| {
+            "native_tool_ceiling_unsupported: worker capability unconfirmed".to_string()
         })?;
         bamboo_subagent::fleet::require_worker_capability(
             &self.worker_bin,
@@ -1509,6 +1529,37 @@ impl ExternalChildRunner for ActorChildRunner {
             self.validate_required_child_context_route(session)
                 .await
                 .map_err(AgentError::LLM)?;
+        }
+        if required_context.is_some() {
+            let names = self
+                .native_tool_ceiling
+                .as_ref()
+                .unwrap()
+                .observe(session)
+                .await
+                .map_err(AgentError::LLM)?;
+            let birth = creation
+                .as_ref()
+                .ok_or_else(|| AgentError::LLM("native_tool_ceiling_birth_missing".into()))?;
+            spec.capabilities.native_tool_ceiling_required = true;
+            spec.capabilities.native_tool_ceiling =
+                Some(bamboo_subagent::proto::NativeToolCeiling {
+                    version: 1,
+                    child_session_id: session.id.clone(),
+                    parent_session_id: job.parent_session_id.clone(),
+                    root_session_id: session.root_session_id.clone(),
+                    created_at: birth.created_at,
+                    spawn_depth: birth.spawn_depth,
+                    project_id: project_id_for_actor_run(session)?,
+                    tools: names,
+                });
+            // Positive native names are a leaf surface, never an expansion path.
+            spec.capabilities.mcp = None;
+            spec.capabilities.mcp_proxy = None;
+            spec.capabilities.skills_dir = None;
+            spec.capabilities.nested_spawn = false;
+            spec.validate()
+                .map_err(|_| AgentError::LLM("native_tool_ceiling_invalid".into()))?;
         }
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);

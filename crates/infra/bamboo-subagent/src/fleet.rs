@@ -112,6 +112,14 @@ async fn ensure_provision_capabilities(
     worker_args: &[String],
     spec: &ProvisionSpec,
 ) -> TransportResult<()> {
+    if spec.capabilities.native_tool_ceiling_required {
+        require_worker_capability(
+            worker_bin,
+            worker_args,
+            crate::provision::NATIVE_TOOL_CEILING_WORKER_CAPABILITY,
+        )
+        .await?;
+    }
     if spec.capabilities.child_creation_identity {
         require_worker_capability(
             worker_bin,

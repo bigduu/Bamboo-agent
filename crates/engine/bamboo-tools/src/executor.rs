@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -181,6 +181,7 @@ fn normalize_resolved_builtin_args(
 /// Built-in tool executor that uses ToolRegistry for dynamic dispatch
 pub struct BuiltinToolExecutor {
     registry: ToolRegistry,
+    native_tool_ceiling: Option<BTreeSet<String>>,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
     /// Framework-owned tool instances whose identity affects compatibility
     /// argument handling or file-change events. Arc identity prevents a custom
@@ -202,6 +203,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: None,
             framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -214,6 +216,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: Some(permission_checker),
             framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -238,6 +241,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: None,
             framework_builtin_tools: BTreeMap::new(),
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -256,6 +260,7 @@ impl BuiltinToolExecutor {
             registry,
             permission_checker: Some(permission_checker),
             framework_builtin_tools: BTreeMap::new(),
+            native_tool_ceiling: None,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -374,6 +379,40 @@ impl BuiltinToolExecutor {
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
     }
 
+    /// Observe the registered Arc, not a same-name custom replacement.
+    pub fn eligible_native_tool(&self, name: &str) -> bool {
+        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Write")
+            && self.registry.get(name).is_some_and(|tool| {
+                self.is_framework_builtin_instance(name, &tool)
+                    && self
+                        .native_tool_ceiling
+                        .as_ref()
+                        .is_none_or(|set| set.contains(name))
+            })
+    }
+
+    /// Install an immutable positive ceiling. Reinstallation can only narrow it.
+    pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
+        let set: BTreeSet<_> = names.iter().cloned().collect();
+        if set.len() != names.len()
+            || names.len() > 5
+            || names.iter().any(|name| !self.eligible_native_tool(name))
+        {
+            return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
+        }
+        self.native_tool_ceiling = Some(set);
+        Ok(self)
+    }
+
+    fn check_native_ceiling(&self, name: &str, tool: &Arc<dyn Tool>) -> Result<(), ToolError> {
+        if self.native_tool_ceiling.as_ref().is_some_and(|set| {
+            !set.contains(name) || !self.is_framework_builtin_instance(name, tool)
+        }) {
+            return Err(ToolError::Execution("native_tool_ceiling_denied".into()));
+        }
+        Ok(())
+    }
+
     fn normalize_registered_builtin_args(
         &self,
         reference: &str,
@@ -413,6 +452,9 @@ impl BuiltinToolExecutor {
 
     /// Get guide for a tool
     pub fn get_guide(&self, tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
+        if self.native_tool_ceiling.is_some() && !self.eligible_native_tool(tool_name) {
+            return None;
+        }
         self.registry.get_guide(tool_name)
     }
 
@@ -453,6 +495,7 @@ impl BuiltinToolExecutor {
             .registry
             .get(execution_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        self.check_native_ceiling(execution_name, &tool)?;
         check_raw_tool_input(execution_name, &call.function.arguments)?;
         let mut args = self.parse_execution_args(call, execution_name, &ctx);
         check_parsed_tool_input(execution_name, &args)?;
@@ -491,7 +534,7 @@ impl BuiltinToolExecutor {
 
     /// Build enhanced prompt for all registered tools
     pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
-        EnhancedPromptBuilder::build(Some(&self.registry), &self.registry.list_tools(), &context)
+        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
     }
 }
 
@@ -624,6 +667,13 @@ impl ToolExecutor for BuiltinToolExecutor {
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
+        if self.native_tool_ceiling.is_some() {
+            let tool = self
+                .registry
+                .get(execution_name)
+                .ok_or_else(|| ToolError::Execution("native_tool_ceiling_denied".into()))?;
+            self.check_native_ceiling(execution_name, &tool)?;
+        }
         let tool_name = execution_name.to_string();
         let args = resolved_args.clone();
         if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
@@ -941,15 +991,35 @@ impl ToolExecutor for BuiltinToolExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        self.registry.list_tools()
+        self.registry
+            .list_tools()
+            .into_iter()
+            .filter(|schema| {
+                self.native_tool_ceiling.is_none()
+                    || self.eligible_native_tool(&schema.function.name)
+            })
+            .collect()
     }
 
     fn owns_exact_tool(&self, tool_name: &str) -> bool {
         self.registry.contains(tool_name)
+            && (self.native_tool_ceiling.is_none() || self.eligible_native_tool(tool_name))
+    }
+
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        self.owns_exact_tool(name)
+            .then_some(self as &dyn ToolExecutor)
     }
 
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        if self.native_tool_ceiling.is_some()
+            && resolved
+                .as_deref()
+                .is_none_or(|name| !self.eligible_native_tool(name))
+        {
+            return crate::ToolMutability::Mutating;
+        }
         resolved
             .as_deref()
             .and_then(|name| self.registry.get(name))
@@ -963,6 +1033,13 @@ impl ToolExecutor for BuiltinToolExecutor {
 
     fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        if self.native_tool_ceiling.is_some()
+            && resolved
+                .as_deref()
+                .is_none_or(|name| !self.eligible_native_tool(name))
+        {
+            return false;
+        }
         resolved
             .as_deref()
             .and_then(|name| self.registry.get(name))
@@ -987,6 +1064,9 @@ impl ToolExecutor for BuiltinToolExecutor {
                 .map(|tool| (execution_name, tool))
         }) {
             Some((execution_name, tool)) => {
+                if self.check_native_ceiling(execution_name, &tool).is_err() {
+                    return (crate::ToolMutability::Mutating, false);
+                }
                 self.normalize_registered_builtin_args(reference, execution_name, &tool, &mut args);
                 let class = tool.classify(&args);
                 (class.mutability, class.parallel_safe)
@@ -1094,6 +1174,7 @@ impl BuiltinToolExecutorBuilder {
             registry: self.registry,
             permission_checker: self.permission_checker,
             framework_builtin_tools: self.framework_builtin_tools,
+            native_tool_ceiling: None,
             tool_event_publisher: self.tool_event_publisher,
         }
     }
@@ -1538,6 +1619,7 @@ mod tests {
             registry,
             permission_checker: None,
             framework_builtin_tools: BTreeMap::from([("Write".to_string(), tool)]),
+            native_tool_ceiling: None,
             tool_event_publisher: publisher,
         }
     }
@@ -4851,5 +4933,202 @@ mod tests {
         for (label, publisher) in publishers {
             assert_real_write_succeeds_with_publisher(publisher, label).await;
         }
+    }
+
+    #[tokio::test]
+    async fn native_ceiling_covers_all_seven_entrypoints_and_sync_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("denied.txt");
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Glob".into(), "Read".into()])
+            .unwrap();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+        let ctx = ToolExecutionContext::none(&call.id);
+        let args = json!({"file_path":path,"content":"forbidden"});
+        assert!(executor.execute(&call).await.is_err());
+        assert!(executor.execute_with_context(&call, ctx).await.is_err());
+        assert!(executor
+            .execute_with_context_outcome(&call, ctx)
+            .await
+            .is_err());
+        assert!(executor
+            .execute_exact_with_context_outcome(&call, "Write", ctx)
+            .await
+            .is_err());
+        assert!(executor.check_permissions_for(&call, &ctx).await.is_err());
+        assert!(executor
+            .check_permissions_for_exact(&call, "Write", &ctx)
+            .await
+            .is_err());
+        assert!(executor
+            .check_permissions_for_resolved(&call, "Write", &args, &ctx)
+            .await
+            .is_err());
+        executor.register_tool(EchoArgsTool).unwrap();
+        assert!(executor
+            .execute(&make_tool_call("echo_args", json!({"v":"late"})))
+            .await
+            .is_err());
+        for name in [
+            "SubAgent",
+            "load_skill",
+            "read_skill_resource",
+            "composition",
+            "Bash",
+            "Edit",
+            "Grep",
+        ] {
+            let forged = make_tool_call(name, json!({}));
+            assert!(executor.execute(&forged).await.is_err());
+        }
+        assert!(!path.exists());
+        assert_eq!(
+            executor
+                .list_tools()
+                .iter()
+                .map(|schema| schema.function.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Read", "Glob"])
+        );
+        assert!(!executor.owns_exact_tool("Write"));
+        assert!(executor.exact_tool_owner("Write").is_none());
+        assert!(executor.get_guide("Write").is_none());
+        assert_eq!(
+            executor.tool_mutability("Write"),
+            crate::ToolMutability::Mutating
+        );
+        assert!(!executor.tool_concurrency_safe("Write"));
+        assert!(!executor.call_parallel_classification(&call).1);
+        fs::write(&path, "actual native read").await.unwrap();
+        let read = make_tool_call("default::read_file", json!({"path":path}));
+        assert!(executor.execute(&read).await.unwrap().success);
+        assert!(BuiltinToolExecutor::with_registry(ToolRegistry::new())
+            .with_native_tool_ceiling(vec!["Read".into()])
+            .is_err());
+        assert!(BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Read".into(), "Read".into()])
+            .is_err());
+        assert!(BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["SubAgent".into()])
+            .is_err());
+        assert!(BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .build()
+            .with_native_tool_ceiling(vec!["Grep".into()])
+            .is_err());
+    }
+
+    struct CeilingReplacement(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Tool for CeilingReplacement {
+        fn name(&self) -> &str {
+            "Write"
+        }
+        fn description(&self) -> &str {
+            "custom replacement"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolCtx) -> Result<ToolOutcome, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::Execution("replacement invoked".into()))
+        }
+    }
+    struct CeilingPermissionBarrier {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl PermissionChecker for CeilingPermissionBarrier {
+        async fn needs_confirmation(&self, _: crate::permission::PermissionType, _: &str) -> bool {
+            self.entered.notify_one();
+            self.release.notified().await;
+            false
+        }
+        async fn request_confirmation(
+            &self,
+            _: crate::permission::PermissionContext,
+        ) -> Result<bool, PermissionError> {
+            Ok(true)
+        }
+        fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {}
+    }
+    #[tokio::test]
+    async fn native_ceiling_captured_original_survives_permission_await_without_invoking_replacement(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("captured.txt");
+        let checker = Arc::new(CeilingPermissionBarrier {
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let executor = Arc::new(
+            BuiltinToolExecutor::new_with_permissions(checker.clone())
+                .with_native_tool_ceiling(vec!["Write".into()])
+                .unwrap(),
+        );
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path":path,"content":"original native"}),
+        );
+        let owned_executor = executor.clone();
+        let owned_call = call.clone();
+        let running = tokio::spawn(async move { owned_executor.execute(&owned_call).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            checker.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        assert!(executor.registry().unregister("Write"));
+        executor
+            .register_tool(CeilingReplacement(invocations.clone()))
+            .unwrap();
+        checker.release.notify_one();
+        assert!(running.await.unwrap().unwrap().success);
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "original native");
+        assert!(executor.execute(&call).await.is_err());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(executor.list_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_ceiling_keeps_read_only_and_resource_hard_denies_under_all_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never.txt");
+        let base = Arc::new(crate::permission::AllowAllPermissionChecker);
+        let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(base));
+        let executor = BuiltinToolExecutor::new_with_permissions(checker)
+            .with_native_tool_ceiling(vec!["Write".into()])
+            .unwrap();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"denied"}));
+        let policy = Arc::new(crate::permission::PermissionConfig::new());
+        policy.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::WriteFile,
+            path.to_string_lossy(),
+            false,
+        ));
+        let resource_denied = BuiltinToolExecutor::new_with_permissions(Arc::new(
+            crate::permission::ConfigPermissionChecker::new(policy),
+        ))
+        .with_native_tool_ceiling(vec!["Write".into()])
+        .unwrap();
+        for (auto_approve_permissions, bypass_permissions) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let ctx = ToolExecutionContext {
+                auto_approve_permissions,
+                bypass_permissions,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            assert!(executor.execute_with_context(&call, ctx).await.is_err());
+            assert!(resource_denied
+                .execute_with_context(&call, ctx)
+                .await
+                .is_err());
+        }
+        assert!(!path.exists());
     }
 }

@@ -510,7 +510,7 @@ impl AppState {
             ))
         })?;
 
-        let base_tools = build_base_tools(
+        let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -762,13 +762,14 @@ impl AppState {
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_live_config_and_codex_tokens(
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_native_tool_ceiling(
                 &config_snapshot,
                 config.clone(),
                 Some(approval_registry.clone()),
                 Some(parent_approval_reviewer),
                 permission_checker.permission_config(),
                 Some(codex_run_tokens.clone()),
+                native_tool_ceiling,
             );
         external_runner.set_session_inbox_runtime(Some(
             bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {

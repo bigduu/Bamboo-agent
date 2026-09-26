@@ -65,6 +65,7 @@ pub async fn run() -> std::result::Result<(), String> {
     let mut spec = ProvisionSpec::read_from_stdin()
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
+    validate_native_startup(&spec)?;
     let provisioned_permission = spec.capabilities.permission_resolution()?;
     if spec.capabilities.required_child_context
         && (spec.reusable || !matches!(spec.executor, ExecutorSpec::BambooRuntime))
@@ -377,6 +378,7 @@ pub struct BambooRuntimeExecutor {
     read_only_child: bool,
     required_child_context: bool,
     child_creation_identity: bool,
+    native_tool_ceiling: Option<bamboo_subagent::proto::NativeToolCeiling>,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -441,11 +443,24 @@ fn bind_worker_session_note(
         .map_err(|error| format!("bind session_note to the worker Jiandu store: {error}"))
 }
 
+fn validate_native_startup(spec: &ProvisionSpec) -> Result<(), String> {
+    if spec.capabilities.required_child_context
+        || spec.capabilities.native_tool_ceiling_required
+        || spec.capabilities.native_tool_ceiling.is_some()
+    {
+        spec.validate()
+            .map_err(|_| "native_tool_ceiling_invalid".to_string())?;
+    }
+    Ok(())
+}
+
 impl BambooRuntimeExecutor {
     /// Assemble the isolated runtime: in-memory config + scoped credentials, provider,
     /// isolated storage/skills/metrics, builtin tools — never touching the user's
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
+        validate_native_startup(spec)?;
+        let strict_native = spec.capabilities.native_tool_ceiling_required;
         let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
         // Local actor processes inherit the managed launcher's environment.
         // Resolve again at the worker boundary, then inject this single store
@@ -532,13 +547,17 @@ impl BambooRuntimeExecutor {
             .unwrap_or_else(|| storage_dir.join("skills"));
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
             skills_dir,
-            project_dir: spec.workspace.clone().map(PathBuf::from),
+            project_dir: (!strict_native)
+                .then(|| spec.workspace.clone().map(PathBuf::from))
+                .flatten(),
             active_mode: None,
         }));
-        skill_manager
-            .initialize()
-            .await
-            .map_err(|e| format!("init skill manager: {e}"))?;
+        if !strict_native {
+            skill_manager
+                .initialize()
+                .await
+                .map_err(|e| format!("init skill manager: {e}"))?;
+        }
         let metrics_storage: Arc<dyn bamboo_metrics::storage::MetricsStorage> =
             Arc::new(SqliteMetricsStorage::new(storage_dir.join("metrics.db")));
         let metrics_collector = MetricsCollector::spawn(metrics_storage, 90);
@@ -587,15 +606,22 @@ impl BambooRuntimeExecutor {
             )
         };
         bind_worker_session_note(&builtin, memory_store.clone())?;
+        let builtin = if let Some(ceiling) = &spec.capabilities.native_tool_ceiling {
+            builtin
+                .with_native_tool_ceiling(ceiling.tools.clone())
+                .map_err(|_| "native_tool_ceiling_invalid".to_string())?
+        } else {
+            builtin
+        };
         let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(builtin);
         // MCP composition (absent for actor children → builtin-only, unchanged):
         //   1. mcp_proxy set → proxy ALL MCP to the orchestrator over the broker
         //      (it runs the host-bound servers like nova; P2).
         //   2. else mcp set → connect the synced portable (URL) servers directly (P1).
         // A parse/connect failure degrades to builtin.
-        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = if let Some(proxy) =
-            spec.capabilities.mcp_proxy.as_ref()
-        {
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = if strict_native {
+            builtin
+        } else if let Some(proxy) = spec.capabilities.mcp_proxy.as_ref() {
             let proxy_id = format!("{}#mcp", spec.identity.child_id);
             // Thread this worker's REAL role (issue #54) so the orchestrator's
             // per-role MCP allowlist — if configured — actually scopes it.
@@ -671,7 +697,9 @@ impl BambooRuntimeExecutor {
             worker_sessions.clone(),
             Some("actor-worker"),
         );
-        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = {
+        let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = if strict_native {
+            default_tools
+        } else {
             let session_repo = bamboo_engine::SessionRepository::new(
                 worker_sessions.clone(),
                 store.clone(),
@@ -884,6 +912,7 @@ impl BambooRuntimeExecutor {
             read_only_child: spec.capabilities.read_only_enforced(),
             required_child_context: spec.capabilities.required_child_context,
             child_creation_identity: spec.capabilities.child_creation_identity,
+            native_tool_ceiling: spec.capabilities.native_tool_ceiling.clone(),
             permission_config,
             no_human_review,
             child_runner,
@@ -1169,6 +1198,13 @@ impl ChildExecutor for BambooRuntimeExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        if self
+            .native_tool_ceiling
+            .as_ref()
+            .is_some_and(|ceiling| !ceiling.matches_run(&run))
+        {
+            return ChildOutcome::error("native_tool_ceiling_identity_mismatch");
+        }
         // Validate before seeding any activation. Product thinking modes are
         // not per-call efforts, and malformed supplied values must not default.
         let reasoning_effort = match run.reasoning_effort.as_ref() {
@@ -1927,6 +1963,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
             event_tx,
             cancel.clone(),
         );
+        if self.native_tool_ceiling.is_some() {
+            // The runtime requires a manager; explicit empty selection prevents
+            // workspace auto-selection or a retained workflow expanding this Run.
+            builder = builder.selected_skill_ids(Vec::new());
+        }
         if let Some(model) = self.model.clone() {
             builder = builder.model(model);
         }
@@ -2200,6 +2241,7 @@ mod tests {
             read_only_child: false,
             required_child_context: false,
             child_creation_identity: false,
+            native_tool_ceiling: None,
             permission_config: None,
             no_human_review: None,
             child_runner: None,
@@ -3199,5 +3241,84 @@ mod tests {
             assert!(live_components.contains(&storage), "id={id:?}");
             assert!(!storage.contains(std::path::MAIN_SEPARATOR));
         }
+    }
+    #[tokio::test]
+    async fn native_ceiling_invalid_startup_rejects_before_any_worker_storage_or_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let untouched = temp.path().join("not-created");
+        let mut spec = spec_with("openai", "fixture-key", None);
+        spec.storage_dir = Some(untouched.to_string_lossy().into_owned());
+        spec.capabilities.native_tool_ceiling_required = true;
+        assert_eq!(
+            BambooRuntimeExecutor::build(&spec).await.err().unwrap(),
+            "native_tool_ceiling_invalid"
+        );
+        assert!(!untouched.exists());
+    }
+    #[tokio::test]
+    async fn native_ceiling_run_mismatches_reject_before_storage_seeding_and_provider() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, mut executor, store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        let mut run = protocol_run("ceiling-child", "ceiling-run", vec![]);
+        let identity = run.logical_session.as_mut().unwrap();
+        identity.creation = Some(bamboo_subagent::proto::ChildCreationIdentity {
+            created_at: chrono::Utc::now(),
+            spawn_depth: 1,
+        });
+        executor.native_tool_ceiling = Some(bamboo_subagent::proto::NativeToolCeiling {
+            version: 1,
+            child_session_id: identity.session_id.clone(),
+            parent_session_id: identity.parent_session_id.clone().unwrap(),
+            root_session_id: identity.root_session_id.clone(),
+            created_at: identity.creation.as_ref().unwrap().created_at,
+            spawn_depth: 1,
+            project_id: None,
+            tools: vec!["Read".into()],
+        });
+        for index in 0..6 {
+            let mut bad = run.clone();
+            match index {
+                0 => bad.logical_session = None,
+                1 => bad.project_id = Some(bamboo_domain::ProjectId::new()),
+                2 => {
+                    bad.logical_session.as_mut().unwrap().parent_session_id =
+                        Some("foreign-parent".into())
+                }
+                3 => bad.logical_session.as_mut().unwrap().root_session_id = "foreign-root".into(),
+                4 => {
+                    bad.logical_session
+                        .as_mut()
+                        .unwrap()
+                        .creation
+                        .as_mut()
+                        .unwrap()
+                        .created_at += chrono::Duration::milliseconds(1)
+                }
+                _ => {
+                    bad.logical_session
+                        .as_mut()
+                        .unwrap()
+                        .creation
+                        .as_mut()
+                        .unwrap()
+                        .spawn_depth = 2
+                }
+            }
+            let (events, _receiver) = EventSink::channel();
+            let outcome = executor
+                .run(
+                    bad,
+                    events,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(
+                outcome.error.as_deref(),
+                Some("native_tool_ceiling_identity_mismatch")
+            );
+            assert!(store.load_session("ceiling-child").await.unwrap().is_none());
+        }
+        assert!(provider.calls.lock().unwrap().is_empty());
     }
 }
