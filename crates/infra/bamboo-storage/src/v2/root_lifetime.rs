@@ -380,7 +380,8 @@ impl SessionStoreV2 {
         }
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         if self.root_revocation(session_id).await?.is_none() {
             return Err(io::Error::new(

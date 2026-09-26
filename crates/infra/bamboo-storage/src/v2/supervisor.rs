@@ -251,7 +251,8 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorBootstrapReceipt> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         let _session = self
             .acquire_session_maintenance_lock(DEFAULT_SUPERVISOR_SESSION_ID)
