@@ -687,11 +687,38 @@ pub enum SessionActivationPolicy {
     InterruptSpecificWait,
 }
 
+/// Permission to activate this specific message, published with its delivery.
+/// This never releases a coordinator's staged queue prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInboxActivationIntent {
+    version: u32,
+    policy: SessionActivationPolicy,
+}
+
+impl SessionInboxActivationIntent {
+    pub fn new(policy: SessionActivationPolicy) -> Self {
+        Self { version: 1, policy }
+    }
+
+    pub fn policy(&self) -> Result<SessionActivationPolicy, SessionInboxError> {
+        if self.version != 1 {
+            return Err(SessionInboxError::InvalidClaim(
+                "unsupported SessionInbox activation intent version".into(),
+            ));
+        }
+        Ok(self.policy)
+    }
+}
+
 /// Opaque claim returned to the single consumer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInboxClaim {
     pub envelope: SessionMessageEnvelope,
     pub generation: u64,
+    /// This item's effective permission at the claim boundary. Aggregate
+    /// backlog generations describe wakeups, never another item's policy.
+    pub activation_policy: SessionActivationPolicy,
     pub claim_id: String,
 }
 
@@ -700,14 +727,19 @@ pub struct SessionInboxBacklog {
     pub pending: usize,
     pub claimed: usize,
     pub generation: u64,
-    /// Highest inbox generation whose producer durably authorized execution.
+    /// Highest inbox generation with durable execution permission, either from
+    /// its own immediate intent or the coordinator's authorized prefix.
     ///
     /// Admission alone is intentionally insufficient: child/Bash coordinators
     /// can stage several sibling outcomes while a durable wait remains armed,
     /// then authorize the accumulated prefix only after the wait policy is
     /// satisfied.
     pub activation_generation: u64,
-    /// Highest authorized generation carrying an explicit external-steering
+    /// The coordinator's separately authorized prefix. Unlike per-message
+    /// immediate intent, this advances only after the coordinator releases
+    /// staged outcomes and lets activation recover a newly released older item.
+    pub coordinator_generation: u64,
+    /// Highest pending, authorized generation carrying an explicit steering
     /// policy that may interrupt a specific child/Bash wait.
     pub interrupt_generation: u64,
     /// Oldest generation still present in `new/` or `cur/`.
@@ -715,8 +747,9 @@ pub struct SessionInboxBacklog {
 }
 
 impl SessionInboxBacklog {
-    /// True only when at least one durable queue item is covered by the
-    /// producer's activation watermark.
+    /// True only when a durable queue item has permission from its immediate
+    /// intent or the coordinator prefix. Inspection computes the highest
+    /// eligible generation; it never grants intervening staged siblings.
     pub fn activation_pending(&self) -> bool {
         self.oldest_generation
             .is_some_and(|oldest| oldest <= self.activation_generation)
@@ -782,6 +815,21 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Publish permission for this message in the same commit as its delivery.
+    /// Implementations must bind the intent to exact-id retry semantics and
+    /// retain the cancellation gate at that publication boundary. It does not
+    /// authorize an earlier staged sibling. Unsupported backends fail closed.
+    async fn deliver_with_activation_intent(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _policy: SessionActivationPolicy,
+        _gate: Option<&super::AdmissionGate>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "immediate SessionInbox activation intent is unsupported".into(),
+        ))
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. An earlier link observation is not a grant.
@@ -807,6 +855,17 @@ pub trait SessionInboxPort: Send + Sync {
         generation: u64,
         policy: SessionActivationPolicy,
     ) -> Result<(), SessionInboxError>;
+
+    /// Read the coordinator prefix independently from immediate per-message
+    /// permission. Legacy backends have no immediate intent and need no hole
+    /// recovery. Backends supporting immediate intent must expose their true
+    /// coordinator prefix here. This value alone is never pending-work proof.
+    async fn coordinator_activation_generation(
+        &self,
+        _target_session_id: &str,
+    ) -> Result<u64, SessionInboxError> {
+        Ok(0)
+    }
 
     async fn claim(
         &self,

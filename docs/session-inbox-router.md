@@ -15,8 +15,9 @@ execution run ids are never durable addresses.
   session. Delivery is bounded, idempotent, and coordinated across independent
   adapters/processes by a per-session file lock.
 - `SessionMessenger` validates logical-session relationships, commits the
-  envelope, durably authorizes the intended activation policy, and only then
-  requests activation.
+  envelope with immediate per-message intent, and only then requests activation.
+  Child/Bash coordinators instead stage envelopes and explicitly release their
+  prefix after the durable wait transition permits it.
 - `SessionActivationRouter` tracks the current logical owner, safe-boundary
   notifications, finalization, and one successor reservation.
 - The runner's safe turn boundary claims an envelope, translates it to a
@@ -36,6 +37,14 @@ failures are observable and fail before activation. Child terminal fields use a
 smaller inline budget and carry the full value's length and SHA-256 identity
 when the displayed value is bounded, so an oversized completion cannot strand
 a satisfied parent wait.
+
+The new activation-intent scan additionally bounds physical Maildir bytes to
+`min(8 × max_payload_bytes + 4 KiB, 32 MiB)` (about 2 MiB with defaults).
+Immediate publication checks the actual pretty transport against the same
+bound. Scan checks metadata and then reads at most the bound plus one byte,
+so growth after stat cannot bypass it. An older staged pretty transport above
+this bound fails inspection closed and stays on disk; recovery does not repair,
+quarantine, or delete it. This guard does not change the legacy ACK readers.
 
 Message ids must be canonical, non-empty, at most 256 bytes, and contain no
 path separator or `..`. Maildir and admitted-receipt filenames use fixed-size
@@ -58,33 +67,49 @@ failure classes, never body content or secret values.
 1. Validate the envelope and authorization without logging body content.
 2. Under the inbox operation lock, reject same-id/different-semantic-envelope
    reuse, enforce payload/backlog limits, allocate a monotonic generation, and
-   commit to `new/`.
-3. Publish the producer's monotonic activation watermark. `activation_generation`
-   is the authoritative upper bound of the queue prefix allowed to execute;
-   delivery by itself is inert. A consumer may claim only generations less
-   than or equal to that watermark, including recovered entries in `cur/`.
-   Newer staged generations cannot hitchhike on an older activation.
+   commit to `new/`. Immediate delivery includes versioned, transport-owned
+   `session_inbox_activation_intent` in that same message-file publication.
+   Cancellation before the rename commits delivers neither message nor intent;
+   cancellation after it leaves both durable.
+3. The coordinator's `activation-generation` file authorizes a prefix. An
+   immediate intent authorizes **only its own message**, with either
+   `respect_specific_wait` or `interrupt_specific_wait`. Inspection and claim
+   use the same rule in `new/` and recovered `cur/`: coordinator-prefix coverage
+   **or** that message's own intent. A newer immediate message cannot release
+   an earlier staged child/Bash sibling. `activation_generation` in inspection
+   is the highest eligible generation, not permission for every preceding id;
+   `coordinator_generation` reports the explicit prefix separately.
+   Each canonical claim carries its own effective activation policy: its own
+   Interrupt intent, or coverage by both coordinator and legacy interrupt
+   prefixes. Local/remote actor delivery uses that claim policy; the aggregate
+   highest pending Interrupt generation never grants a preceding item Interrupt.
 4. If a run owns the logical session, notify that owner. Otherwise reserve one
    runner through the host's canonical runner registry. Startup and retry use
-   the durable activation watermark, not the latest delivered generation.
+   durable message intent and coordinator permission, not the latest delivered
+   generation. If the process stops after rename and before requesting wakeup,
+   startup reconstructs eligibility from the still-present message itself.
 5. At a safe reasoning boundary, recover/drain into `cur/`, checkpoint the
    provider message plus admission cursor, verify the typed transcript proof,
-   write a permanent tombstone containing the semantic digest, then remove
+   write a permanent tombstone containing the semantic digest and original
+   activation intent, then remove
    `cur/`.
 6. Before a run becomes terminal, mark its owner finalizing. If the router has
    a newer generation than the generation actually admitted by that run,
    reserve one successor.
 
-`interrupt_generation` is a second monotonic watermark for the authorized
-prefix whose explicit user/peer/runtime steering may clear a current reasoning
-gate. It is written before the corresponding `activation_generation`, so a
-crash cannot expose an interrupt-authorized prefix as the stricter policy.
+The legacy `interrupt-generation` file describes the coordinator-authorized
+prefix's interruption permission. Inspection additionally derives interruption
+from pending, eligible immediate messages' own policies, so an old interrupted
+message cannot change a later RespectSpecificWait message's policy. Immediate
+delivery never advances either coordinator watermark.
 Child and Bash completion producers use the strict policy: they can stage
 several outcomes, but publish activation only after their durable wait policy
-is satisfied. An activation request can fail after enqueue and watermark
-publication; retrying the same message id and body reuses the original
-generation and retries activation, while reusing the id with a different body
-fails closed.
+is satisfied. An activation request can fail after delivery commits; the error
+retains the exact receipt and reports durable delivery separately from wakeup.
+Retrying the same id, body, and intent reuses the original generation. Changing
+the body or policy, or upgrading a staged id to immediate, fails closed even
+after ACK. Legacy envelopes/receipts without intent remain staged; recovery
+does not infer their original sender's permission.
 
 Cancellation between external runner reservation and owner publication uses an
 asynchronous exact-run rollback handshake. Coalesced deliveries are released
@@ -94,6 +119,12 @@ a poison claim or persistent checkpoint failure receives one in-process
 successor attempt, not an unbounded provider hot loop. A newer generation or a
 process restart permits another bounded attempt while the original claim
 remains inspectable.
+
+An immediate message can be admitted ahead of an older staged outcome. When
+the coordinator later releases that older prefix, its durable monotonic prefix
+progress permits one new dispatch despite the delivery sequence hole. The
+router records the prefix seen before launch; pending work under the same
+prefix does not remove poison-generation suppression or trigger a hot loop.
 
 ## External actor admission handshake
 
@@ -150,6 +181,16 @@ deferred to existing **#685**. The router and actor tests here do not claim that
 worker-originated nested suspension is implemented.
 
 ## Rolling-upgrade compatibility
+
+Before publishing its first immediate intent, the adapter upgrades the existing
+`activation-generation` file under the same inbox lock from a legacy integer to
+`{"version":2,"generation":<unchanged coordinator prefix>}`. The new reader
+accepts both formats and subsequent prefix updates retain v2. The old integer
+reader fails closed on v2, so an old writer cannot turn a newer immediate
+message into a grant for earlier staged siblings. Cancellation before message
+rename may leave the safe format upgrade in place, without any delivered
+message or new prefix permission. Run current backends against an upgraded
+inbox; format downgrade and automatic watermark repair are unsupported.
 
 The following legacy ingress remains temporarily readable:
 

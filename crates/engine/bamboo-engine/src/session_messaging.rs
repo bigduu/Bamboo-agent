@@ -111,7 +111,8 @@ pub enum SessionMessengerError {
         #[source]
         source: SessionActivationError,
     },
-    /// Delivery is durable, but the activation watermark did not persist.
+    /// Staged delivery is durable, but its explicit activation watermark did
+    /// not persist. Immediate delivery instead binds intent at publication.
     /// Startup cannot infer permission to run from admission alone; a caller
     /// must retry this exact envelope until the watermark is committed.
     #[error(
@@ -213,10 +214,9 @@ impl SessionMessenger {
                 error
             })?;
         let admission = self.record_admission(envelope, delivery, started);
-        // Followup never answers a permission/clarification or interrupts a
-        // specific child/Bash wait; the existing spawner owns the final check.
-        self.activate_with_policy(&admission, SessionActivationPolicy::RespectSpecificWait)
-            .await
+        // Its specific-message RespectSpecificWait intent was published while
+        // holding Supervisor authority. This grants no staged sibling prefix.
+        self.activate_prepared(&admission).await
     }
 
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionMessengerError> {
@@ -316,6 +316,27 @@ impl SessionMessenger {
         envelope: SessionMessageEnvelope,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
+        self.admit_with_delivery_intent(envelope, gate, None).await
+    }
+
+    /// Commit this specific message's immediate permission together with the
+    /// envelope. Coordinators continue to use staged [`admit`](Self::admit).
+    pub async fn admit_with_activation_intent(
+        &self,
+        envelope: SessionMessageEnvelope,
+        policy: SessionActivationPolicy,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
+        self.admit_with_delivery_intent(envelope, gate, Some(policy))
+            .await
+    }
+
+    async fn admit_with_delivery_intent(
+        &self,
+        envelope: SessionMessageEnvelope,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        policy: Option<SessionActivationPolicy>,
+    ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
         let started = Instant::now();
         if let Err(error) = self.validate_relationship(&envelope).await {
             self.record_rejection(&error);
@@ -328,9 +349,14 @@ impl SessionMessenger {
             return Err(error);
         }
 
-        let delivery = match gate {
-            Some(gate) => self.inbox.deliver_with_gate(&envelope, gate).await,
-            None => self.inbox.deliver(&envelope).await,
+        let delivery = match (policy, gate) {
+            (Some(policy), gate) => {
+                self.inbox
+                    .deliver_with_activation_intent(&envelope, policy, gate)
+                    .await
+            }
+            (None, Some(gate)) => self.inbox.deliver_with_gate(&envelope, gate).await,
+            (None, None) => self.inbox.deliver(&envelope).await,
         };
         let delivery = match delivery {
             Ok(receipt) => receipt,
@@ -487,8 +513,25 @@ impl SessionMessenger {
         envelope: SessionMessageEnvelope,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
-        let admission = self.admit_with_gate(envelope, gate).await?;
-        self.activate(&admission).await
+        let admission = self
+            .admit_with_activation_intent(
+                envelope,
+                SessionActivationPolicy::InterruptSpecificWait,
+                gate,
+            )
+            .await?;
+        self.activate_prepared(&admission).await
+    }
+
+    pub async fn send_with_policy(
+        &self,
+        envelope: SessionMessageEnvelope,
+        policy: SessionActivationPolicy,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        let admission = self
+            .admit_with_activation_intent(envelope, policy, None)
+            .await?;
+        self.activate_prepared(&admission).await
     }
 }
 
@@ -505,6 +548,75 @@ mod tests {
 
     struct RecordingActivation {
         calls: tokio::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    struct FailingActivation;
+
+    #[async_trait]
+    impl SessionActivationPort for FailingActivation {
+        async fn request_activation(
+            &self,
+            _target_session_id: &str,
+            _inbox_generation: u64,
+        ) -> Result<SessionActivationDisposition, SessionActivationError> {
+            Err(SessionActivationError::Internal(
+                "injected wakeup failure".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_activation_failure_preserves_receipt_and_restart_permission() {
+        let (temp, store, recording, _messenger) = fixture().await;
+        store
+            .save_session(&Session::new("root", "model"))
+            .await
+            .unwrap();
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let messenger = SessionMessenger::new(store, inbox, Arc::new(FailingActivation));
+        let envelope = SessionMessageEnvelope::user_input("root", "steer");
+        let gate = bamboo_domain::AdmissionGate::default();
+        let receipt = match messenger
+            .send_with_gate(envelope.clone(), Some(&gate))
+            .await
+            .unwrap_err()
+        {
+            SessionMessengerError::Activation { receipt, .. } => receipt,
+            error => panic!("expected durable delivery with failed wakeup: {error}"),
+        };
+        assert!(gate.is_committed());
+        gate.cancel_if_pending();
+        let restarted_store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let restarted = Arc::new(FileSessionInbox::new(
+            restarted_store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let backlog = restarted.inspect("root").await.unwrap();
+        assert!(backlog.activation_pending());
+        assert_eq!(backlog.coordinator_generation, 0);
+        // This is the startup reconciliation request: the durable generation
+        // comes from this message's intent while the coordinator prefix is 0.
+        recording
+            .request_activation("root", backlog.activation_generation)
+            .await
+            .unwrap();
+        let retry = SessionMessenger::new(restarted_store, restarted.clone(), recording.clone());
+        assert_eq!(
+            retry
+                .send_with_gate(envelope, Some(&gate))
+                .await
+                .unwrap()
+                .delivery,
+            receipt
+        );
+        assert_eq!(restarted.inspect("root").await.unwrap().pending, 1);
+        assert_eq!(messenger.metrics().snapshot().activation_failed, 1);
+        let claims = restarted.claim("root", 128).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id, receipt.id);
     }
 
     struct FailEligibilityOnce {
@@ -656,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_delivery_without_watermark_reports_exact_retry_required() {
+    async fn staged_delivery_without_watermark_reports_exact_retry_required() {
         let temp = TempDir::new().unwrap();
         let store = Arc::new(
             SessionStoreV2::new(temp.path().to_path_buf())
@@ -684,11 +796,11 @@ mod tests {
         let envelope = peer("root", "child", "watermark-failure");
         let gate = bamboo_domain::AdmissionGate::default();
 
-        let receipt = match messenger
-            .send_with_gate(envelope.clone(), Some(&gate))
+        let admission = messenger
+            .admit_with_gate(envelope.clone(), Some(&gate))
             .await
-            .unwrap_err()
-        {
+            .unwrap();
+        let receipt = match messenger.activate(&admission).await.unwrap_err() {
             SessionMessengerError::ActivationEligibility { receipt, .. } => receipt,
             error => panic!("expected retry-required classification: {error}"),
         };
@@ -700,10 +812,11 @@ mod tests {
         assert_eq!(backlog.activation_generation, 0);
         assert_eq!(backlog.generation, receipt.generation);
 
-        let retried = messenger
-            .send_with_gate(envelope, Some(&gate))
+        let retry = messenger
+            .admit_with_gate(envelope, Some(&gate))
             .await
             .unwrap();
+        let retried = messenger.activate(&retry).await.unwrap();
         assert_eq!(retried.delivery, receipt);
         assert_eq!(activation.calls.lock().await.len(), 1);
         let reopened = reopened.inspect("child").await.unwrap();

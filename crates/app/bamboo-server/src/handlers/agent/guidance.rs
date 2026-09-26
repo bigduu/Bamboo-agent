@@ -153,7 +153,6 @@ pub async fn send(
         },
     });
     let result = async {
-        let admission = state.session_messenger.admit(envelope).await?;
         let policy = match body.mode {
             GuidanceMode::AfterRound => {
                 bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
@@ -162,7 +161,7 @@ pub async fn send(
         };
         state
             .session_messenger
-            .activate_with_policy(&admission, policy)
+            .send_with_policy(envelope, policy)
             .await
     }
     .await;
