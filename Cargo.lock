@@ -1528,6 +1528,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

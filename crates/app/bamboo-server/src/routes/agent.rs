@@ -168,6 +168,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::subagent_snapshot::handler),
         )
         .route(
+            "/actors/{root_id}/snapshot",
+            web::get().to(agent::actor_snapshot::handler),
+        )
+        .route(
             "/sessions/{session_id}/guidance",
             web::get().to(agent::guidance::list),
         )

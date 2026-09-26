@@ -123,6 +123,23 @@ impl SessionStoreV2 {
         }
         supervisor::validate_identity(side).map_err(|error| conflict(error.to_string()))?;
         let proof = self.read_supervisor_proof().await?;
+        Self::validate_supervisor_proof_value(side, proof)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_supervisor_proof(
+        side: &Session,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        supervisor::validate_identity(side).map_err(|_| conflict("invalid identity"))?;
+        let proof = serde_json::from_slice(bytes).map_err(|_| conflict("invalid proof"))?;
+        Self::validate_supervisor_proof_value(side, proof)
+    }
+
+    fn validate_supervisor_proof_value(
+        side: &Session,
+        proof: SupervisorAuthorityProof,
+    ) -> io::Result<()> {
         if proof.state != ProofState::Committed || !proof.matches(side) {
             return Err(conflict("canonical proof is pending or stale"));
         }
