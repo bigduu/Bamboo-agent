@@ -230,6 +230,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::sessions::get_session),
         )
         .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}",
+            web::post().to(agent::sessions::select_root_mode),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}/recover",
+            web::post().to(agent::sessions::recover_root_mode),
+        )
+        .route(
             "/sessions/{session_id}/copy",
             web::post().to(agent::sessions::copy_session),
         )
