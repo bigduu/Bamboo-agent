@@ -14,18 +14,18 @@ use tokio::runtime::Runtime;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
-struct Fixture {
-    _temp: TempDir,
-    runtime: Runtime,
-    store: Arc<SessionStoreV2>,
-    other_store: Arc<SessionStoreV2>,
-    inbox: FileSessionInbox,
-    other: FileSessionInbox,
-    dir: PathBuf,
-    now: chrono::DateTime<Utc>,
+pub(super) struct Fixture {
+    pub(super) _temp: TempDir,
+    pub(super) runtime: Runtime,
+    pub(super) store: Arc<SessionStoreV2>,
+    pub(super) other_store: Arc<SessionStoreV2>,
+    pub(super) inbox: FileSessionInbox,
+    pub(super) other: FileSessionInbox,
+    pub(super) dir: PathBuf,
+    pub(super) now: chrono::DateTime<Utc>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let temp = TempDir::new().unwrap();
         let runtime = Runtime::new().unwrap();
         let (store, other_store, dir) = runtime.block_on(async {
@@ -51,14 +51,14 @@ impl Fixture {
             now: Utc::now(),
         }
     }
-    fn request(&self, seconds: i64) -> SessionInboxLeaseRequest {
+    pub(super) fn request(&self, seconds: i64) -> SessionInboxLeaseRequest {
         SessionInboxLeaseRequest {
             consumer: SessionInboxConsumerId::new(),
             now: self.now + LeaseDuration::seconds(seconds),
             duration: LeaseDuration::seconds(10),
         }
     }
-    fn deliver(&self) -> SessionMessageEnvelope {
+    pub(super) fn deliver(&self) -> SessionMessageEnvelope {
         let envelope = SessionMessageEnvelope::user_input("target", "exact durable input");
         self.runtime
             .block_on(self.inbox.deliver_with_activation_intent(
@@ -69,13 +69,13 @@ impl Fixture {
             .unwrap();
         envelope
     }
-    fn claim(&self, request: &SessionInboxLeaseRequest) -> SessionInboxOwnedClaim {
+    pub(super) fn claim(&self, request: &SessionInboxLeaseRequest) -> SessionInboxOwnedClaim {
         self.runtime
             .block_on(self.inbox.claim_owned("target", 1, None, request))
             .unwrap()
             .remove(0)
     }
-    fn checkpoint(&self, claim: &SessionInboxOwnedClaim) {
+    pub(super) fn checkpoint(&self, claim: &SessionInboxOwnedClaim) {
         self.runtime.block_on(async {
             let mut session = self.store.load_session("target").await.unwrap().unwrap();
             session.add_message(claim.claim.envelope.to_provider_message().unwrap());
@@ -85,7 +85,7 @@ impl Fixture {
             self.store.save_session(&session).await.unwrap();
         });
     }
-    fn assert_physical_locks(&self, inbox: bool) {
+    pub(super) fn assert_physical_locks(&self, inbox: bool) {
         assert!(!probe(
             &self.store.bamboo_home_dir().join(".session-lifecycle.lock")
         ));
@@ -93,7 +93,10 @@ impl Fixture {
             assert!(!probe(&self.dir.join(OPERATION_LOCK_FILE)));
         }
     }
-    fn successor(&self, seconds: i64) -> tokio::task::JoinHandle<Vec<SessionInboxOwnedClaim>> {
+    pub(super) fn successor(
+        &self,
+        seconds: i64,
+    ) -> tokio::task::JoinHandle<Vec<SessionInboxOwnedClaim>> {
         let other = self.other.clone();
         let request = self.request(seconds);
         self.runtime.spawn(async move {
@@ -103,14 +106,14 @@ impl Fixture {
                 .unwrap()
         })
     }
-    fn process_waiter(&self) -> tokio::task::JoinHandle<()> {
+    pub(super) fn process_waiter(&self) -> tokio::task::JoinHandle<()> {
         let inbox = self.inbox.clone();
         let dir = self.dir.clone();
         self.runtime.spawn(async move {
             let _guard = inbox.lock_process(&dir).await;
         })
     }
-    fn assert_waiting<T>(&self, waiter: &tokio::task::JoinHandle<T>) {
+    pub(super) fn assert_waiting<T>(&self, waiter: &tokio::task::JoinHandle<T>) {
         self.runtime
             .block_on(async { tokio::time::sleep(Duration::from_millis(40)).await });
         assert!(
@@ -118,7 +121,7 @@ impl Fixture {
             "successor passed a still-running physical job"
         );
     }
-    fn finish<T>(&self, waiter: tokio::task::JoinHandle<T>) -> T {
+    pub(super) fn finish<T>(&self, waiter: tokio::task::JoinHandle<T>) -> T {
         self.runtime.block_on(async {
             tokio::time::timeout(DEADLINE, waiter)
                 .await
@@ -128,7 +131,7 @@ impl Fixture {
     }
 }
 
-fn probe(path: &Path) -> bool {
+pub(super) fn probe(path: &Path) -> bool {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -152,12 +155,12 @@ struct Latch {
     released: bool,
 }
 #[derive(Default)]
-struct Barrier {
+pub(super) struct Barrier {
     latch: Mutex<Latch>,
     wake: Condvar,
 }
 impl Barrier {
-    fn park(&self) {
+    pub(super) fn park(&self) {
         let mut state = self.latch.lock().unwrap();
         if state.entered {
             return;
@@ -168,7 +171,7 @@ impl Barrier {
             state = self.wake.wait(state).unwrap();
         }
     }
-    fn entered(&self) {
+    pub(super) fn entered(&self) {
         let (state, timeout) = self
             .wake
             .wait_timeout_while(self.latch.lock().unwrap(), DEADLINE, |s| !s.entered)
@@ -177,20 +180,25 @@ impl Barrier {
         drop(state);
         assert!(entered, "selected actual std job was not reached");
     }
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.latch.lock().unwrap().released = true;
         self.wake.notify_all();
     }
 }
 
-struct Parked {
-    barrier: Arc<Barrier>,
-    dropped: Arc<AtomicBool>,
-    runtime: Option<Runtime>,
-    caller: tokio::task::JoinHandle<Result<(), SessionInboxError>>,
+pub(super) struct Parked {
+    pub(super) barrier: Arc<Barrier>,
+    pub(super) dropped: Arc<AtomicBool>,
+    pub(super) runtime: Option<Runtime>,
+    pub(super) caller: tokio::task::JoinHandle<Result<(), SessionInboxError>>,
 }
 impl Parked {
-    fn start<F, J>(mut inbox: FileSessionInbox, event: &'static str, path: PathBuf, job: J) -> Self
+    pub(super) fn start<F, J>(
+        mut inbox: FileSessionInbox,
+        event: &'static str,
+        path: PathBuf,
+        job: J,
+    ) -> Self
     where
         F: std::future::Future<Output = Result<(), SessionInboxError>> + Send + 'static,
         J: FnOnce(FileSessionInbox) -> F,
@@ -205,7 +213,11 @@ impl Parked {
         }));
         Self::with_hook(inbox, barrier, job)
     }
-    fn with_hook<F, J>(mut inbox: FileSessionInbox, barrier: Arc<Barrier>, job: J) -> Self
+    pub(super) fn with_hook<F, J>(
+        mut inbox: FileSessionInbox,
+        barrier: Arc<Barrier>,
+        job: J,
+    ) -> Self
     where
         F: std::future::Future<Output = Result<(), SessionInboxError>> + Send + 'static,
         J: FnOnce(FileSessionInbox) -> F,
@@ -223,7 +235,7 @@ impl Parked {
         parked.barrier.entered();
         parked
     }
-    fn shutdown(&mut self) {
+    pub(super) fn shutdown(&mut self) {
         self.caller.abort();
         self.runtime
             .take()
@@ -239,7 +251,7 @@ impl Parked {
             "inner complete_owned scope survived shutdown"
         );
     }
-    fn result(&mut self) -> Result<(), SessionInboxError> {
+    pub(super) fn result(&mut self) -> Result<(), SessionInboxError> {
         self.barrier.release();
         self.runtime.as_ref().unwrap().block_on(async {
             tokio::time::timeout(DEADLINE, &mut self.caller)

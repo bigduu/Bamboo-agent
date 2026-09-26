@@ -58,10 +58,19 @@ fn invalid(message: &str) -> SessionInboxError {
     SessionInboxError::InvalidClaim(message.into())
 }
 
-// Field order releases the original Inbox FD, then process mutex, then lifecycle.
+// Field order releases Inbox FD, process, then the complete original authority
+// (reverse sorted Sessions, Task and lifecycle for Supervisor followups).
+pub(super) enum InboxAuthority {
+    Lifecycle {
+        _guard: crate::v2::SessionLifecycleReadGuard,
+    },
+    Supervisor {
+        _guard: crate::v2::SupervisorFollowupGuard,
+    },
+}
 struct OwnedScope {
     _process: OwnedMutexGuard<()>,
-    _lifecycle: crate::v2::SessionLifecycleReadGuard,
+    _authority: InboxAuthority,
 }
 struct OwnedGuards {
     _file: FileOperationLock,
@@ -139,6 +148,34 @@ impl OwnedFilesystem {
     pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
         self.job("remove", path, |_, path| std::fs::remove_file(path))
             .await
+    }
+
+    pub(super) async fn deliver(
+        &self,
+        dir: &Path,
+        wrapper: &InboxMessage,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> std::io::Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        let wrapper = wrapper.clone();
+        let gate = gate.cloned();
+        self.job("maildir", dir, move |filesystem, dir| {
+            Mailbox::at(dir)
+                .deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
+                    filesystem.observe(phase, path)
+                })
+                .map_err(std::io::Error::other)
+        })
+        .await
+    }
+
+    pub(super) async fn cancel(&self, dir: &Path, path: &Path, name: &str) -> std::io::Result<()> {
+        let cancelled = dir.join("cancelled");
+        let to = cancelled.join(name);
+        self.job("cancel", path, move |_, path| {
+            std::fs::create_dir_all(cancelled)?;
+            std::fs::rename(path, to)
+        })
+        .await
     }
 
     async fn rotate(&self, from: &Path, to: &Path) -> std::io::Result<()> {
@@ -238,7 +275,7 @@ impl AckAuthority<'_> {
 }
 
 #[cfg(test)]
-struct ScopeDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+pub(super) struct ScopeDrop(pub(super) Option<Arc<std::sync::atomic::AtomicBool>>);
 #[cfg(test)]
 impl Drop for ScopeDrop {
     fn drop(&mut self) {
@@ -259,16 +296,25 @@ pub(super) async fn complete_owned<T: Send + 'static>(
 }
 
 impl FileSessionInbox {
-    async fn owned_filesystem(
+    pub(super) async fn owned_filesystem(
         &self,
         target: &str,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
         let lifecycle = self.lock_lifecycle().await?;
+        self.filesystem_with_authority(target, InboxAuthority::Lifecycle { _guard: lifecycle })
+            .await
+    }
+
+    pub(super) async fn filesystem_with_authority(
+        &self,
+        target: &str,
+        authority: InboxAuthority,
+    ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
         let dir = self.inbox_dir(target).await?;
         let process = self.lock_process(&dir).await;
         let scope = Arc::new(OwnedScope {
             _process: process,
-            _lifecycle: lifecycle,
+            _authority: authority,
         });
         let path = dir.clone();
         #[cfg(test)]
@@ -416,6 +462,7 @@ impl FileSessionInbox {
     pub(super) async fn write_interrupt_watermark(
         dir: &Path,
         generation: u64,
+        filesystem: &OwnedFilesystem,
     ) -> Result<(), SessionInboxError> {
         let bytes = if Self::owned_enabled(dir).await? {
             serde_json::to_vec(&VersionedActivationWatermark {
@@ -427,7 +474,8 @@ impl FileSessionInbox {
         } else {
             generation.to_string().into_bytes()
         };
-        atomic_write(&dir.join(INTERRUPT_GENERATION_FILE), &bytes)
+        filesystem
+            .write(&dir.join(INTERRUPT_GENERATION_FILE), &bytes)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))
     }

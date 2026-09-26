@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{atomic_write, atomic_write_with_gate, Result, StoreError};
+use crate::error::{
+    atomic_write, atomic_write_with_gate, atomic_write_with_gate_blocking, Result, StoreError,
+};
 
 /// Idempotency key for a delivered message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -234,6 +236,38 @@ impl Mailbox {
                 }
                 bamboo_domain::AdmissionCommit::Cancelled => {
                     bamboo_domain::AdmissionCommit::Cancelled
+                }
+            },
+        )
+    }
+
+    /// Deliver in an already-started synchronous filesystem job. The caller
+    /// retains its original transaction locks; the optional gate only controls
+    /// the actual final rename. No nested async or blocking job is scheduled.
+    pub fn deliver_blocking(
+        &self,
+        msg: &InboxMessage,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        observe: impl Fn(&str, &std::path::Path) -> std::io::Result<()>,
+    ) -> Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        let bytes = serde_json::to_vec_pretty(msg).map_err(|e| StoreError::decode(&self.dir, e))?;
+        let nanos = msg.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+        let name = format!("{nanos:020}-{}.json", msg.id.0);
+        Ok(
+            match atomic_write_with_gate_blocking(
+                &self.new_dir().join(name),
+                &bytes,
+                gate,
+                observe,
+            )? {
+                bamboo_domain::AdmissionCommit::Committed(()) => {
+                    bamboo_domain::AdmissionCommit::Committed(msg.id.clone())
+                }
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    bamboo_domain::AdmissionCommit::Cancelled
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    bamboo_domain::AdmissionCommit::AlreadyCommitted
                 }
             },
         )

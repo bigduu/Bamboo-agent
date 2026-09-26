@@ -42,9 +42,39 @@ outcome. The private writer preserves file fsync, write-error cleanup, rename
 failure temp residue and no parent-directory fsync. Windows uses the existing
 true replace operation, without a remove-first gap.
 
-Compatible producers and ordinary mutation paths still require #1353. Runtime
-admission/renewal/writer release remain #1341; no production consumer opts in
-through this storage change.
+Compatible delivery, coordinator GEN/INT/ACT publications, guidance cancellation
+and producer-visible quarantine scans use that same private holder (#1353).
+The holder does not call the owned-format upgrade: legacy and format 2 queues
+retain their format, while compatible producers preserve existing format 3.
+Runtime admission/renewal/writer release remain #1341; no production consumer
+opts in through this storage change.
+
+Ordinary producers acquire lifecycle → process → Inbox FileExt once. Supervisor
+followup admission instead transfers its complete original relationship holder:
+lifecycle → Task → sorted Supervisor/target Session locks → process → Inbox FD.
+Each started acquisition/publication owns these actual guards until its std job
+terminates, including error cleanup. Release reverses that order. Followup never
+reacquires lifecycle or substitutes a borrowed lifecycle guard for its Task and
+Session authority. Its strict relationship check still precedes exact-id retry.
+
+The narrow synchronous Maildir writer runs within this physical job. Its pretty
+JSON, generation-ordered filename, file fsync and hidden-temp cleanup match the
+existing writer. A supplied AdmissionGate is an atomic permission gate, not a
+filesystem lock: `commit` encloses the actual rename. Cancellation can leave an
+allocated GEN hole; it publishes no message or admission receipt. No nested
+async writer or blocking task outlives the holder. Other Mailbox callers keep
+their existing asynchronous entry points. Watermark replacement retains its
+different existing error/residue and Windows true-replace semantics; Maildir
+rename retains its existing platform behavior. Neither writer adds directory
+fsync or a remove-first replacement.
+
+Exact semantic/activation-intent retry remains before gate and capacity checks;
+capacity remains before GEN allocation. Interrupt authority still publishes
+before activation authority. Separate started jobs may complete after runtime
+shutdown while later async stages never start. A completed GEN or watermark is
+not proof that a message was published. Guidance cancellation retains the exact
+envelope as a permanent tombstone; a claimed item is not withdrawn. Existing
+partial-state recovery rules and lost-response semantics remain unchanged.
 
 An unexpired lease belongs to its owner. The same owner's repeated claim returns
 the same incarnation without extending its expiry. `renew_owned` validates the
@@ -107,3 +137,21 @@ wrapper/rotation, terminal retries, quarantine and failure cleanup reuse that
 bounded matrix. Executed platform/results must be reported separately from this
 source contract; these are not OS crash, remote parity or provider execution
 proofs.
+
+The compatible-producer fixture reuses those real two-Store and FileExt probes.
+It parks acquisition, GEN/INT/ACT replacement, Maildir rename and hidden-temp
+cleanup, cancellation, and each producer-visible quarantine entry. Capacity 1
+tests independent producer/owned-consumer exclusion after caller abort or inner
+runtime shutdown, gate cancellation and committed-gate replay, exact semantic
+retry, cold inspection, GEN holes and epoch-1 successor claims. Followup tests
+also probe Task and both exact Session locks while detach/scope, Project/version
+changes and deletion/recreation wait behind the started job, then require fresh
+authorization on retry. These fixtures are source definitions until their
+executed platform/results are separately recorded.
+
+Scope is five production cores (Inbox routing/holder, actual Supervisor guard,
+Mailbox and its writer), plus a single private `v2.rs` reexport of the existing
+SupervisorFollowupGuard. There is no new grant, journal, lease schema, automatic
+format upgrade, production consumer opt-in or whole-async-transaction guarantee.
+Legacy claim/ACK/drain, generic Mailbox callers and runtime lifecycle integration
+remain outside this holder slice.
