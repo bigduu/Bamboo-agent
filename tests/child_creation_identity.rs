@@ -312,9 +312,14 @@ async fn run_fixture() {
     let canonical = host.load_session("logical-b").await.unwrap().unwrap();
     assert_eq!(before.created_at, canonical.created_at);
     assert_eq!(before.spawn_depth, canonical.spawn_depth);
-    // #1357 tracks existing startup loss of the durable read_only flag. This
-    // fixture verifies the actual host-provisioned callable boundary below,
-    // not that independently broken runtime-state persistence projection.
+    assert!(
+        before
+            .agent_runtime_state
+            .as_ref()
+            .expect("warm terminal persists typed runtime")
+            .read_only,
+        "read-only posture survives warm startup and final save"
+    );
     let cursor = before.session_inbox_admission().cloned();
     spawned.kill().await;
 
@@ -382,6 +387,14 @@ async fn run_fixture() {
     assert_eq!(saved.created_at, canonical.created_at);
     assert_eq!(saved.parent_session_id, canonical.parent_session_id);
     assert_eq!(saved.root_session_id, canonical.root_session_id);
+    assert!(
+        saved
+            .agent_runtime_state
+            .as_ref()
+            .expect("cold terminal persists typed runtime")
+            .read_only,
+        "read-only posture survives cold startup and final save"
+    );
     assert_eq!(saved.session_inbox_admission(), cursor.as_ref());
     assert_eq!(
         saved
