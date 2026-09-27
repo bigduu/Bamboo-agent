@@ -302,6 +302,7 @@ async fn fixture(role: Option<&'static str>) {
                 "{}",
                 std::fs::read_to_string(data.join("host.log")).unwrap()
             );
+            let disk = SessionStoreV2::new(data.clone()).await.unwrap();
             let parent = disk.load_session("compact-root").await.unwrap().unwrap();
             if parent
                 .messages
