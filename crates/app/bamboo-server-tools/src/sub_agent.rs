@@ -79,9 +79,8 @@ enum SubAgentArgs {
         #[serde(default)]
         responsibility: Option<String>,
         prompt: String,
-        /// Optional free-text label for this child (cosmetic only — used for
-        /// display and as the warm-worker reuse key). It has NO effect on the
-        /// child's runtime-exposed tools, permissions, or system prompt.
+        /// Exact validated named profile on a supported fresh local route;
+        /// a genuinely unknown name retains the legacy routing/display label.
         #[serde(default)]
         subagent_type: Option<String>,
         /// Working directory for the child. Optional: defaults to the parent
@@ -721,7 +720,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "subagent_type": {
                 "type": "string",
-                "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the tools, permissions, or system prompt the runtime exposes to the child. Optional; omit it if you have no useful label."
+                "description": "For create: exact validated named profile from the Session's safe named-agent catalog. Known names apply private role instructions, model hint and narrower native tools on a fresh local worker; explorer/reviewer are read-only. Unknown names retain legacy routing/display behavior. Invalid or unavailable catalog authority is rejected; private prompts are never published here."
             },
             "workspace": {
                 "type": "string",
@@ -775,7 +774,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "model": {
                 "type": "string",
-                "description": "For create/update: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. On create it takes precedence over per-subagent_type model routing; on update it changes that existing child session in place. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available."
+                "description": "For create/update: explicit model as 'provider:model', or a bare model id to use the parent's provider. On create it takes precedence over a named-profile hint and legacy role routing. Unknown/legacy children retain in-place updates. A bound known profile freezes its role, initial assignment, model and effort; create a new Child to change that contract, or use send_message for additive steering. Call list_models to see available models."
             },
             "lifecycle": {
                 "type": "string",
@@ -844,15 +843,17 @@ impl Tool for SubAgentTool {
                 armed: true,
             };
             let result =
-                tokio::spawn(async move { owner.invoke_inner(args, ctx, Some(gate)).await })
-                    .await
-                    .map_err(|error| {
-                        ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
-                    })?;
+                tokio::spawn(
+                    async move { Box::pin(owner.invoke_inner(args, ctx, Some(gate))).await },
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
+                })?;
             cancel_on_drop.armed = false;
             return result;
         }
-        self.invoke_inner(args, ctx, None).await
+        Box::pin(self.invoke_inner(args, ctx, None)).await
     }
 }
 
@@ -1083,13 +1084,18 @@ impl SubAgentTool {
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = normalize_required_text(Some(prompt), "prompt")?;
-                // subagent_type is an optional cosmetic label only (display +
-                // warm-worker reuse key); it has no behavioral effect. An
-                // omitted/blank value falls back to the neutral "worker" label.
+                // Known catalog names are applied by the canonical creator.
+                // Unknown names retain the old routing/display label.
                 let subagent_type = subagent_type
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "worker".to_string());
+                if (lifecycle.as_deref() == Some("resident") || name.is_some())
+                    && self.sessions.resolve_named_profile(&parent, &subagent_type)
+                        .await.map_err(tool_error_from_child_session)?.is_some()
+                {
+                    return Err(ToolError::InvalidArguments("named_profile_requires_fresh_local_child".into()));
+                }
                 // workspace is optional: default to the parent's workspace.
                 let explicit_workspace = workspace
                     .map(|value| value.trim().to_string())
@@ -1435,6 +1441,9 @@ impl SubAgentTool {
                         });
                         let mut runtime_metadata =
                             self.resolver.resolve_runtime_metadata(&subagent_type).await;
+                        if model.as_deref().is_some_and(|model| !model.trim().is_empty()) {
+                            runtime_metadata.insert(child_session::named_profile::PROFILE_EXPLICIT_MODEL_KEY.into(), "true".into());
+                        }
                         if let Some(packet) = &context_packet {
                             runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
                                 serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
@@ -1471,15 +1480,15 @@ impl SubAgentTool {
                         ))
                         .await
                         .map_err(tool_error_from_child_session)?;
-                        if context_packet.is_some() {
+                        {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
-                            let binding = bamboo_domain::ChildContextBinding::from_session(&child)
-                                .map_err(|error| ToolError::Execution(error.to_string()))?
-                                .ok_or_else(|| ToolError::Execution(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?;
-                            packet_counts = Some(json!({"background_admitted": binding.payload.background.len(),
+                            if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(&child)
+                                .map_err(|error| ToolError::Execution(error.to_string()))? {
+                                packet_counts = Some(json!({"background_admitted": binding.payload.background.len(),
                                 "background_omitted": binding.payload.background_omitted,
                                 "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}));
+                            }
                         }
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.

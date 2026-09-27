@@ -628,6 +628,91 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn resolve_named_profile(
+        &self,
+        parent: &Session,
+        name: &str,
+    ) -> Result<
+        Option<bamboo_engine::session_app::child_session::named_profile::ResolvedChildProfile>,
+        ChildSessionError,
+    > {
+        use bamboo_skills::named_agents::{
+            NamedAgentLimits, NamedAgentProfileStatus, ScopedNamedAgentCatalogStatus,
+        };
+        let invalid = || ChildSessionError::Execution("named_profile_catalog_unavailable".into());
+        // Reuse this adapter's actual data home and durable authority. A worker
+        // embedding without ProjectStore has no supported profile producer.
+        let Some(projects) = self.project_store.clone() else {
+            return Ok(None);
+        };
+        let durable = self
+            .storage
+            .load_session(&parent.id)
+            .await
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if durable.id != parent.id
+            || durable.created_at != parent.created_at
+            || bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                &durable,
+            ) != bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                parent,
+            )
+        {
+            return Err(invalid());
+        }
+        let catalog = crate::services::named_agent_catalog::discover_for_session(
+            &durable,
+            projects,
+            self.session_store.bamboo_home_dir().to_path_buf(),
+            NamedAgentLimits::default(),
+        )
+        .await
+        .map_err(|_| invalid())?;
+        if catalog.metadata().status != ScopedNamedAgentCatalogStatus::Available
+            || catalog
+                .metadata()
+                .entries
+                .iter()
+                .any(|row| row.identity.is_none())
+        {
+            return Err(invalid());
+        }
+        let rows: Vec<_> = catalog
+            .metadata()
+            .entries
+            .iter()
+            .filter(|row| {
+                row.identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.name == name)
+            })
+            .collect();
+        let selected = rows
+            .iter()
+            .find(|row| row.status == NamedAgentProfileStatus::Selectable);
+        let Some(selected) = selected else {
+            return if rows.is_empty() {
+                Ok(None)
+            } else {
+                Err(ChildSessionError::Execution(
+                    "named_profile_not_selectable".into(),
+                ))
+            };
+        };
+        let identity = selected.identity.as_ref().unwrap();
+        let definition = catalog.get(identity).ok_or_else(invalid)?;
+        let default_provider = self
+            .config
+            .read()
+            .await
+            .effective_default_provider()
+            .to_owned();
+        bamboo_engine::session_app::child_session::named_profile::ResolvedChildProfile::from_catalog(
+            identity.clone(), definition, &durable, &default_provider,
+        ).map(Some)
+    }
+
     async fn validate_required_child_context_route(
         &self,
         runtime_metadata: &HashMap<String, String>,

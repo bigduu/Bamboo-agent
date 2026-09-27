@@ -1491,6 +1491,8 @@ impl ExternalChildRunner for ActorChildRunner {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()> {
+        crate::session_app::child_session::named_profile::validate_named_profile(session)
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
         // #68 CORRECTNESS CRUX: capture the per-run escalation bridge HERE, at the
         // moment this grandchild is spawned — while the parent run's bridge is
         // still in our slot — into an owned local handed to `drive()` for this
@@ -1503,6 +1505,13 @@ impl ExternalChildRunner for ActorChildRunner {
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let required_context = bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
+        if crate::session_app::child_session::named_profile::has_named_profile(session)
+            && required_context.is_none()
+        {
+            return Err(AgentError::LLM(
+                "named_profile_requires_strict_context_route".into(),
+            ));
+        }
         let assignment = required_context
             .as_ref()
             .map(|binding| binding.payload.required_assignment.clone())
