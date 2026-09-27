@@ -32,6 +32,7 @@ use tokio_tungstenite::{accept_async, WebSocketStream};
 
 use crate::core::{BrokerCore, EventPublishOutcome, EventPush, PushItem};
 use crate::error::{BrokerError, BrokerResult};
+use crate::peer_auth::{CapturedPeer, PeerPolicy};
 use crate::proto::{BrokerFrame, ClientFrame};
 
 /// Un-keyed (single-bucket) token-bucket limiter for one connection's
@@ -95,6 +96,7 @@ impl Default for BrokerLimits {
 pub struct BrokerServer {
     core: Arc<BrokerCore>,
     token: String,
+    peer_policy: Option<PeerPolicy>,
     limits: BrokerLimits,
     /// One permit per currently-accepted connection, capacity ==
     /// `limits.max_connections`. Held for the lifetime of each connection's
@@ -125,11 +127,24 @@ impl BrokerServer {
         Self {
             core,
             token: token.into(),
+            peer_policy: None,
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
             rejected_connections: AtomicU64::new(0),
             limits,
             tls: None,
         }
+    }
+
+    /// Opt-in operator policy. The CLI pairs this with the scoped Core root;
+    /// legacy constructors never consult this credential table.
+    pub fn with_peer_policy(
+        core: Arc<BrokerCore>,
+        policy: PeerPolicy,
+        limits: BrokerLimits,
+    ) -> Self {
+        let mut server = Self::with_limits(core, "", limits);
+        server.peer_policy = Some(policy);
+        server
     }
 
     /// Terminate TLS (`wss://`) on every accepted connection before the WS
@@ -244,11 +259,36 @@ impl BrokerServer {
         );
 
         // 1. Handshake — the first frame must be a Hello with a valid token.
-        let (session_id, role) = match read_client_frame(&mut source).await? {
+        let mut captured_peer = None;
+        let hello = read_client_frame(&mut source).await.map_err(|error| {
+            if self.peer_policy.is_some() {
+                scoped_error()
+            } else {
+                error
+            }
+        })?;
+        let (session_id, role) = match hello {
             Some(ClientFrame::Hello { agent, token }) => {
-                if token != self.token {
-                    let _ = send(
+                if let Some(policy) = &self.peer_policy {
+                    match policy.capture(&agent, &token) {
+                        Ok(peer) => captured_peer = Some(peer),
+                        Err(error) => {
+                            let _ = send_scoped(
+                                &mut sink,
+                                captured_peer.as_ref(),
+                                BrokerFrame::Error {
+                                    reason: "scoped peer admission denied".into(),
+                                    id: None,
+                                },
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                } else if token != self.token {
+                    let _ = send_scoped(
                         &mut sink,
+                        captured_peer.as_ref(),
                         BrokerFrame::Error {
                             reason: "invalid token".into(),
                             id: None,
@@ -262,8 +302,9 @@ impl BrokerServer {
                 (agent.session_id, agent.role)
             }
             Some(_) => {
-                let _ = send(
+                let _ = send_scoped(
                     &mut sink,
+                    captured_peer.as_ref(),
                     BrokerFrame::Error {
                         reason: "expected hello".into(),
                         id: None,
@@ -274,7 +315,7 @@ impl BrokerServer {
             }
             None => return Ok(()), // closed before handshake
         };
-        send(&mut sink, BrokerFrame::Welcome).await?;
+        send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Welcome).await?;
 
         // 2. Serve: client frames in, subscription stream out.
         let mut control_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
@@ -287,7 +328,8 @@ impl BrokerServer {
         let outcome = loop {
             tokio::select! {
                 biased;
-                frame = read_client_frame(&mut source) => {
+                _ = peer_deadline(captured_peer.as_ref()) => break Err(scoped_error()),
+                frame = read_scoped_frame(&mut source, captured_peer.as_ref()) => {
                     match frame {
                         Ok(Some(ClientFrame::Deliver { to, message })) => {
                             // Per-connection Deliver throttle (#53): backpressure
@@ -306,7 +348,14 @@ impl BrokerServer {
                             // punish" intent this is an accepted tradeoff, not a
                             // bug — flagged here so it isn't rediscovered as a
                             // surprise (review finding on #491/#53).
-                            deliver_limiter.until_ready().await;
+                            if let Some(peer) = captured_peer.as_ref() {
+                                if tokio::time::timeout_at(peer.deadline, deliver_limiter.until_ready()).await.is_err()
+                                    || peer.live().is_err() {
+                                    break Err(scoped_error());
+                                }
+                            } else {
+                                deliver_limiter.until_ready().await;
+                            }
                             // Keep the id BEFORE `core.deliver` takes `&message`,
                             // so a rejection (e.g. `MailboxFull`) can be
                             // correlated back to THIS `Deliver` — otherwise the
@@ -316,13 +365,13 @@ impl BrokerServer {
                             let msg_id = message.id.clone();
                             match self.core.deliver(&to, &message).await {
                                 Ok(id) => {
-                                    if send(&mut sink, BrokerFrame::Delivered { id }).await.is_err() {
+                                    if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Delivered { id }).await.is_err() {
                                         break Ok(());
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = send(
-                                        &mut sink,
+                                    let _ = send_scoped(
+                                        &mut sink, captured_peer.as_ref(),
                                         BrokerFrame::Error {
                                             reason: e.to_string(),
                                             id: Some(msg_id),
@@ -343,8 +392,8 @@ impl BrokerServer {
                                 .await
                                 == EventPublishOutcome::Rejected
                             {
-                                let _ = send(
-                                    &mut sink,
+                                let _ = send_scoped(
+                                    &mut sink, captured_peer.as_ref(),
                                     BrokerFrame::Error {
                                         reason: "invalid or durable batch on live event lane".into(),
                                         id: None,
@@ -361,13 +410,21 @@ impl BrokerServer {
                                     subscription = Some(lease);
                                 }
                                 Err(e) => {
-                                    let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
+                                    let _ = send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Error { reason: e.to_string(), id: None }).await;
                                 }
                             }
                         },
                         Ok(Some(ClientFrame::Ack { id })) => {
-                            if let Err(e) = self.core.ack(&session_id, &id).await {
-                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
+                            let ack = if captured_peer.is_some() {
+                                match subscription.as_ref() {
+                                    Some(lease) => self.core.ack_current(&session_id, &id, lease).await,
+                                    None => Err(scoped_error()),
+                                }
+                            } else {
+                                self.core.ack(&session_id, &id).await
+                            };
+                            if let Err(e) = ack {
+                                let _ = send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Error { reason: e.to_string(), id: None }).await;
                             }
                         }
                         // A second Hello is meaningless mid-session; ignore.
@@ -382,23 +439,28 @@ impl BrokerServer {
                         // The subscriber table IS the registry (Phase 3).
                         Ok(Some(ClientFrame::ListConnected { role })) => {
                             let ids = self.core.connected_by_role(&role).await;
-                            if send(&mut sink, BrokerFrame::Connected { ids }).await.is_err() {
+                            if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Connected { ids }).await.is_err() {
                                 break Ok(());
                             }
                         }
                         Ok(None) => break Ok(()),   // client closed
-                        Err(e) => break Err(e),
+                        Err(e) => {
+                            if captured_peer.is_some() {
+                                let _ = send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Error { reason: "scoped peer admission denied".into(), id: None }).await;
+                            }
+                            break Err(e);
+                        },
                     }
                 }
                 pushed = next_pushed(&mut control_rx) => {
                     match pushed {
                         Some(PushItem::Message(m)) => {
-                            if send(&mut sink, BrokerFrame::Message { message: m }).await.is_err() {
+                            if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Message { message: m }).await.is_err() {
                                 break Ok(());
                             }
                         }
                         Some(PushItem::Cancel(correlation_id)) => {
-                            if send(&mut sink, BrokerFrame::Cancel { correlation_id }).await.is_err() {
+                            if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Cancel { correlation_id }).await.is_err() {
                                 break Ok(());
                             }
                         }
@@ -408,7 +470,7 @@ impl BrokerServer {
                 pushed = next_event(&mut event_rx) => {
                     match pushed {
                         Some(EventPush::Durable(message)) => {
-                            if send(&mut sink, BrokerFrame::Message { message }).await.is_err() {
+                            if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Message { message }).await.is_err() {
                                 break Ok(());
                             }
                         }
@@ -417,8 +479,8 @@ impl BrokerServer {
                             batch,
                             _permit,
                         }) => {
-                            if send(
-                                &mut sink,
+                            if send_scoped(
+                                &mut sink, captured_peer.as_ref(),
                                 BrokerFrame::EventBatch { correlation_id, batch },
                             )
                             .await
@@ -490,4 +552,47 @@ where
     sink.send(Message::text(frame.to_text()))
         .await
         .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
+}
+
+fn scoped_error() -> BrokerError {
+    BrokerError::Auth("scoped peer admission denied".into())
+}
+async fn peer_deadline(peer: Option<&CapturedPeer>) {
+    match peer {
+        Some(peer) => tokio::time::sleep_until(peer.deadline).await,
+        None => std::future::pending().await,
+    }
+}
+async fn read_scoped_frame<S>(
+    source: &mut SplitStream<WebSocketStream<S>>,
+    peer: Option<&CapturedPeer>,
+) -> BrokerResult<Option<ClientFrame>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame =
+        read_client_frame(source)
+            .await
+            .map_err(|e| if peer.is_some() { scoped_error() } else { e })?;
+    if let (Some(peer), Some(frame)) = (peer, frame.as_ref()) {
+        peer.admit(frame)?;
+    }
+    Ok(frame)
+}
+async fn send_scoped<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    peer: Option<&CapturedPeer>,
+    frame: BrokerFrame,
+) -> BrokerResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(peer) = peer {
+        peer.live()?;
+        tokio::time::timeout_at(peer.deadline, send(sink, frame))
+            .await
+            .map_err(|_| scoped_error())?
+    } else {
+        send(sink, frame).await
+    }
 }

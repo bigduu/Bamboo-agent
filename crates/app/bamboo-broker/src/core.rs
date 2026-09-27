@@ -136,6 +136,11 @@ impl BrokerCore {
         }
     }
 
+    /// Disjoint transport namespace; no legacy backlog adoption or migration.
+    pub fn new_scoped(root: impl Into<PathBuf>) -> Self {
+        Self::new(root.into().join("scoped-peers-v1"))
+    }
+
     /// Override the per-mailbox pending-message cap (#53) from
     /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`]. Builder-style — chain onto
     /// [`Self::new`] before wrapping in `Arc`.
@@ -388,6 +393,26 @@ impl BrokerCore {
             }
         }
         Ok(())
+    }
+
+    /// Authorize the current connection at admission only. An admitted remove
+    /// may finish after subscriber replacement; this is not a filesystem lease.
+    pub(crate) async fn ack_current(
+        &self,
+        session_id: &str,
+        id: &MsgId,
+        lease: &SubscriptionLease,
+    ) -> BrokerResult<()> {
+        let owns = self
+            .subscribers
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|s| s.control_sink.same_channel(&lease.control_sink));
+        if !owns {
+            return Err(BrokerError::Auth("scoped peer admission denied".into()));
+        }
+        self.ack(session_id, id).await
     }
 
     /// True if a client is currently subscribed to `session_id`.
