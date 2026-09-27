@@ -5,7 +5,20 @@
 //! reinterpret them.
 
 use bamboo_subagent::{ActorEventBatch, AgentRef, InboxMessage, MsgId};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Authenticated, connection-scoped WorkerHost observation. This is broker
+/// health evidence, not an ActorActivation or a placement lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerHostObservation {
+    pub host_ref: String,
+    pub mailbox: String,
+    pub role: Option<String>,
+    pub credential_expires_at: DateTime<Utc>,
+    pub connection_generation: String,
+}
 
 /// Client → broker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +54,13 @@ pub enum ClientFrame {
     /// answers with [`BrokerFrame::Connected`]. Replaces the HTTP `/v1/agents`
     /// registry discover for schedulable worker selection (Phase 3).
     ListConnected { role: String },
+    /// Internal exact-target query; scoped policy must allow the role's
+    /// presence and Run delivery to this mailbox.
+    ObserveHost {
+        request_id: MsgId,
+        mailbox: String,
+        role: String,
+    },
 }
 
 /// Broker → client.
@@ -80,6 +100,11 @@ pub enum BrokerFrame {
     /// Answer to [`ClientFrame::ListConnected`]: the mailbox ids of every actor
     /// currently connected serving the requested role.
     Connected { ids: Vec<String> },
+    /// Current trusted observation, or none if the target is not live.
+    HostObservation {
+        request_id: MsgId,
+        observation: Option<WorkerHostObservation>,
+    },
 }
 
 impl ClientFrame {
@@ -152,6 +177,11 @@ mod tests {
             ClientFrame::ListConnected {
                 role: "gpu-pool".into(),
             },
+            ClientFrame::ObserveHost {
+                request_id: MsgId::new(),
+                mailbox: "worker".into(),
+                role: "gpu-pool".into(),
+            },
         ];
         for f in frames {
             assert_eq!(ClientFrame::from_text(&f.to_text()).unwrap(), f);
@@ -193,6 +223,20 @@ mod tests {
             },
             BrokerFrame::Connected {
                 ids: vec!["w-1".into(), "w-2".into()],
+            },
+            BrokerFrame::HostObservation {
+                request_id: MsgId::new(),
+                observation: None,
+            },
+            BrokerFrame::HostObservation {
+                request_id: MsgId::new(),
+                observation: Some(WorkerHostObservation {
+                    host_ref: "trusted-host".into(),
+                    mailbox: "worker".into(),
+                    role: Some("gpu-pool".into()),
+                    credential_expires_at: Utc::now(),
+                    connection_generation: MsgId::new().0,
+                }),
             },
         ];
         for f in frames {

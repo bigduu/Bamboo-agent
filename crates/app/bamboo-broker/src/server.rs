@@ -403,7 +403,16 @@ impl BrokerServer {
                             }
                         }
                         Ok(Some(ClientFrame::Subscribe)) => {
-                            match self.core.subscribe_with_lease(&session_id, role.as_deref()).await {
+                            let subscribed = if let Some(peer) = captured_peer.as_ref() {
+                                self.core.subscribe_scoped_with_lease(
+                                    &session_id,
+                                    role.as_deref(),
+                                    peer.authenticated_host(),
+                                ).await
+                            } else {
+                                self.core.subscribe_with_lease(&session_id, role.as_deref()).await
+                            };
+                            match subscribed {
                                 Ok((streams, lease)) => {
                                     control_rx = Some(streams.control);
                                     event_rx = Some(streams.events);
@@ -440,6 +449,19 @@ impl BrokerServer {
                         Ok(Some(ClientFrame::ListConnected { role })) => {
                             let ids = self.core.connected_by_role(&role).await;
                             if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Connected { ids }).await.is_err() {
+                                break Ok(());
+                            }
+                        }
+                        Ok(Some(ClientFrame::ObserveHost { request_id, mailbox, role })) => {
+                            if captured_peer.is_none() {
+                                let _ = send(&mut sink, BrokerFrame::Error {
+                                    reason: "scoped peer admission denied".into(),
+                                    id: None,
+                                }).await;
+                                break Err(scoped_error());
+                            }
+                            let observation = self.core.current_host_observation(&mailbox, &role).await;
+                            if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::HostObservation { request_id, observation }).await.is_err() {
                                 break Ok(());
                             }
                         }

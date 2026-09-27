@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::{collections::HashSet, sync::Arc};
 use tokio::time::Instant;
 
+use crate::core::AuthenticatedHost;
 use crate::{BrokerError, BrokerResult, ClientFrame};
 
 pub const MAX_PEER_POLICY_BYTES: usize = 64 * 1024;
@@ -129,6 +130,13 @@ pub(crate) struct CapturedPeer {
     pub(crate) deadline: Instant,
 }
 impl CapturedPeer {
+    pub(crate) fn authenticated_host(&self) -> AuthenticatedHost {
+        AuthenticatedHost {
+            host_ref: self.peer.host.clone(),
+            credential_expires_at: self.peer.expires_at.to_owned(),
+        }
+    }
+
     pub(crate) fn live(&self) -> BrokerResult<()> {
         if Utc::now() >= self.peer.expires_at || Instant::now() >= self.deadline {
             Err(denied())
@@ -172,6 +180,16 @@ impl CapturedPeer {
             ClientFrame::ListConnected { role } => {
                 identifier(role) && self.peer.presence.contains(role)
             }
+            ClientFrame::ObserveHost {
+                request_id,
+                mailbox,
+                role,
+            } => {
+                identifier(request_id.as_str())
+                    && identifier(role)
+                    && self.peer.presence.contains(role)
+                    && self.destination(mailbox, InboxKind::Run)
+            }
             ClientFrame::Deliver { to, message } => {
                 self.destination(to, message.kind)
                     && identifier(message.id.as_str())
@@ -201,5 +219,72 @@ impl CapturedPeer {
         } else {
             Err(denied())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_subagent::MsgId;
+    use serde_json::json;
+
+    #[test]
+    fn host_observation_authority_requires_presence_and_exact_run_target() {
+        let token = "parent-fixture-credential-000000000001";
+        let policy = |kinds: &[&str], presence: &[&str]| {
+            PeerPolicy::from_json(
+                &serde_json::to_vec(&json!({"peers":[{
+                    "credential":token,"host":"trusted-host","mailbox":"parent",
+                    "role":"parent","expires_at":Utc::now()+chrono::Duration::minutes(5),
+                    "destinations":[{"mailbox":"worker","kinds":kinds}],
+                    "cancel":[],"presence":presence
+                }]}))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let agent = AgentRef {
+            session_id: "parent".into(),
+            role: Some("parent".into()),
+        };
+        let frame = ClientFrame::ObserveHost {
+            request_id: MsgId::new(),
+            mailbox: "worker".into(),
+            role: "worker".into(),
+        };
+        let allowed = policy(&["run"], &["worker"])
+            .capture(&agent, token)
+            .unwrap();
+        assert_eq!(allowed.authenticated_host().host_ref, "trusted-host");
+        assert!(allowed.admit(&frame).is_ok());
+        for denied in [
+            ClientFrame::ObserveHost {
+                request_id: MsgId::new(),
+                mailbox: "other".into(),
+                role: "worker".into(),
+            },
+            ClientFrame::ObserveHost {
+                request_id: MsgId::new(),
+                mailbox: "worker".into(),
+                role: "other".into(),
+            },
+            ClientFrame::ObserveHost {
+                request_id: MsgId::new(),
+                mailbox: "WORKER".into(),
+                role: "worker".into(),
+            },
+        ] {
+            assert!(allowed.admit(&denied).is_err());
+        }
+        assert!(policy(&["ask"], &["worker"])
+            .capture(&agent, token)
+            .unwrap()
+            .admit(&frame)
+            .is_err());
+        assert!(policy(&["run"], &[])
+            .capture(&agent, token)
+            .unwrap()
+            .admit(&frame)
+            .is_err());
     }
 }
