@@ -43,7 +43,11 @@ fn tool_content(body: &Value, id: &str) -> String {
         .into()
 }
 fn logical_child(body: &Value) -> String {
-    let result: Value = serde_json::from_str(&tool_content(body, "compact-create")).unwrap();
+    let content = tool_content(body, "compact-create");
+    let result: Value = serde_json::from_str(&content).unwrap_or_else(|error| {
+        let preview: String = content.chars().take(512).collect();
+        panic!("compact-create did not return JSON: {error}; actual tool result: {preview}");
+    });
     result["actor_id"].as_str().unwrap().into()
 }
 async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
