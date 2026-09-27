@@ -1936,9 +1936,15 @@ const ROOT_CATALOG_REPLIES: [&str; 3] = [
     "F1_ULTRA_CATALOG_OK",
     "F1_ULTRA_CONTINUATION_OK",
 ];
+const ROOT_CATALOG_TASKS: [&str; 3] = [
+    "Report the Standard catalog check.",
+    "Report the first Ultra catalog check.",
+    "Report the same Ultra Root catalog again.",
+];
 
 struct RootCatalogProbe {
     requests: Mutex<Vec<Value>>,
+    auxiliary: Mutex<Vec<Value>>,
 }
 
 async fn root_catalog_provider(
@@ -1946,49 +1952,83 @@ async fn root_catalog_provider(
     probe: web::Data<RootCatalogProbe>,
 ) -> HttpResponse {
     let body = body.into_inner();
-    assert_eq!(body["model"], "catalog-root");
-    let tools = body["tools"]
+    let last_user = body["messages"]
         .as_array()
-        .expect("actual Root provider tools array");
-    let names: Vec<_> = tools
-        .iter()
-        .map(|tool| {
-            tool["function"]["name"]
-                .as_str()
-                .expect("registered provider execution name")
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
         })
-        .collect();
-    let unique: std::collections::BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), names.len(), "duplicate provider tool schemas");
-    let ordinal = {
+        .and_then(|message| message["content"].as_str());
+    let reply = if let Some(ordinal) = ROOT_CATALOG_TASKS
+        .iter()
+        .position(|task| last_user == Some(*task))
+    {
+        assert_eq!(body["model"], "catalog-root");
+        let tools = body["tools"]
+            .as_array()
+            .expect("actual Root provider tools array");
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| {
+                tool["function"]["name"]
+                    .as_str()
+                    .expect("registered provider execution name")
+            })
+            .collect();
+        let unique: std::collections::BTreeSet<_> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "duplicate provider tool schemas");
         let mut requests = probe.requests.lock().unwrap();
-        let ordinal = requests.len();
+        assert_eq!(
+            requests.len(),
+            ordinal,
+            "duplicate or out-of-order Root task marker: {}",
+            ROOT_CATALOG_TASKS[ordinal]
+        );
         requests.push(body.clone());
-        ordinal
+        let count = |name| names.iter().filter(|candidate| **candidate == name).count();
+        assert_eq!(
+            count("SubAgent"),
+            1,
+            "Root task marker {} has provider names {:?}",
+            ROOT_CATALOG_TASKS[ordinal],
+            names.iter().take(32).collect::<Vec<_>>()
+        );
+        let legacy_count = usize::from(ordinal == 0);
+        assert_eq!(
+            count("ask_agent"),
+            legacy_count,
+            "Standard broker positive or Ultra mask: {}",
+            ROOT_CATALOG_TASKS[ordinal]
+        );
+        assert_eq!(
+            count("deploy_agent"),
+            legacy_count,
+            "Standard broker positive or Ultra mask: {}",
+            ROOT_CATALOG_TASKS[ordinal]
+        );
+        ROOT_CATALOG_REPLIES[ordinal]
+    } else {
+        let summary = json!({
+            "model": body["model"],
+            "last_user": last_user.map(|user| bounded_diagnostic(user, 160)),
+            "tool_count": body["tools"].as_array().map(Vec::len)
+        });
+        let mut auxiliary = probe.auxiliary.lock().unwrap();
+        auxiliary.push(summary.clone());
+        assert!(
+            auxiliary.len() <= 4,
+            "more than four auxiliary provider requests: {summary}"
+        );
+        "F1_CATALOG_AUXILIARY_OK"
     };
-    assert!(
-        ordinal < ROOT_CATALOG_REPLIES.len(),
-        "unexpected Root provider round"
-    );
-    let count = |name| names.iter().filter(|candidate| **candidate == name).count();
-    assert_eq!(count("SubAgent"), 1, "one model-facing SubAgent");
-    let legacy_count = usize::from(ordinal == 0);
-    assert_eq!(
-        count("ask_agent"),
-        legacy_count,
-        "Standard broker positive or Ultra mask"
-    );
-    assert_eq!(
-        count("deploy_agent"),
-        legacy_count,
-        "Standard broker positive or Ultra mask"
-    );
     let event = json!({
         "id": "f1-root-catalog",
         "object": "chat.completion.chunk",
         "choices": [{
             "index": 0,
-            "delta": {"role": "assistant", "content": ROOT_CATALOG_REPLIES[ordinal]},
+            "delta": {"role": "assistant", "content": reply},
             "finish_reason": "stop"
         }]
     });
@@ -2000,7 +2040,8 @@ async fn root_catalog_provider(
 async fn root_catalog_turn(
     client: &reqwest::Client,
     base: &str,
-    store: &SessionStoreV2,
+    data: &Path,
+    probe: &web::Data<RootCatalogProbe>,
     host: &mut Host,
     session_id: &str,
     chat_body: Value,
@@ -2018,6 +2059,7 @@ async fn root_catalog_turn(
         "catalog chat: {}",
         chat.text().await.unwrap()
     );
+    let store = SessionStoreV2::new(data.to_path_buf()).await.unwrap();
     let execute = client
         .post(format!("{base}/execute/{session_id}"))
         .json(&json!({}))
@@ -2069,7 +2111,9 @@ async fn root_catalog_turn(
                     }
                     assert_eq!(
                         replies.iter().map(String::as_str).collect::<Vec<_>>(),
-                        expected_replies
+                        expected_replies,
+                        "auxiliary provider requests: {:?}",
+                        probe.auxiliary.lock().unwrap()
                     );
                     assert_eq!(
                         root.messages
@@ -2089,7 +2133,12 @@ async fn root_catalog_turn(
         }
     })
     .await
-    .expect("bounded actual Root catalog turn")
+    .unwrap_or_else(|_| {
+        panic!(
+            "bounded actual Root catalog turn; auxiliary provider requests: {:?}",
+            probe.auxiliary.lock().unwrap()
+        )
+    })
 }
 
 async fn root_catalog_fixture() {
@@ -2105,6 +2154,7 @@ async fn root_catalog_fixture() {
         .unwrap();
     let probe = web::Data::new(RootCatalogProbe {
         requests: Mutex::new(Vec::new()),
+        auxiliary: Mutex::new(Vec::new()),
     });
     let provider_probe = probe.clone();
     let server = HttpServer::new(move || {
@@ -2177,16 +2227,16 @@ async fn root_catalog_fixture() {
     .await
     .expect("actual Root catalog Host health");
 
-    let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let standard = root_catalog_turn(
         &client,
         &base,
-        &store,
+        &data,
+        &probe,
         &mut host,
         "f1-standard-root",
         json!({
             "session_id": "f1-standard-root",
-            "message": "Report the Standard catalog check.",
+            "message": ROOT_CATALOG_TASKS[0],
             "model": "catalog-root",
             "provider": "openai",
             "model_ref": {"provider": "openai", "model": "catalog-root"},
@@ -2202,12 +2252,13 @@ async fn root_catalog_fixture() {
     let ultra_first = root_catalog_turn(
         &client,
         &base,
-        &store,
+        &data,
+        &probe,
         &mut host,
         "f1-ultra-root",
         json!({
             "session_id": "f1-ultra-root",
-            "message": "Report the first Ultra catalog check.",
+            "message": ROOT_CATALOG_TASKS[1],
             "model": "catalog-root",
             "provider": "openai",
             "model_ref": {"provider": "openai", "model": "catalog-root"},
@@ -2223,7 +2274,7 @@ async fn root_catalog_fixture() {
     assert!(ultra_first.root_tool_authority_revision > 0);
     let continuation = json!({
         "session_id": "f1-ultra-root",
-        "message": "Report the same Ultra Root catalog again.",
+        "message": ROOT_CATALOG_TASKS[2],
         "model": "catalog-root",
         "provider": "openai"
     });
@@ -2234,7 +2285,8 @@ async fn root_catalog_fixture() {
     let ultra_second = root_catalog_turn(
         &client,
         &base,
-        &store,
+        &data,
+        &probe,
         &mut host,
         "f1-ultra-root",
         continuation,
@@ -2249,7 +2301,9 @@ async fn root_catalog_fixture() {
         ultra_first.root_tool_authority_revision
     );
     let requests = probe.requests.lock().unwrap().clone();
+    let auxiliary = probe.auxiliary.lock().unwrap().clone();
     assert_eq!(requests.len(), 3, "three actual Root provider requests");
+    assert!(auxiliary.len() <= 4, "bounded auxiliary provider requests");
     assert!(requests
         .iter()
         .all(|request| request["model"] == "catalog-root"));
@@ -2292,7 +2346,6 @@ async fn root_catalog_fixture() {
     host.0.kill().unwrap();
     host.0.wait().unwrap();
     drop(host);
-    drop(store);
     let cold_store = SessionStoreV2::new(data).await.unwrap();
     let cold_standard = cold_store
         .load_session("f1-standard-root")
@@ -2332,6 +2385,8 @@ async fn root_catalog_fixture() {
         json!({
             "issue": 1455,
             "provider_rounds": requests.len(),
+            "auxiliary_provider_rounds": auxiliary.len(),
+            "auxiliary_diagnostics": auxiliary,
             "catalog_counts": observed_counts,
             "root_count": index.len(),
             "child_count": 0,
