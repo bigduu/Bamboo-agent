@@ -339,7 +339,10 @@ async fn fixture(ultra: bool, reasoning: bool) {
     assert_eq!(cold.id, before.id);
     assert_eq!(cold.created_at, before.created_at);
     assert_eq!(cold.parent_session_id, before.parent_session_id);
-    assert_eq!(cold.messages, completed.messages);
+    assert_eq!(
+        serde_json::to_value(&cold.messages).unwrap(),
+        serde_json::to_value(&completed.messages).unwrap()
+    );
     if ultra {
         assert_eq!(
             reopened
