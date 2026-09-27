@@ -246,6 +246,19 @@ fn validate_glob_suffix(messages: &[Message], main: &Session) -> Result<()> {
     Ok(())
 }
 
+// The normal tool dispatcher adds these five lifecycle observations to its
+// actual Glob result. They do not grant authority or permit other metadata.
+fn glob_lifecycle_metadata(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|fields| {
+        fields.len() == 5
+            && value["elapsed_ms"].as_u64().is_some()
+            && value["is_mutating"] == false
+            && value["auto_approved"] == true
+            && value["tool_name"] == "Glob"
+            && value["success"] == true
+    })
+}
+
 fn validate_suffix(request: &ActorTranscriptAppend, main: &Session) -> Result<Session> {
     if encoded(&request.expected_messages)? != encoded(&main.messages)?
         || request.expected_provider_transcript != main.provider_transcript
@@ -283,7 +296,9 @@ fn validate_suffix(request: &ActorTranscriptAppend, main: &Session) -> Result<Se
             || m.reasoning_signature.is_some()
             || m.content_parts.is_some()
             || m.image_ocr.is_some()
-            || m.metadata.is_some()
+            || m.metadata.as_ref().is_some_and(|metadata| {
+                !typed || m.role != Role::Tool || !glob_lifecycle_metadata(metadata)
+            })
             || m.compressed
             || m.compressed_by_event_id.is_some()
             || m.never_compress
