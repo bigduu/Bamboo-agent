@@ -1,6 +1,7 @@
 //! Actual CLI broker + compiled BambooRuntime worker/provider over trusted WSS.
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_broker::{client_config_trusting_cert, BrokerClient, BrokerStreamEvent};
+use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{
     proto::{ChildCreationIdentity, LogicalSessionIdentity, RunSpec, TerminalStatus},
     provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ScopedCredential},
@@ -219,6 +220,8 @@ async fn fixture() {
         ExecutorSpec::BambooRuntime,
         dir.join("fabric").to_string_lossy().into_owned(),
     );
+    let worker_cache = dir.join("worker-cache");
+    spec.storage_dir = Some(worker_cache.to_string_lossy().into_owned());
     spec.capabilities.child_creation_identity = true;
     spec.capabilities.read_only = true;
     spec.capabilities.guardian_read_only = true;
@@ -368,6 +371,22 @@ async fn fixture() {
         .contains("AUTH_NATIVE_REPLY"));
     assert!(events > 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(_worker);
+    let cold = SessionStoreV2::new(worker_cache.clone()).await.unwrap();
+    let cached = cold.load_session("native-child").await.unwrap().unwrap();
+    assert_eq!(cached.id, identity.session_id);
+    assert_eq!(
+        cached.created_at,
+        identity.creation.as_ref().unwrap().created_at
+    );
+    assert_eq!(
+        cached.spawn_depth,
+        identity.creation.as_ref().unwrap().spawn_depth
+    );
+    assert_eq!(cached.parent_session_id, identity.parent_session_id);
+    assert_eq!(cached.root_session_id, identity.root_session_id);
+    assert!(cached.project_id_meta().is_none());
+    assert!(worker_cache.is_dir());
     assert!(base
         .join("scoped-peers-v1/mailboxes/worker-native")
         .exists());
