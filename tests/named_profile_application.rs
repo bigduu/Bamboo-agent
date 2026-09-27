@@ -764,7 +764,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                 3 => {
                     let rejected = handoff_tool(&body, "review-write-denied");
                     assert!(
-                        rejected.contains("native_tool_ceiling_denied"),
+                        rejected == "Error: Tool 'Write' is not callable at the current conversation position",
                         "actual Write result: {}",
                         rejected.chars().take(512).collect::<String>()
                     );
@@ -773,7 +773,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                         WRONG
                     );
                     (
-                        json!({"content":handoff_report("blocked", "Implementer claim contradicted by actual file", "Glob found answer.txt; Read observed answer=41, not answer=42. Write was rejected: native_tool_ceiling_denied.").to_string()}),
+                        json!({"content":handoff_report("blocked", "Implementer claim contradicted by actual file", "Glob found answer.txt; Read observed answer=41, not answer=42. Write was rejected: Tool 'Write' is not callable at the current conversation position.").to_string()}),
                         "stop",
                     )
                 }
@@ -1275,7 +1275,10 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
                 .unwrap();
             assert_eq!(denied.role, bamboo_domain::Role::Tool);
             assert_eq!(denied.tool_success, Some(false));
-            assert!(denied.content.contains("native_tool_ceiling_denied"));
+            assert_eq!(
+                denied.content,
+                "Error: Tool 'Write' is not callable at the current conversation position"
+            );
             assert!(child
                 .messages
                 .iter()
