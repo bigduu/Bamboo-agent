@@ -1941,9 +1941,11 @@ const ROOT_CATALOG_TASKS: [&str; 3] = [
     "Report the first Ultra catalog check.",
     "Report the same Ultra Root catalog again.",
 ];
+const ROOT_CATALOG_TITLE_SYSTEM: &str = "Generate a 3-7 word title summarising this conversation. Output the title text only - no quotes, no trailing punctuation, no preamble.";
 
 struct RootCatalogProbe {
     requests: Mutex<Vec<Value>>,
+    titles: Mutex<Vec<usize>>,
     auxiliary: Mutex<Vec<Value>>,
 }
 
@@ -1961,7 +1963,26 @@ async fn root_catalog_provider(
                 .find(|message| message["role"] == "user")
         })
         .and_then(|message| message["content"].as_str());
-    let reply = if let Some(ordinal) = ROOT_CATALOG_TASKS
+    let title_task = body["messages"].as_array().and_then(|messages| {
+        (messages.len() == 2
+            && messages[0]["role"] == "system"
+            && messages[0]["content"] == ROOT_CATALOG_TITLE_SYSTEM
+            && messages[1]["role"] == "user"
+            && body["tools"].as_array().is_some_and(Vec::is_empty))
+        .then(|| {
+            ROOT_CATALOG_TASKS[..2]
+                .iter()
+                .position(|task| messages[1]["content"].as_str() == Some(*task))
+        })
+        .flatten()
+    });
+    let reply = if let Some(ordinal) = title_task {
+        let mut titles = probe.titles.lock().unwrap();
+        assert!(!titles.contains(&ordinal), "duplicate Root title request");
+        titles.push(ordinal);
+        assert!(titles.len() <= 2, "more than two Root title requests");
+        "Root Catalog Test"
+    } else if let Some(ordinal) = ROOT_CATALOG_TASKS
         .iter()
         .position(|task| last_user == Some(*task))
     {
@@ -1987,6 +2008,7 @@ async fn root_catalog_provider(
             ROOT_CATALOG_TASKS[ordinal]
         );
         requests.push(body.clone());
+        drop(requests);
         let count = |name| names.iter().filter(|candidate| **candidate == name).count();
         assert_eq!(
             count("SubAgent"),
@@ -2154,6 +2176,7 @@ async fn root_catalog_fixture() {
         .unwrap();
     let probe = web::Data::new(RootCatalogProbe {
         requests: Mutex::new(Vec::new()),
+        titles: Mutex::new(Vec::new()),
         auxiliary: Mutex::new(Vec::new()),
     });
     let provider_probe = probe.clone();
@@ -2301,8 +2324,10 @@ async fn root_catalog_fixture() {
         ultra_first.root_tool_authority_revision
     );
     let requests = probe.requests.lock().unwrap().clone();
+    let titles = probe.titles.lock().unwrap().clone();
     let auxiliary = probe.auxiliary.lock().unwrap().clone();
     assert_eq!(requests.len(), 3, "three actual Root provider requests");
+    assert!(titles.len() <= 2, "at most one title per new Root");
     assert!(auxiliary.len() <= 4, "bounded auxiliary provider requests");
     assert!(requests
         .iter()
@@ -2385,6 +2410,7 @@ async fn root_catalog_fixture() {
         json!({
             "issue": 1455,
             "provider_rounds": requests.len(),
+            "title_provider_rounds": titles.len(),
             "auxiliary_provider_rounds": auxiliary.len(),
             "auxiliary_diagnostics": auxiliary,
             "catalog_counts": observed_counts,
