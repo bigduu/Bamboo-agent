@@ -2710,7 +2710,8 @@ impl PlainActorActivation {
             };
             if recovery.is_some()
                 && (!entry.actor.matches_session(session)
-                    || entry.actor.project_id != project_id_for_actor_run(session)?)
+                    || entry.actor.project_id
+                        != project_id_for_actor_run(session)?.map(|id| id.to_string()))
             {
                 return Err(plain_actor_unsupported());
             }
