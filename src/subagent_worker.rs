@@ -2507,6 +2507,7 @@ mod tests {
             "wrong-epoch",
             "expired",
             "cancel",
+            "pre-ack-recovery",
         ] {
             let host_temp = tempfile::tempdir().unwrap();
             let host = Arc::new(SessionStoreV2::new(host_temp.path().into()).await.unwrap());
@@ -2517,7 +2518,11 @@ mod tests {
             host.save_session(&child).await.unwrap();
             host.ensure_actor(&child.id).await.unwrap();
             let deadline = chrono::Utc::now()
-                + chrono::Duration::seconds(if case == "expired" { 5 } else { 30 });
+                + chrono::Duration::seconds(if matches!(case, "expired" | "pre-ack-recovery") {
+                    5
+                } else {
+                    30
+                });
             let consumer = SessionInboxConsumerId::new();
             let actor = host
                 .claim_activation(&ActorActivationClaim {
@@ -2754,6 +2759,91 @@ mod tests {
                         .ack_owned(&child.id, &claim, chrono::Utc::now())
                         .await
                         .unwrap();
+                }
+                "pre-ack-recovery" => {
+                    Box::pin(async {
+                        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                        tokio::time::sleep(delay + std::time::Duration::from_millis(10)).await;
+                        assert!(!worker.is_finished(), "unreleased old worker remains alive");
+                        assert!(provider.calls.lock().unwrap().is_empty());
+                        let replacement_consumer = SessionInboxConsumerId::new();
+                        let now = chrono::Utc::now();
+                        let new_claim = inbox.claim_owned(&child.id, 1, Some("replacement-run"), &SessionInboxLeaseRequest {
+                            consumer: replacement_consumer.clone(), now, duration: chrono::Duration::seconds(30),
+                        }).await.unwrap().pop().unwrap();
+                        assert_eq!(new_claim.claim.envelope, claim.claim.envelope);
+                        assert_eq!(new_claim.claim.generation, claim.claim.generation);
+                        assert_eq!(new_claim.claim.activation_policy, claim.claim.activation_policy);
+                        assert!(new_claim.lease.epoch > claim.lease.epoch);
+                        assert_ne!(new_claim.lease.incarnation, claim.lease.incarnation);
+                        let replacement = host.claim_activation(&ActorActivationClaim {
+                            actor_id: child.id.clone(), run_id: "replacement-run".into(), lease_owner: replacement_consumer.as_str().into(),
+                            lease_expires_at: new_claim.lease.expires_at, inbox_generation: new_claim.claim.generation, placement_ref: None, now,
+                        }).await.unwrap();
+                        host.start_activation(&replacement.fence(), now).await.unwrap();
+                        assert!(host.validate_fence(&actor.fence(), now).await.is_err());
+                        assert!(inbox.ack_owned(&child.id, &claim, now).await.is_err());
+                        let main = host.bamboo_home_dir().join(host.resolve_rel_path(&child.id).await.unwrap()).join("session.json");
+                        let bytes = std::fs::read(&main).unwrap();
+                        let already = inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                            fence: replacement.fence(), expected_created_at: child.created_at, claim: new_claim.clone(),
+                            expected_messages: child.messages.clone(), expected_provider_transcript: child.provider_transcript.clone(),
+                            expected_admission: child.session_inbox_admission().cloned(),
+                        }).await.unwrap();
+                        assert_eq!(already.status, bamboo_storage::ActorInputCheckpointStatus::AlreadyCheckpointed);
+                        assert_eq!(std::fs::read(&main).unwrap(), bytes);
+                        let mut new_run = run.clone();
+                        new_run.activation_run_id = Some("replacement-run".into());
+                        new_run.execution_epoch += 1;
+                        new_run.initial_session_messages[0].activation_run_id = "replacement-run".into();
+                        new_run.messages = already.session.messages.iter().map(|m| {
+                            let mut copy = m.clone();
+                            if copy.id == envelope.id.as_str() {
+                                copy.metadata.as_mut().unwrap().as_object_mut().unwrap().remove("_bamboo_owned_input_checkpoint");
+                                assert!(bamboo_domain::is_matching_session_message(&copy, &envelope));
+                            }
+                            serde_json::to_value(copy).unwrap()
+                        }).collect();
+                        let next_provider = Arc::new(RecordingWorkerProvider::default());
+                        let (_temp, mut next_executor, _store, _inbox) = worker_protocol_fixture(next_provider.clone()).await;
+                        next_executor.initial_input_release_required = true;
+                        next_executor.child_creation_identity = true;
+                        let next_endpoint = endpoint.clone();
+                        let next_worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            bamboo_broker::serve::serve_executor(&next_endpoint, bamboo_subagent::AgentRef {
+                                session_id: "replacement-physical-worker".into(), role: None,
+                            }, "release-test-token", Arc::new(next_executor)).await
+                        }));
+                        let mut next_link = bamboo_broker::BrokerChildLink::connect(&endpoint, bamboo_subagent::AgentRef {
+                            session_id: "replacement-host".into(), role: None,
+                        }, "release-test-token", "replacement-physical-worker").await.unwrap();
+                        next_link.send(ParentFrame::Run(new_run.clone())).await.unwrap();
+                        let next_request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            loop {
+                                if let Some(ChildFrame::Event { event }) = next_link.next_frame().await.unwrap() {
+                                    if event.get("initial_input_control").is_some() {
+                                        let bamboo_subagent::proto::InitialInputControl::Request { request } = bamboo_subagent::proto::InitialInputControl::decode(event).unwrap() else { panic!("request expected") };
+                                        break request;
+                                    }
+                                }
+                            }
+                        }).await.unwrap();
+                        assert!(next_provider.calls.lock().unwrap().is_empty());
+                        assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+                        assert_eq!(next_request, InitialInputReleaseRequest::from_run(&new_run, &new_run.initial_session_messages[0], next_request.nonce.clone()).unwrap());
+                        inbox.ack_owned(&child.id, &new_claim, chrono::Utc::now()).await.unwrap();
+                        next_link.send(ParentFrame::InitialInputRelease { release: InitialInputRelease {
+                            request: next_request, expires_at: new_claim.lease.expires_at,
+                        } }).await.unwrap();
+                        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            loop { if let Some(ChildFrame::Terminal { status, .. }) = next_link.next_frame().await.unwrap() { break status; } }
+                        }).await.unwrap();
+                        assert_eq!(status, bamboo_subagent::TerminalStatus::Completed);
+                        assert_eq!(next_provider.calls.lock().unwrap().len(), 1);
+                        assert!(provider.calls.lock().unwrap().is_empty(), "old worker never receives provider permission");
+                        assert!(!worker.is_finished());
+                        drop(next_worker);
+                    }).await;
                 }
                 "expired" => {
                     let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();

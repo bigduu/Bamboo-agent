@@ -35,6 +35,7 @@ struct Probe {
     glob: bool,
     correction: bool,
     retry: bool,
+    recovery: bool,
 }
 fn call(args: Value) -> Value {
     json!({"tool_calls":[{"index":0,"id":format!("subagent-{}",args["action"].as_str().unwrap()),"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]})
@@ -107,7 +108,8 @@ async fn provider_host_phase(probe: &Probe) -> Value {
         .await
         .ok()
         .map(|state| state.generation);
-    json!({"actor":actor,"last_run_status":child.and_then(|c| c.last_run_status()),
+    json!({"actor":actor,"last_run_status":child.as_ref().and_then(|c| c.last_run_status()),
+        "last_run_error":child.as_ref().and_then(|c| c.last_run_error()).map(|e| bounded_diagnostic(&e, 512).to_owned()),
         "inbox_generation":generation})
 }
 fn print_bounded_retry_log(data: &Path) {
@@ -244,6 +246,53 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 provider_host_phase(&probe).await
             );
         }
+        if probe.recovery && child_call == 1 {
+            assert_eq!(child_call, 1, "one replacement provider entry");
+            assert_eq!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["content"] == "CORRECTION_FROM_ACTUAL_ROOT")
+                    .count(),
+                1
+            );
+            let id = probe.child_id.lock().unwrap().clone().unwrap();
+            let store = std::sync::Arc::new(SessionStoreV2::new(probe.data.clone()).await.unwrap());
+            let actor = store.inspect_actor(&id).await.unwrap();
+            assert_eq!(actor.actor.current_attempt, 2);
+            assert_eq!(
+                actor.activation.unwrap().status,
+                ActorActivationStatus::Running
+            );
+            let child = store.load_session(&id).await.unwrap().unwrap();
+            let input = child
+                .messages
+                .iter()
+                .find(|m| m.content == "CORRECTION_FROM_ACTUAL_ROOT")
+                .unwrap();
+            assert!(input
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("_bamboo_owned_input_checkpoint")
+                .is_some());
+            let envelope_id = bamboo_domain::SessionMessageId::parse(input.id.clone()).unwrap();
+            assert!(child
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&envelope_id));
+            let inbox = bamboo_storage::FileSessionInbox::new(
+                store,
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            assert!(
+                bamboo_domain::SessionInboxPort::was_admitted(&inbox, &id, &envelope_id)
+                    .await
+                    .unwrap(),
+                "real permanent Host ACK precedes provider"
+            );
+        }
         if (probe.correction || probe.retry) && child_call == 1 {
             assert_eq!(
                 body["messages"]
@@ -302,7 +351,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         if probe.reasoning || (probe.retry && child_call == 0) {
             emits_reasoning = true;
             (json!({"content":"UNSUPPORTED_REPLY"}), "stop")
-        } else if probe.correction && child_call == 0 {
+        } else if (probe.correction || probe.recovery) && child_call == 0 {
             (json!({"content":"INITIAL_BEFORE_CORRECTION"}), "stop")
         } else if probe.glob && child_call == 0 {
             assert_eq!(body["tools"].as_array().unwrap().len(), 1);
@@ -369,6 +418,15 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .unwrap()
                     .id;
                 *probe.child_id.lock().unwrap() = Some(id.clone());
+                if probe.recovery {
+                    // Ordinary, pre-activation fixture configuration only: the
+                    // Host still probes/spawns and writes every claim/placement.
+                    let mut child = store.load_session(&id).await.unwrap().unwrap();
+                    child
+                        .metadata
+                        .insert("child_watchdog.max_total_secs".into(), "30".into());
+                    store.save_session(&child).await.unwrap();
+                }
                 if probe.correction || probe.retry {
                     tokio::time::timeout(Duration::from_secs(30), async {
                         while !probe.ready.load(Ordering::SeqCst) {
@@ -421,6 +479,29 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     )
                 }
             }
+            2 if probe.recovery => {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !probe.ready.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                (
+                    call(
+                        json!({"action":"send_message", "child_session_id":probe.child_id.lock().unwrap().clone().unwrap(),
+                    "message":"CORRECTION_FROM_ACTUAL_ROOT", "interrupt_running":false, "auto_run":true}),
+                    ),
+                    "tool_calls",
+                )
+            }
+            4 if probe.recovery => (
+                call(
+                    json!({"action":"run", "child_session_id":probe.child_id.lock().unwrap().clone().unwrap(),
+                    "reset_to_last_user":false}),
+                ),
+                "tool_calls",
+            ),
             2 if probe.replay => (
                 call(
                     json!({"action":"run","child_session_id":probe.child_id.lock().unwrap().clone().unwrap(),"reset_to_last_user":false}),
@@ -446,6 +527,95 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .body(format!(
             "{reasoning_event}data: {event}\n\ndata: [DONE]\n\n"
         ))
+}
+// ACK-only real filesystem fault. No claim, placement, cursor or lease is
+// authored by this helper; Unix root cannot provide this fault boundary.
+struct AckWriteFault(PathBuf, std::fs::Permissions);
+impl AckWriteFault {
+    fn new(path: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&path).unwrap();
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Self(path, original)
+    }
+}
+impl Drop for AckWriteFault {
+    fn drop(&mut self) {
+        std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+    }
+}
+async fn await_host_pre_ack_cut(
+    probe: &Probe,
+    id: &str,
+) -> (bamboo_domain::Session, chrono::DateTime<chrono::Utc>) {
+    use bamboo_domain::SessionInboxPort;
+    let store = std::sync::Arc::new(SessionStoreV2::new(probe.data.clone()).await.unwrap());
+    let inbox = bamboo_storage::FileSessionInbox::new(
+        store.clone(),
+        bamboo_domain::SessionInboxLimits::default(),
+    );
+    let cut = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let child = store.load_session(id).await.unwrap().unwrap();
+            let entry = store.inspect_actor(id).await.unwrap();
+            if entry.activation.as_ref().unwrap().status == ActorActivationStatus::Failed
+                && child.last_run_status().as_deref() == Some("error")
+            {
+                assert!(
+                    child.last_run_error().unwrap().contains("ACK unresolved"),
+                    "actual error: {}",
+                    bounded_diagnostic(&child.last_run_error().unwrap(), 512)
+                );
+                assert_eq!(entry.actor.current_attempt, 1);
+                let placement = entry.activation.unwrap().placement_ref.unwrap();
+                assert_eq!(placement.class, bamboo_domain::ActorPlacementClass::Local);
+                assert!(placement
+                    .lease_id
+                    .starts_with("owned-initial-release-v1:required-worker-"));
+                let input = child.messages.last().unwrap();
+                assert_eq!(input.content, "CORRECTION_FROM_ACTUAL_ROOT");
+                assert!(input
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get("_bamboo_owned_input_checkpoint")
+                    .is_some());
+                assert!(!inbox
+                    .was_admitted(
+                        id,
+                        &bamboo_domain::SessionMessageId::parse(input.id.clone()).unwrap()
+                    )
+                    .await
+                    .unwrap());
+                let leases = inbox
+                    .inspect_owned_leases(id, 2, chrono::Utc::now())
+                    .await
+                    .unwrap();
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].generation, 1);
+                assert_eq!(leases[0].reclaim_count, 0);
+                assert!(
+                    leases[0].expires_at <= chrono::Utc::now() + chrono::Duration::seconds(100)
+                );
+                assert_eq!(
+                    probe.child_calls.load(Ordering::SeqCst),
+                    1,
+                    "unreleased continuation has no provider admission"
+                );
+                return (child, leases[0].expires_at);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if cut.is_err() {
+        panic!(
+            "actual pre-ACK cut timeout: {}",
+            bounded_diagnostic(&provider_host_phase(probe).await.to_string(), 2048)
+        );
+    }
+    cut.unwrap()
 }
 struct Host(Child);
 impl Drop for Host {
@@ -477,7 +647,14 @@ fn start(data: &Path, port: u16) -> Host {
             .unwrap(),
     )
 }
-async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, retry: bool) {
+async fn fixture(
+    ultra: bool,
+    reasoning: bool,
+    correction: bool,
+    glob: bool,
+    retry: bool,
+    recovery: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     let temp_root = temp.path().canonicalize().unwrap();
     let data = temp_root.join("host");
@@ -511,10 +688,11 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
         data: data.clone(),
         workspace: workspace.clone(),
         reasoning,
-        replay: ultra && !reasoning && !correction && !glob && !retry,
+        replay: ultra && !reasoning && !correction && !glob && !retry && !recovery,
         correction,
         glob,
         retry,
+        recovery,
     });
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
@@ -605,6 +783,171 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
     if glob {
         assert!(before.agent_runtime_state.as_ref().unwrap().read_only);
     }
+    let mut recovery_prefix = None;
+    if recovery {
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap()),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        // run(false) suspends the Root; a real new Root turn sends the live correction.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                if parent.last_run_status().as_deref() == Some("suspended") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let initial = store.inspect_actor(&id).await.unwrap();
+        assert_eq!(initial.actor.current_attempt, 1);
+        assert_eq!(
+            initial.activation.as_ref().unwrap().status,
+            ActorActivationStatus::Running
+        );
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Correct the same running Child now","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual Root correction chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
+        let dispatch: Value = client
+            .post(format!("{base}/execute/plain-root"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatch["status"], "started",
+            "actual Root turn: {dispatch}"
+        );
+        let pending = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+                    .await
+                    .unwrap();
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                let delivered = parent.messages.iter().rev().find(|m| {
+                    m.role == bamboo_domain::Role::Tool
+                        && m.tool_call_id.as_deref() == Some("subagent-send_message")
+                });
+                if backlog.activation_pending() && delivered.is_some() {
+                    let receipt: Value = serde_json::from_str(&delivered.unwrap().content).unwrap();
+                    assert_eq!(receipt["message"], "CORRECTION_FROM_ACTUAL_ROOT");
+                    assert_eq!(receipt["inbox_generation"], 1);
+                    assert_eq!(
+                        (backlog.pending, backlog.claimed, backlog.generation),
+                        (1, 0, 1)
+                    );
+                    let current = store.inspect_actor(&id).await.unwrap();
+                    assert_eq!(current.actor.current_attempt, 1);
+                    let activation = current.activation.as_ref().unwrap();
+                    assert_eq!(activation.status, ActorActivationStatus::Running);
+                    assert_eq!(
+                        activation.fence(),
+                        initial.activation.as_ref().unwrap().fence()
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            pending.is_ok(),
+            "actual pending correction timeout: {}",
+            bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
+        );
+        let fault = AckWriteFault::new(
+            data.join(store.resolve_rel_path(&id).await.unwrap())
+                .join("inbox/admitted"),
+        );
+        probe.release.store(true, Ordering::SeqCst);
+        probe.wake.notify_waiters();
+        let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
+        let parent_done = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                if probe.root_calls.load(Ordering::SeqCst) >= 4
+                    && parent.last_run_status().as_deref() == Some("completed")
+                    && parent.messages.last().is_some_and(|m| {
+                        m.role == bamboo_domain::Role::Assistant && m.content == "ROOT_DONE"
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            parent_done.is_ok(),
+            "actual Parent ROOT_DONE timeout (calls={}): {}",
+            probe.root_calls.load(Ordering::SeqCst),
+            bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
+        );
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
+        drop(fault);
+        probe.release.store(false, Ordering::SeqCst);
+        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(delay + Duration::from_millis(10)).await;
+        host = start(&data, port);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                assert!(host.0.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let cold_cut = SessionStoreV2::new(data.clone())
+            .await
+            .unwrap()
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&cold_cut.messages).unwrap(),
+            serde_json::to_value(&cut.messages).unwrap()
+        );
+        recovery_prefix = Some(cut);
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Recover the same checkpointed Child through run(false)","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual cold Root recovery chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
+        assert!(client
+            .post(format!("{base}/execute/plain-root"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while probe.child_calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     let requests = probe.requests.lock().unwrap().clone();
     let child_wire = requests
         .iter()
@@ -628,7 +971,7 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
             running.activation.as_ref().unwrap().status,
             ActorActivationStatus::Running
         );
-        assert_eq!(running.actor.current_attempt, 1);
+        assert_eq!(running.actor.current_attempt, if recovery { 2 } else { 1 });
         original_activation = running.activation;
     }
     if correction {
@@ -706,7 +1049,7 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
         );
     }
     let child_calls = probe.child_calls.load(Ordering::SeqCst);
-    let expected_calls = if correction || retry || (glob && !reasoning) {
+    let expected_calls = if correction || retry || recovery || (glob && !reasoning) {
         2
     } else {
         1
@@ -976,6 +1319,47 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
             serde_json::to_value(&cold.messages).unwrap()
         );
     }
+    if recovery {
+        let prefix = recovery_prefix.as_ref().unwrap();
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cold.created_at, before.created_at);
+        assert_eq!(cold.project_id_meta(), before.project_id_meta());
+        assert_eq!(
+            serde_json::to_value(&cold.messages[..prefix.messages.len()]).unwrap(),
+            serde_json::to_value(&prefix.messages).unwrap()
+        );
+        assert_eq!(cold.messages.len(), prefix.messages.len() + 1);
+        assert_eq!(cold.messages.last().unwrap().content, "FENCED_PLAIN_REPLY");
+        assert_eq!(
+            cold.messages[cold.messages.len() - 3].content,
+            "INITIAL_BEFORE_CORRECTION"
+        );
+        assert_eq!(
+            cold.messages[cold.messages.len() - 2].content,
+            "CORRECTION_FROM_ACTUAL_ROOT"
+        );
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|v| v.get("_bamboo_owned_input_checkpoint").is_some()))
+                .count(),
+            1
+        );
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            reopened.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (backlog.pending, backlog.claimed, backlog.generation),
+            (0, 0, 1)
+        );
+    }
     if ultra {
         assert_eq!(
             reopened
@@ -984,7 +1368,7 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
                 .unwrap()
                 .actor
                 .current_attempt,
-            if retry { 2 } else { 1 }
+            if retry || recovery { 2 } else { 1 }
         );
     }
     handle.stop(true).await;
@@ -992,21 +1376,26 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
 #[actix_web::test]
 async fn actual_zero_tool_child_uses_host_actor_commit_and_preserves_legacy() {
     for (ultra, reasoning) in [(true, false), (true, true), (false, false)] {
-        Box::pin(fixture(ultra, reasoning, false, false, false)).await;
+        Box::pin(fixture(ultra, reasoning, false, false, false, false)).await;
     }
 }
 
 #[actix_web::test]
 async fn actual_owned_readonly_glob_has_one_pair_and_cold_host_history() {
-    Box::pin(fixture(true, false, false, true, false)).await;
+    Box::pin(fixture(true, false, false, true, false, false)).await;
 }
 
 #[actix_web::test]
 async fn actual_owned_child_admits_root_correction_before_second_provider() {
-    Box::pin(fixture(true, false, true, false, false)).await;
+    Box::pin(fixture(true, false, true, false, false, false)).await;
 }
 
 #[actix_web::test]
 async fn actual_failed_owned_child_retries_one_new_root_input() {
-    Box::pin(fixture(true, false, false, false, true)).await;
+    Box::pin(fixture(true, false, false, false, true, false)).await;
+}
+
+#[actix_web::test]
+async fn actual_run_false_recovers_one_expired_pre_ack_checkpoint() {
+    Box::pin(fixture(true, false, false, false, false, true)).await;
 }

@@ -866,6 +866,8 @@ pub async fn run_child_action(
         }));
     }
 
+    port.validate_child_run_request(parent, &child, reset_to_last_user)
+        .await?;
     let mut messages_removed = 0usize;
     if reset_to_last_user.unwrap_or(true) {
         messages_removed = truncate_after_last_user(&mut child)?;
