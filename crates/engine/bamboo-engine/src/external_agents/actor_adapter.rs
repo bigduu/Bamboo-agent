@@ -6916,12 +6916,14 @@ mod tests {
             .register_run(&child.id, "release-host-run")
             .await
             .unwrap();
-        let mut activation = PlainActorActivation::start(
+        let policy = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+        let revision = policy.policy_revision();
+        let activation = PlainActorActivation::start(
             store.clone(),
             &child,
             &binding,
             Some("release-host-run"),
-            None,
+            Some(policy.clone()),
             true,
             Some("probed-physical-worker"),
         )
@@ -6947,8 +6949,8 @@ mod tests {
             .checkpoint_input(&mut child, "release-host-run", &claim)
             .await
             .unwrap();
-        let mut expected = Some(expected_default_permission_posture(7));
-        let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+        let mut expected = Some(expected_default_permission_posture(revision));
+        let ChildFrame::Event { event } = permission_posture_frame(&child.id, revision) else {
             unreachable!()
         };
         let (events, mut events_rx) = mpsc::channel(1);
@@ -6978,7 +6980,17 @@ mod tests {
             }),
             project_id: None,
             reasoning_effort: None,
-            permission_policy: None,
+            permission_policy: Some(bamboo_subagent::proto::PermissionPolicyContext {
+                revision,
+                requested_mode: "default".into(),
+                effective_mode: "default".into(),
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                session_id: child.id.clone(),
+                workspace_path: child.workspace.clone(),
+                inherit_session_grants: false,
+                policy: serde_json::to_value(policy.to_serializable()).unwrap(),
+            }),
             messages: prefix,
             activation_run_id: Some("release-host-run".into()),
             execution_epoch: 9,
@@ -7218,21 +7230,6 @@ mod tests {
             .was_admitted(&child.id, &second.id)
             .await
             .unwrap());
-        // An actual new scoped deny is an unsupported change to this captured Host policy.
-        let changed = Arc::new(bamboo_tools::permission::PermissionConfig::new());
-        changed.deny_scoped_session_permission(
-            &child.id,
-            bamboo_tools::permission::PermissionType::ExecuteCommand,
-            "blocked-action",
-        );
-        activation.permission_config = Some(changed);
-        assert!(release_second!(&child, &request2, epoch2, Some(&release2)).is_err());
-        activation.permission_config = None;
-        assert!(!activation
-            .input_inbox
-            .was_admitted(&child.id, &second.id)
-            .await
-            .unwrap());
         let release2 = release_second!(&child, &request2, epoch2, None).unwrap();
         assert_eq!(
             release_second!(&child, &request2, epoch2, Some(&release2)).unwrap(),
@@ -7334,6 +7331,18 @@ mod tests {
             );
             assert!(cold.session_inbox_admission().unwrap().contains(id));
         }
+        // Mutate the actual captured policy Arc; cached ACK/release is not a fresh grant.
+        policy.deny_scoped_session_permission(
+            &child.id,
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            "blocked-action",
+        );
+        assert!(release_second!(&child, &request2, epoch2, Some(&release2)).is_err());
+        assert!(activation
+            .input_inbox
+            .was_admitted(&child.id, &second.id)
+            .await
+            .unwrap());
         activation
             .finish(ActorActivationFinish::Failed)
             .await
