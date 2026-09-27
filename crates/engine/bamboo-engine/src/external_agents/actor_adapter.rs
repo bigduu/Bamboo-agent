@@ -747,6 +747,16 @@ impl ActorChildRunner {
         self
     }
 
+    async fn require_initial_input_release_worker(&self) -> crate::runtime::runner::Result<()> {
+        bamboo_subagent::fleet::require_worker_capability(
+            &self.worker_bin,
+            &self.worker_args,
+            bamboo_subagent::provision::INITIAL_INPUT_RELEASE_WORKER_CAPABILITY,
+        )
+        .await
+        .map_err(|_| AgentError::LLM("owned initial release worker capability unconfirmed".into()))
+    }
+
     pub fn with_live_provider_config(
         mut self,
         config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
@@ -1666,15 +1676,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 .as_ref()
                 .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
         if plain_actor_store.is_some() && !readonly_actor {
-            bamboo_subagent::fleet::require_worker_capability(
-                &self.worker_bin,
-                &self.worker_args,
-                bamboo_subagent::provision::INITIAL_INPUT_RELEASE_WORKER_CAPABILITY,
-            )
-            .await
-            .map_err(|_| {
-                AgentError::LLM("owned initial release worker capability unconfirmed".into())
-            })?;
+            self.require_initial_input_release_worker().await?;
             spec.capabilities.initial_input_release_required = true;
             spec.validate().map_err(|_| plain_actor_unsupported())?;
         }
@@ -5841,6 +5843,66 @@ mod tests {
                 .unwrap());
             assert_eq!(cold_inbox.inspect(&cold.id).await.unwrap().claimed, 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_initial_release_missing_only_new_capability_rejects_before_spawn_or_run() {
+        use bamboo_subagent::provision::*;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let worker = temp.path().join("mixed-worker");
+        let spawned = temp.path().join("spawned");
+        let run = temp.path().join("run");
+        let probes = temp.path().join("probes");
+        let fabric = temp.path().join("fabric");
+        let mut report = WorkerCapabilityReport::current();
+        report
+            .capabilities
+            .retain(|name| name != INITIAL_INPUT_RELEASE_WORKER_CAPABILITY);
+        assert!(!report.supports(INITIAL_INPUT_RELEASE_WORKER_CAPABILITY));
+        let report = serde_json::to_string(&report).unwrap();
+        std::fs::write(&worker, format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do last=\"$arg\"; done\nif [ \"$last\" = --print-capabilities ]; then\nprintf '%s\\n' '{report}'\nprintf 'probe\\n' >> \"$3\"\nelse\n: > \"$1\"\n: > \"$2\"\ncat >/dev/null\nfi\n"
+        )).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec![
+            spawned.to_str().unwrap().into(),
+            run.to_str().unwrap().into(),
+            probes.to_str().unwrap().into(),
+        ];
+        // Real subprocess probes prove the rejection cannot be an earlier missing bit.
+        for capability in [
+            REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY,
+            CHILD_CREATION_IDENTITY_WORKER_CAPABILITY,
+            NATIVE_TOOL_CEILING_WORKER_CAPABILITY,
+            TYPED_READ_ONLY_WORKER_CAPABILITY,
+        ] {
+            bamboo_subagent::fleet::require_worker_capability(&worker, &args, capability)
+                .await
+                .unwrap();
+        }
+        let runner = ActorChildRunner::new(
+            "mixed".into(),
+            worker,
+            args,
+            fabric.clone(),
+            ExecutorSpec::BambooRuntime,
+            vec![],
+            "openai".into(),
+            1,
+        );
+        // The actual Host method remains mandatory before claim/provision/Run.
+        let error = runner
+            .require_initial_input_release_worker()
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("owned initial release worker capability unconfirmed"));
+        assert_eq!(std::fs::read_to_string(probes).unwrap().lines().count(), 5);
+        assert!(!spawned.exists() && !run.exists() && !fabric.exists());
+        assert!(runner.pool.lock().await.is_empty());
     }
 
     #[tokio::test]
