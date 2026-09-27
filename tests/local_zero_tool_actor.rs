@@ -128,7 +128,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
                 call(
-                    json!({"action":"create","title":"Zero-tool Child","responsibility":if probe.glob {"Verify the assigned file using Glob once, then return one plain reply"} else {"Return exactly one plain answer; do not use tools"},"prompt":if probe.glob {"Find owned-marker.txt with Glob once and report the result"} else {"Respond with a plain answer inside this task boundary"},"subagent_type":"plain-reply","workspace":probe.workspace,"auto_run":probe.correction}),
+                    json!({"action":"create","title":"Zero-tool Child","responsibility":if probe.glob {"Verify the assigned file using Glob once, then return one plain reply"} else {"Return exactly one plain answer; do not use tools"},"prompt":if probe.glob {"Find owned-marker.txt with Glob once and report the result"} else {"Respond with a plain answer inside this task boundary"},"subagent_type":if probe.glob {"explorer"} else {"plain-reply"},"workspace":probe.workspace,"auto_run":probe.correction}),
                 ),
                 "tool_calls",
             ),
@@ -261,8 +261,8 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
     if glob {
         std::fs::write(workspace.join("owned-marker.txt"), "actual read-only file").unwrap();
     }
-    std::fs::write(agents.join("plain-reply.md"), if glob {
-        "---\nschema_version: 1\nname: plain-reply\ndescription: Verify one assigned file\nmodel_hint: openai:plain-child\nread_only: true\ntools:\n  allow: [Glob]\n---\nUse Glob exactly once for the assigned file, then return one plain answer.\n"
+    std::fs::write(agents.join(if glob {"explorer.md"} else {"plain-reply.md"}), if glob {
+        "---\nschema_version: 1\nname: explorer\ndescription: Verify one assigned file\nmodel_hint: openai:plain-child\ntools:\n  allow: [Glob]\n---\nUse Glob exactly once for the assigned file, then return one plain answer.\n"
     } else {
         "---\nschema_version: 1\nname: plain-reply\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n"
     }).unwrap();
