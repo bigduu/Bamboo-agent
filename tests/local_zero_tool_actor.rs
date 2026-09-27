@@ -2228,50 +2228,45 @@ async fn message_only_fixture() {
         .cloned()
         .collect();
     assert_eq!(child_requests.len(), 1);
-    let user_evidence: Vec<_> = before
+    let users: Vec<_> = before
         .messages
         .iter()
         .filter(|m| m.role == bamboo_domain::Role::User)
-        .take(8)
-        .map(|m| {
-            (
-                m.id.as_str(),
-                m.content.len(),
-                m.content.matches(MESSAGE_ONLY_TASK).count(),
-                m.content
-                    .find(MESSAGE_ONLY_TASK)
-                    .map(|at| bounded_diagnostic(&m.content[at..], 160)),
-            )
-        })
         .collect();
-    let provider_user_hits: Vec<_> = child_requests[0]["messages"]
-        .as_array()
+    assert_eq!(users.len(), 1);
+    let assignment = users[0];
+    let context = bamboo_domain::ChildContextBinding::from_session(&before)
         .unwrap()
-        .iter()
-        .filter(|message| message["role"] == "user")
-        .map(|message| {
-            message["content"]
-                .as_str()
-                .unwrap()
-                .matches(MESSAGE_ONLY_TASK)
-                .count()
-        })
-        .collect();
-    assert_eq!(
-        before
-            .messages
-            .iter()
-            .filter(|m| m.role == bamboo_domain::Role::User)
-            .map(|m| m.content.matches(MESSAGE_ONLY_TASK).count())
-            .sum::<usize>(),
-        1,
-        "users={user_evidence:?}, provider_user_hits={provider_user_hits:?}"
-    );
+        .unwrap();
+    assert_eq!(assignment.content, context.payload.required_assignment);
+    let brief = assignment
+        .content
+        .split_once("<task-brief>\n")
+        .unwrap()
+        .1
+        .split_once("\n</task-brief>")
+        .unwrap()
+        .0;
+    let fields: Value = serde_json::from_str(brief).unwrap();
+    assert_eq!(fields["task_brief"], MESSAGE_ONLY_TASK);
+    assert_eq!(fields["objective"], MESSAGE_ONLY_TASK);
     assert!(!before
         .messages
         .iter()
         .any(|m| m.role == bamboo_domain::Role::Assistant));
-    assert_eq!(provider_user_hits.iter().sum::<usize>(), 1);
+    let provider_assignment: Vec<_> = child_requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            m["role"] == "user" && m["content"].as_str().unwrap().contains(MESSAGE_ONLY_TASK)
+        })
+        .collect();
+    assert_eq!(provider_assignment.len(), 1);
+    assert_eq!(
+        provider_assignment[0]["content"].as_str(),
+        Some(assignment.content.as_str())
+    );
     assert!(
         child_requests[0]["tools"].is_null()
             || child_requests[0]["tools"]
