@@ -1930,3 +1930,415 @@ async fn actual_owned_child_admits_two_corrections_and_preserves_overflow_and_ac
         .await;
     }
 }
+
+const ROOT_CATALOG_REPLIES: [&str; 3] = [
+    "F1_STANDARD_CATALOG_OK",
+    "F1_ULTRA_CATALOG_OK",
+    "F1_ULTRA_CONTINUATION_OK",
+];
+
+struct RootCatalogProbe {
+    requests: Mutex<Vec<Value>>,
+}
+
+async fn root_catalog_provider(
+    body: web::Json<Value>,
+    probe: web::Data<RootCatalogProbe>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    assert_eq!(body["model"], "catalog-root");
+    let tools = body["tools"]
+        .as_array()
+        .expect("actual Root provider tools array");
+    let names: Vec<_> = tools
+        .iter()
+        .map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .expect("registered provider execution name")
+        })
+        .collect();
+    let unique: std::collections::BTreeSet<_> = names.iter().copied().collect();
+    assert_eq!(unique.len(), names.len(), "duplicate provider tool schemas");
+    let ordinal = {
+        let mut requests = probe.requests.lock().unwrap();
+        let ordinal = requests.len();
+        requests.push(body.clone());
+        ordinal
+    };
+    assert!(
+        ordinal < ROOT_CATALOG_REPLIES.len(),
+        "unexpected Root provider round"
+    );
+    let count = |name| names.iter().filter(|candidate| **candidate == name).count();
+    assert_eq!(count("SubAgent"), 1, "one model-facing SubAgent");
+    let legacy_count = usize::from(ordinal == 0);
+    assert_eq!(
+        count("ask_agent"),
+        legacy_count,
+        "Standard broker positive or Ultra mask"
+    );
+    assert_eq!(
+        count("deploy_agent"),
+        legacy_count,
+        "Standard broker positive or Ultra mask"
+    );
+    let event = json!({
+        "id": "f1-root-catalog",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ROOT_CATALOG_REPLIES[ordinal]},
+            "finish_reason": "stop"
+        }]
+    });
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+async fn root_catalog_turn(
+    client: &reqwest::Client,
+    base: &str,
+    store: &SessionStoreV2,
+    host: &mut Host,
+    session_id: &str,
+    chat_body: Value,
+    expected_replies: &[&str],
+) -> bamboo_domain::Session {
+    assert_eq!(chat_body["session_id"], session_id);
+    let chat = client
+        .post(format!("{base}/chat"))
+        .json(&chat_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        chat.status().is_success(),
+        "catalog chat: {}",
+        chat.text().await.unwrap()
+    );
+    let execute = client
+        .post(format!("{base}/execute/{session_id}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        execute.status().is_success(),
+        "catalog execute: {}",
+        execute.text().await.unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            let current = store.load_session(session_id).await.unwrap();
+            if let Some(root) = current {
+                assert_ne!(
+                    root.last_run_status().as_deref(),
+                    Some("error"),
+                    "Root: {:?}",
+                    root.last_run_error()
+                );
+                let rows: Value = client
+                    .get(format!("{base}/sessions"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let settled = rows["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == session_id && row["is_running"] == false);
+                if settled && root.last_run_status().as_deref() == Some("completed") {
+                    let replies: Vec<_> = root
+                        .messages
+                        .iter()
+                        .filter(|message| {
+                            message.role == bamboo_domain::Role::Assistant
+                                && !message.content.is_empty()
+                        })
+                        .map(|message| message.content.clone())
+                        .collect();
+                    if replies.len() < expected_replies.len() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    }
+                    assert_eq!(
+                        replies.iter().map(String::as_str).collect::<Vec<_>>(),
+                        expected_replies
+                    );
+                    assert_eq!(
+                        root.messages
+                            .iter()
+                            .filter(|message| message.role == bamboo_domain::Role::User)
+                            .count(),
+                        expected_replies.len()
+                    );
+                    assert!(root.messages.iter().all(|message| {
+                        message.role != bamboo_domain::Role::Tool
+                            && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                    }));
+                    return root;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bounded actual Root catalog turn")
+}
+
+async fn root_catalog_fixture() {
+    let temp = tempfile::tempdir().unwrap();
+    let root_dir = temp.path().canonicalize().unwrap();
+    let data = root_dir.join("host");
+    let workspace = root_dir.join("workspace");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let projects = bamboo_projects::ProjectStore::open(&data).unwrap();
+    let project = projects
+        .create_with_project_path("root-catalog", None, workspace.to_string_lossy(), vec![])
+        .unwrap();
+    let probe = web::Data::new(RootCatalogProbe {
+        requests: Mutex::new(Vec::new()),
+    });
+    let provider_probe = probe.clone();
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(provider_probe.clone())
+            .route(
+                "/v1/chat/completions",
+                web::post().to(root_catalog_provider),
+            )
+            .route(
+                "/v1/models",
+                web::get().to(|| async {
+                    HttpResponse::Ok().json(json!({"data":[{"id":"catalog-root"}]}))
+                }),
+            )
+    })
+    .workers(1)
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+    let provider_url = format!("http://{}/v1", server.addrs()[0]);
+    let running = server.run();
+    let provider_handle = running.handle();
+    actix_web::rt::spawn(running);
+    std::fs::write(
+        data.join("config.json"),
+        serde_json::to_vec(&json!({
+            "provider": "openai",
+            "features": {"provider_model_ref": true},
+            "providers": {"openai": {
+                "api_key": "fixture",
+                "base_url": provider_url,
+                "model": "catalog-root"
+            }},
+            "defaults": {"chat": {"provider": "openai", "model": "catalog-root"}},
+            "subagents": {
+                "runtime": "actor",
+                "executor": "bamboo_runtime",
+                "max_concurrent": 1
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut host = start(&data, port);
+    let base = format!("http://127.0.0.1:{port}/api/v1");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|reply| reply.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("actual Root catalog Host health");
+
+    let store = SessionStoreV2::new(data.clone()).await.unwrap();
+    let standard = root_catalog_turn(
+        &client,
+        &base,
+        &store,
+        &mut host,
+        "f1-standard-root",
+        json!({
+            "session_id": "f1-standard-root",
+            "message": "Report the Standard catalog check.",
+            "model": "catalog-root",
+            "provider": "openai",
+            "model_ref": {"provider": "openai", "model": "catalog-root"},
+            "thinking_mode": "standard",
+            "permission_mode": "bypass",
+            "workspace_path": workspace,
+            "project_id": project.id
+        }),
+        &ROOT_CATALOG_REPLIES[..1],
+    )
+    .await;
+    assert!(!standard.root_orchestration_only_enabled());
+    let ultra_first = root_catalog_turn(
+        &client,
+        &base,
+        &store,
+        &mut host,
+        "f1-ultra-root",
+        json!({
+            "session_id": "f1-ultra-root",
+            "message": "Report the first Ultra catalog check.",
+            "model": "catalog-root",
+            "provider": "openai",
+            "model_ref": {"provider": "openai", "model": "catalog-root"},
+            "thinking_mode": "ultra",
+            "permission_mode": "bypass",
+            "workspace_path": workspace,
+            "project_id": project.id
+        }),
+        &ROOT_CATALOG_REPLIES[1..2],
+    )
+    .await;
+    assert!(ultra_first.root_orchestration_only_enabled());
+    assert!(ultra_first.root_tool_authority_revision > 0);
+    let continuation = json!({
+        "session_id": "f1-ultra-root",
+        "message": "Report the same Ultra Root catalog again.",
+        "model": "catalog-root",
+        "provider": "openai"
+    });
+    assert!(continuation.get("thinking_mode").is_none());
+    assert!(continuation
+        .get("root_orchestration_only_enabled")
+        .is_none());
+    let ultra_second = root_catalog_turn(
+        &client,
+        &base,
+        &store,
+        &mut host,
+        "f1-ultra-root",
+        continuation,
+        &ROOT_CATALOG_REPLIES[1..],
+    )
+    .await;
+    assert!(ultra_second.root_orchestration_only_enabled());
+    assert_eq!(ultra_second.id, ultra_first.id);
+    assert_eq!(ultra_second.created_at, ultra_first.created_at);
+    assert_eq!(
+        ultra_second.root_tool_authority_revision,
+        ultra_first.root_tool_authority_revision
+    );
+    let requests = probe.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3, "three actual Root provider requests");
+    assert!(requests
+        .iter()
+        .all(|request| request["model"] == "catalog-root"));
+    let observed_counts: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let tools = request["tools"].as_array().unwrap();
+            let count = |name| {
+                tools
+                    .iter()
+                    .filter(|tool| tool["function"]["name"] == name)
+                    .count()
+            };
+            json!({
+                "SubAgent": count("SubAgent"),
+                "ask_agent": count("ask_agent"),
+                "deploy_agent": count("deploy_agent")
+            })
+        })
+        .collect();
+    assert_eq!(
+        observed_counts,
+        [
+            json!({"SubAgent": 1, "ask_agent": 1, "deploy_agent": 1}),
+            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0}),
+            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0})
+        ]
+    );
+    let index = store.list_index_entries().await;
+    assert_eq!(index.len(), 2, "two Root Sessions and no Child");
+    assert!(index.iter().all(|row| row.parent_session_id.is_none()));
+    let mut ids = index.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids.as_slice(), ["f1-standard-root", "f1-ultra-root"]);
+
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    drop(host);
+    drop(store);
+    let cold_store = SessionStoreV2::new(data).await.unwrap();
+    let cold_standard = cold_store
+        .load_session("f1-standard-root")
+        .await
+        .unwrap()
+        .unwrap();
+    let cold_ultra = cold_store
+        .load_session("f1-ultra-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!cold_standard.root_orchestration_only_enabled());
+    assert!(cold_ultra.root_orchestration_only_enabled());
+    assert_eq!(cold_standard.id, standard.id);
+    assert_eq!(cold_standard.created_at, standard.created_at);
+    assert_eq!(cold_ultra.id, ultra_second.id);
+    assert_eq!(cold_ultra.created_at, ultra_second.created_at);
+    assert_eq!(
+        cold_ultra.root_tool_authority_revision,
+        ultra_first.root_tool_authority_revision
+    );
+    assert_eq!(
+        serde_json::to_value(&cold_standard.messages).unwrap(),
+        serde_json::to_value(&standard.messages).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&cold_ultra.messages).unwrap(),
+        serde_json::to_value(&ultra_second.messages).unwrap()
+    );
+    assert_eq!(
+        cold_standard.last_run_status().as_deref(),
+        Some("completed")
+    );
+    assert_eq!(cold_ultra.last_run_status().as_deref(), Some("completed"));
+    eprintln!(
+        "root-catalog native evidence: {}",
+        json!({
+            "issue": 1455,
+            "provider_rounds": requests.len(),
+            "catalog_counts": observed_counts,
+            "root_count": index.len(),
+            "child_count": 0,
+            "cold_ultra_revision": cold_ultra.root_tool_authority_revision,
+            "host_killed_and_waited": true
+        })
+    );
+    provider_handle.stop(true).await;
+}
+
+#[actix_web::test]
+async fn actual_root_catalog_masks_legacy_tools_and_preserves_ultra_continuation() {
+    Box::pin(root_catalog_fixture()).await;
+}
