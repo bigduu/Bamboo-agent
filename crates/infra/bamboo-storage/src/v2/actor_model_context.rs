@@ -425,58 +425,6 @@ fn validate_request(
     }
     Ok((current, encoded, false))
 }
-// Capture existence as well as bytes, before the pure async lineage reader.
-fn ancestors(home: &Path, actor: &bamboo_domain::ActorSession) -> Result<Vec<Option<Vec<u8>>>> {
-    let root = home.join(&actor.root_actor_id);
-    let mut bytes = Vec::new();
-    for ancestor in &actor.ancestor_observations {
-        validate_session_id(&ancestor.actor_id)?;
-        let directory = if ancestor.actor_id == actor.root_actor_id {
-            root.clone()
-        } else {
-            root.join("children").join(&ancestor.actor_id)
-        };
-        for directory in directory.ancestors().take_while(|p| p.starts_with(home)) {
-            if !std::fs::symlink_metadata(directory)?.file_type().is_dir() {
-                return Err(Error::InvalidSource);
-            }
-        }
-        for name in [
-            "session.json",
-            RUNTIME_SIDECAR_FILE,
-            root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
-            supervisor_proof::SUPERVISOR_PROOF_FILE,
-        ] {
-            let path = directory.join(name);
-            bytes.push(match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_file() => Some(std::fs::read(path)?),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                _ => return Err(Error::InvalidSource),
-            });
-        }
-    }
-    Ok(bytes)
-}
-fn lineage_matches(
-    recorded: &[bamboo_domain::ActorAncestorObservation],
-    current: &[bamboo_domain::ActorAncestorObservation],
-) -> Result<()> {
-    if recorded.len() != current.len() {
-        return Err(ActorDirectoryError::InvalidIdentity.into());
-    }
-    for (old, new) in recorded.iter().zip(current) {
-        if old.actor_id != new.actor_id
-            || old.session_created_at != new.session_created_at
-            || new.metadata_version < old.metadata_version
-        {
-            return Err(ActorDirectoryError::InvalidIdentity.into());
-        }
-        if new.metadata_version - old.metadata_version >= 2 {
-            return Err(ActorDirectoryError::ProjectTransitionBlocked.into());
-        }
-    }
-    Ok(())
-}
 fn running(source: &Source, fence: &ActorActivationFence) -> Result<()> {
     if actor_directory::current_live(&source.entry, fence, Utc::now())?.status
         != ActorActivationStatus::Running
@@ -510,13 +458,16 @@ impl SessionStoreV2 {
         let (original, ancestor_bytes) = Self::default_writer_job(&guards, move || {
             Ok((|| -> Result<_> {
                 let source = source(&read_dir, &read_id, kind, &read_root)?;
-                let bytes = ancestors(&read_home, &source.entry.actor)?;
+                let bytes = actor_checkpoint_lineage::capture(&read_home, &source.entry.actor)?;
                 Ok((source, bytes))
             })())
         })
         .await??;
         let lineage = self.validate_actor_lineage(&original.entry.actor).await?;
-        lineage_matches(&original.entry.actor.ancestor_observations, &lineage)?;
+        actor_checkpoint_lineage::validate_recorded_observations(
+            &original.entry.actor.ancestor_observations,
+            &lineage,
+        )?;
         if !self.session_lifetime_is_live(&original.main).await? {
             return Err(ActorDirectoryError::InvalidIdentity.into());
         }
@@ -530,7 +481,7 @@ impl SessionStoreV2 {
             let recheck = || -> Result<Source> {
                 let now = source(&directory, &id, kind, &root)?;
                 if !original.unchanged(&now)
-                    || ancestors(&home, &now.entry.actor)? != ancestor_bytes
+                    || !ancestor_bytes.matches_current(&home, &now.entry.actor)?
                 {
                     return Err(Error::InvalidSource);
                 }

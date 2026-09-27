@@ -417,10 +417,21 @@ impl SessionStoreV2 {
         let source_dir = directory.clone();
         let source_id = id.clone();
         let source_root = root.clone();
-        let source = Self::default_writer_job(&guards, move || {
-            Ok(Source::read(&source_dir, &source_id, kind, &source_root))
+        let home = self.sessions_dir.clone();
+        let read_home = home.clone();
+        let (source, ancestors) = Self::default_writer_job(&guards, move || {
+            Ok((|| -> Result<_> {
+                let source = Source::read(&source_dir, &source_id, kind, &source_root)?;
+                let ancestors = actor_checkpoint_lineage::capture(&read_home, &source.entry.actor)?;
+                Ok((source, ancestors))
+            })())
         })
         .await??;
+        let lineage = self.validate_actor_lineage(&source.entry.actor).await?;
+        actor_checkpoint_lineage::validate_recorded_observations(
+            &source.entry.actor.ancestor_observations,
+            &lineage,
+        )?;
         if source.main.created_at != request.expected_created_at {
             return Err(ActorDirectoryError::InvalidIdentity.into());
         }
@@ -435,6 +446,19 @@ impl SessionStoreV2 {
         #[cfg(test)]
         let hook = self.transcript_write_hook.lock().unwrap().clone();
         Self::default_writer_job(&guards, move || {
+            let initial = (|| -> Result<()> {
+                let initial = Source::read(&directory, &id, kind, &root)?;
+                if !source.unchanged(&initial)
+                    || !ancestors.matches_current(&home, &initial.entry.actor)?
+                {
+                    return Err(ActorTranscriptAppendError::InvalidSource);
+                }
+                actor_directory::current_live(&initial.entry, &request.fence, Utc::now())?;
+                Ok(())
+            })();
+            if let Err(error) = initial {
+                return Ok(Err(error));
+            }
             let mut replaced = false;
             let mut rejection = None;
             let path = directory.join("session.json");
@@ -450,7 +474,9 @@ impl SessionStoreV2 {
                 if phase == DurableWritePhase::BeforeReplace {
                     let check = (|| {
                         let current = Source::read(&directory, &id, kind, &root)?;
-                        if !source.unchanged(&current) {
+                        if !source.unchanged(&current)
+                            || !ancestors.matches_current(&home, &current.entry.actor)?
+                        {
                             return Err(ActorTranscriptAppendError::InvalidSource);
                         }
                         // This fresh host clock is deliberately AFTER the publication barrier.
