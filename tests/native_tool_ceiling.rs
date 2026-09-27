@@ -23,6 +23,7 @@ enum Case {
     Narrow,
     Legacy,
     Archived,
+    ForcedApproval,
 }
 struct Probe {
     case: Case,
@@ -34,6 +35,7 @@ struct Probe {
     project: bamboo_domain::ProjectId,
     release_child: AtomicBool,
     child_ready: tokio::sync::Notify,
+    reviews: AtomicUsize,
 }
 fn call(name: &str, args: Value) -> (Value, &'static str) {
     (
@@ -122,6 +124,40 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             }
             _ => (json!({"content":"NATIVE_ROOT_COMPLETED"}), "stop"),
         }
+    } else if probe.case == Case::ForcedApproval
+        && body["model"] == "native-root"
+        && body["messages"]
+            .to_string()
+            .contains("parent agent's security reviewer")
+    {
+        // This is the actual off-loop parent model call. RespectSpecificWait
+        // leaves the request pending while its Child is still awaiting review.
+        let path = probe.data.join("sessions/native-root/inbox/new");
+        let files: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let request = files
+            .iter()
+            .find_map(|path| {
+                let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+                let envelope = value.get("body")?;
+                (envelope["body"]["instruction"] == "direct_parent_forced_permission_request_v1")
+                    .then(|| envelope.clone())
+            })
+            .expect("actual durable parent request exists before reviewer provider call");
+        assert_eq!(request["target_session_id"], "native-root");
+        assert_eq!(request["body"]["data"]["reason"], "configured_always_ask");
+        assert_eq!(request["body"]["data"]["parent_session_id"], "native-root");
+        assert!(uuid::Uuid::parse_str(
+            request["body"]["data"]["request_generation"]
+                .as_str()
+                .unwrap()
+        )
+        .is_ok());
+        assert!(!probe.workspace.join("child-write.txt").exists());
+        probe.reviews.fetch_add(1, Ordering::SeqCst);
+        (json!({"content":"DENY"}), "stop")
     } else {
         (json!({"content":"auxiliary response"}), "stop")
     };
@@ -192,6 +228,7 @@ async fn fixture(case: Case) {
         project: project.id.clone(),
         release_child: AtomicBool::new(false),
         child_ready: Default::default(),
+        reviews: AtomicUsize::new(0),
     });
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
@@ -214,6 +251,14 @@ async fn fixture(case: Case) {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     let mut config = json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"native-root"}},"defaults":{"chat":{"provider":"openai","model":"native-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
+    if case == Case::ForcedApproval {
+        let policy = bamboo_tools::permission::PermissionConfig::new();
+        policy.set_ask_rules(["Write(*)".into()]);
+        bamboo_tools::permission::PermissionStorage::new(&data)
+            .save(&policy)
+            .await
+            .unwrap();
+    }
     if case == Case::Narrow {
         config["tools"] = json!({"disabled":["Bash","Edit","Write"]});
     }
@@ -358,7 +403,15 @@ async fn fixture(case: Case) {
             .unwrap()
             .iter()
             .any(|t| t["function"]["name"] == "Write")));
-        if case == Case::Narrow {
+        if case == Case::ForcedApproval {
+            assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
+            assert!(!workspace.join("child-write.txt").exists());
+            let history = child.last().unwrap()["messages"].to_string();
+            assert!(
+                history.contains("Permission denied by host")
+                    || history.contains("denied by parent agent review")
+            );
+        } else if case == Case::Narrow {
             assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
             assert!(!workspace.join("child-write.txt").exists());
             let history = child.last().unwrap()["messages"].to_string();
@@ -384,6 +437,14 @@ async fn fixture(case: Case) {
             .is_none_or(|state| state.waiting_for_children.is_none()));
     }
     drop(host);
+    if case == Case::ForcedApproval {
+        let cold = SessionStoreV2::new(data.clone()).await.unwrap();
+        let parent = cold.load_session("native-root").await.unwrap().unwrap();
+        assert!(parent.messages.iter().any(|message| message
+            .content
+            .contains("requests a forced permission decision")));
+        assert!(!workspace.join("child-write.txt").exists());
+    }
     handle.stop(true).await;
 }
 #[actix_web::test]
@@ -429,4 +490,9 @@ async fn old_worker_capability_report_cannot_admit_native_ceiling() {
         );
         assert!(!marker.exists() && !fabric.exists());
     }
+}
+
+#[actix_web::test]
+async fn actual_child_forced_request_is_durable_before_parent_review() {
+    Box::pin(fixture(Case::ForcedApproval)).await;
 }
