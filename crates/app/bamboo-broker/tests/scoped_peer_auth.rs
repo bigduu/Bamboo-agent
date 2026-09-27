@@ -580,7 +580,9 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     let second = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
-                break current;
+                if current.connection_generation != first.connection_generation {
+                    break current;
+                }
             }
             tokio::task::yield_now().await;
         }
