@@ -1808,6 +1808,20 @@ impl ExternalChildRunner for ActorChildRunner {
                 .native_tool_ceiling
                 .as_ref()
                 .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
+        let local_history_tools = (plain_actor_store.is_none()
+            && required_context.is_some()
+            && crate::session_app::child_session::named_profile::has_named_profile(session)
+            && matches!(spec.placement, Placement::Local)
+            && matches!(spec.executor, ExecutorSpec::BambooRuntime))
+        .then(|| spec.capabilities.native_tool_ceiling.as_ref())
+        .flatten()
+        .filter(|ceiling| {
+            bamboo_subagent::proto::LocalToolMessages::supports_tools(
+                &ceiling.tools,
+                spec.capabilities.read_only_enforced(),
+            )
+        })
+        .map(|ceiling| ceiling.tools.clone());
         if plain_actor_store.is_some() && !readonly_actor {
             self.require_initial_input_release_worker().await?;
             spec.capabilities.initial_input_release_required = true;
@@ -2437,6 +2451,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 } else {
                     None
                 },
+                local_history_tools: local_history_tools.as_deref(),
+                local_history_read_only: spec.capabilities.read_only_enforced(),
                 plain_input: plain_activation.as_ref(),
                 // BrokerChildLink replaces the actual correlation for each Run;
                 // direct legacy WS Terminal frames carry no such identity.
@@ -2600,7 +2616,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // (run_child_spawn saves the session right after we return.)
         match result {
             Ok(Some(text)) => {
-                if !text.is_empty() {
+                if local_history_tools.is_none() && !text.is_empty() {
                     session.add_message(bamboo_agent_core::Message::assistant(text, None));
                 }
                 Ok(())
@@ -3439,6 +3455,362 @@ impl PlainActorActivation {
             .map_err(|error| AgentError::LLM(format!("Actor completion unconfirmed: {error}")))
     }
 }
+fn local_tool_history_unsupported() -> AgentError {
+    AgentError::LLM("local_tool_history_unsupported".into())
+}
+
+#[derive(Default)]
+struct LocalToolCollector {
+    messages: Option<Vec<bamboo_agent_core::Message>>,
+    starts: HashMap<String, String>,
+    outcomes: HashMap<String, (bool, String)>,
+}
+
+impl LocalToolCollector {
+    fn event(&mut self, value: &serde_json::Value) -> Result<bool, AgentError> {
+        use bamboo_subagent::proto::LocalToolMessages;
+        if self.messages.is_some() {
+            return Err(local_tool_history_unsupported());
+        }
+        if value["type"] == LocalToolMessages::TYPE {
+            let observation: LocalToolMessages = serde_json::from_value(value.clone())
+                .map_err(|_| local_tool_history_unsupported())?;
+            self.messages = Some(
+                observation
+                    .validate()
+                    .map_err(|_| local_tool_history_unsupported())?,
+            );
+            return Ok(false);
+        }
+        let event: AgentEvent =
+            serde_json::from_value(value.clone()).map_err(|_| local_tool_history_unsupported())?;
+        match event {
+            AgentEvent::ToolStart {
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                if !matches!(tool_name.as_str(), "Read" | "Glob" | "Write")
+                    || tool_call_id.is_empty()
+                    || tool_call_id.len() > 128
+                    || self.starts.len() >= LocalToolMessages::MAX_PAIRS
+                    || self.outcomes.contains_key(&tool_call_id)
+                    || self.starts.insert(tool_call_id, tool_name).is_some()
+                {
+                    return Err(local_tool_history_unsupported());
+                }
+            }
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => {
+                if !result.images.is_empty() {
+                    return Err(local_tool_history_unsupported());
+                }
+                self.outcome(tool_call_id, result.success, result.result)?;
+            }
+            AgentEvent::ToolError {
+                tool_call_id,
+                error,
+            } => {
+                self.outcome(tool_call_id, false, format!("Error: {error}"))?;
+            }
+            AgentEvent::ToolToken { tool_call_id, .. } => {
+                if !self.starts.contains_key(&tool_call_id)
+                    || self.outcomes.contains_key(&tool_call_id)
+                {
+                    return Err(local_tool_history_unsupported());
+                }
+            }
+            AgentEvent::ToolLifecycle {
+                tool_call_id,
+                tool_name,
+                is_mutating,
+                auto_approved,
+                phase,
+                ..
+            } => {
+                if self.starts.get(&tool_call_id) != Some(&tool_name)
+                    || is_mutating != (tool_name == "Write")
+                    || auto_approved != (tool_name != "Write")
+                    || !matches!(phase.as_str(), "begin" | "finished" | "error" | "cancelled")
+                {
+                    return Err(local_tool_history_unsupported());
+                }
+            }
+            AgentEvent::ReasoningToken { .. }
+            | AgentEvent::ContextSummarized { .. }
+            | AgentEvent::ContextArchived { .. }
+            | AgentEvent::ContextCompressionStatus { .. }
+            | AgentEvent::NeedClarification { .. }
+            | AgentEvent::SubAgentStarted { .. }
+            | AgentEvent::SubAgentEvent { .. } => return Err(local_tool_history_unsupported()),
+            // Worker commit events are observations, not canonical Host commits.
+            AgentEvent::SessionHistoryCommitted { .. } | AgentEvent::MessageAppended { .. } => {
+                return Ok(false)
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn outcome(&mut self, id: String, success: bool, text: String) -> Result<(), AgentError> {
+        if id.is_empty()
+            || id.len() > 128
+            || text.len() > bamboo_subagent::proto::LocalToolMessages::MAX_BYTES
+            || self.outcomes.len() >= bamboo_subagent::proto::LocalToolMessages::MAX_PAIRS
+            || self.outcomes.insert(id, (success, text)).is_some()
+        {
+            return Err(local_tool_history_unsupported());
+        }
+        Ok(())
+    }
+
+    fn suffix(
+        self,
+        host: &Session,
+        tools: &[String],
+        read_only: bool,
+        terminal: Option<&str>,
+    ) -> Result<Vec<bamboo_agent_core::Message>, AgentError> {
+        use bamboo_subagent::proto::LocalToolMessages;
+        let data = self.messages.ok_or_else(local_tool_history_unsupported)?;
+        let candidate: Vec<_> = data.iter().skip_while(|m| m.role == Role::System).collect();
+        let prefix: Vec<_> = host
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .collect();
+        if !host.provider_transcript.groups().is_empty()
+            || candidate.len() <= prefix.len()
+            || serde_json::to_value(&candidate[..prefix.len()])
+                .map_err(|_| local_tool_history_unsupported())?
+                != serde_json::to_value(&prefix).map_err(|_| local_tool_history_unsupported())?
+        {
+            return Err(local_tool_history_unsupported());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut calls = std::collections::HashSet::new();
+        for message in &host.messages {
+            if !ids.insert(message.id.clone()) {
+                return Err(local_tool_history_unsupported());
+            }
+            for call in message.tool_calls.iter().flatten() {
+                calls.insert(call.id.clone());
+            }
+            if let Some(id) = &message.tool_call_id {
+                calls.insert(id.clone());
+            }
+        }
+        let suffix: Vec<_> = candidate[prefix.len()..]
+            .iter()
+            .map(|message| (**message).clone())
+            .collect();
+        let mut pending = HashMap::new();
+        let mut used = std::collections::HashSet::new();
+        for message in &suffix {
+            if !ids.insert(message.id.clone()) || message.never_compress {
+                return Err(local_tool_history_unsupported());
+            }
+            match message.role {
+                Role::Assistant => {
+                    if !pending.is_empty()
+                        || message.metadata.is_some()
+                        || message.tool_call_id.is_some()
+                        || message.tool_success.is_some()
+                    {
+                        return Err(local_tool_history_unsupported());
+                    }
+                    if let Some(batch) = &message.tool_calls {
+                        if batch.is_empty() {
+                            return Err(local_tool_history_unsupported());
+                        }
+                        for call in batch {
+                            if call.id.is_empty()
+                                || call.id.len() > 128
+                                || call.tool_type != "function"
+                                || !calls.insert(call.id.clone())
+                                || calls.len() > LocalToolMessages::MAX_MESSAGES
+                                || !matches!(call.function.name.as_str(), "Read" | "Glob" | "Write")
+                                || !serde_json::from_str::<serde_json::Value>(
+                                    &call.function.arguments,
+                                )
+                                .is_ok_and(|arguments| arguments.is_object())
+                            {
+                                return Err(local_tool_history_unsupported());
+                            }
+                            pending.insert(call.id.clone(), call.function.name.clone());
+                        }
+                    } else if message.content.trim().is_empty() {
+                        return Err(local_tool_history_unsupported());
+                    }
+                }
+                Role::Tool => {
+                    let id = message
+                        .tool_call_id
+                        .as_ref()
+                        .ok_or_else(local_tool_history_unsupported)?;
+                    let name = pending
+                        .remove(id)
+                        .ok_or_else(local_tool_history_unsupported)?;
+                    let success = message
+                        .tool_success
+                        .ok_or_else(local_tool_history_unsupported)?;
+                    if message.tool_calls.is_some()
+                        || message.phase.is_some()
+                        || self.outcomes.get(id) != Some(&(success, message.content.clone()))
+                        || !used.insert(id.clone())
+                        || used.len() > LocalToolMessages::MAX_PAIRS
+                    {
+                        return Err(local_tool_history_unsupported());
+                    }
+                    let denied_write = name == "Write" && (read_only || !tools.contains(&name));
+                    if denied_write {
+                        if success
+                            || !(message.content.contains("native_tool_ceiling_denied")
+                                || message
+                                    .content
+                                    .contains("not callable at the current conversation position"))
+                        {
+                            return Err(local_tool_history_unsupported());
+                        }
+                    } else if !tools.contains(&name) || self.starts.get(id) != Some(&name) {
+                        return Err(local_tool_history_unsupported());
+                    }
+                    if let Some(metadata) = &message.metadata {
+                        let object = metadata
+                            .as_object()
+                            .ok_or_else(local_tool_history_unsupported)?;
+                        if object.len() != 5
+                            || metadata["elapsed_ms"].as_u64().is_none()
+                            || metadata["tool_name"].as_str() != Some(name.as_str())
+                            || metadata["is_mutating"].as_bool() != Some(name == "Write")
+                            || metadata["auto_approved"].as_bool() != Some(name != "Write")
+                            || metadata["success"].as_bool() != Some(success)
+                        {
+                            return Err(local_tool_history_unsupported());
+                        }
+                    }
+                }
+                _ => return Err(local_tool_history_unsupported()),
+            }
+        }
+        let last = suffix.last().ok_or_else(local_tool_history_unsupported)?;
+        if !pending.is_empty()
+            || used.len() != self.outcomes.len()
+            || self.starts.keys().any(|id| !used.contains(id))
+            || last.role != Role::Assistant
+            || last.tool_calls.is_some()
+            || last.phase == Some(bamboo_domain::MessagePhase::Commentary)
+            || terminal != Some(last.content.as_str())
+        {
+            return Err(local_tool_history_unsupported());
+        }
+        Ok(suffix)
+    }
+}
+
+async fn commit_local_tool_history(
+    collector: LocalToolCollector,
+    session: &mut Session,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    selection: (&[String], bool),
+    terminal: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<(), AgentError> {
+    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
+        return Err(local_tool_history_unsupported());
+    }
+    let latest = binding
+        .storage
+        .load_session(&session.id)
+        .await
+        .map_err(|_| local_tool_history_unsupported())?
+        .ok_or_else(local_tool_history_unsupported)?;
+    if latest.id != session.id
+        || latest.kind != session.kind
+        || latest.created_at != session.created_at
+        || latest.root_session_id != session.root_session_id
+        || latest.parent_session_id != session.parent_session_id
+        || latest.spawn_depth != session.spawn_depth
+        || latest.project_id_meta() != session.project_id_meta()
+        || serde_json::to_value(&latest.provider_transcript)
+            .map_err(|_| local_tool_history_unsupported())?
+            != serde_json::to_value(&session.provider_transcript)
+                .map_err(|_| local_tool_history_unsupported())?
+    {
+        return Err(local_tool_history_unsupported());
+    }
+    let suffix = collector.suffix(&latest, selection.0, selection.1, terminal)?;
+    let before = session.clone();
+    let mut staged = session.clone();
+    staged.messages = latest.messages.clone();
+    staged.messages.extend(suffix.iter().cloned());
+    staged.updated_at = chrono::Utc::now();
+    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
+        return Err(local_tool_history_unsupported());
+    }
+    binding
+        .persistence
+        .checkpoint_runtime_session(&mut staged)
+        .await
+        .map_err(|_| local_tool_history_unsupported())?;
+    let saved = binding
+        .storage
+        .load_session(&session.id)
+        .await
+        .map_err(|_| local_tool_history_unsupported())?
+        .ok_or_else(local_tool_history_unsupported)?;
+    if serde_json::to_value(&saved.provider_transcript)
+        .map_err(|_| local_tool_history_unsupported())?
+        != serde_json::to_value(&latest.provider_transcript)
+            .map_err(|_| local_tool_history_unsupported())?
+    {
+        return Err(local_tool_history_unsupported());
+    }
+    let start = saved
+        .messages
+        .iter()
+        .position(|message| message.id == suffix[0].id)
+        .ok_or_else(local_tool_history_unsupported)?;
+    if saved.messages.len() < latest.messages.len()
+        || serde_json::to_value(&saved.messages[..latest.messages.len()])
+            .map_err(|_| local_tool_history_unsupported())?
+            != serde_json::to_value(&latest.messages)
+                .map_err(|_| local_tool_history_unsupported())?
+        || serde_json::to_value(saved.messages.get(start..start + suffix.len()))
+            .map_err(|_| local_tool_history_unsupported())?
+            != serde_json::to_value(Some(&suffix[..]))
+                .map_err(|_| local_tool_history_unsupported())?
+    {
+        return Err(local_tool_history_unsupported());
+    }
+    // Append-safe reconciliation may add a concurrent Host User; it may never
+    // rewrite the validated Host prefix or any worker row being committed.
+    let expected = latest.messages.iter().chain(&suffix);
+    for message in expected {
+        let matches: Vec<_> = saved
+            .messages
+            .iter()
+            .filter(|current| current.id == message.id)
+            .collect();
+        if matches.len() != 1
+            || serde_json::to_value(matches[0]).map_err(|_| local_tool_history_unsupported())?
+                != serde_json::to_value(message).map_err(|_| local_tool_history_unsupported())?
+        {
+            *session = before;
+            return Err(local_tool_history_unsupported());
+        }
+    }
+    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
+        return Err(local_tool_history_unsupported());
+    }
+    staged.messages = saved.messages;
+    *session = staged;
+    Ok(())
+}
+
 #[derive(Default)]
 struct ReadOnlyActorCollector {
     start: Option<(String, serde_json::Value)>,
@@ -3996,6 +4368,8 @@ struct ActorDriveContext<'a> {
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     plain_actor: bool,
     readonly_output: Option<&'a mut Vec<bamboo_agent_core::Message>>,
+    local_history_tools: Option<&'a [String]>,
+    local_history_read_only: bool,
     plain_input: Option<&'a PlainActorActivation>,
     plain_run: Option<(&'a RunSpec, &'a AtomicU64)>,
     first_frame_timeout: Option<Duration>,
@@ -4765,6 +5139,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         first_frame_timeout,
         plain_actor,
         mut readonly_output,
+        local_history_tools,
+        local_history_read_only,
         plain_input,
         plain_run,
     } = context;
@@ -4798,6 +5174,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut readonly = readonly_output
         .as_ref()
         .map(|_| ReadOnlyActorCollector::default());
+    let mut local_history = local_history_tools.map(|_| LocalToolCollector::default());
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -4846,6 +5223,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
+                        if local_history.is_some() {
+                            return Err(local_tool_history_unsupported());
+                        }
                         if event.get("initial_input_control").is_some() {
                             let bamboo_subagent::proto::InitialInputControl::Request { request } =
                                 bamboo_subagent::proto::InitialInputControl::decode(event).map_err(|_| plain_actor_unsupported())?
@@ -4868,6 +5248,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         if expected_creation.is_some() {
                             return Err(AgentError::LLM("worker omitted required Child creation event identity".into()));
                         }
+                        if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE { continue; }
                         if event["type"] == "owned_readonly_transcript" {
                             if plain_actor { return Err(plain_actor_unsupported()); }
                             continue;
@@ -4898,6 +5279,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             expected_source_actor_id,
                             expected_creation,
                         )?;
+                        if local_history.is_some() && batch.first_seq != next_actor_event_seq {
+                            return Err(local_tool_history_unsupported());
+                        }
                         if batch.last_seq < next_actor_event_seq {
                             continue;
                         }
@@ -4919,6 +5303,19 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .min(batch.events.len() as u64) as usize;
                         for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
                             let seq = batch.first_seq + offset as u64;
+                            if let Some(collector) = local_history.as_mut() {
+                                if permission_handshake.is_awaiting() && event["type"] != "permission_posture_activated" {
+                                    return Err(local_tool_history_unsupported());
+                                }
+                                if !collector.event(&event)? {
+                                    next_actor_event_seq = seq.saturating_add(1);
+                                    continue;
+                                }
+                            } else if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
+                                // Completion DATA is private and grants nothing on an unselected route.
+                                next_actor_event_seq = seq.saturating_add(1);
+                                continue;
+                            }
                             let publish = if let Some(collector) = readonly.as_mut() {
                                 if permission_handshake.is_awaiting()
                                     && event["type"] != "permission_posture_activated" {
@@ -5182,6 +5579,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 claim.envelope.id
                             )));
                         }
+                        if status == TerminalStatus::Completed {
+                            if let Some(collector) = local_history.take() {
+                                commit_local_tool_history(
+                                    collector, logical_session,
+                                    session_inbox_runtime.ok_or_else(local_tool_history_unsupported)?,
+                                    activation_run_id.ok_or_else(local_tool_history_unsupported)?,
+                                    (local_history_tools.ok_or_else(local_tool_history_unsupported)?, local_history_read_only),
+                                    result.as_deref(), cancel_token,
+                                ).await?;
+                            }
+                        }
                         if let Some(collector) = readonly.take() {
                             if status == TerminalStatus::Completed {
                                 let activation = plain_input.ok_or_else(plain_actor_unsupported)?;
@@ -5407,6 +5815,522 @@ mod tests {
     use super::*;
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
+
+    fn local_tool_sample(
+        host: &Session,
+        denied_write: bool,
+    ) -> (LocalToolCollector, Vec<bamboo_agent_core::Message>) {
+        use bamboo_agent_core::{FunctionCall, Message, ToolCall};
+        let calls = ["Read", "Write"]
+            .map(|name| ToolCall {
+                id: format!("local-{name}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: "{\"file_path\":\"answer.txt\"}".into(),
+                },
+            })
+            .to_vec();
+        let mut rows = vec![Message::assistant("checking", Some(calls))];
+        let mut collector = LocalToolCollector::default();
+        for name in ["Read", "Write"] {
+            let denied = name == "Write" && denied_write;
+            let id = format!("local-{name}");
+            if !denied {
+                collector
+                    .event(
+                        &serde_json::to_value(AgentEvent::ToolStart {
+                            tool_call_id: id.clone(),
+                            tool_name: name.into(),
+                            arguments: serde_json::json!({"file_path":"answer.txt"}),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let text = if denied {
+                "Error: native_tool_ceiling_denied: Write"
+            } else {
+                "actual file result"
+            };
+            let mut message = Message::tool_result_with_status(id.clone(), text, !denied);
+            message.metadata = Some(serde_json::json!({"elapsed_ms":7,"tool_name":name,
+                "is_mutating":name == "Write","auto_approved":name != "Write","success":!denied}));
+            rows.push(message);
+            let event = if denied {
+                AgentEvent::ToolError {
+                    tool_call_id: id,
+                    error: "native_tool_ceiling_denied: Write".into(),
+                }
+            } else {
+                AgentEvent::ToolComplete {
+                    tool_call_id: id,
+                    result: bamboo_agent_core::tools::ToolResult::text(true, text),
+                }
+            };
+            collector
+                .event(&serde_json::to_value(event).unwrap())
+                .unwrap();
+        }
+        rows.push(Message::assistant("complete exact report", None));
+        let mut messages = host.messages.clone();
+        if let Some(system) = messages
+            .iter_mut()
+            .find(|message| message.role == Role::System)
+        {
+            system.content = "worker-private system never imported".into();
+        }
+        messages.extend(rows.iter().cloned());
+        let data = bamboo_subagent::proto::LocalToolMessages::Complete {
+            version: 1,
+            messages: messages
+                .iter()
+                .map(|message| serde_json::to_value(message).unwrap())
+                .collect(),
+        };
+        assert!(!collector
+            .event(&serde_json::to_value(data).unwrap())
+            .unwrap());
+        (collector, rows)
+    }
+
+    #[test]
+    fn local_tool_suffix_preserves_full_current_prefix_and_rejects_authority_or_collisions() {
+        let mut host = Session::new("tool-history-prefix", "model");
+        host.messages
+            .push(bamboo_agent_core::Message::user("assignment"));
+        let mut confirmed = bamboo_agent_core::Message::user("confirmed during Run");
+        confirmed.metadata = Some(
+            serde_json::json!({"session_message":{"id":confirmed.id,"target_session_id":host.id}}),
+        );
+        host.messages.push(confirmed);
+        let tools = vec!["Read".into(), "Write".into()];
+        let (good, rows) = local_tool_sample(&host, false);
+        assert_eq!(
+            serde_json::to_value(
+                good.suffix(&host, &tools, false, Some("complete exact report"))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        for case in [
+            "missing",
+            "changed",
+            "metadata",
+            "system",
+            "user",
+            "collision",
+            "dangling",
+            "result",
+            "terminal",
+            "tool_metadata",
+            "grant",
+            "ledger",
+        ] {
+            let (mut collector, _) = local_tool_sample(&host, false);
+            let mut current = host.clone();
+            let messages = collector.messages.as_mut().unwrap();
+            match case {
+                "missing" => {
+                    messages.remove(host.messages.len() - 1);
+                }
+                "changed" => messages[0].content.push('!'),
+                "metadata" => messages[1].metadata = None,
+                "system" => messages.last_mut().unwrap().role = Role::System,
+                "user" => messages.last_mut().unwrap().role = Role::User,
+                "collision" => messages.last_mut().unwrap().id = host.messages[0].id.clone(),
+                "dangling" => {
+                    messages[host.messages.len() + 1].tool_call_id = Some("foreign".into())
+                }
+                "result" => messages[host.messages.len() + 1].content.push('!'),
+                "tool_metadata" => {
+                    messages[host.messages.len() + 1].metadata.as_mut().unwrap()["permission"] =
+                        true.into()
+                }
+                "grant" => {
+                    messages[host.messages.len()].tool_calls.as_mut().unwrap()[0]
+                        .function
+                        .name = "Bash".into()
+                }
+                "ledger" => {
+                    current.append_provider_transcript_group(current.messages[0].id.clone(), None, vec![
+                        bamboo_domain::session::provider_transcript::ProviderTranscriptItem::try_from_payload(
+                            bamboo_domain::ProviderFamily::OpenAi,
+                            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                            bamboo_domain::session::provider_transcript::ProviderTranscriptOrigin::HostToolSearch,
+                            bamboo_domain::session::provider_transcript::ProviderTranscriptAuthor::ToolResult,
+                            serde_json::json!({"type":"tool_search_output","execution":"client","call_id":"search","status":"completed","tools":[]}),
+                        ).unwrap(),
+                    ]).unwrap();
+                }
+                "terminal" => {}
+                _ => unreachable!(),
+            }
+            let terminal = if case == "terminal" {
+                "different"
+            } else {
+                "complete exact report"
+            };
+            assert!(
+                collector
+                    .suffix(&current, &tools, false, Some(terminal))
+                    .is_err(),
+                "{case}"
+            );
+        }
+        let (denied, _) = local_tool_sample(&host, true);
+        assert!(denied
+            .suffix(&host, &["Read".into()], true, Some("complete exact report"))
+            .is_ok());
+        let (successful, _) = local_tool_sample(&host, false);
+        assert!(successful
+            .suffix(&host, &["Read".into()], true, Some("complete exact report"))
+            .is_err());
+        let mut empty = LocalToolCollector::default();
+        assert!(empty
+            .event(
+                &serde_json::to_value(AgentEvent::ReasoningToken {
+                    content: "private".into()
+                })
+                .unwrap()
+            )
+            .is_err());
+        let (mut completed, _) = local_tool_sample(&host, false);
+        assert!(completed.event(&serde_json::json!({"type":"local_client_tool_messages_v1","version":1,"messages":[]})).is_err());
+    }
+
+    struct LocalToolConcurrentCheckpoint {
+        real: SessionInboxRuntimeBinding,
+        claim: SessionInboxClaim,
+    }
+    #[async_trait]
+    impl RuntimeSessionPersistence for LocalToolConcurrentCheckpoint {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.real.persistence.save_runtime_session(session).await
+        }
+        async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            // A real canonical admission wins after validation, before the
+            // final append-safe checkpoint acquires its serialization lock.
+            let mut latest = self.real.storage.load_session(&session.id).await?.unwrap();
+            checkpoint_and_ack_canonical_claim(&self.real, &mut latest, &self.claim)
+                .await
+                .map_err(|_| std::io::Error::other("concurrent admission failed"))?;
+            self.real
+                .persistence
+                .checkpoint_runtime_session(session)
+                .await
+        }
+        async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.real.storage.load_session(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn local_tool_history_checkpoint_preserves_confirmed_input_and_cold_pairs_or_refuses() {
+        for case in [
+            "success",
+            "concurrent_input",
+            "checkpoint_error",
+            "stale_prefix",
+            "cancelled",
+            "lost_owner",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("local-tool-root", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child("local-tool-child", &root.id, "model", "child");
+            let mut system = bamboo_agent_core::Message::user("Host-owned immutable System");
+            system.role = Role::System;
+            child.messages.push(system);
+            child
+                .messages
+                .push(bamboo_agent_core::Message::user("assignment"));
+            store.save_session(&child).await.unwrap();
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+            let binding = actor_binding(store.clone(), inbox.clone(), locked.clone());
+            let mut owner = Some(
+                binding
+                    .router
+                    .register_run(&child.id, "current-run")
+                    .await
+                    .unwrap(),
+            );
+            let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+                &child.id,
+                "current confirmed User",
+            );
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            let claim = inbox.claim(&child.id, 1).await.unwrap().remove(0);
+            checkpoint_and_ack_canonical_claim(&binding, &mut child, &claim)
+                .await
+                .unwrap();
+            assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+            let before = serde_json::to_value(&child).unwrap();
+            let (collector, rows) = local_tool_sample(&child, false);
+            let mut binding = binding;
+            let late = bamboo_domain::SessionMessageEnvelope::user_input(
+                &child.id,
+                "concurrent confirmed User",
+            );
+            if case == "concurrent_input" {
+                let receipt = inbox.deliver(&late).await.unwrap();
+                inbox
+                    .mark_activation_eligible(
+                        &child.id,
+                        receipt.generation,
+                        bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+                let late_claim = inbox.claim(&child.id, 1).await.unwrap().remove(0);
+                binding.persistence = Arc::new(LocalToolConcurrentCheckpoint {
+                    real: actor_binding(store.clone(), inbox.clone(), locked.clone()),
+                    claim: late_claim,
+                });
+            }
+            if case == "checkpoint_error" {
+                binding.persistence = Arc::new(ActorFaultingPersistence {
+                    inner: locked.clone(),
+                    fail_checkpoint_once: AtomicBool::new(true),
+                });
+            }
+            if case == "stale_prefix" {
+                let mut latest = child.clone();
+                latest
+                    .messages
+                    .push(bamboo_agent_core::Message::user("new confirmed prefix"));
+                store.save_session(&latest).await.unwrap();
+            }
+            let cancel = CancellationToken::new();
+            if case == "cancelled" {
+                cancel.cancel();
+            }
+            if case == "lost_owner" {
+                owner.take().unwrap().abandon().await;
+            }
+            let durable_before =
+                serde_json::to_value(store.load_session(&child.id).await.unwrap()).unwrap();
+            let result = commit_local_tool_history(
+                collector,
+                &mut child,
+                &binding,
+                "current-run",
+                (&["Read".into(), "Write".into()], false),
+                Some("complete exact report"),
+                &cancel,
+            )
+            .await;
+            let cold = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap()
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if !matches!(case, "success" | "concurrent_input") {
+                assert!(result.is_err(), "{case}");
+                assert_eq!(
+                    serde_json::to_value(&child).unwrap(),
+                    before,
+                    "{case}: no partial mutable success"
+                );
+                assert_eq!(
+                    serde_json::to_value(Some(&cold)).unwrap(),
+                    durable_before,
+                    "{case}: no write"
+                );
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(
+                serde_json::to_value(&cold.messages[..3]).unwrap(),
+                before["messages"]
+            );
+            let suffix_start = if case == "concurrent_input" {
+                assert!(inbox.was_admitted(&child.id, &late.id).await.unwrap());
+                assert_eq!(
+                    serde_json::to_value(&cold.messages[3]).unwrap(),
+                    serde_json::to_value(late.to_provider_message().unwrap()).unwrap()
+                );
+                assert!(child
+                    .messages
+                    .iter()
+                    .any(|message| message.id == late.id.as_str()));
+                4
+            } else {
+                3
+            };
+            assert_eq!(
+                serde_json::to_value(&cold.messages[suffix_start..]).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|message| message.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|message| message.content == "complete exact report")
+                    .count(),
+                1
+            );
+            assert_eq!(cold.metadata, child.metadata);
+            assert!(cold.provider_transcript.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_tool_completion_requires_current_ordered_batch_and_never_falls_back_to_text() {
+        for case in [
+            "legacy",
+            "missing",
+            "gap",
+            "duplicate",
+            "epoch",
+            "source",
+            "birth",
+            "qos",
+        ] {
+            let mut session = Session::new_child("frame-child", "frame-root", "model", "child");
+            session
+                .messages
+                .push(bamboo_agent_core::Message::user("original"));
+            let before = serde_json::to_value(&session).unwrap();
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: session.created_at,
+                spawn_depth: session.spawn_depth,
+            };
+            let mut messages = session.messages.clone();
+            messages.push(bamboo_agent_core::Message::assistant("complete", None));
+            let event = serde_json::to_value(bamboo_subagent::proto::LocalToolMessages::Complete {
+                version: 1,
+                messages: messages
+                    .iter()
+                    .map(|message| serde_json::to_value(message).unwrap())
+                    .collect(),
+            })
+            .unwrap();
+            let mut batch = ActorEventBatch {
+                logical_session: Some(LogicalSessionIdentity {
+                    session_id: session.id.clone(),
+                    parent_session_id: session.parent_session_id.clone(),
+                    root_session_id: session.root_session_id.clone(),
+                    creation: Some(creation.clone()),
+                }),
+                activation_id: Some("current".into()),
+                execution_epoch: 7,
+                source_node_id: None,
+                source_actor_id: Some("selected".into()),
+                first_seq: 1,
+                last_seq: 1,
+                qos: bamboo_subagent::proto::ActorEventQos::Durable,
+                events: vec![event.clone()],
+            };
+            match case {
+                "gap" => {
+                    batch.first_seq = 2;
+                    batch.last_seq = 2;
+                }
+                "epoch" => batch.execution_epoch = 6,
+                "source" => batch.source_actor_id = Some("replaced".into()),
+                "birth" => {
+                    batch
+                        .logical_session
+                        .as_mut()
+                        .unwrap()
+                        .creation
+                        .as_mut()
+                        .unwrap()
+                        .created_at += chrono::Duration::nanoseconds(1)
+                }
+                "qos" => batch.qos = bamboo_subagent::proto::ActorEventQos::Ephemeral,
+                _ => {}
+            }
+            let terminal = ChildFrame::Terminal {
+                status: TerminalStatus::Completed,
+                result: Some("complete".into()),
+                error: None,
+                transcript: vec![],
+            };
+            let frames = match case {
+                "legacy" => vec![ChildFrame::Event { event }, terminal],
+                "missing" => vec![terminal],
+                "duplicate" => vec![
+                    ChildFrame::EventBatch {
+                        batch: batch.clone(),
+                    },
+                    ChildFrame::EventBatch { batch },
+                    terminal,
+                ],
+                _ => vec![ChildFrame::EventBatch { batch }, terminal],
+            };
+            let mut link = ConfirmationSequenceLink {
+                frames: frames.into(),
+                sent: vec![],
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let (_live, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let tools = vec!["Read".into()];
+            let outcome = drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: "frame-root",
+                child_session_id: "frame-child",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut session,
+                expected_permission_posture: None,
+                expected_creation: Some(&creation),
+                session_inbox_runtime: None,
+                activation_run_id: Some("current"),
+                execution_epoch: 7,
+                expected_source_actor_id: "selected",
+                initial_inflight_claims: vec![].into(),
+                plain_actor: false,
+                readonly_output: None,
+                local_history_tools: Some(&tools),
+                local_history_read_only: true,
+                plain_input: None,
+                plain_run: None,
+                first_frame_timeout: Some(Duration::from_secs(1)),
+            })
+            .await;
+            assert!(outcome.is_err(), "{case}: no last-text success fallback");
+            assert_eq!(serde_json::to_value(&session).unwrap(), before, "{case}");
+            assert!(link.sent.is_empty());
+            assert!(rx.try_recv().is_err(), "DATA must never enter public feed");
+        }
+    }
 
     fn processless_pool_worker(mailbox_id: &str) -> PooledWorker {
         PooledWorker {
@@ -7660,6 +8584,8 @@ mod tests {
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
             readonly_output: None,
+            local_history_tools: None,
+            local_history_read_only: false,
             plain_input: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
@@ -8863,6 +9789,8 @@ mod tests {
             initial_inflight_claims: claims,
             plain_actor: false,
             readonly_output: None,
+            local_history_tools: None,
+            local_history_read_only: false,
             plain_input: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
@@ -9875,6 +10803,8 @@ mod tests {
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
                 readonly_output: None,
+                local_history_tools: None,
+                local_history_read_only: false,
                 plain_input: None,
                 plain_run: None,
                 first_frame_timeout: None,
@@ -9944,6 +10874,8 @@ mod tests {
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
                 readonly_output: None,
+                local_history_tools: None,
+                local_history_read_only: false,
                 plain_input: None,
                 plain_run: None,
                 first_frame_timeout: None,
@@ -10010,6 +10942,8 @@ mod tests {
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
             readonly_output: None,
+            local_history_tools: None,
+            local_history_read_only: false,
             plain_input: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(100)),
@@ -10054,6 +10988,8 @@ mod tests {
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
             readonly_output: None,
+            local_history_tools: None,
+            local_history_read_only: false,
             plain_input: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(50)),

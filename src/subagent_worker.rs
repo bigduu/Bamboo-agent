@@ -380,6 +380,7 @@ pub struct BambooRuntimeExecutor {
     required_child_context: bool,
     child_creation_identity: bool,
     native_tool_ceiling: Option<bamboo_subagent::proto::NativeToolCeiling>,
+    local_tool_history: bool,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -916,6 +917,21 @@ impl BambooRuntimeExecutor {
             required_child_context: spec.capabilities.required_child_context,
             child_creation_identity: spec.capabilities.child_creation_identity,
             native_tool_ceiling: spec.capabilities.native_tool_ceiling.clone(),
+            local_tool_history: matches!(
+                spec.placement,
+                bamboo_subagent::provision::Placement::Local
+            ) && spec.capabilities.required_child_context
+                && !spec.capabilities.initial_input_release_required
+                && spec
+                    .capabilities
+                    .native_tool_ceiling
+                    .as_ref()
+                    .is_some_and(|ceiling| {
+                        bamboo_subagent::proto::LocalToolMessages::supports_tools(
+                            &ceiling.tools,
+                            spec.capabilities.read_only_enforced(),
+                        )
+                    }),
             permission_config,
             no_human_review,
             child_runner,
@@ -2072,6 +2088,18 @@ impl ChildExecutor for BambooRuntimeExecutor {
 
         match result {
             Ok(()) => {
+                if self.local_tool_history {
+                    let observation = match local_tool_completion(&session) {
+                        Ok(observation) => observation,
+                        Err(error) => return ChildOutcome::error(error),
+                    };
+                    tail_events
+                        .emit(
+                            serde_json::to_value(observation)
+                                .expect("validated local completion DATA"),
+                        )
+                        .await;
+                }
                 if readonly_tail {
                     // The Host alone selects the owned route. An ordinary
                     // strict Glob worker retains its original completion if
@@ -2108,6 +2136,25 @@ impl ChildExecutor for BambooRuntimeExecutor {
             Err(e) => ChildOutcome::error(e.to_string()),
         }
     }
+}
+
+fn local_tool_completion(
+    session: &Session,
+) -> Result<bamboo_subagent::proto::LocalToolMessages, &'static str> {
+    if !session.provider_transcript.groups().is_empty() {
+        return Err("local_tool_history_unsupported");
+    }
+    let observation = bamboo_subagent::proto::LocalToolMessages::Complete {
+        version: 1,
+        messages: session
+            .messages
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(|_| "local_tool_history_unsupported")?,
+    };
+    observation.validate()?;
+    Ok(observation)
 }
 
 /// Remove sibling actor storage directories whose last modification is older
@@ -2194,6 +2241,33 @@ mod tests {
     use bamboo_subagent::executor::ExecutorControl;
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+
+    #[test]
+    fn local_completion_preserves_message_data_and_refuses_provider_state() {
+        let mut session = Session::new("local-completion", "model");
+        session.add_message(Message::user("full canonical input"));
+        session.add_message(Message::assistant("complete", None));
+        let before = serde_json::to_value(&session).unwrap();
+        let data = local_tool_completion(&session).unwrap();
+        assert_eq!(
+            serde_json::to_value(data.validate().unwrap()).unwrap(),
+            before["messages"]
+        );
+        session.append_provider_transcript_group(session.messages[0].id.clone(), None, vec![
+            bamboo_domain::session::provider_transcript::ProviderTranscriptItem::try_from_payload(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                bamboo_domain::session::provider_transcript::ProviderTranscriptOrigin::HostToolSearch,
+                bamboo_domain::session::provider_transcript::ProviderTranscriptAuthor::ToolResult,
+                serde_json::json!({"type":"tool_search_output","execution":"client","call_id":"search","status":"completed","tools":[]}),
+            ).unwrap(),
+        ]).unwrap();
+        assert!(local_tool_completion(&session).is_err());
+        session.provider_transcript = Default::default();
+        session.messages.last_mut().unwrap().reasoning_signature = Some("opaque".into());
+        assert!(local_tool_completion(&session).is_err());
+        assert_eq!(session.messages[0].content, "full canonical input");
+    }
 
     #[test]
     fn read_only_worker_keeps_plan_audit_but_uses_no_shell_authorization() {
@@ -2350,6 +2424,7 @@ mod tests {
             required_child_context: false,
             child_creation_identity: false,
             native_tool_ceiling: None,
+            local_tool_history: false,
             permission_config: None,
             no_human_review: None,
             child_runner: None,
