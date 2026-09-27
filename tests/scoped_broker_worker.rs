@@ -1,5 +1,6 @@
 //! Actual CLI broker + compiled BambooRuntime worker/provider over trusted WSS.
 use actix_web::{web, App, HttpResponse, HttpServer};
+use bamboo_agent_core::storage::Storage;
 use bamboo_broker::{client_config_trusting_cert, BrokerClient, BrokerStreamEvent};
 use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{
@@ -253,7 +254,7 @@ async fn fixture() {
         .args(["--id", "worker-native", "--spec-stdin", "--tls-ca-cert"])
         .arg(&cert)
         .env("BAMBOO_BROKER_TOKEN", WORKER);
-    let _worker = spawn(
+    let mut _worker = spawn(
         c,
         Some(spec.to_json().unwrap().into_bytes()),
         &dir.join("worker.log"),
@@ -371,6 +372,8 @@ async fn fixture() {
         .contains("AUTH_NATIVE_REPLY"));
     assert!(events > 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    _worker.0.kill().unwrap();
+    _worker.0.wait().unwrap();
     drop(_worker);
     let cold = SessionStoreV2::new(worker_cache.clone()).await.unwrap();
     let cached = cold.load_session("native-child").await.unwrap().unwrap();
