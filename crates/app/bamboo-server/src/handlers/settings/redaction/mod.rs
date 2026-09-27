@@ -309,7 +309,7 @@ pub(crate) fn preserve_remote_broker_echo(
 ) -> Result<(), &'static str> {
     let denied = "remote broker routes must be configured by the operator";
     let has_strict = current
-        .subagents
+        .subagents()
         .remote_placements
         .iter()
         .any(|row| row.broker_peer.is_some());
@@ -434,7 +434,7 @@ mod remote_broker_redaction_tests {
             preserve_remote_broker_echo(&Config::default(), &mut patch).unwrap();
         }
         let mut legacy = config.clone();
-        legacy.subagents.remote_placements.remove(0);
+        legacy.subagents_mut().remote_placements.remove(0);
         let mut legacy_clear = serde_json::json!({"subagents":{"remote_placements":null}})
             .as_object()
             .unwrap()

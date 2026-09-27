@@ -564,7 +564,7 @@ async fn fixture() {
             .is_client_error());
         let saved = bamboo_config::Config::from_data_dir_without_env(Some(data.clone()));
         assert_eq!(
-            serde_json::to_value(&saved.subagents.remote_placements).unwrap(),
+            serde_json::to_value(&saved.subagents().remote_placements).unwrap(),
             config["subagents"]["remote_placements"]
         );
     }
@@ -578,7 +578,7 @@ async fn fixture() {
         .is_success());
     let saved = bamboo_config::Config::from_data_dir_without_env(Some(data.clone()));
     assert_eq!(
-        serde_json::to_value(&saved.subagents.remote_placements).unwrap(),
+        serde_json::to_value(&saved.subagents().remote_placements).unwrap(),
         config["subagents"]["remote_placements"]
     );
     turn(&client, &base, &p, 1, 0).await;
