@@ -758,6 +758,8 @@ impl AppState {
             crate::app_state::parent_approval_reviewer::ParentAgentApprovalReviewer::new(
                 session_repo.clone(),
                 provider_router.clone(),
+                session_messenger.clone(),
+                project_store.clone(),
             ),
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());

@@ -6714,6 +6714,7 @@ mod live_reload_tests {
         state.fabric_deployer.registry().lock().await.insert(
             key,
             bamboo_server_tools::Deployed {
+                actor: None,
                 env: "test".to_string(),
                 handle: bamboo_broker::DeployedAgent::from_parts(worker_id, child, None),
             },

@@ -45,6 +45,9 @@ use bamboo_domain::{
     SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
+mod actor_checkpoint_lineage;
+#[cfg(test)]
+mod actor_checkpoint_lineage_tests;
 mod actor_directory;
 mod actor_input;
 // A private observation port, deliberately without an acting caller.

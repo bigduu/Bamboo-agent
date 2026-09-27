@@ -56,6 +56,7 @@ impl Drop for SynchronousLaunchGuard {
     }
 }
 
+use crate::sub_agent_facade::{self as facade, Projection};
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::ReasoningEffort;
@@ -640,9 +641,7 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
 pub fn subagent_tool_description() -> &'static str {
-    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context and only the tools and permissions exposed to it by the runtime, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
-PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
-Use list/get to inspect existing children; plain get returns metadata, get with view=messages returns bounded transcript pages, view=result returns UTF-8 slices of the child's last assistant answer, and view=error reads the last run error. Follow next_cursor for more; view=message with message_id reads a selected message in slices. Use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+    facade::description()
 }
 
 /// The `SubAgent` parameters schema. Exposed standalone (mirroring
@@ -650,153 +649,7 @@ Use list/get to inspect existing children; plain get returns metadata, get with 
 /// the IDENTICAL schema to its own LLM — no drift between the real tool and the
 /// proxy.
 pub fn subagent_parameters_schema() -> serde_json::Value {
-    let mut schema = json!({
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_models"],
-                "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_models to enumerate the models you can pin a child to via create.model. \
-        A create call requires: title, responsibility, and prompt (workspace is optional and defaults to the parent's workspace). EXAMPLE create: {\"action\":\"create\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
-            },
-            "child_session_id": {
-                "type": "string",
-                "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
-            },
-            "view": {
-                "type": "string",
-                "enum": ["overview", "messages", "message", "result", "error", "result_binding", "typed_result"],
-                "description": "For get: overview (default) is metadata only; messages returns bounded transcript previews; message reads one selected message; result reads the child's latest assistant answer; error reads the last run error. Content views return UTF-8 slices with next_cursor. Required-packet result_binding discovers host birth/digest selectors; typed_result requires both selectors and returns a strict child-reported JSON report separately from durable snapshot observations (not verified evidence or a run receipt)."
-            },
-            "cursor": {
-                "type": "string",
-                "description": "For get: opaque next_cursor from the prior page or content slice. A reset or rewrite of the selected transcript invalidates it."
-            },
-            "message_id": {
-                "type": "string",
-                "description": "For get with view=message: message_id from a messages page."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 16,
-                "description": "For get with view=messages: previews per page, default 8, capped at 16."
-            },
-            "max_bytes": {
-                "type": "integer",
-                "minimum": 4,
-                "maximum": 8192,
-                "description": "For get with view=message, result, or error: maximum UTF-8 content bytes per slice, default 4096, capped at 8192."
-            },
-            "child_session_ids": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "For wait: optional explicit subset of child sessions to wait on. Omit to wait on every currently-active child."
-            },
-            "wait_for": {
-                "type": "string",
-                "enum": ["all", "any", "first_error"],
-                "description": "For wait: resume policy. all (default) resumes when every tracked child is done; any resumes on the first; first_error resumes early on any error/timeout/cancel."
-            },
-            "wait": {
-                "type": "boolean",
-                "description": "For create: if true, suspend immediately and wait for just THIS child (legacy one-shot behavior). Defaults to false — create returns immediately and the child runs in the background; suspend later with action=wait."
-            },
-            "title": {
-                "type": "string",
-                "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-agents panel."
-            },
-            "description": {
-                "type": "string",
-                "description": "Legacy alias of title; prefer title."
-            },
-            "responsibility": {
-                "type": "string",
-                "description": "Single explicit responsibility for the child session. Required for create. Keep this narrow and non-overlapping with other child sessions."
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Detailed task instructions, context, constraints, and expected output for the child session. Required for create; optional for update."
-            },
-            "subagent_type": {
-                "type": "string",
-                "description": "For create: exact validated named profile from the Session's safe named-agent catalog. Known names apply private role instructions, model hint and narrower native tools on a fresh local worker; explorer/reviewer are read-only. Unknown names retain legacy routing/display behavior. Invalid or unavailable catalog authority is rejected; private prompts are never published here."
-            },
-            "workspace": {
-                "type": "string",
-                "description": "For create: absolute path to the child session's working directory for file operations. Optional — defaults to the parent session's workspace when omitted."
-            },
-            "auto_run": {
-                "type": "boolean",
-                "description": "For create/send_message/update: whether to enqueue the child session immediately. Defaults to true for create/send_message and false for update."
-            },
-            "fork_last_messages": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "For create: model-controllable context fork. When > 0, the last N messages of YOUR (the parent's) conversation are carried into the child's task brief as a 'Forked context from parent' block, so the child starts with the recent context it needs. Omit/0 (default) gives the child a clean, freshly-seeded context. Use a small N (e.g. 2-6) to share just the immediately relevant turns; omit it when the task brief is already self-contained."
-            },
-            "context_packet": {
-                "type": "object", "additionalProperties": false,
-                "description": "Opt-in fresh built-in local one-shot context. Required text is complete or rejected before child creation (16KiB required, 24KiB escaped assignment, 32KiB input, 2048 bytes per line). Optional selected background is omitted whole (8 entries/4KiB) and counted. Message IDs refer to this durable parent's messages. This content never grants tools or permissions; omit for legacy behavior.",
-                "required": ["version", "objective", "constraints", "acceptance", "non_goals", "necessary_user_instructions", "recorded_decisions"],
-                "properties": {
-                    "version": {"type": "integer", "enum": [1]},
-                    "objective": {"type": "string"},
-                    "constraints": {"type": "array", "items": {"type": "string"}},
-                    "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-                    "non_goals": {"type": "array", "items": {"type": "string"}},
-                    "necessary_user_instructions": {"type": "array", "items": {"type": "string"}},
-                    "recorded_decisions": {"type": "array", "items": {"type": "string"}},
-                    "source_user_message_ids": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
-                    "background_message_ids": {"type": "array", "maxItems": 64, "items": {"type": "string"}}
-                }
-            },
-            "reset_after_update": {
-                "type": "boolean",
-                "description": "For update: whether to truncate messages after refreshed assignment. Defaults to true."
-            },
-            "reset_to_last_user": {
-                "type": "boolean",
-                "description": "For run: whether to truncate messages after the last user message before rerun. Defaults to true."
-            },
-            "message": {
-                "type": "string",
-                "description": "Follow-up instruction to append as a new user message for send_message. Required for send_message."
-            },
-            "interrupt_running": {
-                "type": "boolean",
-                "description": "For send_message/cancel: if true, cancel a currently running child session before appending or returning. Defaults to false for send_message. When false on a running child, the message is queued and will be picked up at the next turn boundary without canceling progress."
-            },
-            "reasoning_effort": {
-                "type": "string",
-                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
-                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"none\" to explicitly disable reasoning on models that support it, \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, and \"xhigh\"/\"max\" for deep reasoning tasks. Omit to use the selected sub-agent model preference, then the provider default; the child does NOT inherit the parent's reasoning_effort."
-            },
-            "model": {
-                "type": "string",
-                "description": "For create/update: explicit model as 'provider:model', or a bare model id to use the parent's provider. On create it takes precedence over a named-profile hint and legacy role routing. Unknown/legacy children retain in-place updates. A bound known profile freezes its role, initial assignment, model and effort; create a new Child to change that contract, or use send_message for additive steering. Call list_models to see available models."
-            },
-            "lifecycle": {
-                "type": "string",
-                "enum": ["oneshot", "resident"],
-                "description": "For create: 'oneshot' (default) spins up a fresh throwaway child for this task. 'resident' reuses ONE long-lived agent (identified by 'name', scoped to this conversation) across many tasks — the first resident create spins it up, later creates with the same name route the new task to that same agent instead of spawning another. Use resident for recurring task types (e.g. an 'essayist' that writes many essays — one agent, one panel entry, not N); use oneshot for independent throwaway work."
-            },
-            "name": {
-                "type": "string",
-                "description": "For create with lifecycle=resident: the resident agent's stable reuse key, e.g. 'essayist'. Required to reuse a resident; defaults to subagent_type when omitted. Reusing the same name routes the new task to the existing resident agent."
-            },
-            "context": {
-                "type": "string",
-                "enum": ["reset", "accumulate"],
-                "description": "For create with lifecycle=resident: how the resident treats prior tasks. 'reset' (default) makes each task independent (clears prior context). 'accumulate' makes the agent remember earlier tasks (useful for a researcher building up knowledge). Set on first create; honored on reuse."
-            }
-        },
-        "required": ["action"],
-        "additionalProperties": false
-    });
-    schema["properties"]["expected_child_created_at"] = json!({"type":"string", "description":"Only get view=typed_result: exact RFC3339 Child birth from context_packet create output or result_binding."});
-    schema["properties"]["expected_assignment_sha256"] = json!({"type":"string", "description":"Only get view=typed_result: exact 64 lowercase hex assignment digest from the same discovery."});
-    schema
+    facade::parameters_schema()
 }
 
 #[async_trait]
@@ -818,6 +671,15 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        let normalized = facade::normalize(args)?;
+        let args = normalized.args;
+        let projection = normalized.projection;
+        if projection == Some(Projection::Tree) {
+            let parent_id = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("SubAgent requires a current session".into())
+            })?;
+            return facade::inspect_tree(self.sessions.as_ref(), parent_id).await;
+        }
         // The owner outlives a cancelled caller so an in-flight registration or
         // delivery can be resolved. The gate prevents a new launch when the
         // caller's cancellation wins before entering the scheduler or Inbox
@@ -842,18 +704,18 @@ impl Tool for SubAgentTool {
                 gate: gate.clone(),
                 armed: true,
             };
-            let result =
-                tokio::spawn(
-                    async move { Box::pin(owner.invoke_inner(args, ctx, Some(gate))).await },
-                )
-                .await
-                .map_err(|error| {
-                    ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
-                })?;
+            let result = tokio::spawn(async move {
+                Box::pin(owner.invoke_inner(args, ctx, Some(gate), projection.is_some())).await
+            })
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
+            })?;
             cancel_on_drop.armed = false;
-            return result;
+            return facade::finish(projection, result);
         }
-        Box::pin(self.invoke_inner(args, ctx, None)).await
+        let result = Box::pin(self.invoke_inner(args, ctx, None, projection.is_some())).await;
+        facade::finish(projection, result)
     }
 }
 
@@ -863,6 +725,7 @@ impl SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
         launch_gate: Option<Arc<LaunchGate>>,
+        compact: bool,
     ) -> Result<ToolOutcome, ToolError> {
         if launch_gate.as_ref().is_some_and(|gate| gate.is_cancelled()) {
             return Err(tool_error_from_child_session(cancelled_launch_error()));
@@ -1083,7 +946,14 @@ impl SubAgentTool {
                 }
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
-                let prompt = normalize_required_text(Some(prompt), "prompt")?;
+                let prompt = if compact {
+                    if prompt.trim().is_empty() {
+                        return Err(ToolError::InvalidArguments("message must be non-empty".into()));
+                    }
+                    prompt
+                } else {
+                    normalize_required_text(Some(prompt), "prompt")?
+                };
                 // Known catalog names are applied by the canonical creator.
                 // Unknown names retain the old routing/display label.
                 let subagent_type = subagent_type
@@ -1096,25 +966,6 @@ impl SubAgentTool {
                 {
                     return Err(ToolError::InvalidArguments("named_profile_requires_fresh_local_child".into()));
                 }
-                // workspace is optional: default to the parent's workspace.
-                let explicit_workspace = workspace
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                let workspace_was_explicit = explicit_workspace.is_some();
-                let parent_workspace_is_project_default = parent
-                    .metadata
-                    .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
-                    .map(String::as_str)
-                    == Some(
-                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
-                    );
-                let requested_workspace = explicit_workspace
-                    .or_else(|| {
-                        (!parent_workspace_is_project_default)
-                            .then(|| parent.workspace.clone())
-                            .flatten()
-                    })
-                    .unwrap_or_default();
                 let parent_project_id =
                     match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
                         bamboo_engine::project_context::SessionProjectIdentity::Assigned(
@@ -1130,36 +981,66 @@ impl SubAgentTool {
                             )));
                         }
                     };
-                let workspace_source = if workspace_was_explicit {
-                    bamboo_engine::project_context::WorkspaceSource::Explicit
-                } else if parent_workspace_is_project_default
-                    || (requested_workspace.is_empty() && parent_project_id.is_some())
-                {
-                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                let (workspace, workspace_source) = if compact {
+                    // Chat stores its workspace on the typed metadata plane.
+                    // Use the same canonical resolver as Plan before creation.
+                    self.sessions
+                        .resolve_child_workspace(&parent, workspace.as_deref())
+                        .await
+                        .map_err(tool_error_from_child_session)?
                 } else {
-                    match parent
+                    // workspace is optional: default to the parent's workspace.
+                    let explicit_workspace = workspace
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
+                    let workspace_was_explicit = explicit_workspace.is_some();
+                    let parent_workspace_is_project_default = parent
                         .metadata
                         .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
                         .map(String::as_str)
+                        == Some(
+                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
+                        );
+                    let requested_workspace = explicit_workspace
+                        .or_else(|| {
+                            (!parent_workspace_is_project_default)
+                                .then(|| parent.workspace.clone())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    let workspace_source = if workspace_was_explicit {
+                        bamboo_engine::project_context::WorkspaceSource::Explicit
+                    } else if parent_workspace_is_project_default
+                        || (requested_workspace.is_empty() && parent_project_id.is_some())
                     {
-                        Some("project_default") => {
-                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                    } else {
+                        match parent
+                            .metadata
+                            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                            .map(String::as_str)
+                        {
+                            Some("project_default") => {
+                                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                            }
+                            _ => bamboo_engine::project_context::WorkspaceSource::Session,
                         }
-                        _ => bamboo_engine::project_context::WorkspaceSource::Session,
-                    }
+                    };
+                    // This must precede resident lookup/cancellation and every
+                    // child/session mutation. Reused residents bypass
+                    // `create_child_action`, while new children and guardians use
+                    // it as a second fail-closed boundary.
+                    let workspace = self
+                        .sessions
+                        .validate_child_workspace(
+                            parent_project_id.as_ref(),
+                            &requested_workspace,
+                        )
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+
+                    (workspace, workspace_source)
                 };
-                // This must precede resident lookup/cancellation and every
-                // child/session mutation. Reused residents bypass
-                // `create_child_action`, while new children and guardians use
-                // it as a second fail-closed boundary.
-                let workspace = self
-                    .sessions
-                    .validate_child_workspace(
-                        parent_project_id.as_ref(),
-                        &requested_workspace,
-                    )
-                    .await
-                    .map_err(tool_error_from_child_session)?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(
@@ -1987,69 +1868,34 @@ mod tests {
     }
 
     #[test]
-    fn subagent_schema_keeps_actions_arguments_and_only_action_required() {
+    fn subagent_schema_advertises_the_actual_compact_logical_caller() {
         let schema = subagent_parameters_schema();
-        assert_eq!(schema["required"], json!(["action"]));
-        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema.get("required").is_none());
+        assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
-            schema["properties"]["action"]["enum"],
-            json!([
-                "create",
-                "wait",
-                "list",
-                "get",
-                "update",
-                "run",
-                "send_message",
-                "cancel",
-                "delete",
-                "list_models"
-            ])
+            schema["properties"]["intent"]["enum"],
+            json!(["chat", "inspect", "control"])
         );
-
-        let actual: std::collections::BTreeSet<&str> = schema["properties"]
+        let actual: std::collections::BTreeSet<_> = schema["properties"]
             .as_object()
-            .expect("properties object")
+            .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        let expected = std::collections::BTreeSet::from([
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from(["intent", "target", "role", "message", "reply_to",])
+        );
+        for physical_or_runtime in [
+            "model",
+            "workspace",
+            "worker_bin",
+            "endpoint",
             "action",
             "auto_run",
-            "child_session_id",
-            "child_session_ids",
-            "context",
-            "context_packet",
-            "cursor",
-            "description",
-            "fork_last_messages",
-            "expected_child_created_at",
-            "expected_assignment_sha256",
-            "interrupt_running",
-            "lifecycle",
-            "limit",
-            "max_bytes",
-            "message",
-            "message_id",
-            "model",
-            "name",
-            "prompt",
-            "reasoning_effort",
-            "reset_after_update",
-            "reset_to_last_user",
-            "responsibility",
-            "subagent_type",
-            "title",
-            "view",
-            "wait",
-            "wait_for",
-            "workspace",
-        ]);
-        assert_eq!(actual, expected);
-        assert!(schema["properties"]["model"]["description"]
-            .as_str()
-            .expect("model description")
-            .contains("create/update"));
+        ] {
+            assert!(schema["properties"].get(physical_or_runtime).is_none());
+        }
     }
 
     #[test]
@@ -2077,10 +1923,14 @@ mod tests {
         assert!(!description.contains("full agent"));
 
         let schema = subagent_parameters_schema();
-        let label_description = schema["properties"]["subagent_type"]["description"]
+        let label_description = schema["properties"]["role"]["description"]
             .as_str()
-            .expect("subagent_type description");
+            .expect("role description");
         assert!(label_description.contains("runtime exposes to the child"));
+        for role in ["explorer", "implementer", "reviewer"] {
+            assert!(label_description.contains(role));
+        }
+        assert!(label_description.contains("no builtin role is implicitly selected"));
         assert!(!label_description.contains("full agent"));
     }
 

@@ -3,6 +3,7 @@
 //! See `docs/design/named-agent-definitions-v1.md` for the file contract and
 //! platform boundary. Only the public metadata projections are serializable.
 
+mod builtin;
 mod parser;
 mod reader;
 mod scoped;

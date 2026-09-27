@@ -302,10 +302,21 @@ impl SessionStoreV2 {
         let source_dir = directory.clone();
         let source_id = request.fence.actor_id.clone();
         let source_root = root.clone();
-        let source = Self::default_writer_job(&guards._guards, move || {
-            Ok(Source::read(&source_dir, &source_id, kind, &source_root))
+        let home = self.sessions_dir.clone();
+        let read_home = home.clone();
+        let (source, ancestors) = Self::default_writer_job(&guards._guards, move || {
+            Ok((|| -> Result<_> {
+                let source = Source::read(&source_dir, &source_id, kind, &source_root)?;
+                let ancestors = actor_checkpoint_lineage::capture(&read_home, &source.entry.actor)?;
+                Ok((source, ancestors))
+            })())
         })
         .await??;
+        let lineage = self.validate_actor_lineage(&source.entry.actor).await?;
+        actor_checkpoint_lineage::validate_recorded_observations(
+            &source.entry.actor.ancestor_observations,
+            &lineage,
+        )?;
         if admission(&source.side).is_some() {
             return Err(ActorInputCheckpointError::Unsupported);
         }
@@ -332,7 +343,14 @@ impl SessionStoreV2 {
                 &directory.join("session.json"),
                 move |_, path| {
                     let operation = (|| {
-                        running(&source, &request)?;
+                        let initial =
+                            Source::read(&directory, &request.fence.actor_id, kind, &root)?;
+                        if !source.unchanged(&initial)
+                            || !ancestors.matches_current(&home, &initial.entry.actor)?
+                        {
+                            return Err(ActorInputCheckpointError::PrefixConflict);
+                        }
+                        running(&initial, &request)?;
                         let (envelope, proof) = current_input(&inbox, &inbox_dir, &request)?;
                         let present = already(&source, &request, &envelope, &proof)?;
                         let mut replaced = false;
@@ -340,7 +358,9 @@ impl SessionStoreV2 {
                         let verify = || -> Result<()> {
                             let current =
                                 Source::read(&directory, &request.fence.actor_id, kind, &root)?;
-                            if !source.unchanged(&current) {
+                            if !source.unchanged(&current)
+                                || !ancestors.matches_current(&home, &current.entry.actor)?
+                            {
                                 return Err(ActorInputCheckpointError::PrefixConflict);
                             }
                             running(&current, &request)?;

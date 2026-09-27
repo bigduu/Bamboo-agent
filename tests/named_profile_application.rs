@@ -25,6 +25,9 @@ enum Case {
     ExplicitModel,
     Duplicate,
     Invalid,
+    BuiltinImplementer,
+    BuiltinExplorer,
+    BuiltinReviewer,
 }
 struct Probe {
     case: Case,
@@ -34,16 +37,29 @@ struct Probe {
     child: AtomicUsize,
     requests: Mutex<Vec<Value>>,
     profile_path: PathBuf,
+    builtin_prompt: Option<String>,
     release_child: AtomicBool,
     child_ready: tokio::sync::Notify,
 }
 fn role(case: Case) -> &'static str {
     match case {
-        Case::Explorer => "explorer",
-        Case::Reviewer => "reviewer",
+        Case::Explorer | Case::BuiltinExplorer => "explorer",
+        Case::Reviewer | Case::BuiltinReviewer => "reviewer",
         Case::Unknown => "unknown-label",
         _ => "implementer",
     }
+}
+fn builtin(case: Case) -> bool {
+    matches!(
+        case,
+        Case::BuiltinImplementer | Case::BuiltinExplorer | Case::BuiltinReviewer
+    )
+}
+fn read_only(case: Case) -> bool {
+    matches!(
+        case,
+        Case::Explorer | Case::Reviewer | Case::BuiltinExplorer | Case::BuiltinReviewer
+    )
 }
 fn child_model(case: Case) -> &'static str {
     if case == Case::ExplicitModel {
@@ -94,7 +110,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             ),
             1 => {
                 let mut args = json!({"action":"create","title":"Profile child","responsibility":"Complete a bounded assignment with evidence","prompt":"Use the real file tools and report evidence","subagent_type":role(probe.case),"workspace":probe.workspace,"auto_run":false});
-                if probe.case == Case::Unknown {
+                if probe.case == Case::Unknown || builtin(probe.case) {
                     args["model"] = json!("openai:native-child");
                 } else if probe.case == Case::ExplicitModel {
                     args["model"] = json!("openai:explicit-child");
@@ -127,14 +143,36 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     let selected = disk.load_session(&child).await.unwrap().unwrap();
                     let binding: Value =
                         serde_json::from_str(&selected.metadata["child.named_profile.v1"]).unwrap();
-                    assert_eq!(binding["source"], "project");
+                    assert_eq!(
+                        binding["source"],
+                        if builtin(probe.case) {
+                            "builtin"
+                        } else {
+                            "project"
+                        }
+                    );
+                    if builtin(probe.case) {
+                        assert!(binding["project_id"].is_null());
+                        assert_eq!(
+                            binding["scope_project_id"],
+                            selected.project_id_meta().unwrap()
+                        );
+                        assert!(selected.messages[0]
+                            .content
+                            .contains(probe.builtin_prompt.as_ref().unwrap()));
+                        assert!(!binding
+                            .to_string()
+                            .contains(probe.builtin_prompt.as_ref().unwrap()));
+                    }
                     assert_eq!(binding["name"], role(probe.case));
                     assert_eq!(selected.model, child_model(probe.case));
                     assert_eq!(
                         selected.agent_runtime_state.as_ref().unwrap().read_only,
-                        matches!(probe.case, Case::Explorer | Case::Reviewer)
+                        read_only(probe.case)
                     );
-                    assert!(selected.messages[0].content.contains("PROJECT_ROLE_V1"));
+                    if !builtin(probe.case) {
+                        assert!(selected.messages[0].content.contains("PROJECT_ROLE_V1"));
+                    }
                     assert!(!binding.to_string().contains("PROJECT_ROLE_V1"));
                 }
                 call(
@@ -203,7 +241,7 @@ async fn fixture(case: Case) {
     std::fs::create_dir_all(&global).unwrap();
     std::fs::create_dir_all(&local).unwrap();
     let profile_path = local.join(format!("{}.md", role(case)));
-    if case != Case::Unknown {
+    if case != Case::Unknown && !builtin(case) {
         std::fs::write(
             global.join(format!("{}.md", role(case))),
             definition(
@@ -220,6 +258,25 @@ async fn fixture(case: Case) {
             std::fs::write(&profile_path, "---\nschema_version: 1\nname: implementer\nmalformed: true\n---\nINVALID_ROLE_BODY\n").unwrap();
         }
     }
+    let builtin_prompt = if builtin(case) {
+        use bamboo_skills::named_agents::{NamedAgentLimits, ScopedNamedAgentCatalog};
+        let project_home = projects.paths().project_home(&project.id);
+        let catalog = ScopedNamedAgentCatalog::discover_with_builtins(
+            &data,
+            Some((&project.id, &project_home)),
+            NamedAgentLimits::default(),
+        )
+        .unwrap();
+        let identity = catalog
+            .metadata()
+            .entries
+            .iter()
+            .find_map(|row| row.identity.as_ref().filter(|id| id.name == role(case)))
+            .unwrap();
+        Some(catalog.get(identity).unwrap().system_prompt().to_owned())
+    } else {
+        None
+    };
     let probe = web::Data::new(Probe {
         case,
         data: data.clone(),
@@ -228,6 +285,7 @@ async fn fixture(case: Case) {
         child: AtomicUsize::new(0),
         requests: Mutex::new(vec![]),
         profile_path,
+        builtin_prompt,
         release_child: AtomicBool::new(false),
         child_ready: Default::default(),
     });
@@ -382,10 +440,24 @@ async fn fixture(case: Case) {
         if case != Case::Unknown {
             for request in &child {
                 let text = request["messages"].to_string();
-                assert!(
-                    text.contains("PROJECT_ROLE_V1"),
-                    "selected role must reach actual provider: {text}"
-                );
+                if builtin(case) {
+                    assert!(
+                        request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["content"]
+                                .as_str()
+                                .is_some_and(|content| content
+                                    .contains(probe.builtin_prompt.as_ref().unwrap()))),
+                        "complete builtin role must reach actual provider"
+                    );
+                } else {
+                    assert!(
+                        text.contains("PROJECT_ROLE_V1"),
+                        "selected role must reach actual provider: {text}"
+                    );
+                }
                 assert!(!text.contains("RELOADED_ROLE_MUST_NOT_APPLY"));
                 assert!(!text.contains("SHADOWED_GLOBAL_MUST_NOT_APPLY"));
             }
@@ -414,7 +486,7 @@ async fn fixture(case: Case) {
             .unwrap()
             .iter()
             .any(|t| t["function"]["name"] == "Write")));
-        if matches!(case, Case::Narrow | Case::Explorer | Case::Reviewer) {
+        if case == Case::Narrow || read_only(case) {
             assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
             assert!(!workspace.join("child-write.txt").exists());
             let history = child.last().unwrap()["messages"].to_string();
@@ -429,6 +501,11 @@ async fn fixture(case: Case) {
                 assert_eq!(
                     names,
                     std::collections::BTreeSet::from(["Glob", "Read", "Write"])
+                );
+            } else if case == Case::BuiltinImplementer {
+                assert_eq!(
+                    names,
+                    std::collections::BTreeSet::from(["Bash", "Edit", "Glob", "Read", "Write"])
                 );
             } else {
                 assert!(
@@ -456,6 +533,17 @@ async fn actual_named_profiles_reach_provider_and_native_dispatch() {
         Case::ExplicitModel,
         Case::Duplicate,
         Case::Invalid,
+    ] {
+        Box::pin(fixture(case)).await;
+    }
+}
+
+#[actix_web::test]
+async fn actual_builtin_roles_reach_provider_and_native_dispatch() {
+    for case in [
+        Case::BuiltinImplementer,
+        Case::BuiltinExplorer,
+        Case::BuiltinReviewer,
     ] {
         Box::pin(fixture(case)).await;
     }

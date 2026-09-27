@@ -17,11 +17,16 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 
+use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_broker::{
     AgentDeployment, DeployedAgent, Deployer, DockerDeployer, LocalProcessDeployer, SshDeployer,
 };
 use bamboo_config::Config;
+use bamboo_domain::{
+    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session, SessionKind,
+};
+use bamboo_storage::SessionStoreV2;
 
 /// Keeps deployed workers alive (the handles are kill-on-drop) and lets `stop`
 /// tear them down. Shared for the server's lifetime.
@@ -29,6 +34,8 @@ pub type DeployedRegistry = Arc<Mutex<HashMap<String, Deployed>>>;
 
 /// One live deployment: how it was deployed + the kill-on-drop handle.
 pub struct Deployed {
+    /// Host logical identity; None retains existing cluster/legacy compatibility.
+    pub actor: Option<ActorSession>,
     pub env: String,
     pub handle: DeployedAgent,
 }
@@ -43,6 +50,7 @@ pub struct DeployAgentTool {
     /// for `env=docker` deploys — the assigned model's credential only, never
     /// the whole config or the master encryption key (#46).
     config: Arc<RwLock<Config>>,
+    actor_store: Option<Arc<SessionStoreV2>>,
 }
 
 impl DeployAgentTool {
@@ -59,14 +67,82 @@ impl DeployAgentTool {
             bamboo_bin: bamboo_bin.into(),
             registry,
             config,
+            actor_store: None,
         }
     }
+    /// Production uses the actual Host store, never a worker-local Session.
+    pub fn with_actor_store(mut self, store: Arc<SessionStoreV2>) -> Self {
+        self.actor_store = Some(store);
+        self
+    }
+}
+
+pub(crate) struct ResolvedDeployment {
+    pub key: String,
+    pub worker_id: String,
+    pub actor: Option<ActorSession>,
+}
+
+/// Resolve a live physical handle only after checking its saved Host identity.
+/// This does not reserve an activation or grant transcript/permission authority.
+pub(crate) async fn resolve_deployed_target(
+    registry: &DeployedRegistry,
+    store: Option<&Arc<SessionStoreV2>>,
+    caller: Option<&str>,
+    target: &str,
+) -> Result<Option<ResolvedDeployment>, ToolError> {
+    let resolved = {
+        let reg = registry.lock().await;
+        reg.iter()
+            .find(|(key, d)| {
+                *key == &crate::registry_keys::agent_key(target)
+                    || d.actor
+                        .as_ref()
+                        .is_some_and(|actor| actor.actor_id == target || d.handle.id == target)
+            })
+            .map(|(key, d)| ResolvedDeployment {
+                key: key.clone(),
+                worker_id: d.handle.id.clone(),
+                actor: d.actor.clone(),
+            })
+    };
+    let Some(resolved) = resolved else {
+        if target.starts_with("actor-") {
+            return Err(ToolError::Execution(
+                "logical Actor is not a live deployment".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if let Some(saved) = &resolved.actor {
+        let invalid = || {
+            ToolError::Execution("deployment Actor identity or caller is no longer valid".into())
+        };
+        if caller != saved.parent_actor_id.as_deref() {
+            return Err(invalid());
+        }
+        let current = store
+            .ok_or_else(invalid)?
+            .inspect_actor(&saved.actor_id)
+            .await
+            .map_err(|_| invalid())?;
+        if current.actor.state != ActorLogicalState::Cold
+            || current.actor.session_created_at != saved.session_created_at
+            || current.actor.parent_actor_id != saved.parent_actor_id
+            || current.actor.root_actor_id != saved.root_actor_id
+            || current.actor.project_id != saved.project_id
+            || current.actor.spawn_depth != saved.spawn_depth
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(resolved))
 }
 
 /// Parameters for `action=deploy`, grouped so the deploy call stays tidy.
 #[derive(Debug, Deserialize)]
 struct DeployParams {
-    /// Worker id (its broker mailbox key). Auto-generated when omitted.
+    /// Optional live deployment alias, never the Host ActorId or physical mailbox.
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -102,7 +178,11 @@ enum DeployArgs {
 }
 
 impl DeployAgentTool {
-    async fn deploy(&self, params: DeployParams) -> Result<ToolResult, ToolError> {
+    async fn deploy(
+        &self,
+        params: DeployParams,
+        caller: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
         let DeployParams {
             id,
             role,
@@ -116,6 +196,23 @@ impl DeployAgentTool {
         let id = id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
             format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
         });
+        let alias = id;
+        if self.actor_store.is_some() && alias.starts_with("actor-") {
+            return Err(ToolError::InvalidArguments(
+                "deployment aliases cannot use the logical Actor namespace".into(),
+            ));
+        }
+        let key = crate::registry_keys::agent_key(&alias);
+        if self.registry.lock().await.contains_key(&key) {
+            return Err(ToolError::InvalidArguments(
+                "deployment alias is already live".into(),
+            ));
+        }
+        let id = if self.actor_store.is_some() {
+            format!("worker-{}", uuid::Uuid::new_v4())
+        } else {
+            alias.clone()
+        };
         let env = env.unwrap_or_else(|| "local".to_string());
 
         // A container cannot reach the host's loopback; for docker, address the
@@ -198,59 +295,206 @@ impl DeployAgentTool {
             // (or a self-signed one whose CA is already in the OS trust store).
             tls_ca_cert: None,
         };
-        let handle = deployer
-            .deploy(&deployment)
-            .await
-            .map_err(|e| ToolError::Execution(format!("deploy '{id}' ({env}) failed: {e}")))?;
+        let actor = if let Some(store) = &self.actor_store {
+            let caller = caller.ok_or_else(|| {
+                ToolError::Execution("deploy requires a saved calling Root".into())
+            })?;
+            let parent = store
+                .load_session(caller)
+                .await
+                .map_err(|_| ToolError::Execution("deployment parent could not be loaded".into()))?
+                .filter(|parent| parent.id == caller && parent.kind == SessionKind::Root)
+                .ok_or_else(|| {
+                    ToolError::Execution("deploy requires a saved calling Root".into())
+                })?;
+            let project = parent
+                .project_id_meta()
+                .map(ProjectId::parse)
+                .transpose()
+                .map_err(|_| ToolError::Execution("deployment parent Project is invalid".into()))?;
+            let mut child = Session::new_child_of(
+                format!("actor-{}", uuid::Uuid::new_v4()),
+                &parent,
+                deployment
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| parent.model.clone()),
+                "Deployed resident",
+            );
+            child.metadata.insert("lifecycle".into(), "resident".into());
+            child
+                .metadata
+                .insert("deployment_kind".into(), "legacy_broker".into());
+            if let Some(project) = project {
+                child.set_project_id_meta(project.as_str());
+            }
+            store.save_session(&child).await.map_err(|_| {
+                ToolError::Execution(
+                    "deployment Actor Session could not be persisted; no worker launched".into(),
+                )
+            })?;
+            Some(
+                store
+                    .ensure_actor(&child.id)
+                    .await
+                    .map_err(|_| {
+                        ToolError::Execution(
+                            "deployment Actor identity could not be persisted; no worker launched"
+                                .into(),
+                        )
+                    })?
+                    .actor,
+            )
+        } else {
+            None
+        };
+        let handle = match deployer.deploy(&deployment).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let (Some(store), Some(actor)) = (&self.actor_store, &actor) {
+                    let _ = store
+                        .retire_actor(&actor.actor_id, chrono::Utc::now())
+                        .await;
+                    tracing::warn!(%error, "deployment launcher failed after logical identity persistence");
+                    return Err(ToolError::Execution(
+                        "deployment launcher failed; logical identity was not reported as running"
+                            .into(),
+                    ));
+                }
+                return Err(ToolError::Execution(format!(
+                    "deploy '{id}' ({env}) failed: {error}"
+                )));
+            }
+        };
+        let public_id = actor
+            .as_ref()
+            .map(|actor| actor.actor_id.clone())
+            .unwrap_or_else(|| id.clone());
 
         // Namespace the registry key so an agent-chosen id can never collide
         // with a cluster-fabric node id in the SHARED registry (cross-eviction).
-        self.registry.lock().await.insert(
-            crate::registry_keys::agent_key(&id),
-            Deployed {
-                env: env.clone(),
-                handle,
-            },
-        );
+        let pending = Deployed {
+            actor,
+            env: env.clone(),
+            handle,
+        };
+        let duplicate = {
+            let mut registry = self.registry.lock().await;
+            match registry.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(pending);
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(_) => Some(pending),
+            }
+        };
+        // Concurrent launches must never replace an already published handle.
+        if let Some(duplicate) = duplicate {
+            duplicate.handle.shutdown().await;
+            if let (Some(store), Some(actor)) = (&self.actor_store, duplicate.actor) {
+                let _ = store
+                    .retire_actor(&actor.actor_id, chrono::Utc::now())
+                    .await;
+            }
+            return Err(ToolError::Execution(
+                "deployment alias became live during launch; the new worker was stopped".into(),
+            ));
+        }
 
         Ok(tool_json(json!({
-            "id": id,
+            "id": public_id,
             "env": env,
             "status": "deployed",
-            "note": format!("worker '{id}' is connecting to the broker; ask it with ask_agent(target=\"{id}\", ...)"),
+            "note": format!("deployment is connecting; use ask_agent(target=\"{public_id}\", ...). Actor activation is not yet integrated"),
         })))
     }
 
-    async fn stop(&self, id: String) -> Result<ToolResult, ToolError> {
+    async fn stop(&self, id: String, caller: Option<&str>) -> Result<ToolResult, ToolError> {
         // Take the entry out FIRST, then shut down without holding the registry
         // lock: shutdown is now graceful (SIGTERM + drain grace window, #49), so
         // it can take seconds — other deploy/stop/list calls must not serialize
         // behind it.
-        let removed = self
-            .registry
-            .lock()
-            .await
-            .remove(&crate::registry_keys::agent_key(&id));
+        let target =
+            resolve_deployed_target(&self.registry, self.actor_store.as_ref(), caller, &id).await?;
+        let Some(target) = target else {
+            return Ok(tool_json(json!({ "id": id, "status": "not_found" })));
+        };
+        let removed = {
+            let mut reg = self.registry.lock().await;
+            if reg
+                .get(&target.key)
+                .is_some_and(|d| d.handle.id == target.worker_id)
+            {
+                reg.remove(&target.key)
+            } else {
+                None
+            }
+        };
         match removed {
             Some(d) => {
                 d.handle.shutdown().await;
-                Ok(tool_json(json!({ "id": id, "status": "stopped" })))
+                let public_id = if let Some(actor) = d.actor {
+                    self.actor_store
+                        .as_ref()
+                        .ok_or_else(|| {
+                            ToolError::Execution("deployment Host store is unavailable".into())
+                        })?
+                        .retire_actor(&actor.actor_id, chrono::Utc::now())
+                        .await
+                        .map_err(|_| {
+                            ToolError::Execution(
+                                "worker stopped; Actor retirement is unconfirmed".into(),
+                            )
+                        })?;
+                    actor.actor_id
+                } else {
+                    id
+                };
+                Ok(tool_json(json!({ "id": public_id, "status": "stopped" })))
             }
             None => Ok(tool_json(json!({ "id": id, "status": "not_found" }))),
         }
     }
 
-    async fn list(&self) -> Result<ToolResult, ToolError> {
-        let reg = self.registry.lock().await;
-        // The registry is shared with the cluster fabric, so show every worker
-        // with its source (agent-deployed vs cluster node) and the bare id.
-        let agents: Vec<_> = reg
-            .iter()
-            .map(|(key, d)| {
-                let (source, id) = crate::registry_keys::split(key);
-                json!({ "id": id, "source": source, "env": d.env })
-            })
-            .collect();
+    async fn list(&self, caller: Option<&str>) -> Result<ToolResult, ToolError> {
+        let entries: Vec<_> = {
+            let registry = self.registry.lock().await;
+            registry
+                .iter()
+                .map(|(key, deployment)| {
+                    (
+                        key.clone(),
+                        deployment
+                            .actor
+                            .as_ref()
+                            .map(|actor| actor.actor_id.clone()),
+                        deployment.env.clone(),
+                    )
+                })
+                .collect()
+        };
+        let mut agents = Vec::new();
+        for (key, actor_id, env) in entries {
+            // Never await canonical reads while holding the registry mutex.
+            if let Some(actor_id) = &actor_id {
+                if resolve_deployed_target(
+                    &self.registry,
+                    self.actor_store.as_ref(),
+                    caller,
+                    actor_id,
+                )
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+                {
+                    continue;
+                }
+            }
+            let (source, alias) = crate::registry_keys::split(&key);
+            let id = actor_id.as_deref().unwrap_or(alias);
+            agents.push(json!({ "id": id, "source": source, "env": env }));
+        }
         Ok(tool_json(json!({ "agents": agents })))
     }
 }
@@ -275,6 +519,7 @@ impl Tool for DeployAgentTool {
          scale yourself out: you deploy a fresh broker-agent, then drive it with ask_agent. The \
          worker connects back to the same message broker you are on, and inherits your MCP servers \
          + skills (via the orchestrator MCP proxy), so it can do real work — not just echo.\n\
+         The returned ActorId names a durable Host resident; it does not claim an Actor activation.\n\
          \n\
          PREFER LOCAL. Default to a local `SubAgent` (an in-context child) for delegation. Reach for \
          a REMOTE worker (env=ssh, or a cluster node) ONLY when the task genuinely needs THAT \
@@ -297,11 +542,11 @@ impl Tool for DeployAgentTool {
          \n\
          WORKED EXAMPLE (scale out, use, tear down):\n\
          1. deploy_agent(action=deploy, env=local, role=\"tester\", model=\"anthropic:claude-opus-4-8\") \
-         → returns id \"agent-7f8e9d\".\n\
-         2. ask_agent(target=\"agent-7f8e9d\", question=\"Run the full test suite and report \
+         → returns logical id \"actor-…\".\n\
+         2. ask_agent(target=\"actor-…\", question=\"Run the full test suite and report \
          failures.\", mode=steer).\n\
          3. deploy_agent(action=list) → confirm it (and any siblings) are running.\n\
-         4. deploy_agent(action=stop, id=\"agent-7f8e9d\") → once its work is collected.\n\
+         4. deploy_agent(action=stop, id=\"actor-…\") → once its work is collected.\n\
          \n\
          Tip: use echo=true to deploy a dependency-free no-LLM worker for a connectivity smoke test \
          before committing to a real model. Returned id is what you pass as ask_agent's `target`."
@@ -312,7 +557,7 @@ impl Tool for DeployAgentTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["deploy", "stop", "list"] },
-                "id": { "type": "string", "description": "deploy: worker id (auto if omitted). stop: id to stop." },
+                "id": { "type": "string", "description": "deploy: optional live alias (auto if omitted). stop: returned logical ActorId or its live alias." },
                 "role": { "type": "string", "description": "deploy: role/profile label." },
                 "model": { "type": "string", "description": "deploy: provider:model for the worker." },
                 "env": { "type": "string", "enum": ["local", "docker", "ssh"], "description": "deploy: where to run (default local)." },
@@ -332,14 +577,14 @@ impl Tool for DeployAgentTool {
     async fn invoke(
         &self,
         args: serde_json::Value,
-        _ctx: ToolCtx,
+        ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
         let parsed: DeployArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid deploy_agent args: {e}")))?;
         match parsed {
-            DeployArgs::Deploy(params) => self.deploy(params).await,
-            DeployArgs::Stop { id } => self.stop(id).await,
-            DeployArgs::List => self.list().await,
+            DeployArgs::Deploy(params) => self.deploy(params, ctx.session_id()).await,
+            DeployArgs::Stop { id } => self.stop(id, ctx.session_id()).await,
+            DeployArgs::List => self.list(ctx.session_id()).await,
         }
         .map(ToolOutcome::Completed)
     }
@@ -402,6 +647,7 @@ mod tests {
         registry.lock().await.insert(
             crate::registry_keys::agent_key("w1"),
             Deployed {
+                actor: None,
                 env: "local".into(),
                 handle: agent,
             },
@@ -411,31 +657,74 @@ mod tests {
             "registered worker process should be running"
         );
 
-        let listed = parse(tool.list().await.unwrap());
+        let listed = parse(tool.list(None).await.unwrap());
         let agents = listed["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["id"], "w1");
         assert_eq!(agents[0]["env"], "local");
 
         // (2) stop: removes the entry AND kills the process (shutdown awaits the child).
-        let stopped = parse(tool.stop("w1".to_string()).await.unwrap());
+        let stopped = parse(tool.stop("w1".to_string(), None).await.unwrap());
         assert_eq!(stopped["id"], "w1");
         assert_eq!(stopped["status"], "stopped");
         assert!(!pid_alive(pid), "stopped worker process must be killed");
 
         // (3) list after stop is empty.
-        let listed = parse(tool.list().await.unwrap());
+        let listed = parse(tool.list(None).await.unwrap());
         assert!(listed["agents"].as_array().unwrap().is_empty());
 
         // (4) double-stop (already removed) is a no-op, not a crash.
-        let again = parse(tool.stop("w1".to_string()).await.unwrap());
+        let again = parse(tool.stop("w1".to_string(), None).await.unwrap());
         assert_eq!(again["status"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn host_identity_failure_does_not_launch_and_failed_launcher_leaves_retired_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(dir.path().into()).await.unwrap());
+        let registry = empty_registry();
+        let tool = DeployAgentTool::new(
+            "ws://127.0.0.1:1",
+            "test-token",
+            dir.path().join("absent-bamboo"),
+            registry.clone(),
+            Arc::new(RwLock::new(Config::default())),
+        )
+        .with_actor_store(store.clone());
+        let params = || serde_json::from_value(serde_json::json!({"echo":true})).unwrap();
+        let error = tool
+            .deploy(params(), Some("missing-root"))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("saved calling Root"));
+        assert!(registry.lock().await.is_empty());
+        assert!(!store.sessions_root_dir().join("missing-root").exists());
+        let root = Session::new("saved-root", "echo-model");
+        store.save_session(&root).await.unwrap();
+        let error = tool.deploy(params(), Some(&root.id)).await.err().unwrap();
+        assert!(error.to_string().contains("launcher failed"));
+        assert!(registry.lock().await.is_empty());
+        let children = store.sessions_root_dir().join(&root.id).join("children");
+        let actors: Vec<_> = std::fs::read_dir(children)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .collect();
+        assert_eq!(actors.len(), 1);
+        let actor_id = actors[0].file_name().into_string().unwrap();
+        let child = store.load_session(&actor_id).await.unwrap().unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some(root.id.as_str()));
+        let entry = store.inspect_actor(&actor_id).await.unwrap();
+        assert_eq!(entry.actor.state, ActorLogicalState::Retired);
+        assert_eq!(entry.actor.current_attempt, 0);
+        assert!(entry.activation.is_none());
     }
 
     #[tokio::test]
     async fn stop_unknown_id_is_not_found_not_a_crash() {
         let tool = tool_with(empty_registry());
-        let r = parse(tool.stop("never-deployed".to_string()).await.unwrap());
+        let r = parse(tool.stop("never-deployed".to_string(), None).await.unwrap());
         assert_eq!(r["status"], "not_found");
     }
 
