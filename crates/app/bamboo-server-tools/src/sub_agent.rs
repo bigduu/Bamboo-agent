@@ -966,6 +966,21 @@ impl SubAgentTool {
                 {
                     return Err(ToolError::InvalidArguments("named_profile_requires_fresh_local_child".into()));
                 }
+                let parent_project_id =
+                    match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
+                        bamboo_engine::project_context::SessionProjectIdentity::Assigned(
+                            project_id,
+                        ) => Some(project_id),
+                        bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                        bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                            raw,
+                            message,
+                        } => {
+                            return Err(ToolError::InvalidArguments(format!(
+                                "parent session carries an invalid Project identity '{raw}': {message}"
+                            )));
+                        }
+                    };
                 let (workspace, workspace_source) = if compact {
                     // Chat stores its workspace on the typed metadata plane.
                     // Use the same canonical resolver as Plan before creation.
@@ -993,21 +1008,6 @@ impl SubAgentTool {
                                 .flatten()
                         })
                         .unwrap_or_default();
-                    let parent_project_id =
-                        match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
-                            bamboo_engine::project_context::SessionProjectIdentity::Assigned(
-                                project_id,
-                            ) => Some(project_id),
-                            bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
-                            bamboo_engine::project_context::SessionProjectIdentity::Invalid {
-                                raw,
-                                message,
-                            } => {
-                                return Err(ToolError::InvalidArguments(format!(
-                                    "parent session carries an invalid Project identity '{raw}': {message}"
-                                )));
-                            }
-                        };
                     let workspace_source = if workspace_was_explicit {
                         bamboo_engine::project_context::WorkspaceSource::Explicit
                     } else if parent_workspace_is_project_default
