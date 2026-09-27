@@ -5,6 +5,7 @@ use bamboo_domain::ProjectId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NamedAgentProfileSource {
+    Builtin,
     Global,
     Project,
 }
@@ -69,11 +70,29 @@ impl ScopedNamedAgentCatalog {
         project: Option<(&ProjectId, &Path)>,
         limits: NamedAgentLimits,
     ) -> Result<Self, NamedAgentDiagnosticCode> {
+        Self::discover_inner(global_home, project, limits, false)
+    }
+
+    /// Explicit default-role package: Project > Global > Builtin. Roots and
+    /// Project identity remain host-authored; source/revision are exact identity.
+    pub fn discover_with_builtins(
+        global_home: &Path,
+        project: Option<(&ProjectId, &Path)>,
+        limits: NamedAgentLimits,
+    ) -> Result<Self, NamedAgentDiagnosticCode> {
+        Self::discover_inner(global_home, project, limits, true)
+    }
+
+    fn discover_inner(
+        global_home: &Path,
+        project: Option<(&ProjectId, &Path)>,
+        limits: NamedAgentLimits,
+        include_builtins: bool,
+    ) -> Result<Self, NamedAgentDiagnosticCode> {
         if !limits.valid() {
             return Err(NamedAgentDiagnosticCode::InvalidLimits);
         }
         let mut budget = ScanBudget::default();
-        let global = NamedAgentCatalog::discover_with_budget(global_home, limits, &mut budget);
         let mut catalog = Self {
             definitions: BTreeMap::new(),
             metadata: ScopedNamedAgentCatalogMetadata {
@@ -82,11 +101,30 @@ impl ScopedNamedAgentCatalog {
                 diagnostic_code: None,
             },
         };
+        if include_builtins {
+            let layer = builtin::catalog(limits, &mut budget);
+            if let Some(code) = layer.metadata.diagnostic_code {
+                catalog.unavailable(code);
+                return catalog.checked(limits);
+            }
+            catalog.add_layer(layer, NamedAgentProfileSource::Builtin, None);
+        }
+        let global = NamedAgentCatalog::discover_with_budget(global_home, limits, &mut budget);
         if let Some(code) = global.metadata.diagnostic_code {
             catalog.unavailable(code);
             return catalog.checked(limits);
         }
+        let anonymous_global = global
+            .metadata
+            .entries
+            .iter()
+            .find(|entry| entry.name.is_none())
+            .and_then(|entry| entry.diagnostic_code);
         catalog.add_layer(global, NamedAgentProfileSource::Global, None);
+        if let Some(code) = anonymous_global.filter(|_| include_builtins) {
+            catalog.unavailable(code);
+            return catalog.checked(limits);
+        }
         if let Some((id, home)) = project {
             let layer = NamedAgentCatalog::discover_with_budget(home, limits, &mut budget);
             if let Some(code) = layer.metadata.diagnostic_code {
@@ -121,7 +159,7 @@ impl ScopedNamedAgentCatalog {
             .filter_map(|entry| entry.name.as_ref())
             .cloned()
             .collect();
-        if source == NamedAgentProfileSource::Project {
+        if source != NamedAgentProfileSource::Builtin {
             for entry in &mut self.metadata.entries {
                 if entry
                     .identity
