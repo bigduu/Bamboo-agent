@@ -273,7 +273,8 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                     break;
                 }
                 // Held spawn/retry may suspend with a merged, untagged sibling wait.
-                if p.hold.load(Ordering::SeqCst)
+                if matches!(op, 0 | 1)
+                    && p.hold.load(Ordering::SeqCst)
                     && root.last_run_status().as_deref() == Some("suspended")
                     && root
                         .agent_runtime_state
