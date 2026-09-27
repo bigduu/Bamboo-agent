@@ -66,7 +66,7 @@ pub(crate) async fn discover_for_session(
                 Ok((id, home))
             })
             .transpose()?;
-        ScopedNamedAgentCatalog::discover(
+        ScopedNamedAgentCatalog::discover_with_builtins(
             &global,
             project.as_ref().map(|(id, home)| (id, home.as_path())),
             limits,

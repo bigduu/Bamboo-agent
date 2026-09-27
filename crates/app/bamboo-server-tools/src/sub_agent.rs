@@ -720,7 +720,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "subagent_type": {
                 "type": "string",
-                "description": "For create: exact validated named profile from the Session's safe named-agent catalog. Known names apply private role instructions, model hint and narrower native tools on a fresh local worker; explorer/reviewer are read-only. Unknown names retain legacy routing/display behavior. Invalid or unavailable catalog authority is rejected; private prompts are never published here."
+                "description": "For create: exact validated named profile from the Session's safe named-agent catalog. Builtin roles are explorer (read-only investigation), implementer (bounded implementation), and reviewer (independent read-only adversarial review); Project and Global definitions override the same builtin name. Known names apply private role instructions, model hint and narrower native tools on a fresh local worker. Tool declarations only narrow what the runtime exposes to the child. Omit to retain the legacy worker label; no builtin role is implicitly selected. Unknown names retain legacy routing/display behavior. Invalid or unavailable catalog authority is rejected; private prompts are never published here."
             },
             "workspace": {
                 "type": "string",
@@ -2081,6 +2081,10 @@ mod tests {
             .as_str()
             .expect("subagent_type description");
         assert!(label_description.contains("runtime exposes to the child"));
+        for role in ["explorer", "implementer", "reviewer"] {
+            assert!(label_description.contains(role));
+        }
+        assert!(label_description.contains("no builtin role is implicitly selected"));
         assert!(!label_description.contains("full agent"));
     }
 
