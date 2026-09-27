@@ -808,7 +808,13 @@ async fn fixture(
             ActorActivationStatus::Running
         );
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
-        assert!(client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Correct the same running Child now","model":"plain-root","provider":"openai","thinking_mode":"ultra"})).send().await.unwrap().status().is_success());
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Correct the same running Child now","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual Root correction chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
         let dispatch: Value = client
             .post(format!("{base}/execute/plain-root"))
             .json(&json!({}))
@@ -919,7 +925,13 @@ async fn fixture(
             serde_json::to_value(&cut.messages).unwrap()
         );
         recovery_prefix = Some(cut);
-        assert!(client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Recover the same checkpointed Child through run(false)","model":"plain-root","provider":"openai","thinking_mode":"ultra"})).send().await.unwrap().status().is_success());
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Recover the same checkpointed Child through run(false)","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual cold Root recovery chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
         assert!(client
             .post(format!("{base}/execute/plain-root"))
             .json(&json!({}))
