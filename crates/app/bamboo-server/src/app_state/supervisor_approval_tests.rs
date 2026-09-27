@@ -12,6 +12,8 @@ use bamboo_llm::{Config, LLMProvider, ProviderModelRouter, ProviderRegistry};
 use bamboo_tools::permission::{PermissionDecision, PermissionDecisionKind, PermissionRequest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -135,7 +137,11 @@ impl Fixture {
         web::Data::new(state)
     }
 
-    pub(crate) async fn pending() -> Self {
+    pub(crate) fn pending() -> Pin<Box<impl Future<Output = Self>>> {
+        Box::pin(Self::pending_inner())
+    }
+
+    async fn pending_inner() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let state = Self::open(directory.path(), probe.clone()).await;
@@ -206,7 +212,11 @@ impl Fixture {
         assert_eq!(self.probe.provider_calls.load(Ordering::SeqCst), 1);
     }
 
-    async fn park(&self) {
+    fn park(&self) -> Pin<Box<impl Future<Output = ()> + '_>> {
+        Box::pin(self.park_inner())
+    }
+
+    async fn park_inner(&self) {
         self.probe.next_call.store(true, Ordering::SeqCst);
         let mut session = self.reload().await;
         let workspace = self.directory.path().join("workspace");
