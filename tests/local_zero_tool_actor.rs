@@ -2334,7 +2334,9 @@ async fn message_only_fixture() {
         serde_json::to_value(&completed.messages[..before.messages.len()]).unwrap(),
         serde_json::to_value(&before.messages).unwrap()
     );
-    drop(host); // Host guard kills and waits; no live Host/worker cache is reused.
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    drop(host); // Confirmed kill/wait precedes the cold Store reopen.
     drop(store);
     let cold_store = SessionStoreV2::new(data).await.unwrap();
     let cold = cold_store.load_session(&id).await.unwrap().unwrap();
