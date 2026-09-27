@@ -924,6 +924,15 @@ impl ActorChildRunner {
         });
     }
 
+    fn fresh_required_worker_spec(spec: &ProvisionSpec) -> ProvisionSpec {
+        let mut physical = spec.clone();
+        // A killed one-shot worker may leave an unACKed Run in its mailbox.
+        // A fresh subscriber must not replay that Run. Logical birth, storage
+        // namespace, typed input targets and authority remain on the RunSpec.
+        physical.identity.child_id = format!("required-worker-{}", uuid::Uuid::new_v4());
+        physical
+    }
+
     /// Check out a warm bus worker for `key`, reusing a live parked one if any,
     /// else spawning a fresh one that dials the bus. The returned worker is OWNED
     /// by the caller for the run's duration (checkout removes it from the pool, so
@@ -935,7 +944,8 @@ impl ActorChildRunner {
         spec: &ProvisionSpec,
     ) -> crate::runtime::runner::Result<PooledWorker> {
         if spec.capabilities.required_child_context {
-            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec)
+            let physical = Self::fresh_required_worker_spec(spec);
+            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, &physical)
                 .await
                 .map_err(|error| {
                     AgentError::LLM(format!("required-context worker spawn failed: {error}"))
@@ -8099,6 +8109,36 @@ mod tests {
                 provision.identity.child_id, expected.session_id,
                 "test fixture must prove transport identity is independent"
             );
+        }
+        let mut original = spec_with("worker", "provider", "model", Some("/ws"), None);
+        original.executor = ExecutorSpec::BambooRuntime;
+        original.identity.depth = session.spawn_depth;
+        original.capabilities.required_child_context = true;
+        original.capabilities.child_creation_identity = true;
+        original.capabilities.enforce_permissions = true;
+        original.capabilities.native_tool_ceiling_required = true;
+        original.capabilities.native_tool_ceiling =
+            Some(bamboo_subagent::proto::NativeToolCeiling {
+                version: 1,
+                child_session_id: session.id.clone(),
+                parent_session_id: job.parent_session_id.clone(),
+                root_session_id: session.root_session_id.clone(),
+                created_at: session.created_at,
+                spawn_depth: session.spawn_depth,
+                project_id: None,
+                tools: vec![],
+            });
+        original.validate().unwrap();
+        let first = ActorChildRunner::fresh_required_worker_spec(&original);
+        let second = ActorChildRunner::fresh_required_worker_spec(&original);
+        assert_ne!(first.identity.child_id, second.identity.child_id);
+        assert_ne!(first.identity.child_id, original.identity.child_id);
+        for physical in [first, second] {
+            physical.validate().unwrap();
+            let mut actual = serde_json::to_value(&physical).unwrap();
+            actual["identity"]["child_id"] = serde_json::json!(original.identity.child_id);
+            assert_eq!(actual, serde_json::to_value(&original).unwrap());
+            assert_eq!(logical_identity_for_actor_run(&session, &job), expected);
         }
     }
 

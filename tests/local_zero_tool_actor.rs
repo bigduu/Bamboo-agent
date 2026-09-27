@@ -27,6 +27,7 @@ struct Probe {
     wake: tokio::sync::Notify,
     requests: Mutex<Vec<Value>>,
     child_id: Mutex<Option<String>>,
+    first_worker_run: Mutex<Option<(PathBuf, Vec<u8>)>>,
     data: PathBuf,
     workspace: PathBuf,
     reasoning: bool,
@@ -140,6 +141,42 @@ fn print_bounded_retry_log(data: &Path) {
         );
     }
 }
+fn claimed_required_runs(data: &Path) -> Vec<(PathBuf, Vec<u8>, bamboo_subagent::RunSpec)> {
+    use std::io::Read;
+    let mut runs = Vec::new();
+    for mailbox in std::fs::read_dir(data.join("broker/mailboxes"))
+        .unwrap()
+        .take(17)
+    {
+        let mailbox = mailbox.unwrap();
+        if !mailbox
+            .file_name()
+            .to_str()
+            .unwrap()
+            .starts_with("required-worker-")
+        {
+            continue;
+        }
+        for entry in std::fs::read_dir(mailbox.path().join("cur"))
+            .unwrap()
+            .take(5)
+        {
+            let path = entry.unwrap().path();
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 256 * 1024);
+            let message: bamboo_subagent::InboxMessage = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(message.kind, bamboo_subagent::InboxKind::Run);
+            runs.push((path, bytes, serde_json::from_value(message.body).unwrap()));
+        }
+    }
+    assert!(runs.len() <= 2);
+    runs
+}
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
@@ -159,6 +196,49 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             wake.await;
         }
         if probe.retry {
+            {
+                let runs = claimed_required_runs(&probe.data);
+                let mut first = probe.first_worker_run.lock().unwrap();
+                if child_call == 0 {
+                    assert_eq!(runs.len(), 1);
+                    assert!(runs[0].2.initial_session_messages.is_empty());
+                    *first = Some((runs[0].0.clone(), runs[0].1.clone()));
+                } else if child_call == 1 {
+                    assert_eq!(runs.len(), 2);
+                    let (old_path, old_bytes) = first.as_ref().unwrap();
+                    let old = runs.iter().find(|r| &r.0 == old_path).unwrap();
+                    assert_eq!(&old.1, old_bytes, "old unACKed Run remains untouched");
+                    let new = runs.iter().find(|r| &r.0 != old_path).unwrap();
+                    assert_ne!(
+                        new.0.parent().unwrap().parent(),
+                        old_path.parent().unwrap().parent()
+                    );
+                    assert_eq!(new.2.logical_session, old.2.logical_session);
+                    assert_eq!(new.2.project_id, old.2.project_id);
+                    assert_ne!(new.2.activation_run_id, old.2.activation_run_id);
+                    assert_eq!(new.2.initial_session_messages.len(), 1);
+                    let mailbox = |path: &Path| {
+                        path.parent()
+                            .unwrap()
+                            .parent()
+                            .unwrap()
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    eprintln!(
+                        "actual distinct worker mailboxes old={} new={} old Run still unACKed",
+                        mailbox(old_path),
+                        mailbox(&new.0)
+                    );
+                    assert_eq!(
+                        new.2.logical_session.as_ref().unwrap().session_id,
+                        probe.child_id.lock().unwrap().as_ref().unwrap().as_str()
+                    );
+                }
+            }
             eprintln!(
                 "actual plain-child request index={child_call} Host phase={}",
                 provider_host_phase(&probe).await
@@ -433,6 +513,7 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
         wake: Default::default(),
         requests: Mutex::new(vec![]),
         child_id: Mutex::new(None),
+        first_worker_run: Mutex::new(None),
         data: data.clone(),
         workspace: workspace.clone(),
         reasoning,

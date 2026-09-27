@@ -53,6 +53,11 @@ unconfirmed checkpoint dispatches no Run/provider and performs no ACK or
 ordinary save. The successful plain reply is appended with the new fence;
 rejected worker reasoning/cache content is never Host canonical history.
 
+Fresh required-context bus workers receive unique physical mailbox IDs. A killed
+worker's unACKed Run stays in its old mailbox instead of being replayed by the
+retry process. Logical Child identity/birth, cache namespace, typed input targets
+and permissions are unchanged; legacy pooled/direct/remote routes are unchanged.
+
 Only one retry worker Run is enabled here; extra pending input stays durable
 and unsupported. Same-generation checkpoint/old-claim recovery is separate:
 its actual server Run caller must first omit legacy full-save/reset, then reuse
