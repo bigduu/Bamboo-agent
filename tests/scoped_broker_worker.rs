@@ -245,7 +245,9 @@ async fn fixture() {
         token: WORKER.into(),
     });
     let mut c = command(&dir);
-    c.args(["broker-agent", "serve", "--spec-stdin", "--tls-ca-cert"])
+    c.args(["broker-agent", "serve", "--broker"])
+        .arg(&url)
+        .args(["--id", "worker-native", "--spec-stdin", "--tls-ca-cert"])
         .arg(&cert)
         .env("BAMBOO_BROKER_TOKEN", WORKER);
     let _worker = spawn(
