@@ -2211,7 +2211,7 @@ async fn message_only_fixture() {
                 "message-only held-cut timeout: {}",
                 json!({
                     "root_status":current.last_run_status(),
-                    "root_error":current.last_run_error().map(|e| bounded_diagnostic(&e, 512)),
+                    "root_error":current.last_run_error().map(|e| bounded_diagnostic(&e, 512).to_owned()),
                     "root_settled":root_settled.load(Ordering::SeqCst),
                     "child_ready":probe.child_ready.load(Ordering::SeqCst),
                     "root_calls":probe.root_calls.load(Ordering::SeqCst),
