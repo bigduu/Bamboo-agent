@@ -2278,12 +2278,16 @@ async fn root_catalog_fixture() {
             json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0})
         ]
     );
-    let index = store.list_index_entries().await;
+    // The Host created these Roots after `store` opened. Its in-memory index
+    // does not reload across processes; reopen for this final assertion.
+    let index_store = SessionStoreV2::new(data.clone()).await.unwrap();
+    let index = index_store.list_index_entries().await;
     assert_eq!(index.len(), 2, "two Root Sessions and no Child");
     assert!(index.iter().all(|row| row.parent_session_id.is_none()));
     let mut ids = index.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
     ids.sort_unstable();
     assert_eq!(ids.as_slice(), ["f1-standard-root", "f1-ultra-root"]);
+    drop(index_store);
 
     host.0.kill().unwrap();
     host.0.wait().unwrap();
