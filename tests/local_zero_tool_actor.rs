@@ -2145,6 +2145,7 @@ async fn message_only_fixture() {
         .status()
         .is_success());
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
+    let root_settled = AtomicBool::new(false);
     let parent = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
@@ -2162,6 +2163,7 @@ async fn message_only_fixture() {
                 .unwrap()
                 .iter()
                 .any(|r| r["id"] == "plain-root" && r["is_running"] == false);
+            root_settled.store(settled, Ordering::SeqCst);
             if settled
                 && parent.last_run_status().as_deref() == Some("completed")
                 && probe.child_ready.load(Ordering::SeqCst)
@@ -2177,8 +2179,49 @@ async fn message_only_fixture() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    let parent = match parent {
+        Ok(parent) => parent,
+        Err(_) => {
+            let current = store.load_session("plain-root").await.unwrap().unwrap();
+            let mut children = Vec::new();
+            for row in store
+                .list_index_entries()
+                .await
+                .into_iter()
+                .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
+            {
+                let child = store.load_session(&row.id).await.unwrap();
+                children
+                    .push(json!({"id":row.id,"status":child.and_then(|c| c.last_run_status())}));
+            }
+            let models: Vec<_> = probe
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .take(16)
+                .map(|request| request["model"].as_str().unwrap_or("missing").to_owned())
+                .collect();
+            let log = std::fs::read_to_string(data.join("host.log")).unwrap_or_default();
+            let tail: Vec<_> = current.messages.iter().rev().take(4).map(|m|
+                json!({"role":m.role,"tool_call_id":m.tool_call_id,"tool_success":m.tool_success,
+                    "content":bounded_diagnostic(&m.content, 256)})).collect();
+            panic!(
+                "message-only held-cut timeout: {}",
+                json!({
+                    "root_status":current.last_run_status(),
+                    "root_error":current.last_run_error().map(|e| bounded_diagnostic(&e, 512)),
+                    "root_settled":root_settled.load(Ordering::SeqCst),
+                    "child_ready":probe.child_ready.load(Ordering::SeqCst),
+                    "root_calls":probe.root_calls.load(Ordering::SeqCst),
+                    "child_calls":probe.child_calls.load(Ordering::SeqCst),
+                    "children":children,"provider_models":models,"root_tail":tail,
+                    "host_log":bounded_diagnostic(&log, 2048)
+                })
+            );
+        }
+    };
     let result = message_only_root_result(&parent);
     let id = result["actor_id"].as_str().unwrap().to_owned();
     let before = store.load_session(&id).await.unwrap().unwrap();
