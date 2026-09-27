@@ -1345,15 +1345,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Per-Run authority replaces the prior warm activation's selection;
         // omission takes the existing ordinary default path, not a latched value.
         session.reasoning_effort = reasoning_effort;
-        if let Some(identity) = logical_identity {
-            if let Some(creation) = identity.creation {
+        if let Some(ref identity) = logical_identity {
+            if let Some(creation) = identity.creation.as_ref() {
                 session.created_at = creation.created_at;
             }
-            session.parent_session_id = identity.parent_session_id;
+            session.parent_session_id = identity.parent_session_id.clone();
             session.root_session_id = if identity.root_session_id.trim().is_empty() {
                 session.id.clone()
             } else {
-                identity.root_session_id
+                identity.root_session_id.clone()
             };
             session.kind = SessionKind::Child;
             session.title_generated = true;
