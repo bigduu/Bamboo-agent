@@ -26,6 +26,7 @@ pub const PROVISION_VERSION: u32 = 2;
 pub const TYPED_READ_ONLY_WORKER_CAPABILITY: &str = "typed_read_only_tool_policy_v1";
 pub const REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY: &str = "required_child_context_v1";
 pub const NATIVE_TOOL_CEILING_WORKER_CAPABILITY: &str = "native_tool_ceiling_v1";
+pub const INITIAL_INPUT_RELEASE_WORKER_CAPABILITY: &str = "owned_initial_input_release_v1";
 pub const CHILD_CREATION_IDENTITY_WORKER_CAPABILITY: &str = "durable_child_creation_identity_v1";
 
 /// Non-secret capability document printed by `bamboo subagent-worker
@@ -43,6 +44,7 @@ impl WorkerCapabilityReport {
         Self {
             provision_version: PROVISION_VERSION,
             capabilities: vec![
+                INITIAL_INPUT_RELEASE_WORKER_CAPABILITY.to_string(),
                 TYPED_READ_ONLY_WORKER_CAPABILITY.to_string(),
                 REQUIRED_CHILD_CONTEXT_WORKER_CAPABILITY.to_string(),
                 CHILD_CREATION_IDENTITY_WORKER_CAPABILITY.to_string(),
@@ -130,6 +132,9 @@ pub struct ProvisionSpec {
 /// skills exactly as before.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Host-owned initial typed input cannot enter SDK before exact ACK/release.
+    #[serde(default)]
+    pub initial_input_release_required: bool,
     /// Every logical Child Run must carry its authoritative host birth.
     /// Older workers must acknowledge this before receiving a provision.
     #[serde(default)]
@@ -586,6 +591,22 @@ impl ProvisionSpec {
     /// honor only `mcp_proxy`; fail closed here instead (D4 from the drift
     /// audit: this invariant was documented but never guarded).
     pub fn validate(&self) -> Result<()> {
+        if self.capabilities.initial_input_release_required
+            && (!self.capabilities.required_child_context
+                || !self.capabilities.child_creation_identity
+                || !self.capabilities.native_tool_ceiling_required
+                || !self
+                    .capabilities
+                    .native_tool_ceiling
+                    .as_ref()
+                    .is_some_and(|ceiling| ceiling.tools.is_empty())
+                || !self.capabilities.enforce_permissions
+                || self.bus.is_none())
+        {
+            return Err(StoreError::Invalid(
+                "initial_input_release_unsupported".into(),
+            ));
+        }
         if (self.capabilities.required_child_context
             && !self.capabilities.native_tool_ceiling_required)
             || self.capabilities.native_tool_ceiling_required
@@ -694,6 +715,16 @@ mod tests {
             credential_ref: None,
         });
         s
+    }
+
+    #[test]
+    fn initial_release_flag_rejects_inconsistent_provision() {
+        assert!(WorkerCapabilityReport::current().supports(INITIAL_INPUT_RELEASE_WORKER_CAPABILITY));
+        let mut spec = spec();
+        spec.capabilities.initial_input_release_required = true;
+        assert!(spec.validate().is_err());
+        spec.capabilities.initial_input_release_required = false;
+        assert!(spec.validate().is_ok(), "legacy provision unchanged");
     }
 
     #[test]
@@ -809,6 +840,7 @@ mod tests {
         s.capabilities = Capabilities {
             child_creation_identity: false,
             required_child_context: false,
+            initial_input_release_required: false,
             native_tool_ceiling_required: false,
             native_tool_ceiling: None,
             mcp: Some(serde_json::json!({ "version": 1, "servers": [] })),

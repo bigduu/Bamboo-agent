@@ -92,6 +92,15 @@ impl BrokerChildLink {
                 );
                 self.client.deliver(&self.child, m).await?;
             }
+            ParentFrame::InitialInputRelease { release } => {
+                let body =
+                    serde_json::to_value(bamboo_subagent::proto::InitialInputControl::Release {
+                        release,
+                    })
+                    .map_err(|e| BrokerError::Transport(format!("encode initial release: {e}")))?;
+                let m = self.msg(InboxKind::Steer, body, self.run_id.clone());
+                self.client.deliver(&self.child, m).await?;
+            }
             ParentFrame::SessionMessage { delivery } => {
                 let body = serde_json::to_value(delivery).map_err(|e| {
                     BrokerError::Transport(format!("encode SessionMessageDelivery: {e}"))
@@ -150,6 +159,31 @@ impl BrokerChildLink {
                     ) {
                         Ok(batch) => Some(ChildFrame::EventBatch { batch }),
                         Err(_) => Some(ChildFrame::Event { event: msg.body }),
+                    }
+                }
+                InboxKind::SessionMessageAdmitted
+                    if msg.body.get("initial_input_control").is_some() =>
+                {
+                    match bamboo_subagent::proto::InitialInputControl::decode(msg.body).map_err(
+                        |e| BrokerError::Transport(format!("decode initial control: {e}")),
+                    )? {
+                        bamboo_subagent::proto::InitialInputControl::Request { request } => {
+                            Some(ChildFrame::Event {
+                                event: serde_json::to_value(
+                                    bamboo_subagent::proto::InitialInputControl::Request {
+                                        request,
+                                    },
+                                )
+                                .map_err(|e| {
+                                    BrokerError::Transport(format!("encode initial control: {e}"))
+                                })?,
+                            })
+                        }
+                        _ => {
+                            return Err(BrokerError::Transport(
+                                "unexpected initial release direction".into(),
+                            ))
+                        }
                     }
                 }
                 InboxKind::SessionMessageAdmitted => {

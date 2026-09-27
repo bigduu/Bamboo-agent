@@ -1236,6 +1236,21 @@ where
                 biased;
                 _ = forward_cancel.cancelled() => return,
                 control = controls.recv(), if controls_open => match control {
+                    Some(ExecutorControl::InitialInputReleaseRequest(request)) => {
+                        // The worker enqueued its actual permission audit before
+                        // this control. Drain/flush it on the ordered event lane
+                        // before asking the Host for provider permission.
+                        while let Ok(event) = events.try_recv() {
+                            for batch in event_batcher.push(event) {
+                                if !forward_actor_event_batch(&uplink_fwd, &parent_fwd, &run_id_fwd, batch).await { return; }
+                            }
+                        }
+                        if let Some(batch) = event_batcher.flush() {
+                            if !forward_actor_event_batch(&uplink_fwd, &parent_fwd, &run_id_fwd, batch).await { return; }
+                        }
+                        let Ok(body) = serde_json::to_value(bamboo_subagent::proto::InitialInputControl::Request { request }) else { return; };
+                        if uplink_fwd.deliver_ordered(&parent_fwd, emit(InboxKind::SessionMessageAdmitted, body)).await.is_err() { return; }
+                    }
                     Some(ExecutorControl::SessionMessageAdmitted(confirmation)) => {
                         let body = serde_json::to_value(confirmation)
                             .unwrap_or_else(|_| serde_json::json!({}));
@@ -1471,6 +1486,17 @@ fn decode_steer_body(
     body: &serde_json::Value,
     durable_message_id: Option<&str>,
 ) -> Option<bamboo_subagent::SteerMessage> {
+    if ["initial_input_control", "request", "release"]
+        .iter()
+        .any(|key| body.get(key).is_some())
+    {
+        return match bamboo_subagent::proto::InitialInputControl::decode(body.clone()) {
+            Ok(bamboo_subagent::proto::InitialInputControl::Release { release }) => {
+                Some(bamboo_subagent::SteerMessage::InitialInputRelease(release))
+            }
+            _ => None, // Unknown tags/wrong direction never fall back to Text.
+        };
+    }
     // Any typed-protocol marker makes this a typed frame. A partial/malformed
     // typed frame must fail closed; it may never fall through to a coincidental
     // `text` field and become an uncorrelated legacy steer.
@@ -1847,6 +1873,19 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("mailbox reaches {expected} pending file(s)"));
+    }
+
+    #[test]
+    fn malformed_initial_release_never_becomes_text_steering() {
+        for value in [
+            serde_json::json!({"release":{}, "text":"unsafe"}),
+            serde_json::json!({"request":{}, "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"unknown", "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"release", "release":{}, "text":"unsafe"}),
+            serde_json::json!({"initial_input_control":"request", "request":{}, "text":"unsafe"}),
+        ] {
+            assert!(decode_steer_body(&value, Some("transport-id")).is_none());
+        }
     }
 
     #[test]

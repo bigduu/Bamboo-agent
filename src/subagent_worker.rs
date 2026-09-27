@@ -376,6 +376,7 @@ pub struct BambooRuntimeExecutor {
     /// Whether this worker enforces the typed read-only child boundary through
     /// its host-provisioned tool denylist and ReadOnlyCommandChecker.
     read_only_child: bool,
+    initial_input_release_required: bool,
     required_child_context: bool,
     child_creation_identity: bool,
     native_tool_ceiling: Option<bamboo_subagent::proto::NativeToolCeiling>,
@@ -444,7 +445,8 @@ fn bind_worker_session_note(
 }
 
 fn validate_native_startup(spec: &ProvisionSpec) -> Result<(), String> {
-    if spec.capabilities.required_child_context
+    if spec.capabilities.initial_input_release_required
+        || spec.capabilities.required_child_context
         || spec.capabilities.native_tool_ceiling_required
         || spec.capabilities.native_tool_ceiling.is_some()
     {
@@ -910,6 +912,7 @@ impl BambooRuntimeExecutor {
             spawn_depth: spec.identity.depth,
             provisioned_permission,
             read_only_child: spec.capabilities.read_only_enforced(),
+            initial_input_release_required: spec.capabilities.initial_input_release_required,
             required_child_context: spec.capabilities.required_child_context,
             child_creation_identity: spec.capabilities.child_creation_identity,
             native_tool_ceiling: spec.capabilities.native_tool_ceiling.clone(),
@@ -1671,6 +1674,24 @@ impl ChildExecutor for BambooRuntimeExecutor {
             session = reloaded;
         }
 
+        if self.initial_input_release_required {
+            // The actual bootstrap audit is already durable. Queue it before
+            // the release control; the broker preserves this boundary order.
+            if let Some(audit) =
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+            {
+                let posture = AgentEvent::PermissionPostureActivated {
+                    session_id: session.id.clone(),
+                    policy_revision: audit.policy_revision,
+                    requested_mode: audit.resolution.requested.as_str().to_string(),
+                    effective_mode: audit.resolution.effective.as_str().to_string(),
+                    executor_mapping: audit.executor_mapping,
+                };
+                events
+                    .emit(serde_json::to_value(posture).expect("typed permission posture"))
+                    .await;
+            }
+        }
         // Initial actor deliveries are a startup barrier: enqueue the complete
         // ordered authorized prefix and mirror its durable policy locally,
         // then execute the real safe-turn checkpoint before starting provider
@@ -1725,16 +1746,41 @@ impl ChildExecutor for BambooRuntimeExecutor {
                         delivery.envelope.id
                     ));
                 }
-                events
-                    .confirm_session_message(SessionMessageAdmissionConfirmation {
-                        target_session_id: delivery.target_session_id.clone(),
-                        envelope_id: delivery.envelope.id.as_str().to_string(),
-                        canonical_claim_generation: delivery.canonical_claim_generation,
-                        activation_run_id: delivery.activation_run_id.clone(),
-                    })
-                    .await;
+                if !self.initial_input_release_required {
+                    events
+                        .confirm_session_message(SessionMessageAdmissionConfirmation {
+                            target_session_id: delivery.target_session_id.clone(),
+                            envelope_id: delivery.envelope.id.as_str().to_string(),
+                            canonical_claim_generation: delivery.canonical_claim_generation,
+                            activation_run_id: delivery.activation_run_id.clone(),
+                        })
+                        .await;
+                }
             }
         }
+        let initial_release_deadline =
+            if self.initial_input_release_required && !initial_deliveries.is_empty() {
+                if initial_deliveries.len() != 1 {
+                    return ChildOutcome::error("initial release requires one exact typed input");
+                }
+                let request = match bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
+                    &run,
+                    &initial_deliveries[0],
+                    uuid::Uuid::new_v4().to_string(),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => return ChildOutcome::error(error),
+                };
+                if let Err(error) = events.request_initial_release(request.clone()).await {
+                    return ChildOutcome::error(error);
+                }
+                match steer.wait_initial_release(&request, &cancel, &events).await {
+                    Ok(deadline) => Some(deadline),
+                    Err(error) => return ChildOutcome::error(error),
+                }
+            } else {
+                None
+            };
 
         // In-band steering: typed ParentFrame::SessionMessage values enter the
         // worker-local durable SessionInbox. The real engine safe-turn bridge
@@ -1757,6 +1803,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     break;
                 };
                 let (envelope, confirmation, activation_policy) = match message {
+                    SteerMessage::InitialInputRelease(_) => break, // Late authority is never user text.
                     SteerMessage::Text(text) => {
                         let envelope = SessionMessageEnvelope {
                             id: SessionMessageId::new(),
@@ -1966,18 +2013,20 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         }));
-        if let Some(audit) =
-            bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
-        {
-            let _ = event_tx
-                .send(AgentEvent::PermissionPostureActivated {
-                    session_id: session.id.clone(),
-                    policy_revision: audit.policy_revision,
-                    requested_mode: audit.resolution.requested.as_str().to_string(),
-                    effective_mode: audit.resolution.effective.as_str().to_string(),
-                    executor_mapping: audit.executor_mapping,
-                })
-                .await;
+        if !self.initial_input_release_required {
+            if let Some(audit) =
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+            {
+                let _ = event_tx
+                    .send(AgentEvent::PermissionPostureActivated {
+                        session_id: session.id.clone(),
+                        policy_revision: audit.policy_revision,
+                        requested_mode: audit.resolution.requested.as_str().to_string(),
+                        effective_mode: audit.resolution.effective.as_str().to_string(),
+                        executor_mapping: audit.executor_mapping,
+                    })
+                    .await;
+            }
         }
 
         let mut builder = bamboo_engine::ExecuteRequestBuilder::new(
@@ -2009,6 +2058,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Scope the approval proxy to exactly this run (task-local), so gated
         // tools route ConfirmationRequired to the host. Unset => unchanged
         // (fail-closed) behavior.
+        if initial_release_deadline.is_some_and(|deadline| chrono::Utc::now() >= deadline) {
+            return ChildOutcome::error("initial release expired before SDK admission");
+        }
         let result = bamboo_tools::with_approval_proxy(
             approval_proxy,
             self.agent.execute(&mut session, builder.build()),
@@ -2294,6 +2346,7 @@ mod tests {
                 bamboo_domain::PermissionMode::Default,
             ),
             read_only_child: false,
+            initial_input_release_required: false,
             required_child_context: false,
             child_creation_identity: false,
             native_tool_ceiling: None,
@@ -2437,6 +2490,357 @@ mod tests {
         }
     }
 
+    // Real Host Store/owned Inbox and broker; the executor is the real
+    // BambooRuntime, and only its provider is recorded. No fabricated ACK.
+    #[tokio::test]
+    async fn initial_release_real_broker_runtime_waits_for_owned_host_ack() {
+        use bamboo_domain::{
+            ActorActivationClaim, ActorDirectoryPort, SessionInboxConsumerId,
+            SessionInboxLeaseRequest, SessionInboxLimits, SessionInboxPort,
+        };
+        use bamboo_subagent::proto::{
+            ChildFrame, InitialInputRelease, InitialInputReleaseRequest, ParentFrame,
+        };
+        for case in [
+            "ack-retry",
+            "wrong-nonce",
+            "wrong-epoch",
+            "expired",
+            "cancel",
+        ] {
+            let host_temp = tempfile::tempdir().unwrap();
+            let host = Arc::new(SessionStoreV2::new(host_temp.path().into()).await.unwrap());
+            let parent = Session::new("release-parent", "model");
+            host.save_session(&parent).await.unwrap();
+            let mut child = Session::new_child_of("release-child", &parent, "model", "base task");
+            child.add_message(Message::user("base task"));
+            host.save_session(&child).await.unwrap();
+            host.ensure_actor(&child.id).await.unwrap();
+            let deadline = chrono::Utc::now()
+                + chrono::Duration::seconds(if case == "expired" { 5 } else { 30 });
+            let consumer = SessionInboxConsumerId::new();
+            let actor = host
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: child.id.clone(),
+                    run_id: "release-run".into(),
+                    lease_owner: consumer.as_str().into(),
+                    lease_expires_at: deadline,
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+            host.start_activation(&actor.fence(), chrono::Utc::now())
+                .await
+                .unwrap();
+            let inbox =
+                bamboo_storage::FileSessionInbox::new(host.clone(), SessionInboxLimits::default());
+            let envelope =
+                SessionMessageEnvelope::user_input(&child.id, "HOST_RELEASED_INPUT_ONCE");
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let claim = inbox
+                .claim_owned(
+                    &child.id,
+                    1,
+                    Some("release-run"),
+                    &SessionInboxLeaseRequest {
+                        consumer,
+                        now: chrono::Utc::now(),
+                        duration: deadline - chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut run = protocol_run(
+                &child.id,
+                "release-run",
+                vec![SessionMessageDelivery {
+                    target_session_id: child.id.clone(),
+                    envelope: envelope.clone(),
+                    canonical_claim_generation: receipt.generation,
+                    activation_run_id: "release-run".into(),
+                    activation_policy: claim.claim.activation_policy,
+                }],
+            );
+            run.logical_session = Some(LogicalSessionIdentity {
+                session_id: child.id.clone(),
+                parent_session_id: child.parent_session_id.clone(),
+                root_session_id: child.root_session_id.clone(),
+                creation: Some(bamboo_subagent::proto::ChildCreationIdentity {
+                    created_at: child.created_at,
+                    spawn_depth: child.spawn_depth,
+                }),
+            });
+            run.messages = child
+                .messages
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect();
+            let committed = inbox
+                .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                    fence: actor.fence(),
+                    expected_created_at: child.created_at,
+                    claim: claim.clone(),
+                    expected_messages: child.messages.clone(),
+                    expected_provider_transcript: child.provider_transcript.clone(),
+                    expected_admission: None,
+                })
+                .await
+                .unwrap();
+            child = committed.session;
+            let provider = Arc::new(RecordingWorkerProvider::default());
+            let (_worker_temp, mut executor, worker_store, worker_inbox) =
+                worker_protocol_fixture(provider.clone()).await;
+            executor.initial_input_release_required = true;
+            executor.child_creation_identity = true;
+            let broker_temp = tempfile::tempdir().unwrap();
+            let broker = Arc::new(bamboo_broker::server::BrokerServer::new(
+                Arc::new(bamboo_broker::core::BrokerCore::new(broker_temp.path())),
+                "release-test-token",
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                broker.serve(listener).await
+            }));
+            let worker_endpoint = endpoint.clone();
+            let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                bamboo_broker::serve::serve_executor(
+                    &worker_endpoint,
+                    bamboo_subagent::AgentRef {
+                        session_id: "release-physical-worker".into(),
+                        role: None,
+                    },
+                    "release-test-token",
+                    Arc::new(executor),
+                )
+                .await
+            }));
+            let mut link = bamboo_broker::BrokerChildLink::connect(
+                &endpoint,
+                bamboo_subagent::AgentRef {
+                    session_id: "release-host".into(),
+                    role: None,
+                },
+                "release-test-token",
+                "release-physical-worker",
+            )
+            .await
+            .unwrap();
+            link.send(ParentFrame::Run(run.clone())).await.unwrap();
+            let mut saw_posture = false;
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match link.next_frame().await.unwrap().unwrap() {
+                        ChildFrame::EventBatch { batch } => {
+                            saw_posture |= batch
+                                .events
+                                .iter()
+                                .any(|e| e["type"] == "permission_posture_activated");
+                        }
+                        ChildFrame::Event { event }
+                            if event.get("initial_input_control").is_some() =>
+                        {
+                            let bamboo_subagent::proto::InitialInputControl::Request { request } =
+                                bamboo_subagent::proto::InitialInputControl::decode(event).unwrap()
+                            else {
+                                panic!("wrong initial control direction")
+                            };
+                            break request;
+                        }
+                        ChildFrame::Terminal { error, .. } => {
+                            panic!("worker before release: {error:?}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{case}: initial release request: {error}"));
+            let cancel_run_path = if case == "cancel" {
+                let cur = broker_temp
+                    .path()
+                    .join("mailboxes/release-physical-worker/cur");
+                let mut captured = None;
+                for entry in std::fs::read_dir(cur).unwrap() {
+                    let path = entry.unwrap().path();
+                    let message: bamboo_subagent::InboxMessage =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    if message.kind == bamboo_subagent::InboxKind::Run {
+                        assert_eq!(message.from.session_id, "release-host");
+                        assert_eq!(message.body, serde_json::to_value(&run).unwrap());
+                        assert!(message.correlation_id.is_none());
+                        assert!(path
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .ends_with(&format!("-{}.json", message.id.as_str())));
+                        assert!(captured.replace(path).is_none(), "one actual Run");
+                    }
+                }
+                Some(captured.expect("cancel must observe its actual unacked Run"))
+            } else {
+                None
+            };
+            assert!(
+                saw_posture,
+                "actual audit is ordered before the release request"
+            );
+            assert_eq!(
+                request,
+                InitialInputReleaseRequest::from_run(
+                    &run,
+                    &run.initial_session_messages[0],
+                    request.nonce.clone()
+                )
+                .unwrap()
+            );
+            assert!(worker_inbox
+                .was_admitted(&child.id, &envelope.id)
+                .await
+                .unwrap());
+            assert!(worker_store
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == envelope.id.as_str()));
+            assert!(
+                provider.calls.lock().unwrap().is_empty(),
+                "local receipt must not enter SDK"
+            );
+            assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+            let mut release = InitialInputRelease {
+                request,
+                expires_at: deadline.min(claim.lease.expires_at),
+            };
+            match case {
+                "ack-retry" => {
+                    // Real ACK failure, not a mocked successful receipt. Keep
+                    // the actual worker alive while Host admission is delayed.
+                    let dir = host
+                        .bamboo_home_dir()
+                        .join(host.resolve_rel_path(&child.id).await.unwrap())
+                        .join("inbox/admitted");
+                    if dir.exists() {
+                        std::fs::remove_dir_all(&dir).unwrap();
+                    }
+                    std::fs::write(&dir, b"blocked Host ACK destination").unwrap();
+                    assert!(inbox
+                        .ack_owned(&child.id, &claim, chrono::Utc::now())
+                        .await
+                        .is_err());
+                    assert!(provider.calls.lock().unwrap().is_empty());
+                    std::fs::remove_file(&dir).unwrap();
+                    inbox
+                        .ack_owned(&child.id, &claim, chrono::Utc::now())
+                        .await
+                        .unwrap();
+                    inbox
+                        .ack_owned(&child.id, &claim, chrono::Utc::now())
+                        .await
+                        .unwrap();
+                }
+                "expired" => {
+                    let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                    tokio::time::sleep(delay + std::time::Duration::from_millis(10)).await;
+                    assert!(
+                        !worker.is_finished(),
+                        "unreleased physical worker is still alive"
+                    );
+                    assert!(host
+                        .validate_fence(&actor.fence(), chrono::Utc::now())
+                        .await
+                        .is_err());
+                    assert!(inbox
+                        .ack_owned(&child.id, &claim, chrono::Utc::now())
+                        .await
+                        .is_err());
+                    assert!(provider.calls.lock().unwrap().is_empty());
+                }
+                "wrong-nonce" => release.request.nonce = uuid::Uuid::new_v4().to_string(),
+                "wrong-epoch" => release.request.execution_epoch += 1,
+                "cancel" => {}
+                _ => unreachable!(),
+            }
+            link.send(if case == "cancel" {
+                ParentFrame::Cancel
+            } else {
+                ParentFrame::InitialInputRelease { release }
+            })
+            .await
+            .unwrap();
+            let status = if let Some(path) = cancel_run_path {
+                // Existing Run cancellation suppresses Outcome, but its actual
+                // ACK follows executor completion and descendant-task joins.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while tokio::fs::try_exists(&path).await.unwrap() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{case}: actual Run ACK: {error}"));
+                assert!(!worker.is_finished(), "cancel settles Run, not worker");
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            if let Some(ChildFrame::Terminal { status, .. }) =
+                                link.next_frame().await.unwrap()
+                            {
+                                break status;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: Terminal: {error}")),
+                )
+            };
+            let calls = provider.calls.lock().unwrap().len();
+            assert_eq!(calls, usize::from(case == "ack-retry"), "{case}");
+            if case == "ack-retry" {
+                assert_eq!(status, Some(bamboo_subagent::TerminalStatus::Completed));
+            } else if case != "cancel" {
+                assert_ne!(status.unwrap(), bamboo_subagent::TerminalStatus::Completed);
+            }
+            let cold = SessionStoreV2::new(host_temp.path().into())
+                .await
+                .unwrap()
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            assert!(cold
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&envelope.id));
+            drop(worker);
+            drop(server);
+        }
+    }
+
     async fn execute_protocol_run(
         executor: &BambooRuntimeExecutor,
         run: RunSpec,
@@ -2452,8 +2856,9 @@ mod tests {
         .await;
         let mut confirmations = Vec::new();
         while let Ok(control) = control_rx.try_recv() {
-            let ExecutorControl::SessionMessageAdmitted(confirmation) = control;
-            confirmations.push(confirmation);
+            if let ExecutorControl::SessionMessageAdmitted(confirmation) = control {
+                confirmations.push(confirmation);
+            }
         }
         (outcome, confirmations)
     }

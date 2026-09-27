@@ -417,6 +417,135 @@ pub struct SessionMessageAdmissionConfirmation {
     pub activation_run_id: String,
 }
 
+/// Closed initial-input barrier. This is not a tool grant or an approval reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputReleaseRequest {
+    pub version: u32,
+    pub nonce: String,
+    pub child_id: String,
+    pub parent_id: String,
+    pub root_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub envelope_id: String,
+    pub generation: u64,
+    pub activation_run_id: String,
+    pub execution_epoch: u64,
+}
+impl InitialInputReleaseRequest {
+    pub fn from_run(
+        run: &RunSpec,
+        delivery: &SessionMessageDelivery,
+        nonce: String,
+    ) -> Result<Self, String> {
+        let logical = run
+            .logical_session
+            .as_ref()
+            .ok_or("initial release logical identity missing")?;
+        let birth = logical
+            .creation
+            .as_ref()
+            .ok_or("initial release birth missing")?;
+        let parent = logical
+            .parent_session_id
+            .as_ref()
+            .ok_or("initial release parent missing")?;
+        if uuid::Uuid::parse_str(&nonce).is_err()
+            || nonce.len() != 36
+            || logical.session_id.is_empty()
+            || parent.is_empty()
+            || logical.root_session_id.is_empty()
+            || birth.spawn_depth == 0
+            || run.execution_epoch == 0
+            || delivery.canonical_claim_generation == 0
+            || run.activation_run_id.as_deref() != Some(delivery.activation_run_id.as_str())
+            || delivery.target_session_id != logical.session_id
+            || delivery.envelope.target_session_id != logical.session_id
+        {
+            return Err("initial release binding invalid".into());
+        }
+        let request = Self {
+            version: 1,
+            nonce,
+            child_id: logical.session_id.clone(),
+            parent_id: parent.clone(),
+            root_id: logical.root_session_id.clone(),
+            created_at: birth.created_at,
+            spawn_depth: birth.spawn_depth,
+            project_id: run.project_id.clone(),
+            envelope_id: delivery.envelope.id.as_str().into(),
+            generation: delivery.canonical_claim_generation,
+            activation_run_id: delivery.activation_run_id.clone(),
+            execution_epoch: run.execution_epoch,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        let identity = NativeToolCeiling {
+            version: self.version,
+            child_session_id: self.child_id.clone(),
+            parent_session_id: self.parent_id.clone(),
+            root_session_id: self.root_id.clone(),
+            created_at: self.created_at,
+            spawn_depth: self.spawn_depth,
+            project_id: self.project_id.clone(),
+            tools: Vec::new(),
+        };
+        if identity.validate().is_err()
+            || uuid::Uuid::parse_str(&self.nonce).is_err()
+            || self.nonce.len() != 36
+            || self.generation == 0
+            || self.execution_epoch == 0
+            || self.activation_run_id.is_empty()
+            || self.activation_run_id.len() > 256
+            || bamboo_domain::SessionMessageId::parse(self.envelope_id.clone()).is_err()
+        {
+            return Err("initial release binding invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputRelease {
+    pub request: InitialInputReleaseRequest,
+    pub expires_at: DateTime<Utc>,
+}
+impl InitialInputRelease {
+    pub fn permits(&self, request: &InitialInputReleaseRequest, now: DateTime<Utc>) -> bool {
+        &self.request == request && request.version == 1 && now < self.expires_at
+    }
+}
+/// Reserved discriminator: unknown or malformed values never become text steering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "initial_input_control",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InitialInputControl {
+    Request { request: InitialInputReleaseRequest },
+    Release { release: InitialInputRelease },
+}
+impl InitialInputControl {
+    pub fn decode(body: serde_json::Value) -> Result<Self, String> {
+        if serde_json::to_vec(&body).map_or(true, |bytes| bytes.len() > 4096) {
+            return Err("initial release control exceeds bound".into());
+        }
+        let control: Self =
+            serde_json::from_value(body).map_err(|_| "initial release control malformed")?;
+        match &control {
+            Self::Request { request } => request.validate()?,
+            Self::Release { release } => release.request.validate()?,
+        }
+        Ok(control)
+    }
+}
+
 /// Per-activation secret envelope. A Bamboo-routed Codex token lives here so a
 /// warm worker never reuses a credential from an earlier run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -570,6 +699,9 @@ pub enum ParentFrame {
     SessionMessage {
         delivery: SessionMessageDelivery,
     },
+    InitialInputRelease {
+        release: InitialInputRelease,
+    },
     /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
     /// decision on a gated tool the worker proxied back (Phase 2 child→parent
     /// approval delegation). `id` correlates to the request. When
@@ -648,6 +780,60 @@ impl ChildFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_release_schema_is_closed_and_exact() {
+        let request = InitialInputReleaseRequest {
+            version: 1,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            child_id: "child".into(),
+            parent_id: "parent".into(),
+            root_id: "parent".into(),
+            created_at: Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            envelope_id: "input".into(),
+            generation: 1,
+            activation_run_id: "run".into(),
+            execution_epoch: 7,
+        };
+        let release = InitialInputRelease {
+            request: request.clone(),
+            expires_at: Utc::now() + chrono::Duration::seconds(1),
+        };
+        assert!(release.permits(&request, Utc::now()));
+        for change in [
+            "nonce",
+            "generation",
+            "execution_epoch",
+            "child_id",
+            "created_at",
+            "project_id",
+        ] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[change] = match change {
+                "generation" | "execution_epoch" => serde_json::json!(2),
+                "created_at" => serde_json::json!("2020-01-01T00:00:00Z"),
+                _ => serde_json::json!("foreign"),
+            };
+            if let Ok(changed) = serde_json::from_value(value) {
+                assert!(!release.permits(&changed, Utc::now()), "{change}");
+            }
+        }
+        assert!(!release.permits(&request, release.expires_at));
+        let mut absent_project = serde_json::to_value(&request).unwrap();
+        absent_project.as_object_mut().unwrap().remove("project_id");
+        assert!(serde_json::from_value::<InitialInputReleaseRequest>(absent_project).is_err());
+        let bytes = serde_json::to_string(&request).unwrap();
+        let duplicate = bytes.replacen("{", "{\"nonce\":\"foreign\",", 1);
+        assert!(serde_json::from_str::<InitialInputReleaseRequest>(&duplicate).is_err());
+        let mut value = serde_json::to_value(InitialInputControl::Release { release }).unwrap();
+        value["text"] = "cannot become steer".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value.clone()).is_err());
+        value.as_object_mut().unwrap().remove("text");
+        value["initial_input_control"] = "unknown".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value).is_err());
+    }
 
     #[test]
     fn parent_frames_round_trip() {
