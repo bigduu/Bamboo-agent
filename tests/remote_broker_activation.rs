@@ -270,8 +270,10 @@ async fn wait_calls(p: &Probe, count: usize) {
     .expect("actual resident provider admission");
 }
 async fn host(data: &Path, config: &Value, mode: &str) -> (Process, String) {
-    let candidate = serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
-    candidate.save_subagents_to_dir(data).unwrap();
+    let configured = serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
+    let mut candidate = bamboo_config::Config::from_data_dir_without_env(Some(data.to_path_buf()));
+    *candidate.subagents_mut() = configured.subagents().clone();
+    candidate.save_to_dir(data.to_path_buf()).unwrap();
     let bind: std::net::SocketAddr = address().parse().unwrap();
     let base = format!("http://{bind}/api/v1");
     let mut c = command(data);
