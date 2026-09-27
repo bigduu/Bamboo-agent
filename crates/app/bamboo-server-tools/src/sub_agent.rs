@@ -705,7 +705,9 @@ impl Tool for SubAgentTool {
                 armed: true,
             };
             let result = tokio::spawn(async move {
-                Box::pin(owner.invoke_inner(args, ctx, Some(gate), projection.is_some())).await
+                owner
+                    .invoke_inner(args, ctx, Some(gate), projection.is_some())
+                    .await
             })
             .await
             .map_err(|error| {
@@ -714,13 +716,125 @@ impl Tool for SubAgentTool {
             cancel_on_drop.armed = false;
             return facade::finish(projection, result);
         }
-        let result = Box::pin(self.invoke_inner(args, ctx, None, projection.is_some())).await;
+        if action == Some("cancel") {
+            let result = self.invoke_cancel(args, ctx).await;
+            return facade::finish(projection, result);
+        }
+        let result = self
+            .invoke_inner(args, ctx, None, projection.is_some())
+            .await;
         facade::finish(projection, result)
     }
 }
 
+struct ParsedSubAgentInvocation<'a> {
+    parent_session_id: &'a str,
+    parsed: SubAgentArgs,
+    report_args: Option<serde_json::Value>,
+    has_result_selectors: bool,
+}
+
+fn parse_subagent_invocation<'a>(
+    args: serde_json::Value,
+    ctx: &'a ToolCtx,
+) -> Result<ParsedSubAgentInvocation<'a>, ToolError> {
+    let parent_session_id = ctx.session_id().ok_or_else(|| {
+        ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
+    })?;
+
+    // Backward compatibility: legacy SubAgent calls did not include an
+    // "action" field and always meant "create". If action is missing,
+    // default to "create" before deserializing the tagged enum.
+    let mut args = args;
+    if args.get("action").is_none() {
+        args["action"] = json!("create");
+    }
+
+    let has_packet = args.get("context_packet").is_some();
+    if has_packet && !args["context_packet"].is_object() {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+        ));
+    }
+    if has_packet
+        && serde_json::to_vec(&args).map_or(true, |bytes| {
+            bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES
+        })
+    {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Budget.to_string(),
+        ));
+    }
+    let report_args = matches!(
+        args["view"].as_str(),
+        Some("result_binding" | "typed_result")
+    )
+    .then(|| args.clone());
+    let has_result_selectors = args.get("expected_child_created_at").is_some()
+        || args.get("expected_assignment_sha256").is_some();
+    let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
+        ToolError::InvalidArguments(if has_packet {
+            bamboo_domain::ChildContextPacketError::Invalid.to_string()
+        } else {
+            format!("Invalid SubAgent args: {error}")
+        })
+    })?;
+
+    Ok(ParsedSubAgentInvocation {
+        parent_session_id,
+        parsed,
+        report_args,
+        has_result_selectors,
+    })
+}
+
 impl SubAgentTool {
-    async fn invoke_inner(
+    fn invoke_inner<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+        launch_gate: Option<Arc<LaunchGate>>,
+        compact: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolOutcome, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(self.invoke_inner_async(args, ctx, launch_gate, compact))
+    }
+
+    fn invoke_cancel<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolOutcome, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let ParsedSubAgentInvocation {
+                parent_session_id,
+                parsed,
+                ..
+            } = parse_subagent_invocation(args, &ctx)?;
+            let SubAgentArgs::Cancel { child_session_id } = parsed else {
+                unreachable!("cancel route is selected only for normalized cancel args");
+            };
+            let parent = self
+                .sessions
+                .as_ref()
+                .load_root_session(parent_session_id)
+                .await
+                .map_err(tool_error_from_child_session)?;
+            let result = child_session::cancel_child_action(
+                self.sessions.as_ref(),
+                &parent.id,
+                child_session_id,
+            )
+            .await
+            .map_err(tool_error_from_child_session)?;
+            tool_result(result).map(ToolOutcome::Completed)
+        })
+    }
+
+    async fn invoke_inner_async(
         &self,
         args: serde_json::Value,
         ctx: ToolCtx,
@@ -730,47 +844,12 @@ impl SubAgentTool {
         if launch_gate.as_ref().is_some_and(|gate| gate.is_cancelled()) {
             return Err(tool_error_from_child_session(cancelled_launch_error()));
         }
-        let parent_session_id = ctx.session_id().ok_or_else(|| {
-            ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
-        })?;
-
-        // Backward compatibility: legacy SubAgent calls did not include an
-        // "action" field and always meant "create". If action is missing,
-        // default to "create" before deserializing the tagged enum.
-        let mut args = args;
-        if args.get("action").is_none() {
-            args["action"] = json!("create");
-        }
-
-        let has_packet = args.get("context_packet").is_some();
-        if has_packet && !args["context_packet"].is_object() {
-            return Err(ToolError::InvalidArguments(
-                bamboo_domain::ChildContextPacketError::Invalid.to_string(),
-            ));
-        }
-        if has_packet
-            && serde_json::to_vec(&args).map_or(true, |bytes| {
-                bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES
-            })
-        {
-            return Err(ToolError::InvalidArguments(
-                bamboo_domain::ChildContextPacketError::Budget.to_string(),
-            ));
-        }
-        let report_args = matches!(
-            args["view"].as_str(),
-            Some("result_binding" | "typed_result")
-        )
-        .then(|| args.clone());
-        let has_result_selectors = args.get("expected_child_created_at").is_some()
-            || args.get("expected_assignment_sha256").is_some();
-        let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(if has_packet {
-                bamboo_domain::ChildContextPacketError::Invalid.to_string()
-            } else {
-                format!("Invalid SubAgent args: {error}")
-            })
-        })?;
+        let ParsedSubAgentInvocation {
+            parent_session_id,
+            parsed,
+            report_args,
+            has_result_selectors,
+        } = parse_subagent_invocation(args, &ctx)?;
 
         // `list_models` is read-only and session-independent.
         if let SubAgentArgs::ListModels = parsed {
