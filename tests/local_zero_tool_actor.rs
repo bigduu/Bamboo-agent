@@ -79,6 +79,67 @@ fn provider_request_shape(body: &Value) -> String {
     diagnostic.truncate(end);
     diagnostic
 }
+fn bounded_diagnostic(text: &str, cap: usize) -> &str {
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+async fn provider_host_phase(probe: &Probe) -> Value {
+    let Some(id) = probe.child_id.lock().unwrap().clone() else {
+        return json!({"child_id_available":false});
+    };
+    let Ok(store) = SessionStoreV2::new(probe.data.clone()).await else {
+        return json!({"host_store_available":false});
+    };
+    let store = std::sync::Arc::new(store);
+    let actor = store.inspect_actor(&id).await.ok().map(|entry| {
+        json!({"attempt":entry.actor.current_attempt,"state":entry.actor.state,
+            "activation":entry.activation.map(|a| json!({"status":a.status,
+                "run_id":a.run_id,"inbox_generation":a.inbox_generation}))})
+    });
+    let child = store.load_session(&id).await.ok().flatten();
+    let inbox =
+        bamboo_storage::FileSessionInbox::new(store, bamboo_domain::SessionInboxLimits::default());
+    let generation = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+        .await
+        .ok()
+        .map(|state| state.generation);
+    json!({"actor":actor,"last_run_status":child.and_then(|c| c.last_run_status()),
+        "inbox_generation":generation})
+}
+fn print_bounded_retry_log(data: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(data.join("host.log")) else {
+        return;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(16 * 1024)))
+        .is_err()
+    {
+        return;
+    }
+    let mut tail = Vec::new();
+    if file.take(16 * 1024).read_to_end(&mut tail).is_err() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&tail)
+        .lines()
+        .filter(|line| {
+            line.contains("Turn") && line.contains("failed") && line.contains("Retrying")
+        })
+        .take(4)
+    {
+        eprintln!(
+            "actual existing Engine retry: {}",
+            bounded_diagnostic(line, 1024)
+        );
+    }
+}
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
@@ -96,6 +157,12 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 break;
             }
             wake.await;
+        }
+        if probe.retry {
+            eprintln!(
+                "actual plain-child request index={child_call} Host phase={}",
+                provider_host_phase(&probe).await
+            );
         }
         if (probe.correction || probe.retry) && child_call == 1 {
             assert_eq!(
@@ -245,6 +312,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                                     == ActorActivationStatus::Failed
                                     && child.last_run_status().as_deref() == Some("error")
                                 {
+                                    eprintln!(
+                                        "actual first Failed run={} error={}",
+                                        actual.activation.as_ref().unwrap().run_id,
+                                        bounded_diagnostic(
+                                            child.last_run_error().as_deref().unwrap_or("none"),
+                                            512
+                                        )
+                                    );
                                     assert_eq!(actual.actor.current_attempt, 1);
                                     assert!(!child
                                         .messages
@@ -562,6 +637,9 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, ret
         1
     };
     if child_calls != expected_calls {
+        if retry {
+            print_bounded_retry_log(&data);
+        }
         let actor = store.inspect_actor(&id).await.map(|entry| {
             json!({"state":entry.actor.state,"attempt":entry.actor.current_attempt,
                 "activation":entry.activation.map(|a| a.status)})
