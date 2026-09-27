@@ -38,12 +38,57 @@ struct Probe {
 fn call(args: Value) -> Value {
     json!({"tool_calls":[{"index":0,"id":format!("subagent-{}",args["action"].as_str().unwrap()),"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]})
 }
+fn provider_request_shape(body: &Value) -> String {
+    let messages = body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let text_has = |needle: &str| {
+        messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(needle))
+        })
+    };
+    let mut diagnostic = json!({
+        "stream":body["stream"].as_bool(),
+        "messages":messages.len(),
+        "roles":messages.iter().take(16).map(|m| match m["role"].as_str() {
+            Some("system") => "system", Some("user") => "user", Some("assistant") => "assistant",
+            Some("tool") => "tool", _ => "other",
+        }).collect::<Vec<_>>(),
+        "content_shapes":messages.iter().take(16).map(|m| {
+            if m["content"].is_string() { "string" } else if m["content"].is_array() { "array" } else { "other" }
+        }).collect::<Vec<_>>(),
+        "tools":body["tools"].as_array().map(|tools| tools.iter().take(8).map(|tool| {
+            tool["function"]["name"].as_str().unwrap_or("unknown").chars().take(32).collect::<String>()
+        }).collect::<Vec<_>>()),
+        "correction_exact":messages.iter().filter(|m| m["content"] == "CORRECTION_FROM_ACTUAL_ROOT").count(),
+        "correction_embedded":text_has("CORRECTION_FROM_ACTUAL_ROOT"),
+        "array_correction_text_parts":messages.iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|part| part["text"].as_str().is_some_and(|text| text.contains("CORRECTION_FROM_ACTUAL_ROOT"))).count(),
+        "assignment":text_has("Delegated child assignment"),
+        "task_evaluation":text_has("You are a task progress evaluator"),
+        "permission_reviewer":text_has("You are a security reviewer"),
+        "max_tokens":body["max_tokens"].as_u64(),
+        "max_completion_tokens":body["max_completion_tokens"].as_u64(),
+    }).to_string();
+    let mut end = diagnostic.len().min(1900);
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic.truncate(end);
+    diagnostic
+}
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
     let mut emits_reasoning = false;
     let (delta, finish) = if body["model"] == "plain-child" {
         let child_call = probe.child_calls.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "actual plain-child request index={child_call} shape={}",
+            provider_request_shape(&body)
+        );
         probe.ready.store(true, Ordering::SeqCst);
         while !probe.release.load(Ordering::SeqCst) {
             let wake = probe.wake.notified();
