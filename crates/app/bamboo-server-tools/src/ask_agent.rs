@@ -10,6 +10,7 @@
 //! Only registered on the Root surface when a broker is configured
 //! (`subagents.broker` in config).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +18,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{AgentRef, AskMode};
+
+use crate::deploy_agent::{resolve_deployed_target, DeployedRegistry};
 
 /// Default / max wait for an answer.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -26,6 +30,7 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 pub struct AskAgentTool {
     endpoint: String,
     token: String,
+    deployments: Option<(DeployedRegistry, Arc<SessionStoreV2>)>,
 }
 
 impl AskAgentTool {
@@ -33,7 +38,16 @@ impl AskAgentTool {
         Self {
             endpoint: endpoint.into(),
             token: token.into(),
+            deployments: None,
         }
+    }
+    pub fn with_deployments(
+        mut self,
+        registry: DeployedRegistry,
+        store: Arc<SessionStoreV2>,
+    ) -> Self {
+        self.deployments = Some((registry, store));
+        self
     }
 }
 
@@ -56,8 +70,8 @@ impl Tool for AskAgentTool {
     fn description(&self) -> &str {
         "Ask another agent — already running locally, in a Docker container, or on a remote host — \
          a question over the message broker, and get its answer back synchronously. This is how you \
-         COMMAND a worker you (or a teammate) deployed: `target` is that agent's id (the broker \
-         mailbox key returned by deploy_agent, or a peer's session id). Replies route back to you \
+         COMMAND a worker you (or a teammate) deployed: `target` is that agent's id (the logical \
+         ActorId returned by deploy_agent, its live alias, or an existing peer's session id). Replies route back to you \
          automatically.\n\
          \n\
          TWO MODES (pick deliberately):\n\
@@ -70,12 +84,12 @@ impl Tool for AskAgentTool {
          \n\
          WORKED EXAMPLE (deploy → poll → steer):\n\
          1. deploy_agent(action=deploy, env=docker, image=\"bamboo:latest\", role=\"researcher\") \
-         → returns id \"agent-1a2b3c\".\n\
-         2. ask_agent(target=\"agent-1a2b3c\", question=\"Summarize the auth flow in this repo.\", \
+         → returns id \"actor-…\".\n\
+         2. ask_agent(target=\"actor-…\", question=\"Summarize the auth flow in this repo.\", \
          mode=query) → wait for its findings.\n\
-         3. ask_agent(target=\"agent-1a2b3c\", question=\"Now write the fix to src/auth.rs and run \
+         3. ask_agent(target=\"actor-…\", question=\"Now write the fix to src/auth.rs and run \
          the tests.\", mode=steer) → reassigns it to do the work.\n\
-         4. ask_agent(target=\"agent-1a2b3c\", question=\"Are the tests green yet?\", mode=query) → \
+         4. ask_agent(target=\"actor-…\", question=\"Are the tests green yet?\", mode=query) → \
          poll until done.\n\
          \n\
          Blocks until the target answers or `timeout_secs` elapses (default 60, max 300) — raise it \
@@ -87,7 +101,7 @@ impl Tool for AskAgentTool {
         json!({
             "type": "object",
             "properties": {
-                "target": { "type": "string", "description": "The target agent's id (broker mailbox key)." },
+                "target": { "type": "string", "description": "The logical ActorId returned by deploy_agent, a live deployment alias, or an existing peer id." },
                 "question": { "type": "string", "description": "What to ask the target agent." },
                 "mode": {
                     "type": "string",
@@ -135,17 +149,34 @@ impl Tool for AskAgentTool {
             role: None,
         };
 
+        let resolved = if let Some((registry, store)) = &self.deployments {
+            resolve_deployed_target(registry, Some(store), Some(caller), &parsed.target).await?
+        } else {
+            None
+        };
+        let target = resolved
+            .as_ref()
+            .map(|target| target.worker_id.as_str())
+            .unwrap_or(&parsed.target);
+        let public_id = resolved
+            .as_ref()
+            .and_then(|target| target.actor.as_ref())
+            .map(|actor| actor.actor_id.as_str())
+            .unwrap_or(&parsed.target);
         let answer = bamboo_broker::ask_agent(
             &self.endpoint,
             me,
             &self.token,
-            &parsed.target,
+            target,
             &parsed.question,
             mode,
             timeout,
         )
         .await
-        .map_err(|e| ToolError::Execution(format!("ask_agent failed: {e}")))?;
+        .map_err(|error| {
+            tracing::warn!(%error, "ask_agent transport failed");
+            ToolError::Execution("ask_agent could not obtain a reply from the deployment".into())
+        })?;
 
         let mode_str = if matches!(mode, AskMode::Steer) {
             "steer"
@@ -154,8 +185,7 @@ impl Tool for AskAgentTool {
         };
         Ok(ToolOutcome::Completed(ToolResult {
             success: true,
-            result: json!({ "from": parsed.target, "mode": mode_str, "answer": answer })
-                .to_string(),
+            result: json!({ "from": public_id, "mode": mode_str, "answer": answer }).to_string(),
             display_preference: None,
             images: Vec::new(),
         }))
