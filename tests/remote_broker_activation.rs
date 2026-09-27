@@ -207,6 +207,16 @@ async fn wait_child_after(data: &Path, id: &str, status: &str, since: SystemTime
     .expect("actual Child terminal")
 }
 async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target: usize) {
+    let existing_wait = if op == 0 && p.hold.load(Ordering::SeqCst) {
+        let reader = SessionStoreV2::new(p.data.clone()).await.unwrap();
+        reader
+            .load_session("remote-root")
+            .await
+            .unwrap()
+            .and_then(|root| root.agent_runtime_state?.waiting_for_children)
+    } else {
+        None
+    };
     let number = p.turn.fetch_add(1, Ordering::SeqCst) + 1;
     p.operation.store(op, Ordering::SeqCst);
     p.target.store(target, Ordering::SeqCst);
@@ -290,6 +300,27 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                         })
                 {
                     break;
+                }
+                drop(ids);
+                if op == 0
+                    && existing_wait.is_some()
+                    && result["observed_status"] == "running_in_background"
+                {
+                    let child = cold(&p.data, actor).await;
+                    if child.last_run_status().as_deref() == Some("running")
+                        && root.last_run_status().as_deref() == Some("suspended")
+                    {
+                        assert_eq!(child.id, actor);
+                        assert_eq!(child.parent_session_id.as_deref(), Some("remote-root"));
+                        assert_eq!(child.root_session_id, "remote-root");
+                        assert_eq!(
+                            root.agent_runtime_state
+                                .as_ref()
+                                .and_then(|state| state.waiting_for_children.as_ref()),
+                            existing_wait.as_ref()
+                        );
+                        break;
+                    }
                 }
             }
             if root
