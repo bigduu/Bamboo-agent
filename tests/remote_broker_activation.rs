@@ -231,7 +231,7 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
         loop {
             let root = cold(&p.data, "remote-root").await;
             let call_id = format!("remote-op-{number}");
-            let result = matches!(op, 0 | 1)
+            let result = matches!(op, 0 | 1 | 2)
                 .then(|| {
                     root.messages
                         .iter()
@@ -252,6 +252,25 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                     }
                 } else {
                     assert_eq!(actor, ids[target]);
+                }
+                // A successful cancel may suspend on a different held actor.
+                // Observe the durable tool result and remaining wait together;
+                // the fixture releases that provider only after both cancels.
+                if op == 2
+                    && result["observed_status"] == "cancelled"
+                    && p.hold.load(Ordering::SeqCst)
+                    && root.last_run_status().as_deref() == Some("suspended")
+                    && root
+                        .agent_runtime_state
+                        .as_ref()
+                        .and_then(|s| s.waiting_for_children.as_ref())
+                        .is_some_and(|wait| {
+                            !wait.child_session_ids.is_empty()
+                                && !wait.child_session_ids.iter().any(|id| id == actor)
+                                && wait.child_session_ids.iter().all(|id| ids.contains(id))
+                        })
+                {
+                    break;
                 }
                 // Held spawn/retry may suspend with a merged, untagged sibling wait.
                 if p.hold.load(Ordering::SeqCst)
