@@ -375,26 +375,43 @@ async fn fixture(role: Option<&'static str>) {
         });
     if !matched {
         // Only fixture-authored User bodies, never full requests/config/secrets.
-        let mut diagnostic = String::new();
-        for request in requests.iter().filter(|r| r["model"] == "compact-child") {
-            for message in request["messages"].as_array().unwrap() {
-                if message["role"] != "user" {
-                    continue;
-                }
-                let content = message["content"]
+        let mut users: Vec<_> = requests
+            .iter()
+            .filter(|r| r["model"] == "compact-child")
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "user")
+            .map(|m| {
+                let shape = if m["content"].is_string() {
+                    "string"
+                } else {
+                    "other"
+                };
+                let content = m["content"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| message["content"].to_string());
-                let line = format!("\nrole=user content={content}");
-                for ch in line.chars().take(4096) {
-                    if diagnostic.len() + ch.len_utf8() > 8192 {
-                        break;
-                    }
-                    diagnostic.push(ch);
+                    .unwrap_or_else(|| m["content"].to_string());
+                let task =
+                    content.contains("compact-marker.txt") || content.contains("<task-brief>");
+                (task, shape, content)
+            })
+            .collect();
+        users.sort_by_key(|(task, _, _)| !task);
+        const HEADER: &str = "actual compact-child User wire (bounded): ";
+        let mut diagnostic = String::new();
+        for (task, shape, content) in users {
+            let prefix: String = content.chars().take(if task { 4096 } else { 80 }).collect();
+            let line = format!(
+                "\nrole=user shape={shape} bytes={} content={prefix}",
+                content.len()
+            );
+            for ch in line.chars() {
+                if diagnostic.len() + ch.len_utf8() + HEADER.len() + 1 > 8192 {
+                    break;
                 }
+                diagnostic.push(ch);
             }
         }
-        eprintln!("actual compact-child User wire (bounded): {diagnostic}");
+        eprintln!("{HEADER}{diagnostic}");
     }
     assert!(
         matched,
