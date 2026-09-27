@@ -779,6 +779,7 @@ impl AppState {
                 persistence: persistence.clone(),
             },
         ));
+        external_runner.set_actor_directory_store(Some(session_store.clone()));
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
