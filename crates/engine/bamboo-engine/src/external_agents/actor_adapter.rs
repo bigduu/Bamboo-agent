@@ -1631,7 +1631,14 @@ impl ExternalChildRunner for ActorChildRunner {
                 return Err(plain_actor_unsupported());
             }
             if root.root_orchestration_only_enabled() {
-                if !plain_initial_history(session) {
+                if !plain_initial_history(session)
+                    && (spec
+                        .capabilities
+                        .native_tool_ceiling
+                        .as_ref()
+                        .is_none_or(|ceiling| !ceiling.tools.is_empty())
+                        || pre_ack_input(session)?.is_none())
+                {
                     return Err(plain_actor_unsupported());
                 }
                 Some(store)
@@ -2437,10 +2444,11 @@ struct PlainActorActivation {
     input_inbox: bamboo_storage::FileSessionInbox,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     initial_input: Option<SessionInboxOwnedClaim>,
+    recovering_pre_ack: bool,
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports a fresh plain activation, one bounded correction while Running, or a Failed retry with one new input and no old claim/checkpoint. Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, one bounded correction while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -2452,6 +2460,109 @@ fn plain_initial_history(session: &Session) -> bool {
     }) && session.provider_transcript.is_empty()
         && session.session_inbox_admission().is_none()
         && session.pending_injected_messages().is_none()
+}
+// Selection only. Storage's closed raw bookkeeper/current-prefix validator is
+// still mandatory after the actual replacement claim; this metadata is no grant.
+fn pre_ack_input(
+    session: &Session,
+) -> Result<Option<(bamboo_domain::SessionMessageId, u64)>, AgentError> {
+    let Some(message) = session.messages.last() else {
+        return Ok(None);
+    };
+    let Some(proof) = message
+        .metadata
+        .as_ref()
+        .and_then(|v| v.get("_bamboo_owned_input_checkpoint"))
+    else {
+        return Ok(None);
+    };
+    let id = bamboo_domain::SessionMessageId::parse(message.id.clone())
+        .map_err(|_| plain_actor_unsupported())?;
+    let generation = proof
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|g| *g > 0)
+        .ok_or_else(plain_actor_unsupported)?;
+    if message.role != Role::User
+        || session
+            .messages
+            .iter()
+            .filter(|m| m.id == message.id)
+            .count()
+            != 1
+        || !session
+            .session_inbox_admission()
+            .is_some_and(|cursor| cursor.contains(&id))
+        || !session.provider_transcript.is_empty()
+        || session.pending_injected_messages().is_some()
+        || session
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool || m.tool_calls.is_some())
+    {
+        return Err(plain_actor_unsupported());
+    }
+    Ok(Some((id, generation)))
+}
+fn qualified_pre_ack_owner(
+    entry: &bamboo_domain::ActorDirectoryEntry,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(old) = entry.activation.as_ref() else {
+        return false;
+    };
+    let recoverable = (entry.actor.state == ActorLogicalState::Failed
+        && old.status == bamboo_domain::ActorActivationStatus::Failed)
+        || (entry.actor.state == ActorLogicalState::Active
+            && old.status.is_live()
+            && old.lease_expires_at <= now);
+    let trusted = old.placement_ref.as_ref().is_some_and(|placement| {
+        placement.class == bamboo_domain::ActorPlacementClass::Local
+            && placement
+                .lease_id
+                .strip_prefix("owned-initial-release-v1:")
+                .is_some_and(|worker| {
+                    !worker.is_empty()
+                        && worker.len() <= 256
+                        && !worker.contains("..")
+                        && worker.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+                        })
+                })
+    });
+    recoverable && trusted
+}
+async fn expired_pre_ack_input(
+    inbox: &bamboo_storage::FileSessionInbox,
+    session: &Session,
+) -> Result<Option<(bamboo_domain::SessionMessageId, u64)>, AgentError> {
+    let Some((id, generation)) = pre_ack_input(session)? else {
+        return Ok(None);
+    };
+    let backlog = inbox
+        .inspect(&session.id)
+        .await
+        .map_err(|_| plain_actor_unsupported())?;
+    let leases = inbox
+        .inspect_owned_leases(&session.id, 2, chrono::Utc::now())
+        .await
+        .map_err(|_| plain_actor_unsupported())?;
+    if backlog.pending != 0
+        || backlog.claimed != 1
+        || backlog.generation != generation
+        || backlog.oldest_generation != Some(generation)
+        || !backlog.activation_pending()
+        || leases.len() != 1
+        || !leases[0].expired
+        || leases[0].generation != generation
+        || inbox
+            .was_admitted(&session.id, &id)
+            .await
+            .map_err(|_| plain_actor_unsupported())?
+    {
+        return Err(plain_actor_unsupported());
+    }
+    Ok(Some((id, generation)))
 }
 impl PlainActorActivation {
     // Callee-side boxing keeps this storage chain out of the already large
@@ -2494,10 +2605,28 @@ impl PlainActorActivation {
                 && backlog.claimed == 0
                 && backlog.oldest_generation == Some(backlog.generation)
                 && backlog.activation_pending();
-            if (!fresh && !retry) || !plain_initial_history(session) {
+            let input_inbox = bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            let now = chrono::Utc::now();
+            let recovery = if allow_failed_retry
+                && release_worker.is_some()
+                && qualified_pre_ack_owner(&entry, now)
+            {
+                expired_pre_ack_input(&input_inbox, session).await?
+            } else {
+                None
+            };
+            if recovery.is_some()
+                && (!entry.actor.matches_session(session)
+                    || entry.actor.project_id != project_id_for_actor_run(session)?)
+            {
                 return Err(plain_actor_unsupported());
             }
-            let now = chrono::Utc::now();
+            if recovery.is_none() && ((!fresh && !retry) || !plain_initial_history(session)) {
+                return Err(plain_actor_unsupported());
+            }
             let duration = crate::runtime::execution::spawn::watchdog_policy_for_session(session)
                 .max_total_secs
                 .checked_add(60)
@@ -2507,13 +2636,41 @@ impl PlainActorActivation {
                 .checked_add_signed(duration)
                 .ok_or_else(plain_actor_unsupported)?;
             let input_consumer = SessionInboxConsumerId::new();
+            let input_deadline = expires.min(now + chrono::Duration::hours(1));
+            let recovered = if let Some((id, generation)) = &recovery {
+                if !binding.router.owns_run(&session.id, run_id).await {
+                    return Err(plain_actor_unsupported());
+                }
+                let lease = SessionInboxLeaseRequest {
+                    consumer: input_consumer.clone(),
+                    now,
+                    duration: input_deadline - now,
+                };
+                let mut claims = input_inbox
+                    .claim_owned(&session.id, 1, Some(run_id), &lease)
+                    .await
+                    .map_err(|_| plain_actor_unsupported())?;
+                let claim = claims.pop().ok_or_else(plain_actor_unsupported)?;
+                if claim.claim.envelope.id != *id
+                    || claim.claim.generation != *generation
+                    || !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
+                        if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                Some(claim)
+            } else {
+                None
+            };
             let claimed = store
                 .claim_activation(&ActorActivationClaim {
                     actor_id: session.id.clone(),
                     run_id: run_id.into(),
                     lease_owner: input_consumer.as_str().into(),
                     lease_expires_at: expires,
-                    inbox_generation: backlog.generation,
+                    inbox_generation: recovered
+                        .as_ref()
+                        .map_or(backlog.generation, |claim| claim.claim.generation),
                     placement_ref: release_worker.map(|worker| bamboo_domain::ActorPlacementRef {
                         class: bamboo_domain::ActorPlacementClass::Local,
                         // Written only after the real worker capability probe
@@ -2524,10 +2681,6 @@ impl PlainActorActivation {
                 })
                 .await
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
-            let input_inbox = bamboo_storage::FileSessionInbox::new(
-                store.clone(),
-                bamboo_domain::SessionInboxLimits::default(),
-            );
             let activation = Self {
                 store,
                 fence: claimed.fence(),
@@ -2535,12 +2688,13 @@ impl PlainActorActivation {
                 created_at: session.created_at,
                 provider_transcript: session.provider_transcript.clone(),
                 input_consumer,
-                input_deadline: expires.min(now + chrono::Duration::hours(1)),
+                input_deadline,
                 actor_deadline: claimed.lease_expires_at,
                 initial_release_required: release_worker.is_some(),
                 input_inbox,
                 permission_config,
-                initial_input: None,
+                initial_input: recovered,
+                recovering_pre_ack: recovery.is_some(),
             };
             if let Err(error) = activation
                 .store
@@ -2590,16 +2744,23 @@ impl PlainActorActivation {
                     .inspect(&session.id)
                     .await
                     .map_err(|_| plain_actor_unsupported())?;
-                if backlog.pending != 1
-                    || backlog.claimed != 0
+                let expected = if activation.recovering_pre_ack {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
+                if (backlog.pending, backlog.claimed) != expected
                     || backlog.generation != activation.inbox_generation
                 {
                     return Err(plain_actor_unsupported());
                 }
-                let claim = activation
-                    .claim_input(binding, session, run_id)
-                    .await?
-                    .ok_or_else(plain_actor_unsupported)?;
+                let claim = match activation.initial_input.clone() {
+                    Some(claim) => claim,
+                    None => activation
+                        .claim_input(binding, session, run_id)
+                        .await?
+                        .ok_or_else(plain_actor_unsupported)?,
+                };
                 if claim.claim.generation != activation.inbox_generation {
                     return Err(plain_actor_unsupported());
                 }
@@ -2686,12 +2847,6 @@ impl PlainActorActivation {
         Box::pin(async move {
             // The worker receives the committed pre-input prefix. Only typed
             // delivery adds the User; the Host-private bookkeeper is not a grant.
-            let messages = session
-                .messages
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| plain_actor_unsupported())?;
             let committed = self.input_inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                 fence: self.fence.clone(), expected_created_at: self.created_at,
                 claim: claim.clone(), expected_messages: session.messages.clone(),
@@ -2701,6 +2856,35 @@ impl PlainActorActivation {
                 tracing::warn!(%error, "Actor correction checkpoint rejected or unconfirmed; no worker dispatch or ACK");
                 AgentError::LLM("Actor correction checkpoint unconfirmed; durable Inbox and history are preserved".into())
             })?;
+            if self.recovering_pre_ack
+                && committed.status
+                    != bamboo_storage::ActorInputCheckpointStatus::AlreadyCheckpointed
+            {
+                return Err(plain_actor_unsupported());
+            }
+            let messages = session
+                .messages
+                .iter()
+                .map(|message| {
+                    let mut worker = message.clone();
+                    if committed.status
+                        == bamboo_storage::ActorInputCheckpointStatus::AlreadyCheckpointed
+                        && worker.id == committed.envelope.id.as_str()
+                    {
+                        worker
+                            .metadata
+                            .as_mut()
+                            .and_then(serde_json::Value::as_object_mut)
+                            .ok_or_else(plain_actor_unsupported)?
+                            .remove("_bamboo_owned_input_checkpoint");
+                        if !bamboo_domain::is_matching_session_message(&worker, &committed.envelope)
+                        {
+                            return Err(plain_actor_unsupported());
+                        }
+                    }
+                    serde_json::to_value(worker).map_err(|_| plain_actor_unsupported())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             *session = committed.session;
             Ok((
                 messages,
@@ -5842,6 +6026,338 @@ mod tests {
                 .await
                 .unwrap());
             assert_eq!(cold_inbox.inspect(&cold.id).await.unwrap().claimed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_ack_owned_recovery_requires_expiry_provenance_and_verified_already() {
+        for case in [
+            "accepted",
+            "actor-live",
+            "claim-live",
+            "legacy",
+            "ack",
+            "readonly",
+            "prefix",
+            "duplicate",
+            "missing-marker",
+            "mixed",
+            "project",
+            "birth",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let parent = Session::new("recovery-parent", "model");
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                Session::new_child_of("recovery-child", &parent, "model", "original task");
+            child.add_message(bamboo_agent_core::Message::user("original task"));
+            store.save_session(&child).await.unwrap();
+            store.ensure_actor(&child.id).await.unwrap();
+            let inbox = bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            let now = chrono::Utc::now();
+            let cutoff = now + chrono::Duration::seconds(1);
+            let consumer = SessionInboxConsumerId::new();
+            let old = store
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: child.id.clone(),
+                    run_id: "old-run".into(),
+                    lease_owner: consumer.as_str().into(),
+                    lease_expires_at: if case == "actor-live" {
+                        now + chrono::Duration::minutes(1)
+                    } else {
+                        cutoff
+                    },
+                    inbox_generation: 0,
+                    placement_ref: if case == "legacy" {
+                        None
+                    } else {
+                        Some(bamboo_domain::ActorPlacementRef {
+                            class: bamboo_domain::ActorPlacementClass::Local,
+                            lease_id: "owned-initial-release-v1:actual-old-worker".into(),
+                        })
+                    },
+                    now,
+                })
+                .await
+                .unwrap();
+            store.start_activation(&old.fence(), now).await.unwrap();
+            let envelope =
+                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RECOVER_SAME_INPUT");
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let claim = inbox
+                .claim_owned(
+                    &child.id,
+                    1,
+                    Some("old-run"),
+                    &SessionInboxLeaseRequest {
+                        consumer,
+                        now,
+                        duration: if case == "claim-live" {
+                            chrono::Duration::minutes(1)
+                        } else {
+                            cutoff - now
+                        },
+                    },
+                )
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            child = inbox
+                .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                    fence: old.fence(),
+                    expected_created_at: child.created_at,
+                    claim: claim.clone(),
+                    expected_messages: child.messages.clone(),
+                    expected_provider_transcript: child.provider_transcript.clone(),
+                    expected_admission: None,
+                })
+                .await
+                .unwrap()
+                .session;
+            if case == "ack" {
+                inbox
+                    .ack_owned(&child.id, &claim, chrono::Utc::now())
+                    .await
+                    .unwrap();
+            }
+            if case == "mixed" {
+                inbox
+                    .deliver(&bamboo_domain::SessionMessageEnvelope::user_input(
+                        &child.id,
+                        "different input",
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let directory = store
+                .bamboo_home_dir()
+                .join(store.resolve_rel_path(&child.id).await.unwrap());
+            let main = std::fs::read(directory.join("session.json")).unwrap();
+            let canonical = child.clone();
+            match case {
+                "prefix" => child.messages[0].content.push_str(" stale"),
+                "duplicate" => child.messages.push(child.messages.last().unwrap().clone()),
+                "missing-marker" => {
+                    child
+                        .messages
+                        .last_mut()
+                        .unwrap()
+                        .metadata
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("_bamboo_owned_input_checkpoint");
+                }
+                "project" => child.set_project_id_meta(bamboo_domain::ProjectId::new().to_string()),
+                "birth" => child.created_at += chrono::Duration::nanoseconds(1),
+                _ => {}
+            }
+            let delay = (cutoff - chrono::Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(delay + Duration::from_millis(10)).await;
+            let second = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let binding = actor_binding(
+                second.clone(),
+                Arc::new(bamboo_storage::FileSessionInbox::new(
+                    second.clone(),
+                    bamboo_domain::SessionInboxLimits::default(),
+                )),
+                Arc::new(bamboo_storage::LockedSessionStore::new(second.clone())),
+            );
+            let _owner = binding
+                .router
+                .register_run(&child.id, "replacement-run")
+                .await
+                .unwrap();
+            let prepared = PlainActorActivation::start_and_prepare(
+                second.clone(),
+                &mut child,
+                &binding,
+                Some("replacement-run"),
+                None,
+                case != "readonly",
+                Some("probed-new-worker"),
+            )
+            .await;
+            assert_eq!(
+                std::fs::read(directory.join("session.json")).unwrap(),
+                main,
+                "{case}: Already or refusal never rewrites Main"
+            );
+            if case != "accepted" {
+                assert!(prepared.is_err(), "{case}");
+                assert_eq!(
+                    inbox.was_admitted(&child.id, &envelope.id).await.unwrap(),
+                    case == "ack"
+                );
+                continue;
+            }
+            let (replacement, delivery) = prepared.unwrap();
+            assert!(replacement.recovering_pre_ack);
+            let (messages, delivery) = delivery.unwrap();
+            let new_claim = replacement.initial_input.as_ref().unwrap();
+            assert_eq!(new_claim.claim.envelope, claim.claim.envelope);
+            assert_eq!(new_claim.claim.generation, claim.claim.generation);
+            assert_eq!(
+                new_claim.claim.activation_policy,
+                claim.claim.activation_policy
+            );
+            assert!(new_claim.lease.epoch > claim.lease.epoch);
+            assert_ne!(new_claim.lease.incarnation, claim.lease.incarnation);
+            assert_eq!(
+                replacement.inbox_generation, 1,
+                "old Actor generation was zero"
+            );
+            assert_eq!(
+                second
+                    .inspect_actor(&child.id)
+                    .await
+                    .unwrap()
+                    .actor
+                    .current_attempt,
+                2
+            );
+            assert!(second
+                .validate_fence(&old.fence(), chrono::Utc::now())
+                .await
+                .is_err());
+            assert!(inbox
+                .ack_owned(&child.id, &claim, chrono::Utc::now())
+                .await
+                .is_err());
+            assert_eq!(
+                serde_json::to_value(&child.messages).unwrap(),
+                serde_json::to_value(&canonical.messages).unwrap()
+            );
+            let mut worker: Vec<bamboo_agent_core::Message> = messages
+                .iter()
+                .cloned()
+                .map(|v| serde_json::from_value(v).unwrap())
+                .collect();
+            let target = worker.last_mut().unwrap();
+            assert!(target
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("_bamboo_owned_input_checkpoint")
+                .is_none());
+            assert!(bamboo_domain::is_matching_session_message(
+                target, &envelope
+            ));
+            let mut wanted = canonical.messages.last().unwrap().clone();
+            wanted
+                .metadata
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("_bamboo_owned_input_checkpoint");
+            assert_eq!(
+                serde_json::to_value(target).unwrap(),
+                serde_json::to_value(wanted).unwrap()
+            );
+            let run = RunSpec {
+                assignment: "original task".into(),
+                logical_session: Some(LogicalSessionIdentity {
+                    session_id: child.id.clone(),
+                    parent_session_id: child.parent_session_id.clone(),
+                    root_session_id: child.root_session_id.clone(),
+                    creation: Some(bamboo_subagent::proto::ChildCreationIdentity {
+                        created_at: child.created_at,
+                        spawn_depth: child.spawn_depth,
+                    }),
+                }),
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages,
+                activation_run_id: Some("replacement-run".into()),
+                execution_epoch: 2,
+                initial_session_messages: vec![delivery.clone()],
+                secrets: Default::default(),
+            };
+            let mut expected = Some(expected_default_permission_posture(7));
+            let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+                unreachable!()
+            };
+            let (events, mut rx) = mpsc::channel(1);
+            process_actor_event(
+                event,
+                true,
+                &mut PermissionPostureHandshake::Awaiting,
+                expected.as_ref(),
+                Some(&binding),
+                &mut child,
+                &events,
+                &mut ActorEventDisplay::default(),
+            )
+            .await
+            .unwrap();
+            rx.recv().await.unwrap();
+            let request = bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
+                &run,
+                &delivery,
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap();
+            replacement
+                .release_initial_input(
+                    &binding,
+                    &child,
+                    &run,
+                    2,
+                    new_claim,
+                    &request,
+                    &mut expected,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+            replacement
+                .append_reply(&mut child, "RECOVERY_REPLY".into(), &events)
+                .await
+                .unwrap();
+            rx.recv().await.unwrap();
+            replacement
+                .finish(ActorActivationFinish::Succeeded)
+                .await
+                .unwrap();
+            let cold = second.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(cold.created_at, canonical.created_at);
+            assert_eq!(
+                serde_json::to_value(&cold.messages[..canonical.messages.len()]).unwrap(),
+                serde_json::to_value(&canonical.messages).unwrap()
+            );
+            assert_eq!(cold.messages.last().unwrap().content, "RECOVERY_REPLY");
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
         }
     }
 

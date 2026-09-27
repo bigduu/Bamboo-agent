@@ -324,6 +324,16 @@ pub trait ChildSessionPort: Send + Sync {
         parent_id: &str,
         child_id: &str,
     ) -> Result<Session, ChildSessionError>;
+    /// Validate a run request before resetting transcript or changing control state.
+    /// Default embeddings retain their existing behavior; this never grants an activation.
+    async fn validate_child_run_request(
+        &self,
+        _parent: &Session,
+        _child: &Session,
+        _reset: Option<bool>,
+    ) -> Result<(), ChildSessionError> {
+        Ok(())
+    }
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
     /// Save a child session whose `agent_runtime_state` posture
     /// (`permission_mode` / `no_human_approver`) the caller just set

@@ -832,6 +832,51 @@ impl ChildSessionPort for ChildSessionAdapter {
         Ok(child)
     }
 
+    async fn validate_child_run_request(
+        &self,
+        parent: &Session,
+        child: &Session,
+        reset: Option<bool>,
+    ) -> Result<(), ChildSessionError> {
+        // A marker only selects a strict request check. The actual replacement
+        // owner, provenance and complete Already prefix are rechecked by runner/Storage.
+        if child.messages.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .is_some_and(|v| v.get("_bamboo_owned_input_checkpoint").is_some())
+        }) {
+            if reset != Some(false)
+                || child.parent_session_id.as_deref() != Some(parent.id.as_str())
+            {
+                return Err(ChildSessionError::InvalidArguments("Checkpointed Actor input recovery requires SubAgent.run(reset_to_last_user=false); history is preserved".into()));
+            }
+            let current = self.load_child_for_parent(&parent.id, &child.id).await?;
+            let messages = |session: &Session| {
+                serde_json::to_value(&session.messages)
+                    .map_err(|e| ChildSessionError::Execution(e.to_string()))
+            };
+            if messages(&current)? != messages(child)?
+                || current.created_at != child.created_at
+                || current.root_session_id != child.root_session_id
+                || current.project_id_meta() != child.project_id_meta()
+            {
+                return Err(ChildSessionError::Execution(
+                    "Actor recovery snapshot changed; reload before retry".into(),
+                ));
+            }
+            let inbox = bamboo_storage::FileSessionInbox::new(
+                self.session_store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &child.id)
+                .await
+                .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+            if backlog.pending != 0 || backlog.claimed != 1 || !backlog.activation_pending() {
+                return Err(ChildSessionError::Execution("Actor recovery requires one eligible unconfirmed claim; no new input is queued".into()));
+            }
+        }
+        Ok(())
+    }
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
         // Adopting save: most child actions (update/run/send_message/cancel)
         // don't touch bypass_permissions, so a concurrent `PATCH` to a running
