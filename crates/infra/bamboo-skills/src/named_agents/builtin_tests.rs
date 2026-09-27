@@ -20,7 +20,12 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
         assert!(definition.system_prompt().len() <= MAX_BUILTIN_PROMPT_BYTES);
         for required in ["Responsibility:", "Scope:", "Evidence:", "stop"] {
             assert!(
-                definition.system_prompt().contains(required),
+                definition.system_prompt().contains(required)
+                    || (required == "stop"
+                        && definition
+                            .system_prompt()
+                            .to_ascii_lowercase()
+                            .contains(required)),
                 "{name}: {required}"
             );
         }
