@@ -102,9 +102,9 @@ struct Marker {
 pub(super) struct Source {
     pub(super) raw: String,
     pub(super) side_bytes: Vec<u8>,
-    record_bytes: Vec<u8>,
-    marker_bytes: Vec<u8>,
-    proof_bytes: Option<Vec<u8>>,
+    pub(super) record_bytes: Vec<u8>,
+    pub(super) marker_bytes: Vec<u8>,
+    pub(super) proof_bytes: Option<Vec<u8>>,
     pub(super) main: Session,
     pub(super) side: Session,
     pub(super) entry: ActorDirectoryEntry,
@@ -112,11 +112,22 @@ pub(super) struct Source {
 impl Source {
     // Pure initialized reader: no ensure/inspect/validate_fence transaction.
     pub(super) fn read(directory: &Path, id: &str, kind: SessionKind, root: &str) -> Result<Self> {
+        Self::read_checked(directory, id, kind, root, |_, _| Ok(()))
+    }
+    // Opt-in preflight sees the exact buffers subsequently decoded below.
+    pub(super) fn read_checked(
+        directory: &Path,
+        id: &str,
+        kind: SessionKind,
+        root: &str,
+        preflight: impl FnOnce(&str, &[u8]) -> Result<()>,
+    ) -> Result<Self> {
         let raw = String::from_utf8(regular_bytes(&directory.join("session.json"))?)
             .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
         let side_bytes = regular_bytes(&directory.join(RUNTIME_SIDECAR_FILE))?;
         let record_bytes = regular_bytes(&directory.join("actor-authority.json"))?;
         let marker_bytes = regular_bytes(&directory.join("actor-authority.initialized.json"))?;
+        preflight(&raw, &side_bytes)?;
         compact_main::validate_full_main(raw.as_bytes())
             .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
         let mut main: Session = decode(raw.as_bytes())?;

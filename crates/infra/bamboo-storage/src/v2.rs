@@ -54,7 +54,11 @@ pub use actor_input::{
 };
 #[cfg(test)]
 mod actor_input_tests;
+mod actor_model_context;
 mod actor_transcript;
+pub use actor_model_context::{
+    ActorModelContextCheckpoint, ActorModelContextError, ActorModelContextOutcome,
+};
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };

@@ -203,7 +203,7 @@ impl SessionStoreV2 {
     /// middle Child currently leaves its nested descendants on disk. Verify
     /// the complete parent chain, root identity, depth and Project before
     /// publishing or accepting any activation sidecar for the descendant.
-    async fn validate_actor_lineage(
+    pub(super) async fn validate_actor_lineage(
         &self,
         actor: &ActorSession,
     ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {

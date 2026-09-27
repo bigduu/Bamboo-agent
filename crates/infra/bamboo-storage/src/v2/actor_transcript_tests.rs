@@ -14,7 +14,7 @@ use serde_json::{json, value::RawValue};
 use std::collections::BTreeMap;
 use std::sync::{Condvar, Mutex as StdMutex};
 
-const ID: &str = "append-actor";
+pub(super) const ID: &str = "append-actor";
 const DEADLINE: Duration = Duration::from_secs(10);
 #[derive(Debug, Default)]
 struct Latch {
@@ -87,7 +87,7 @@ impl TranscriptWriteHook {
         self.changed.notify_all();
     }
 }
-struct Release(Arc<TranscriptWriteHook>);
+pub(super) struct Release(pub(super) Arc<TranscriptWriteHook>);
 impl Drop for Release {
     fn drop(&mut self) {
         self.0.release();
@@ -146,7 +146,7 @@ fn items(family: ProviderFamily, tag: &str) -> Vec<ProviderTranscriptItem> {
         })
         .collect()
 }
-fn claim(run: &str, expires: DateTime<Utc>) -> ActorActivationClaim {
+pub(super) fn claim(run: &str, expires: DateTime<Utc>) -> ActorActivationClaim {
     ActorActivationClaim {
         actor_id: ID.into(),
         run_id: run.into(),
@@ -170,14 +170,14 @@ fn request(session: &Session, fence: bamboo_domain::ActorActivationFence) -> Act
         native_groups: vec![],
     }
 }
-fn actor_dir(home: &Path, child: bool) -> PathBuf {
+pub(super) fn actor_dir(home: &Path, child: bool) -> PathBuf {
     if child {
         home.join("sessions/root/children").join(ID)
     } else {
         home.join("sessions").join(ID)
     }
 }
-fn files(directory: &Path) -> Vec<Option<Vec<u8>>> {
+pub(super) fn files(directory: &Path) -> Vec<Option<Vec<u8>>> {
     [
         "session.json",
         RUNTIME_SIDECAR_FILE,
@@ -189,7 +189,7 @@ fn files(directory: &Path) -> Vec<Option<Vec<u8>>> {
     .map(|name| std::fs::read(directory.join(name)).ok())
     .into()
 }
-fn raw_field<'a>(raw: &'a str, key: &str) -> &'a str {
+pub(super) fn raw_field<'a>(raw: &'a str, key: &str) -> &'a str {
     let fields: BTreeMap<String, &RawValue> = serde_json::from_str(raw).unwrap();
     fields[key].get()
 }
@@ -200,7 +200,7 @@ fn raw_entries(raw: &str) -> Vec<&str> {
         .map(RawValue::get)
         .collect()
 }
-async fn setup(
+pub(super) async fn setup(
     home: &Path,
     child: bool,
     family: ProviderFamily,
@@ -270,7 +270,7 @@ async fn setup(
     let req = request(&session, activation.fence());
     (store, second, session, req)
 }
-fn no_temps(directory: &Path) {
+pub(super) fn no_temps(directory: &Path) {
     assert!(!std::fs::read_dir(directory).unwrap().any(|entry| entry
         .unwrap()
         .file_name()
@@ -691,7 +691,7 @@ async fn pure_reader_rejects_missing_corrupt_duplicate_or_contradictory_source_w
     unchanged_rejection(&store, &directory, base).await;
 }
 
-fn lock_paths(store: &SessionStoreV2) -> [PathBuf; 3] {
+pub(super) fn lock_paths(store: &SessionStoreV2) -> [PathBuf; 3] {
     [
         store.bamboo_home_dir.join(SESSION_LIFECYCLE_LOCK_FILE),
         store
@@ -700,7 +700,7 @@ fn lock_paths(store: &SessionStoreV2) -> [PathBuf; 3] {
         store.session_write_lock_path(ID),
     ]
 }
-fn physically_held(store: &SessionStoreV2) {
+pub(super) fn physically_held(store: &SessionStoreV2) {
     for path in lock_paths(store) {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -714,7 +714,7 @@ fn physically_held(store: &SessionStoreV2) {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 }
-fn released(store: &SessionStoreV2) {
+pub(super) fn released(store: &SessionStoreV2) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let all = lock_paths(store).iter().all(|path| {
