@@ -26,8 +26,9 @@ use tempfile::TempDir;
 #[tokio::test(flavor = "multi_thread")]
 async fn subagent_create_runs_actor_process_through_the_server() {
     let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
-    let home = TempDir::new().unwrap();
-    let fabric_dir = home.path().join("fabric");
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let fabric_dir = home.join("fabric");
 
     // The friendly config a user would write — plus expert worker_bin override
     // because inside a test the "current executable" is the test runner, not bamboo.
@@ -44,32 +45,32 @@ async fn subagent_create_runs_actor_process_through_the_server() {
         }
     });
     std::fs::write(
-        home.path().join("config.json"),
+        home.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
 
-    let state = AppState::new_with_memory_store(
-        home.path().to_path_buf(),
-        MemoryStore::new(home.path().join("jiandu")),
-    )
-    .await
-    .expect("app state boots");
+    let state =
+        AppState::new_with_memory_store(home.clone(), MemoryStore::new(home.join("jiandu")))
+            .await
+            .expect("app state boots");
 
     // A root session for the parent (workspace = the temp dir).
     let parent_id = "parent-actor-e2e";
     let mut parent = Session::new(parent_id, "claude-test");
     parent.title = "Actor e2e parent".into();
-    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    parent.workspace = Some(home.to_string_lossy().into_owned());
     state.storage.save_session(&parent).await.unwrap();
     state.session_store.save_session(&parent).await.unwrap();
 
-    // Invoke the SubAgent tool exactly as the LLM would.
+    // Invoke the real caller with an unknown legacy role: builtin worker
+    // intentionally requires the strict BambooRuntime route, not this Echo fixture.
     let tools = state.tool_factory.get(ToolSurface::Root);
     let args = serde_json::json!({
         "action": "create",
         "title": "Echo task",
         "responsibility": "echo the assignment",
+        "subagent_type": "legacy-echo-fixture",
         "prompt": "hello actor",
         "wait": false,
         "auto_run": true
@@ -176,8 +177,9 @@ async fn subagent_create_runs_actor_process_through_the_server() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_running_actor_child_through_the_server() {
     let bamboo_bin = env!("CARGO_BIN_EXE_bamboo");
-    let home = TempDir::new().unwrap();
-    let fabric_dir = home.path().join("fabric");
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let fabric_dir = home.join("fabric");
 
     let config = serde_json::json!({
         "provider": "anthropic",
@@ -191,21 +193,19 @@ async fn cancel_running_actor_child_through_the_server() {
         }
     });
     std::fs::write(
-        home.path().join("config.json"),
+        home.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
 
-    let state = AppState::new_with_memory_store(
-        home.path().to_path_buf(),
-        MemoryStore::new(home.path().join("jiandu")),
-    )
-    .await
-    .expect("app state boots");
+    let state =
+        AppState::new_with_memory_store(home.clone(), MemoryStore::new(home.join("jiandu")))
+            .await
+            .expect("app state boots");
 
     let parent_id = "parent-cancel-e2e";
     let mut parent = Session::new(parent_id, "claude-test");
-    parent.workspace = Some(home.path().to_string_lossy().into_owned());
+    parent.workspace = Some(home.to_string_lossy().into_owned());
     state.storage.save_session(&parent).await.unwrap();
     state.session_store.save_session(&parent).await.unwrap();
 
@@ -219,6 +219,7 @@ async fn cancel_running_actor_child_through_the_server() {
                 "action": "create",
                 "title": "Sleeper",
                 "responsibility": "sleep until cancelled",
+                "subagent_type": "legacy-echo-fixture",
                 // 60s cancellable sleep: the run stays open until we cancel.
                 "prompt": "__sleep_ms:60000 never reached",
                 "wait": false,
