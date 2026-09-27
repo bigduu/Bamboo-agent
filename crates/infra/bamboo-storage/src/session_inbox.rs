@@ -38,7 +38,8 @@ const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "session_inbox_owned.rs"]
 mod owned;
-use owned::{AckAuthority, InboxAuthority, OwnedFilesystem, StoredLease};
+pub(crate) use owned::OwnedFilesystem;
+use owned::{AckAuthority, InboxAuthority, StoredLease};
 
 struct StoredInboxReceipt {
     delivery: SessionInboxReceipt,
@@ -126,6 +127,25 @@ impl FileSessionInbox {
             #[cfg(test)]
             owned_scope_drop: None,
         }
+    }
+
+    /// Storage-only opt-in; this result is not provider or worker admission.
+    pub async fn checkpoint_actor_input(
+        &self,
+        request: crate::ActorInputCheckpoint,
+    ) -> Result<crate::ActorInputCheckpointResult, crate::ActorInputCheckpointError> {
+        self.sessions
+            .checkpoint_owned_input(self.clone(), request)
+            .await
+    }
+
+    pub(crate) async fn actor_input_filesystem(
+        &self,
+        target: &str,
+        guards: Arc<crate::v2::ActorInputGuards>,
+    ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        self.filesystem_with_authority(target, InboxAuthority::Actor { _guard: guards })
+            .await
     }
 
     pub fn limits(&self) -> SessionInboxLimits {

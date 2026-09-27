@@ -46,6 +46,14 @@ use bamboo_domain::{
 };
 
 mod actor_directory;
+mod actor_input;
+pub(crate) use actor_input::ActorInputGuards;
+pub use actor_input::{
+    ActorInputCheckpoint, ActorInputCheckpointError, ActorInputCheckpointResult,
+    ActorInputCheckpointStatus,
+};
+#[cfg(test)]
+mod actor_input_tests;
 mod actor_transcript;
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
