@@ -13,6 +13,7 @@ use std::collections::HashMap;
 mod actions;
 mod helpers;
 mod inspection;
+pub mod named_profile;
 mod result_projection;
 
 #[cfg(test)]
@@ -211,6 +212,16 @@ pub struct QueuedInjectedMessage {
 
 #[async_trait]
 pub trait ChildSessionPort: Send + Sync {
+    /// Host-private catalog selection. Embeddings without a catalog keep the
+    /// legacy path; server implementations reject unavailable authority.
+    async fn resolve_named_profile(
+        &self,
+        _parent: &Session,
+        _name: &str,
+    ) -> Result<Option<named_profile::ResolvedChildProfile>, ChildSessionError> {
+        Ok(None)
+    }
+
     /// Opt-in required packets may only cross an explicitly supported fresh
     /// local Bamboo worker route. Embeddings must prove support before persist.
     async fn validate_required_child_context_route(
