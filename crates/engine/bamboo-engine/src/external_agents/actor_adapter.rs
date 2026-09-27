@@ -2399,6 +2399,7 @@ async fn require_unowned_glob(
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
     fence: ActorActivationFence,
+    inbox_generation: u64,
     created_at: chrono::DateTime<chrono::Utc>,
     provider_transcript: bamboo_domain::ProviderTranscriptState,
     input_consumer: SessionInboxConsumerId,
@@ -2494,6 +2495,7 @@ impl PlainActorActivation {
             let activation = Self {
                 store,
                 fence: claimed.fence(),
+                inbox_generation: claimed.inbox_generation,
                 created_at: session.created_at,
                 provider_transcript: session.provider_transcript.clone(),
                 input_consumer,
@@ -2538,7 +2540,7 @@ impl PlainActorActivation {
                 allow_failed_retry,
             )
             .await?;
-            if activation.fence.inbox_generation == 0 {
+            if activation.inbox_generation == 0 {
                 return Ok((activation, None));
             }
             let prepared = async {
@@ -2550,7 +2552,7 @@ impl PlainActorActivation {
                     .map_err(|_| plain_actor_unsupported())?;
                 if backlog.pending != 1
                     || backlog.claimed != 0
-                    || backlog.generation != activation.fence.inbox_generation
+                    || backlog.generation != activation.inbox_generation
                 {
                     return Err(plain_actor_unsupported());
                 }
@@ -2558,7 +2560,7 @@ impl PlainActorActivation {
                     .claim_input(binding, session, run_id)
                     .await?
                     .ok_or_else(plain_actor_unsupported)?;
-                if claim.claim.generation != activation.fence.inbox_generation {
+                if claim.claim.generation != activation.inbox_generation {
                     return Err(plain_actor_unsupported());
                 }
                 let delivery = activation.checkpoint_input(session, run_id, &claim).await?;
