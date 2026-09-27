@@ -678,6 +678,63 @@ fn resolve_remote_placements(
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedRemotePlacement> {
     let mut out = std::collections::HashMap::new();
     for p in placements {
+        let duplicate_strict = placements
+            .iter()
+            .any(|other| other.role == p.role && other.broker_peer.is_some())
+            && placements
+                .iter()
+                .filter(|other| other.role == p.role)
+                .count()
+                != 1;
+        if duplicate_strict {
+            out.insert(
+                p.role.clone(),
+                super::actor_adapter::ResolvedRemotePlacement {
+                    endpoint: String::new(),
+                    token: None,
+                    ca_cert_file: None,
+                    host_label: Some("remote".into()),
+                    broker_peer: Some(Err(())),
+                },
+            );
+            continue;
+        }
+        if let Some(peer) = &p.broker_peer {
+            let token = p
+                .token_env
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok());
+            let valid = peer.valid()
+                && p.endpoint.len() <= 2048
+                && p.token_env
+                    .as_ref()
+                    .is_some_and(|name| !name.is_empty() && name.len() <= 256)
+                && url::Url::parse(&p.endpoint).is_ok_and(|url| {
+                    url.scheme() == "wss"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                })
+                && token.as_ref().is_some_and(|s| {
+                    (32..=256).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic())
+                })
+                && p.ca_cert_file.as_ref().is_some_and(|path| {
+                    bamboo_broker::client_config_trusting_cert(std::path::Path::new(path)).is_ok()
+                });
+            out.insert(
+                p.role.clone(),
+                super::actor_adapter::ResolvedRemotePlacement {
+                    endpoint: p.endpoint.clone(),
+                    token: if valid { token } else { None },
+                    ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+                    host_label: Some("remote".into()),
+                    broker_peer: Some(if valid { Ok(peer.clone()) } else { Err(()) }),
+                },
+            );
+            continue; // Invalid explicit routes remain selected, never Local fallback.
+        }
         let token = match p.token_env.as_deref() {
             Some(env_var) => match std::env::var(env_var) {
                 Ok(token) => Some(token),
@@ -716,6 +773,7 @@ fn resolve_remote_placements(
                 // Badge from the node's own metadata when the endpoint points at
                 // a known cluster node; else the endpoint host is used downstream.
                 host_label: node_label_for_endpoint(nodes, &p.endpoint),
+                broker_peer: None,
             },
         );
     }
@@ -1180,6 +1238,41 @@ mod placement_resolver_tests {
         DeployProfile, Node, NodePlacement, SshAuth, SshTarget, TrustLevel,
     };
     use bamboo_config::{RemoteActorPlacement, SchedulablePlacement};
+
+    #[test]
+    fn explicit_broker_route_retains_unavailable_selection_and_redacted_debug() {
+        let route = bamboo_config::RemoteBrokerPeer {
+            parent_mailbox: "host".into(),
+            worker_mailbox: "worker".into(),
+            parent_role: Some("host".into()),
+            worker_role: Some("worker".into()),
+        };
+        assert!(route.valid());
+        let mut invalid = route.clone();
+        invalid.worker_mailbox = "Worker".into();
+        assert!(!invalid.valid());
+        invalid.worker_mailbox = "../worker".into();
+        assert!(!invalid.valid());
+        let placement = RemoteActorPlacement {
+            role: "worker".into(),
+            endpoint: "ws://private.invalid".into(),
+            token_env: Some("BAMBOO_1431_MISSING_FIXTURE_TOKEN".into()),
+            ca_cert_file: None,
+            broker_peer: Some(route),
+        };
+        let parsed: RemoteActorPlacement =
+            serde_json::from_value(serde_json::to_value(&placement).unwrap()).unwrap();
+        assert_eq!(parsed, placement);
+        let resolved = resolve_remote_placements(&[placement], &[]);
+        let selected = &resolved["worker"];
+        assert!(matches!(selected.broker_peer, Some(Err(()))));
+        assert!(selected.token.is_none());
+        assert_eq!(selected.host_label.as_deref(), Some("remote"));
+        assert!(!format!("{selected:?}").contains("private.invalid"));
+        assert!(serde_json::from_value::<bamboo_config::RemoteBrokerPeer>(serde_json::json!({
+            "parent_mailbox":"host", "worker_mailbox":"worker", "parent_role":null, "worker_role":null,"credential":"secret"
+        })).is_err());
+    }
 
     fn ssh_node(id: &str, label: &str, host: &str, default_role: Option<&str>) -> Node {
         Node {

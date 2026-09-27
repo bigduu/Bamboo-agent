@@ -116,6 +116,21 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         broker.remove("token_encrypted");
     }
 
+    if let Some(placements) = root
+        .get_mut("subagents")
+        .and_then(|s| s.get_mut("remote_placements"))
+        .and_then(Value::as_array_mut)
+    {
+        for placement in placements {
+            if placement
+                .get("broker_peer")
+                .is_some_and(|peer| !peer.is_null())
+            {
+                *placement = serde_json::json!({"role": placement.get("role"), "broker_peer_configured": true});
+            }
+        }
+    }
+
     // Redact notification-channel secrets (ntfy token, Bark device key).
     // `token`/`device_key` are `#[serde(skip_serializing)]` on `Config` so they
     // never appear here already; mirror the provider-instance `api_key`
@@ -284,4 +299,157 @@ pub fn redact_providers_for_api(mut value: Value, config: &Config) -> Value {
     }
 
     value
+}
+
+/// Restore only an exact lock-time public echo. Strict routes are operator-only;
+/// a masked entry never supplies transport identity or credential authority.
+pub(crate) fn preserve_remote_broker_echo(
+    current: &Config,
+    patch: &mut serde_json::Map<String, Value>,
+) -> Result<(), &'static str> {
+    let denied = "remote broker routes must be configured by the operator";
+    let has_strict = current
+        .subagents
+        .remote_placements
+        .iter()
+        .any(|row| row.broker_peer.is_some());
+    if has_strict && patch.get("subagents").is_some_and(|s| !s.is_object()) {
+        return Err(denied);
+    }
+    let Some(incoming) = patch
+        .get_mut("subagents")
+        .and_then(|s| s.get_mut("remote_placements"))
+    else {
+        return Ok(());
+    };
+    if incoming.is_null() && !has_strict {
+        return Ok(());
+    }
+    let private = current.to_compatibility_value().map_err(|_| denied)?;
+    let expected = redact_config_for_api(private.clone(), current);
+    let current_rows = private["subagents"]["remote_placements"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let incoming = incoming.as_array_mut().ok_or(denied)?;
+    for (index, row) in current_rows.iter().enumerate() {
+        if row.get("broker_peer").is_some_and(|peer| !peer.is_null()) {
+            let echoed = incoming.get_mut(index).ok_or(denied)?;
+            if echoed != &expected["subagents"]["remote_placements"][index]
+                || incoming_role_count(&expected["subagents"]["remote_placements"], row.get("role"))
+                    != 1
+            {
+                return Err(denied);
+            }
+            *echoed = row.clone();
+        }
+    }
+    for (index, row) in incoming.iter().enumerate() {
+        if row.get("broker_peer_configured").is_some()
+            || row.get("broker_peer").is_some_and(|peer| !peer.is_null())
+                && current_rows.get(index) != Some(row)
+        {
+            return Err(denied);
+        }
+        if current_rows.iter().any(|old| {
+            old.get("broker_peer").is_some_and(|p| !p.is_null())
+                && old.get("role") == row.get("role")
+        }) && incoming
+            .iter()
+            .filter(|other| other.get("role") == row.get("role"))
+            .count()
+            != 1
+        {
+            return Err(denied);
+        }
+    }
+    Ok(())
+}
+fn incoming_role_count(rows: &Value, role: Option<&Value>) -> usize {
+    rows.as_array().map_or(0, |rows| {
+        rows.iter().filter(|row| row.get("role") == role).count()
+    })
+}
+
+#[cfg(test)]
+mod remote_broker_redaction_tests {
+    use super::*;
+    #[test]
+    fn private_route_echo_preserves_mixed_routes_and_rejects_edits() {
+        let original = serde_json::json!({"subagents":{"remote_placements":[
+            {"role":"worker", "endpoint":"wss://private.invalid", "token_env":"PRIVATE_TOKEN", "ca_cert_file":"private-ca",
+                "broker_peer":{"parent_mailbox":"private-parent", "worker_mailbox":"private-worker", "parent_role":"host", "worker_role":"worker"}},
+            {"role":"legacy", "endpoint":"ws://legacy.invalid"}]}});
+        let config: Config = serde_json::from_value(original).unwrap();
+        let private = config.to_compatibility_value().unwrap();
+        let public = redact_config_for_api(private.clone(), &config);
+        let route = &public["subagents"]["remote_placements"][0];
+        assert_eq!(
+            route,
+            &serde_json::json!({"role":"worker", "broker_peer_configured":true})
+        );
+        assert_eq!(
+            public["subagents"]["remote_placements"][1],
+            private["subagents"]["remote_placements"][1]
+        );
+        let mut echo = public.as_object().unwrap().clone();
+        preserve_remote_broker_echo(&config, &mut echo).unwrap();
+        assert_eq!(
+            echo["subagents"]["remote_placements"],
+            private["subagents"]["remote_placements"]
+        );
+        for change in [
+            serde_json::json!([]),
+            serde_json::json!([{"role":"worker", "broker_peer_configured":false}]),
+            serde_json::json!([public["subagents"]["remote_placements"][1], route]),
+            serde_json::json!([route, {"role":"worker", "endpoint":"ws://replacement"}]),
+        ] {
+            let mut patch = serde_json::json!({"subagents":{"remote_placements":change}})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(preserve_remote_broker_echo(&config, &mut patch).is_err());
+        }
+        let mut unrelated = serde_json::json!({"subagents":{"max_concurrent":2}})
+            .as_object()
+            .unwrap()
+            .clone();
+        preserve_remote_broker_echo(&config, &mut unrelated).unwrap();
+        assert_eq!(unrelated["subagents"]["max_concurrent"], 2);
+        for invalid in [Value::Null, serde_json::json!(7)] {
+            let mut patch = serde_json::json!({"subagents":invalid})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(preserve_remote_broker_echo(&config, &mut patch).is_err());
+        }
+        for rows in [
+            serde_json::json!([]),
+            serde_json::json!([{"role":"legacy","endpoint":"ws://legacy.invalid"}]),
+        ] {
+            let mut patch = serde_json::json!({"subagents":{"remote_placements":rows}})
+                .as_object()
+                .unwrap()
+                .clone();
+            preserve_remote_broker_echo(&Config::default(), &mut patch).unwrap();
+        }
+        let mut legacy = config.clone();
+        legacy.subagents.remote_placements.remove(0);
+        let mut legacy_clear = serde_json::json!({"subagents":{"remote_placements":null}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(preserve_remote_broker_echo(&config, &mut legacy_clear).is_err());
+        preserve_remote_broker_echo(&legacy, &mut legacy_clear).unwrap();
+        for row in [
+            route.clone(),
+            private["subagents"]["remote_placements"][0].clone(),
+        ] {
+            let mut patch = serde_json::json!({"subagents":{"remote_placements":[row]}})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(preserve_remote_broker_echo(&Config::default(), &mut patch).is_err());
+        }
+    }
 }

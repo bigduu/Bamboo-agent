@@ -475,3 +475,204 @@ async fn wss_scoped_frames_current_ack_and_expiry_preserve_real_maildir() {
     assert!(matches!(recv(&mut ws).await, BrokerFrame::Error { .. }));
     task.abort();
 }
+
+#[tokio::test]
+async fn strict_actor_link_fences_source_run_birth_and_order_over_real_wss() {
+    use bamboo_broker::{BrokerChildLink, BrokerClient};
+    use bamboo_subagent::{
+        proto::ChildCreationIdentity, ChildFrame, LogicalSessionIdentity, ParentFrame, RunSpec,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = cert(dir.path());
+    let expiry = Utc::now() + ChronoDuration::minutes(5);
+    let mk = |token, mailbox, role| {
+        json!({"credential":token,"mailbox":mailbox,"role":role,
+        "host":format!("host-{mailbox}"),"expires_at":expiry,
+        "destinations":[{"mailbox":if mailbox=="a" {"b"}else{"a"},"kinds":if mailbox=="a" {vec!["run"]}else{vec!["event","outcome"]}}],
+        "cancel":if mailbox=="a" {vec!["b"]}else{vec![]},"presence":if mailbox=="a" {vec!["worker"]}else{vec![]}})
+    };
+    let core = Arc::new(BrokerCore::new(dir.path().join("broker")));
+    let (url, server) = listen(
+        core,
+        json!({"peers":[mk(A,"a","host"),mk(B,"b","worker"),
+        mk("rogue-opaque-fixture-credential-000001","c","worker")]}),
+        &cert,
+        &key,
+        BrokerLimits::default(),
+    )
+    .await;
+    let host = AgentRef {
+        session_id: "a".into(),
+        role: Some("host".into()),
+    };
+    let mut worker = BrokerClient::connect_with_tls(
+        &url,
+        agent("b"),
+        B,
+        Some(client_config_trusting_cert(&cert).unwrap()),
+    )
+    .await
+    .unwrap();
+    worker.subscribe().await.unwrap();
+    let mut rogue = BrokerClient::connect_with_tls(
+        &url,
+        agent("c"),
+        "rogue-opaque-fixture-credential-000001",
+        Some(client_config_trusting_cert(&cert).unwrap()),
+    )
+    .await
+    .unwrap();
+    let identity = LogicalSessionIdentity {
+        session_id: "logical-child".into(),
+        parent_session_id: Some("logical-root".into()),
+        root_session_id: "logical-root".into(),
+        creation: Some(ChildCreationIdentity {
+            created_at: Utc::now(),
+            spawn_depth: 1,
+        }),
+    };
+    for case in [
+        "order",
+        "source",
+        "birth",
+        "parent",
+        "root",
+        "activation",
+        "epoch",
+        "missing",
+        "untyped",
+    ] {
+        let mut link = BrokerChildLink::connect_strict_with_tls(
+            &url,
+            host.clone(),
+            A,
+            agent("b"),
+            client_config_trusting_cert(&cert).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut run = RunSpec {
+            assignment: "task".into(),
+            logical_session: Some(identity.clone()),
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: vec![],
+            activation_run_id: Some(format!("run-{case}")),
+            execution_epoch: 9,
+            initial_session_messages: vec![],
+            secrets: Default::default(),
+        };
+        if case == "missing" {
+            run.logical_session.as_mut().unwrap().creation = None;
+            assert!(link.send(ParentFrame::Run(run)).await.is_err());
+            continue;
+        }
+        link.send(ParentFrame::Run(run.clone())).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), worker.next_message())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.kind, InboxKind::Run);
+        worker.ack(received.id.clone()).await.unwrap();
+        let mut batch = batch(true);
+        batch.logical_session = Some(identity.clone());
+        batch.activation_id = run.activation_run_id;
+        batch.execution_epoch = run.execution_epoch;
+        batch.source_actor_id = Some(if case == "source" { "c" } else { "b" }.into());
+        batch.source_node_id = None;
+        match case {
+            "birth" => {
+                batch
+                    .logical_session
+                    .as_mut()
+                    .unwrap()
+                    .creation
+                    .as_mut()
+                    .unwrap()
+                    .created_at += ChronoDuration::nanoseconds(1)
+            }
+            "parent" => {
+                batch.logical_session.as_mut().unwrap().parent_session_id = Some("foreign".into())
+            }
+            "root" => batch.logical_session.as_mut().unwrap().root_session_id = "foreign".into(),
+            "activation" => batch.activation_id = Some("stale".into()),
+            "epoch" => batch.execution_epoch += 1,
+            _ => {}
+        }
+        let body = if case == "untyped" {
+            json!({"type":"complete"})
+        } else {
+            serde_json::to_value(&batch).unwrap()
+        };
+        let msg = |body, from, correlation| InboxMessage {
+            id: MsgId::new(),
+            from,
+            kind: InboxKind::Event,
+            body,
+            created_at: Utc::now(),
+            correlation_id: Some(correlation),
+        };
+        if case == "source" {
+            rogue
+                .deliver("a", msg(body, agent("c"), received.id))
+                .await
+                .unwrap();
+        } else {
+            if case == "order" {
+                worker
+                    .deliver(
+                        "a",
+                        msg(json!({"type":"complete"}), agent("b"), MsgId::new()),
+                    )
+                    .await
+                    .unwrap();
+                let mut live = batch.clone();
+                live.qos = ActorEventQos::Ephemeral;
+                live.events = vec![json!({"type":"token","content":"wire order"})];
+                worker
+                    .publish_event_batch("a", &received.id, live)
+                    .await
+                    .unwrap();
+            }
+            worker
+                .deliver("a", msg(body, agent("b"), received.id.clone()))
+                .await
+                .unwrap();
+            if case == "order" {
+                worker
+                    .deliver(
+                        "a",
+                        InboxMessage {
+                            id: MsgId::new(),
+                            from: agent("b"),
+                            kind: InboxKind::Outcome,
+                            body: json!({"status":"completed","result":"done","error":null}),
+                            created_at: Utc::now(),
+                            correlation_id: Some(received.id),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let next = tokio::time::timeout(Duration::from_secs(3), link.next_frame())
+            .await
+            .unwrap();
+        if case == "order" {
+            assert!(
+                matches!(next.unwrap(),Some(ChildFrame::EventBatch{batch}) if batch.qos==ActorEventQos::Ephemeral)
+            );
+            assert!(
+                matches!(link.next_frame().await.unwrap(),Some(ChildFrame::EventBatch{batch}) if batch.qos==ActorEventQos::Durable)
+            );
+            assert!(matches!(
+                link.next_frame().await.unwrap(),
+                Some(ChildFrame::Terminal { .. })
+            ));
+        } else {
+            assert!(next.is_err(), "{case}");
+        }
+    }
+    server.abort();
+}
