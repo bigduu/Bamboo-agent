@@ -577,9 +577,17 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
         assert_eq!(tail[1].tool_success, Some(true));
         assert!(tail[1].content.contains("owned-marker.txt"));
         assert_eq!(tail[2].content, "FENCED_PLAIN_REPLY");
-        assert!(tail
-            .iter()
-            .all(|m| m.reasoning.is_none() && m.metadata.is_none()));
+        assert!(tail.iter().all(|m| m.reasoning.is_none()));
+        assert!(tail[0].metadata.is_none() && tail[2].metadata.is_none());
+        let lifecycle = tail[1].metadata.as_ref().unwrap();
+        assert!(lifecycle["elapsed_ms"].as_u64().is_some());
+        assert_eq!(
+            lifecycle,
+            &json!({
+                "elapsed_ms": lifecycle["elapsed_ms"], "is_mutating": false,
+                "auto_approved": true, "tool_name": "Glob", "success": true,
+            })
+        );
     }
     if correction {
         assert!(

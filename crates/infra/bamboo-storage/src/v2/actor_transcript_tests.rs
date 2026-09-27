@@ -1043,9 +1043,13 @@ async fn actor_glob_pair_preserves_physical_prefix_and_rejects_every_unsupported
         Message::tool_result("actual-glob-call", "marker.txt"),
         Message::assistant("verified", None),
     ];
+    req.messages[1].metadata = Some(json!({
+        "elapsed_ms": 17, "is_mutating": false, "auto_approved": true,
+        "tool_name": "Glob", "success": true,
+    }));
     let directory = actor_dir(home.path(), true);
     let before = files(&directory);
-    for change in 0..12 {
+    for change in 0..22 {
         let mut bad = req.clone();
         match change {
             0 => {
@@ -1065,11 +1069,29 @@ async fn actor_glob_pair_preserves_physical_prefix_and_rejects_every_unsupported
             8 => bad.messages[0].reasoning = Some("hidden".into()),
             9 => bad.messages[1].metadata = Some(json!({"authority":true})),
             10 => bad.messages[2].compressed = true,
-            _ => {
+            11 => {
                 bad.messages[0].tool_calls.as_mut().unwrap()[0]
                     .function
                     .arguments = "invalid".into()
             }
+            12 => {
+                bad.messages[1]
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("elapsed_ms");
+            }
+            13 => bad.messages[1].metadata.as_mut().unwrap()["private"] = json!(true),
+            14 => bad.messages[1].metadata.as_mut().unwrap()["auto_approved"] = json!(false),
+            15 => bad.messages[1].metadata.as_mut().unwrap()["is_mutating"] = json!(true),
+            16 => bad.messages[1].metadata.as_mut().unwrap()["tool_name"] = json!("Bash"),
+            17 => bad.messages[1].metadata.as_mut().unwrap()["success"] = json!(false),
+            18 => bad.messages[1].metadata.as_mut().unwrap()["elapsed_ms"] = json!(-1),
+            19 => bad.messages[1].metadata.as_mut().unwrap()["elapsed_ms"] = json!({"ms":17}),
+            20 => bad.messages[0].metadata = req.messages[1].metadata.clone(),
+            _ => bad.messages[2].metadata = req.messages[1].metadata.clone(),
         }
         unchanged_rejection(&store, &directory, bad).await;
     }
