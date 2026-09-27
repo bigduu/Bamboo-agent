@@ -82,6 +82,49 @@ fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     })
 }
 
+/// Ordinary runner writes do not author tagged tool waits. Their first arm is
+/// a runtime-only control-plane write; untagged safety-net waits remain owned
+/// by the runner. Adopt the latest wait under the same lock as this save,
+/// without reverting the new run's Initializing/Running status to Suspended.
+fn adopt_durable_tagged_child_wait(
+    session: &mut Session,
+    latest: &Session,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if session.id != latest.id || session.created_at != latest.created_at {
+        return None;
+    }
+    let incoming = session.agent_runtime_state.as_mut()?;
+    let wait = incoming.waiting_for_children.as_ref()?;
+    wait.registered_by_tool_call_id.as_ref()?;
+    let registered_at = wait.registered_at;
+    incoming.waiting_for_children = latest
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.clone());
+    if incoming.waiting_for_children.is_some() {
+        return None;
+    }
+    if session
+        .metadata
+        .get("runtime.suspend_reason")
+        .map(String::as_str)
+        == Some("waiting_for_children")
+    {
+        session.metadata.remove("runtime.suspend_reason");
+    }
+    if incoming
+        .suspension
+        .as_ref()
+        .is_some_and(|s| s.reason == "waiting_for_children")
+    {
+        incoming.suspension = None;
+        if incoming.status == bamboo_domain::AgentStatusState::Suspended {
+            incoming.status = bamboo_domain::AgentStatusState::Idle;
+        }
+    }
+    Some(registered_at)
+}
+
 /// A synchronous SubAgent tool has already persisted its tagged wait before
 /// launching the child. At runner finalization, the durable copy therefore
 /// owns later completion/rollback changes to that wait. Reconcile inside the
@@ -872,6 +915,7 @@ impl LockedSessionStore {
             );
             apply_authoritative_metadata(session, latest);
             adopt_fresher_disk_permission_posture(session, latest);
+            let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
         let result = self.save_session_rebasing_task_conflicts(session).await;
@@ -1093,6 +1137,9 @@ impl LockedSessionStore {
                 if let Some(registered_at) = adopt_finalized_tool_child_wait(session, latest) {
                     preserve_finalized_hidden_child_resumes(session, latest, registered_at);
                 }
+            }
+            if let Some(registered_at) = adopt_durable_tagged_child_wait(session, latest) {
+                preserve_finalized_hidden_child_resumes(session, latest, registered_at);
             }
             adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
@@ -5175,6 +5222,228 @@ mod tests {
         assert_eq!(state.status, AgentStatusState::Idle);
         assert!(state.waiting_for_children.is_some());
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_checkpoint_tagged_wait_adoption_preserves_current_run_and_clear_winner() {
+        use bamboo_domain::session::runtime_state::SuspensionState;
+        use bamboo_domain::session::types::Message;
+        use bamboo_domain::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        for checkpoint in [false, true] {
+            for status in [AgentStatusState::Initializing, AgentStatusState::Running] {
+                for current_wait in 0..3 {
+                    let (_temp, storage) = make_storage().await;
+                    let store = LockedSessionStore::new(storage.clone());
+                    let mut parent = fresh("mid-run-tagged-wait");
+                    let mut wait = WaitingForChildrenState::for_children(
+                        vec!["child-b".into(), "child-a".into()],
+                        ChildWaitPolicy::Any,
+                        chrono::Utc::now() - chrono::Duration::minutes(5),
+                    );
+                    wait.registered_by_tool_call_id = Some("original-call".into());
+                    let mut previous = AgentRuntimeState::new("old-run");
+                    previous.status = AgentStatusState::Suspended;
+                    previous.waiting_for_children = Some(wait.clone());
+                    parent.agent_runtime_state = Some(previous);
+                    parent.add_message(Message::user("original task"));
+                    storage.save_session(&parent).await.unwrap();
+                    let mut incoming = parent.clone();
+                    let runtime = incoming.agent_runtime_state.as_mut().unwrap();
+                    runtime.run_id = "reasoning-run".into();
+                    runtime.status = status;
+                    incoming.metadata.remove("runtime.suspend_reason");
+                    incoming.add_message(Message::user("new admitted reasoning"));
+                    let expected = match current_wait {
+                        0 => Some(wait),
+                        1 => None,
+                        _ => {
+                            let mut new_wait = wait;
+                            new_wait.wait_for = ChildWaitPolicy::FirstError;
+                            new_wait.registered_by_tool_call_id = Some("new-tool-call".into());
+                            Some(new_wait)
+                        }
+                    };
+                    let current = expected.clone();
+                    store
+                        .update_runtime_config(&parent.id, move |latest| {
+                            let runtime = latest.agent_runtime_state.as_mut().unwrap();
+                            runtime.waiting_for_children = current;
+                            if runtime.waiting_for_children.is_none() {
+                                runtime.status = AgentStatusState::Idle;
+                                runtime.suspension = None;
+                                latest.metadata.remove("runtime.suspend_reason");
+                            }
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if expected.is_none() {
+                        let mut completed =
+                            storage.load_session(&parent.id).await.unwrap().unwrap();
+                        for (content, created_at) in [
+                            (
+                                "old consumed outcome",
+                                chrono::Utc::now() - chrono::Duration::hours(1),
+                            ),
+                            ("current completed outcome", chrono::Utc::now()),
+                        ] {
+                            let mut message = Message::user(content);
+                            message.created_at = created_at;
+                            message.metadata =
+                                Some(serde_json::json!({"runtime_kind":"child_completion_resume"}));
+                            completed.add_message(message);
+                        }
+                        store.merge_save_runtime(&mut completed).await.unwrap();
+                    }
+                    if checkpoint {
+                        store
+                            .checkpoint_runtime_session(&mut incoming)
+                            .await
+                            .unwrap();
+                    } else {
+                        store.merge_save_runtime(&mut incoming).await.unwrap();
+                    }
+                    for saved in [
+                        incoming.clone(),
+                        storage.load_session(&parent.id).await.unwrap().unwrap(),
+                    ] {
+                        let runtime = saved.agent_runtime_state.unwrap();
+                        assert_eq!(runtime.waiting_for_children, expected);
+                        assert_eq!(runtime.status, status);
+                        assert_eq!(runtime.run_id, "reasoning-run");
+                        assert!(runtime.suspension.is_none());
+                        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+                        assert_eq!(
+                            saved
+                                .messages
+                                .iter()
+                                .filter(|m| m.content == "new admitted reasoning")
+                                .count(),
+                            1
+                        );
+                        assert!(saved.messages.iter().any(|m| m.content == "original task"));
+                        if expected.is_none() {
+                            assert_eq!(
+                                saved
+                                    .messages
+                                    .iter()
+                                    .filter(|m| m.content == "current completed outcome")
+                                    .count(),
+                                1
+                            );
+                            assert_eq!(
+                                saved
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.content == "old consumed outcome"),
+                                checkpoint
+                            );
+                        }
+                    }
+
+                    if expected.is_none() {
+                        incoming.agent_runtime_state.as_mut().unwrap().status =
+                            AgentStatusState::Completed;
+                        store
+                            .merge_save_finalized_runtime(&mut incoming)
+                            .await
+                            .unwrap();
+                        let finalized = storage.load_session(&parent.id).await.unwrap().unwrap();
+                        assert!(finalized
+                            .agent_runtime_state
+                            .as_ref()
+                            .unwrap()
+                            .waiting_for_children
+                            .is_none());
+                        assert_eq!(
+                            finalized
+                                .messages
+                                .iter()
+                                .filter(|m| m.content == "current completed outcome")
+                                .count(),
+                            1
+                        );
+                    }
+
+                    // A separate current suspension is not owned by wait adoption.
+                    if expected.is_none() {
+                        let mut unrelated = parent;
+                        let runtime = unrelated.agent_runtime_state.as_mut().unwrap();
+                        runtime.status = AgentStatusState::Suspended;
+                        runtime.suspension = Some(SuspensionState {
+                            reason: "awaiting_clarification".into(),
+                            suspended_at: chrono::Utc::now(),
+                            resumable: true,
+                            hook_point: Some("AfterToolExecution".into()),
+                        });
+                        let suspension = runtime.suspension.clone();
+                        unrelated.metadata.insert(
+                            "runtime.suspend_reason".into(),
+                            "awaiting_clarification".into(),
+                        );
+                        store
+                            .checkpoint_runtime_session(&mut unrelated)
+                            .await
+                            .unwrap();
+                        let runtime = unrelated.agent_runtime_state.as_ref().unwrap();
+                        assert!(runtime.waiting_for_children.is_none());
+                        assert_eq!(runtime.status, AgentStatusState::Suspended);
+                        assert_eq!(runtime.suspension, suspension);
+                        assert_eq!(
+                            unrelated
+                                .metadata
+                                .get("runtime.suspend_reason")
+                                .map(String::as_str),
+                            Some("awaiting_clarification")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tagged_control_plane_first_arm_and_untagged_runner_first_save_remain_owned() {
+        use bamboo_domain::{AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState};
+        for tagged in [true, false] {
+            let (_temp, storage) = make_storage().await;
+            let store = LockedSessionStore::new(storage.clone());
+            let mut parent = fresh("first-wait-publication");
+            parent.agent_runtime_state = Some(AgentRuntimeState::new("parent-run"));
+            storage.save_session(&parent).await.unwrap();
+            let mut wait = WaitingForChildrenState::for_children(
+                vec!["new-child".into()],
+                ChildWaitPolicy::All,
+                chrono::Utc::now(),
+            );
+            if tagged {
+                wait.registered_by_tool_call_id = Some("first-arm-call".into());
+            }
+            parent
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .waiting_for_children = Some(wait.clone());
+            if tagged {
+                // The real ChildSessionAdapter authors tools through this API.
+                store.save_runtime_only(&mut parent).await.unwrap();
+            } else {
+                store.merge_save_runtime(&mut parent).await.unwrap();
+            }
+            let saved = storage.load_session(&parent.id).await.unwrap().unwrap();
+            assert_eq!(
+                saved
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .waiting_for_children
+                    .as_ref(),
+                Some(&wait)
+            );
+        }
     }
 
     #[tokio::test]

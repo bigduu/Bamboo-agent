@@ -1107,14 +1107,18 @@ async fn suspend_to_wait_for_children(
 ///
 /// Returns `Some` suspend outcome (with the durable wait persisted) when it
 /// engages, or `None` to let the run complete normally. No-ops when there is no
-/// storage, no active children, or a wait is already registered — so child
-/// sessions (which have no children) and explicit-wait flows are unaffected.
+/// storage, no active children, or an untagged wait is already registered.
+/// An inherited tool wait is freshly observed even when its children finished.
 async fn maybe_suspend_for_orphaned_children(
     session: &mut Session,
     config: &AgentLoopConfig,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<Option<TurnOutcome>, AgentError> {
-    if runtime_state.waiting_for_children.is_some() {
+    let inherited_tool_wait = runtime_state
+        .waiting_for_children
+        .as_ref()
+        .is_some_and(|wait| wait.registered_by_tool_call_id.is_some());
+    if runtime_state.waiting_for_children.is_some() && !inherited_tool_wait {
         return Ok(None);
     }
     let Some(storage) = config.storage.as_ref() else {
@@ -1129,18 +1133,23 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
-    if active.is_empty() {
+    if active.is_empty() && !inherited_tool_wait {
         return Ok(None);
     }
     active.sort();
     active.dedup();
 
     // InterruptSpecificWait permits a reasoning turn, not a new wait lease.
-    // Startup resets the live state; restore the current durable value before
+    // Startup carries only the wait; observe the current durable value before
     // the orphan gate could replace its policy, deadline or originating call.
     let durable = storage.load_session(&session.id).await.map_err(|_| {
         AgentError::Tool("parent wait observation failed; refusing to replace its wait".into())
     })?;
+    if inherited_tool_wait && durable.is_none() {
+        return Err(AgentError::Tool(
+            "parent wait observation failed; current session is missing".into(),
+        ));
+    }
     if let Some(durable) = durable {
         if durable.id != session.id || durable.created_at != session.created_at {
             return Err(AgentError::Tool(
@@ -1164,6 +1173,32 @@ async fn maybe_suspend_for_orphaned_children(
                 sent_complete: false,
             }));
         }
+    }
+
+    if inherited_tool_wait {
+        // A completed Any/FirstError wait can leave another child active.
+        // Its clear is final: do not grant that child a new six-hour wait.
+        runtime_state.waiting_for_children = None;
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_children")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if runtime_state
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_children")
+        {
+            runtime_state.suspension = None;
+            if runtime_state.status == AgentStatusState::Suspended {
+                runtime_state.status = AgentStatusState::Idle;
+            }
+        }
+        state_bridge::write_runtime_state(session, runtime_state);
+        return Ok(None);
     }
 
     tracing::info!(
@@ -9455,6 +9490,15 @@ mod tests {
                 Some(&wait)
             );
             assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+            assert!(
+                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .should_break
+            );
+            assert_eq!(runtime.waiting_for_children.as_ref(), Some(&wait));
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
             let mut durable = inner.load_session(&parent.id).await.unwrap().unwrap();
             assert_eq!(
                 durable
@@ -9483,6 +9527,21 @@ mod tests {
             );
             assert!(runtime.waiting_for_children.is_none());
             assert_eq!(runtime.status, AgentStatusState::Idle);
+            assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+
+            // Startup's carried identity is stale after completion. The real
+            // orphan gate must not renew it over the still-running other child.
+            runtime.status = AgentStatusState::Running;
+            runtime.waiting_for_children = Some(wait);
+            assert!(
+                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(runtime.waiting_for_children.is_none());
+            assert_eq!(runtime.status, AgentStatusState::Running);
             assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
             assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
         }
