@@ -278,11 +278,13 @@ async fn host(data: &Path, config: &Value, mode: &str) -> (Process, String) {
     )
     .unwrap();
     candidate.save_to_dir(data.to_path_buf()).unwrap();
-    let bind = address();
+    let bind: std::net::SocketAddr = address().parse().unwrap();
     let base = format!("http://{bind}/api/v1");
     let mut c = command(data);
     c.args(["serve", "--bind"])
-        .arg(&bind)
+        .arg(bind.ip().to_string())
+        .arg("--port")
+        .arg(bind.port().to_string())
         .arg("--data-dir")
         .arg(data);
     if mode == "missing" {
