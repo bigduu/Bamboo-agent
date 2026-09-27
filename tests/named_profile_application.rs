@@ -762,8 +762,12 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                     )
                 }
                 3 => {
-                    assert!(handoff_tool(&body, "review-write-denied")
-                        .contains("native_tool_ceiling_denied"));
+                    let rejected = handoff_tool(&body, "review-write-denied");
+                    assert!(
+                        rejected.contains("native_tool_ceiling_denied"),
+                        "actual Write result: {}",
+                        rejected.chars().take(512).collect::<String>()
+                    );
                     assert_eq!(
                         std::fs::read_to_string(probe.workspace.join("answer.txt")).unwrap(),
                         WRONG
