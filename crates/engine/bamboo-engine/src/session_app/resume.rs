@@ -5,6 +5,9 @@
 //! The server layer implements `ResumeExecutionPort` to supply the
 //! infrastructure operations.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::Session;
@@ -181,7 +184,17 @@ pub async fn resume_session_execution_with_handoff(
 /// - `AlreadyRunning` — a runner is already active
 /// - `Completed` — no pending user message
 /// - `NotFound` — session not found
-pub async fn resume_session_execution(
+pub fn resume_session_execution<'a>(
+    port: &'a dyn ResumeExecutionPort,
+    session_id: &'a str,
+    config: ResumeConfigSnapshot,
+) -> Pin<Box<impl Future<Output = ResumeOutcome> + Send + 'a>> {
+    // Allocate in the callee so a caller's future holds only the pinned box,
+    // rather than embedding the full Session and resume-request poll frame.
+    Box::pin(resume_session_execution_inner(port, session_id, config))
+}
+
+async fn resume_session_execution_inner(
     port: &dyn ResumeExecutionPort,
     session_id: &str,
     config: ResumeConfigSnapshot,
