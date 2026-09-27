@@ -420,10 +420,39 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool) {
             "actual second SubAgent run was dispatched"
         );
     }
-    assert_eq!(
-        probe.child_calls.load(Ordering::SeqCst),
-        if correction { 2 } else { 1 }
-    );
+    let child_calls = probe.child_calls.load(Ordering::SeqCst);
+    let expected_calls = if correction { 2 } else { 1 };
+    if child_calls != expected_calls {
+        let actor = store.inspect_actor(&id).await.map(|entry| {
+            json!({"state":entry.actor.state,"attempt":entry.actor.current_attempt,
+                "activation":entry.activation.map(|a| a.status)})
+        });
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap()),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id).await;
+        let mut diagnostic = json!({
+            "status":completed.last_run_status(),
+            "error":completed.last_run_error().map(|s| s.chars().take(384).collect::<String>()),
+            "actor":actor.map_err(|e| e.to_string()),
+            "inbox":backlog.map(|b| json!({"pending":b.pending,"claimed":b.claimed,
+                "generation":b.generation,"eligible":b.activation_generation})).map_err(|e| e.to_string()),
+            "tail":completed.messages.iter().rev().take(3).map(|m| json!({
+                "id":m.id,"role":m.role,"content":m.content.chars().take(128).collect::<String>(),
+                "owned_marker":m.metadata.as_ref().is_some_and(|v| v.get("_bamboo_owned_input_checkpoint").is_some())
+            })).collect::<Vec<_>>()
+        }).to_string();
+        let mut end = diagnostic.len().min(2048);
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+        assert_eq!(
+            child_calls, expected_calls,
+            "actual Child phase: {diagnostic}"
+        );
+    }
     if ultra {
         let finished = store.inspect_actor(&id).await.unwrap();
         let finished_activation = finished.activation.unwrap();
