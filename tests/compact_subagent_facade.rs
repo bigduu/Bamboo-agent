@@ -362,11 +362,16 @@ async fn fixture(role: Option<&'static str>) {
         .iter()
         .filter(|r| r["model"] == "compact-child")
         .any(|r| {
-            r["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["content"].as_str().is_some_and(|s| s.contains(TASK)))
+            r["messages"].as_array().unwrap().iter().any(|m| {
+                m["content"].as_str().is_some_and(|content| {
+                    if role.is_some() {
+                        serde_json::from_str::<Value>(content)
+                            .is_ok_and(|packet| packet["objective"] == TASK)
+                    } else {
+                        content.contains(TASK)
+                    }
+                })
+            })
         }));
     for message in parent
         .messages
