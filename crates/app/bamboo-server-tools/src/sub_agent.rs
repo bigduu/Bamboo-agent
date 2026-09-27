@@ -680,6 +680,13 @@ impl Tool for SubAgentTool {
             })?;
             return facade::inspect_tree(self.sessions.as_ref(), parent_id).await;
         }
+        if projection == Some(Projection::ForcedPermissionAudit) {
+            let caller_id = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("SubAgent requires a current session".into())
+            })?;
+            return facade::inspect_forced_permission_audit(self.sessions.as_ref(), caller_id)
+                .await;
+        }
         // The owner outlives a cancelled caller so an in-flight registration or
         // delivery can be resolved. The gate prevents a new launch when the
         // caller's cancellation wins before entering the scheduler or Inbox

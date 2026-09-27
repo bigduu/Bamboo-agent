@@ -2,8 +2,13 @@
 //! No fixture submits a resolved ceiling. Config and actual Project are inputs.
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
+use bamboo_agent::server::{
+    app_state::AppState,
+    tools::{ChildSessionAdapter, SubAgentTool},
+};
 use bamboo_agent_core::storage::Storage;
-use bamboo_domain::{ChildContextPacket, Role};
+use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+use bamboo_domain::{ChildContextPacket, Role, Session, SessionKind};
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use std::{
@@ -11,7 +16,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -42,6 +47,8 @@ struct Probe {
     release_child: AtomicBool,
     child_ready: tokio::sync::Notify,
     reviews: AtomicUsize,
+    audit_seen: AtomicBool,
+    audit_request: Mutex<Option<Value>>,
     original_wait: Mutex<Option<Value>>,
     rearmed: AtomicBool,
     review_release: tokio::sync::Notify,
@@ -158,6 +165,47 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     json!({"action":"run","child_session_id":child,"reset_to_last_user":false}),
                 )
             }
+            3 if probe.case.forced() => call(
+                "SubAgent",
+                json!({"intent":"inspect","message":"forced_permission_audit"}),
+            ),
+            4 if probe.case.forced() => {
+                let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+                let parent = disk.load_session("native-root").await.unwrap().unwrap();
+                let request_id = parent
+                    .messages
+                    .iter()
+                    .find_map(|message| {
+                        (message
+                            .metadata
+                            .as_ref()?
+                            .pointer("/session_message/body/instruction")?
+                            == "direct_parent_forced_permission_request_v1")
+                            .then_some(message.id.as_str())
+                    })
+                    .expect("durable request for Root's actual compact inspection");
+                let tool_text = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["role"] == "tool")
+                    .map(|message| message["content"].to_string())
+                    .last()
+                    .expect("actual Root inspection tool result");
+                assert!(
+                    tool_text.contains("forced_permission_audit"),
+                    "actual Root tool result: {tool_text}"
+                );
+                assert!(tool_text.contains("audit_recorded") && tool_text.contains(request_id));
+                assert!(
+                    !tool_text.contains("operation_digest")
+                        && !tool_text.contains("policy_revision")
+                        && !tool_text.contains("request_generation")
+                        && !tool_text.contains("real native child")
+                );
+                probe.audit_seen.store(true, Ordering::SeqCst);
+                (json!({"content":"PARENT_REVIEW_AWARE_WAIT"}), "stop")
+            }
             _ => {
                 let pending = probe.case.forced() && probe.child.load(Ordering::SeqCst) < 2;
                 (
@@ -197,6 +245,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         )
         .is_ok());
         assert!(!probe.workspace.join("child-write.txt").exists());
+        *probe.audit_request.lock().unwrap() = Some(request.clone());
         probe.reviews.fetch_add(1, Ordering::SeqCst);
         probe.review_release.notified().await; // Actual Parent reasoning must re-arm the SAME wait.
         (
@@ -241,6 +290,37 @@ fn start(data: &Path, port: u16) -> Host {
             .unwrap(),
     )
 }
+async fn audit_tool(data: &Path) -> SubAgentTool {
+    let state = AppState::new(data.to_path_buf()).await.unwrap();
+    let adapter = Arc::new(ChildSessionAdapter::new(
+        state.session_store.clone(),
+        state.storage.clone(),
+        state.persistence.clone(),
+        state.spawn_scheduler.clone(),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+        None,
+        None,
+        state.config.clone(),
+    ));
+    SubAgentTool::new(adapter.clone(), adapter)
+}
+async fn inspect_audit(tool: &SubAgentTool, caller: &str) -> Result<Value, String> {
+    let mut ctx = ToolCtx::none("native-audit-boundary");
+    ctx.session_id = Some(Arc::<str>::from(caller));
+    let outcome = tool
+        .invoke(
+            json!({"intent":"inspect","message":"forced_permission_audit"}),
+            ctx,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("read-only inspection must complete synchronously");
+    };
+    serde_json::from_str(&result.result).map_err(|error| error.to_string())
+}
 async fn fixture(case: Case) {
     eprintln!("actual native tool ceiling case {case:?}");
     let temp = tempfile::tempdir().unwrap();
@@ -274,6 +354,8 @@ async fn fixture(case: Case) {
         release_child: AtomicBool::new(false),
         child_ready: Default::default(),
         reviews: AtomicUsize::new(0),
+        audit_seen: AtomicBool::new(false),
+        audit_request: Mutex::new(None),
         original_wait: Mutex::new(None),
         rearmed: AtomicBool::new(false),
         review_release: Default::default(),
@@ -362,6 +444,7 @@ async fn fixture(case: Case) {
     assert!(executed.status().is_success());
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let mut seen_wait = false;
+    let mut checked_audit_boundaries = false;
     let parent = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             assert!(
@@ -370,6 +453,44 @@ async fn fixture(case: Case) {
                 std::fs::read_to_string(data.join("host.log")).unwrap()
             );
             let parent = store.load_session("native-root").await.unwrap().unwrap();
+            if case.forced()
+                && probe.reviews.load(Ordering::SeqCst) == 1
+                && !checked_audit_boundaries
+            {
+                let mut other = Session::new("native-other-root", "native-root");
+                other.set_project_id_meta(project.id.to_string());
+                other.workspace = Some(workspace.to_string_lossy().into_owned());
+                SessionStoreV2::new(data.clone())
+                    .await
+                    .unwrap()
+                    .save_session(&other)
+                    .await
+                    .unwrap();
+                let other = SessionStoreV2::new(data.clone())
+                    .await
+                    .unwrap()
+                    .load_session("native-other-root")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(other.kind, SessionKind::Root);
+                assert_eq!(other.root_session_id, other.id);
+                assert_eq!(other.parent_session_id, None);
+                assert_eq!(other.project_id_meta(), Some(project.id.to_string()));
+                let tool = audit_tool(&data).await;
+                let foreign = inspect_audit(&tool, "native-other-root").await.unwrap();
+                assert_eq!(foreign["records"], json!([]));
+                let request = probe.audit_request.lock().unwrap().clone().unwrap();
+                let child = request["body"]["data"]["child_session_id"]
+                    .as_str()
+                    .unwrap();
+                let denied = inspect_audit(&tool, child).await.unwrap_err();
+                assert!(
+                    denied.contains("Root"),
+                    "Child caller must be rejected: {denied}"
+                );
+                checked_audit_boundaries = true;
+            }
             if parent
                 .agent_runtime_state
                 .as_ref()
@@ -392,7 +513,9 @@ async fn fixture(case: Case) {
                         }
                     }
                     if probe.reviews.load(Ordering::SeqCst) == 1
-                        && probe.root.load(Ordering::SeqCst) >= 4
+                        && probe.audit_seen.load(Ordering::SeqCst)
+                        && checked_audit_boundaries
+                        && probe.root.load(Ordering::SeqCst) >= 5
                         && state.status
                             == bamboo_domain::session::runtime_state::AgentStatusState::Suspended
                     {
@@ -477,6 +600,8 @@ async fn fixture(case: Case) {
             .any(|t| t["function"]["name"] == "Write")));
         if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
+            assert!(probe.audit_seen.load(Ordering::SeqCst));
+            assert!(checked_audit_boundaries);
             assert_eq!(
                 workspace.join("child-write.txt").exists(),
                 case == Case::ForcedApprove
@@ -519,6 +644,8 @@ async fn fixture(case: Case) {
             .as_ref()
             .is_none_or(|state| state.waiting_for_children.is_none()));
     }
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
     drop(host);
     if case.forced() {
         let cold = SessionStoreV2::new(data.clone()).await.unwrap();
@@ -540,6 +667,23 @@ async fn fixture(case: Case) {
             .collect();
         assert_eq!(records.len(), 2);
         assert_ne!(records[0].id, records[1].id);
+        let request = records
+            .iter()
+            .find_map(|message| {
+                message
+                    .metadata
+                    .as_ref()?
+                    .get("session_message")
+                    .filter(|marker| {
+                        marker["body"]["instruction"]
+                            == "direct_parent_forced_permission_request_v1"
+                    })
+            })
+            .unwrap();
+        assert_eq!(
+            request,
+            probe.audit_request.lock().unwrap().as_ref().unwrap()
+        );
         assert!(records.iter().all(|m| m.never_compress));
         assert_eq!(
             workspace.join("child-write.txt").exists(),
