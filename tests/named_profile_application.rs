@@ -706,12 +706,25 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                         "explicit correction reaches the same Child unchanged"
                     );
                     handoff_call(
+                        "implementer-correction-read",
+                        "Read",
+                        json!({"file_path":probe.workspace.join("answer.txt")}),
+                    )
+                }
+                3 => {
+                    let read = handoff_tool(&body, "implementer-correction-read");
+                    assert!(
+                        !read.starts_with("Error:") && read.contains("answer=41"),
+                        "actual correction Read result: {}",
+                        read.chars().take(512).collect::<String>()
+                    );
+                    handoff_call(
                         "implementer-correct",
                         "Write",
                         json!({"file_path":probe.workspace.join("answer.txt"),"content":CORRECT}),
                     )
                 }
-                3 => {
+                4 => {
                     assert!(
                         !handoff_tool(&body, "implementer-correct").starts_with("Error:"),
                         "actual implementer-correct result: {}",
@@ -1196,7 +1209,7 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
             .map(|s| s.chars().take(512).collect::<String>())
     );
     assert_eq!(probe.root.load(Ordering::SeqCst), 13);
-    assert_eq!(probe.implementer.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.implementer.load(Ordering::SeqCst), 5);
     assert_eq!(probe.reviewer.load(Ordering::SeqCst), 7);
     assert_eq!(
         std::fs::read_to_string(workspace.join("answer.txt")).unwrap(),
