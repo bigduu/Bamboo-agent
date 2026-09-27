@@ -1695,9 +1695,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         }
         if !initial_deliveries.is_empty() {
-            self.agent
-                .admit_session_inbox_at_safe_boundary(&mut session)
-                .await;
+            if let Err(error) = self
+                .agent
+                .admit_session_inbox_at_safe_boundary_checked(&mut session)
+                .await
+            {
+                return ChildOutcome::error(format!(
+                    "initial worker SessionInbox admission failed: {error}"
+                ));
+            }
             for delivery in &initial_deliveries {
                 let transcript_proof = session.messages.iter().any(|message| {
                     bamboo_domain::is_matching_session_message(message, &delivery.envelope)
@@ -2199,15 +2205,26 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
-        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
-            Arc::new(LockedSessionStore::new(storage.clone()));
         let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
             store.clone(),
             bamboo_domain::SessionInboxLimits::default(),
         ));
+        let executor = worker_executor_for_store(provider, store.clone(), inbox.clone()).await;
+        (temp, executor, store, inbox)
+    }
+
+    async fn worker_executor_for_store(
+        provider: Arc<RecordingWorkerProvider>,
+        store: Arc<SessionStoreV2>,
+        inbox: Arc<dyn SessionInboxPort>,
+    ) -> BambooRuntimeExecutor {
+        let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(LockedSessionStore::new(storage.clone()));
         let metrics = MetricsCollector::spawn(
-            Arc::new(SqliteMetricsStorage::new(temp.path().join("metrics.db"))),
+            Arc::new(SqliteMetricsStorage::new(
+                store.bamboo_home_dir().join("metrics.db"),
+            )),
             7,
         );
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(NoTools);
@@ -2225,7 +2242,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let executor = BambooRuntimeExecutor {
+        BambooRuntimeExecutor {
             agent,
             session_inbox: inbox.clone(),
             model: Some("test-model".to_string()),
@@ -2245,8 +2262,7 @@ mod tests {
             permission_config: None,
             no_human_review: None,
             child_runner: None,
-        };
-        (temp, executor, store, inbox)
+        }
     }
 
     #[derive(Default)]
@@ -2710,6 +2726,199 @@ mod tests {
             "pathless Glob inspected the wrong directory: {}",
             result.result
         );
+    }
+
+    struct WorkerAckErrorInbox {
+        inner: Arc<dyn SessionInboxPort>,
+        fail_once: std::sync::atomic::AtomicBool,
+        after_receipt: bool,
+    }
+
+    #[async_trait]
+    impl SessionInboxPort for WorkerAckErrorInbox {
+        async fn deliver(
+            &self,
+            envelope: &SessionMessageEnvelope,
+        ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
+            self.inner.deliver(envelope).await
+        }
+
+        async fn mark_activation_eligible(
+            &self,
+            target: &str,
+            generation: u64,
+            policy: bamboo_domain::SessionActivationPolicy,
+        ) -> Result<(), bamboo_domain::SessionInboxError> {
+            self.inner
+                .mark_activation_eligible(target, generation, policy)
+                .await
+        }
+
+        async fn claim(
+            &self,
+            target: &str,
+            limit: usize,
+        ) -> Result<Vec<bamboo_domain::SessionInboxClaim>, bamboo_domain::SessionInboxError>
+        {
+            self.inner.claim(target, limit).await
+        }
+
+        async fn was_admitted(
+            &self,
+            target: &str,
+            id: &SessionMessageId,
+        ) -> Result<bool, bamboo_domain::SessionInboxError> {
+            self.inner.was_admitted(target, id).await
+        }
+
+        async fn ack(
+            &self,
+            target: &str,
+            claim: &bamboo_domain::SessionInboxClaim,
+        ) -> Result<(), bamboo_domain::SessionInboxError> {
+            let fail = self
+                .fail_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            if !fail || self.after_receipt {
+                self.inner.ack(target, claim).await?;
+            }
+            if fail {
+                return Err(bamboo_domain::SessionInboxError::Storage(
+                    "injected ACK I/O error at /private/internal-inbox-path".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn inspect(
+            &self,
+            target: &str,
+        ) -> Result<bamboo_domain::SessionInboxBacklog, bamboo_domain::SessionInboxError> {
+            self.inner.inspect(target).await
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_startup_ack_stops_worker_before_provider_and_confirmation() {
+        for after_receipt in [false, true] {
+            let provider = Arc::new(RecordingWorkerProvider::default());
+            let (temp, unused_executor, store, real_inbox) =
+                worker_protocol_fixture(provider.clone()).await;
+            drop(unused_executor);
+            let faulted: Arc<dyn SessionInboxPort> = Arc::new(WorkerAckErrorInbox {
+                inner: real_inbox.clone(),
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+                after_receipt,
+            });
+            let executor =
+                worker_executor_for_store(provider.clone(), store.clone(), faulted).await;
+            let id = format!("startup-ack-stop-{after_receipt}");
+            let original = delivery(&id, "startup-input", "durable once", 7, "activation-one");
+            let (outcome, confirmations) = execute_protocol_run(
+                &executor,
+                protocol_run(&id, "activation-one", vec![original.clone()]),
+            )
+            .await;
+            assert_eq!(
+                outcome.status,
+                bamboo_subagent::proto::TerminalStatus::Error
+            );
+            let error = outcome.error.unwrap();
+            assert!(error.contains(
+                "SessionInbox ACK unresolved; durable input is preserved; retry this activation"
+            ));
+            assert!(!error.contains("/private/internal-inbox-path"));
+            assert!(confirmations.is_empty());
+            assert!(provider.calls.lock().unwrap().is_empty());
+            let durable = store.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                durable
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        bamboo_domain::is_matching_session_message(message, &original.envelope)
+                    })
+                    .count(),
+                1
+            );
+            assert!(durable
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&original.envelope.id));
+            assert_eq!(
+                real_inbox
+                    .was_admitted(&id, &original.envelope.id)
+                    .await
+                    .unwrap(),
+                after_receipt
+            );
+            assert_eq!(
+                real_inbox.inspect(&id).await.unwrap().claimed,
+                usize::from(!after_receipt)
+            );
+            drop(executor);
+
+            // Reopen the actual filesystem store and run the real checked worker
+            // startup again with the same envelope and a new activation owner.
+            let reopened = Arc::new(
+                SessionStoreV2::new(temp.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                reopened.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let retry_provider = Arc::new(RecordingWorkerProvider::default());
+            let retry_executor =
+                worker_executor_for_store(retry_provider.clone(), reopened.clone(), inbox.clone())
+                    .await;
+            let mut retry = original.clone();
+            retry.activation_run_id = "activation-two".into();
+            let (outcome, confirmations) = execute_protocol_run(
+                &retry_executor,
+                protocol_run(&id, "activation-two", vec![retry]),
+            )
+            .await;
+            assert_eq!(
+                outcome.status,
+                bamboo_subagent::proto::TerminalStatus::Completed,
+                "{outcome:?}"
+            );
+            assert_eq!(confirmations.len(), 1);
+            assert_eq!(confirmations[0].envelope_id, "startup-input");
+            assert_eq!(confirmations[0].activation_run_id, "activation-two");
+            {
+                let calls = retry_provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0]
+                        .iter()
+                        .filter(|message| {
+                            bamboo_domain::is_matching_session_message(message, &original.envelope)
+                        })
+                        .count(),
+                    1
+                );
+            }
+            let durable = reopened.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                durable
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        bamboo_domain::is_matching_session_message(message, &original.envelope)
+                    })
+                    .count(),
+                1
+            );
+            assert!(inbox
+                .was_admitted(&id, &original.envelope.id)
+                .await
+                .unwrap());
+            let backlog = inbox.inspect(&id).await.unwrap();
+            assert_eq!(backlog.pending + backlog.claimed, 0);
+        }
     }
 
     #[tokio::test]
