@@ -6023,6 +6023,7 @@ mod tests {
         assert!(mismatched.event(&changed).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn owned_initial_release_requires_current_prefix_ack_and_same_receipt() {
         let temp = tempfile::tempdir().unwrap();
@@ -6144,15 +6145,41 @@ mod tests {
             .was_admitted(&child.id, &envelope.id)
             .await
             .unwrap());
-        // Block the actual durable ACK destination after the checkpoint.
+        // Keep receipt lookup readable so Already reaches the real ACK write.
+        // Unix root can bypass these modes; this FS fault needs an unprivileged user.
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePermissions(std::path::PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
         let admitted = store
             .bamboo_home_dir()
             .join(store.resolve_rel_path(&child.id).await.unwrap())
             .join("inbox/admitted");
-        if admitted.exists() {
-            std::fs::remove_dir_all(&admitted).unwrap();
-        }
-        std::fs::write(&admitted, b"physical ACK failure").unwrap();
+        std::fs::create_dir_all(&admitted).unwrap();
+        let restore = RestorePermissions(
+            admitted.clone(),
+            std::fs::metadata(&admitted).unwrap().permissions(),
+        );
+        std::fs::set_permissions(&admitted, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let verified = activation
+            .input_inbox
+            .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                fence: activation.fence.clone(),
+                expected_created_at: child.created_at,
+                claim: claim.clone(),
+                expected_messages: child.messages.clone(),
+                expected_provider_transcript: child.provider_transcript.clone(),
+                expected_admission: child.session_inbox_admission().cloned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            verified.status,
+            bamboo_storage::ActorInputCheckpointStatus::AlreadyCheckpointed
+        );
         let error = activation
             .release_initial_input(
                 &binding,
@@ -6166,8 +6193,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("ACK unresolved"));
-        std::fs::remove_file(admitted).unwrap();
+        std::fs::set_permissions(&admitted, restore.1.clone()).unwrap();
+        drop(restore);
+        assert!(
+            error.to_string().contains("ACK unresolved"),
+            "actual release error (<=512B): {}",
+            error.to_string().chars().take(128).collect::<String>()
+        );
         let release = activation
             .release_initial_input(
                 &binding,
