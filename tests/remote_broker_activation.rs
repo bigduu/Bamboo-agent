@@ -248,6 +248,22 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
             {
                 break;
             }
+            // A deliberately held retry suspends its parent until cancellation.
+            if op == 1
+                && p.hold.load(Ordering::SeqCst)
+                && root.last_run_status().as_deref() == Some("suspended")
+                && root
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|s| s.waiting_for_children.as_ref())
+                    .is_some_and(|wait| {
+                        wait.registered_by_tool_call_id.as_deref()
+                            == Some(format!("remote-op-{number}").as_str())
+                            && wait.child_session_ids == vec![p.ids.lock().unwrap()[target].clone()]
+                    })
+            {
+                break;
+            }
             assert_ne!(
                 root.last_run_status().as_deref(),
                 Some("error"),
