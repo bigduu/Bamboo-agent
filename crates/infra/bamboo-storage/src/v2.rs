@@ -47,6 +47,11 @@ use bamboo_domain::{
 
 mod actor_directory;
 mod actor_input;
+// A private observation port, deliberately without an acting caller.
+#[allow(dead_code)]
+mod canonical_birth_census;
+#[cfg(test)]
+mod canonical_birth_census_tests;
 pub(crate) use actor_input::ActorInputGuards;
 pub use actor_input::{
     ActorInputCheckpoint, ActorInputCheckpointError, ActorInputCheckpointResult,
@@ -1122,6 +1127,8 @@ pub struct SessionStoreV2 {
     migration_scan_pause: std::sync::Mutex<Option<startup_sidecar_tests::ScanPause>>,
     #[cfg(test)]
     task_write_hook: std::sync::Mutex<Option<Arc<task_publication_lifetime_tests::TaskWriteHook>>>,
+    #[cfg(test)]
+    census_read_hook: std::sync::Mutex<Option<Arc<canonical_birth_census_tests::ReadHook>>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1440,6 +1447,8 @@ impl SessionStoreV2 {
             migration_scan_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             task_write_hook: std::sync::Mutex::new(task_write_hook),
+            #[cfg(test)]
+            census_read_hook: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store

@@ -4,7 +4,7 @@
 use super::*;
 use bamboo_domain::SessionAuthorityConflict;
 
-const ROOT_REVOCATIONS_DIR: &str = ".root-revocations";
+pub(super) const ROOT_REVOCATIONS_DIR: &str = ".root-revocations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RootPublicationFault {
@@ -17,6 +17,23 @@ struct RootRevocation {
     version: u32,
     session_id: String,
     revoked_through: DateTime<Utc>,
+}
+
+/// Stricter opt-in observation; existing writer and async reader stay unchanged.
+pub(super) fn census_revocation(bytes: &[u8], id: &str) -> io::Result<DateTime<Utc>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Closed {
+        version: u32,
+        session_id: String,
+        revoked_through: DateTime<Utc>,
+    }
+    let value: Closed =
+        serde_json::from_slice(bytes).map_err(|_| invalid("invalid census revocation"))?;
+    if value.version != 1 || value.session_id != id {
+        return Err(invalid("census revocation identity or version mismatch"));
+    }
+    Ok(value.revoked_through)
 }
 
 #[derive(Deserialize)]
