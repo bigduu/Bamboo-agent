@@ -3462,7 +3462,7 @@ fn local_tool_history_unsupported() -> AgentError {
 #[derive(Default)]
 struct LocalToolCollector {
     messages: Option<Vec<bamboo_agent_core::Message>>,
-    starts: HashMap<String, String>,
+    starts: HashMap<String, (String, serde_json::Value)>,
     outcomes: HashMap<String, (bool, String)>,
 }
 
@@ -3488,14 +3488,18 @@ impl LocalToolCollector {
             AgentEvent::ToolStart {
                 tool_call_id,
                 tool_name,
-                ..
+                arguments,
             } => {
-                if !matches!(tool_name.as_str(), "Read" | "Glob" | "Write")
+                if !arguments.is_object()
+                    || !matches!(tool_name.as_str(), "Read" | "Glob" | "Write")
                     || tool_call_id.is_empty()
                     || tool_call_id.len() > 128
                     || self.starts.len() >= LocalToolMessages::MAX_PAIRS
                     || self.outcomes.contains_key(&tool_call_id)
-                    || self.starts.insert(tool_call_id, tool_name).is_some()
+                    || self
+                        .starts
+                        .insert(tool_call_id, (tool_name, arguments))
+                        .is_some()
                 {
                     return Err(local_tool_history_unsupported());
                 }
@@ -3530,7 +3534,7 @@ impl LocalToolCollector {
                 phase,
                 ..
             } => {
-                if self.starts.get(&tool_call_id) != Some(&tool_name)
+                if self.starts.get(&tool_call_id).map(|(name, _)| name) != Some(&tool_name)
                     || is_mutating != (tool_name == "Write")
                     || auto_approved != (tool_name != "Write")
                     || !matches!(phase.as_str(), "begin" | "finished" | "error" | "cancelled")
@@ -3626,16 +3630,20 @@ impl LocalToolCollector {
                             return Err(local_tool_history_unsupported());
                         }
                         for call in batch {
+                            let arguments =
+                                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                    .ok()
+                                    .filter(|arguments| arguments.is_object())
+                                    .ok_or_else(local_tool_history_unsupported)?;
                             if call.id.is_empty()
                                 || call.id.len() > 128
                                 || call.tool_type != "function"
                                 || !calls.insert(call.id.clone())
                                 || calls.len() > LocalToolMessages::MAX_MESSAGES
                                 || !matches!(call.function.name.as_str(), "Read" | "Glob" | "Write")
-                                || !serde_json::from_str::<serde_json::Value>(
-                                    &call.function.arguments,
-                                )
-                                .is_ok_and(|arguments| arguments.is_object())
+                                || self.starts.get(&call.id).is_some_and(|(name, actual)| {
+                                    name != &call.function.name || actual != &arguments
+                                })
                             {
                                 return Err(local_tool_history_unsupported());
                             }
@@ -3674,7 +3682,9 @@ impl LocalToolCollector {
                         {
                             return Err(local_tool_history_unsupported());
                         }
-                    } else if !tools.contains(&name) || self.starts.get(id) != Some(&name) {
+                    } else if !tools.contains(&name)
+                        || self.starts.get(id).map(|(actual, _)| actual) != Some(&name)
+                    {
                         return Err(local_tool_history_unsupported());
                     }
                     if let Some(metadata) = &message.metadata {
@@ -5926,6 +5936,7 @@ mod tests {
             "terminal",
             "tool_metadata",
             "grant",
+            "start_arguments",
             "ledger",
         ] {
             let (mut collector, _) = local_tool_sample(&host, false);
@@ -5952,6 +5963,10 @@ mod tests {
                     messages[host.messages.len()].tool_calls.as_mut().unwrap()[0]
                         .function
                         .name = "Bash".into()
+                }
+                "start_arguments" => {
+                    collector.starts.get_mut("local-Read").unwrap().1 =
+                        serde_json::json!({"file_path":"different.txt"})
                 }
                 "ledger" => {
                     current.append_provider_transcript_group(current.messages[0].id.clone(), None, vec![
@@ -5983,6 +5998,14 @@ mod tests {
         assert!(denied
             .suffix(&host, &["Read".into()], true, Some("complete exact report"))
             .is_ok());
+        let (mut contradicted, _) = local_tool_sample(&host, true);
+        contradicted.starts.insert(
+            "local-Write".into(),
+            ("Read".into(), serde_json::json!({"file_path":"answer.txt"})),
+        );
+        assert!(contradicted
+            .suffix(&host, &["Read".into()], true, Some("complete exact report"))
+            .is_err());
         let (successful, _) = local_tool_sample(&host, false);
         assert!(successful
             .suffix(&host, &["Read".into()], true, Some("complete exact report"))
