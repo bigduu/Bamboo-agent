@@ -2667,7 +2667,33 @@ mod tests {
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{case}: initial release request: {error}"));
+            let cancel_run_path = if case == "cancel" {
+                let cur = broker_temp
+                    .path()
+                    .join("mailboxes/release-physical-worker/cur");
+                let mut captured = None;
+                for entry in std::fs::read_dir(cur).unwrap() {
+                    let path = entry.unwrap().path();
+                    let message: bamboo_subagent::InboxMessage =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    if message.kind == bamboo_subagent::InboxKind::Run {
+                        assert_eq!(message.from.session_id, "release-host");
+                        assert_eq!(message.body, serde_json::to_value(&run).unwrap());
+                        assert!(message.correlation_id.is_none());
+                        assert!(path
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .ends_with(&format!("-{}.json", message.id.as_str())));
+                        assert!(captured.replace(path).is_none(), "one actual Run");
+                    }
+                }
+                Some(captured.expect("cancel must observe its actual unacked Run"))
+            } else {
+                None
+            };
             assert!(
                 saw_posture,
                 "actual audit is ordered before the release request"
@@ -2758,23 +2784,39 @@ mod tests {
             })
             .await
             .unwrap();
-            let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if let Some(ChildFrame::Terminal { status, .. }) =
-                        link.next_frame().await.unwrap()
-                    {
-                        break status;
+            let status = if let Some(path) = cancel_run_path {
+                // Existing Run cancellation suppresses Outcome, but its actual
+                // ACK follows executor completion and descendant-task joins.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while tokio::fs::try_exists(&path).await.unwrap() {
+                        tokio::task::yield_now().await;
                     }
-                }
-            })
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{case}: actual Run ACK: {error}"));
+                assert!(!worker.is_finished(), "cancel settles Run, not worker");
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            if let Some(ChildFrame::Terminal { status, .. }) =
+                                link.next_frame().await.unwrap()
+                            {
+                                break status;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: Terminal: {error}")),
+                )
+            };
             let calls = provider.calls.lock().unwrap().len();
             assert_eq!(calls, usize::from(case == "ack-retry"), "{case}");
             if case == "ack-retry" {
-                assert_eq!(status, bamboo_subagent::TerminalStatus::Completed);
-            } else {
-                assert_ne!(status, bamboo_subagent::TerminalStatus::Completed);
+                assert_eq!(status, Some(bamboo_subagent::TerminalStatus::Completed));
+            } else if case != "cancel" {
+                assert_ne!(status.unwrap(), bamboo_subagent::TerminalStatus::Completed);
             }
             let cold = SessionStoreV2::new(host_temp.path().into())
                 .await
