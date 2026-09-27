@@ -516,7 +516,12 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
                 ActorActivationStatus::Failed
             } else {
                 ActorActivationStatus::Succeeded
-            }
+            },
+            "actual terminal: status={:?}, error={:?}",
+            completed.last_run_status(),
+            completed
+                .last_run_error()
+                .map(|error| error.chars().take(384).collect::<String>())
         );
     } else {
         let observed = store
