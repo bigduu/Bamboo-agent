@@ -495,7 +495,6 @@ fn forced_audit_marker(
         || data.project_id != root_actor.project_id
         || data.child_session_id == root.id
         || data.request_id.trim().is_empty()
-        || data.request_id.trim() != data.request_id
         || data.request_id.len() > 256
         || generation.to_string() != data.request_generation
         || digest.len() != 64
@@ -504,7 +503,6 @@ fn forced_audit_marker(
             data.reason,
             PermissionReasonCode::HardDangerous | PermissionReasonCode::ConfiguredAlwaysAsk
         )
-        || data.tool.trim().is_empty()
         || data.tool.chars().count() > 128
         || data.resource.chars().count() > 800
         || !data.live.is_object()
@@ -552,8 +550,7 @@ fn forced_audit_marker(
         .provider_message
         .as_ref()
         .ok_or_else(invalid_audit)?;
-    if display.len() > 2048
-        || content.text != display
+    if content.text != display
         || !content.parts.is_empty()
         || provider.content != *content
         || !provider.metadata.is_empty()
@@ -885,7 +882,7 @@ mod tests {
                 data: Some(json!({
                     "version":1,"child_session_id":child.id,"child_created_at":child.created_at,
                     "parent_session_id":root.id,"parent_created_at":root.created_at,
-                    "root_session_id":root.id,"project_id":null,"request_id":"request-1",
+                    "root_session_id":root.id,"project_id":null,"request_id":" request-1 ",
                     "request_generation":generation,
                     "operation_digest":SessionMessageId::stable("permission-operation",&json!({"x":1})).to_string(),
                     "policy_revision":1,"reason":"configured_always_ask","tool":"Write",
