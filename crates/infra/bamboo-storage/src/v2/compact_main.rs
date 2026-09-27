@@ -281,6 +281,45 @@ struct ProjectMetadata {
     #[serde(default)]
     project_id: Option<String>,
 }
+
+/// Census-only ordinary identity and raw Project, without compatibility trimming.
+pub(super) fn census_project(bytes: &[u8]) -> io::Result<Option<bamboo_domain::ProjectId>> {
+    let fields: MainFields<'_> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    if fields.duplicate {
+        return Err(invalid());
+    }
+    if let Some(raw) = fields.values.get("authority_identity") {
+        let identity: UniqueValue = serde_json::from_str(raw.get()).map_err(|_| invalid())?;
+        if identity.0 != serde_json::json!({"kind":"ordinary"}) {
+            return Err(invalid());
+        }
+    }
+    let metadata: ProjectMetadata = fields
+        .values
+        .get("metadata")
+        .map(|value| serde_json::from_str::<ProjectMetadata>(value.get()).map_err(|_| invalid()))
+        .transpose()?
+        .unwrap_or_default();
+    let runtime: Option<ProjectMetadata> = fields
+        .values
+        .get("runtime_metadata")
+        .map(|value| {
+            serde_json::from_str::<Option<ProjectMetadata>>(value.get()).map_err(|_| invalid())
+        })
+        .transpose()?
+        .flatten();
+    runtime
+        .and_then(|value| value.project_id)
+        .or(metadata.project_id)
+        .map(|raw| {
+            let project = bamboo_domain::ProjectId::parse(raw.clone()).map_err(|_| invalid())?;
+            if project.as_str() != raw {
+                return Err(invalid());
+            }
+            Ok(project)
+        })
+        .transpose()
+}
 struct FlatAuthority;
 impl FlatAuthority {
     fn from_fields(fields: &BTreeMap<String, &RawValue>) -> io::Result<CompactMainAuthority> {

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bamboo_domain::{
     ActorActivation, ActorActivationClaim, ActorActivationFence, ActorActivationFinish,
     ActorActivationStatus, ActorAncestorObservation, ActorDirectoryEntry, ActorDirectoryError,
-    ActorDirectoryPort, ActorLogicalState, ActorSession,
+    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,28 @@ struct ActorInitializedMarker {
     schema_version: u32,
     actor_id: String,
     session_created_at: DateTime<Utc>,
+}
+
+/// Pure census validation only; never initialize, refresh or claim an Actor.
+pub(super) fn validate_census_witnesses(
+    record: &[u8],
+    marker: &[u8],
+    session: &Session,
+    project: Option<&ProjectId>,
+) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid census Actor witness");
+    let record: ActorDirectoryEntry = serde_json::from_slice(record).map_err(|_| invalid())?;
+    let marker: ActorInitializedMarker = serde_json::from_slice(marker).map_err(|_| invalid())?;
+    if record.validate().is_err()
+        || !record.actor.matches_session(session)
+        || record.actor.project_id.as_deref() != project.map(ProjectId::as_str)
+        || marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+        || marker.actor_id != session.id
+        || marker.session_created_at != session.created_at
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn storage(error: io::Error) -> ActorDirectoryError {
