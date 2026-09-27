@@ -33,7 +33,7 @@ struct Probe {
     replay: bool,
 }
 fn call(args: Value) -> Value {
-    json!({"tool_calls":[{"index":0,"id":format!("subagent-{}",args["action"]),"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]})
+    json!({"tool_calls":[{"index":0,"id":format!("subagent-{}",args["action"].as_str().unwrap()),"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]})
 }
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
