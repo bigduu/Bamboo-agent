@@ -712,7 +712,14 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                     )
                 }
                 3 => {
-                    assert!(!handoff_tool(&body, "implementer-correct").starts_with("Error:"));
+                    assert!(
+                        !handoff_tool(&body, "implementer-correct").starts_with("Error:"),
+                        "actual implementer-correct result: {}",
+                        handoff_tool(&body, "implementer-correct")
+                            .chars()
+                            .take(512)
+                            .collect::<String>()
+                    );
                     (
                         json!({"content":handoff_report("completed", "Narrow correction applied", "answer.txt now contains answer=42").to_string()}),
                         "stop",
