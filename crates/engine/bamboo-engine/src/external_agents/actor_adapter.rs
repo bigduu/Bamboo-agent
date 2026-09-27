@@ -23,7 +23,8 @@ use bamboo_domain::poison::PoisonRecover;
 use bamboo_domain::{
     ActorActivationClaim, ActorActivationFence, ActorActivationFinish, ActorDirectoryPort,
     ActorLogicalState, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal, HookResult,
-    SessionInboxClaim,
+    SessionInboxClaim, SessionInboxConsumerId, SessionInboxLeaseRequest, SessionInboxOwnedClaim,
+    SessionInboxPort,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -2040,7 +2041,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     session,
                     session_inbox_runtime.as_ref().unwrap(),
                     bound_activation_run_id.as_deref(),
-                    &actor.mailbox_id,
+                    self.permission_config.clone(),
                 )
                 .await;
                 match started {
@@ -2061,33 +2062,30 @@ impl ExternalChildRunner for ActorChildRunner {
             }
             let mut logical_identity = logical_identity_for_actor_run(session, job);
             logical_identity.creation = creation.clone();
-            if let Err(e) = client
-                .send(ParentFrame::Run(RunSpec {
-                    // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
-                    assignment: assignment.clone(),
-                    logical_session: Some(logical_identity),
-                    project_id: project_id.clone(),
-                    // Creation/update already resolves the child's explicit
-                    // selection and own role preference into this field. Do
-                    // not infer effort from a possibly inherited model_ref.
-                    reasoning_effort: if !remote
-                        && matches!(self.executor, ExecutorSpec::BambooRuntime)
-                    {
-                        session
-                            .reasoning_effort
-                            .map(|effort| effort.as_str().to_owned())
-                    } else {
-                        None
-                    },
-                    permission_policy: permission_policy.clone(),
-                    messages,
-                    activation_run_id: bound_activation_run_id.clone(),
-                    execution_epoch,
-                    initial_session_messages,
-                    secrets: run_secrets.clone(),
-                }))
-                .await
-            {
+            let run_spec = RunSpec {
+                // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
+                assignment: assignment.clone(),
+                logical_session: Some(logical_identity),
+                project_id: project_id.clone(),
+                // Creation/update already resolves the child's explicit
+                // selection and own role preference into this field. Do
+                // not infer effort from a possibly inherited model_ref.
+                reasoning_effort: if !remote && matches!(self.executor, ExecutorSpec::BambooRuntime)
+                {
+                    session
+                        .reasoning_effort
+                        .map(|effort| effort.as_str().to_owned())
+                } else {
+                    None
+                },
+                permission_policy: permission_policy.clone(),
+                messages,
+                activation_run_id: bound_activation_run_id.clone(),
+                execution_epoch,
+                initial_session_messages,
+                secrets: run_secrets.clone(),
+            };
+            if let Err(e) = client.send(ParentFrame::Run(run_spec.clone())).await {
                 if let (Some(binding), Some(run_id)) = (
                     session_inbox_runtime.as_ref(),
                     bound_activation_run_id.as_deref(),
@@ -2145,6 +2143,13 @@ impl ExternalChildRunner for ActorChildRunner {
                 // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
                 // on a fixed remote endpoint).
                 plain_actor: plain_activation.is_some(),
+                plain_input: plain_activation.as_ref(),
+                // BrokerChildLink replaces the actual correlation for each Run;
+                // direct legacy WS Terminal frames carry no such identity.
+                plain_run: self
+                    .bus
+                    .as_ref()
+                    .map(|_| (&run_spec, &self.next_execution_epoch)),
                 first_frame_timeout: Some(WORKER_FIRST_FRAME_TIMEOUT),
             })
             .await;
@@ -2219,34 +2224,8 @@ impl ExternalChildRunner for ActorChildRunner {
         if let Some(activation) = plain_activation {
             return match result {
                 Ok(Some(text)) if !text.is_empty() => {
-                    let message = bamboo_agent_core::Message::assistant(text, None);
-                    let committed = activation
-                        .store
-                        .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
-                            fence: activation.fence.clone(),
-                            expected_created_at: activation.created_at,
-                            expected_messages: activation.messages.clone(),
-                            expected_provider_transcript: activation.provider_transcript.clone(),
-                            messages: vec![message.clone()],
-                            native_groups: Vec::new(),
-                        })
-                        .await;
-                    match committed {
-                        Ok(committed) => {
-                            // Adopt exactly what the final guarded writer committed.
-                            // Later ordinary CP saves cannot fabricate this reply.
-                            *session = committed;
-                            let _ = event_tx
-                                .send(AgentEvent::MessageAppended {
-                                    session_id: session.id.clone(),
-                                    message_id: message.id,
-                                    role: message.role,
-                                    content: message.content,
-                                    created_at: message.created_at,
-                                })
-                                .await;
-                            activation.finish(ActorActivationFinish::Succeeded).await
-                        }
+                    match activation.append_reply(session, text, &event_tx).await {
+                        Ok(()) => activation.finish(ActorActivationFinish::Succeeded).await,
                         Err(error) => {
                             // OutcomeUnconfirmed is an error, never ordinary-save fallback.
                             let _ = activation.finish(ActorActivationFinish::Failed).await;
@@ -2289,16 +2268,20 @@ impl ExternalChildRunner for ActorChildRunner {
 
 // v1 opts in only a fresh zero-tool named Child of a durable Ultra Root.
 // A terminal String is a plain projection, not the worker's hidden native ledger.
-// No lease renewal/reclaim, steering, remote activation or continuation is enabled.
+// Only bounded typed corrections to this Running activation are enabled.
+// No lease renewal/reclaim, raw steering, remote activation or restart is enabled.
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
     fence: ActorActivationFence,
     created_at: chrono::DateTime<chrono::Utc>,
-    messages: Vec<bamboo_agent_core::Message>,
     provider_transcript: bamboo_domain::ProviderTranscriptState,
+    input_consumer: SessionInboxConsumerId,
+    input_deadline: chrono::DateTime<chrono::Utc>,
+    input_inbox: bamboo_storage::FileSessionInbox,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
 }
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports one fresh plain reply only; start a new Child for continuation or steering. Durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports one fresh plain activation and at most one bounded typed correction while Running; start a new Child for later continuation. Durable history is preserved.".into())
 }
 impl PlainActorActivation {
     // Callee-side boxing keeps this storage chain out of the already large
@@ -2308,7 +2291,7 @@ impl PlainActorActivation {
         session: &'a Session,
         binding: &'a SessionInboxRuntimeBinding,
         run_id: Option<&'a str>,
-        owner: &'a str,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Self, AgentError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -2340,11 +2323,12 @@ impl PlainActorActivation {
             let expires = now
                 .checked_add_signed(duration)
                 .ok_or_else(plain_actor_unsupported)?;
+            let input_consumer = SessionInboxConsumerId::new();
             let claimed = store
                 .claim_activation(&ActorActivationClaim {
                     actor_id: session.id.clone(),
                     run_id: run_id.into(),
-                    lease_owner: owner.into(),
+                    lease_owner: input_consumer.as_str().into(),
                     lease_expires_at: expires,
                     inbox_generation: 0,
                     placement_ref: None,
@@ -2352,12 +2336,19 @@ impl PlainActorActivation {
                 })
                 .await
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
+            let input_inbox = bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
             let activation = Self {
                 store,
                 fence: claimed.fence(),
                 created_at: session.created_at,
-                messages: session.messages.clone(),
                 provider_transcript: session.provider_transcript.clone(),
+                input_consumer,
+                input_deadline: expires.min(now + chrono::Duration::hours(1)),
+                input_inbox,
+                permission_config,
             };
             if let Err(error) = activation
                 .store
@@ -2369,6 +2360,216 @@ impl PlainActorActivation {
             }
             Ok(activation)
         })
+    }
+    fn append_reply<'a>(
+        &'a self,
+        session: &'a mut Session,
+        text: String,
+        event_tx: &'a mpsc::Sender<AgentEvent>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let message = bamboo_agent_core::Message::assistant(text, None);
+            *session = self
+                .store
+                .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
+                    fence: self.fence.clone(),
+                    expected_created_at: self.created_at,
+                    expected_messages: session.messages.clone(),
+                    expected_provider_transcript: self.provider_transcript.clone(),
+                    messages: vec![message.clone()],
+                    native_groups: Vec::new(),
+                })
+                .await
+                .map_err(|error| AgentError::LLM(format!("actor reply commit failed: {error}")))?;
+            let _ = event_tx
+                .send(AgentEvent::MessageAppended {
+                    session_id: session.id.clone(),
+                    message_id: message.id,
+                    role: message.role,
+                    content: message.content,
+                    created_at: message.created_at,
+                })
+                .await;
+            Ok(())
+        })
+    }
+    // First Terminal is a real completed plain reply, not a cache event. Commit
+    // it before appending the typed correction, then use the existing startup
+    // admission barrier on a second correlated Run under the SAME Host fence.
+    fn continue_input<'a>(
+        &'a self,
+        client: &'a mut dyn bamboo_subagent::ChildLink,
+        binding: &'a SessionInboxRuntimeBinding,
+        session: &'a mut Session,
+        run_id: &'a str,
+        run: Option<(&'a RunSpec, &'a AtomicU64)>,
+        expected_posture: &'a mut Option<ExpectedPermissionPosture>,
+        text: String,
+        event_tx: &'a mpsc::Sender<AgentEvent>,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                    Output = Result<Option<(SessionInboxOwnedClaim, u64)>, AgentError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if !self
+                .input_inbox
+                .inspect(&session.id)
+                .await
+                .map_err(|_| plain_actor_unsupported())?
+                .activation_pending()
+            {
+                return Ok(None);
+            }
+            if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
+                return Err(plain_actor_unsupported());
+            }
+            let now = chrono::Utc::now();
+            if now >= self.input_deadline {
+                return Err(plain_actor_unsupported());
+            }
+            let lease = SessionInboxLeaseRequest {
+                consumer: self.input_consumer.clone(),
+                now,
+                duration: self.input_deadline - now,
+            };
+            let claim = self
+                .input_inbox
+                .claim_owned(&session.id, 1, Some(run_id), &lease)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "Actor correction claim unconfirmed");
+                    AgentError::LLM(
+                        "Actor correction claim unconfirmed; durable input is preserved".into(),
+                    )
+                })?
+                .into_iter()
+                .next();
+            let Some(claim) = claim else {
+                return Ok(None);
+            };
+            let (run, epochs) = run.ok_or_else(plain_actor_unsupported)?;
+            // Narrow text-only admission before touching the canonical Main.
+            if !matches!(&claim.claim.envelope.body,
+                bamboo_domain::SessionMessageBody::Content(content)
+                if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
+            {
+                return Err(plain_actor_unsupported());
+            }
+            self.append_reply(session, text, event_tx).await?;
+            // The worker receives this committed prefix; the following User is
+            // carried by typed delivery, without the Host-private bookkeeper.
+            let messages = session
+                .messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| plain_actor_unsupported())?;
+            let committed = self.input_inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                fence: self.fence.clone(), expected_created_at: self.created_at,
+                claim: claim.clone(), expected_messages: session.messages.clone(),
+                expected_provider_transcript: session.provider_transcript.clone(),
+                expected_admission: session.session_inbox_admission().cloned(),
+            }).await.map_err(|error| {
+                tracing::warn!(%error, "Actor correction checkpoint rejected or unconfirmed; no worker dispatch or ACK");
+                AgentError::LLM("Actor correction checkpoint unconfirmed; durable Inbox and history are preserved".into())
+            })?;
+            // Never fabricate or merge a candidate after the actual final writer.
+            *session = committed.session;
+            // The first Run allocated a new Host audit. Bind the second Run to
+            // this actual checkpoint readback, never the old dispatch witness.
+            self.refresh_continuation_posture(session, run, expected_posture)?;
+            let delivery = SessionMessageDelivery {
+                target_session_id: session.id.clone(),
+                envelope: committed.envelope,
+                canonical_claim_generation: committed.generation,
+                activation_run_id: run_id.into(),
+                activation_policy: claim.claim.activation_policy,
+            };
+            let epoch = epochs
+                .fetch_add(1, Ordering::Relaxed)
+                .checked_add(1)
+                .ok_or_else(plain_actor_unsupported)?;
+            let mut next = run.clone();
+            next.messages = messages;
+            next.initial_session_messages = vec![delivery];
+            next.execution_epoch = epoch;
+            client.send(ParentFrame::Run(next)).await.map_err(|_| {
+                AgentError::LLM(
+                    "Actor correction dispatch unconfirmed; durable input is preserved".into(),
+                )
+            })?;
+            Ok(Some((claim, epoch)))
+        })
+    }
+    fn refresh_continuation_posture(
+        &self,
+        session: &Session,
+        run: &RunSpec,
+        expected: &mut Option<ExpectedPermissionPosture>,
+    ) -> Result<(), AgentError> {
+        let Some(expected) = expected.as_mut() else {
+            return Err(plain_actor_unsupported());
+        };
+        let audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+            .ok_or_else(plain_actor_unsupported)?;
+        if audit.policy_revision != expected.policy_revision
+            || audit.resolution != expected.resolution
+            || audit.executor_mapping != expected.executor_mapping
+        {
+            return Err(plain_actor_unsupported());
+        }
+        match (&self.permission_config, &run.permission_policy) {
+            (Some(config), Some(policy)) => {
+                ensure_no_active_scoped_session_denies(config, &session.id)?;
+                if config.policy_revision() != policy.revision
+                    || policy.revision != audit.policy_revision
+                    || policy.session_id != session.id
+                    || policy.workspace_path != session.workspace
+                    || policy.inherit_session_grants
+                    || serde_json::to_value(config.to_serializable())
+                        .map_err(|_| plain_actor_unsupported())?
+                        != policy.policy
+                {
+                    return Err(plain_actor_unsupported());
+                }
+            }
+            (None, None) => {}
+            _ => return Err(plain_actor_unsupported()),
+        }
+        expected.expected_audit_revision = Some(audit.audit_revision);
+        Ok(())
+    }
+    async fn confirm_input(
+        &self,
+        binding: &SessionInboxRuntimeBinding,
+        session: &Session,
+        run_id: &str,
+        claim: &SessionInboxOwnedClaim,
+        confirmation: &bamboo_subagent::proto::SessionMessageAdmissionConfirmation,
+    ) -> Result<(), AgentError> {
+        if confirmation.target_session_id != session.id
+            || confirmation.envelope_id != claim.claim.envelope.id.as_str()
+            || confirmation.canonical_claim_generation != claim.claim.generation
+            || confirmation.activation_run_id != run_id
+            || run_id != self.fence.run_id
+            || !binding.router.owns_run(&session.id, run_id).await
+        {
+            return Err(plain_actor_unsupported());
+        }
+        self.input_inbox
+            .ack_owned(&session.id, claim, chrono::Utc::now())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "Actor correction ACK unresolved");
+                AgentError::LLM(
+                    "Actor correction ACK unresolved; durable input is preserved".into(),
+                )
+            })
     }
     async fn finish(&self, outcome: ActorActivationFinish) -> Result<(), AgentError> {
         self.store
@@ -2809,6 +3010,8 @@ struct ActorDriveContext<'a> {
     expected_source_actor_id: &'a str,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     plain_actor: bool,
+    plain_input: Option<&'a PlainActorActivation>,
+    plain_run: Option<(&'a RunSpec, &'a AtomicU64)>,
     first_frame_timeout: Option<Duration>,
 }
 
@@ -3566,7 +3769,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         live_rx,
         delivery_rx,
         logical_session,
-        expected_permission_posture,
+        mut expected_permission_posture,
         expected_creation,
         session_inbox_runtime,
         activation_run_id,
@@ -3575,6 +3778,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         initial_inflight_claims,
         first_frame_timeout,
         plain_actor,
+        plain_input,
+        plain_run,
     } = context;
 
     // First-frame watchdog: a live worker emits its first frame (run-started /
@@ -3586,6 +3791,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut got_first_frame = false;
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     let mut inflight_claims = initial_inflight_claims;
+    let mut owned_input: Option<SessionInboxOwnedClaim> = None;
+    let mut continued = false;
+    let mut current_epoch = execution_epoch;
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
@@ -3611,7 +3819,11 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
             Some(_generation) = delivery_rx.recv(),
                 if session_inbox_runtime.is_some() && activation_run_id.is_some() =>
             {
-                if plain_actor { return Err(plain_actor_unsupported()); }
+                if plain_input.is_some() {
+                    // Keep the real Inbox pending until this Run's completed
+                    // reply can be committed BEFORE its correction User.
+                    continue;
+                }
                 forward_next_canonical_claim(
                     client,
                     session_inbox_runtime.expect("guarded"),
@@ -3660,7 +3872,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             logical_session,
                             parent_session_id,
                             activation_run_id,
-                            execution_epoch,
+                            current_epoch,
                             expected_source_actor_id,
                             expected_creation,
                         )?;
@@ -3821,7 +4033,14 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         }
                     }
                     Ok(Some(ChildFrame::SessionMessageAdmitted { confirmation })) => {
-                        if plain_actor { return Err(plain_actor_unsupported()); }
+                        if let Some(activation) = plain_input {
+                            let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
+                            let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
+                            let claim = owned_input.as_ref().ok_or_else(plain_actor_unsupported)?;
+                            activation.confirm_input(binding, logical_session, run_id, claim, &confirmation).await?;
+                            owned_input = None;
+                            continue;
+                        }
                         let Some(binding) = session_inbox_runtime else {
                             tracing::warn!(
                                 child_session_id,
@@ -3896,11 +4115,39 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     .to_string(),
                             ));
                         }
+                        if owned_input.is_some() {
+                            return Err(AgentError::LLM("Actor terminated before confirming its durable correction; Inbox claim is retained".into()));
+                        }
                         if let Some(claim) = inflight_claims.front() {
                             return Err(AgentError::LLM(format!(
                                 "actor terminated before durably admitting SessionInbox message {}; canonical claim remains recoverable",
                                 claim.envelope.id
                             )));
+                        }
+                        if let Some(activation) = plain_input {
+                            if status == TerminalStatus::Completed {
+                                let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
+                                let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
+                                if !continued {
+                                    if let Some((claim, epoch)) = activation.continue_input(
+                                        client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
+                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?, event_tx,
+                                    ).await? {
+                                        owned_input = Some(claim);
+                                        continued = true;
+                                        current_epoch = epoch;
+                                        // These are native coordinates scoped to the newly
+                                        // correlated epoch. Public Host feed seq is untouched.
+                                        next_actor_event_seq = 1;
+                                        permission_handshake = PermissionPostureHandshake::new(expected_permission_posture.as_ref());
+                                        display = ActorEventDisplay::default();
+                                        continue;
+                                    }
+                                } else if activation.input_inbox.inspect(&logical_session.id).await
+                                    .map_err(|_| plain_actor_unsupported())?.activation_pending() {
+                                    return Err(AgentError::LLM("Only one Actor correction continuation is supported; remaining Inbox input is preserved".into()));
+                                }
+                            }
                         }
                         return match status {
                             TerminalStatus::Completed => Ok(result),
@@ -4709,6 +4956,263 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn owned_actor_input_checkpoint_precedes_dispatch_and_exact_ack() {
+        for reject_checkpoint in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let parent = Session::new("owned-input-parent", "model");
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                Session::new_child_of("owned-input-child", &parent, "model", "one plain task");
+            store.save_session(&child).await.unwrap();
+            let raw_storage: Arc<dyn Storage> = store.clone();
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(raw_storage));
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let binding = actor_binding(store.clone(), inbox, locked);
+            let run_id = "owned-input-run";
+            let _registration = binding
+                .router
+                .register_run(&child.id, run_id)
+                .await
+                .unwrap();
+            let activation =
+                PlainActorActivation::start(store.clone(), &child, &binding, Some(run_id), None)
+                    .await
+                    .unwrap();
+            let envelope =
+                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "CORRECTION_ONCE");
+            let receipt = activation.input_inbox.deliver(&envelope).await.unwrap();
+            activation
+                .input_inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let mut link = ConfirmationSequenceLink {
+                frames: VecDeque::new(),
+                sent: Vec::new(),
+            };
+            let run = RunSpec {
+                assignment: "one plain task".into(),
+                logical_session: None,
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![],
+                activation_run_id: Some(run_id.into()),
+                execution_epoch: 1,
+                initial_session_messages: vec![],
+                secrets: Default::default(),
+            };
+            let epochs = AtomicU64::new(1);
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut expected = Some(expected_default_permission_posture(7));
+            let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+                unreachable!()
+            };
+            process_actor_event(
+                event,
+                true,
+                &mut PermissionPostureHandshake::Awaiting,
+                expected.as_ref(),
+                Some(&binding),
+                &mut child,
+                &tx,
+                &mut ActorEventDisplay::default(),
+            )
+            .await
+            .unwrap();
+            rx.recv().await.unwrap();
+            let first_audit =
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                    .unwrap()
+                    .audit_revision;
+            if reject_checkpoint {
+                // A real bounded publication channel blocks AFTER first-reply
+                // commit, so change actual Actor authority before checkpoint.
+                tx.send(AgentEvent::Complete {
+                    usage: Default::default(),
+                })
+                .await
+                .unwrap();
+            }
+            let mut operation = activation.continue_input(
+                &mut link,
+                &binding,
+                &mut child,
+                run_id,
+                Some((&run, &epochs)),
+                &mut expected,
+                "FIRST_PLAIN_REPLY".into(),
+                &tx,
+            );
+            if reject_checkpoint {
+                tokio::select! {
+                    result = &mut operation => panic!("publication barrier released early: {result:?}"),
+                    _ = async {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                let actual = store.load_session("owned-input-child").await.unwrap().unwrap();
+                                if actual.messages.iter().any(|m| m.content == "FIRST_PLAIN_REPLY") { break; }
+                                tokio::task::yield_now().await;
+                            }
+                        }).await.unwrap();
+                        activation.finish(ActorActivationFinish::Failed).await.unwrap();
+                        rx.recv().await.unwrap();
+                    } => {}
+                }
+            }
+            let result = operation.await;
+            if reject_checkpoint {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("checkpoint unconfirmed"));
+                assert!(
+                    link.sent.is_empty(),
+                    "zero worker/provider correction dispatch"
+                );
+                let durable = store.load_session(&child.id).await.unwrap().unwrap();
+                assert!(durable
+                    .messages
+                    .iter()
+                    .any(|m| m.content == "FIRST_PLAIN_REPLY"));
+                assert!(!durable
+                    .messages
+                    .iter()
+                    .any(|m| m.id == envelope.id.as_str()));
+                assert!(!activation
+                    .input_inbox
+                    .was_admitted(&child.id, &envelope.id)
+                    .await
+                    .unwrap());
+                assert_eq!(
+                    activation
+                        .input_inbox
+                        .inspect(&child.id)
+                        .await
+                        .unwrap()
+                        .claimed,
+                    1
+                );
+                continue;
+            }
+            let (claim, epoch) = result.unwrap().unwrap();
+            rx.recv().await.unwrap(); // Actual first-reply publication.
+            assert_eq!(epoch, 2);
+            assert_eq!(link.sent.len(), 1);
+            let ParentFrame::Run(next) = &link.sent[0] else {
+                panic!("correlated continuation Run")
+            };
+            assert_eq!(next.execution_epoch, 2);
+            assert_eq!(next.activation_run_id.as_deref(), Some(run_id));
+            assert!(next
+                .messages
+                .iter()
+                .any(|m| m["content"] == "FIRST_PLAIN_REPLY"));
+            assert!(!next
+                .messages
+                .iter()
+                .any(|m| m["id"] == envelope.id.as_str()));
+            let delivery = &next.initial_session_messages[0];
+            assert_eq!(delivery.envelope, envelope);
+            let durable = store.load_session(&child.id).await.unwrap().unwrap();
+            assert!(durable
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&envelope.id));
+            assert_eq!(
+                durable
+                    .messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            assert!(
+                !activation
+                    .input_inbox
+                    .was_admitted(&child.id, &envelope.id)
+                    .await
+                    .unwrap(),
+                "checkpoint is not a worker admission receipt"
+            );
+            let mut confirmation = admission_confirmation(&child.id, &claim.claim, run_id);
+            confirmation.canonical_claim_generation += 1;
+            assert!(activation
+                .confirm_input(&binding, &child, run_id, &claim, &confirmation)
+                .await
+                .is_err());
+            assert!(!activation
+                .input_inbox
+                .was_admitted(&child.id, &envelope.id)
+                .await
+                .unwrap());
+            confirmation.canonical_claim_generation = claim.claim.generation;
+            activation
+                .confirm_input(&binding, &child, run_id, &claim, &confirmation)
+                .await
+                .unwrap();
+            assert!(activation
+                .input_inbox
+                .was_admitted(&child.id, &envelope.id)
+                .await
+                .unwrap());
+            assert_eq!(
+                expected.as_ref().unwrap().expected_audit_revision,
+                Some(first_audit)
+            );
+            let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+                unreachable!()
+            };
+            process_actor_event(
+                event,
+                true,
+                &mut PermissionPostureHandshake::Awaiting,
+                expected.as_ref(),
+                Some(&binding),
+                &mut child,
+                &tx,
+                &mut ActorEventDisplay::default(),
+            )
+            .await
+            .unwrap();
+            rx.recv().await.unwrap();
+            assert!(
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                    .unwrap()
+                    .audit_revision
+                    > first_audit
+            );
+            let reopened = bamboo_storage::SessionStoreV2::new(temp.path().into())
+                .await
+                .unwrap();
+            let cold = reopened.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            assert!(cold
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&envelope.id));
+        }
+    }
+
     fn admission_confirmation(
         session_id: &str,
         claim: &SessionInboxClaim,
@@ -4943,6 +5447,8 @@ mod tests {
             expected_source_actor_id: session_id,
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            plain_input: None,
+            plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
         .await;
@@ -6143,6 +6649,8 @@ mod tests {
             expected_source_actor_id: session_id,
             initial_inflight_claims: claims,
             plain_actor: false,
+            plain_input: None,
+            plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
         .await
@@ -7122,6 +7630,8 @@ mod tests {
                 expected_source_actor_id: "child-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                plain_input: None,
+                plain_run: None,
                 first_frame_timeout: None,
             }),
         )
@@ -7188,6 +7698,8 @@ mod tests {
                 expected_source_actor_id: "child-no-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                plain_input: None,
+                plain_run: None,
                 first_frame_timeout: None,
             }),
         )
@@ -7251,6 +7763,8 @@ mod tests {
             expected_source_actor_id: "child-x",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            plain_input: None,
+            plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(100)),
         })
         .await;
@@ -7292,6 +7806,8 @@ mod tests {
             expected_source_actor_id: "child-y",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            plain_input: None,
+            plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(50)),
         })
         .await;
