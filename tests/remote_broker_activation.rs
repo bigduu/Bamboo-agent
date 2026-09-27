@@ -139,25 +139,14 @@ async fn response(body: web::Json<Value>, p: web::Data<Probe>) -> HttpResponse {
                 .unwrap()["content"]
                 .as_str()
                 .unwrap();
-            if p.operation.load(Ordering::SeqCst) == 0 {
-                let result: Value = serde_json::from_str(content).unwrap_or_else(|e| {
-                    panic!(
-                        "create: {e}: {}",
-                        content.chars().take(512).collect::<String>()
-                    )
-                });
-                p.ids
-                    .lock()
-                    .unwrap()
-                    .push(result["actor_id"].as_str().unwrap().into());
-            } else if p.operation.load(Ordering::SeqCst) == 3 {
+            if p.operation.load(Ordering::SeqCst) == 3 {
                 assert!(
                     content.contains("REMOTE_NATIVE_REPLY"),
                     "{}",
                     content.chars().take(512).collect::<String>()
                 );
                 assert!(!content.contains("remote-worker") && !content.contains(HOST));
-            } else {
+            } else if p.operation.load(Ordering::SeqCst) != 0 {
                 assert!(!content.contains("SubAgent operation failed"), "{content}");
             }
             (
@@ -241,26 +230,52 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let root = cold(&p.data, "remote-root").await;
+            let call_id = format!("remote-op-{number}");
+            let result = matches!(op, 0 | 1)
+                .then(|| {
+                    root.messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.tool_call_id.as_deref() == Some(&call_id))
+                        .map(|m| {
+                            serde_json::from_str::<Value>(&m.content)
+                                .expect("actual durable SubAgent tool result")
+                        })
+                })
+                .flatten();
+            if let Some(result) = result {
+                let actor = result["actor_id"].as_str().expect("actual logical ActorId");
+                let mut ids = p.ids.lock().unwrap();
+                if op == 0 {
+                    if !ids.iter().any(|id| id == actor) {
+                        ids.push(actor.into());
+                    }
+                } else {
+                    assert_eq!(actor, ids[target]);
+                }
+                // Held spawn/retry may suspend with a merged, untagged sibling wait.
+                if p.hold.load(Ordering::SeqCst)
+                    && root.last_run_status().as_deref() == Some("suspended")
+                    && root
+                        .agent_runtime_state
+                        .as_ref()
+                        .and_then(|s| s.waiting_for_children.as_ref())
+                        .is_some_and(|wait| {
+                            wait.child_session_ids.iter().any(|id| id == actor)
+                                && wait.child_session_ids.iter().all(|id| ids.contains(id))
+                                && wait
+                                    .registered_by_tool_call_id
+                                    .as_ref()
+                                    .is_none_or(|id| id == &call_id)
+                        })
+                {
+                    break;
+                }
+            }
             if root
                 .messages
                 .iter()
                 .any(|m| m.content == format!("REMOTE_ROOT_DONE_{number}"))
-            {
-                break;
-            }
-            // A deliberately held retry suspends its parent until cancellation.
-            if op == 1
-                && p.hold.load(Ordering::SeqCst)
-                && root.last_run_status().as_deref() == Some("suspended")
-                && root
-                    .agent_runtime_state
-                    .as_ref()
-                    .and_then(|s| s.waiting_for_children.as_ref())
-                    .is_some_and(|wait| {
-                        wait.registered_by_tool_call_id.as_deref()
-                            == Some(format!("remote-op-{number}").as_str())
-                            && wait.child_session_ids == vec![p.ids.lock().unwrap()[target].clone()]
-                    })
             {
                 break;
             }
