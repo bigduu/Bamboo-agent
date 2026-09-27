@@ -2067,8 +2067,6 @@ async fn message_only_fixture() {
         .unwrap();
     let agents = projects.paths().project_home(&project.id).join("agents");
     std::fs::create_dir_all(&agents).unwrap();
-    // Ordinary catalog input bounds the existing zero-tool route. The caller
-    // supplies neither a role nor a resolved permission/profile binding.
     std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n").unwrap();
     let probe = web::Data::new(MessageOnlyProbe {
         root_calls: AtomicUsize::new(0),
@@ -2145,7 +2143,6 @@ async fn message_only_fixture() {
         .status()
         .is_success());
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
-    let root_settled = AtomicBool::new(false);
     let parent = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
@@ -2163,7 +2160,6 @@ async fn message_only_fixture() {
                 .unwrap()
                 .iter()
                 .any(|r| r["id"] == "plain-root" && r["is_running"] == false);
-            root_settled.store(settled, Ordering::SeqCst);
             if settled
                 && parent.last_run_status().as_deref() == Some("suspended")
                 && parent
@@ -2184,26 +2180,14 @@ async fn message_only_fixture() {
         }
     })
     .await;
-    let parent = match parent {
-        Ok(parent) => parent,
-        Err(_) => {
-            let current = store.load_session("plain-root").await.unwrap().unwrap();
-            let log = std::fs::read_to_string(data.join("host.log")).unwrap_or_default();
-            panic!(
-                "message-only held-cut timeout: {}",
-                json!({
-                    "root_status":current.last_run_status(),
-                    "root_error":current.last_run_error().map(|e| bounded_diagnostic(&e, 512).to_owned()),
-                    "root_settled":root_settled.load(Ordering::SeqCst),
-                    "child_ready":probe.child_ready.load(Ordering::SeqCst),
-                    "root_calls":probe.root_calls.load(Ordering::SeqCst),
-                    "child_calls":probe.child_calls.load(Ordering::SeqCst),
-                    "tool_result_count":current.messages.iter().filter(|m| m.tool_call_id.as_deref() == Some(MESSAGE_ONLY_CALL)).count(),
-                    "host_log":bounded_diagnostic(&log, 2048)
-                })
-            );
-        }
-    };
+    let parent = parent.unwrap_or_else(|_| {
+        panic!(
+            "message-only held-cut timeout: root_calls={}, child_calls={}, child_ready={}",
+            probe.root_calls.load(Ordering::SeqCst),
+            probe.child_calls.load(Ordering::SeqCst),
+            probe.child_ready.load(Ordering::SeqCst)
+        )
+    });
     let result = message_only_root_result(&parent, false);
     let id = result["actor_id"].as_str().unwrap().to_owned();
     let wait = parent
@@ -2235,19 +2219,6 @@ async fn message_only_fixture() {
     assert_eq!(binding["root_id"], "plain-root");
     assert_eq!(binding["model"], "plain-child");
     assert_eq!(binding["tools"], json!([]));
-    assert_eq!(
-        before
-            .messages
-            .iter()
-            .filter(|m| m.role == bamboo_domain::Role::User)
-            .map(|m| m.content.matches(MESSAGE_ONLY_TASK).count())
-            .sum::<usize>(),
-        1
-    );
-    assert!(!before
-        .messages
-        .iter()
-        .any(|m| m.role == bamboo_domain::Role::Assistant));
     let child_requests: Vec<_> = probe
         .requests
         .lock()
@@ -2257,20 +2228,50 @@ async fn message_only_fixture() {
         .cloned()
         .collect();
     assert_eq!(child_requests.len(), 1);
-    assert_eq!(
-        child_requests[0]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|m| m["role"] == "user")
-            .map(|m| m["content"]
+    let user_evidence: Vec<_> = before
+        .messages
+        .iter()
+        .filter(|m| m.role == bamboo_domain::Role::User)
+        .take(8)
+        .map(|m| {
+            (
+                m.id.as_str(),
+                m.content.len(),
+                m.content.matches(MESSAGE_ONLY_TASK).count(),
+                m.content
+                    .find(MESSAGE_ONLY_TASK)
+                    .map(|at| bounded_diagnostic(&m.content[at..], 160)),
+            )
+        })
+        .collect();
+    let provider_user_hits: Vec<_> = child_requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .map(|message| {
+            message["content"]
                 .as_str()
                 .unwrap()
                 .matches(MESSAGE_ONLY_TASK)
-                .count())
+                .count()
+        })
+        .collect();
+    assert_eq!(
+        before
+            .messages
+            .iter()
+            .filter(|m| m.role == bamboo_domain::Role::User)
+            .map(|m| m.content.matches(MESSAGE_ONLY_TASK).count())
             .sum::<usize>(),
-        1
+        1,
+        "users={user_evidence:?}, provider_user_hits={provider_user_hits:?}"
     );
+    assert!(!before
+        .messages
+        .iter()
+        .any(|m| m.role == bamboo_domain::Role::Assistant));
+    assert_eq!(provider_user_hits.iter().sum::<usize>(), 1);
     assert!(
         child_requests[0]["tools"].is_null()
             || child_requests[0]["tools"]
