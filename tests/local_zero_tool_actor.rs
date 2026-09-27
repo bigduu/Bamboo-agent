@@ -49,10 +49,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             wake.await;
         }
         if probe.reasoning {
-            (
-                json!({"reasoning_content":"UNSUPPORTED_NATIVE_REASONING","content":"UNSUPPORTED_REPLY"}),
-                "stop",
-            )
+            (json!({"content":"UNSUPPORTED_REPLY"}), "stop")
         } else {
             (json!({"content":"FENCED_PLAIN_REPLY"}), "stop")
         }
@@ -109,10 +106,20 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     } else {
         (json!({"content":"auxiliary"}), "stop")
     };
+    // The real OpenAI compatibility parser emits ReasoningToken only from a
+    // reasoning-only delta, not a delta that also carries answer content.
+    let reasoning_event = if body["model"] == "plain-child" && probe.reasoning {
+        let reasoning = json!({"id":"plain-actor","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"UNSUPPORTED_NATIVE_REASONING"},"finish_reason":null}]});
+        format!("data: {reasoning}\n\n")
+    } else {
+        String::new()
+    };
     let event = json!({"id":"plain-actor","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
     HttpResponse::Ok()
         .content_type("text/event-stream")
-        .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
+        .body(format!(
+            "{reasoning_event}data: {event}\n\ndata: [DONE]\n\n"
+        ))
 }
 struct Host(Child);
 impl Drop for Host {
