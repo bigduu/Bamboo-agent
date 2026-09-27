@@ -966,70 +966,81 @@ impl SubAgentTool {
                 {
                     return Err(ToolError::InvalidArguments("named_profile_requires_fresh_local_child".into()));
                 }
-                // workspace is optional: default to the parent's workspace.
-                let explicit_workspace = workspace
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                let workspace_was_explicit = explicit_workspace.is_some();
-                let parent_workspace_is_project_default = parent
-                    .metadata
-                    .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
-                    .map(String::as_str)
-                    == Some(
-                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
-                    );
-                let requested_workspace = explicit_workspace
-                    .or_else(|| {
-                        (!parent_workspace_is_project_default)
-                            .then(|| parent.workspace.clone())
-                            .flatten()
-                    })
-                    .unwrap_or_default();
-                let parent_project_id =
-                    match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
-                        bamboo_engine::project_context::SessionProjectIdentity::Assigned(
-                            project_id,
-                        ) => Some(project_id),
-                        bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
-                        bamboo_engine::project_context::SessionProjectIdentity::Invalid {
-                            raw,
-                            message,
-                        } => {
-                            return Err(ToolError::InvalidArguments(format!(
-                                "parent session carries an invalid Project identity '{raw}': {message}"
-                            )));
-                        }
-                    };
-                let workspace_source = if workspace_was_explicit {
-                    bamboo_engine::project_context::WorkspaceSource::Explicit
-                } else if parent_workspace_is_project_default
-                    || (requested_workspace.is_empty() && parent_project_id.is_some())
-                {
-                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                let (workspace, workspace_source) = if compact {
+                    // Chat stores its workspace on the typed metadata plane.
+                    // Use the same canonical resolver as Plan before creation.
+                    self.sessions
+                        .resolve_child_workspace(&parent, workspace.as_deref())
+                        .await
+                        .map_err(tool_error_from_child_session)?
                 } else {
-                    match parent
+                    // workspace is optional: default to the parent's workspace.
+                    let explicit_workspace = workspace
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
+                    let workspace_was_explicit = explicit_workspace.is_some();
+                    let parent_workspace_is_project_default = parent
                         .metadata
                         .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
                         .map(String::as_str)
+                        == Some(
+                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
+                        );
+                    let requested_workspace = explicit_workspace
+                        .or_else(|| {
+                            (!parent_workspace_is_project_default)
+                                .then(|| parent.workspace.clone())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    let parent_project_id =
+                        match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
+                            bamboo_engine::project_context::SessionProjectIdentity::Assigned(
+                                project_id,
+                            ) => Some(project_id),
+                            bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                            bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                                raw,
+                                message,
+                            } => {
+                                return Err(ToolError::InvalidArguments(format!(
+                                    "parent session carries an invalid Project identity '{raw}': {message}"
+                                )));
+                            }
+                        };
+                    let workspace_source = if workspace_was_explicit {
+                        bamboo_engine::project_context::WorkspaceSource::Explicit
+                    } else if parent_workspace_is_project_default
+                        || (requested_workspace.is_empty() && parent_project_id.is_some())
                     {
-                        Some("project_default") => {
-                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                    } else {
+                        match parent
+                            .metadata
+                            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                            .map(String::as_str)
+                        {
+                            Some("project_default") => {
+                                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                            }
+                            _ => bamboo_engine::project_context::WorkspaceSource::Session,
                         }
-                        _ => bamboo_engine::project_context::WorkspaceSource::Session,
-                    }
+                    };
+                    // This must precede resident lookup/cancellation and every
+                    // child/session mutation. Reused residents bypass
+                    // `create_child_action`, while new children and guardians use
+                    // it as a second fail-closed boundary.
+                    let workspace = self
+                        .sessions
+                        .validate_child_workspace(
+                            parent_project_id.as_ref(),
+                            &requested_workspace,
+                        )
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+
+                    (workspace, workspace_source)
                 };
-                // This must precede resident lookup/cancellation and every
-                // child/session mutation. Reused residents bypass
-                // `create_child_action`, while new children and guardians use
-                // it as a second fail-closed boundary.
-                let workspace = self
-                    .sessions
-                    .validate_child_workspace(
-                        parent_project_id.as_ref(),
-                        &requested_workspace,
-                    )
-                    .await
-                    .map_err(tool_error_from_child_session)?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(

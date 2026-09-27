@@ -5911,7 +5911,7 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
         .unwrap()
         .unwrap();
     let workspace = h.workspace_path.to_string_lossy().into_owned();
-    parent.workspace = Some(workspace.clone());
+    parent.workspace = None;
     parent.set_workspace_path_meta(workspace);
     parent.metadata_version += 1;
     h.storage.save_session(&parent).await.unwrap();
