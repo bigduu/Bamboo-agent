@@ -111,7 +111,7 @@ async fn root_tool_result(
                 .json()
                 .await
                 .unwrap();
-            let settled = rows
+            let settled = rows["sessions"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1756,14 +1756,14 @@ async fn finish_two_fixture(
                 .json()
                 .await
                 .unwrap();
-            let row = rows
+            let row = rows["sessions"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["id"] == id)
                 .unwrap();
             let parent = store.load_session("plain-root").await.unwrap().unwrap();
-            let root_settled = rows
+            let root_settled = rows["sessions"]
                 .as_array()
                 .unwrap()
                 .iter()
