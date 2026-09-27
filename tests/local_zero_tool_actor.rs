@@ -215,15 +215,16 @@ async fn observe_two_provider(body: &Value, probe: &Probe, index: usize) {
                 format!("OWNED_REPLY_{i}")
             );
             assert!(child.session_inbox_admission().unwrap().contains(envelope));
+            let admission = serde_json::to_value(child.session_inbox_admission().unwrap()).unwrap();
             assert_eq!(
-                child
-                    .session_inbox_admission()
+                admission["admitted"]
+                    .as_array()
                     .unwrap()
-                    .admitted
                     .iter()
-                    .find(|r| &r.id == envelope)
-                    .unwrap()
-                    .sequence,
+                    .find(|row| row["id"] == envelope.as_str())
+                    .unwrap()["sequence"]
+                    .as_u64()
+                    .unwrap(),
                 *generation
             );
         }
