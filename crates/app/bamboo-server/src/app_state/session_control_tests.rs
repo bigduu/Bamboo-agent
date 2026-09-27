@@ -3,13 +3,16 @@ use super::AppState;
 use crate::tools::ToolSurface;
 use actix_web::{test, web, App};
 use bamboo_agent_core::tools::{
-    ExecutingSupervisorObservation, FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome,
-    ToolSchema,
+    ExecutingSupervisorObservation, FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutor,
+    ToolOutcome, ToolSchema,
 };
 use bamboo_agent_core::{
     Message, PendingQuestion, PendingQuestionSource, Session, ToolExecutionContext, ToolResult,
 };
-use bamboo_domain::{SessionActivationPolicy, SessionMessageEnvelope, SupervisorReference};
+use bamboo_domain::{
+    SessionActivationDisposition, SessionActivationError, SessionActivationPolicy,
+    SessionActivationPort, SessionInboxPort, SessionMessageEnvelope, SupervisorReference,
+};
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMProvider, ProviderRegistry};
 use bamboo_tools::permission::{PermissionDecision, PermissionDecisionKind, PermissionRequest};
@@ -22,6 +25,36 @@ use tokio::sync::Notify;
 const TARGET: &str = "followup-runtime-target";
 const CALL: &str = "target-human-question";
 const STEER: &str = "supervisor followup unique content";
+
+// The messenger enters this port only after FileInbox has published the
+// followup. Delegate the failure to the real router's watermark reader.
+struct WatermarkFailureAfterDelivery {
+    inbox: Arc<dyn SessionInboxPort>,
+    router: Arc<bamboo_engine::SessionActivationRouter>,
+    watermark: std::path::PathBuf,
+    original_bytes: tokio::sync::Mutex<Option<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl SessionActivationPort for WatermarkFailureAfterDelivery {
+    async fn request_activation(
+        &self,
+        target_session_id: &str,
+        inbox_generation: u64,
+    ) -> Result<SessionActivationDisposition, SessionActivationError> {
+        let backlog = self.inbox.inspect(target_session_id).await.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert_eq!(backlog.oldest_generation, Some(inbox_generation));
+        assert!(backlog.activation_pending());
+        let original = tokio::fs::read(&self.watermark).await.unwrap();
+        assert!(self.original_bytes.lock().await.replace(original).is_none());
+        tokio::fs::remove_file(&self.watermark).await.unwrap();
+        tokio::fs::create_dir(&self.watermark).await.unwrap();
+        self.router
+            .request_activation(target_session_id, inbox_generation)
+            .await
+    }
+}
 
 // Fixture-only pause tool for exercising the generic NeedsHuman transport.
 struct FixtureClarification;
@@ -151,6 +184,7 @@ struct Fixture {
     probe: Arc<Probe>,
     reference: SupervisorReference,
     original: Session,
+    followup_tools: Option<Arc<dyn ToolExecutor>>,
 }
 
 impl Fixture {
@@ -240,6 +274,7 @@ impl Fixture {
             probe,
             reference,
             original,
+            followup_tools: None,
         }
     }
 
@@ -293,8 +328,9 @@ impl Fixture {
         ctx = ctx.with_executing_supervisor(
             ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
         );
-        self.state
-            .tools_for(ToolSurface::Root)
+        self.followup_tools
+            .clone()
+            .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root))
             .execute_with_context_outcome(&call, ctx)
             .await
     }
@@ -656,15 +692,33 @@ async fn supervisor_followup_active_to_human_wait_keeps_queued_followup_until_re
 #[actix_web::test]
 async fn supervisor_followup_real_activation_failures_keep_receipt_and_retry_original_input() {
     for failure in ["watermark", "spawner"] {
-        let f = Box::pin(Fixture::new()).await;
+        let mut f = Box::pin(Fixture::new()).await;
         let watermark = f
             .state
             .app_data_dir
             .join("sessions")
             .join(TARGET)
             .join("inbox/activation-generation");
-        if failure == "watermark" {
-            tokio::fs::create_dir_all(&watermark).await.unwrap();
+        let watermark_failure = if failure == "watermark" {
+            let activation = Arc::new(WatermarkFailureAfterDelivery {
+                inbox: f.state.session_inbox.clone(),
+                router: f.state.session_activation_router.clone(),
+                watermark: watermark.clone(),
+                original_bytes: tokio::sync::Mutex::new(None),
+            });
+            let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+                f.state.storage.clone(),
+                f.state.session_inbox.clone(),
+                activation.clone(),
+            ));
+            // The supported overlay preserves the actual Root permission gate
+            // and SessionControlTool receipt/error mapping. Only its activation
+            // phase is decorated; delivery still uses the real FileInbox.
+            f.followup_tools = Some(Arc::new(crate::tools::OverlayToolExecutor::new(
+                f.state.tools_for(ToolSurface::Root),
+                Arc::new(bamboo_server_tools::SessionControlTool::new(messenger)),
+            )));
+            Some(activation)
         } else {
             // The production spawner reports its real uninitialized-root-tool
             // error; do not replace activation with a successful mock counter.
@@ -685,7 +739,8 @@ async fn supervisor_followup_real_activation_failures_keep_receipt_and_retry_ori
                 .session_activation_router
                 .set_spawner(Arc::new(uninitialized))
                 .await;
-        }
+            None
+        };
         let receipt = f.followup("failed-activation", STEER).await;
         assert_eq!(receipt["admitted"], true);
         assert_eq!(receipt["generation"], 1);
@@ -693,21 +748,27 @@ async fn supervisor_followup_real_activation_failures_keep_receipt_and_retry_ori
         let error = receipt["activation_error"].as_str().unwrap();
         assert!(
             error.contains(if failure == "watermark" {
-                "watermark"
+                "read inbox activation generation"
             } else {
                 "root tool surface"
             }),
             "{error}"
         );
         assert!(f.probe.requests.lock().unwrap().is_empty());
-        if failure == "watermark" {
+        if let Some(activation) = watermark_failure {
             tokio::fs::remove_dir(&watermark).await.unwrap();
+            let original = activation.original_bytes.lock().await.take().unwrap();
+            tokio::fs::write(&watermark, original).await.unwrap();
+            f.followup_tools = None;
         } else {
             f.state
                 .session_activation_router
                 .set_spawner(f.state.child_completion_coordinator.clone())
                 .await;
         }
+        let pending = f.state.session_inbox.inspect(TARGET).await.unwrap();
+        assert_eq!(pending.pending, 1);
+        assert!(pending.activation_pending());
         let retry = f.followup("failed-activation", STEER).await;
         assert_eq!(retry["receipt_id"], receipt["receipt_id"]);
         assert_eq!(retry["generation"], receipt["generation"]);
