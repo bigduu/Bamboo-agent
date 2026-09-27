@@ -1310,7 +1310,7 @@ async fn cancelled_run_clears_wait_without_releasing_precommit_scheduler_block()
 }
 
 #[tokio::test]
-async fn cancelled_send_message_clears_wait_without_releasing_precommit_inbox_block() {
+async fn compact_chat_cancellation_clears_wait_without_releasing_precommit_inbox_block() {
     let harness = build_test_harness().await;
     let port = Arc::new(WaitOrderPort::new(
         harness.adapter.clone(),
@@ -1325,8 +1325,7 @@ async fn cancelled_send_message_clears_wait_without_releasing_precommit_inbox_bl
         invoke_completed(
             &tool,
             json!({
-                "action": "send_message",
-                "child_session_id": child_id,
+                "target": child_id,
                 "message": "Do this only if admitted",
             }),
             subagent_test_ctx(&parent_id, "send-message-precommit-cancel"),
@@ -5900,6 +5899,239 @@ fn child_report_fixture() -> serde_json::Value {
         "reported_evidence":[{"description":"Not host verified","reference":"/unreadable/reported/path","sha256":null}],
         "reported_verification":[{"check":"focused check","reported_status":"unknown","details":""}],
         "proposals":[],"blockers":["Need a decision"],"open_decisions":[]})
+}
+
+#[tokio::test]
+async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = h.workspace_path.to_string_lossy().into_owned();
+    parent.workspace = Some(workspace.clone());
+    parent.set_workspace_path_meta(workspace);
+    parent.metadata_version += 1;
+    h.storage.save_session(&parent).await.unwrap();
+    let port = Arc::new(WaitOrderPort::new(h.adapter.clone(), h.storage.clone()));
+    port.expect_wait_on_enqueue.store(false, Ordering::SeqCst);
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port.clone(), h.adapter.clone());
+    let message = "  Analyze this complete task 🪷\n\nPreserve every instruction and the trailing whitespace.  ";
+    let result = invoke_completed(
+        &tool,
+        json!({"message":message}),
+        subagent_test_ctx(&h.parent_session_id, "compact-create"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["actor_id"].as_str().unwrap();
+    assert_eq!(payload["observed_status"], "running_in_background");
+    assert_eq!(
+        port.last_admit_child_id.read().unwrap().as_deref(),
+        Some(child_id)
+    );
+    let child = h.storage.load_session(child_id).await.unwrap().unwrap();
+    assert_eq!(
+        child.parent_session_id.as_deref(),
+        Some(h.parent_session_id.as_str())
+    );
+    assert_eq!(child.metadata["assignment_prompt"], message);
+    assert!(child
+        .messages
+        .iter()
+        .any(|m| m.role == Role::User && m.content.contains(message)));
+    assert_eq!(
+        child.workspace.as_deref(),
+        Some(h.workspace_path.to_str().unwrap())
+    );
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+    assert!(payload.get("child_session_id").is_none());
+    assert!(payload.get("runtime_kind").is_none());
+    let schema = tool.parameters_schema();
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
+    assert!(schema["properties"].get("action").is_none());
+}
+
+#[tokio::test]
+async fn compact_owned_inspection_correction_and_control_keep_one_logical_child() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.metadata.insert(
+        "external.agent_id".into(),
+        "physical-worker-sentinel".into(),
+    );
+    child.set_last_run_error("physical-endpoint-sentinel");
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+    for query in [
+        "overview".to_string(),
+        "messages".to_string(),
+        "result".to_string(),
+        "error".to_string(),
+    ] {
+        let result = invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect", "target":h.child_session_id, "message":query}),
+            subagent_test_ctx(&h.parent_session_id, "compact-inspect"),
+        )
+        .await
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["actor_id"], h.child_session_id);
+        assert!(!result.result.contains("physical-worker-sentinel"));
+        assert!(!result.result.contains("physical-endpoint-sentinel"));
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        if query == "messages" {
+            assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
+            let cursor = payload["next_cursor"].as_str().unwrap();
+            let page = invoke_completed(
+                &h.tool,
+                json!({"intent":"inspect", "target":h.child_session_id,
+                "message":json!({"view":"messages", "cursor":cursor}).to_string()}),
+                subagent_test_ctx(&h.parent_session_id, "compact-page"),
+            )
+            .await
+            .unwrap();
+            let page: serde_json::Value = serde_json::from_str(&page.result).unwrap();
+            assert_eq!(page["messages"][0]["index"], 1);
+            assert_eq!(page["messages"][0]["content_preview"], "initial assignment");
+        }
+        if query == "result" {
+            assert_eq!(payload["text"], "initial answer");
+        }
+    }
+    let legacy = invoke_completed(
+        &h.tool,
+        json!({"action":"get", "child_session_id":h.child_session_id}),
+        subagent_test_ctx(&h.parent_session_id, "legacy-inspect"),
+    )
+    .await
+    .unwrap();
+    let legacy: serde_json::Value = serde_json::from_str(&legacy.result).unwrap();
+    assert_eq!(legacy["child_session_id"], h.child_session_id);
+    assert_eq!(legacy["external_agent_id"], "physical-worker-sentinel");
+
+    let foreign = Session::new("other-root", "gpt-5");
+    h.storage.save_session(&foreign).await.unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id}),
+        subagent_test_ctx(&foreign.id, "foreign-inspect")
+    )
+    .await
+    .is_err());
+    let correction = "  Keep the same child 🪷\nDo not broaden the task.  ";
+    h.activation
+        .force_disposition(SessionActivationDisposition::ActiveNotified);
+    let delivered = invoke_completed(
+        &h.tool,
+        json!({"target":h.child_session_id, "message":correction}),
+        subagent_test_ctx(&h.parent_session_id, "compact-correction"),
+    )
+    .await
+    .unwrap();
+    let delivered: serde_json::Value = serde_json::from_str(&delivered.result).unwrap();
+    assert_eq!(delivered["actor_id"], h.child_session_id);
+    assert_eq!(delivered["observed_status"], "message_delivered_live");
+    let claims = h.session_inbox.claim(&h.child_session_id, 1).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].envelope.id.as_str(),
+        delivered["delivery_message_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        claims[0].envelope.body,
+        bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
+            correction
+        ))
+    );
+
+    let cancelled = invoke_completed(
+        &h.tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"cancel"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-cancel"),
+    )
+    .await
+    .unwrap();
+    let cancelled: serde_json::Value = serde_json::from_str(&cancelled.result).unwrap();
+    assert_eq!(cancelled["actor_id"], h.child_session_id);
+    assert_eq!(cancelled["observed_status"], "completed");
+    let port = Arc::new(WaitOrderPort::new(h.adapter.clone(), h.storage.clone()));
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let retry_tool = SubAgentTool::new(port.clone(), h.adapter.clone());
+    let retried = invoke_completed(
+        &retry_tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"retry"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-retry"),
+    )
+    .await
+    .unwrap();
+    let retried: serde_json::Value = serde_json::from_str(&retried.result).unwrap();
+    assert_eq!(retried["actor_id"], h.child_session_id);
+    assert_eq!(retried["runtime_control"], "waiting_for_children");
+    assert_eq!(
+        port.last_admit_child_id.read().unwrap().as_deref(),
+        Some(h.child_session_id.as_str())
+    );
+    assert_eq!(h.adapter.list_children(&h.parent_session_id).await.len(), 1);
+    assert_eq!(
+        h.storage
+            .load_session(&h.child_session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        child.created_at
+    );
+}
+
+#[tokio::test]
+async fn compact_tree_bounds_owned_observations_without_physical_identity() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    for n in 0..35 {
+        let child = Session::new_child(
+            format!("tree-child-{n}"),
+            h.parent_session_id.clone(),
+            "gpt-5",
+            "Tree child",
+        );
+        h.storage.save_session(&child).await.unwrap();
+    }
+    let foreign = Session::new("foreign-root", "gpt-5");
+    h.storage.save_session(&foreign).await.unwrap();
+    let foreign_child = Session::new_child("foreign-child", foreign.id, "gpt-5", "Not owned");
+    h.storage.save_session(&foreign_child).await.unwrap();
+    let result = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-tree"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["actor_id"], h.parent_session_id);
+    assert_eq!(payload["truncated"], true);
+    let nodes = payload["nodes"].as_array().unwrap();
+    assert!(nodes.len() <= 32);
+    assert_eq!(nodes[0]["actor_id"], h.parent_session_id);
+    assert!(nodes
+        .iter()
+        .skip(1)
+        .all(|node| node["parent_actor_id"] == h.parent_session_id));
+    assert!(nodes
+        .iter()
+        .all(|node| node.get("parent_actor_id").is_some()));
+    assert!(!result.result.contains("foreign-child"));
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
 }
 
 async fn required_result_harness() -> (

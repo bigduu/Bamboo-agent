@@ -23,6 +23,7 @@ pub mod session_control;
 pub mod session_inspector;
 pub mod skill_runtime;
 pub mod sub_agent;
+mod sub_agent_facade;
 pub mod surface;
 
 pub use archive::ArchiveContextTool;
