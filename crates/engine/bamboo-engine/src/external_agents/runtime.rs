@@ -151,6 +151,12 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
             runner.set_session_inbox_runtime(binding.clone());
         }
     }
+
+    fn set_actor_directory_store(&self, store: Option<Arc<bamboo_storage::SessionStoreV2>>) {
+        for runner in &self.runners {
+            runner.set_actor_directory_store(store.clone());
+        }
+    }
 }
 
 /// Build the child runner from the application config.

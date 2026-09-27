@@ -104,6 +104,10 @@ pub trait ExternalChildRunner: Send + Sync {
     /// runners use this to bridge active local/remote/warm workers without a
     /// process-global live-session registry.
     fn set_session_inbox_runtime(&self, _binding: Option<SessionInboxRuntimeBinding>) {}
+
+    /// Optional actual host Store for the local zero-tool named-profile route.
+    /// This does not enable owned Inbox claims or grant authority to custom runners.
+    fn set_actor_directory_store(&self, _store: Option<Arc<bamboo_storage::SessionStoreV2>>) {}
 }
 
 #[derive(Clone)]
