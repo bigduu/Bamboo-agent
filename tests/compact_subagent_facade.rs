@@ -365,8 +365,17 @@ async fn fixture(role: Option<&'static str>) {
             r["messages"].as_array().unwrap().iter().any(|m| {
                 m["content"].as_str().is_some_and(|content| {
                     if role.is_some() {
-                        serde_json::from_str::<Value>(content)
-                            .is_ok_and(|packet| packet["objective"] == TASK)
+                        content.matches("<task-brief>").count() == 1
+                            && content.matches("</task-brief>").count() == 1
+                            && content
+                                .split_once("<task-brief>")
+                                .and_then(|(_, tail)| tail.split_once("</task-brief>"))
+                                .and_then(|(payload, _)| {
+                                    serde_json::from_str::<Value>(payload).ok()
+                                })
+                                .is_some_and(|packet| {
+                                    packet["objective"] == TASK && packet["task_brief"] == TASK
+                                })
                     } else {
                         content.contains(TASK)
                     }
