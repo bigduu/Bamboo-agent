@@ -358,7 +358,7 @@ async fn fixture(role: Option<&'static str>) {
         .any(|m| m.role == Role::Assistant && m.content == "COMPACT_CORRECTION_DONE"));
     assert!(probe.child_calls.load(Ordering::SeqCst) >= 3);
     let requests = probe.requests.lock().unwrap().clone();
-    assert!(requests
+    let matched = requests
         .iter()
         .filter(|r| r["model"] == "compact-child")
         .any(|r| {
@@ -372,7 +372,34 @@ async fn fixture(role: Option<&'static str>) {
                     }
                 })
             })
-        }));
+        });
+    if !matched {
+        // Only fixture-authored User bodies, never full requests/config/secrets.
+        let mut diagnostic = String::new();
+        for request in requests.iter().filter(|r| r["model"] == "compact-child") {
+            for message in request["messages"].as_array().unwrap() {
+                if message["role"] != "user" {
+                    continue;
+                }
+                let content = message["content"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| message["content"].to_string());
+                let line = format!("\nrole=user content={content}");
+                for ch in line.chars().take(4096) {
+                    if diagnostic.len() + ch.len_utf8() > 8192 {
+                        break;
+                    }
+                    diagnostic.push(ch);
+                }
+            }
+        }
+        eprintln!("actual compact-child User wire (bounded): {diagnostic}");
+    }
+    assert!(
+        matched,
+        "actual child provider must receive the complete task"
+    );
     for message in parent
         .messages
         .iter()
