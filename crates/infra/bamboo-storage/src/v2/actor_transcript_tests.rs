@@ -30,7 +30,7 @@ pub(super) struct TranscriptWriteHook {
     changed: Condvar,
 }
 impl TranscriptWriteHook {
-    fn install(
+    pub(super) fn install(
         store: &SessionStoreV2,
         phase: DurableWritePhase,
         fail: bool,
@@ -71,7 +71,7 @@ impl TranscriptWriteHook {
         }
         Ok(())
     }
-    fn entered(&self) {
+    pub(super) fn entered(&self) {
         let latch = self.latch.lock().unwrap();
         let (latch, timeout) = self
             .changed
@@ -82,7 +82,7 @@ impl TranscriptWriteHook {
             "no actual Before/AfterReplace barrier"
         );
     }
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.latch.lock().unwrap().released = true;
         self.changed.notify_all();
     }

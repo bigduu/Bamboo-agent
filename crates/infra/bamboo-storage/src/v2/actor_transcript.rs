@@ -51,7 +51,7 @@ type Result<T> = std::result::Result<T, ActorTranscriptAppendError>;
 
 // Standard serde decoding retains borrowed input spans and rejects duplicate
 // object keys instead of letting a Value/Map silently keep the last identity.
-struct Object<'a>(BTreeMap<String, &'a RawValue>);
+pub(super) struct Object<'a>(pub(super) BTreeMap<String, &'a RawValue>);
 impl<'de> Deserialize<'de> for Object<'de> {
     fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
         struct ObjectVisitor;
@@ -76,16 +76,16 @@ impl<'de> Deserialize<'de> for Object<'de> {
         decoder.deserialize_map(ObjectVisitor)
     }
 }
-fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
+pub(super) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|_| ActorTranscriptAppendError::InvalidSource)
 }
-fn object(raw: &str) -> Result<Object<'_>> {
+pub(super) fn object(raw: &str) -> Result<Object<'_>> {
     decode(raw.as_bytes())
 }
-fn encoded<T: Serialize>(value: &T) -> Result<String> {
+pub(super) fn encoded<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|_| ActorTranscriptAppendError::UnsupportedPayload)
 }
-fn regular_bytes(path: &Path) -> Result<Vec<u8>> {
+pub(super) fn regular_bytes(path: &Path) -> Result<Vec<u8>> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(ActorTranscriptAppendError::InvalidSource);
     }
@@ -99,19 +99,19 @@ struct Marker {
     actor_id: String,
     session_created_at: DateTime<Utc>,
 }
-struct Source {
-    raw: String,
-    side_bytes: Vec<u8>,
+pub(super) struct Source {
+    pub(super) raw: String,
+    pub(super) side_bytes: Vec<u8>,
     record_bytes: Vec<u8>,
     marker_bytes: Vec<u8>,
     proof_bytes: Option<Vec<u8>>,
-    main: Session,
-    side: Session,
-    entry: ActorDirectoryEntry,
+    pub(super) main: Session,
+    pub(super) side: Session,
+    pub(super) entry: ActorDirectoryEntry,
 }
 impl Source {
     // Pure initialized reader: no ensure/inspect/validate_fence transaction.
-    fn read(directory: &Path, id: &str, kind: SessionKind, root: &str) -> Result<Self> {
+    pub(super) fn read(directory: &Path, id: &str, kind: SessionKind, root: &str) -> Result<Self> {
         let raw = String::from_utf8(regular_bytes(&directory.join("session.json"))?)
             .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
         let side_bytes = regular_bytes(&directory.join(RUNTIME_SIDECAR_FILE))?;
@@ -181,7 +181,7 @@ impl Source {
             entry,
         })
     }
-    fn unchanged(&self, other: &Self) -> bool {
+    pub(super) fn unchanged(&self, other: &Self) -> bool {
         self.raw == other.raw
             && self.side_bytes == other.side_bytes
             && self.record_bytes == other.record_bytes
@@ -301,7 +301,7 @@ fn validate_suffix(request: &ActorTranscriptAppend, main: &Session) -> Result<Se
     Ok(candidate)
 }
 
-fn appended_array<T: Serialize>(raw: &str, suffix: &[T]) -> Result<String> {
+pub(super) fn appended_array<T: Serialize>(raw: &str, suffix: &[T]) -> Result<String> {
     let entries: Vec<&RawValue> = decode(raw.as_bytes())?;
     let mut result = raw[..raw.len() - 1].to_string(); // RawValue is exactly the JSON array span.
     for (index, item) in suffix.iter().enumerate() {
@@ -313,7 +313,7 @@ fn appended_array<T: Serialize>(raw: &str, suffix: &[T]) -> Result<String> {
     result.push(']');
     Ok(result)
 }
-fn splice(raw: &str, mut replacements: Vec<(&RawValue, String)>) -> Result<String> {
+pub(super) fn splice(raw: &str, mut replacements: Vec<(&RawValue, String)>) -> Result<String> {
     replacements.sort_by_key(|(span, _)| std::cmp::Reverse(span.get().as_ptr() as usize));
     let mut output = raw.to_string();
     for (span, replacement) in replacements {

@@ -64,6 +64,9 @@ pub(super) enum InboxAuthority {
     Lifecycle {
         _guard: crate::v2::SessionLifecycleReadGuard,
     },
+    Actor {
+        _guard: Arc<crate::v2::ActorInputGuards>,
+    },
     Supervisor {
         _guard: crate::v2::SupervisorFollowupGuard,
     },
@@ -82,14 +85,14 @@ pub(super) type FilesystemHook = Arc<dyn Fn(&str, &Path) -> std::io::Result<()> 
 
 /// Private mutation capability: constructed only from the actual acquired guards.
 #[derive(Clone)]
-pub(super) struct OwnedFilesystem {
+pub(crate) struct OwnedFilesystem {
     guards: Arc<OwnedGuards>,
     #[cfg(test)]
     hook: Option<FilesystemHook>,
 }
 
 impl OwnedFilesystem {
-    async fn job<T: Send + 'static>(
+    pub(crate) async fn job<T: Send + 'static>(
         &self,
         event: &'static str,
         path: &Path,
@@ -694,6 +697,76 @@ impl FileSessionInbox {
             result.push(Self::owned_claim(wrapper, generation, name, lease, target)?);
         }
         Ok(result)
+    }
+
+    // Called only inside a complete std job that owns the actual joint guard.
+    // Existing v3 decoder/caps and lease identity remain the authority.
+    pub(crate) fn locked_input_claim(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        now: DateTime<Utc>,
+    ) -> Result<(SessionMessageEnvelope, Option<SessionInboxActivationIntent>), SessionInboxError>
+    {
+        use std::io::Read;
+        let storage = |error: std::io::Error| SessionInboxError::Storage(error.to_string());
+        let read = |path: &Path| -> Result<Vec<u8>, SessionInboxError> {
+            let file = File::open(path).map_err(storage)?;
+            let limit = self.max_transport_bytes();
+            if !file.metadata().map_err(storage)?.is_file() {
+                return Err(invalid("invalid owned input file"));
+            }
+            let mut bytes = Vec::new();
+            file.take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(storage)?;
+            if bytes.len() > limit {
+                return Err(invalid("Inbox lease transport exceeds byte limit"));
+            }
+            Ok(bytes)
+        };
+        Self::validate_claim_name(&claim.claim.claim_id)?;
+        let activation: VersionedActivationWatermark =
+            serde_json::from_slice(&read(&dir.join(ACTIVATION_GENERATION_FILE))?)
+                .map_err(|_| invalid("invalid owned activation watermark"))?;
+        let interrupt: VersionedActivationWatermark =
+            serde_json::from_slice(&read(&dir.join(INTERRUPT_GENERATION_FILE))?)
+                .map_err(|_| invalid("invalid owned interrupt watermark"))?;
+        if activation.version != 3
+            || activation.interrupt_snapshot.is_none()
+            || interrupt.version != 3
+        {
+            return Err(invalid("owned input requires v3 watermarks"));
+        }
+        let (wrapper, stored) =
+            Self::decode_owned_wrapper(&read(&dir.join("cur").join(&claim.claim.claim_id))?)?;
+        let stored = stored.ok_or_else(|| invalid("Inbox lease missing"))?;
+        let intent = Self::activation_intent(&wrapper.body)?;
+        if !stored.same_identity(&claim.lease)
+            || stored.policy != claim.claim.activation_policy
+            || stored.token.expires_at <= now
+            || Self::owned_name(claim.claim.generation, &stored.token) != claim.claim.claim_id
+            || !Self::eligible(claim.claim.generation, activation.generation, intent)
+        {
+            return Err(invalid("Inbox claim lost, expired or ineligible"));
+        }
+        let actual = Self::owned_claim(
+            wrapper,
+            claim.claim.generation,
+            claim.claim.claim_id.clone(),
+            stored,
+            target,
+        )?;
+        if actual.claim != claim.claim {
+            return Err(invalid("Inbox claim mismatch"));
+        }
+        match std::fs::symlink_metadata(Self::admitted_path(dir, &actual.claim.envelope.id)) {
+            Ok(_) => return Err(invalid("Inbox claim is already terminal")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+        }
+        Ok((actual.claim.envelope, intent))
     }
 
     async fn current_owned(
