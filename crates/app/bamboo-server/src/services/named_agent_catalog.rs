@@ -48,7 +48,7 @@ pub(crate) async fn discover_for_session(
     global: std::path::PathBuf,
     limits: NamedAgentLimits,
 ) -> Result<ScopedNamedAgentCatalog, CatalogError> {
-    let project_id = match ProjectContextResolver::session_project_identity(&session) {
+    let project_id = match ProjectContextResolver::session_project_identity(session) {
         SessionProjectIdentity::Unassigned => None,
         SessionProjectIdentity::Assigned(id) => Some(id),
         SessionProjectIdentity::Invalid { .. } => return Err(CatalogError::ProjectUnavailable),
