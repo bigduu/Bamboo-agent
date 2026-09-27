@@ -109,7 +109,7 @@ async fn provider_host_phase(probe: &Probe) -> Value {
         .ok()
         .map(|state| state.generation);
     json!({"actor":actor,"last_run_status":child.as_ref().and_then(|c| c.last_run_status()),
-        "last_run_error":child.as_ref().and_then(|c| c.last_run_error()).map(|e| bounded_diagnostic(&e, 512)),
+        "last_run_error":child.as_ref().and_then(|c| c.last_run_error()).map(|e| bounded_diagnostic(&e, 512).to_owned()),
         "inbox_generation":generation})
 }
 fn print_bounded_retry_log(data: &Path) {
@@ -866,6 +866,28 @@ async fn fixture(
         probe.release.store(true, Ordering::SeqCst);
         probe.wake.notify_waiters();
         let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
+        let parent_done = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                if probe.root_calls.load(Ordering::SeqCst) >= 4
+                    && parent.last_run_status().as_deref() == Some("completed")
+                    && parent.messages.last().is_some_and(|m| {
+                        m.role == bamboo_domain::Role::Assistant && m.content == "ROOT_DONE"
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            parent_done.is_ok(),
+            "actual Parent ROOT_DONE timeout (calls={}): {}",
+            probe.root_calls.load(Ordering::SeqCst),
+            bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
+        );
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
         drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
         drop(fault);
         probe.release.store(false, Ordering::SeqCst);
