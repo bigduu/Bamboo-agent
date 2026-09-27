@@ -10,7 +10,7 @@ use bamboo_subagent::{
     AgentRef, BusEndpoint, ProvisionSpec,
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::{
     io::Write,
@@ -98,8 +98,8 @@ async fn response(body: web::Json<Value>, p: web::Data<Probe>) -> HttpResponse {
             return HttpResponse::Ok()
                 .content_type("text/event-stream")
                 .streaming(
-                    futures_util::stream::once(async { Ok::<_, std::io::Error>(first) })
-                        .chain(futures_util::stream::once(async move {
+                    futures::stream::once(async { Ok::<_, std::io::Error>(first) })
+                        .chain(futures::stream::once(async move {
                             while p.hold.load(Ordering::SeqCst) {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
