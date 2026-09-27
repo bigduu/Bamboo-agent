@@ -395,7 +395,7 @@ pub(super) fn build_root_tools(
     // Intentional same-name overlay replacement: Root keeps every privileged
     // cross-session action while Base/Child expose only current-Session reads.
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
-        session_store,
+        session_store.clone(),
         storage,
     ));
     let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
@@ -416,10 +416,10 @@ pub(super) fn build_root_tools(
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools_with_control,
-                Arc::new(crate::tools::AskAgentTool::new(
-                    b.endpoint.clone(),
-                    b.token.clone(),
-                )),
+                Arc::new(
+                    crate::tools::AskAgentTool::new(b.endpoint.clone(), b.token.clone())
+                        .with_deployments(fabric_deployer.registry(), session_store.clone()),
+                ),
             ));
             // deploy_agent shares the fabric deployer's registry, so its
             // list/stop covers cluster-deployed workers too (and vice versa).
@@ -428,13 +428,16 @@ pub(super) fn build_root_tools(
             let with_deploy: Arc<dyn ToolExecutor> =
                 Arc::new(crate::tools::OverlayToolExecutor::new(
                     with_ask,
-                    Arc::new(crate::tools::DeployAgentTool::new(
-                        b.endpoint,
-                        b.token,
-                        bamboo_bin,
-                        fabric_deployer.registry(),
-                        config.clone(),
-                    )),
+                    Arc::new(
+                        crate::tools::DeployAgentTool::new(
+                            b.endpoint,
+                            b.token,
+                            bamboo_bin,
+                            fabric_deployer.registry(),
+                            config.clone(),
+                        )
+                        .with_actor_store(session_store),
+                    ),
                 ));
             // `cluster`: progressive-disclosure inventory (list/describe/status)
             // + dispatch (deploy/stop) via the SAME shared deploy engine.
