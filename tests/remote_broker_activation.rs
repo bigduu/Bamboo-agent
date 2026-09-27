@@ -270,14 +270,8 @@ async fn wait_calls(p: &Probe, count: usize) {
     .expect("actual resident provider admission");
 }
 async fn host(data: &Path, config: &Value, mode: &str) -> (Process, String) {
-    let mut candidate = serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
-    bamboo_config::persist_provider_credential_transaction(
-        data,
-        &mut candidate,
-        &std::collections::BTreeSet::from(["openai".to_owned()]),
-    )
-    .unwrap();
-    candidate.save_to_dir(data.to_path_buf()).unwrap();
+    let candidate = serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
+    candidate.save_subagents_to_dir(data).unwrap();
     let bind: std::net::SocketAddr = address().parse().unwrap();
     let base = format!("http://{bind}/api/v1");
     let mut c = command(data);
@@ -506,6 +500,18 @@ async fn fixture() {
         "defaults":{"chat":{"provider":"openai","model":"remote-root"},"subagent_models":{"worker":{"provider":"openai","model":"remote-child"}}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":2,"remote_placements":[{"role":ROLE,"endpoint":url,
             "token_env":"BAMBOO_REMOTE_HOST_TOKEN","ca_cert_file":cert,"broker_peer":{"parent_mailbox":"remote-parent","parent_role":"host","worker_mailbox":"remote-worker","worker_role":"worker"}}]}});
+    // Initialize provider/defaults once; restarts update only the selected route.
+    {
+        let mut candidate =
+            serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
+        bamboo_config::persist_provider_credential_transaction(
+            &data,
+            &mut candidate,
+            &std::collections::BTreeSet::from(["openai".to_owned()]),
+        )
+        .unwrap();
+        candidate.save_to_dir(data.clone()).unwrap();
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
