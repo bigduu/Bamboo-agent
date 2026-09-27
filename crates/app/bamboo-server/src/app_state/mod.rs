@@ -526,6 +526,7 @@ pub(crate) use config_runtime::ConfigSectionMutationError;
 pub(crate) use config_runtime::CredentialBackedResetCommit;
 pub mod init;
 pub mod parent_approval_reviewer;
+mod parent_permission_outcome;
 mod parent_permission_request;
 mod persistence;
 mod project_watcher;

@@ -3,7 +3,8 @@
 use bamboo_agent_core::{storage::Storage, Session};
 use bamboo_domain::{
     ActorSession, SessionKind, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+    SessionMessageId, SessionMessageKind, SessionMessageSource, SessionProviderMessage,
+    SessionRuntimeInstruction,
 };
 use bamboo_subagent::proto::LogicalSessionIdentity;
 use bamboo_tools::permission::{PermissionReasonCode, PermissionRequest, PermissionType};
@@ -182,7 +183,11 @@ pub(super) fn envelope(
             instruction: "direct_parent_forced_permission_request_v1".into(),
             content: Some(SessionMessageContent::text(display.clone())),
             data: Some(data),
-            provider_message: None,
+            provider_message: Some(SessionProviderMessage {
+                content: SessionMessageContent::text(display.clone()),
+                metadata: Default::default(),
+                never_compress: true,
+            }),
         }),
         created_at: chrono::Utc::now(),
         thread_id: None,

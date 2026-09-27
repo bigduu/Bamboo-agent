@@ -24,6 +24,12 @@ enum Case {
     Legacy,
     Archived,
     ForcedApproval,
+    ForcedApprove,
+}
+impl Case {
+    fn forced(self) -> bool {
+        matches!(self, Self::ForcedApproval | Self::ForcedApprove)
+    }
 }
 struct Probe {
     case: Case,
@@ -36,6 +42,9 @@ struct Probe {
     release_child: AtomicBool,
     child_ready: tokio::sync::Notify,
     reviews: AtomicUsize,
+    original_wait: Mutex<Option<Value>>,
+    rearmed: AtomicBool,
+    review_release: tokio::sync::Notify,
 }
 fn call(name: &str, args: Value) -> (Value, &'static str) {
     (
@@ -68,7 +77,34 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             2 if probe.case == Case::Narrow => {
                 call("Glob", json!({"pattern":"*.txt","path":probe.workspace}))
             }
-            _ => (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop"),
+            _ => {
+                if probe.case.forced() {
+                    let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+                    let parent = disk.load_session("native-root").await.unwrap().unwrap();
+                    let terminal = parent
+                        .messages
+                        .iter()
+                        .find_map(|m| {
+                            m.metadata.as_ref()?.get("session_message").filter(|v| {
+                                v["body"]["instruction"]
+                                    == "direct_parent_forced_permission_terminal_v1"
+                            })
+                        })
+                        .expect(
+                            "durable terminal precedes actual tool result/provider continuation",
+                        );
+                    assert_eq!(
+                        terminal["body"]["data"]["approved"],
+                        probe.case == Case::ForcedApprove
+                    );
+                    assert_eq!(
+                        probe.workspace.join("child-write.txt").exists(),
+                        probe.case == Case::ForcedApprove
+                    );
+                    assert!(probe.rearmed.load(Ordering::SeqCst));
+                }
+                (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop")
+            }
         }
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
         match probe.root.fetch_add(1, Ordering::SeqCst) {
@@ -122,30 +158,35 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     json!({"action":"run","child_session_id":child,"reset_to_last_user":false}),
                 )
             }
-            _ => (json!({"content":"NATIVE_ROOT_COMPLETED"}), "stop"),
+            _ => {
+                let pending = probe.case.forced() && probe.child.load(Ordering::SeqCst) < 2;
+                (
+                    json!({"content":if pending { "PARENT_REVIEW_AWARE_WAIT" } else { "NATIVE_ROOT_COMPLETED" }}),
+                    "stop",
+                )
+            }
         }
-    } else if probe.case == Case::ForcedApproval
+    } else if probe.case.forced()
         && body["model"] == "native-root"
         && body["messages"]
             .to_string()
             .contains("parent agent's security reviewer")
     {
-        // This is the actual off-loop parent model call. RespectSpecificWait
-        // leaves the request pending while its Child is still awaiting review.
-        let path = probe.data.join("sessions/native-root/inbox/new");
-        let files: Vec<_> = std::fs::read_dir(path)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        let request = files
+        let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+        let parent = disk.load_session("native-root").await.unwrap().unwrap();
+        let request = parent
+            .messages
             .iter()
-            .find_map(|path| {
-                let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-                let envelope = value.get("body")?;
-                (envelope["body"]["instruction"] == "direct_parent_forced_permission_request_v1")
-                    .then(|| envelope.clone())
+            .find_map(|message| {
+                message
+                    .metadata
+                    .as_ref()?
+                    .get("session_message")
+                    .filter(|v| {
+                        v["body"]["instruction"] == "direct_parent_forced_permission_request_v1"
+                    })
             })
-            .expect("actual durable parent request exists before reviewer provider call");
+            .expect("actual immutable request before off-loop provider");
         assert_eq!(request["target_session_id"], "native-root");
         assert_eq!(request["body"]["data"]["reason"], "configured_always_ask");
         assert_eq!(request["body"]["data"]["parent_session_id"], "native-root");
@@ -157,7 +198,11 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .is_ok());
         assert!(!probe.workspace.join("child-write.txt").exists());
         probe.reviews.fetch_add(1, Ordering::SeqCst);
-        (json!({"content":"DENY"}), "stop")
+        probe.review_release.notified().await; // Actual Parent reasoning must re-arm the SAME wait.
+        (
+            json!({"content":if probe.case == Case::ForcedApprove { "APPROVE" } else { "DENY" }}),
+            "stop",
+        )
     } else {
         (json!({"content":"auxiliary response"}), "stop")
     };
@@ -229,6 +274,9 @@ async fn fixture(case: Case) {
         release_child: AtomicBool::new(false),
         child_ready: Default::default(),
         reviews: AtomicUsize::new(0),
+        original_wait: Mutex::new(None),
+        rearmed: AtomicBool::new(false),
+        review_release: Default::default(),
     });
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
@@ -251,7 +299,7 @@ async fn fixture(case: Case) {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     let mut config = json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"native-root"}},"defaults":{"chat":{"provider":"openai","model":"native-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
-    if case == Case::ForcedApproval {
+    if case.forced() {
         let policy = bamboo_tools::permission::PermissionConfig::new();
         policy.set_ask_rules(["Write(*)".into()]);
         bamboo_tools::permission::PermissionStorage::new(&data)
@@ -328,6 +376,30 @@ async fn fixture(case: Case) {
                 .is_some_and(|state| state.waiting_for_children.is_some())
             {
                 seen_wait = true;
+                if case.forced() {
+                    let state = parent.agent_runtime_state.as_ref().unwrap();
+                    let wait =
+                        serde_json::to_value(state.waiting_for_children.as_ref().unwrap()).unwrap();
+                    {
+                        let mut original = probe.original_wait.lock().unwrap();
+                        if let Some(original) = original.as_ref() {
+                            assert_eq!(
+                                &wait, original,
+                                "request reasoning cannot refresh the child wait deadline"
+                            );
+                        } else {
+                            *original = Some(wait);
+                        }
+                    }
+                    if probe.reviews.load(Ordering::SeqCst) == 1
+                        && probe.root.load(Ordering::SeqCst) >= 4
+                        && state.status
+                            == bamboo_domain::session::runtime_state::AgentStatusState::Suspended
+                    {
+                        probe.rearmed.store(true, Ordering::SeqCst);
+                        probe.review_release.notify_one();
+                    }
+                }
                 probe.release_child.store(true, Ordering::SeqCst);
                 probe.child_ready.notify_waiters();
             }
@@ -403,14 +475,25 @@ async fn fixture(case: Case) {
             .unwrap()
             .iter()
             .any(|t| t["function"]["name"] == "Write")));
-        if case == Case::ForcedApproval {
+        if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
-            assert!(!workspace.join("child-write.txt").exists());
-            let history = child.last().unwrap()["messages"].to_string();
-            assert!(
-                history.contains("Permission denied by host")
-                    || history.contains("denied by parent agent review")
+            assert_eq!(
+                workspace.join("child-write.txt").exists(),
+                case == Case::ForcedApprove
             );
+            assert!(probe.rearmed.load(Ordering::SeqCst));
+            let history = child.last().unwrap()["messages"].to_string();
+            if case == Case::ForcedApproval {
+                assert!(
+                    history.contains("Permission denied by host")
+                        || history.contains("denied by parent agent review")
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("child-write.txt")).unwrap(),
+                    "real native child"
+                );
+            }
         } else if case == Case::Narrow {
             assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
             assert!(!workspace.join("child-write.txt").exists());
@@ -437,13 +520,40 @@ async fn fixture(case: Case) {
             .is_none_or(|state| state.waiting_for_children.is_none()));
     }
     drop(host);
-    if case == Case::ForcedApproval {
+    if case.forced() {
         let cold = SessionStoreV2::new(data.clone()).await.unwrap();
         let parent = cold.load_session("native-root").await.unwrap().unwrap();
         assert!(parent.messages.iter().any(|message| message
             .content
             .contains("requests a forced permission decision")));
-        assert!(!workspace.join("child-write.txt").exists());
+        let records: Vec<_> = parent
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|v| v.pointer("/session_message/source/subsystem"))
+                    .and_then(Value::as_str)
+                    == Some("direct_parent_permission_review")
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].id, records[1].id);
+        assert!(records.iter().all(|m| m.never_compress));
+        assert_eq!(
+            workspace.join("child-write.txt").exists(),
+            case == Case::ForcedApprove
+        );
+        assert!(
+            parent
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .is_none(),
+            "completion wins, no wait resurrection"
+        );
     }
     handle.stop(true).await;
 }
@@ -494,5 +604,7 @@ async fn old_worker_capability_report_cannot_admit_native_ceiling() {
 
 #[actix_web::test]
 async fn actual_child_forced_request_is_durable_before_parent_review() {
-    Box::pin(fixture(Case::ForcedApproval)).await;
+    for case in [Case::ForcedApproval, Case::ForcedApprove] {
+        Box::pin(fixture(case)).await;
+    }
 }
