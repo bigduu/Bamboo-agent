@@ -533,6 +533,7 @@ struct AckWriteFault(PathBuf, std::fs::Permissions);
 impl AckWriteFault {
     fn new(path: PathBuf) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&path).unwrap();
         let original = std::fs::metadata(&path).unwrap().permissions();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
         Self(path, original)
