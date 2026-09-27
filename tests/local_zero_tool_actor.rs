@@ -65,6 +65,25 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 "tool_calls",
             ),
             1 => {
+                let content = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message["role"] == "tool" && message["tool_call_id"] == "subagent-create"
+                    })
+                    .expect("actual Root SubAgent create tool result")["content"]
+                    .as_str()
+                    .unwrap();
+                let diagnostic: String = content.chars().take(512).collect();
+                let created: Value = serde_json::from_str(content).unwrap_or_else(|_| {
+                    panic!("actual Root create did not return JSON: {diagnostic}")
+                });
+                assert_eq!(
+                    created["status"], "created",
+                    "actual Root create failed: {diagnostic}"
+                );
                 let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
                 let id = store
                     .list_index_entries()
@@ -127,8 +146,9 @@ fn start(data: &Path, port: u16) -> Host {
 }
 async fn fixture(ultra: bool, reasoning: bool) {
     let temp = tempfile::tempdir().unwrap();
-    let data = temp.path().join("host");
-    let workspace = temp.path().join("workspace");
+    let temp_root = temp.path().canonicalize().unwrap();
+    let data = temp_root.join("host");
+    let workspace = temp_root.join("workspace");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
     let projects = bamboo_projects::ProjectStore::open(&data).unwrap();
