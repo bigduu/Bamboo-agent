@@ -2215,6 +2215,8 @@ async fn message_only_fixture() {
         .unwrap();
     assert_eq!(wait.child_session_ids, [id.clone()]);
     assert_eq!(wait.registered_by_tool_call_id, None);
+    drop(store);
+    let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let before = store.load_session(&id).await.unwrap().unwrap();
     assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
     assert_eq!(before.root_session_id, "plain-root");
