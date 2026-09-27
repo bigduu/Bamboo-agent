@@ -462,7 +462,7 @@ async fn reap_worker_pool_once(pool: &Arc<tokio::sync::Mutex<WorkerPool>>) -> us
 /// the env-named bearer is already READ into `token` here (the raw token never
 /// rides the config), and `ca_cert_file` is the path to a PEM pinning a
 /// self-signed worker cert (`None` ⇒ default webpki roots / plaintext `ws://`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedRemotePlacement {
     pub endpoint: String,
     pub token: Option<String>,
@@ -471,6 +471,15 @@ pub struct ResolvedRemotePlacement {
     /// node's `label`/host, surfaced on the UI placement badge. `None` ⇒ derive
     /// from the endpoint host.
     pub host_label: Option<String>,
+    /// Some(Err) preserves explicit unavailable selection; never falls back.
+    pub broker_peer: Option<Result<bamboo_config::RemoteBrokerPeer, ()>>,
+}
+impl std::fmt::Debug for ResolvedRemotePlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedRemotePlacement")
+            .field("broker_peer", &self.broker_peer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A role routed to a SCHEDULED worker (remote-actor-plan §3.4 / P2b, #181),
@@ -596,6 +605,8 @@ pub struct ActorChildRunner {
     /// `wss://` connect, no spawn, no pool, no kill) instead of the local
     /// subprocess + warm-pool path. Empty (the default) = all-local behavior.
     remote_placements: HashMap<String, ResolvedRemotePlacement>,
+    /// Fixed parent mailbox subscription has exactly one in-process owner.
+    strict_remote_subscription: tokio::sync::Mutex<()>,
     /// Roles routed to a REGISTRY-SCHEDULED worker (#181, P2b), keyed by sub-agent
     /// role. A role present here (AND not already in `remote_placements`, which
     /// wins) routes through the dedicated SCHEDULABLE branch in
@@ -812,6 +823,7 @@ impl ActorChildRunner {
             approval_reviewer: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
             remote_placements: HashMap::new(),
+            strict_remote_subscription: tokio::sync::Mutex::new(()),
             schedulable_placements: HashMap::new(),
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
             codex_run_tokens: None,
@@ -1399,7 +1411,9 @@ impl ActorChildRunner {
             spec.placement = Placement::Remote {
                 endpoint: placement.endpoint.clone(),
             };
-            spec.secrets.worker_auth_token = placement.token.clone();
+            if placement.broker_peer.is_none() {
+                spec.secrets.worker_auth_token = placement.token.clone();
+            }
         } else if let Some(placement) = self.schedulable_placements.get(spec.identity.role.as_str())
         {
             // #181 (P2b): route this role to a SCHEDULED worker — ONLY when it is
@@ -1639,7 +1653,29 @@ impl ExternalChildRunner for ActorChildRunner {
             .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
-        let creation = if matches!(spec.placement, Placement::Local)
+        let strict_remote = self
+            .remote_placements
+            .get(spec.identity.role.as_str())
+            .and_then(|p| p.broker_peer.as_ref());
+        if strict_remote.is_some_and(|route| route.is_err())
+            || strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime)
+        {
+            return Err(remote_broker_unavailable());
+        }
+        let lineage = if strict_remote.is_some() {
+            Some(
+                remote_canonical_lineage(
+                    session_inbox_runtime
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    session,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let creation = if (matches!(spec.placement, Placement::Local) || strict_remote.is_some())
             && matches!(spec.executor, ExecutorSpec::BambooRuntime)
         {
             let binding = session_inbox_runtime.as_ref().ok_or_else(|| {
@@ -1882,11 +1918,25 @@ impl ExternalChildRunner for ActorChildRunner {
         // (cancellation still proceeds — the cancel branch in drive() runs while
         // we hold the permit). Released when this fn returns, i.e. once the worker
         // is parked back into the pool, so idle workers don't pin slots.
-        let _slot = self
-            .concurrency
-            .acquire()
-            .await
-            .map_err(|_| AgentError::LLM("actor concurrency limiter closed".to_string()))?;
+        let _slot = if strict_remote.is_some() {
+            tokio::select! { biased;
+                _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                permit = self.concurrency.acquire() => permit.map_err(|_| remote_broker_unavailable())?,
+            }
+        } else {
+            self.concurrency
+                .acquire()
+                .await
+                .map_err(|_| AgentError::LLM("actor concurrency limiter closed".into()))?
+        };
+        let _remote_subscription = if strict_remote.is_some() {
+            Some(tokio::select! { biased;
+                _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                guard = self.strict_remote_subscription.lock() => guard,
+            })
+        } else {
+            None
+        };
 
         // Bamboo-as-provider credentials are minted at the activation boundary,
         // after backpressure admits the run and never at worker provisioning.
@@ -1948,47 +1998,98 @@ impl ExternalChildRunner for ActorChildRunner {
                                 spec.identity.role
                             ))
                         })?;
-                    let endpoint = placement.endpoint.clone();
-                    // Build the TLS trust: a pinned CA pins a self-signed worker cert;
-                    // otherwise default webpki roots (or plaintext for `ws://`).
-                    let trust_cfg = match placement.ca_cert_file.as_deref() {
-                        Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
+                    if let Some(Ok(peer)) = &placement.broker_peer {
+                        let tls = bamboo_broker::client_config_trusting_cert(
+                            placement
+                                .ca_cert_file
+                                .as_deref()
+                                .ok_or_else(remote_broker_unavailable)?,
+                        )
+                        .map_err(|_| remote_broker_unavailable())?;
+                        let connect = bamboo_broker::BrokerChildLink::connect_strict_with_tls(
+                            &placement.endpoint,
+                            bamboo_subagent::AgentRef {
+                                session_id: peer.parent_mailbox.clone(),
+                                role: peer.parent_role.clone(),
+                            },
+                            placement
+                                .token
+                                .as_deref()
+                                .ok_or_else(remote_broker_unavailable)?,
+                            bamboo_subagent::AgentRef {
+                                session_id: peer.worker_mailbox.clone(),
+                                role: peer.worker_role.clone(),
+                            },
+                            tls,
+                        );
+                        let link = tokio::select! { biased;
+                            _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                            result = tokio::time::timeout(Duration::from_secs(30), connect) =>
+                                result.map_err(|_| remote_broker_unavailable())?.map_err(|_| remote_broker_unavailable())?,
+                        };
+                        let record = AgentRecord {
+                            agent_id: job.child_session_id.clone(),
+                            role: spec.identity.role.clone(),
+                            labels: Vec::new(),
+                            endpoint: String::new(),
+                            pid: 0,
+                            version: String::new(),
+                            started_at: chrono::Utc::now(),
+                            lease_expires_at: chrono::Utc::now(),
+                        };
+                        (
+                            PooledWorker {
+                                worker: SpawnedChild::remote(record),
+                                mailbox_id: peer.worker_mailbox.clone(),
+                                parked_at: None,
+                            },
+                            Box::new(link) as Box<dyn bamboo_subagent::ChildLink>,
+                        )
+                    } else {
+                        let endpoint = placement.endpoint.clone();
+                        // Build the TLS trust: a pinned CA pins a self-signed worker cert;
+                        // otherwise default webpki roots (or plaintext for `ws://`).
+                        let trust_cfg = match placement.ca_cert_file.as_deref() {
+                            Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
+                                AgentError::LLM(format!(
+                                    "remote worker CA cert '{}': {e}",
+                                    path.display()
+                                ))
+                            })?),
+                            None => None,
+                        };
+                        let client = ChildClient::connect_with_auth_tls(
+                            &endpoint,
+                            placement.token.as_deref(),
+                            trust_cfg,
+                        )
+                        .await
+                        .map_err(|e| {
                             AgentError::LLM(format!(
-                                "remote worker CA cert '{}': {e}",
-                                path.display()
+                                "remote actor connect to '{endpoint}' failed: {e}"
                             ))
-                        })?),
-                        None => None,
-                    };
-                    let client = ChildClient::connect_with_auth_tls(
-                        &endpoint,
-                        placement.token.as_deref(),
-                        trust_cfg,
-                    )
-                    .await
-                    .map_err(|e| {
-                        AgentError::LLM(format!("remote actor connect to '{endpoint}' failed: {e}"))
-                    })?;
-                    // Process-less handle so live-actor registration (in-band steering)
-                    // works exactly as for a local worker; `kill()` is a no-op.
-                    let record = AgentRecord {
-                        agent_id: job.child_session_id.clone(),
-                        role: spec.identity.role.clone(),
-                        labels: Vec::new(),
-                        endpoint: endpoint.clone(),
-                        pid: 0,
-                        version: String::new(),
-                        started_at: chrono::Utc::now(),
-                        lease_expires_at: chrono::Utc::now(),
-                    };
-                    let _ = endpoint;
-                    let actor = PooledWorker {
-                        worker: SpawnedChild::remote(record),
-                        mailbox_id: job.child_session_id.clone(),
-                        parked_at: None,
-                    };
-                    let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
-                    (actor, client)
+                        })?;
+                        // Process-less handle so live-actor registration (in-band steering)
+                        // works exactly as for a local worker; `kill()` is a no-op.
+                        let record = AgentRecord {
+                            agent_id: job.child_session_id.clone(),
+                            role: spec.identity.role.clone(),
+                            labels: Vec::new(),
+                            endpoint: endpoint.clone(),
+                            pid: 0,
+                            version: String::new(),
+                            started_at: chrono::Utc::now(),
+                            lease_expires_at: chrono::Utc::now(),
+                        };
+                        let _ = endpoint;
+                        let actor = PooledWorker {
+                            worker: SpawnedChild::remote(record),
+                            mailbox_id: job.child_session_id.clone(),
+                            parked_at: None,
+                        };
+                        let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
+                        (actor, client)
+                    }
                 }
                 PlacementKind::Schedulable => {
                     // SCHEDULABLE branch (#181): pick a LIVE worker of the pool role
@@ -2150,6 +2251,32 @@ impl ExternalChildRunner for ActorChildRunner {
                     .collect()
             };
 
+            if strict_remote.is_some() {
+                let current =
+                    remote_canonical_lineage(session_inbox_runtime.as_ref().unwrap(), session)
+                        .await;
+                if current.as_ref().ok() != lineage.as_ref()
+                    || bound_activation_run_id
+                        .as_deref()
+                        .map_or(true, str::is_empty)
+                    || cancel_token.is_cancelled()
+                {
+                    if let (Some(binding), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        binding
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    return Err(if cancel_token.is_cancelled() {
+                        AgentError::Cancelled
+                    } else {
+                        remote_broker_unavailable()
+                    });
+                }
+            }
             if let Some(expected) = creation.as_ref() {
                 let checked =
                     canonical_child_creation(session_inbox_runtime.as_ref().unwrap(), session, job)
@@ -2372,6 +2499,18 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
             }
             break (result, actor);
+        };
+
+        let result = if strict_remote.is_some() {
+            result.map_err(|error| {
+                if matches!(error, AgentError::Cancelled) {
+                    error
+                } else {
+                    remote_broker_unavailable()
+                }
+            })
+        } else {
+            result
         };
 
         // Park the warm worker for reuse on a clean run, or kill it on
@@ -5145,6 +5284,66 @@ fn project_id_for_actor_run(
     }
 }
 
+fn remote_broker_unavailable() -> AgentError {
+    AgentError::LLM("remote_broker_activation_unavailable".into())
+}
+
+// Read only: no ensure/repair/Actor initialization or subtree budget. Capture
+// exactly the canonical chain and compare it again immediately before Run.
+async fn remote_canonical_lineage(
+    binding: &SessionInboxRuntimeBinding,
+    session: &Session,
+) -> Result<Vec<bamboo_domain::ActorSession>, AgentError> {
+    let mut current = bamboo_domain::ActorSession::from_session(session)
+        .map_err(|_| remote_broker_unavailable())?;
+    let mut chain = Vec::new();
+    loop {
+        if chain.len() > MAX_SPAWN_DEPTH as usize {
+            return Err(remote_broker_unavailable());
+        }
+        let saved = binding
+            .storage
+            .load_session(&current.actor_id)
+            .await
+            .map_err(|_| remote_broker_unavailable())?
+            .ok_or_else(remote_broker_unavailable)?;
+        let observed = bamboo_domain::ActorSession::from_session(&saved)
+            .map_err(|_| remote_broker_unavailable())?;
+        if observed.actor_id != current.actor_id
+            || observed.session_created_at != current.session_created_at
+            || observed.parent_actor_id != current.parent_actor_id
+            || observed.root_actor_id != current.root_actor_id
+            || observed.spawn_depth != current.spawn_depth
+            || observed.project_id != current.project_id
+        {
+            return Err(remote_broker_unavailable());
+        }
+        chain.push(observed.clone());
+        let Some(parent_id) = observed.parent_actor_id.as_ref() else {
+            if observed.actor_id != session.root_session_id || observed.spawn_depth != 0 {
+                return Err(remote_broker_unavailable());
+            }
+            return Ok(chain);
+        };
+        let parent = binding
+            .storage
+            .load_session(parent_id)
+            .await
+            .map_err(|_| remote_broker_unavailable())?
+            .ok_or_else(remote_broker_unavailable)?;
+        let parent = bamboo_domain::ActorSession::from_session(&parent)
+            .map_err(|_| remote_broker_unavailable())?;
+        if parent.root_actor_id != observed.root_actor_id
+            || parent.project_id != observed.project_id
+            || parent.spawn_depth.checked_add(1) != Some(observed.spawn_depth)
+            || parent.session_created_at > observed.session_created_at
+        {
+            return Err(remote_broker_unavailable());
+        }
+        current = parent;
+    }
+}
+
 async fn canonical_child_creation(
     binding: &SessionInboxRuntimeBinding,
     session: &Session,
@@ -5514,6 +5713,22 @@ mod tests {
             storage,
             persistence,
         }
+    }
+
+    #[tokio::test]
+    async fn remote_broker_lineage_rejects_missing_parent_and_project_drift() {
+        let (_temp, store, locked, inbox, parent, _claim) =
+            actor_inbox_fixture("remote-parent").await;
+        let child = Session::new_child_of("remote-child", &parent, "model", "child");
+        store.save_session(&child).await.unwrap();
+        let binding = actor_binding(store.clone(), inbox, locked);
+        let first = remote_canonical_lineage(&binding, &child).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let mut changed = child.clone();
+        changed.set_project_id_meta("different-project");
+        assert!(remote_canonical_lineage(&binding, &changed).await.is_err());
+        store.delete_session(&parent.id).await.unwrap();
+        assert!(remote_canonical_lineage(&binding, &child).await.is_err());
     }
 
     #[tokio::test]
@@ -10051,6 +10266,7 @@ mod tests {
                 token: Some("T-secret".into()),
                 ca_cert_file: None,
                 host_label: None,
+                broker_peer: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -10075,6 +10291,7 @@ mod tests {
                 token: Some("T".into()),
                 ca_cert_file: None,
                 host_label: None,
+                broker_peer: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -10655,6 +10872,7 @@ mod tests {
                 token: Some(token.to_string()),
                 ca_cert_file: None,
                 host_label: Some("mini-e2e".into()), // node label, surfaced on the badge
+                broker_peer: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -10774,6 +10992,7 @@ mod tests {
                 token: Some("T-remote".into()),
                 ca_cert_file: None,
                 host_label: None,
+                broker_peer: None,
             },
         );
         let mut sched = HashMap::new();
@@ -10821,6 +11040,7 @@ mod tests {
                 token: None,
                 ca_cert_file: None,
                 host_label: Some("mini".into()),
+                broker_peer: None,
             },
         );
         let runner = bogus_runner(remote);
@@ -10840,6 +11060,7 @@ mod tests {
                 token: None,
                 ca_cert_file: None,
                 host_label: None,
+                broker_peer: None,
             },
         );
         let r2 = bogus_runner(remote_nolabel);

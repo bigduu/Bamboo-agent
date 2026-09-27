@@ -6029,6 +6029,29 @@ async fn compact_owned_inspection_correction_and_control_keep_one_logical_child(
     )
     .await
     .is_err());
+    let before = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"cancel"}),
+        subagent_test_ctx(&foreign.id, "foreign-cancel")
+    )
+    .await
+    .is_err());
+    let after = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
     let correction = "  Keep the same child 🪷\nDo not broaden the task.  ";
     h.activation
         .force_disposition(SessionActivationDisposition::ActiveNotified);

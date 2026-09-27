@@ -287,7 +287,8 @@ async fn provider_host_phase(probe: &Probe) -> Value {
         .await
         .ok()
         .map(|state| state.generation);
-    json!({"actor":actor,"last_run_status":child.and_then(|c| c.last_run_status()),
+    json!({"actor":actor,"last_run_status":child.as_ref().and_then(|c| c.last_run_status()),
+        "last_run_error":child.as_ref().and_then(|c| c.last_run_error()).map(|e| bounded_diagnostic(&e, 512).to_owned()),
         "inbox_generation":generation})
 }
 fn print_bounded_retry_log(data: &Path) {
@@ -747,7 +748,7 @@ async fn await_host_pre_ack_cut(
         store.clone(),
         bamboo_domain::SessionInboxLimits::default(),
     );
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let cut = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let child = store.load_session(id).await.unwrap().unwrap();
             let entry = store.inspect_actor(id).await.unwrap();
@@ -800,8 +801,14 @@ async fn await_host_pre_ack_cut(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap()
+    .await;
+    if cut.is_err() {
+        panic!(
+            "actual pre-ACK cut timeout: {}",
+            bounded_diagnostic(&provider_host_phase(probe).await.to_string(), 2048)
+        );
+    }
+    cut.unwrap()
 }
 struct Host(Child);
 impl Drop for Host {
@@ -995,17 +1002,82 @@ async fn fixture_with_followups(
             std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap()),
             bamboo_domain::SessionInboxLimits::default(),
         );
+        // run(false) suspends the Root; a real new Root turn sends the live correction.
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
-                .await
-                .unwrap()
-                .activation_pending()
-            {
+            loop {
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                if parent.last_run_status().as_deref() == Some("suspended") {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
+        let initial = store.inspect_actor(&id).await.unwrap();
+        assert_eq!(initial.actor.current_attempt, 1);
+        assert_eq!(
+            initial.activation.as_ref().unwrap().status,
+            ActorActivationStatus::Running
+        );
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Correct the same running Child now","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual Root correction chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
+        let dispatch: Value = client
+            .post(format!("{base}/execute/plain-root"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatch["status"], "started",
+            "actual Root turn: {dispatch}"
+        );
+        let pending = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+                    .await
+                    .unwrap();
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                let delivered = parent.messages.iter().rev().find(|m| {
+                    m.role == bamboo_domain::Role::Tool
+                        && m.tool_call_id.as_deref() == Some("subagent-send_message")
+                });
+                if backlog.activation_pending() && delivered.is_some() {
+                    let receipt: Value = serde_json::from_str(&delivered.unwrap().content).unwrap();
+                    assert_eq!(receipt["message"], "CORRECTION_FROM_ACTUAL_ROOT");
+                    assert_eq!(receipt["inbox_generation"], 1);
+                    assert_eq!(
+                        (backlog.pending, backlog.claimed, backlog.generation),
+                        (1, 0, 1)
+                    );
+                    let current = store.inspect_actor(&id).await.unwrap();
+                    assert_eq!(current.actor.current_attempt, 1);
+                    let activation = current.activation.as_ref().unwrap();
+                    assert_eq!(activation.status, ActorActivationStatus::Running);
+                    assert_eq!(
+                        activation.fence(),
+                        initial.activation.as_ref().unwrap().fence()
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            pending.is_ok(),
+            "actual pending correction timeout: {}",
+            bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
+        );
         let fault = AckWriteFault::new(
             data.join(store.resolve_rel_path(&id).await.unwrap())
                 .join("inbox/admitted"),
@@ -1013,6 +1085,28 @@ async fn fixture_with_followups(
         probe.release.store(true, Ordering::SeqCst);
         probe.wake.notify_waiters();
         let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
+        let parent_done = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let parent = store.load_session("plain-root").await.unwrap().unwrap();
+                if probe.root_calls.load(Ordering::SeqCst) >= 4
+                    && parent.last_run_status().as_deref() == Some("completed")
+                    && parent.messages.last().is_some_and(|m| {
+                        m.role == bamboo_domain::Role::Assistant && m.content == "ROOT_DONE"
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            parent_done.is_ok(),
+            "actual Parent ROOT_DONE timeout (calls={}): {}",
+            probe.root_calls.load(Ordering::SeqCst),
+            bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
+        );
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
         drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
         drop(fault);
         probe.release.store(false, Ordering::SeqCst);
@@ -1044,7 +1138,13 @@ async fn fixture_with_followups(
             serde_json::to_value(&cut.messages).unwrap()
         );
         recovery_prefix = Some(cut);
-        assert!(client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Recover the same checkpointed Child through run(false)","model":"plain-root","provider":"openai","thinking_mode":"ultra"})).send().await.unwrap().status().is_success());
+        let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Recover the same checkpointed Child through run(false)","model":"plain-root","provider":"openai"})).send().await.unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "actual cold Root recovery chat: {status}; {}",
+            bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
+        );
         assert!(client
             .post(format!("{base}/execute/plain-root"))
             .json(&json!({}))

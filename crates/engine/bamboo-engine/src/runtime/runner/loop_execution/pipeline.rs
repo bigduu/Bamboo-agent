@@ -1107,17 +1107,23 @@ async fn suspend_to_wait_for_children(
 ///
 /// Returns `Some` suspend outcome (with the durable wait persisted) when it
 /// engages, or `None` to let the run complete normally. No-ops when there is no
-/// storage, no active children, or a wait is already registered — so child
-/// sessions (which have no children) and explicit-wait flows are unaffected.
+/// storage, no active children, or an untagged wait is already registered.
+/// An inherited tool wait is freshly observed even when its children finished.
 async fn maybe_suspend_for_orphaned_children(
     session: &mut Session,
     config: &AgentLoopConfig,
     runtime_state: &mut AgentRuntimeState,
-) -> Option<TurnOutcome> {
-    if runtime_state.waiting_for_children.is_some() {
-        return None;
+) -> Result<Option<TurnOutcome>, AgentError> {
+    let inherited_tool_wait = runtime_state
+        .waiting_for_children
+        .as_ref()
+        .is_some_and(|wait| wait.registered_by_tool_call_id.is_some());
+    if runtime_state.waiting_for_children.is_some() && !inherited_tool_wait {
+        return Ok(None);
     }
-    let storage = config.storage.as_ref()?;
+    let Some(storage) = config.storage.as_ref() else {
+        return Ok(None);
+    };
 
     let mut active: Vec<String> = storage
         .list_child_run_statuses(&session.id)
@@ -1127,18 +1133,80 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
-    if active.is_empty() {
-        return None;
+    if active.is_empty() && !inherited_tool_wait {
+        return Ok(None);
     }
     active.sort();
     active.dedup();
+
+    // InterruptSpecificWait permits a reasoning turn, not a new wait lease.
+    // Startup carries only the wait; observe the current durable value before
+    // the orphan gate could replace its policy, deadline or originating call.
+    let durable = storage.load_session(&session.id).await.map_err(|_| {
+        AgentError::Tool("parent wait observation failed; refusing to replace its wait".into())
+    })?;
+    if inherited_tool_wait && durable.is_none() {
+        return Err(AgentError::Tool(
+            "parent wait observation failed; current session is missing".into(),
+        ));
+    }
+    if let Some(durable) = durable {
+        if durable.id != session.id || durable.created_at != session.created_at {
+            return Err(AgentError::Tool(
+                "parent wait observation belongs to a different session lifetime".into(),
+            ));
+        }
+        if let Some(wait) = durable
+            .agent_runtime_state
+            .and_then(|state| state.waiting_for_children)
+        {
+            runtime_state.waiting_for_children = Some(wait);
+            state_bridge::write_runtime_state(session, runtime_state);
+            session.metadata.insert(
+                "runtime.suspend_reason".into(),
+                "waiting_for_children".into(),
+            );
+            // No intermediate save: the existing suspend-stage re-observation
+            // and finalized merge must still let a concurrent completion win.
+            return Ok(Some(TurnOutcome {
+                should_break: true,
+                sent_complete: false,
+            }));
+        }
+    }
+
+    if inherited_tool_wait {
+        // A completed Any/FirstError wait can leave another child active.
+        // Its clear is final: do not grant that child a new six-hour wait.
+        runtime_state.waiting_for_children = None;
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_children")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if runtime_state
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_children")
+        {
+            runtime_state.suspension = None;
+            if runtime_state.status == AgentStatusState::Suspended {
+                runtime_state.status = AgentStatusState::Idle;
+            }
+        }
+        state_bridge::write_runtime_state(session, runtime_state);
+        return Ok(None);
+    }
 
     tracing::info!(
         "[{}] end-of-turn safety net: suspending to wait for {} orphaned child session(s) the model did not explicitly wait on",
         session.id,
         active.len(),
     );
-    Some(
+    Ok(Some(
         suspend_to_wait_for_children(
             session,
             runtime_state,
@@ -1147,7 +1215,7 @@ async fn maybe_suspend_for_orphaned_children(
             ChildWaitPolicy::All,
         )
         .await,
-    )
+    ))
 }
 
 /// Runner primitive: durably suspend `session` to wait on a known set of still
@@ -3197,12 +3265,18 @@ async fn run_pipeline_inner(
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
-                if let Some(suspend) =
-                    maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
-                        .await
+                match maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
+                    .await
                 {
-                    turn_outcome = Some(suspend);
-                    break;
+                    Ok(Some(suspend)) => {
+                        turn_outcome = Some(suspend);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        terminal_error = Some(error);
+                        break;
+                    }
                 }
                 // Safety net (issue #84 Phase 2b): if the model is about to finish
                 // but left a `run_in_background` Bash shell still running for this
@@ -9253,6 +9327,7 @@ mod tests {
         let outcome =
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
+                .expect("parent wait observation succeeds")
                 .expect("must suspend when active children remain");
         assert!(outcome.should_break && !outcome.sent_complete);
 
@@ -9300,6 +9375,7 @@ mod tests {
         assert!(
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
+                .unwrap()
                 .is_none(),
             "no active children → must not suspend"
         );
@@ -9328,8 +9404,231 @@ mod tests {
         assert!(
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
+                .unwrap()
                 .is_none()
         );
+    }
+
+    struct InterruptedWaitStorage {
+        inner: Arc<TestStorage>,
+        read_error: bool,
+        saves: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for InterruptedWaitStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            self.inner.save_session(session).await
+        }
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            if self.read_error {
+                return Err(std::io::Error::other("private fixture source failure"));
+            }
+            self.inner.load_session(id).await
+        }
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+        async fn list_child_run_statuses(
+            &self,
+            _parent: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            Ok(vec![("child-running".into(), Some("running".into()))])
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_wait_restores_exact_value_without_save_and_completion_wins() {
+        for policy in [
+            ChildWaitPolicy::All,
+            ChildWaitPolicy::Any,
+            ChildWaitPolicy::FirstError,
+        ] {
+            let inner = Arc::new(TestStorage::default());
+            let mut parent = Session::new("interrupted-parent", "model");
+            let registered_at = Utc::now() - chrono::Duration::minutes(5);
+            let wait = WaitingForChildrenState {
+                child_session_ids: vec!["child-other".into(), "child-running".into()],
+                wait_for: policy,
+                registered_at,
+                timeout_at: match policy {
+                    ChildWaitPolicy::All => None,
+                    ChildWaitPolicy::Any => Some(registered_at),
+                    ChildWaitPolicy::FirstError => {
+                        Some(registered_at + chrono::Duration::minutes(10))
+                    }
+                },
+                registered_by_tool_call_id: Some("original-subagent-call".into()),
+            };
+            let mut durable_runtime = AgentRuntimeState::new("original-parent-run");
+            durable_runtime.status = AgentStatusState::Suspended;
+            durable_runtime.waiting_for_children = Some(wait.clone());
+            parent.agent_runtime_state = Some(durable_runtime);
+            inner.save_session(&parent).await.unwrap();
+            let storage = Arc::new(InterruptedWaitStorage {
+                inner: inner.clone(),
+                read_error: false,
+                saves: AtomicUsize::new(0),
+            });
+            let config = config_with_storage(storage.clone());
+            let mut runtime = AgentRuntimeState::new("interrupt-reasoning-run");
+            parent.agent_runtime_state = Some(runtime.clone());
+            let outcome = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.should_break && !outcome.sent_complete);
+            assert_eq!(runtime.waiting_for_children.as_ref(), Some(&wait));
+            assert_eq!(
+                parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .waiting_for_children
+                    .as_ref(),
+                Some(&wait)
+            );
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+            assert!(
+                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .should_break
+            );
+            assert_eq!(runtime.waiting_for_children.as_ref(), Some(&wait));
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+            let mut durable = inner.load_session(&parent.id).await.unwrap().unwrap();
+            assert_eq!(
+                durable
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .waiting_for_children
+                    .as_ref(),
+                Some(&wait)
+            );
+
+            // A real durable transition after observation clears the wait.
+            // Exercise the same fresh-read reconciliation used at suspension.
+            durable
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .waiting_for_children = None;
+            inner.save_session(&durable).await.unwrap();
+            let cleared = storage.load_session(&parent.id).await.unwrap().unwrap();
+            runtime.status = AgentStatusState::Suspended;
+            super::reconcile_child_wait_at_suspend(
+                &mut parent,
+                &mut runtime,
+                cleared.agent_runtime_state.unwrap().waiting_for_children,
+            );
+            assert!(runtime.waiting_for_children.is_none());
+            assert_eq!(runtime.status, AgentStatusState::Idle);
+            assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+
+            // Startup's carried identity is stale after completion. The real
+            // orphan gate must not renew it over the still-running other child.
+            runtime.status = AgentStatusState::Running;
+            runtime.waiting_for_children = Some(wait);
+            assert!(
+                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(runtime.waiting_for_children.is_none());
+            assert_eq!(runtime.status, AgentStatusState::Running);
+            assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_wait_absent_preserves_new_orphan_wait_behavior() {
+        for persisted_parent in [false, true] {
+            let inner = Arc::new(TestStorage::default());
+            let mut parent = Session::new("no-durable-wait", "model");
+            if persisted_parent {
+                inner.save_session(&parent).await.unwrap();
+            }
+            let storage = Arc::new(InterruptedWaitStorage {
+                inner: inner.clone(),
+                read_error: false,
+                saves: AtomicUsize::new(0),
+            });
+            let config = config_with_storage(storage.clone());
+            let mut runtime = AgentRuntimeState::new("orphan-run");
+            let before = Utc::now();
+            let outcome = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.should_break && !outcome.sent_complete);
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 1);
+            let persisted = inner.load_session(&parent.id).await.unwrap().unwrap();
+            let wait = persisted
+                .agent_runtime_state
+                .unwrap()
+                .waiting_for_children
+                .unwrap();
+            assert_eq!(wait.child_session_ids, vec!["child-running"]);
+            assert_eq!(wait.wait_for, ChildWaitPolicy::All);
+            assert!(wait.registered_at >= before);
+            assert_eq!(
+                wait.timeout_at,
+                Some(wait.registered_at + chrono::Duration::hours(6))
+            );
+            assert!(wait.registered_by_tool_call_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_wait_observation_fails_closed_on_read_error_or_replaced_parent() {
+        for read_error in [true, false] {
+            let inner = Arc::new(TestStorage::default());
+            let mut parent = Session::new("observation-parent", "model");
+            let mut replacement = parent.clone();
+            replacement.created_at += chrono::Duration::nanoseconds(1);
+            inner.save_session(&replacement).await.unwrap();
+            let storage = Arc::new(InterruptedWaitStorage {
+                inner,
+                read_error,
+                saves: AtomicUsize::new(0),
+            });
+            let config = config_with_storage(storage.clone());
+            let original = serde_json::to_value(&parent).unwrap();
+            let mut runtime = AgentRuntimeState::new("parent-run");
+            let original_runtime = runtime.clone();
+            let error = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                .await
+                .err()
+                .expect("observation must not renew on uncertainty");
+            assert!(matches!(error, AgentError::Tool(_)));
+            assert!(!error.to_string().contains("private fixture source failure"));
+            assert_eq!(serde_json::to_value(&parent).unwrap(), original);
+            assert_eq!(runtime, original_runtime);
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+
+            // An already registered live wait preserves the old no-read path.
+            runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                vec!["child-running".into()],
+                ChildWaitPolicy::All,
+                Utc::now(),
+            ));
+            let live_wait = runtime.waiting_for_children.clone();
+            assert!(
+                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(runtime.waiting_for_children, live_wait);
+            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

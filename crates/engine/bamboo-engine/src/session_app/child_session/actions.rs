@@ -3,6 +3,7 @@
 use bamboo_domain::Session;
 use chrono::Utc;
 use serde_json::json;
+use std::{future::Future, pin::Pin};
 
 use super::helpers::{
     append_subagent_delegation_contract, compute_status_guidance,
@@ -1149,7 +1150,15 @@ fn should_route_child_message_through_inbox(is_running: bool, should_auto_run: b
     is_running || should_auto_run
 }
 
-pub async fn cancel_child_action(
+pub fn cancel_child_action<'a>(
+    port: &'a dyn ChildSessionPort,
+    parent_id: &'a str,
+    child_session_id: String,
+) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ChildSessionError>> + Send + 'a>> {
+    Box::pin(cancel_child_action_inner(port, parent_id, child_session_id))
+}
+
+async fn cancel_child_action_inner(
     port: &dyn ChildSessionPort,
     parent_id: &str,
     child_session_id: String,

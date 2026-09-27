@@ -255,6 +255,16 @@ impl BrokerClient {
         Self::connect_with_tls_mode(endpoint, agent, token, None, true).await
     }
 
+    /// Ordered Actor stream with operator-selected TLS trust.
+    pub(crate) async fn connect_actor_with_tls(
+        endpoint: &str,
+        agent: AgentRef,
+        token: &str,
+        tls_config: Option<rustls::ClientConfig>,
+    ) -> BrokerResult<Self> {
+        Self::connect_with_tls_mode(endpoint, agent, token, tls_config, true).await
+    }
+
     /// Like [`connect`](Self::connect), but for `wss://` lets the caller
     /// supply a custom rustls [`rustls::ClientConfig`] — e.g. one built by
     /// [`client_config_trusting_cert`] that trusts exactly a self-signed
