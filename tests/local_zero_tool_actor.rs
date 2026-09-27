@@ -294,16 +294,10 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 store,
                 bamboo_domain::SessionInboxLimits::default(),
             );
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !bamboo_domain::SessionInboxPort::was_admitted(&inbox, &id, &envelope_id)
-                    .await
-                    .unwrap()
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            assert!(
+                bamboo_domain::SessionInboxPort::was_admitted(&inbox, &id, &envelope_id).await.unwrap(),
+                "actual Host ACK must precede this provider request, not become true after admission"
+            );
         }
         if probe.reasoning || (probe.retry && child_call == 0) {
             emits_reasoning = true;

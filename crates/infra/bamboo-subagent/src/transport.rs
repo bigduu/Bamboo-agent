@@ -621,6 +621,11 @@ where
                         let _ = steer.send(SteerMessage::Text(text));
                     }
                 }
+                Ok(ParentFrame::InitialInputRelease { release }) => {
+                    if let Some(steer) = &active_steer {
+                        let _ = steer.send(SteerMessage::InitialInputRelease(release));
+                    }
+                }
                 Ok(ParentFrame::SessionMessage { delivery }) => {
                     if let Some(steer) = &active_steer {
                         let _ = steer.send(SteerMessage::SessionMessage(Box::new(delivery)));
@@ -744,6 +749,12 @@ fn start_run<E: ChildExecutor + ?Sized>(
     let mut control = OwnedTask::new(tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
             let frame = match control {
+                ExecutorControl::InitialInputReleaseRequest(request) => ChildFrame::Event {
+                    event: serde_json::to_value(crate::proto::InitialInputControl::Request {
+                        request,
+                    })
+                    .expect("typed initial control"),
+                },
                 ExecutorControl::SessionMessageAdmitted(confirmation) => {
                     ChildFrame::SessionMessageAdmitted { confirmation }
                 }
