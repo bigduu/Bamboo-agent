@@ -3635,10 +3635,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
-                        if plain_actor && !plain_actor_event(&event)? { continue; }
                         if expected_creation.is_some() {
                             return Err(AgentError::LLM("worker omitted required Child creation event identity".into()));
                         }
+                        if plain_actor && !plain_actor_event(&event)? { continue; }
                         // Rolling-upgrade compatibility: old actors have no
                         // route/sequence metadata, but retain the same typed
                         // permission handshake and event validation.
