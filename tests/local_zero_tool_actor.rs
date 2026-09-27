@@ -21,6 +21,7 @@ use std::{
 
 struct Probe {
     root_calls: AtomicUsize,
+    followup_turn: AtomicUsize,
     child_calls: AtomicUsize,
     ready: AtomicBool,
     release: AtomicBool,
@@ -53,62 +54,81 @@ fn followup_call(id: &str, index: usize) -> Value {
     result["tool_calls"][0]["id"] = json!(format!("owned-followup-{index}"));
     result
 }
-async fn two_root_step(body: &Value, probe: &Probe, round: usize) -> (Value, &'static str) {
+fn two_root_step(body: &Value, probe: &Probe, round: usize) -> (Value, &'static str) {
     if round == 0 {
         return (
-            call(
-                json!({"action":"create","title":"Two corrections", "responsibility":"Answer each bounded input without tools",
-            "prompt":"Return one plain reply per assigned input", "subagent_type":"plain-reply", "workspace":probe.workspace,"auto_run":true}),
-            ),
+            call(json!({"action":"create","title":"Two corrections",
+            "responsibility":"Answer each bounded input without tools",
+            "prompt":"Return one plain reply per assigned input", "subagent_type":"plain-reply",
+            "workspace":probe.workspace,"auto_run":true})),
             "tool_calls",
         );
     }
-    let tool_id = if round == 1 {
-        "subagent-create".to_owned()
-    } else {
-        format!("owned-followup-{}", round - 1)
-    };
-    let text = body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .rev()
-        .find(|m| m["role"] == "tool" && m["tool_call_id"] == tool_id)
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
-    let result: Value = serde_json::from_str(text)
-        .unwrap_or_else(|_| panic!("actual Root tool result: {}", bounded_diagnostic(text, 512)));
-    if round == 1 {
-        assert_eq!(result["status"], "running_in_background");
-        let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
-        let id = store
-            .list_index_entries()
-            .await
-            .into_iter()
-            .find(|r| r.parent_session_id.as_deref() == Some("plain-root"))
+    let turn = probe.followup_turn.load(Ordering::SeqCst);
+    let call_id = format!("owned-followup-{turn}");
+    if turn == 0
+        || body["messages"]
+            .as_array()
             .unwrap()
-            .id;
-        *probe.child_id.lock().unwrap() = Some(id.clone());
-        return (followup_call(&id, 1), "tool_calls");
+            .iter()
+            .any(|m| m["role"] == "tool" && m["tool_call_id"] == call_id)
+    {
+        return (json!({"content":"ROOT_DONE"}), "stop");
     }
-    assert_eq!(result["status"], "message_delivered_live");
     let id = probe.child_id.lock().unwrap().clone().unwrap();
-    assert_eq!(result["child_session_id"], id);
-    probe.deliveries.lock().unwrap().push((
-        bamboo_domain::SessionMessageId::parse(result["message_id"].as_str().unwrap()).unwrap(),
-        result["inbox_generation"].as_u64().unwrap(),
-    ));
-    let limit = if probe.two == Some(TwoFollowups::Overflow) {
-        3
-    } else {
-        2
-    };
-    if round <= limit {
-        (followup_call(&id, round), "tool_calls")
-    } else {
-        (json!({"content":"ROOT_DONE"}), "stop")
+    let mut delta = followup_call(&id, turn);
+    if turn == 2 && probe.two == Some(TwoFollowups::Overflow) {
+        let mut third = followup_call(&id, 3)["tool_calls"][0].clone();
+        third["index"] = json!(1);
+        delta["tool_calls"].as_array_mut().unwrap().push(third);
     }
+    (delta, "tool_calls")
+}
+async fn root_tool_result(
+    probe: &Probe,
+    client: &reqwest::Client,
+    base: &str,
+    call_id: &str,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+            let parent = store.load_session("plain-root").await.unwrap().unwrap();
+            let results: Vec<_> = parent
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == bamboo_domain::Role::Tool
+                        && m.tool_call_id.as_deref() == Some(call_id)
+                })
+                .collect();
+            assert!(results.len() <= 1, "unique actual Root Tool result");
+            let rows: Value = client
+                .get(format!("{base}/sessions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let settled = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "plain-root" && row["is_running"] == false);
+            if settled && !results.is_empty() {
+                return serde_json::from_str(&results[0].content).unwrap_or_else(|_| {
+                    panic!(
+                        "actual {call_id} Tool result: {}",
+                        bounded_diagnostic(&results[0].content, 512)
+                    )
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
 }
 async fn observe_two_provider(body: &Value, probe: &Probe, index: usize) {
     assert!(index < 3, "no fourth provider admission");
@@ -566,7 +586,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     } else if body["model"] == "plain-root" && body["tools"].to_string().contains("SubAgent") {
         let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
         if probe.two.is_some() {
-            two_root_step(&body, &probe, round).await
+            two_root_step(&body, &probe, round)
         } else {
             match round {
                 0 => (
@@ -885,6 +905,7 @@ async fn fixture_with_followups(
     }).unwrap();
     let probe = web::Data::new(Probe {
         root_calls: AtomicUsize::new(0),
+        followup_turn: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
         ready: AtomicBool::new(false),
         release: AtomicBool::new(false),
@@ -972,10 +993,14 @@ async fn fixture_with_followups(
         .unwrap()
         .status()
         .is_success());
+    if two.is_some() {
+        let created = root_tool_result(&probe, &client, &base, "subagent-create").await;
+        assert_eq!(created["status"], "running_in_background");
+        *probe.child_id.lock().unwrap() =
+            Some(created["child_session_id"].as_str().unwrap().to_owned());
+    }
     tokio::time::timeout(Duration::from_secs(60), async {
-        while !probe.ready.load(Ordering::SeqCst)
-            || (two.is_some() && probe.child_id.lock().unwrap().is_none())
-        {
+        while !probe.ready.load(Ordering::SeqCst) {
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1216,34 +1241,77 @@ async fn fixture_with_followups(
         .unwrap();
     }
     if let Some(mode) = two {
-        let count = if mode == TwoFollowups::Overflow { 3 } else { 2 };
         let inbox = bamboo_storage::FileSessionInbox::new(
             std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap()),
             bamboo_domain::SessionInboxLimits::default(),
         );
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
-                    .await
-                    .unwrap();
-                if probe.deliveries.lock().unwrap().len() == count
-                    && backlog.pending == count
-                    && backlog.claimed == 0
-                {
-                    assert_eq!(backlog.generation, count as u64);
-                    let actual = store.load_session(&id).await.unwrap().unwrap();
-                    assert!(!actual
-                        .messages
-                        .iter()
-                        .any(|m| m.content.starts_with("OWNED_ROOT_CORRECTION_")));
-                    break;
-                }
-                assert!(host.0.try_wait().unwrap().is_none());
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        for turn in 1..=2 {
+            probe.followup_turn.store(turn, Ordering::SeqCst);
+            // An actual ordinary Root turn, not a held Child's unavailable model successor.
+            let response = client
+                .post(format!("{base}/chat"))
+                .json(&json!({
+                "session_id":"plain-root", "message":format!("Queue owned correction turn {turn}"),
+                "model":"plain-root", "provider":"openai"}))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "actual correction chat: {}",
+                bounded_diagnostic(&response.text().await.unwrap(), 512)
+            );
+            let dispatch: Value = client
+                .post(format!("{base}/execute/plain-root"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(dispatch["status"], "started");
+            let end = if turn == 2 && mode == TwoFollowups::Overflow {
+                3
+            } else {
+                turn
+            };
+            for index in turn..=end {
+                let result =
+                    root_tool_result(&probe, &client, &base, &format!("owned-followup-{index}"))
+                        .await;
+                assert_eq!(result["status"], "message_delivered_live");
+                assert_eq!(result["child_session_id"], id);
+                assert_eq!(result["message"], format!("OWNED_ROOT_CORRECTION_{index}"));
+                probe.deliveries.lock().unwrap().push((
+                    bamboo_domain::SessionMessageId::parse(result["message_id"].as_str().unwrap())
+                        .unwrap(),
+                    result["inbox_generation"].as_u64().unwrap(),
+                ));
             }
-        })
-        .await
-        .unwrap();
+            let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+                .await
+                .unwrap();
+            assert_eq!(
+                (backlog.pending, backlog.claimed, backlog.generation),
+                (end, 0, end as u64)
+            );
+            assert!(backlog.activation_pending());
+            let current = store.inspect_actor(&id).await.unwrap();
+            assert_eq!(
+                current.activation.as_ref().unwrap().fence(),
+                original_activation.as_ref().unwrap().fence()
+            );
+            assert_eq!(current.actor.current_attempt, 1);
+            let actual = store.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(actual.created_at, before.created_at);
+            assert_eq!(actual.project_id_meta(), before.project_id_meta());
+            assert!(!actual
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with("OWNED_ROOT_CORRECTION_")));
+            assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        }
     }
     probe.release.store(true, Ordering::SeqCst);
     probe.wake.notify_waiters();
@@ -1693,7 +1761,24 @@ async fn finish_two_fixture(
                 .iter()
                 .find(|r| r["id"] == id)
                 .unwrap();
-            if row["is_running"] == false {
+            let parent = store.load_session("plain-root").await.unwrap().unwrap();
+            let root_settled = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == "plain-root" && r["is_running"] == false);
+            if row["is_running"] == false
+                && root_settled
+                && parent.last_run_status().as_deref() == Some("completed")
+            {
+                assert!(
+                    parent
+                        .messages
+                        .iter()
+                        .any(|m| m.role == bamboo_domain::Role::Assistant
+                            && m.content == "ROOT_DONE"),
+                    "actual settled parent successor"
+                );
                 break;
             }
             assert!(host.0.try_wait().unwrap().is_none());
@@ -1724,6 +1809,12 @@ async fn finish_two_fixture(
             .last_run_error()
             .map(|e| e.chars().take(384).collect::<String>())
     );
+    if mode == TwoFollowups::Overflow {
+        assert!(completed
+            .last_run_error()
+            .unwrap()
+            .contains("completed reply committed"));
+    }
     if mode == TwoFollowups::SecondAckFailure {
         assert!(completed
             .last_run_error()

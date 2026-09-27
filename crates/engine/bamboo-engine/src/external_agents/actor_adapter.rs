@@ -6916,7 +6916,7 @@ mod tests {
             .register_run(&child.id, "release-host-run")
             .await
             .unwrap();
-        let activation = PlainActorActivation::start(
+        let mut activation = PlainActorActivation::start(
             store.clone(),
             &child,
             &binding,
@@ -7135,6 +7135,205 @@ mod tests {
             )
             .await
             .is_err());
+        // A second real checkpoint/release reuses the activation, not its old epoch or nonce.
+        let deadlines = (
+            activation.fence.clone(),
+            activation.actor_deadline,
+            activation.input_deadline,
+        );
+        let second = bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RELEASE_TWICE");
+        let receipt = activation.input_inbox.deliver(&second).await.unwrap();
+        activation
+            .input_inbox
+            .mark_activation_eligible(
+                &child.id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let mut link = ConfirmationSequenceLink {
+            frames: VecDeque::new(),
+            sent: Vec::new(),
+        };
+        let epochs = AtomicU64::new(9);
+        let (claim2, epoch2) = activation
+            .continue_input(
+                &mut link,
+                &binding,
+                &mut child,
+                "release-host-run",
+                Some((&run, &epochs)),
+                &mut expected,
+                "SECOND_REPLY".into(),
+                &events,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        events_rx.recv().await.unwrap();
+        assert_eq!(epoch2, 10);
+        let ParentFrame::Run(next) = &link.sent[0] else {
+            panic!("second correlated Run")
+        };
+        assert_eq!(next.logical_session, run.logical_session);
+        assert_eq!(next.activation_run_id, run.activation_run_id);
+        assert_eq!(next.initial_session_messages.len(), 1);
+        assert!(next
+            .messages
+            .iter()
+            .any(|m| m["id"] == envelope.id.as_str()));
+        assert!(next.messages.iter().any(|m| m["content"] == "SECOND_REPLY"));
+        assert!(!next.messages.iter().any(|m| m["id"] == second.id.as_str()));
+        let request2 = bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
+            next,
+            &next.initial_session_messages[0],
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        assert_ne!(request2.nonce, request.nonce);
+        macro_rules! release_second {
+            ($candidate:expr, $request:expr, $epoch:expr, $previous:expr) => {
+                activation
+                    .release_initial_input(
+                        &binding,
+                        $candidate,
+                        next,
+                        $epoch,
+                        &claim2,
+                        $request,
+                        &mut expected,
+                        $previous,
+                    )
+                    .await
+            };
+        }
+        assert!(release_second!(&child, &request, epoch2, None).is_err());
+        assert!(release_second!(&child, &request2, 9, None).is_err());
+        let mut stale2 = child.clone();
+        stale2.add_message(bamboo_agent_core::Message::user("stale second prefix"));
+        assert!(release_second!(&stale2, &request2, epoch2, None).is_err());
+        assert!(!activation
+            .input_inbox
+            .was_admitted(&child.id, &second.id)
+            .await
+            .unwrap());
+        // An actual new scoped deny is an unsupported change to this captured Host policy.
+        let changed = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+        changed.deny_scoped_session_permission(
+            &child.id,
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            "blocked-action",
+        );
+        activation.permission_config = Some(changed);
+        assert!(release_second!(&child, &request2, epoch2, Some(&release2)).is_err());
+        activation.permission_config = None;
+        assert!(!activation
+            .input_inbox
+            .was_admitted(&child.id, &second.id)
+            .await
+            .unwrap());
+        let release2 = release_second!(&child, &request2, epoch2, None).unwrap();
+        assert_eq!(
+            release_second!(&child, &request2, epoch2, Some(&release2)).unwrap(),
+            release2
+        );
+        let mut wrong2 = request2.clone();
+        wrong2.nonce = request.nonce.clone();
+        assert!(release_second!(&child, &wrong2, epoch2, Some(&release2)).is_err());
+        assert!(activation
+            .input_inbox
+            .was_admitted(&child.id, &second.id)
+            .await
+            .unwrap());
+        let expired = bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "EXPIRED_INPUT");
+        let receipt = activation.input_inbox.deliver(&expired).await.unwrap();
+        activation
+            .input_inbox
+            .mark_activation_eligible(
+                &child.id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let expired_claim = activation
+            .input_inbox
+            .claim_owned(
+                &child.id,
+                1,
+                Some("release-host-run"),
+                &SessionInboxLeaseRequest {
+                    consumer: activation.input_consumer.clone(),
+                    now,
+                    duration: chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (prefix, delivery3) = activation
+            .checkpoint_input(&mut child, "release-host-run", &expired_claim)
+            .await
+            .unwrap();
+        let mut expired_run = next.clone();
+        expired_run.execution_epoch = 11;
+        expired_run.messages = prefix;
+        expired_run.initial_session_messages = vec![delivery3.clone()];
+        let expired_request = bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
+            &expired_run,
+            &delivery3,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        tokio::time::sleep(
+            (expired_claim.lease.expires_at - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default(),
+        )
+        .await;
+        assert!(chrono::Utc::now() >= expired_claim.lease.expires_at);
+        assert!(activation
+            .release_initial_input(
+                &binding,
+                &child,
+                &expired_run,
+                11,
+                &expired_claim,
+                &expired_request,
+                &mut expected,
+                None
+            )
+            .await
+            .is_err());
+        assert!(!activation
+            .input_inbox
+            .was_admitted(&child.id, &expired.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            (
+                activation.fence.clone(),
+                activation.actor_deadline,
+                activation.input_deadline
+            ),
+            deadlines
+        );
+        assert_eq!(
+            link.sent.len(),
+            1,
+            "no dispatch from rejected release checks"
+        );
+        let cold = store.load_session(&child.id).await.unwrap().unwrap();
+        for id in [&envelope.id, &second.id] {
+            assert_eq!(
+                cold.messages.iter().filter(|m| m.id == id.as_str()).count(),
+                1
+            );
+            assert!(cold.session_inbox_admission().unwrap().contains(id));
+        }
         activation
             .finish(ActorActivationFinish::Failed)
             .await
