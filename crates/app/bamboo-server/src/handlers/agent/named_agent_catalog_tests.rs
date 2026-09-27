@@ -67,7 +67,7 @@ async fn actual_authenticated_route_uses_durable_project_without_workspace_or_ca
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["status"] == "selectable")
+        .find(|entry| entry["status"] == "selectable" && entry["identity"]["name"] == "reviewer")
         .unwrap();
     assert_eq!(selected["identity"]["source"], "project");
     assert_eq!(selected["identity"]["project_id"], id.as_str());
@@ -79,6 +79,7 @@ async fn actual_authenticated_route_uses_durable_project_without_workspace_or_ca
         "private-hint",
         "\"tools\"",
         "foreign-project",
+        "Builtin role package v1:",
         home.to_str().unwrap(),
     ] {
         assert!(!serialized.contains(private));
@@ -285,7 +286,23 @@ async fn existing_project_backup_recovery_is_usable_and_catalog_creates_no_agent
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["status"], "available");
-    assert!(body["entries"].as_array().unwrap().is_empty());
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let names: std::collections::BTreeSet<_> = entries
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry["status"], "selectable");
+            assert_eq!(entry["identity"]["source"], "builtin");
+            assert!(entry["identity"]["project_id"].is_null());
+            assert_eq!(entry["identity"]["revision"].as_str().unwrap().len(), 64);
+            entry["identity"]["name"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["explorer", "implementer", "reviewer"])
+    );
+    assert!(!body.to_string().contains("Builtin role package v1:"));
     assert_eq!(state.project_store.get(&id).unwrap().id, id); // Existing get recovered the authority; the catalog added no recovery protocol.
     assert!(!home.join("agents").exists());
     assert!(!state
@@ -310,22 +327,21 @@ async fn app_state_homes_remain_distinct_and_anonymous_project_source_disables_h
         let catalog = named_agent_catalog::discover(&state, &session.id, Default::default())
             .await
             .unwrap();
+        let identity = catalog
+            .metadata()
+            .entries
+            .iter()
+            .find_map(|row| {
+                row.identity
+                    .as_ref()
+                    .filter(|identity| identity.name == name)
+            })
+            .unwrap();
         assert_eq!(
-            catalog.metadata().entries[0]
-                .identity
-                .as_ref()
-                .unwrap()
-                .name,
-            name
+            identity.source,
+            bamboo_skills::named_agents::NamedAgentProfileSource::Global
         );
-        assert_eq!(
-            catalog.metadata().entries[0]
-                .identity
-                .as_ref()
-                .unwrap()
-                .project_id,
-            None
-        );
+        assert_eq!(identity.project_id, None);
         let id = ProjectId::parse("assigned").unwrap();
         state
             .project_store
