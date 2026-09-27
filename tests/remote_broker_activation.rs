@@ -270,10 +270,14 @@ async fn wait_calls(p: &Probe, count: usize) {
     .expect("actual resident provider admission");
 }
 async fn host(data: &Path, config: &Value, mode: &str) -> (Process, String) {
-    serde_json::from_value::<bamboo_config::Config>(config.clone())
-        .unwrap()
-        .save_to_dir(data.to_path_buf())
-        .unwrap();
+    let mut candidate = serde_json::from_value::<bamboo_config::Config>(config.clone()).unwrap();
+    bamboo_config::persist_provider_credential_transaction(
+        data,
+        &mut candidate,
+        &std::collections::BTreeSet::from(["openai".to_owned()]),
+    )
+    .unwrap();
+    candidate.save_to_dir(data.to_path_buf()).unwrap();
     let bind = address();
     let base = format!("http://{bind}/api/v1");
     let mut c = command(data);
