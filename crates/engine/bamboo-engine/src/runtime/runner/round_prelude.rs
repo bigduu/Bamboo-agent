@@ -157,6 +157,12 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
             .set_permission_mode(disk_mode);
     }
 
+    // Publish only already-durable messages above, then stop before any prompt
+    // preparation or provider/tool execution uses an input with unresolved ACK.
+    if let Some(error) = turn_refresh.admission_error {
+        return Err(AgentError::Tool(error));
+    }
+
     // A host may tighten Root authority during the prior round's final tool.
     // Refresh its bounded durable proof before prompt/catalog construction so
     // the next provider request cannot advertise an already-revoked tool.

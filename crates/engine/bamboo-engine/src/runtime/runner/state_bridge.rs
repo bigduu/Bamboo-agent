@@ -15,6 +15,8 @@ use bamboo_domain::{
 };
 
 const METADATA_KEY: &str = "agent.runtime.state";
+const INBOX_ACK_UNRESOLVED: &str =
+    "SessionInbox ACK unresolved; durable input is preserved; retry this activation";
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
@@ -187,6 +189,10 @@ pub struct TurnBoundaryRefresh {
     /// boundary. Callers may publish these only after this function returns;
     /// recovery of an already-committed message is intentionally excluded.
     pub committed_messages: Vec<Message>,
+    /// An unresolved ACK stops this activation even if its transcript and
+    /// permanent receipt are already durable. Neither is proof that ACK returned
+    /// successfully; the next safe boundary can retry existing recovery.
+    pub admission_error: Option<String>,
     /// `None` when there was no storage / no on-disk session to read.
     pub disk_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
@@ -484,6 +490,7 @@ pub async fn migrate_legacy_pending_only(
 struct InboxAdmission {
     merged: usize,
     committed_messages: Vec<Message>,
+    admission_error: Option<String>,
 }
 
 async fn admit_session_inbox(
@@ -577,6 +584,7 @@ async fn admit_session_inbox(
                     %error,
                     "failed to remove permanently admitted duplicate"
                 );
+                admission.admission_error = Some(INBOX_ACK_UNRESOLVED.to_string());
                 break;
             }
             continue;
@@ -682,6 +690,7 @@ async fn admit_session_inbox(
                 %error,
                 "SessionInbox checkpoint succeeded but ack failed; dedupe will recover"
             );
+            admission.admission_error = Some(INBOX_ACK_UNRESOLVED.to_string());
             break;
         }
         if !transcript_has_id {
@@ -819,6 +828,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
         return TurnBoundaryRefresh {
             merged: admission.merged,
             committed_messages: admission.committed_messages,
+            admission_error: admission.admission_error,
             disk_permission_mode,
         };
     }
@@ -827,6 +837,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
         return TurnBoundaryRefresh {
             merged: 0,
             committed_messages: Vec::new(),
+            admission_error: None,
             disk_permission_mode,
         };
     };
@@ -837,6 +848,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
         return TurnBoundaryRefresh {
             merged: 0,
             committed_messages: Vec::new(),
+            admission_error: None,
             disk_permission_mode,
         };
     };
@@ -893,6 +905,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
         return TurnBoundaryRefresh {
             merged,
             committed_messages: if saved { appended_messages } else { Vec::new() },
+            admission_error: None,
             disk_permission_mode,
         };
     }
@@ -900,6 +913,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
     TurnBoundaryRefresh {
         merged,
         committed_messages: Vec::new(),
+        admission_error: None,
         disk_permission_mode,
     }
 }
@@ -2166,6 +2180,189 @@ mod tests {
             .unwrap());
         let backlog = reopened.inspect(&running.id).await.unwrap();
         assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+
+    #[derive(Default)]
+    struct AckBoundaryProvider(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl bamboo_llm::LLMProvider for AckBoundaryProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<bamboo_llm::LLMStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(bamboo_llm::LLMChunk::Token("done".into())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn run_ack_boundary(
+        session: &mut Session,
+        storage: Arc<dyn Storage>,
+        persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+        inbox: Arc<dyn SessionInboxPort>,
+        provider: Arc<AckBoundaryProvider>,
+    ) -> (Result<(), AgentError>, Vec<bamboo_agent_core::AgentEvent>) {
+        let (events, mut received) = tokio::sync::mpsc::channel(128);
+        let result = crate::runtime::runner::run_agent_loop_with_config(
+            session,
+            "continue".into(),
+            events,
+            provider,
+            Arc::new(bamboo_tools::BuiltinToolExecutorBuilder::new().build()),
+            tokio_util::sync::CancellationToken::new(),
+            crate::runtime::config::AgentLoopConfig {
+                storage: Some(storage),
+                persistence: Some(persistence),
+                session_inbox: Some(inbox),
+                system_prompt: Some("system".into()),
+                model_name: Some("model".into()),
+                run_budget: bamboo_config::RunBudgetConfig {
+                    max_rounds: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut observed = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            observed.push(event);
+        }
+        (result, observed)
+    }
+
+    #[tokio::test]
+    async fn unresolved_ack_stops_shared_provider_round_and_cold_retry_deduplicates() {
+        for permanent in [false, true] {
+            for after_receipt in [false, true] {
+                let id = format!("ack-stop-{permanent}-{after_receipt}");
+                let (home, store, locked, real_inbox, mut running) =
+                    durable_inbox_fixture(&id).await;
+                let envelope = SessionMessageEnvelope::user_input(&id, "durable input");
+                deliver_interrupt_eligible(&real_inbox, &envelope).await;
+                if permanent {
+                    // Model receipt publication followed by an interrupted cur
+                    // removal using the actual claim bytes and permanent receipt.
+                    let claim = real_inbox.claim(&id, 1).await.unwrap().remove(0);
+                    let path = store
+                        .bamboo_home_dir()
+                        .join(store.resolve_rel_path(&id).await.unwrap())
+                        .join("inbox/cur")
+                        .join(&claim.claim_id);
+                    let raw_claim = tokio::fs::read(&path).await.unwrap();
+                    running.add_message(envelope.to_provider_message().unwrap());
+                    running
+                        .session_inbox_admission_mut()
+                        .record(envelope.id.clone(), claim.generation);
+                    locked
+                        .checkpoint_runtime_session(&mut running)
+                        .await
+                        .unwrap();
+                    real_inbox.ack(&id, &claim).await.unwrap();
+                    tokio::fs::write(&path, raw_claim).await.unwrap();
+                    assert!(real_inbox.was_admitted(&id, &envelope.id).await.unwrap());
+                }
+                let faulted: Arc<dyn SessionInboxPort> = Arc::new(AckAfterPersistErrorInbox {
+                    inner: real_inbox.clone(),
+                    fail_before_once: std::sync::atomic::AtomicBool::new(!after_receipt),
+                    fail_after_once: std::sync::atomic::AtomicBool::new(after_receipt),
+                });
+                let provider = Arc::new(AckBoundaryProvider::default());
+                let (result, events) = run_ack_boundary(
+                    &mut running,
+                    store.clone(),
+                    locked,
+                    faulted,
+                    provider.clone(),
+                )
+                .await;
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SessionInbox ACK unresolved"));
+                assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event,
+                    bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. }
+                    if message_id == envelope.id.as_str()))
+                        .count(),
+                    usize::from(!permanent)
+                );
+                assert_eq!(
+                    real_inbox.was_admitted(&id, &envelope.id).await.unwrap(),
+                    permanent || after_receipt
+                );
+                assert_eq!(
+                    real_inbox.inspect(&id).await.unwrap().claimed,
+                    usize::from(!after_receipt)
+                );
+
+                let reopened = Arc::new(
+                    bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                        .await
+                        .unwrap(),
+                );
+                let mut retry = reopened.load_session(&id).await.unwrap().unwrap();
+                assert_eq!(
+                    retry
+                        .messages
+                        .iter()
+                        .filter(|message| bamboo_domain::is_matching_session_message(
+                            message, &envelope
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(retry
+                    .session_inbox_admission()
+                    .unwrap()
+                    .contains(&envelope.id));
+                let storage: Arc<dyn Storage> = reopened.clone();
+                let persistence =
+                    Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+                let inbox: Arc<dyn SessionInboxPort> =
+                    Arc::new(bamboo_storage::FileSessionInbox::new(
+                        reopened.clone(),
+                        bamboo_domain::SessionInboxLimits::default(),
+                    ));
+                let (result, events) = run_ack_boundary(
+                    &mut retry,
+                    storage,
+                    persistence,
+                    inbox.clone(),
+                    provider.clone(),
+                )
+                .await;
+                result.unwrap();
+                assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+                assert!(!events.iter().any(|event| matches!(event,
+                    bamboo_agent_core::AgentEvent::MessageAppended { message_id, .. }
+                    if message_id == envelope.id.as_str())));
+                assert!(inbox.was_admitted(&id, &envelope.id).await.unwrap());
+                let backlog = inbox.inspect(&id).await.unwrap();
+                assert_eq!(backlog.pending + backlog.claimed, 0);
+                let durable = reopened.load_session(&id).await.unwrap().unwrap();
+                assert_eq!(
+                    durable
+                        .messages
+                        .iter()
+                        .filter(|message| bamboo_domain::is_matching_session_message(
+                            message, &envelope
+                        ))
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]
