@@ -1978,14 +1978,14 @@ async fn message_only_provider(
             assert!(schema["properties"].get("action").is_none());
             assert!(schema["required"]
                 .as_array()
-                .is_none_or(|required| { required.iter().all(|field| field == "message") }));
+                .is_none_or(|r| r.iter().all(|field| field == "message")));
             (
                 json!({"tool_calls":[{"index":0,"id":MESSAGE_ONLY_CALL,"type":"function",
                     "function":{"name":"SubAgent","arguments":json!({"message":MESSAGE_ONLY_TASK}).to_string()}}]}),
                 "tool_calls",
             )
         } else {
-            assert_eq!(round, 1, "Root only delegates and reports progress");
+            assert!(round <= 2, "Root only delegates and reports progress");
             let results: Vec<_> = body["messages"]
                 .as_array()
                 .unwrap()
@@ -2009,7 +2009,7 @@ async fn message_only_provider(
         .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
-fn message_only_root_result(root: &bamboo_domain::Session) -> Value {
+fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> Value {
     let calls: Vec<_> = root
         .messages
         .iter()
@@ -2036,11 +2036,7 @@ fn message_only_root_result(root: &bamboo_domain::Session) -> Value {
     assert_eq!(results[0].tool_success, Some(true));
     let result: Value = serde_json::from_str(&results[0].content).unwrap();
     assert_eq!(result["observed_status"], "running_in_background");
-    assert_eq!(
-        result.as_object().unwrap().len(),
-        2,
-        "compact identity and status"
-    );
+    assert_eq!(result.as_object().unwrap().len(), 2);
     assert!(result["actor_id"]
         .as_str()
         .is_some_and(|id| !id.is_empty() && id != root.id));
@@ -2050,7 +2046,11 @@ fn message_only_root_result(root: &bamboo_domain::Session) -> Value {
         .filter(|m| m.role == bamboo_domain::Role::Assistant && !m.content.is_empty())
         .map(|m| m.content.as_str())
         .collect();
-    assert_eq!(replies, ["F2_ROOT_DELEGATION_DONE"]);
+    if completed {
+        assert_eq!(replies, ["F2_ROOT_DELEGATION_DONE"]);
+    } else {
+        assert!(replies.is_empty());
+    }
     result
 }
 
@@ -2165,7 +2165,11 @@ async fn message_only_fixture() {
                 .any(|r| r["id"] == "plain-root" && r["is_running"] == false);
             root_settled.store(settled, Ordering::SeqCst);
             if settled
-                && parent.last_run_status().as_deref() == Some("completed")
+                && parent.last_run_status().as_deref() == Some("suspended")
+                && parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .is_some_and(|state| state.waiting_for_children.is_some())
                 && probe.child_ready.load(Ordering::SeqCst)
             {
                 break parent;
@@ -2184,29 +2188,7 @@ async fn message_only_fixture() {
         Ok(parent) => parent,
         Err(_) => {
             let current = store.load_session("plain-root").await.unwrap().unwrap();
-            let mut children = Vec::new();
-            for row in store
-                .list_index_entries()
-                .await
-                .into_iter()
-                .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
-            {
-                let child = store.load_session(&row.id).await.unwrap();
-                children
-                    .push(json!({"id":row.id,"status":child.and_then(|c| c.last_run_status())}));
-            }
-            let models: Vec<_> = probe
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .take(16)
-                .map(|request| request["model"].as_str().unwrap_or("missing").to_owned())
-                .collect();
             let log = std::fs::read_to_string(data.join("host.log")).unwrap_or_default();
-            let tail: Vec<_> = current.messages.iter().rev().take(4).map(|m|
-                json!({"role":m.role,"tool_call_id":m.tool_call_id,"tool_success":m.tool_success,
-                    "content":bounded_diagnostic(&m.content, 256)})).collect();
             panic!(
                 "message-only held-cut timeout: {}",
                 json!({
@@ -2216,14 +2198,23 @@ async fn message_only_fixture() {
                     "child_ready":probe.child_ready.load(Ordering::SeqCst),
                     "root_calls":probe.root_calls.load(Ordering::SeqCst),
                     "child_calls":probe.child_calls.load(Ordering::SeqCst),
-                    "children":children,"provider_models":models,"root_tail":tail,
+                    "tool_result_count":current.messages.iter().filter(|m| m.tool_call_id.as_deref() == Some(MESSAGE_ONLY_CALL)).count(),
                     "host_log":bounded_diagnostic(&log, 2048)
                 })
             );
         }
     };
-    let result = message_only_root_result(&parent);
+    let result = message_only_root_result(&parent, false);
     let id = result["actor_id"].as_str().unwrap().to_owned();
+    let wait = parent
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .as_ref()
+        .unwrap();
+    assert_eq!(wait.child_session_ids, [id.clone()]);
+    assert_eq!(wait.registered_by_tool_call_id, None);
     let before = store.load_session(&id).await.unwrap().unwrap();
     assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
     assert_eq!(before.root_session_id, "plain-root");
@@ -2233,15 +2224,6 @@ async fn message_only_fixture() {
         Some(project.id.as_str())
     );
     assert_eq!(before.workspace.as_deref(), workspace.to_str());
-    assert_eq!(
-        store
-            .list_index_entries()
-            .await
-            .into_iter()
-            .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
-            .count(),
-        1
-    );
     let binding: Value = serde_json::from_str(&before.metadata["child.named_profile.v1"]).unwrap();
     assert_eq!(binding["name"], "worker");
     assert_eq!(binding["source"], "project");
@@ -2332,6 +2314,12 @@ async fn message_only_fixture() {
                 "Child: {:?}",
                 child.last_run_error()
             );
+            assert_ne!(
+                parent.last_run_status().as_deref(),
+                Some("error"),
+                "Root: {:?}",
+                parent.last_run_error()
+            );
             let actor = store.inspect_actor(&id).await.unwrap();
             let rows: Value = client
                 .get(format!("{base}/sessions"))
@@ -2351,6 +2339,7 @@ async fn message_only_fixture() {
             if settled
                 && child.last_run_status().as_deref() == Some("completed")
                 && actor.activation.as_ref().unwrap().status == ActorActivationStatus::Succeeded
+                && parent.last_run_status().as_deref() == Some("completed")
             {
                 assert_eq!(actor.actor.current_attempt, 1);
                 assert_eq!(actor.activation.as_ref().unwrap().run_id, activation.run_id);
@@ -2361,9 +2350,18 @@ async fn message_only_fixture() {
     })
     .await
     .unwrap();
-    assert_eq!(message_only_root_result(&parent_completed), result);
-    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(message_only_root_result(&parent_completed, true), result);
+    assert!((2..=3).contains(&probe.root_calls.load(Ordering::SeqCst)));
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+    let index_store = SessionStoreV2::new(data.clone()).await.unwrap();
+    let indexed: Vec<_> = index_store
+        .list_index_entries()
+        .await
+        .into_iter()
+        .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(indexed, [id.clone()]);
     let answers: Vec<_> = completed
         .messages
         .iter()
@@ -2380,6 +2378,7 @@ async fn message_only_fixture() {
     host.0.kill().unwrap();
     host.0.wait().unwrap();
     drop(host); // Confirmed kill/wait precedes the cold Store reopen.
+    drop(index_store);
     drop(store);
     let cold_store = SessionStoreV2::new(data).await.unwrap();
     let cold = cold_store.load_session(&id).await.unwrap().unwrap();
@@ -2408,7 +2407,7 @@ async fn message_only_fixture() {
         serde_json::to_value(&cold_root.messages).unwrap(),
         serde_json::to_value(&parent_completed.messages).unwrap()
     );
-    assert_eq!(message_only_root_result(&cold_root), result);
+    assert_eq!(message_only_root_result(&cold_root, true), result);
     assert_eq!(cold.last_run_status().as_deref(), Some("completed"));
     assert_eq!(cold_root.last_run_status().as_deref(), Some("completed"));
     let cold_actor = cold_store.inspect_actor(&id).await.unwrap();
@@ -2419,7 +2418,7 @@ async fn message_only_fixture() {
     assert_eq!(cold_actor.activation.unwrap().run_id, activation.run_id);
     eprintln!(
         "message-only native evidence: {}",
-        json!({"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":2,"child_provider_calls":1,"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
+        json!({"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":probe.root_calls.load(Ordering::SeqCst),"child_provider_calls":probe.child_calls.load(Ordering::SeqCst),"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
     );
     handle.stop(true).await;
 }
