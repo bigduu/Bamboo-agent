@@ -27,21 +27,166 @@ struct Probe {
     wake: tokio::sync::Notify,
     requests: Mutex<Vec<Value>>,
     child_id: Mutex<Option<String>>,
+    first_worker_run: Mutex<Option<(PathBuf, Vec<u8>)>>,
     data: PathBuf,
     workspace: PathBuf,
     reasoning: bool,
     replay: bool,
     glob: bool,
     correction: bool,
+    retry: bool,
 }
 fn call(args: Value) -> Value {
     json!({"tool_calls":[{"index":0,"id":format!("subagent-{}",args["action"].as_str().unwrap()),"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]})
 }
+fn provider_request_shape(body: &Value) -> String {
+    let messages = body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let text_has = |needle: &str| {
+        messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(needle))
+        })
+    };
+    let mut diagnostic = json!({
+        "stream":body["stream"].as_bool(),
+        "messages":messages.len(),
+        "roles":messages.iter().take(16).map(|m| match m["role"].as_str() {
+            Some("system") => "system", Some("user") => "user", Some("assistant") => "assistant",
+            Some("tool") => "tool", _ => "other",
+        }).collect::<Vec<_>>(),
+        "content_shapes":messages.iter().take(16).map(|m| {
+            if m["content"].is_string() { "string" } else if m["content"].is_array() { "array" } else { "other" }
+        }).collect::<Vec<_>>(),
+        "tools":body["tools"].as_array().map(|tools| tools.iter().take(8).map(|tool| {
+            tool["function"]["name"].as_str().unwrap_or("unknown").chars().take(32).collect::<String>()
+        }).collect::<Vec<_>>()),
+        "correction_exact":messages.iter().filter(|m| m["content"] == "CORRECTION_FROM_ACTUAL_ROOT").count(),
+        "correction_embedded":text_has("CORRECTION_FROM_ACTUAL_ROOT"),
+        "array_correction_text_parts":messages.iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|part| part["text"].as_str().is_some_and(|text| text.contains("CORRECTION_FROM_ACTUAL_ROOT"))).count(),
+        "assignment":text_has("Delegated child assignment"),
+        "task_evaluation":text_has("You are a task progress evaluator"),
+        "permission_reviewer":text_has("You are a security reviewer"),
+        "max_tokens":body["max_tokens"].as_u64(),
+        "max_completion_tokens":body["max_completion_tokens"].as_u64(),
+    }).to_string();
+    let mut end = diagnostic.len().min(1900);
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic.truncate(end);
+    diagnostic
+}
+fn bounded_diagnostic(text: &str, cap: usize) -> &str {
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+async fn provider_host_phase(probe: &Probe) -> Value {
+    let Some(id) = probe.child_id.lock().unwrap().clone() else {
+        return json!({"child_id_available":false});
+    };
+    let Ok(store) = SessionStoreV2::new(probe.data.clone()).await else {
+        return json!({"host_store_available":false});
+    };
+    let store = std::sync::Arc::new(store);
+    let actor = store.inspect_actor(&id).await.ok().map(|entry| {
+        json!({"attempt":entry.actor.current_attempt,"state":entry.actor.state,
+            "activation":entry.activation.map(|a| json!({"status":a.status,
+                "run_id":a.run_id,"inbox_generation":a.inbox_generation}))})
+    });
+    let child = store.load_session(&id).await.ok().flatten();
+    let inbox =
+        bamboo_storage::FileSessionInbox::new(store, bamboo_domain::SessionInboxLimits::default());
+    let generation = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+        .await
+        .ok()
+        .map(|state| state.generation);
+    json!({"actor":actor,"last_run_status":child.and_then(|c| c.last_run_status()),
+        "inbox_generation":generation})
+}
+fn print_bounded_retry_log(data: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(data.join("host.log")) else {
+        return;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(16 * 1024)))
+        .is_err()
+    {
+        return;
+    }
+    let mut tail = Vec::new();
+    if file.take(16 * 1024).read_to_end(&mut tail).is_err() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&tail)
+        .lines()
+        .filter(|line| {
+            line.contains("Turn") && line.contains("failed") && line.contains("Retrying")
+        })
+        .take(4)
+    {
+        eprintln!(
+            "actual existing Engine retry: {}",
+            bounded_diagnostic(line, 1024)
+        );
+    }
+}
+fn claimed_required_runs(data: &Path) -> Vec<(PathBuf, Vec<u8>, bamboo_subagent::RunSpec)> {
+    use std::io::Read;
+    let mut runs = Vec::new();
+    for mailbox in std::fs::read_dir(data.join("broker/mailboxes"))
+        .unwrap()
+        .take(17)
+    {
+        let mailbox = mailbox.unwrap();
+        if !mailbox
+            .file_name()
+            .to_str()
+            .unwrap()
+            .starts_with("required-worker-")
+        {
+            continue;
+        }
+        for entry in std::fs::read_dir(mailbox.path().join("cur"))
+            .unwrap()
+            .take(5)
+        {
+            let path = entry.unwrap().path();
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 256 * 1024);
+            let message: bamboo_subagent::InboxMessage = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(message.kind, bamboo_subagent::InboxKind::Run);
+            runs.push((path, bytes, serde_json::from_value(message.body).unwrap()));
+        }
+    }
+    assert!(runs.len() <= 2);
+    runs
+}
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
+    let mut emits_reasoning = false;
     let (delta, finish) = if body["model"] == "plain-child" {
         let child_call = probe.child_calls.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "actual plain-child request index={child_call} shape={}",
+            provider_request_shape(&body)
+        );
         probe.ready.store(true, Ordering::SeqCst);
         while !probe.release.load(Ordering::SeqCst) {
             let wake = probe.wake.notified();
@@ -50,7 +195,56 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             }
             wake.await;
         }
-        if probe.correction && child_call == 1 {
+        if probe.retry {
+            {
+                let runs = claimed_required_runs(&probe.data);
+                let mut first = probe.first_worker_run.lock().unwrap();
+                if child_call == 0 {
+                    assert_eq!(runs.len(), 1);
+                    assert!(runs[0].2.initial_session_messages.is_empty());
+                    *first = Some((runs[0].0.clone(), runs[0].1.clone()));
+                } else if child_call == 1 {
+                    assert_eq!(runs.len(), 2);
+                    let (old_path, old_bytes) = first.as_ref().unwrap();
+                    let old = runs.iter().find(|r| &r.0 == old_path).unwrap();
+                    assert_eq!(&old.1, old_bytes, "old unACKed Run remains untouched");
+                    let new = runs.iter().find(|r| &r.0 != old_path).unwrap();
+                    assert_ne!(
+                        new.0.parent().unwrap().parent(),
+                        old_path.parent().unwrap().parent()
+                    );
+                    assert_eq!(new.2.logical_session, old.2.logical_session);
+                    assert_eq!(new.2.project_id, old.2.project_id);
+                    assert_ne!(new.2.activation_run_id, old.2.activation_run_id);
+                    assert_eq!(new.2.initial_session_messages.len(), 1);
+                    let mailbox = |path: &Path| {
+                        path.parent()
+                            .unwrap()
+                            .parent()
+                            .unwrap()
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    eprintln!(
+                        "actual distinct worker mailboxes old={} new={} old Run still unACKed",
+                        mailbox(old_path),
+                        mailbox(&new.0)
+                    );
+                    assert_eq!(
+                        new.2.logical_session.as_ref().unwrap().session_id,
+                        probe.child_id.lock().unwrap().as_ref().unwrap().as_str()
+                    );
+                }
+            }
+            eprintln!(
+                "actual plain-child request index={child_call} Host phase={}",
+                provider_host_phase(&probe).await
+            );
+        }
+        if (probe.correction || probe.retry) && child_call == 1 {
             assert_eq!(
                 body["messages"]
                     .as_array()
@@ -63,17 +257,31 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             let id = probe.child_id.lock().unwrap().clone().unwrap();
             let store = std::sync::Arc::new(SessionStoreV2::new(probe.data.clone()).await.unwrap());
             let canonical = store.load_session(&id).await.unwrap().unwrap();
-            let first = canonical
-                .messages
-                .iter()
-                .position(|m| m.content == "INITIAL_BEFORE_CORRECTION")
-                .unwrap();
+            if probe.retry {
+                let entry = store.inspect_actor(&id).await.unwrap();
+                assert_eq!(entry.actor.current_attempt, 2);
+                assert_eq!(
+                    entry.activation.unwrap().status,
+                    ActorActivationStatus::Running
+                );
+                assert!(!canonical
+                    .messages
+                    .iter()
+                    .any(|m| m.role == bamboo_domain::Role::Assistant));
+            }
             let message = canonical
                 .messages
                 .iter()
                 .find(|m| m.content == "CORRECTION_FROM_ACTUAL_ROOT")
                 .unwrap();
-            assert_eq!(canonical.messages[first + 1].id, message.id);
+            if probe.correction {
+                let first = canonical
+                    .messages
+                    .iter()
+                    .position(|m| m.content == "INITIAL_BEFORE_CORRECTION")
+                    .unwrap();
+                assert_eq!(canonical.messages[first + 1].id, message.id);
+            }
             let envelope_id = bamboo_domain::SessionMessageId::parse(message.id.clone()).unwrap();
             assert!(
                 canonical
@@ -97,7 +305,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             .await
             .unwrap();
         }
-        if probe.reasoning {
+        if probe.reasoning || (probe.retry && child_call == 0) {
+            emits_reasoning = true;
             (json!({"content":"UNSUPPORTED_REPLY"}), "stop")
         } else if probe.correction && child_call == 0 {
             (json!({"content":"INITIAL_BEFORE_CORRECTION"}), "stop")
@@ -128,7 +337,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
                 call(
-                    json!({"action":"create","title":"Zero-tool Child","responsibility":if probe.glob {"Verify the assigned file using Glob once, then return one plain reply"} else {"Return exactly one plain answer; do not use tools"},"prompt":if probe.glob {"Find owned-marker.txt with Glob once and report the result"} else {"Respond with a plain answer inside this task boundary"},"subagent_type":if probe.glob {"explorer"} else {"plain-reply"},"workspace":probe.workspace,"auto_run":probe.correction}),
+                    json!({"action":"create","title":"Zero-tool Child","responsibility":if probe.glob {"Verify the assigned file using Glob once, then return one plain reply"} else {"Return exactly one plain answer; do not use tools"},"prompt":if probe.glob {"Find owned-marker.txt with Glob once and report the result"} else {"Respond with a plain answer inside this task boundary"},"subagent_type":if probe.glob {"explorer"} else {"plain-reply"},"workspace":probe.workspace,"auto_run":probe.correction || probe.retry}),
                 ),
                 "tool_calls",
             ),
@@ -150,7 +359,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 });
                 assert_eq!(
                     created["status"],
-                    if probe.correction {
+                    if probe.correction || probe.retry {
                         "running_in_background"
                     } else {
                         "created"
@@ -166,7 +375,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .unwrap()
                     .id;
                 *probe.child_id.lock().unwrap() = Some(id.clone());
-                if probe.correction {
+                if probe.correction || probe.retry {
                     tokio::time::timeout(Duration::from_secs(30), async {
                         while !probe.ready.load(Ordering::SeqCst) {
                             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -174,9 +383,39 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     })
                     .await
                     .unwrap();
+                    if probe.retry {
+                        tokio::time::timeout(Duration::from_secs(60), async {
+                            loop {
+                                let actual = store.inspect_actor(&id).await.unwrap();
+                                let child = store.load_session(&id).await.unwrap().unwrap();
+                                if actual.activation.as_ref().unwrap().status
+                                    == ActorActivationStatus::Failed
+                                    && child.last_run_status().as_deref() == Some("error")
+                                {
+                                    eprintln!(
+                                        "actual first Failed run={} error={}",
+                                        actual.activation.as_ref().unwrap().run_id,
+                                        bounded_diagnostic(
+                                            child.last_run_error().as_deref().unwrap_or("none"),
+                                            512
+                                        )
+                                    );
+                                    assert_eq!(actual.actor.current_attempt, 1);
+                                    assert!(!child
+                                        .messages
+                                        .iter()
+                                        .any(|m| m.role == bamboo_domain::Role::Assistant));
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }
                     (
                         call(json!({"action":"send_message","child_session_id":id,
-                        "message":"CORRECTION_FROM_ACTUAL_ROOT","interrupt_running":false})),
+                        "message":"CORRECTION_FROM_ACTUAL_ROOT","interrupt_running":false,"auto_run":true})),
                         "tool_calls",
                     )
                 } else {
@@ -201,7 +440,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     };
     // Keep the published #1414 reasoning-only fixture shape when adding this
     // correction case: answer+reasoning in one delta is not a ReasoningToken.
-    let reasoning_event = if body["model"] == "plain-child" && probe.reasoning {
+    let reasoning_event = if emits_reasoning {
         let reasoning = json!({"id":"plain-actor","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"UNSUPPORTED_NATIVE_REASONING"},"finish_reason":null}]});
         format!("data: {reasoning}\n\n")
     } else {
@@ -244,7 +483,7 @@ fn start(data: &Path, port: u16) -> Host {
             .unwrap(),
     )
 }
-async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
+async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, retry: bool) {
     let temp = tempfile::tempdir().unwrap();
     let temp_root = temp.path().canonicalize().unwrap();
     let data = temp_root.join("host");
@@ -274,12 +513,14 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
         wake: Default::default(),
         requests: Mutex::new(vec![]),
         child_id: Mutex::new(None),
+        first_worker_run: Mutex::new(None),
         data: data.clone(),
         workspace: workspace.clone(),
         reasoning,
-        replay: ultra && !reasoning && !correction && !glob,
+        replay: ultra && !reasoning && !correction && !glob && !retry,
         correction,
         glob,
+        retry,
     });
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
@@ -430,7 +671,16 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
         loop {
             let child = store.load_session(&id).await.unwrap().unwrap();
             let status = child.last_run_status();
-            if matches!(status.as_deref(), Some("completed" | "error" | "cancelled")) {
+            if matches!(status.as_deref(), Some("completed" | "error" | "cancelled"))
+                && (!retry
+                    || store
+                        .inspect_actor(&id)
+                        .await
+                        .unwrap()
+                        .actor
+                        .current_attempt
+                        == 2)
+            {
                 break child;
             }
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
@@ -462,12 +712,15 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
         );
     }
     let child_calls = probe.child_calls.load(Ordering::SeqCst);
-    let expected_calls = if correction || (glob && !reasoning) {
+    let expected_calls = if correction || retry || (glob && !reasoning) {
         2
     } else {
         1
     };
     if child_calls != expected_calls {
+        if retry {
+            print_bounded_retry_log(&data);
+        }
         let actor = store.inspect_actor(&id).await.map(|entry| {
             json!({"state":entry.actor.state,"attempt":entry.actor.current_attempt,
                 "activation":entry.activation.map(|a| a.status)})
@@ -509,6 +762,13 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
             );
             assert_eq!(finished_activation.lease_owner, original.lease_owner);
             assert_eq!(finished_activation.lease_epoch, original.lease_epoch);
+        }
+        if retry {
+            let original = original_activation.as_ref().unwrap();
+            assert_eq!(finished.actor.current_attempt, 2);
+            assert!(finished_activation.lease_epoch > original.lease_epoch);
+            assert_ne!(finished_activation.run_id, original.run_id);
+            assert_ne!(finished_activation.lease_owner, original.lease_owner);
         }
         assert_eq!(
             finished_activation.status,
@@ -656,6 +916,72 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
             .unwrap();
         assert_eq!((backlog.pending, backlog.claimed), (0, 0));
     }
+    if retry {
+        assert_eq!(cold.root_session_id, before.root_session_id);
+        assert_eq!(cold.spawn_depth, before.spawn_depth);
+        assert_eq!(cold.project_id_meta(), before.project_id_meta());
+        let corrective = cold
+            .messages
+            .iter()
+            .position(|m| m.content == "CORRECTION_FROM_ACTUAL_ROOT")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&cold.messages[..corrective]).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert_eq!(cold.messages[corrective].role, bamboo_domain::Role::User);
+        assert_eq!(cold.messages[corrective + 1].content, "FENCED_PLAIN_REPLY");
+        assert_eq!(corrective + 2, cold.messages.len());
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|v| v.get("_bamboo_owned_input_checkpoint").is_some()))
+                .count(),
+            1
+        );
+        let id =
+            bamboo_domain::SessionMessageId::parse(cold.messages[corrective].id.clone()).unwrap();
+        assert!(cold.session_inbox_admission().unwrap().contains(&id));
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            reopened.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        assert!(
+            bamboo_domain::SessionInboxPort::was_admitted(&inbox, &cold.id, &id)
+                .await
+                .unwrap()
+        );
+        let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &cold.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (backlog.pending, backlog.claimed, backlog.generation),
+            (0, 0, 1)
+        );
+        assert!(reopened
+            .finish_activation(
+                &original_activation.as_ref().unwrap().fence(),
+                chrono::Utc::now(),
+                bamboo_domain::ActorActivationFinish::Failed
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(
+                &reopened
+                    .load_session(&cold.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .messages
+            )
+            .unwrap(),
+            serde_json::to_value(&cold.messages).unwrap()
+        );
+    }
     if ultra {
         assert_eq!(
             reopened
@@ -664,7 +990,7 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
                 .unwrap()
                 .actor
                 .current_attempt,
-            1
+            if retry { 2 } else { 1 }
         );
     }
     handle.stop(true).await;
@@ -672,16 +998,21 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool) {
 #[actix_web::test]
 async fn actual_zero_tool_child_uses_host_actor_commit_and_preserves_legacy() {
     for (ultra, reasoning) in [(true, false), (true, true), (false, false)] {
-        Box::pin(fixture(ultra, reasoning, false, false)).await;
+        Box::pin(fixture(ultra, reasoning, false, false, false)).await;
     }
 }
 
 #[actix_web::test]
 async fn actual_owned_readonly_glob_has_one_pair_and_cold_host_history() {
-    Box::pin(fixture(true, false, false, true)).await;
+    Box::pin(fixture(true, false, false, true, false)).await;
 }
 
 #[actix_web::test]
 async fn actual_owned_child_admits_root_correction_before_second_provider() {
-    Box::pin(fixture(true, false, true, false)).await;
+    Box::pin(fixture(true, false, true, false, false)).await;
+}
+
+#[actix_web::test]
+async fn actual_failed_owned_child_retries_one_new_root_input() {
+    Box::pin(fixture(true, false, false, false, true)).await;
 }

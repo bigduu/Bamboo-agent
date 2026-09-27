@@ -924,6 +924,15 @@ impl ActorChildRunner {
         });
     }
 
+    fn fresh_required_worker_spec(spec: &ProvisionSpec) -> ProvisionSpec {
+        let mut physical = spec.clone();
+        // A killed one-shot worker may leave an unACKed Run in its mailbox.
+        // A fresh subscriber must not replay that Run. Logical birth, storage
+        // namespace, typed input targets and authority remain on the RunSpec.
+        physical.identity.child_id = format!("required-worker-{}", uuid::Uuid::new_v4());
+        physical
+    }
+
     /// Check out a warm bus worker for `key`, reusing a live parked one if any,
     /// else spawning a fresh one that dials the bus. The returned worker is OWNED
     /// by the caller for the run's duration (checkout removes it from the pool, so
@@ -935,7 +944,8 @@ impl ActorChildRunner {
         spec: &ProvisionSpec,
     ) -> crate::runtime::runner::Result<PooledWorker> {
         if spec.capabilities.required_child_context {
-            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, spec)
+            let physical = Self::fresh_required_worker_spec(spec);
+            let worker = spawn_worker_on_bus(&self.worker_bin, &self.worker_args, &physical)
                 .await
                 .map_err(|error| {
                     AgentError::LLM(format!("required-context worker spawn failed: {error}"))
@@ -1611,14 +1621,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 return Err(plain_actor_unsupported());
             }
             if root.root_orchestration_only_enabled() {
-                if session
-                    .messages
-                    .iter()
-                    .any(|message| matches!(message.role, Role::Assistant | Role::Tool))
-                    || !session.provider_transcript.is_empty()
-                    || session.session_inbox_admission().is_some()
-                    || session.pending_injected_messages().is_some()
-                {
+                if !plain_initial_history(session) {
                     return Err(plain_actor_unsupported());
                 }
                 Some(store)
@@ -1751,7 +1754,7 @@ impl ExternalChildRunner for ActorChildRunner {
             policy_resolution.unwrap_or(provisioned_permission),
             has_explicit_deny,
         )?;
-        let expected_permission_posture =
+        let mut expected_permission_posture =
             expected_executor_mapping.map(|executor_mapping| ExpectedPermissionPosture {
                 policy_revision: permission_policy
                     .as_ref()
@@ -2003,7 +2006,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
                 _ => Vec::new(),
             };
-            let initial_session_messages = initial_pairs
+            let mut initial_session_messages = initial_pairs
                 .iter()
                 .map(|(_, delivery)| delivery.clone())
                 .collect::<Vec<_>>();
@@ -2013,7 +2016,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 .collect::<VecDeque<_>>();
             // Recompute after claim reconciliation: a warm retry may have had a
             // canonical receipt whose transcript proof was restored above.
-            let messages = if let Some(binding) = &required_context {
+            let mut messages = if let Some(binding) = &required_context {
                 binding
                     .validate_messages(&session.id, &session.messages)
                     .map_err(|error| AgentError::Budget(error.to_string()))?;
@@ -2056,16 +2059,23 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
             }
             if let Some(store) = &plain_actor_store {
-                let started = PlainActorActivation::start(
+                let started = PlainActorActivation::start_and_prepare(
                     store.clone(),
                     session,
                     session_inbox_runtime.as_ref().unwrap(),
                     bound_activation_run_id.as_deref(),
                     self.permission_config.clone(),
+                    !readonly_actor,
                 )
                 .await;
                 match started {
-                    Ok(activation) => plain_activation = Some(activation),
+                    Ok((activation, prepared)) => {
+                        if let Some((prefix, delivery)) = prepared {
+                            messages = prefix;
+                            initial_session_messages = vec![delivery];
+                        }
+                        plain_activation = Some(activation);
+                    }
                     Err(error) => {
                         if let Some(run_id) = bound_activation_run_id.as_deref() {
                             session_inbox_runtime
@@ -2105,7 +2115,24 @@ impl ExternalChildRunner for ActorChildRunner {
                 initial_session_messages,
                 secrets: run_secrets.clone(),
             };
-            if let Err(e) = client.send(ParentFrame::Run(run_spec.clone())).await {
+            let dispatch = async {
+                if let Some(activation) = plain_activation
+                    .as_ref()
+                    .filter(|activation| activation.initial_input.is_some())
+                {
+                    activation.refresh_continuation_posture(
+                        session,
+                        &run_spec,
+                        &mut expected_permission_posture,
+                    )?;
+                }
+                client
+                    .send(ParentFrame::Run(run_spec.clone()))
+                    .await
+                    .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))
+            }
+            .await;
+            if let Err(e) = dispatch {
                 if let (Some(binding), Some(run_id)) = (
                     session_inbox_runtime.as_ref(),
                     bound_activation_run_id.as_deref(),
@@ -2121,7 +2148,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 if let Some(activation) = &plain_activation {
                     activation.finish(ActorActivationFinish::Failed).await?;
                 }
-                return Err(AgentError::LLM(format!("actor run dispatch failed: {e}")));
+                return Err(e);
             }
 
             // Register as a live actor so send_message (running, no interrupt) can
@@ -2376,21 +2403,35 @@ async fn require_unowned_glob(
     Ok(())
 }
 
-// Fresh zero-tool or read-only Glob named Child of a durable Ultra Root.
-// Glob uses its exact typed tail; only zero-tool supports one typed correction.
-// No lease renewal/reclaim, raw steering, remote activation or restart is enabled.
+// Zero-tool or read-only Glob named Child of a durable Ultra Root.
+// Glob uses its typed tail; only zero-tool supports correction/Failed retry.
+// No lease renewal/reclaim, raw steering, remote activation or automatic restart.
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
     fence: ActorActivationFence,
+    inbox_generation: u64,
     created_at: chrono::DateTime<chrono::Utc>,
     provider_transcript: bamboo_domain::ProviderTranscriptState,
     input_consumer: SessionInboxConsumerId,
     input_deadline: chrono::DateTime<chrono::Utc>,
     input_inbox: bamboo_storage::FileSessionInbox,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    initial_input: Option<SessionInboxOwnedClaim>,
 }
+type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports one fresh plain activation and at most one bounded typed correction while Running; start a new Child for later continuation. Durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, one bounded correction while Running, or a Failed retry with one new input and no old claim/checkpoint. Other continuation is unsupported; durable history is preserved.".into())
+}
+fn plain_initial_history(session: &Session) -> bool {
+    !session.messages.iter().any(|message| {
+        matches!(message.role, Role::Assistant | Role::Tool)
+            || message
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.get("_bamboo_owned_input_checkpoint").is_some())
+    }) && session.provider_transcript.is_empty()
+        && session.session_inbox_admission().is_none()
+        && session.pending_injected_messages().is_none()
 }
 impl PlainActorActivation {
     // Callee-side boxing keeps this storage chain out of the already large
@@ -2401,6 +2442,7 @@ impl PlainActorActivation {
         binding: &'a SessionInboxRuntimeBinding,
         run_id: Option<&'a str>,
         permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+        allow_failed_retry: bool,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Self, AgentError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -2410,17 +2452,28 @@ impl PlainActorActivation {
                 .inspect(&session.id)
                 .await
                 .map_err(|_| plain_actor_unsupported())?;
-            if backlog.pending != 0 || backlog.claimed != 0 || backlog.generation != 0 {
-                return Err(plain_actor_unsupported());
-            }
             let entry = store
                 .ensure_actor(&session.id)
                 .await
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
-            if entry.actor.current_attempt != 0
-                || entry.actor.state != ActorLogicalState::Cold
-                || entry.activation.is_some()
-            {
+            let fresh = entry.actor.current_attempt == 0
+                && entry.actor.state == ActorLogicalState::Cold
+                && entry.activation.is_none()
+                && backlog.pending == 0
+                && backlog.claimed == 0
+                && backlog.generation == 0;
+            let retry = allow_failed_retry
+                && entry.actor.state == ActorLogicalState::Failed
+                && entry.actor.current_attempt > 0
+                && entry.activation.as_ref().is_some_and(|old| {
+                    old.status == bamboo_domain::ActorActivationStatus::Failed
+                        && backlog.generation > old.inbox_generation
+                })
+                && backlog.pending == 1
+                && backlog.claimed == 0
+                && backlog.oldest_generation == Some(backlog.generation)
+                && backlog.activation_pending();
+            if (!fresh && !retry) || !plain_initial_history(session) {
                 return Err(plain_actor_unsupported());
             }
             let now = chrono::Utc::now();
@@ -2439,7 +2492,7 @@ impl PlainActorActivation {
                     run_id: run_id.into(),
                     lease_owner: input_consumer.as_str().into(),
                     lease_expires_at: expires,
-                    inbox_generation: 0,
+                    inbox_generation: backlog.generation,
                     placement_ref: None,
                     now,
                 })
@@ -2452,12 +2505,14 @@ impl PlainActorActivation {
             let activation = Self {
                 store,
                 fence: claimed.fence(),
+                inbox_generation: claimed.inbox_generation,
                 created_at: session.created_at,
                 provider_transcript: session.provider_transcript.clone(),
                 input_consumer,
                 input_deadline: expires.min(now + chrono::Duration::hours(1)),
                 input_inbox,
                 permission_config,
+                initial_input: None,
             };
             if let Err(error) = activation
                 .store
@@ -2468,6 +2523,165 @@ impl PlainActorActivation {
                 return Err(AgentError::LLM(error.to_string()));
             }
             Ok(activation)
+        })
+    }
+    fn start_and_prepare<'a>(
+        store: Arc<bamboo_storage::SessionStoreV2>,
+        session: &'a mut Session,
+        binding: &'a SessionInboxRuntimeBinding,
+        run_id: Option<&'a str>,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+        allow_failed_retry: bool,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                    Output = Result<(Self, Option<PlainInitialDelivery>), AgentError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut activation = Self::start(
+                store,
+                session,
+                binding,
+                run_id,
+                permission_config,
+                allow_failed_retry,
+            )
+            .await?;
+            if activation.inbox_generation == 0 {
+                return Ok((activation, None));
+            }
+            let prepared = async {
+                let run_id = run_id.ok_or_else(plain_actor_unsupported)?;
+                let backlog = activation
+                    .input_inbox
+                    .inspect(&session.id)
+                    .await
+                    .map_err(|_| plain_actor_unsupported())?;
+                if backlog.pending != 1
+                    || backlog.claimed != 0
+                    || backlog.generation != activation.inbox_generation
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                let claim = activation
+                    .claim_input(binding, session, run_id)
+                    .await?
+                    .ok_or_else(plain_actor_unsupported)?;
+                if claim.claim.generation != activation.inbox_generation {
+                    return Err(plain_actor_unsupported());
+                }
+                let delivery = activation.checkpoint_input(session, run_id, &claim).await?;
+                activation.initial_input = Some(claim);
+                Ok(delivery)
+            }
+            .await;
+            match prepared {
+                Ok(delivery) => Ok((activation, Some(delivery))),
+                Err(error) => {
+                    activation.finish(ActorActivationFinish::Failed).await?;
+                    Err(error)
+                }
+            }
+        })
+    }
+    fn claim_input<'a>(
+        &'a self,
+        binding: &'a SessionInboxRuntimeBinding,
+        session: &'a Session,
+        run_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<Option<SessionInboxOwnedClaim>, AgentError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if !self
+                .input_inbox
+                .inspect(&session.id)
+                .await
+                .map_err(|_| plain_actor_unsupported())?
+                .activation_pending()
+            {
+                return Ok(None);
+            }
+            if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
+                return Err(plain_actor_unsupported());
+            }
+            let now = chrono::Utc::now();
+            if now >= self.input_deadline {
+                return Err(plain_actor_unsupported());
+            }
+            let lease = SessionInboxLeaseRequest {
+                consumer: self.input_consumer.clone(),
+                now,
+                duration: self.input_deadline - now,
+            };
+            let claim = self
+                .input_inbox
+                .claim_owned(&session.id, 1, Some(run_id), &lease)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "Actor correction claim unconfirmed");
+                    AgentError::LLM(
+                        "Actor correction claim unconfirmed; durable input is preserved".into(),
+                    )
+                })?
+                .into_iter()
+                .next();
+            if let Some(claim) = &claim {
+                if !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
+                    if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
+                {
+                    return Err(plain_actor_unsupported());
+                }
+            }
+            Ok(claim)
+        })
+    }
+    fn checkpoint_input<'a>(
+        &'a self,
+        session: &'a mut Session,
+        run_id: &'a str,
+        claim: &'a SessionInboxOwnedClaim,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<PlainInitialDelivery, AgentError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // The worker receives the committed pre-input prefix. Only typed
+            // delivery adds the User; the Host-private bookkeeper is not a grant.
+            let messages = session
+                .messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| plain_actor_unsupported())?;
+            let committed = self.input_inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                fence: self.fence.clone(), expected_created_at: self.created_at,
+                claim: claim.clone(), expected_messages: session.messages.clone(),
+                expected_provider_transcript: session.provider_transcript.clone(),
+                expected_admission: session.session_inbox_admission().cloned(),
+            }).await.map_err(|error| {
+                tracing::warn!(%error, "Actor correction checkpoint rejected or unconfirmed; no worker dispatch or ACK");
+                AgentError::LLM("Actor correction checkpoint unconfirmed; durable Inbox and history are preserved".into())
+            })?;
+            *session = committed.session;
+            Ok((
+                messages,
+                SessionMessageDelivery {
+                    target_session_id: session.id.clone(),
+                    envelope: committed.envelope,
+                    canonical_claim_generation: committed.generation,
+                    activation_run_id: run_id.into(),
+                    activation_policy: claim.claim.activation_policy,
+                },
+            ))
         })
     }
     fn append_reply<'a>(
@@ -2525,80 +2739,14 @@ impl PlainActorActivation {
         >,
     > {
         Box::pin(async move {
-            if !self
-                .input_inbox
-                .inspect(&session.id)
-                .await
-                .map_err(|_| plain_actor_unsupported())?
-                .activation_pending()
-            {
-                return Ok(None);
-            }
-            if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
-                return Err(plain_actor_unsupported());
-            }
-            let now = chrono::Utc::now();
-            if now >= self.input_deadline {
-                return Err(plain_actor_unsupported());
-            }
-            let lease = SessionInboxLeaseRequest {
-                consumer: self.input_consumer.clone(),
-                now,
-                duration: self.input_deadline - now,
-            };
-            let claim = self
-                .input_inbox
-                .claim_owned(&session.id, 1, Some(run_id), &lease)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "Actor correction claim unconfirmed");
-                    AgentError::LLM(
-                        "Actor correction claim unconfirmed; durable input is preserved".into(),
-                    )
-                })?
-                .into_iter()
-                .next();
-            let Some(claim) = claim else {
+            let Some(claim) = self.claim_input(binding, session, run_id).await? else {
                 return Ok(None);
             };
             let (run, epochs) = run.ok_or_else(plain_actor_unsupported)?;
-            // Narrow text-only admission before touching the canonical Main.
-            if !matches!(&claim.claim.envelope.body,
-                bamboo_domain::SessionMessageBody::Content(content)
-                if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
-            {
-                return Err(plain_actor_unsupported());
-            }
             self.append_reply(session, text, event_tx).await?;
-            // The worker receives this committed prefix; the following User is
-            // carried by typed delivery, without the Host-private bookkeeper.
-            let messages = session
-                .messages
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| plain_actor_unsupported())?;
-            let committed = self.input_inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
-                fence: self.fence.clone(), expected_created_at: self.created_at,
-                claim: claim.clone(), expected_messages: session.messages.clone(),
-                expected_provider_transcript: session.provider_transcript.clone(),
-                expected_admission: session.session_inbox_admission().cloned(),
-            }).await.map_err(|error| {
-                tracing::warn!(%error, "Actor correction checkpoint rejected or unconfirmed; no worker dispatch or ACK");
-                AgentError::LLM("Actor correction checkpoint unconfirmed; durable Inbox and history are preserved".into())
-            })?;
-            // Never fabricate or merge a candidate after the actual final writer.
-            *session = committed.session;
-            // The first Run allocated a new Host audit. Bind the second Run to
-            // this actual checkpoint readback, never the old dispatch witness.
+            let (messages, delivery) = self.checkpoint_input(session, run_id, &claim).await?;
+            // Fresh actual Host audit, unchanged permission/ceiling checks.
             self.refresh_continuation_posture(session, run, expected_posture)?;
-            let delivery = SessionMessageDelivery {
-                target_session_id: session.id.clone(),
-                envelope: committed.envelope,
-                canonical_claim_generation: committed.generation,
-                activation_run_id: run_id.into(),
-                activation_policy: claim.claim.activation_policy,
-            };
             let epoch = epochs
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
@@ -4027,8 +4175,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut got_first_frame = false;
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     let mut inflight_claims = initial_inflight_claims;
-    let mut owned_input: Option<SessionInboxOwnedClaim> = None;
-    let mut continued = false;
+    let mut owned_input = plain_input.and_then(|activation| activation.initial_input.clone());
+    let mut continued = owned_input.is_some();
     let mut current_epoch = execution_epoch;
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
@@ -5221,6 +5369,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_actor_retry_checkpoints_new_input_and_rejects_old_or_stale_state() {
+        for case in [
+            "accepted",
+            "readonly-refusal",
+            "prefix-refusal",
+            "old-claim",
+            "old-checkpoint",
+            "succeeded",
+            "changed-birth",
+            "oversize",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let parent = Session::new("retry-parent", "model");
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                Session::new_child_of("retry-child", &parent, "model", "original assignment");
+            child.add_message(bamboo_agent_core::Message::user("original assignment"));
+            store.save_session(&child).await.unwrap();
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let binding = actor_binding(store.clone(), inbox, locked);
+            let registration = binding
+                .router
+                .register_run(&child.id, "first-run")
+                .await
+                .unwrap();
+            let first = PlainActorActivation::start(
+                store.clone(),
+                &child,
+                &binding,
+                Some("first-run"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            if matches!(case, "old-claim" | "old-checkpoint") {
+                let old = bamboo_domain::SessionMessageEnvelope::user_input(
+                    &child.id,
+                    "unconfirmed old input",
+                );
+                let receipt = first.input_inbox.deliver(&old).await.unwrap();
+                first
+                    .input_inbox
+                    .mark_activation_eligible(
+                        &child.id,
+                        receipt.generation,
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+                let claim = first
+                    .claim_input(&binding, &child, "first-run")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if case == "old-checkpoint" {
+                    first
+                        .checkpoint_input(&mut child, "first-run", &claim)
+                        .await
+                        .unwrap();
+                }
+            }
+            first
+                .finish(if case == "succeeded" {
+                    ActorActivationFinish::Succeeded
+                } else {
+                    ActorActivationFinish::Failed
+                })
+                .await
+                .unwrap();
+            drop(registration);
+            let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+                &child.id,
+                if case == "oversize" {
+                    "x".repeat(8193)
+                } else {
+                    "NEW_CORRECTION".into()
+                },
+            );
+            let receipt = first.input_inbox.deliver(&envelope).await.unwrap();
+            first
+                .input_inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let before = store.load_session(&child.id).await.unwrap().unwrap();
+            let expected_messages = serde_json::to_value(&before.messages).unwrap();
+            child = before.clone();
+            if case == "prefix-refusal" {
+                child.messages.last_mut().unwrap().content = "stale cached prefix".into();
+            }
+            if case == "changed-birth" {
+                child.created_at += chrono::Duration::milliseconds(1);
+            }
+            let _retry_registration = binding
+                .router
+                .register_run(&child.id, "retry-run")
+                .await
+                .unwrap();
+            let result = PlainActorActivation::start_and_prepare(
+                store.clone(),
+                &mut child,
+                &binding,
+                Some("retry-run"),
+                None,
+                case != "readonly-refusal",
+            )
+            .await;
+            if case != "accepted" {
+                assert!(result.is_err(), "{case}: no retry Run may be dispatched");
+                let actual = store.load_session(&before.id).await.unwrap().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&actual.messages).unwrap(),
+                    expected_messages,
+                    "{case}: failed preparation preserves Main history"
+                );
+                assert!(
+                    !first
+                        .input_inbox
+                        .was_admitted(&before.id, &envelope.id)
+                        .await
+                        .unwrap(),
+                    "{case}: no ACK"
+                );
+                if case == "readonly-refusal" {
+                    let entry = store.inspect_actor(&before.id).await.unwrap();
+                    assert_eq!(entry.actor.current_attempt, 1);
+                    assert_eq!(
+                        entry.activation.unwrap().activation_id,
+                        first.fence.activation_id
+                    );
+                    let backlog = first.input_inbox.inspect(&before.id).await.unwrap();
+                    assert_eq!((backlog.pending, backlog.claimed), (1, 0));
+                }
+                if matches!(case, "prefix-refusal" | "changed-birth" | "oversize") {
+                    assert_eq!(
+                        first.input_inbox.inspect(&before.id).await.unwrap().claimed,
+                        1
+                    );
+                    assert_eq!(
+                        store
+                            .inspect_actor(&before.id)
+                            .await
+                            .unwrap()
+                            .activation
+                            .unwrap()
+                            .status,
+                        bamboo_domain::ActorActivationStatus::Failed
+                    );
+                }
+                continue;
+            }
+            let (retry, prepared) = result.unwrap();
+            let (prefix, delivery) = prepared.unwrap();
+            assert_eq!(
+                prefix,
+                serde_json::to_value(&before.messages)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            );
+            assert_eq!(delivery.envelope, envelope);
+            assert_eq!(delivery.activation_run_id, "retry-run");
+            assert_eq!(delivery.canonical_claim_generation, receipt.generation);
+            assert!(store
+                .validate_fence(&first.fence, chrono::Utc::now())
+                .await
+                .is_err());
+            let running = store.inspect_actor(&child.id).await.unwrap();
+            assert_eq!(running.actor.current_attempt, 2);
+            assert_eq!(
+                running.activation.as_ref().unwrap().status,
+                bamboo_domain::ActorActivationStatus::Running
+            );
+            assert!(running.activation.unwrap().lease_epoch > first.fence.lease_epoch);
+            let claim = retry.initial_input.as_ref().unwrap();
+            assert!(child
+                .session_inbox_admission()
+                .unwrap()
+                .contains(&envelope.id));
+            assert!(
+                !retry
+                    .input_inbox
+                    .was_admitted(&child.id, &envelope.id)
+                    .await
+                    .unwrap(),
+                "checkpoint is not startup confirmation"
+            );
+            let mut confirmation = admission_confirmation(&child.id, &claim.claim, "retry-run");
+            confirmation.activation_run_id = "first-run".into();
+            assert!(retry
+                .confirm_input(&binding, &child, "retry-run", claim, &confirmation)
+                .await
+                .is_err());
+            assert!(!retry
+                .input_inbox
+                .was_admitted(&child.id, &envelope.id)
+                .await
+                .unwrap());
+            confirmation.activation_run_id = "retry-run".into();
+            retry
+                .confirm_input(&binding, &child, "retry-run", claim, &confirmation)
+                .await
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            retry
+                .append_reply(&mut child, "RETRY_REPLY".into(), &tx)
+                .await
+                .unwrap();
+            rx.recv().await.unwrap();
+            retry
+                .finish(ActorActivationFinish::Succeeded)
+                .await
+                .unwrap();
+            let reopened = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let cold = reopened.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(cold.created_at, before.created_at);
+            assert_eq!(cold.messages.len(), before.messages.len() + 2);
+            assert_eq!(
+                cold.messages[before.messages.len()].id,
+                envelope.id.as_str()
+            );
+            assert_eq!(cold.messages.last().unwrap().content, "RETRY_REPLY");
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.id == envelope.id.as_str())
+                    .count(),
+                1
+            );
+            let cold_inbox = bamboo_storage::FileSessionInbox::new(
+                reopened,
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            assert!(cold_inbox
+                .was_admitted(&cold.id, &envelope.id)
+                .await
+                .unwrap());
+            assert_eq!(cold_inbox.inspect(&cold.id).await.unwrap().claimed, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_glob_only_observes_own_initialization_signals() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
@@ -5365,10 +5774,16 @@ mod tests {
                 .register_run(&child.id, run_id)
                 .await
                 .unwrap();
-            let activation =
-                PlainActorActivation::start(store.clone(), &child, &binding, Some(run_id), None)
-                    .await
-                    .unwrap();
+            let activation = PlainActorActivation::start(
+                store.clone(),
+                &child,
+                &binding,
+                Some(run_id),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
             let envelope =
                 bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "CORRECTION_ONCE");
             let receipt = activation.input_inbox.deliver(&envelope).await.unwrap();
@@ -7694,6 +8109,36 @@ mod tests {
                 provision.identity.child_id, expected.session_id,
                 "test fixture must prove transport identity is independent"
             );
+        }
+        let mut original = spec_with("worker", "provider", "model", Some("/ws"), None);
+        original.executor = ExecutorSpec::BambooRuntime;
+        original.identity.depth = session.spawn_depth;
+        original.capabilities.required_child_context = true;
+        original.capabilities.child_creation_identity = true;
+        original.capabilities.enforce_permissions = true;
+        original.capabilities.native_tool_ceiling_required = true;
+        original.capabilities.native_tool_ceiling =
+            Some(bamboo_subagent::proto::NativeToolCeiling {
+                version: 1,
+                child_session_id: session.id.clone(),
+                parent_session_id: job.parent_session_id.clone(),
+                root_session_id: session.root_session_id.clone(),
+                created_at: session.created_at,
+                spawn_depth: session.spawn_depth,
+                project_id: None,
+                tools: vec![],
+            });
+        original.validate().unwrap();
+        let first = ActorChildRunner::fresh_required_worker_spec(&original);
+        let second = ActorChildRunner::fresh_required_worker_spec(&original);
+        assert_ne!(first.identity.child_id, second.identity.child_id);
+        assert_ne!(first.identity.child_id, original.identity.child_id);
+        for physical in [first, second] {
+            physical.validate().unwrap();
+            let mut actual = serde_json::to_value(&physical).unwrap();
+            actual["identity"]["child_id"] = serde_json::json!(original.identity.child_id);
+            assert_eq!(actual, serde_json::to_value(&original).unwrap());
+            assert_eq!(logical_identity_for_actor_run(&session, &job), expected);
         }
     }
 
