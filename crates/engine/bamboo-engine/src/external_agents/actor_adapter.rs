@@ -2519,7 +2519,7 @@ async fn require_unowned_glob(
 }
 
 // Zero-tool or read-only Glob named Child of a durable Ultra Root.
-// Glob uses its typed tail; only zero-tool supports correction/Failed retry.
+// Glob uses its typed tail; fresh zero-tool supports two bounded corrections.
 // No lease renewal/reclaim, raw steering, remote activation or automatic restart.
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
@@ -2538,7 +2538,7 @@ struct PlainActorActivation {
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports a fresh plain activation, one bounded correction while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, two bounded corrections while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4640,7 +4640,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     let mut inflight_claims = initial_inflight_claims;
     let mut owned_input = plain_input.and_then(|activation| activation.initial_input.clone());
-    let mut continued = owned_input.is_some();
+    // Retry/recovery already consumes its one input; only a fresh activation
+    // can continue twice. Neither budget restarts the Actor lease or watchdog.
+    let continuation_limit = if owned_input.is_some() { 1 } else { 2 };
+    let mut continuations = usize::from(owned_input.is_some());
     let mut released_input: Option<(
         SessionInboxOwnedClaim,
         bamboo_subagent::proto::InitialInputRelease,
@@ -5058,14 +5061,14 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             if status == TerminalStatus::Completed {
                                 let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
                                 let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
-                                if !continued {
+                                if continuations < continuation_limit {
                                     if let Some((claim, epoch)) = activation.continue_input(
                                         client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
                                         result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?, event_tx,
                                     ).await? {
                                         owned_input = Some(claim);
                                         released_input = None;
-                                        continued = true;
+                                        continuations += 1;
                                         current_epoch = epoch;
                                         approval_epoch.store(epoch, Ordering::Release);
                                         // These are native coordinates scoped to the newly
@@ -5077,7 +5080,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     }
                                 } else if activation.input_inbox.inspect(&logical_session.id).await
                                     .map_err(|_| plain_actor_unsupported())?.activation_pending() {
-                                    return Err(AgentError::LLM("Only one Actor correction continuation is supported; remaining Inbox input is preserved".into()));
+                                    if continuation_limit == 1 {
+                                        return Err(AgentError::LLM("Only one Actor correction continuation is supported; remaining Inbox input is preserved".into()));
+                                    }
+                                    // The outer success path appends the last reply. An
+                                    // explicit cap refusal must preserve it here instead,
+                                    // without claiming/acking the excess input or saving
+                                    // through the ordinary writer on this owned Actor.
+                                    activation.append_reply(logical_session,
+                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?,
+                                        event_tx).await?;
+                                    return Err(AgentError::LLM("Actor correction continuation limit reached; completed reply committed and remaining Inbox input preserved".into()));
                                 }
                             }
                         }
