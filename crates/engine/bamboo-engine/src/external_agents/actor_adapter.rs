@@ -670,6 +670,86 @@ const CHILD_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// rather than a blind pass. `review` is an LLM call: `drive()` invokes it in a
 /// SPAWNED task (NEVER in the frame pump) and delivers the verdict async via the
 /// live channel, so the agent loop is never blocked.
+/// Process-local Host scope. Durable data can compare its stamp but cannot
+/// deserialize a new live authority from it.
+#[derive(Clone)]
+pub struct ChildApprovalScope {
+    stamp: serde_json::Value,
+    deadline: chrono::DateTime<chrono::Utc>,
+    parent: String,
+    child: String,
+    run: String,
+    epoch: u64,
+    current_epoch: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    router: Arc<crate::SessionActivationRouter>,
+    admission: Arc<AtomicUsize>,
+}
+
+pub struct ChildApprovalAdmission(Arc<AtomicUsize>);
+impl Drop for ChildApprovalAdmission {
+    fn drop(&mut self) {
+        self.0.store(2, Ordering::Release);
+    }
+}
+
+impl ChildApprovalScope {
+    /// Called by the actual Host frame pump, never from a wire payload.
+    pub fn new(
+        parent: &str,
+        child: &str,
+        transport: (u32, &str, u64, &str, chrono::DateTime<chrono::Utc>),
+        router: Arc<crate::SessionActivationRouter>,
+        cancel: CancellationToken,
+        current_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        let (attempt, run, epoch, reply, deadline) = transport;
+        let deadline = deadline.min(chrono::Utc::now() + chrono::Duration::seconds(240));
+        Self {
+            stamp: serde_json::json!({"host_scope": uuid::Uuid::new_v4().to_string(),
+                "attempt": attempt, "run": run, "epoch": epoch, "reply": reply,
+                "deadline": deadline}),
+            deadline,
+            parent: parent.into(),
+            child: child.into(),
+            run: run.into(),
+            epoch,
+            current_epoch,
+            cancel,
+            router,
+            admission: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    pub fn stamp(&self) -> &serde_json::Value {
+        &self.stamp
+    }
+    pub fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
+        self.deadline
+    }
+    pub fn first_admission(&self) -> Option<ChildApprovalAdmission> {
+        self.admission
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ChildApprovalAdmission(self.admission.clone()))
+    }
+    pub fn is_admitting(&self) -> bool {
+        self.admission.load(Ordering::Acquire) == 1
+    }
+    pub async fn is_current(&self, parent: &str, child: &str) -> bool {
+        self.parent == parent
+            && self.child == child
+            && !self.cancel.is_cancelled()
+            && self.current_epoch.load(Ordering::Acquire) == self.epoch
+            && self.router.owns_run(child, &self.run).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildApprovalReview {
+    Reply(bool),
+    NoReply,
+}
+
 #[async_trait]
 pub trait ChildApprovalReviewer: Send + Sync {
     /// Judge whether the gated action `request` (`{tool_name, permission,
@@ -680,6 +760,16 @@ pub trait ChildApprovalReviewer: Send + Sync {
         child_session_id: &str,
         request: &serde_json::Value,
     ) -> bool;
+
+    async fn review_scoped(
+        &self,
+        parent: &str,
+        child: &str,
+        request: &serde_json::Value,
+        _scope: &ChildApprovalScope,
+    ) -> ChildApprovalReview {
+        ChildApprovalReview::Reply(self.review(parent, child, request).await)
+    }
 }
 
 fn child_approval_reviewer_slot() -> &'static std::sync::OnceLock<Arc<dyn ChildApprovalReviewer>> {
@@ -4695,6 +4785,11 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         bamboo_subagent::proto::InitialInputRelease,
     )> = None;
     let mut current_epoch = execution_epoch;
+    let approval_epoch = Arc::new(AtomicU64::new(execution_epoch));
+    let approval_cancel = cancel_token.child_token();
+    let _approval_lifetime = approval_cancel.clone().drop_guard();
+    let mut approval_scopes: HashMap<String, (serde_json::Value, ChildApprovalScope)> =
+        HashMap::new();
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
@@ -4881,20 +4976,45 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             let req_id = id.clone();
                             let body = body.clone();
                             let registry = approval_registry.cloned();
+                            let Some((binding, run)) = session_inbox_runtime.zip(activation_run_id) else {
+                                // Legacy/custom reviewers retain their original boolean seam;
+                                // the canonical server reviewer denies without a live scope.
+                                tokio::spawn(async move {
+                                    let approved = tokio::time::timeout(CHILD_APPROVAL_TIMEOUT,
+                                        reviewer.review(&parent, &child, &body)).await.unwrap_or(false);
+                                    super::live::deliver_approval_scoped(registry.as_ref(), &child,
+                                        child_attempt, &req_id, approved);
+                                });
+                                continue;
+                            };
+                            let generation = body.pointer("/permission_request/request_generation")
+                                .and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                            let scope = if let Some((original, scope)) = approval_scopes.get(&generation) {
+                                if original != &body || scope.stamp()["reply"] != req_id {
+                                    return Err(AgentError::LLM("approval generation changed in live scope".into()));
+                                }
+                                scope.clone()
+                            } else {
+                                if approval_scopes.len() >= 64 {
+                                    return Err(AgentError::LLM("approval live scope limit exceeded".into()));
+                                }
+                                let scope = ChildApprovalScope::new(&parent, &child,
+                                    (child_attempt, run, current_epoch, &req_id, chrono::Utc::now() + chrono::Duration::seconds(240)), binding.router.clone(),
+                                    approval_cancel.clone(), approval_epoch.clone());
+                                approval_scopes.insert(generation, (body.clone(), scope.clone()));
+                                scope
+                            };
                             tokio::spawn(async move {
-                                let approved = tokio::time::timeout(
+                                let result = tokio::time::timeout(
                                     CHILD_APPROVAL_TIMEOUT,
-                                    reviewer.review(&parent, &child, &body),
-                                )
-                                .await
-                                .unwrap_or(false);
-                                super::live::deliver_approval_scoped(
-                                    registry.as_ref(),
-                                    &child,
-                                    child_attempt,
-                                    &req_id,
-                                    approved,
-                                );
+                                    reviewer.review_scoped(&parent, &child, &body, &scope),
+                                ).await.unwrap_or(ChildApprovalReview::Reply(false));
+                                if let ChildApprovalReview::Reply(approved) = result {
+                                    if scope.is_current(&parent, &child).await {
+                                        super::live::deliver_approval_scoped(registry.as_ref(), &child,
+                                            child_attempt, &req_id, approved && chrono::Utc::now() < scope.deadline());
+                                    }
+                                }
                             });
                         } else if approval_decider.is_some() {
                             // A decider is wired (policy / auto): decide promptly
@@ -5086,6 +5206,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         released_input = None;
                                         continued = true;
                                         current_epoch = epoch;
+                                        approval_epoch.store(epoch, Ordering::Release);
                                         // These are native coordinates scoped to the newly
                                         // correlated epoch. Public Host feed seq is untouched.
                                         next_actor_event_seq = 1;

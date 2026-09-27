@@ -760,6 +760,10 @@ impl AppState {
                 provider_router.clone(),
                 session_messenger.clone(),
                 project_store.clone(),
+            )
+            .with_canonical_store(
+                session_store.clone(),
+                permission_checker.permission_config(),
             ),
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
