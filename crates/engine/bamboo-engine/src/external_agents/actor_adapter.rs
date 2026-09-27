@@ -5380,6 +5380,7 @@ mod tests {
             store.save_session(&parent).await.unwrap();
             let mut child =
                 Session::new_child_of("retry-child", &parent, "model", "original assignment");
+            child.add_message(bamboo_agent_core::Message::user("original assignment"));
             store.save_session(&child).await.unwrap();
             let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
             let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
