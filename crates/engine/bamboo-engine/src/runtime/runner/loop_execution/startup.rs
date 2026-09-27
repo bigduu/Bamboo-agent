@@ -185,6 +185,13 @@ pub(super) async fn initialize_loop_state(
         runtime_state.checkpoints = previous.checkpoints.clone();
         runtime_state.hook_contexts = previous.hook_contexts.clone();
         runtime_state.stop_hook_forced_continuations = previous.stop_hook_forced_continuations;
+        // An interrupted tool-owned wait remains durable during this reasoning
+        // turn. Carry its identity, never the old suspended execution status.
+        runtime_state.waiting_for_children = previous
+            .waiting_for_children
+            .as_ref()
+            .filter(|wait| wait.registered_by_tool_call_id.is_some())
+            .cloned();
     }
     runtime_state.llm.model_name = Some(model_name.clone());
     runtime_state.llm.provider_name = config.provider_name.clone();
@@ -440,6 +447,88 @@ mod tests {
             PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap(),
             audit_before
         );
+    }
+
+    #[tokio::test]
+    async fn startup_tagged_wait_survives_real_auto_catalog_publication_without_suspending() {
+        use bamboo_agent_core::storage::Storage;
+        use bamboo_domain::{ChildWaitPolicy, WaitingForChildrenState};
+
+        for tagged in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let skills_dir = directory.path().join("skills");
+            std::fs::create_dir_all(&skills_dir).unwrap();
+            let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+                skills_dir,
+                ..Default::default()
+            }));
+            manager.initialize().await.unwrap();
+            let storage = Arc::new(
+                bamboo_storage::SessionStoreV2::new(directory.path().join("sessions"))
+                    .await
+                    .unwrap(),
+            );
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+            let repo = Arc::new(crate::SessionRepository::new(
+                Arc::default(),
+                storage.clone(),
+                locked,
+            ));
+            let config = AgentLoopConfig {
+                skill_manager: Some(manager),
+                storage: Some(storage.clone()),
+                persistence: Some(repo),
+                ..Default::default()
+            };
+            let mut session = Session::new("startup-interrupted-wait", "model");
+            let mut wait = WaitingForChildrenState::for_children(
+                vec!["child".into()],
+                ChildWaitPolicy::FirstError,
+                chrono::Utc::now() - chrono::Duration::minutes(5),
+            );
+            if tagged {
+                wait.registered_by_tool_call_id = Some("original-tool-call".into());
+            }
+            let runtime = session.agent_runtime_state.get_or_insert_default();
+            runtime.status = AgentStatusState::Suspended;
+            runtime.waiting_for_children = Some(wait.clone());
+            storage.save_session(&session).await.unwrap();
+            let tools = SuccessfulLoadSkill::default();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+            let state = initialize_loop_state(
+                &mut session,
+                "reason about the request",
+                &config,
+                &tools,
+                &event_tx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                session
+                    .metadata
+                    .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                    .map(String::as_str),
+                Some("auto")
+            );
+            let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+            let expected = tagged.then_some(&wait);
+            for runtime in [
+                &state.runtime_state,
+                session.agent_runtime_state.as_ref().unwrap(),
+                saved.agent_runtime_state.as_ref().unwrap(),
+            ] {
+                assert_eq!(runtime.waiting_for_children.as_ref(), expected);
+                assert!(runtime.suspension.is_none());
+            }
+            assert_eq!(state.runtime_state.status, AgentStatusState::Running);
+            assert_eq!(
+                saved.agent_runtime_state.as_ref().unwrap().status,
+                AgentStatusState::Initializing
+            );
+            assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
