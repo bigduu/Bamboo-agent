@@ -1935,6 +1935,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
             RunEscalationBinding(runner.clone())
         });
 
+        let readonly_tail = self.required_child_context
+            && self.read_only_child
+            && self
+                .native_tool_ceiling
+                .as_ref()
+                .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
+        let tail_prefix_len = session.messages.len();
+        let tail_events = events.clone();
         // AgentEvents stream to the parent verbatim (zero mapping).
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
         let forward = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1998,6 +2006,28 @@ impl ChildExecutor for BambooRuntimeExecutor {
 
         match result {
             Ok(()) => {
+                if readonly_tail {
+                    // The Host alone selects the owned route. An ordinary
+                    // strict Glob worker retains its original completion if
+                    // this optional cache observation cannot be represented;
+                    // an owned Host requires it and fails closed when absent.
+                    if let Ok(messages) = session
+                        .messages
+                        .get(tail_prefix_len..)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        let tail =
+                            bamboo_subagent::proto::ReadOnlyActorTranscript::Complete { messages };
+                        if tail.validate().is_ok() {
+                            tail_events
+                                .emit(serde_json::to_value(tail).expect("validated typed tail"))
+                                .await;
+                        }
+                    }
+                }
                 // The result text = the session's final assistant message.
                 let text = session
                     .messages

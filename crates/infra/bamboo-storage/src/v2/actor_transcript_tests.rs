@@ -1025,3 +1025,78 @@ async fn compact_main_append_preserves_legacy_absence_and_rejects_initial_or_fin
     let raw = std::fs::read(directory.join("session.json")).unwrap();
     assert!(compact_main::validate_full_main(&raw).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn actor_glob_pair_preserves_physical_prefix_and_rejects_every_unsupported_tail() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, second, _, mut req) = setup(home.path(), true, ProviderFamily::OpenAi).await;
+    let call = bamboo_domain::ToolCall {
+        id: "actual-glob-call".into(),
+        tool_type: "function".into(),
+        function: bamboo_domain::FunctionCall {
+            name: "Glob".into(),
+            arguments: r#"{"pattern":"marker.txt","limit":1}"#.into(),
+        },
+    };
+    req.messages = vec![
+        Message::assistant("Inspecting the assigned path", Some(vec![call])),
+        Message::tool_result("actual-glob-call", "marker.txt"),
+        Message::assistant("verified", None),
+    ];
+    let directory = actor_dir(home.path(), true);
+    let before = files(&directory);
+    for change in 0..12 {
+        let mut bad = req.clone();
+        match change {
+            0 => {
+                bad.messages[0].tool_calls.as_mut().unwrap()[0]
+                    .function
+                    .name = "Bash".into()
+            }
+            1 => bad.messages[1].tool_call_id = Some("foreign-call".into()),
+            2 => bad.messages[1].tool_success = Some(false),
+            3 => bad.messages[0].tool_calls.as_mut().unwrap()[0].id.clear(),
+            4 => bad.messages.swap(0, 1),
+            5 => {
+                bad.messages.pop();
+            }
+            6 => bad.messages.push(bad.messages[1].clone()),
+            7 => bad.messages[2].role = Role::User,
+            8 => bad.messages[0].reasoning = Some("hidden".into()),
+            9 => bad.messages[1].metadata = Some(json!({"authority":true})),
+            10 => bad.messages[2].compressed = true,
+            _ => {
+                bad.messages[0].tool_calls.as_mut().unwrap()[0]
+                    .function
+                    .arguments = "invalid".into()
+            }
+        }
+        unchanged_rejection(&store, &directory, bad).await;
+    }
+    let actual = store.append_actor_transcript(req.clone()).await.unwrap();
+    let after = files(&directory);
+    assert_eq!(
+        before[1..],
+        after[1..],
+        "Runtime/proof/attachments unchanged"
+    );
+    assert_eq!(
+        raw_field(
+            std::str::from_utf8(before[0].as_ref().unwrap()).unwrap(),
+            "provider_transcript"
+        ),
+        raw_field(
+            std::str::from_utf8(after[0].as_ref().unwrap()).unwrap(),
+            "provider_transcript"
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.messages[req.expected_messages.len()..]).unwrap(),
+        serde_json::to_value(&req.messages).unwrap()
+    );
+    let cold = second.load_session(ID).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&cold.messages).unwrap(),
+        serde_json::to_value(&actual.messages).unwrap()
+    );
+}

@@ -1583,7 +1583,7 @@ impl ExternalChildRunner for ActorChildRunner {
         }
         // Eligibility uses the actual Host callable ceiling, after the strict
         // built-in route and birth capability checks. A role label is not a grant.
-        let zero_tool_store = actor_directory_store.filter(|_| {
+        let first_reply_store = actor_directory_store.filter(|_| {
             required_context.is_some()
                 && crate::session_app::child_session::named_profile::has_named_profile(session)
                 && matches!(spec.placement, Placement::Local)
@@ -1593,9 +1593,12 @@ impl ExternalChildRunner for ActorChildRunner {
                     .capabilities
                     .native_tool_ceiling
                     .as_ref()
-                    .is_some_and(|ceiling| ceiling.tools.is_empty())
+                    .is_some_and(|ceiling| {
+                        ceiling.tools.is_empty()
+                            || (spec.capabilities.read_only_enforced() && ceiling.tools == ["Glob"])
+                    })
         });
-        let plain_actor_store = if let Some(store) = zero_tool_store {
+        let plain_actor_store = if let Some(store) = first_reply_store {
             let root = bamboo_agent_core::storage::Storage::load_session(
                 store.as_ref(),
                 &session.root_session_id,
@@ -1620,7 +1623,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 Some(store)
             } else {
                 // Public bounded observation is only a no-replay check. It is
-                // never an activation grant. Ordinary zero-tool first runs stay legacy.
+                // never an activation grant. Ordinary first runs stay legacy.
                 let observed = store
                     .actor_subtree_snapshot(
                         ActorSnapshotPrincipal::host_owner(),
@@ -1642,6 +1645,13 @@ impl ExternalChildRunner for ActorChildRunner {
         } else {
             None
         };
+        let readonly_actor = plain_actor_store.is_some()
+            && spec
+                .capabilities
+                .native_tool_ceiling
+                .as_ref()
+                .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
+        let mut readonly_messages = Vec::new();
         let mut plain_activation = None;
         if spec.limits.idle_timeout_secs.is_none() {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
@@ -2145,6 +2155,11 @@ impl ExternalChildRunner for ActorChildRunner {
                 // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
                 // on a fixed remote endpoint).
                 plain_actor: plain_activation.is_some(),
+                readonly_output: if readonly_actor {
+                    Some(&mut readonly_messages)
+                } else {
+                    None
+                },
                 first_frame_timeout: Some(WORKER_FIRST_FRAME_TIMEOUT),
             })
             .await;
@@ -2219,7 +2234,11 @@ impl ExternalChildRunner for ActorChildRunner {
         if let Some(activation) = plain_activation {
             return match result {
                 Ok(Some(text)) if !text.is_empty() => {
-                    let message = bamboo_agent_core::Message::assistant(text, None);
+                    let messages = if readonly_actor {
+                        std::mem::take(&mut readonly_messages)
+                    } else {
+                        vec![bamboo_agent_core::Message::assistant(text, None)]
+                    };
                     let committed = activation
                         .store
                         .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
@@ -2227,7 +2246,7 @@ impl ExternalChildRunner for ActorChildRunner {
                             expected_created_at: activation.created_at,
                             expected_messages: activation.messages.clone(),
                             expected_provider_transcript: activation.provider_transcript.clone(),
-                            messages: vec![message.clone()],
+                            messages: messages.clone(),
                             native_groups: Vec::new(),
                         })
                         .await;
@@ -2236,15 +2255,17 @@ impl ExternalChildRunner for ActorChildRunner {
                             // Adopt exactly what the final guarded writer committed.
                             // Later ordinary CP saves cannot fabricate this reply.
                             *session = committed;
-                            let _ = event_tx
-                                .send(AgentEvent::MessageAppended {
-                                    session_id: session.id.clone(),
-                                    message_id: message.id,
-                                    role: message.role,
-                                    content: message.content,
-                                    created_at: message.created_at,
-                                })
-                                .await;
+                            for message in messages {
+                                let _ = event_tx
+                                    .send(AgentEvent::MessageAppended {
+                                        session_id: session.id.clone(),
+                                        message_id: message.id,
+                                        role: message.role,
+                                        content: message.content,
+                                        created_at: message.created_at,
+                                    })
+                                    .await;
+                            }
                             activation.finish(ActorActivationFinish::Succeeded).await
                         }
                         Err(error) => {
@@ -2378,6 +2399,131 @@ impl PlainActorActivation {
             .map_err(|error| AgentError::LLM(format!("Actor completion unconfirmed: {error}")))
     }
 }
+#[derive(Default)]
+struct ReadOnlyActorCollector {
+    start: Option<(String, serde_json::Value)>,
+    result: Option<String>,
+    messages: Option<Vec<bamboo_agent_core::Message>>,
+}
+impl ReadOnlyActorCollector {
+    fn event(&mut self, value: &serde_json::Value) -> Result<bool, AgentError> {
+        if self.messages.is_some() {
+            return Err(plain_actor_unsupported());
+        }
+        if value["type"] == "owned_readonly_transcript" {
+            let tail: bamboo_subagent::proto::ReadOnlyActorTranscript =
+                serde_json::from_value(value.clone()).map_err(|_| plain_actor_unsupported())?;
+            tail.validate().map_err(|_| plain_actor_unsupported())?;
+            let bamboo_subagent::proto::ReadOnlyActorTranscript::Complete { messages } = tail;
+            let typed: Vec<bamboo_agent_core::Message> = messages
+                .iter()
+                .map(|raw| {
+                    let message: bamboo_agent_core::Message =
+                        serde_json::from_value(raw.clone())
+                            .map_err(|_| plain_actor_unsupported())?;
+                    if serde_json::to_value(&message).map_err(|_| plain_actor_unsupported())?
+                        != *raw
+                    {
+                        return Err(plain_actor_unsupported());
+                    }
+                    Ok(message)
+                })
+                .collect::<Result<_, _>>()?;
+            let (id, args) = self.start.as_ref().ok_or_else(plain_actor_unsupported)?;
+            let call = typed[0]
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| {
+                    if calls.len() == 1 {
+                        calls.first()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(plain_actor_unsupported)?;
+            if call.id != *id
+                || call.function.name != "Glob"
+                || serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    .map_err(|_| plain_actor_unsupported())?
+                    != *args
+                || typed[1].tool_call_id.as_ref() != Some(id)
+                || typed[1].tool_success != Some(true)
+                || self.result.as_ref() != Some(&typed[1].content)
+            {
+                return Err(plain_actor_unsupported());
+            }
+            self.messages = Some(typed);
+            return Ok(false);
+        }
+        let event: AgentEvent =
+            serde_json::from_value(value.clone()).map_err(|_| plain_actor_unsupported())?;
+        match event {
+            AgentEvent::ToolStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                if tool_name != "Glob"
+                    || tool_call_id.trim().is_empty()
+                    || self.start.is_some()
+                    || !arguments.is_object()
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                self.start = Some((tool_call_id, arguments));
+                Ok(true)
+            }
+            AgentEvent::ToolComplete {
+                tool_call_id,
+                result,
+            } => {
+                if self.start.as_ref().map(|s| &s.0) != Some(&tool_call_id)
+                    || self.result.is_some()
+                    || !result.success
+                    || !result.images.is_empty()
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                self.result = Some(result.result);
+                Ok(true)
+            }
+            AgentEvent::ToolToken { tool_call_id, .. } => {
+                if self.start.as_ref().map(|s| &s.0) != Some(&tool_call_id) || self.result.is_some()
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                Ok(true)
+            }
+            AgentEvent::ToolLifecycle {
+                tool_call_id,
+                tool_name,
+                is_mutating,
+                phase,
+                error,
+                ..
+            } => {
+                if tool_name != "Glob"
+                    || is_mutating
+                    || !matches!(phase.as_str(), "begin" | "finished")
+                    || error.is_some()
+                    || self.start.as_ref().map(|s| &s.0) != Some(&tool_call_id)
+                {
+                    return Err(plain_actor_unsupported());
+                }
+                Ok(true)
+            }
+            _ => plain_actor_event(value),
+        }
+    }
+    fn finish(self, terminal: Option<&str>) -> Result<Vec<bamboo_agent_core::Message>, AgentError> {
+        let messages = self.messages.ok_or_else(plain_actor_unsupported)?;
+        if terminal != Some(messages[2].content.as_str()) || messages[2].content.trim().is_empty() {
+            return Err(plain_actor_unsupported());
+        }
+        Ok(messages)
+    }
+}
+
 fn plain_actor_event(value: &serde_json::Value) -> Result<bool, AgentError> {
     let event: AgentEvent =
         serde_json::from_value(value.clone()).map_err(|_| plain_actor_unsupported())?;
@@ -2809,6 +2955,7 @@ struct ActorDriveContext<'a> {
     expected_source_actor_id: &'a str,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     plain_actor: bool,
+    readonly_output: Option<&'a mut Vec<bamboo_agent_core::Message>>,
     first_frame_timeout: Option<Duration>,
 }
 
@@ -3575,6 +3722,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         initial_inflight_claims,
         first_frame_timeout,
         plain_actor,
+        readonly_output,
     } = context;
 
     // First-frame watchdog: a live worker emits its first frame (run-started /
@@ -3591,6 +3739,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
     let mut next_actor_event_seq = 1u64;
     let mut display = ActorEventDisplay::default();
+    let mut readonly = readonly_output
+        .as_ref()
+        .map(|_| ReadOnlyActorCollector::default());
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -3637,6 +3788,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                     Ok(Some(ChildFrame::Event { event })) => {
                         if expected_creation.is_some() {
                             return Err(AgentError::LLM("worker omitted required Child creation event identity".into()));
+                        }
+                        if event["type"] == "owned_readonly_transcript" {
+                            if plain_actor { return Err(plain_actor_unsupported()); }
+                            continue;
                         }
                         if plain_actor && !plain_actor_event(&event)? { continue; }
                         // Rolling-upgrade compatibility: old actors have no
@@ -3685,7 +3840,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .min(batch.events.len() as u64) as usize;
                         for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
                             let seq = batch.first_seq + offset as u64;
-                            if plain_actor && !plain_actor_event(&event)? {
+                            let publish = if let Some(collector) = readonly.as_mut() {
+                                if permission_handshake.is_awaiting()
+                                    && event["type"] != "permission_posture_activated" {
+                                    return Err(plain_actor_unsupported());
+                                }
+                                collector.event(&event)?
+                            } else if event["type"] == "owned_readonly_transcript" {
+                                if plain_actor { return Err(plain_actor_unsupported()); }
+                                false // A worker cache observation is not a legacy Host commit.
+                            } else if plain_actor { plain_actor_event(&event)? } else { true };
+                            if !publish {
                                 next_actor_event_seq = seq.saturating_add(1);
                                 continue;
                             }
@@ -3901,6 +4066,11 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 "actor terminated before durably admitting SessionInbox message {}; canonical claim remains recoverable",
                                 claim.envelope.id
                             )));
+                        }
+                        if let (Some(collector), Some(output)) = (readonly, readonly_output) {
+                            if status == TerminalStatus::Completed {
+                                *output = collector.finish(result.as_deref())?;
+                            }
                         }
                         return match status {
                             TerminalStatus::Completed => Ok(result),
@@ -4709,6 +4879,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn owned_glob_collector_requires_actual_ordered_tool_trace_and_typed_tail() {
+        let call = bamboo_domain::ToolCall {
+            id: "glob".into(),
+            tool_type: "function".into(),
+            function: bamboo_domain::FunctionCall {
+                name: "Glob".into(),
+                arguments: r#"{"pattern":"marker.txt"}"#.into(),
+            },
+        };
+        let messages = vec![
+            bamboo_agent_core::Message::assistant("", Some(vec![call])),
+            bamboo_agent_core::Message::tool_result("glob", "marker.txt"),
+            bamboo_agent_core::Message::assistant("done", None),
+        ];
+        let start = serde_json::to_value(AgentEvent::ToolStart {
+            tool_call_id: "glob".into(),
+            tool_name: "Glob".into(),
+            arguments: serde_json::json!({"pattern":"marker.txt"}),
+        })
+        .unwrap();
+        let complete = serde_json::to_value(AgentEvent::ToolComplete {
+            tool_call_id: "glob".into(),
+            result: bamboo_domain::ToolResult::text(true, "marker.txt"),
+        })
+        .unwrap();
+        let tail =
+            serde_json::to_value(bamboo_subagent::proto::ReadOnlyActorTranscript::Complete {
+                messages: messages
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()
+                    .unwrap(),
+            })
+            .unwrap();
+        let mut ordered = ReadOnlyActorCollector::default();
+        assert!(ordered.event(&start).unwrap());
+        assert!(ordered.event(&complete).unwrap());
+        assert!(!ordered.event(&tail).unwrap());
+        assert!(ordered.event(&tail).is_err(), "duplicate suffix");
+        assert_eq!(ordered.finish(Some("done")).unwrap().len(), 3);
+        assert!(ReadOnlyActorCollector::default()
+            .finish(Some("done"))
+            .is_err());
+        let mut unfinished = ReadOnlyActorCollector::default();
+        unfinished.event(&start).unwrap();
+        unfinished.event(&complete).unwrap();
+        assert!(unfinished.finish(Some("done")).is_err(), "missing suffix");
+        let mut closed = tail.clone();
+        closed["grant"] = true.into();
+        assert!(
+            serde_json::from_value::<bamboo_subagent::proto::ReadOnlyActorTranscript>(closed)
+                .is_err()
+        );
+        let mut oversized = tail.clone();
+        oversized["messages"][2]["content"] = "x".repeat(64 * 1024).into();
+        assert!(
+            serde_json::from_value::<bamboo_subagent::proto::ReadOnlyActorTranscript>(oversized)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(ReadOnlyActorCollector::default().event(&complete).is_err());
+        assert!(ReadOnlyActorCollector::default().event(&tail).is_err());
+        let mut bad = start.clone();
+        bad["tool_name"] = "Bash".into();
+        assert!(ReadOnlyActorCollector::default().event(&bad).is_err());
+        let mut duplicate = ReadOnlyActorCollector::default();
+        duplicate.event(&start).unwrap();
+        assert!(duplicate.event(&start).is_err());
+        let hidden = serde_json::to_value(AgentEvent::ReasoningToken {
+            content: "hidden".into(),
+        })
+        .unwrap();
+        assert!(ReadOnlyActorCollector::default().event(&hidden).is_err());
+        let mut mismatched = ReadOnlyActorCollector::default();
+        mismatched.event(&start).unwrap();
+        let mut bad = complete.clone();
+        bad["tool_call_id"] = "foreign".into();
+        assert!(mismatched.event(&bad).is_err());
+        mismatched.event(&complete).unwrap();
+        let mut changed = tail.clone();
+        changed["messages"][1]["content"] = "fabricated".into();
+        assert!(mismatched.event(&changed).is_err());
+    }
+
     fn admission_confirmation(
         session_id: &str,
         claim: &SessionInboxClaim,
@@ -4943,6 +5199,7 @@ mod tests {
             expected_source_actor_id: session_id,
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            readonly_output: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
         .await;
@@ -6143,6 +6400,7 @@ mod tests {
             expected_source_actor_id: session_id,
             initial_inflight_claims: claims,
             plain_actor: false,
+            readonly_output: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
         .await
@@ -7122,6 +7380,7 @@ mod tests {
                 expected_source_actor_id: "child-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                readonly_output: None,
                 first_frame_timeout: None,
             }),
         )
@@ -7188,6 +7447,7 @@ mod tests {
                 expected_source_actor_id: "child-no-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                readonly_output: None,
                 first_frame_timeout: None,
             }),
         )
@@ -7251,6 +7511,7 @@ mod tests {
             expected_source_actor_id: "child-x",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            readonly_output: None,
             first_frame_timeout: Some(Duration::from_millis(100)),
         })
         .await;
@@ -7292,6 +7553,7 @@ mod tests {
             expected_source_actor_id: "child-y",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            readonly_output: None,
             first_frame_timeout: Some(Duration::from_millis(50)),
         })
         .await;

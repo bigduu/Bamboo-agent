@@ -201,6 +201,51 @@ impl Source {
     }
 }
 
+// v1 client-tool extension: exactly one read-only Glob pair and a final reply.
+// Tool availability/permission is independently established by the Host caller.
+fn validate_glob_suffix(messages: &[Message], main: &Session) -> Result<()> {
+    let [call, result, final_reply] = messages else {
+        return Err(ActorTranscriptAppendError::UnsupportedPayload);
+    };
+    let Some(calls) = &call.tool_calls else {
+        return Err(ActorTranscriptAppendError::UnsupportedPayload);
+    };
+    let [tool] = calls.as_slice() else {
+        return Err(ActorTranscriptAppendError::UnsupportedPayload);
+    };
+    if encoded(&messages)?.len() > 64 * 1024
+        || call.role != Role::Assistant
+        || call.phase != Some(bamboo_domain::MessagePhase::Commentary)
+        || call.tool_call_id.is_some()
+        || call.tool_success.is_some()
+        || tool.id.trim().is_empty()
+        || tool.tool_type != "function"
+        || tool.function.name != "Glob"
+        || serde_json::from_str::<serde_json::Value>(&tool.function.arguments)
+            .map_or(true, |args| !args.is_object())
+        || main.messages.iter().any(|m| {
+            m.tool_call_id.as_deref() == Some(tool.id.as_str())
+                || m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.id == tool.id))
+        })
+        || result.role != Role::Tool
+        || result.phase.is_some()
+        || result.tool_calls.is_some()
+        || result.tool_call_id.as_deref() != Some(tool.id.as_str())
+        || result.tool_success != Some(true)
+        || final_reply.role != Role::Assistant
+        || final_reply.phase != Some(bamboo_domain::MessagePhase::FinalAnswer)
+        || final_reply.tool_calls.is_some()
+        || final_reply.tool_call_id.is_some()
+        || final_reply.tool_success.is_some()
+        || final_reply.content.trim().is_empty()
+    {
+        return Err(ActorTranscriptAppendError::UnsupportedPayload);
+    }
+    Ok(())
+}
+
 fn validate_suffix(request: &ActorTranscriptAppend, main: &Session) -> Result<Session> {
     if encoded(&request.expected_messages)? != encoded(&main.messages)?
         || request.expected_provider_transcript != main.provider_transcript
@@ -216,13 +261,24 @@ fn validate_suffix(request: &ActorTranscriptAppend, main: &Session) -> Result<Se
     if request.messages.is_empty() {
         return Err(ActorTranscriptAppendError::UnsupportedPayload);
     }
+    let typed = request
+        .messages
+        .iter()
+        .any(|m| m.tool_calls.is_some() || m.role == Role::Tool);
+    if typed {
+        if !request.native_groups.is_empty() {
+            return Err(ActorTranscriptAppendError::UnsupportedPayload);
+        }
+        validate_glob_suffix(&request.messages, main)?;
+    }
     for m in &request.messages {
         if m.id.trim().is_empty()
             || !ids.insert(m.id.as_str())
-            || m.role != Role::Assistant
-            || m.tool_calls.is_some()
-            || m.tool_call_id.is_some()
-            || m.tool_success.is_some()
+            || (!typed
+                && (m.role != Role::Assistant
+                    || m.tool_calls.is_some()
+                    || m.tool_call_id.is_some()
+                    || m.tool_success.is_some()))
             || m.reasoning.is_some()
             || m.reasoning_signature.is_some()
             || m.content_parts.is_some()
