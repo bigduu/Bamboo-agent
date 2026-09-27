@@ -18,6 +18,11 @@ new native execution epoch reject old frames; public Host feed sequencing stays
 unchanged. The same Actor fence, attempt and original lease/watchdog remain in
 force. There is no second Actor claim/start or early parent success.
 
+Before dispatching the second Run, its permission audit witness is refreshed
+from the actual Host checkpoint readback. The posture and current Host policy
+must still match the original ceiling; changes reject continuation. The existing
+durable audit comparison remains active for the second worker bootstrap.
+
 Only one continuation (two worker Runs) is supported. Text is limited to 8 KiB,
 without parts. Input lease expiry never exceeds the original Actor lease or one
 hour from its initial claim. Direct legacy WS continuation, raw steering,

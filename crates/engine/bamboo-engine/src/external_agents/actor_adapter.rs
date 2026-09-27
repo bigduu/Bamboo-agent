@@ -2041,6 +2041,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     session,
                     session_inbox_runtime.as_ref().unwrap(),
                     bound_activation_run_id.as_deref(),
+                    self.permission_config.clone(),
                 )
                 .await;
                 match started {
@@ -2277,6 +2278,7 @@ struct PlainActorActivation {
     input_consumer: SessionInboxConsumerId,
     input_deadline: chrono::DateTime<chrono::Utc>,
     input_inbox: bamboo_storage::FileSessionInbox,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
 }
 fn plain_actor_unsupported() -> AgentError {
     AgentError::LLM("This Actor Child supports one fresh plain activation and at most one bounded typed correction while Running; start a new Child for later continuation. Durable history is preserved.".into())
@@ -2289,6 +2291,7 @@ impl PlainActorActivation {
         session: &'a Session,
         binding: &'a SessionInboxRuntimeBinding,
         run_id: Option<&'a str>,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Self, AgentError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -2345,6 +2348,7 @@ impl PlainActorActivation {
                 input_consumer,
                 input_deadline: expires.min(now + chrono::Duration::hours(1)),
                 input_inbox,
+                permission_config,
             };
             if let Err(error) = activation
                 .store
@@ -2400,6 +2404,7 @@ impl PlainActorActivation {
         session: &'a mut Session,
         run_id: &'a str,
         run: Option<(&'a RunSpec, &'a AtomicU64)>,
+        expected_posture: &'a mut Option<ExpectedPermissionPosture>,
         text: String,
         event_tx: &'a mpsc::Sender<AgentEvent>,
     ) -> std::pin::Pin<
@@ -2475,6 +2480,9 @@ impl PlainActorActivation {
             })?;
             // Never fabricate or merge a candidate after the actual final writer.
             *session = committed.session;
+            // The first Run allocated a new Host audit. Bind the second Run to
+            // this actual checkpoint readback, never the old dispatch witness.
+            self.refresh_continuation_posture(session, run, expected_posture)?;
             let delivery = SessionMessageDelivery {
                 target_session_id: session.id.clone(),
                 envelope: committed.envelope,
@@ -2497,6 +2505,44 @@ impl PlainActorActivation {
             })?;
             Ok(Some((claim, epoch)))
         })
+    }
+    fn refresh_continuation_posture(
+        &self,
+        session: &Session,
+        run: &RunSpec,
+        expected: &mut Option<ExpectedPermissionPosture>,
+    ) -> Result<(), AgentError> {
+        let Some(expected) = expected.as_mut() else {
+            return Err(plain_actor_unsupported());
+        };
+        let audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+            .ok_or_else(plain_actor_unsupported)?;
+        if audit.policy_revision != expected.policy_revision
+            || audit.resolution != expected.resolution
+            || audit.executor_mapping != expected.executor_mapping
+        {
+            return Err(plain_actor_unsupported());
+        }
+        match (&self.permission_config, &run.permission_policy) {
+            (Some(config), Some(policy)) => {
+                ensure_no_active_scoped_session_denies(config, &session.id)?;
+                if config.policy_revision() != policy.revision
+                    || policy.revision != audit.policy_revision
+                    || policy.session_id != session.id
+                    || policy.workspace_path != session.workspace
+                    || policy.inherit_session_grants
+                    || serde_json::to_value(config.to_serializable())
+                        .map_err(|_| plain_actor_unsupported())?
+                        != policy.policy
+                {
+                    return Err(plain_actor_unsupported());
+                }
+            }
+            (None, None) => {}
+            _ => return Err(plain_actor_unsupported()),
+        }
+        expected.expected_audit_revision = Some(audit.audit_revision);
+        Ok(())
     }
     async fn confirm_input(
         &self,
@@ -3723,7 +3769,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         live_rx,
         delivery_rx,
         logical_session,
-        expected_permission_posture,
+        mut expected_permission_posture,
         expected_creation,
         session_inbox_runtime,
         activation_run_id,
@@ -4084,7 +4130,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
                                 if !continued {
                                     if let Some((claim, epoch)) = activation.continue_input(
-                                        client, binding, logical_session, run_id, plain_run,
+                                        client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
                                         result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?, event_tx,
                                     ).await? {
                                         owned_input = Some(claim);
@@ -4938,7 +4984,7 @@ mod tests {
                 .await
                 .unwrap();
             let activation =
-                PlainActorActivation::start(store.clone(), &child, &binding, Some(run_id))
+                PlainActorActivation::start(store.clone(), &child, &binding, Some(run_id), None)
                     .await
                     .unwrap();
             let envelope =
@@ -4971,6 +5017,27 @@ mod tests {
             };
             let epochs = AtomicU64::new(1);
             let (tx, mut rx) = mpsc::channel(1);
+            let mut expected = Some(expected_default_permission_posture(7));
+            let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+                unreachable!()
+            };
+            process_actor_event(
+                event,
+                true,
+                &mut PermissionPostureHandshake::Awaiting,
+                expected.as_ref(),
+                Some(&binding),
+                &mut child,
+                &tx,
+                &mut ActorEventDisplay::default(),
+            )
+            .await
+            .unwrap();
+            rx.recv().await.unwrap();
+            let first_audit =
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                    .unwrap()
+                    .audit_revision;
             if reject_checkpoint {
                 // A real bounded publication channel blocks AFTER first-reply
                 // commit, so change actual Actor authority before checkpoint.
@@ -4986,6 +5053,7 @@ mod tests {
                 &mut child,
                 run_id,
                 Some((&run, &epochs)),
+                &mut expected,
                 "FIRST_PLAIN_REPLY".into(),
                 &tx,
             );
@@ -5041,6 +5109,7 @@ mod tests {
                 continue;
             }
             let (claim, epoch) = result.unwrap().unwrap();
+            rx.recv().await.unwrap(); // Actual first-reply publication.
             assert_eq!(epoch, 2);
             assert_eq!(link.sent.len(), 1);
             let ParentFrame::Run(next) = &link.sent[0] else {
@@ -5100,6 +5169,32 @@ mod tests {
                 .was_admitted(&child.id, &envelope.id)
                 .await
                 .unwrap());
+            assert_eq!(
+                expected.as_ref().unwrap().expected_audit_revision,
+                Some(first_audit)
+            );
+            let ChildFrame::Event { event } = permission_posture_frame(&child.id, 7) else {
+                unreachable!()
+            };
+            process_actor_event(
+                event,
+                true,
+                &mut PermissionPostureHandshake::Awaiting,
+                expected.as_ref(),
+                Some(&binding),
+                &mut child,
+                &tx,
+                &mut ActorEventDisplay::default(),
+            )
+            .await
+            .unwrap();
+            rx.recv().await.unwrap();
+            assert!(
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                    .unwrap()
+                    .audit_revision
+                    > first_audit
+            );
             let reopened = bamboo_storage::SessionStoreV2::new(temp.path().into())
                 .await
                 .unwrap();

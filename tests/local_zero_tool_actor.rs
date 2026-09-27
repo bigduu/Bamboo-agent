@@ -516,6 +516,15 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool) {
         serde_json::to_value(&completed.messages).unwrap()
     );
     if correction {
+        assert!(
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&cold.metadata)
+                .unwrap()
+                .audit_revision
+                > bamboo_domain::PermissionAuditSnapshot::from_metadata(&before.metadata)
+                    .unwrap()
+                    .audit_revision,
+            "the second Run must durably confirm a fresh Host permission audit"
+        );
         let first = cold
             .messages
             .iter()
