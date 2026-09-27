@@ -1025,3 +1025,100 @@ async fn compact_main_append_preserves_legacy_absence_and_rejects_initial_or_fin
     let raw = std::fs::read(directory.join("session.json")).unwrap();
     assert!(compact_main::validate_full_main(&raw).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn actor_glob_pair_preserves_physical_prefix_and_rejects_every_unsupported_tail() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, second, _, mut req) = setup(home.path(), true, ProviderFamily::OpenAi).await;
+    let call = bamboo_domain::ToolCall {
+        id: "actual-glob-call".into(),
+        tool_type: "function".into(),
+        function: bamboo_domain::FunctionCall {
+            name: "Glob".into(),
+            arguments: r#"{"pattern":"marker.txt","limit":1}"#.into(),
+        },
+    };
+    req.messages = vec![
+        Message::assistant("Inspecting the assigned path", Some(vec![call])),
+        Message::tool_result("actual-glob-call", "marker.txt"),
+        Message::assistant("verified", None),
+    ];
+    req.messages[1].metadata = Some(json!({
+        "elapsed_ms": 17, "is_mutating": false, "auto_approved": true,
+        "tool_name": "Glob", "success": true,
+    }));
+    let directory = actor_dir(home.path(), true);
+    let before = files(&directory);
+    for change in 0..22 {
+        let mut bad = req.clone();
+        match change {
+            0 => {
+                bad.messages[0].tool_calls.as_mut().unwrap()[0]
+                    .function
+                    .name = "Bash".into()
+            }
+            1 => bad.messages[1].tool_call_id = Some("foreign-call".into()),
+            2 => bad.messages[1].tool_success = Some(false),
+            3 => bad.messages[0].tool_calls.as_mut().unwrap()[0].id.clear(),
+            4 => bad.messages.swap(0, 1),
+            5 => {
+                bad.messages.pop();
+            }
+            6 => bad.messages.push(bad.messages[1].clone()),
+            7 => bad.messages[2].role = Role::User,
+            8 => bad.messages[0].reasoning = Some("hidden".into()),
+            9 => bad.messages[1].metadata = Some(json!({"authority":true})),
+            10 => bad.messages[2].compressed = true,
+            11 => {
+                bad.messages[0].tool_calls.as_mut().unwrap()[0]
+                    .function
+                    .arguments = "invalid".into()
+            }
+            12 => {
+                bad.messages[1]
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("elapsed_ms");
+            }
+            13 => bad.messages[1].metadata.as_mut().unwrap()["private"] = json!(true),
+            14 => bad.messages[1].metadata.as_mut().unwrap()["auto_approved"] = json!(false),
+            15 => bad.messages[1].metadata.as_mut().unwrap()["is_mutating"] = json!(true),
+            16 => bad.messages[1].metadata.as_mut().unwrap()["tool_name"] = json!("Bash"),
+            17 => bad.messages[1].metadata.as_mut().unwrap()["success"] = json!(false),
+            18 => bad.messages[1].metadata.as_mut().unwrap()["elapsed_ms"] = json!(-1),
+            19 => bad.messages[1].metadata.as_mut().unwrap()["elapsed_ms"] = json!({"ms":17}),
+            20 => bad.messages[0].metadata = req.messages[1].metadata.clone(),
+            _ => bad.messages[2].metadata = req.messages[1].metadata.clone(),
+        }
+        unchanged_rejection(&store, &directory, bad).await;
+    }
+    let actual = store.append_actor_transcript(req.clone()).await.unwrap();
+    let after = files(&directory);
+    assert_eq!(
+        before[1..],
+        after[1..],
+        "Runtime/proof/attachments unchanged"
+    );
+    assert_eq!(
+        raw_field(
+            std::str::from_utf8(before[0].as_ref().unwrap()).unwrap(),
+            "provider_transcript"
+        ),
+        raw_field(
+            std::str::from_utf8(after[0].as_ref().unwrap()).unwrap(),
+            "provider_transcript"
+        )
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.messages[req.expected_messages.len()..]).unwrap(),
+        serde_json::to_value(&req.messages).unwrap()
+    );
+    let cold = second.load_session(ID).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&cold.messages).unwrap(),
+        serde_json::to_value(&actual.messages).unwrap()
+    );
+}

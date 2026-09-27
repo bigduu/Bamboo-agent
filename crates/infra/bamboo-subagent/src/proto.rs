@@ -76,6 +76,28 @@ pub struct RunSpec {
     pub secrets: RunSecrets,
 }
 
+/// Actual worker message suffix, carried in the existing sequenced event lane.
+/// This cache observation grants nothing; the Host separately validates its
+/// current callable ceiling, event trace and fenced canonical append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum ReadOnlyActorTranscript {
+    #[serde(rename = "owned_readonly_transcript")]
+    Complete { messages: Vec<serde_json::Value> },
+}
+impl ReadOnlyActorTranscript {
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let Self::Complete { messages } = self;
+        if messages.len() != 3
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("owned_readonly_transcript_unsupported");
+        }
+        Ok(())
+    }
+}
+
 /// Logical session ancestry carried across every actor placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSessionIdentity {
