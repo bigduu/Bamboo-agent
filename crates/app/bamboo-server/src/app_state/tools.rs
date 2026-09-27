@@ -282,9 +282,33 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
                 return Err("native_tool_ceiling_owner_unknown".into());
             }
         }
+        let profile =
+            bamboo_engine::session_app::child_session::named_profile::named_profile_tool_names(
+                session,
+            )
+            .map_err(|_| "named_profile_binding_invalid".to_string())?;
+        let child_denied: std::collections::BTreeSet<_> = session
+            .metadata
+            .get("disabled_tools")
+            .map(|raw| {
+                serde_json::from_str::<Vec<String>>(raw)
+                    .map_err(|_| "named_profile_parent_tools_invalid".to_string())
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| self.resolve(name))
+            .collect();
         Ok(bamboo_subagent::proto::NativeToolCeiling::NAMES
             .iter()
-            .filter(|name| self.native_owner(name) && !disabled.contains(**name))
+            .filter(|name| {
+                self.native_owner(name)
+                    && !disabled.contains(**name)
+                    && !child_denied.contains(**name)
+                    && profile
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool == **name))
+            })
             .map(|name| (*name).to_string())
             .collect())
     }

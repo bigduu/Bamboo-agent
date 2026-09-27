@@ -16,10 +16,76 @@ use super::{
 
 pub async fn create_child_action(
     port: &dyn ChildSessionPort,
-    input: CreateChildInput,
+    mut input: CreateChildInput,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
+
+    let profile = port
+        .resolve_named_profile(&input.parent_session, &input.subagent_type)
+        .await?;
+    if let Some(profile) = &profile {
+        if input.lifecycle.as_deref() == Some("resident")
+            || input.resident_name.is_some()
+            || input.context_fork.unwrap_or_default() > 0
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "named_profile_requires_fresh_local_child".into(),
+            ));
+        }
+        input.read_only |= profile.read_only()
+            || bamboo_domain::PermissionAuditSnapshot::from_metadata(
+                &input.parent_session.metadata,
+            )
+            .is_some_and(|audit| audit.resolution.effective == bamboo_domain::PermissionMode::Plan)
+            || input
+                .parent_session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|r| r.read_only || r.plan_mode.is_some());
+        if let Some(model) = profile.model().filter(|_| {
+            !input
+                .runtime_metadata
+                .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
+        }) {
+            input.model_override = Some(model.model.clone());
+            input.model_ref_override = Some(model.clone());
+        }
+        // The existing strict route protects the complete assignment. This
+        // default adds no invented user constraints or parent-history fork.
+        if !input
+            .runtime_metadata
+            .contains_key(bamboo_domain::CHILD_PACKET_INPUT_KEY)
+        {
+            let packet = bamboo_domain::ChildContextPacket {
+                version: 1,
+                objective: input.assignment_prompt.clone(),
+                constraints: Vec::new(),
+                acceptance: vec!["Complete the assigned task; report concrete evidence, verification and remaining blockers.".into()],
+                non_goals: Vec::new(),
+                necessary_user_instructions: Vec::new(),
+                recorded_decisions: Vec::new(),
+                source_user_message_ids: Vec::new(),
+                background_message_ids: Vec::new(),
+            };
+            input.runtime_metadata.insert(
+                bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                serde_json::to_string(&packet).map_err(|_| {
+                    ChildSessionError::InvalidArguments("invalid_child_context_packet".into())
+                })?,
+            );
+        }
+        if let Some(raw) = input.parent_session.metadata.get("disabled_tools") {
+            let parent_denied: std::collections::BTreeSet<String> = serde_json::from_str(raw)
+                .map_err(|_| {
+                    ChildSessionError::Execution("named_profile_parent_tools_invalid".into())
+                })?;
+            input
+                .disabled_tools
+                .get_or_insert_with(Default::default)
+                .extend(parent_denied);
+        }
+    }
 
     // Resolve only from the durable parent, before constructing or persisting a
     // child. The observation is content identity, not task/permission CAS.
@@ -275,7 +341,9 @@ pub async fn create_child_action(
 
     // Apply runtime metadata (e.g. external agent routing).
     for (key, value) in input.runtime_metadata {
-        if key != bamboo_domain::CHILD_PACKET_INPUT_KEY {
+        if key != bamboo_domain::CHILD_PACKET_INPUT_KEY
+            && key != super::named_profile::PROFILE_EXPLICIT_MODEL_KEY
+        {
             child.metadata.insert(key, value);
         }
     }
@@ -293,6 +361,9 @@ pub async fn create_child_action(
             global
         }
     };
+    let base_prompt = profile.as_ref().map_or(base_prompt.clone(), |profile| {
+        profile.append_prompt(&base_prompt)
+    });
     let system_prompt = append_subagent_delegation_contract(&base_prompt);
 
     child
@@ -356,6 +427,10 @@ pub async fn create_child_action(
                 serde_json::to_string(disabled).unwrap_or_default(),
             );
         }
+    }
+
+    if let Some(profile) = profile {
+        profile.bind(&mut child, &input.parent_session)?;
     }
 
     let model = child.model.clone();
@@ -650,6 +725,15 @@ pub async fn update_child_action_with_background(
 
     let should_refresh_assignment =
         responsibility.is_some() || prompt.is_some() || subagent_type.is_some();
+    if super::named_profile::has_named_profile(&child)
+        && (should_refresh_assignment
+            || assignment_background.is_some()
+            || model_ref_override.is_some()
+            || reasoning_effort.is_some())
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "named_profile_contract_is_frozen; create a new Child to select another profile or model".into()));
+    }
     if (should_refresh_assignment || assignment_background.is_some())
         && bamboo_domain::ChildContextBinding::from_session(&child)
             .map_err(|error| ChildSessionError::Execution(error.to_string()))?

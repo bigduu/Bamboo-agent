@@ -33,13 +33,26 @@ pub(crate) async fn discover(
     if session.id != session_id {
         return Err(CatalogError::SessionUnavailable);
     }
+    discover_for_session(
+        &session,
+        state.project_store.clone(),
+        state.app_data_dir.clone(),
+        limits,
+    )
+    .await
+}
+
+pub(crate) async fn discover_for_session(
+    session: &bamboo_domain::Session,
+    projects: std::sync::Arc<bamboo_projects::ProjectStore>,
+    global: std::path::PathBuf,
+    limits: NamedAgentLimits,
+) -> Result<ScopedNamedAgentCatalog, CatalogError> {
     let project_id = match ProjectContextResolver::session_project_identity(&session) {
         SessionProjectIdentity::Unassigned => None,
         SessionProjectIdentity::Assigned(id) => Some(id),
         SessionProjectIdentity::Invalid { .. } => return Err(CatalogError::ProjectUnavailable),
     };
-    let projects = state.project_store.clone();
-    let global = state.app_data_dir.clone();
     tokio::task::spawn_blocking(move || {
         let project = project_id
             .map(|id| {
