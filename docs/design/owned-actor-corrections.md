@@ -41,6 +41,7 @@ actual Inbox must contain exactly one eligible new generation, newer than the
 failed activation. The existing Directory claim/start creates a new attempt
 and lease owner on the same logical Child/birth; it is not renewal of the old
 activation. Live, expired-live, Succeeded and ambiguous old state reject.
+Read-only Glob never enters this retry path; it retains its fresh-only admission.
 
 Before sending the retry Run, the Host claims that actual input and invokes the
 same `ActorInputCheckpoint` consumer as the Running correction. It adopts the

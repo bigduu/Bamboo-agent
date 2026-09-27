@@ -31,6 +31,7 @@ struct Probe {
     workspace: PathBuf,
     reasoning: bool,
     replay: bool,
+    glob: bool,
     correction: bool,
     retry: bool,
 }
@@ -117,14 +118,34 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             (json!({"content":"UNSUPPORTED_REPLY"}), "stop")
         } else if probe.correction && child_call == 0 {
             (json!({"content":"INITIAL_BEFORE_CORRECTION"}), "stop")
+        } else if probe.glob && child_call == 0 {
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(body["tools"][0]["function"]["name"], "Glob");
+            (
+                json!({"tool_calls":[{"index":0,"id":"owned-glob-once","type":"function","function":{"name":"Glob","arguments":json!({"pattern":"owned-marker.txt","limit":1}).to_string()}}]}),
+                "tool_calls",
+            )
         } else {
+            if probe.glob {
+                let results: Vec<_> = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "tool" && m["tool_call_id"] == "owned-glob-once")
+                    .collect();
+                assert_eq!(results.len(), 1);
+                assert!(results[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(probe.workspace.join("owned-marker.txt").to_str().unwrap()));
+            }
             (json!({"content":"FENCED_PLAIN_REPLY"}), "stop")
         }
     } else if body["model"] == "plain-root" && body["tools"].to_string().contains("SubAgent") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
                 call(
-                    json!({"action":"create","title":"Zero-tool Child","responsibility":"Return exactly one plain answer; do not use tools","prompt":"Respond with a plain answer inside this task boundary","subagent_type":"plain-reply","workspace":probe.workspace,"auto_run":probe.correction || probe.retry}),
+                    json!({"action":"create","title":"Zero-tool Child","responsibility":if probe.glob {"Verify the assigned file using Glob once, then return one plain reply"} else {"Return exactly one plain answer; do not use tools"},"prompt":if probe.glob {"Find owned-marker.txt with Glob once and report the result"} else {"Respond with a plain answer inside this task boundary"},"subagent_type":if probe.glob {"explorer"} else {"plain-reply"},"workspace":probe.workspace,"auto_run":probe.correction || probe.retry}),
                 ),
                 "tool_calls",
             ),
@@ -262,7 +283,7 @@ fn start(data: &Path, port: u16) -> Host {
             .unwrap(),
     )
 }
-async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
+async fn fixture(ultra: bool, reasoning: bool, correction: bool, glob: bool, retry: bool) {
     let temp = tempfile::tempdir().unwrap();
     let temp_root = temp.path().canonicalize().unwrap();
     let data = temp_root.join("host");
@@ -276,7 +297,14 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
     let agents = projects.paths().project_home(&project.id).join("agents");
     std::fs::create_dir_all(&agents).unwrap();
     // This is the public named-profile selection path, not a test capability switch.
-    std::fs::write(agents.join("plain-reply.md"), "---\nschema_version: 1\nname: plain-reply\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n").unwrap();
+    if glob {
+        std::fs::write(workspace.join("owned-marker.txt"), "actual read-only file").unwrap();
+    }
+    std::fs::write(agents.join(if glob {"explorer.md"} else {"plain-reply.md"}), if glob {
+        "---\nschema_version: 1\nname: explorer\ndescription: Verify one assigned file\nmodel_hint: openai:plain-child\ntools:\n  allow: [Glob]\n---\nUse Glob exactly once for the assigned file, then return one plain answer.\n"
+    } else {
+        "---\nschema_version: 1\nname: plain-reply\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n"
+    }).unwrap();
     let probe = web::Data::new(Probe {
         root_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
@@ -288,8 +316,9 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
         data: data.clone(),
         workspace: workspace.clone(),
         reasoning,
-        replay: ultra && !reasoning && !correction && !retry,
+        replay: ultra && !reasoning && !correction && !glob && !retry,
         correction,
+        glob,
         retry,
     });
     let server_probe = probe.clone();
@@ -374,14 +403,26 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
     assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
     assert_eq!(before.spawn_depth, 1);
     let binding: Value = serde_json::from_str(&before.metadata["child.named_profile.v1"]).unwrap();
-    assert_eq!(binding["tools"], json!([]));
+    assert_eq!(
+        binding["tools"],
+        if glob { json!(["Glob"]) } else { json!([]) }
+    );
+    if glob {
+        assert!(before.agent_runtime_state.as_ref().unwrap().read_only);
+    }
     let requests = probe.requests.lock().unwrap().clone();
     let child_wire = requests
         .iter()
         .find(|body| body["model"] == "plain-child")
         .unwrap();
     assert!(
-        child_wire["tools"].is_null() || child_wire["tools"].as_array().is_some_and(Vec::is_empty)
+        (glob
+            && child_wire["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Glob"))
+            || (!glob
+                && (child_wire["tools"].is_null()
+                    || child_wire["tools"].as_array().is_some_and(Vec::is_empty)))
     );
     let mut original_activation = None;
     if ultra {
@@ -470,7 +511,11 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
         );
     }
     let child_calls = probe.child_calls.load(Ordering::SeqCst);
-    let expected_calls = if correction || retry { 2 } else { 1 };
+    let expected_calls = if correction || retry || (glob && !reasoning) {
+        2
+    } else {
+        1
+    };
     if child_calls != expected_calls {
         let actor = store.inspect_actor(&id).await.map(|entry| {
             json!({"state":entry.actor.state,"attempt":entry.actor.current_attempt,
@@ -527,7 +572,12 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
                 ActorActivationStatus::Failed
             } else {
                 ActorActivationStatus::Succeeded
-            }
+            },
+            "actual terminal: status={:?}, error={:?}",
+            completed.last_run_status(),
+            completed
+                .last_run_error()
+                .map(|error| error.chars().take(384).collect::<String>())
         );
     } else {
         let observed = store
@@ -571,6 +621,22 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
         serde_json::to_value(&cold.messages).unwrap(),
         serde_json::to_value(&completed.messages).unwrap()
     );
+    if glob && !reasoning {
+        let tail = &cold.messages[cold.messages.len() - 3..];
+        assert_eq!(tail[0].role, bamboo_domain::Role::Assistant);
+        let calls = tail[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "owned-glob-once");
+        assert_eq!(calls[0].function.name, "Glob");
+        assert_eq!(tail[1].role, bamboo_domain::Role::Tool);
+        assert_eq!(tail[1].tool_call_id.as_deref(), Some("owned-glob-once"));
+        assert_eq!(tail[1].tool_success, Some(true));
+        assert!(tail[1].content.contains("owned-marker.txt"));
+        assert_eq!(tail[2].content, "FENCED_PLAIN_REPLY");
+        assert!(tail
+            .iter()
+            .all(|m| m.reasoning.is_none() && m.metadata.is_none()));
+    }
     if correction {
         assert!(
             bamboo_domain::PermissionAuditSnapshot::from_metadata(&cold.metadata)
@@ -720,16 +786,21 @@ async fn fixture(ultra: bool, reasoning: bool, correction: bool, retry: bool) {
 #[actix_web::test]
 async fn actual_zero_tool_child_uses_host_actor_commit_and_preserves_legacy() {
     for (ultra, reasoning) in [(true, false), (true, true), (false, false)] {
-        Box::pin(fixture(ultra, reasoning, false, false)).await;
+        Box::pin(fixture(ultra, reasoning, false, false, false)).await;
     }
 }
 
 #[actix_web::test]
+async fn actual_owned_readonly_glob_has_one_pair_and_cold_host_history() {
+    Box::pin(fixture(true, false, false, true, false)).await;
+}
+
+#[actix_web::test]
 async fn actual_owned_child_admits_root_correction_before_second_provider() {
-    Box::pin(fixture(true, false, true, false)).await;
+    Box::pin(fixture(true, false, true, false, false)).await;
 }
 
 #[actix_web::test]
 async fn actual_failed_owned_child_retries_one_new_root_input() {
-    Box::pin(fixture(true, false, false, true)).await;
+    Box::pin(fixture(true, false, false, false, true)).await;
 }
