@@ -542,6 +542,7 @@ async fn strict_actor_link_fences_source_run_birth_and_order_over_real_wss() {
         "missing",
         "untyped",
     ] {
+        eprintln!("strict scoped WSS case={case}");
         let mut link = BrokerChildLink::connect_strict_with_tls(
             &url,
             host.clone(),
@@ -600,11 +601,7 @@ async fn strict_actor_link_fences_source_run_birth_and_order_over_real_wss() {
             "epoch" => batch.execution_epoch += 1,
             _ => {}
         }
-        let body = if case == "untyped" {
-            json!({"type":"complete"})
-        } else {
-            serde_json::to_value(&batch).unwrap()
-        };
+        let body = serde_json::to_value(&batch).unwrap();
         let msg = |body, from, correlation| InboxMessage {
             id: MsgId::new(),
             from,
@@ -618,13 +615,22 @@ async fn strict_actor_link_fences_source_run_birth_and_order_over_real_wss() {
                 .deliver("a", msg(body, agent("c"), received.id))
                 .await
                 .unwrap();
-        } else {
-            if case == "order" {
+        } else if case == "untyped" {
+            assert!(
                 worker
                     .deliver(
                         "a",
-                        msg(json!({"type":"complete"}), agent("b"), MsgId::new()),
+                        msg(json!({"type":"complete"}), agent("b"), received.id)
                     )
+                    .await
+                    .is_err(),
+                "{case}: scoped Broker rejects untyped Event"
+            );
+            continue;
+        } else {
+            if case == "order" {
+                worker
+                    .deliver("a", msg(body.clone(), agent("b"), MsgId::new()))
                     .await
                     .unwrap();
                 let mut live = batch.clone();
