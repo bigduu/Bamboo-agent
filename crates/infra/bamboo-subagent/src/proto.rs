@@ -98,6 +98,97 @@ impl ReadOnlyActorTranscript {
     }
 }
 
+/// Completion DATA on the existing durable event lane, never Session authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum LocalToolMessages {
+    #[serde(rename = "local_client_tool_messages_v1")]
+    Complete {
+        version: u32,
+        messages: Vec<serde_json::Value>,
+    },
+}
+
+impl LocalToolMessages {
+    pub const TYPE: &'static str = "local_client_tool_messages_v1";
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub const MAX_MESSAGES: usize = 128;
+    pub const MAX_PAIRS: usize = 32;
+
+    pub fn supports_tools(tools: &[String], read_only: bool) -> bool {
+        !tools.is_empty()
+            && !(read_only && tools.len() == 1 && tools[0] == "Glob")
+            && tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "Read" | "Glob" | "Write"))
+    }
+
+    pub fn validate(&self) -> Result<Vec<bamboo_domain::Message>, &'static str> {
+        use std::io::Write;
+        struct Limit(usize);
+        impl Write for Limit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= LocalToolMessages::MAX_BYTES)
+                    .ok_or_else(|| std::io::Error::other("local tool history limit"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Self::Complete { version, messages } = self;
+        if *version != 1
+            || messages.is_empty()
+            || messages.len() > Self::MAX_MESSAGES
+            || serde_json::to_writer(Limit(0), self).is_err()
+        {
+            return Err("local_tool_history_unsupported");
+        }
+        let typed: Vec<bamboo_domain::Message> = messages
+            .iter()
+            .map(|value| {
+                let message: bamboo_domain::Message = serde_json::from_value(value.clone())
+                    .map_err(|_| "local_tool_history_unsupported")?;
+                if serde_json::to_value(&message).map_err(|_| "local_tool_history_unsupported")?
+                    != *value
+                    || message.id.is_empty()
+                    || message.id.len() > 128
+                    || message.reasoning.is_some()
+                    || message.reasoning_signature.is_some()
+                    || message.content_parts.is_some()
+                    || message.image_ocr.is_some()
+                    || message.compressed
+                    || message.compressed_by_event_id.is_some()
+                    || message.compression_level != 0
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+                Ok(message)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut ids = std::collections::HashSet::new();
+        let mut calls = std::collections::HashSet::new();
+        for message in &typed {
+            if !ids.insert(&message.id) {
+                return Err("local_tool_history_unsupported");
+            }
+            for call in message.tool_calls.iter().flatten() {
+                if call.id.is_empty()
+                    || call.id.len() > 128
+                    || !calls.insert(&call.id)
+                    || calls.len() > Self::MAX_PAIRS
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+            }
+        }
+        Ok(typed)
+    }
+}
+
 /// Logical session ancestry carried across every actor placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSessionIdentity {
@@ -780,6 +871,72 @@ impl ChildFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_tool_messages_are_closed_bounded_and_durable() {
+        let raw = serde_json::to_value(bamboo_domain::Message::user("confirmed")).unwrap();
+        let good = LocalToolMessages::Complete {
+            version: 1,
+            messages: vec![raw.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(good.validate().unwrap()[0].clone()).unwrap(),
+            raw
+        );
+        let event = serde_json::to_value(&good).unwrap();
+        assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
+        for field in ["session", "permission", "version_extra"] {
+            let mut changed = event.clone();
+            changed[field] = serde_json::json!({});
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed).is_err(),
+                "{field}"
+            );
+        }
+        for mutation in [
+            "version",
+            "missing",
+            "unknown_message",
+            "reasoning",
+            "compressed",
+            "duplicate",
+            "bytes",
+            "rows",
+        ] {
+            let mut changed = event.clone();
+            match mutation {
+                "version" => changed["version"] = 2.into(),
+                "missing" => {
+                    changed.as_object_mut().unwrap().remove("messages");
+                }
+                "unknown_message" => changed["messages"][0]["cursor"] = 1.into(),
+                "reasoning" => changed["messages"][0]["reasoning"] = "private".into(),
+                "compressed" => changed["messages"][0]["compression_level"] = 1.into(),
+                "duplicate" => changed["messages"] = serde_json::json!([raw, raw]),
+                "bytes" => {
+                    changed["messages"][0]["content"] =
+                        "\\\"".repeat(LocalToolMessages::MAX_BYTES).into()
+                }
+                "rows" => {
+                    changed["messages"] =
+                        serde_json::to_value(vec![raw.clone(); LocalToolMessages::MAX_MESSAGES + 1])
+                            .unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed)
+                    .map_or(true, |data| data.validate().is_err()),
+                "{mutation}"
+            );
+        }
+        assert!(LocalToolMessages::supports_tools(
+            &["Read".into(), "Write".into()],
+            false
+        ));
+        assert!(!LocalToolMessages::supports_tools(&["Glob".into()], true));
+        assert!(!LocalToolMessages::supports_tools(&["Bash".into()], false));
+    }
 
     #[test]
     fn initial_release_schema_is_closed_and_exact() {
