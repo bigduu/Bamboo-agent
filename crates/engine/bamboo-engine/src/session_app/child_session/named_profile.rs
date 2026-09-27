@@ -206,7 +206,8 @@ fn read_binding(session: &Session) -> Result<Option<Binding>, ChildSessionError>
         crate::project_context::SessionProjectIdentity::Unassigned => None,
         crate::project_context::SessionProjectIdentity::Invalid { .. } => return Err(rejected()),
     };
-    let source_valid = binding.source == "global" || binding.source == "project";
+    let source_valid =
+        binding.source == "builtin" || binding.source == "global" || binding.source == "project";
     if binding.version != 1
         || !source_valid
         || binding.child_id != session.id
@@ -217,7 +218,7 @@ fn read_binding(session: &Session) -> Result<Option<Binding>, ChildSessionError>
         || binding.model_ref != session.model_ref
         || binding.scope_project_id != project
         || (binding.source == "project" && binding.project_id != project)
-        || (binding.source == "global" && binding.project_id.is_some())
+        || (binding.source != "project" && binding.project_id.is_some())
         || binding.name.is_empty()
         || binding.name.len() > 64
         || binding.revision.len() != 64
@@ -310,6 +311,9 @@ mod tests {
 
     fn bound(profile: ResolvedChildProfile, parent: &Session) -> Session {
         let mut child = Session::new_child_of("profile-child", parent, "role-model", "role");
+        if let Some(project) = parent.project_id_meta() {
+            child.set_project_id_meta(project);
+        }
         child.model_ref = profile.model.clone();
         child
             .agent_runtime_state
@@ -434,5 +438,54 @@ mod tests {
         assert!(child.messages[0].content.ends_with(&body));
         assert!(child.messages[0].content.contains("GLOBAL_CUSTOM_BASE"));
         validate_named_profile(&child).unwrap();
+    }
+
+    #[test]
+    fn builtin_binding_retains_assigned_scope_without_a_source_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let catalog = ScopedNamedAgentCatalog::discover_with_builtins(
+            &home,
+            None,
+            NamedAgentLimits::default(),
+        )
+        .unwrap();
+        let identity = catalog
+            .metadata()
+            .entries
+            .iter()
+            .find_map(|row| row.identity.as_ref().filter(|id| id.name == "explorer"))
+            .unwrap()
+            .clone();
+        assert!(identity.project_id.is_none());
+        let mut parent = Session::new("parent", "model");
+        parent.set_project_id_meta("assigned-project");
+        let profile = ResolvedChildProfile::from_catalog(
+            identity.clone(),
+            catalog.get(&identity).unwrap(),
+            &parent,
+            "openai",
+        )
+        .unwrap();
+        let child = bound(profile, &parent);
+        let binding = read_binding(&child).unwrap().unwrap();
+        assert_eq!(binding.source, "builtin");
+        assert!(binding.project_id.is_none());
+        assert_eq!(
+            binding.scope_project_id.as_deref(),
+            Some("assigned-project")
+        );
+        assert!(binding.read_only);
+        let mut source_project = child.clone();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&source_project.metadata[NAMED_PROFILE_BINDING_KEY]).unwrap();
+        value["project_id"] = "assigned-project".into();
+        source_project
+            .metadata
+            .insert(NAMED_PROFILE_BINDING_KEY.into(), value.to_string());
+        assert!(validate_named_profile(&source_project).is_err());
+        let mut foreign_scope = child;
+        foreign_scope.set_project_id_meta("foreign-project");
+        assert!(validate_named_profile(&foreign_scope).is_err());
     }
 }
