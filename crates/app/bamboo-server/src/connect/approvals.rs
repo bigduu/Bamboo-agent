@@ -17,22 +17,19 @@
 //!
 //! [render_pending_ask_type]: crate::connect::render::PendingAsk
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_engine::execution::{
     create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
-    reserve_session_execution, SessionExecutionReservation, SessionExecutionReserveOutcome,
+    reserve_session_execution, SessionExecutionReserveOutcome,
 };
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
 };
-use bamboo_engine::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
     repark_permission_replay, restore_permission_replay_authorization,
@@ -46,7 +43,7 @@ use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
-use bamboo_engine::session_app::types::{RespondInput, ResumeConfigSnapshot};
+use bamboo_engine::session_app::types::RespondInput;
 use bamboo_engine::{ModelRoster, RoleModel};
 
 use super::bridge::ConnectContext;
@@ -702,371 +699,325 @@ impl ResumeExecutionPort for ConnectResumePort {
         };
 
         let ctx = self.ctx.clone();
-        tokio::spawn(connect_approval_replay_task(ConnectApprovalReplayTask {
-            ctx,
-            session,
-            session_id,
-            execution_reservation,
-            mpsc_tx,
-            history_commit_barrier,
-            model_roster,
-            reasoning_effort,
-            config,
-            reexecute_tool_call_id,
-            reexecute_request_generation,
-        }));
-    }
-}
+        tokio::spawn(async move {
+            let mut session = session;
 
-struct ConnectApprovalReplayTask {
-    ctx: ConnectContext,
-    session: Session,
-    session_id: String,
-    execution_reservation: SessionExecutionReservation,
-    mpsc_tx: mpsc::Sender<AgentEvent>,
-    history_commit_barrier: HistoryCommitBarrier,
-    model_roster: ModelRoster,
-    reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
-    config: ResumeConfigSnapshot,
-    reexecute_tool_call_id: String,
-    reexecute_request_generation: Option<String>,
-}
-
-// Construct the replay future in the callee so the Connect adapter does not
-// carry the complete replay task's construction frame on its caller's stack.
-fn connect_approval_replay_task(
-    task: ConnectApprovalReplayTask,
-) -> Pin<Box<impl Future<Output = ()> + Send>> {
-    let ConnectApprovalReplayTask {
-        ctx,
-        session,
-        session_id,
-        execution_reservation,
-        mpsc_tx,
-        history_commit_barrier,
-        model_roster,
-        reasoning_effort,
-        config,
-        reexecute_tool_call_id,
-        reexecute_request_generation,
-    } = task;
-    Box::pin(async move {
-        let mut session = session;
-
-        if let Some(replay_target) = find_pending_tool_call(
-            &session,
-            &reexecute_tool_call_id,
-            reexecute_request_generation.as_deref(),
-        ) {
-            if reexecute_request_generation.is_none()
-                && replay_target.request_generation().is_some()
-            {
-                tracing::error!(
-                    %session_id,
-                    tool_call_id = %reexecute_tool_call_id,
-                    "connect typed permission replay is missing its generation marker; refusing to resume"
-                );
-                return;
-            }
-            let tool_call = replay_target.tool_call().clone();
-            let tool_name = tool_call.function.name.clone();
-            let executor = ctx.tools.clone();
-            let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
-                executor.owns_exact_tool(name)
-            });
-            if replay_owner.is_none() && reexecute_request_generation.is_some() {
-                tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
-                return;
-            }
-            let executing_supervisor = match validate_permission_replay_authority(
+            if let Some(replay_target) = find_pending_tool_call(
                 &session,
-                &replay_target,
-                replay_owner.as_deref().unwrap_or(&tool_name),
+                &reexecute_tool_call_id,
+                reexecute_request_generation.as_deref(),
             ) {
-                Ok(observation) => observation,
-                Err(error) => {
-                    tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
-                    return;
-                }
-            };
-            let configured_mode = ctx
-                .permission_checker
-                .permission_config()
-                .map(|config| config.mode())
-                .unwrap_or_default();
-            let decision = match refresh_approval_replay_posture(
-                ctx.session_repo.storage().as_ref(),
-                &mut session,
-                configured_mode,
-                replay_owner.as_deref(),
-            )
-            .await
-            {
-                Ok(decision) => decision,
-                Err(error) => {
+                if reexecute_request_generation.is_none()
+                    && replay_target.request_generation().is_some()
+                {
                     tracing::error!(
                         %session_id,
                         tool_call_id = %reexecute_tool_call_id,
-                        %error,
-                        "connect approval replay posture refresh failed closed"
+                        "connect typed permission replay is missing its generation marker; refusing to resume"
                     );
                     return;
                 }
-            };
-            let blocked_by_tool_authority = matches!(
-                decision,
-                ApprovalReplayDecision::BlockedByRootToolAuthority
-                    | ApprovalReplayDecision::BlockedByUnavailableTool
-            );
-            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-            session
-                .metadata
-                .remove(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
-
-            let (content, success) = match decision {
-                ApprovalReplayDecision::BlockedByPlan(_) => (
-                    format!(
-                        "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
-                    ),
-                    false,
-                ),
-                ApprovalReplayDecision::BlockedByRootToolAuthority => (
-                    format!(
-                        "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed"
-                    ),
-                    false,
-                ),
-                ApprovalReplayDecision::BlockedByUnavailableTool => (
-                    format!(
-                        "Approved tool '{tool_name}' is no longer available; the stale approval was not executed"
-                    ),
-                    false,
-                ),
-                ApprovalReplayDecision::Execute(flags) => {
-                    let replay_owner = replay_owner
-                        .as_deref()
-                        .expect("Execute requires a registered execution owner");
-                    let Some(permission_config) =
-                        ctx.permission_checker.permission_config()
-                    else {
-                        tracing::error!(
-                            %session_id,
-                            tool_call_id = %reexecute_tool_call_id,
-                            "connect typed approval replay has no permission configuration; refusing to resume"
-                        );
+                let tool_call = replay_target.tool_call().clone();
+                let tool_name = tool_call.function.name.clone();
+                let executor = ctx.tools.clone();
+                let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
+                    executor.owns_exact_tool(name)
+                });
+                if replay_owner.is_none() && reexecute_request_generation.is_some() {
+                    tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
+                    return;
+                }
+                let executing_supervisor = match validate_permission_replay_authority(
+                    &session,
+                    &replay_target,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
                         return;
-                    };
-                    if let Err(error) = restore_permission_replay_authorization(
-                        permission_config.as_ref(),
-                        &session,
-                        &replay_target,
-                        replay_owner,
-                    ) {
+                    }
+                };
+                let configured_mode = ctx
+                    .permission_checker
+                    .permission_config()
+                    .map(|config| config.mode())
+                    .unwrap_or_default();
+                let decision = match refresh_approval_replay_posture(
+                    ctx.session_repo.storage().as_ref(),
+                    &mut session,
+                    configured_mode,
+                    replay_owner.as_deref(),
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
                         tracing::error!(
                             %session_id,
                             tool_call_id = %reexecute_tool_call_id,
                             %error,
-                            "connect typed approval replay authorization recovery failed closed"
+                            "connect approval replay posture refresh failed closed"
                         );
                         return;
                     }
-                    let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
-                        == bamboo_tools::orchestrator::ToolMutability::Mutating;
-                    let mut emitter = bamboo_tools::ToolEmitter::new(
-                        &tool_call.id,
-                        &tool_name,
-                        is_mutating,
-                    );
-                    emitter.set_auto_approved(true);
-                    let _ = mpsc_tx
-                        .send(emitter.begin().clone().into_agent_event())
-                        .await;
-                    let exec_result = bamboo_tools::permission::with_permission_replay_generation(
-                        session.id.as_str(),
-                        reexecute_tool_call_id.as_str(),
-                        reexecute_request_generation.as_deref(),
-                        executor.execute_exact_with_context_outcome(
-                            &tool_call,
-                            replay_owner,
-                            ToolExecutionContext {
-                                executing_supervisor,
-                                session_id: Some(session.id.as_str()),
-                                root_session_id: Some(
-                                    if session.root_session_id.trim().is_empty() {
-                                        session.id.as_str()
-                                    } else {
-                                        session.root_session_id.as_str()
-                                    },
-                                ),
-                                tool_call_id: reexecute_tool_call_id.as_str(),
-                                event_tx: Some(&mpsc_tx),
-                                available_tool_schemas: None,
-                                bypass_permissions: flags.bypass_permissions,
-                                auto_approve_permissions: flags.auto_approve_permissions,
-                                plan_read_only: flags.plan_read_only,
-                                can_async_resume: false,
-                                bash_completion_sink: None,
-                                pre_parsed_args: None,
-                            },
-                        ),
-                    )
-                    .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
+                };
+                let blocked_by_tool_authority = matches!(
+                    decision,
+                    ApprovalReplayDecision::BlockedByRootToolAuthority
+                        | ApprovalReplayDecision::BlockedByUnavailableTool
+                );
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+                session
+                    .metadata
+                    .remove(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
 
-                    match exec_result {
-                        Ok(tool_result) => {
-                            match repark_permission_replay(
-                                &mut session,
-                                &replay_target,
-                                &tool_result,
-                                replay_owner,
-                            ) {
-                                Ok(Some(reparked)) => {
-                                    let _ = mpsc_tx
-                                        .send(
-                                            emitter
-                                                .finish(Some(
-                                                    "Awaiting additional permission approval"
-                                                        .to_string(),
-                                                ))
-                                                .clone()
-                                                .into_agent_event(),
-                                        )
-                                        .await;
-                                    let _ = mpsc_tx
-                                        .send(AgentEvent::ToolComplete {
-                                            tool_call_id: tool_call.id.clone(),
-                                            result: tool_result,
-                                        })
-                                        .await;
-                                    let _ = mpsc_tx
-                                        .send(AgentEvent::NeedClarification {
-                                            question: reparked.question,
-                                            options: (!reparked.options.is_empty())
-                                                .then_some(reparked.options),
-                                            tool_call_id: Some(tool_call.id.clone()),
-                                            tool_name: Some(tool_name.clone()),
-                                            allow_custom: reparked.allow_custom,
-                                            source: Some(
-                                                bamboo_agent_core::PendingQuestionSource::PauseTool,
-                                            ),
-                                        })
-                                        .await;
-                                    ctx.session_repo.save_and_cache(&mut session).await;
-                                    return;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::error!(
-                                        %session_id,
-                                        tool_call_id = %reexecute_tool_call_id,
-                                        %error,
-                                        "connect additional permission replay could not be re-parked; refusing to resume"
-                                    );
-                                    return;
-                                }
-                            }
-                            let _ = mpsc_tx
-                                .send(
-                                    emitter
-                                        .finish(Some(
-                                            "Re-executed after approval".to_string(),
-                                        ))
-                                        .clone()
-                                        .into_agent_event(),
-                                )
-                                .await;
-                            let _ = mpsc_tx
-                                .send(AgentEvent::ToolComplete {
-                                    tool_call_id: tool_call.id.clone(),
-                                    result: tool_result.clone(),
-                                })
-                                .await;
-                            (tool_result.result, tool_result.success)
+                let (content, success) = match decision {
+                    ApprovalReplayDecision::BlockedByPlan(_) => (
+                        format!(
+                            "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority => (
+                        format!(
+                            "Root orchestration policy blocked approved tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::BlockedByUnavailableTool => (
+                        format!(
+                            "Approved tool '{tool_name}' is no longer available; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::Execute(flags) => {
+                        let replay_owner = replay_owner
+                            .as_deref()
+                            .expect("Execute requires a registered execution owner");
+                        let Some(permission_config) =
+                            ctx.permission_checker.permission_config()
+                        else {
+                            tracing::error!(
+                                %session_id,
+                                tool_call_id = %reexecute_tool_call_id,
+                                "connect typed approval replay has no permission configuration; refusing to resume"
+                            );
+                            return;
+                        };
+                        if let Err(error) = restore_permission_replay_authorization(
+                            permission_config.as_ref(),
+                            &session,
+                            &replay_target,
+                            replay_owner,
+                        ) {
+                            tracing::error!(
+                                %session_id,
+                                tool_call_id = %reexecute_tool_call_id,
+                                %error,
+                                "connect typed approval replay authorization recovery failed closed"
+                            );
+                            return;
                         }
-                        Err(error) => {
-                            let message =
-                                format!("Tool re-execution after approval failed: {error}");
-                            let _ = mpsc_tx
-                                .send(
-                                    emitter.error(message.clone()).clone().into_agent_event(),
-                                )
-                                .await;
-                            (message, false)
+                        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
+                            == bamboo_tools::orchestrator::ToolMutability::Mutating;
+                        let mut emitter = bamboo_tools::ToolEmitter::new(
+                            &tool_call.id,
+                            &tool_name,
+                            is_mutating,
+                        );
+                        emitter.set_auto_approved(true);
+                        let _ = mpsc_tx
+                            .send(emitter.begin().clone().into_agent_event())
+                            .await;
+                        let exec_result = bamboo_tools::permission::with_permission_replay_generation(
+                            session.id.as_str(),
+                            reexecute_tool_call_id.as_str(),
+                            reexecute_request_generation.as_deref(),
+                            executor.execute_exact_with_context_outcome(
+                                &tool_call,
+                                replay_owner,
+                                ToolExecutionContext {
+                                    executing_supervisor,
+                                    session_id: Some(session.id.as_str()),
+                                    root_session_id: Some(
+                                        if session.root_session_id.trim().is_empty() {
+                                            session.id.as_str()
+                                        } else {
+                                            session.root_session_id.as_str()
+                                        },
+                                    ),
+                                    tool_call_id: reexecute_tool_call_id.as_str(),
+                                    event_tx: Some(&mpsc_tx),
+                                    available_tool_schemas: None,
+                                    bypass_permissions: flags.bypass_permissions,
+                                    auto_approve_permissions: flags.auto_approve_permissions,
+                                    plan_read_only: flags.plan_read_only,
+                                    can_async_resume: false,
+                                    bash_completion_sink: None,
+                                    pre_parsed_args: None,
+                                },
+                            ),
+                        )
+                        .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
+
+                        match exec_result {
+                            Ok(tool_result) => {
+                                match repark_permission_replay(
+                                    &mut session,
+                                    &replay_target,
+                                    &tool_result,
+                                    replay_owner,
+                                ) {
+                                    Ok(Some(reparked)) => {
+                                        let _ = mpsc_tx
+                                            .send(
+                                                emitter
+                                                    .finish(Some(
+                                                        "Awaiting additional permission approval"
+                                                            .to_string(),
+                                                    ))
+                                                    .clone()
+                                                    .into_agent_event(),
+                                            )
+                                            .await;
+                                        let _ = mpsc_tx
+                                            .send(AgentEvent::ToolComplete {
+                                                tool_call_id: tool_call.id.clone(),
+                                                result: tool_result,
+                                            })
+                                            .await;
+                                        let _ = mpsc_tx
+                                            .send(AgentEvent::NeedClarification {
+                                                question: reparked.question,
+                                                options: (!reparked.options.is_empty())
+                                                    .then_some(reparked.options),
+                                                tool_call_id: Some(tool_call.id.clone()),
+                                                tool_name: Some(tool_name.clone()),
+                                                allow_custom: reparked.allow_custom,
+                                                source: Some(
+                                                    bamboo_agent_core::PendingQuestionSource::PauseTool,
+                                                ),
+                                            })
+                                            .await;
+                                        ctx.session_repo.save_and_cache(&mut session).await;
+                                        return;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        tracing::error!(
+                                            %session_id,
+                                            tool_call_id = %reexecute_tool_call_id,
+                                            %error,
+                                            "connect additional permission replay could not be re-parked; refusing to resume"
+                                        );
+                                        return;
+                                    }
+                                }
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter
+                                            .finish(Some(
+                                                "Re-executed after approval".to_string(),
+                                            ))
+                                            .clone()
+                                            .into_agent_event(),
+                                    )
+                                    .await;
+                                let _ = mpsc_tx
+                                    .send(AgentEvent::ToolComplete {
+                                        tool_call_id: tool_call.id.clone(),
+                                        result: tool_result.clone(),
+                                    })
+                                    .await;
+                                (tool_result.result, tool_result.success)
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("Tool re-execution after approval failed: {error}");
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter.error(message.clone()).clone().into_agent_event(),
+                                    )
+                                    .await;
+                                (message, false)
+                            }
                         }
                     }
-                }
-            };
+                };
 
-            tracing::info!(
-                "[{}] connect: resolved approved tool replay '{}' ({}) -> success={}",
-                session_id,
-                tool_name,
-                reexecute_tool_call_id,
-                success
-            );
-            if !apply_tool_result(&mut session, &replay_target, content, success) {
+                tracing::info!(
+                    "[{}] connect: resolved approved tool replay '{}' ({}) -> success={}",
+                    session_id,
+                    tool_name,
+                    reexecute_tool_call_id,
+                    success
+                );
+                if !apply_tool_result(&mut session, &replay_target, content, success) {
+                    tracing::error!(
+                        %session_id,
+                        tool_call_id = %reexecute_tool_call_id,
+                        "connect approved tool replay result target changed unexpectedly; refusing to resume"
+                    );
+                    return;
+                }
+                if blocked_by_tool_authority {
+                    if let Err(error) = ctx.session_repo.save_replay_resolution(&mut session).await
+                    {
+                        tracing::error!(%session_id, %error, "connect blocked approval replay result failed to persist; refusing to resume");
+                        return;
+                    }
+                } else {
+                    ctx.session_repo.save_and_cache(&mut session).await;
+                }
+            } else {
                 tracing::error!(
                     %session_id,
                     tool_call_id = %reexecute_tool_call_id,
-                    "connect approved tool replay result target changed unexpectedly; refusing to resume"
+                    request_generation = ?reexecute_request_generation,
+                    "connect permission replay target missing or generation-mismatched; markers retained and resume refused"
                 );
                 return;
             }
-            if blocked_by_tool_authority {
-                if let Err(error) = ctx.session_repo.save_replay_resolution(&mut session).await {
-                    tracing::error!(%session_id, %error, "connect blocked approval replay result failed to persist; refusing to resume");
-                    return;
-                }
-            } else {
-                ctx.session_repo.save_and_cache(&mut session).await;
-            }
-        } else {
-            tracing::error!(
-                %session_id,
-                tool_call_id = %reexecute_tool_call_id,
-                request_generation = ?reexecute_request_generation,
-                "connect permission replay target missing or generation-mismatched; markers retained and resume refused"
-            );
-            return;
-        }
 
-        consume_pending_clarification_resume(&mut session);
-        spawn_session_execution(SessionExecutionArgs {
-            agent: ctx.agent.clone(),
-            session_id,
-            session,
-            execution_reservation,
-            tools_override: Some(ctx.tools.clone()),
-            provider_override: None,
-            model_roster,
-            reasoning_effort,
-            reasoning_effort_source: "connect_resume".to_string(),
-            auxiliary_model_resolver: None,
-            disabled_filter_resolver: None,
-            disabled_tools: Some(config.disabled_tools.clone()),
-            disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
-            selected_skill_ids: None,
-            selected_skill_mode: None,
-            mpsc_tx,
-            history_commit_barrier,
-            image_fallback: config.image_fallback.clone(),
-            gold_config: config.gold_config.clone(),
-            guardian_config: None,
-            guardian_spawner: None,
-            bash_resume_hook: None,
-            bash_completion_sink: None,
-            app_data_dir: ctx.app_data_dir.clone(),
-            // No per-request override on this path; the config-level
-            // default (issue #221) still applies.
-            run_budget: None,
-            runners: ctx.agent_runners.clone(),
-            sessions_cache: ctx.session_repo.cache().clone(),
-            on_complete: None,
-            // Connect drives root sessions; a child finishing on this
-            // path is backstopped by the child-wait watchdog (#546).
-            child_completion_handler: None,
+            consume_pending_clarification_resume(&mut session);
+            spawn_session_execution(SessionExecutionArgs {
+                agent: ctx.agent.clone(),
+                session_id,
+                session,
+                execution_reservation,
+                tools_override: Some(ctx.tools.clone()),
+                provider_override: None,
+                model_roster,
+                reasoning_effort,
+                reasoning_effort_source: "connect_resume".to_string(),
+                auxiliary_model_resolver: None,
+                disabled_filter_resolver: None,
+                disabled_tools: Some(config.disabled_tools.clone()),
+                disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
+                selected_skill_ids: None,
+                selected_skill_mode: None,
+                mpsc_tx,
+                history_commit_barrier,
+                image_fallback: config.image_fallback.clone(),
+                gold_config: config.gold_config.clone(),
+                guardian_config: None,
+                guardian_spawner: None,
+                bash_resume_hook: None,
+                bash_completion_sink: None,
+                app_data_dir: ctx.app_data_dir.clone(),
+                // No per-request override on this path; the config-level
+                // default (issue #221) still applies.
+                run_budget: None,
+                runners: ctx.agent_runners.clone(),
+                sessions_cache: ctx.session_repo.cache().clone(),
+                on_complete: None,
+                // Connect drives root sessions; a child finishing on this
+                // path is backstopped by the child-wait watchdog (#546).
+                child_completion_handler: None,
+            });
         });
-    })
+    }
 }
 
 /// Find the concrete approved invocation, newest-first and generation-bound.
