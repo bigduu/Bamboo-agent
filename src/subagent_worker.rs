@@ -1032,6 +1032,8 @@ struct HostApprovalProxy {
     /// that case `reviewer` MUST be set, else the action fails closed.
     host: Option<HostBridge>,
     reviewer: Option<Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer>>,
+    logical_session: Option<bamboo_subagent::proto::LogicalSessionIdentity>,
+    project_id: Option<String>,
 }
 
 #[async_trait]
@@ -1042,6 +1044,10 @@ impl bamboo_tools::ApprovalProxy for HostApprovalProxy {
             "permission": ask.permission,
             "resource": ask.resource,
             "permission_request": ask.permission_request,
+            "approval_identity": {
+                "logical_session": self.logical_session,
+                "project_id": self.project_id,
+            },
         });
         // No human to ask → decide locally with the model-reviewer.
         if let Some(reviewer) = &self.reviewer {
@@ -1918,6 +1924,8 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     host,
                     // #73: when this run has no human approver, decide locally.
                     reviewer: self.no_human_review.clone(),
+                    logical_session: logical_identity.clone(),
+                    project_id: session.project_id_meta(),
                 }) as Arc<dyn bamboo_tools::ApprovalProxy>)
             } else {
                 None
@@ -2928,17 +2936,23 @@ mod tests {
         let approve = HostApprovalProxy {
             host: None,
             reviewer: Some(Arc::new(FixedReviewer(true))),
+            logical_session: None,
+            project_id: None,
         };
         assert!(approve.request_approval(ask.clone()).await);
         let deny = HostApprovalProxy {
             host: None,
             reviewer: Some(Arc::new(FixedReviewer(false))),
+            logical_session: None,
+            project_id: None,
         };
         assert!(!deny.request_approval(ask.clone()).await);
         // no host AND no reviewer → fail closed.
         let neither = HostApprovalProxy {
             host: None,
             reviewer: None,
+            logical_session: None,
+            project_id: None,
         };
         assert!(!neither.request_approval(ask).await);
     }
