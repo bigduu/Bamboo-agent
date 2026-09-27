@@ -1930,3 +1930,456 @@ async fn actual_owned_child_admits_two_corrections_and_preserves_overflow_and_ac
         .await;
     }
 }
+
+const MESSAGE_ONLY_TASK: &str = "Report one bounded plain answer for the F2 assignment. Return F2_CHILD_COMPLETED and stop. Do not use tools or create another agent.";
+const MESSAGE_ONLY_CALL: &str = "f2-message-only";
+
+struct MessageOnlyProbe {
+    root_calls: AtomicUsize,
+    child_calls: AtomicUsize,
+    child_ready: AtomicBool,
+    release_child: AtomicBool,
+    wake: tokio::sync::Notify,
+    requests: Mutex<Vec<Value>>,
+}
+
+async fn message_only_provider(
+    body: web::Json<Value>,
+    probe: web::Data<MessageOnlyProbe>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    probe.requests.lock().unwrap().push(body.clone());
+    let (delta, finish) = if body["model"] == "plain-child" {
+        assert_eq!(probe.child_calls.fetch_add(1, Ordering::SeqCst), 0);
+        assert!(body["tools"].is_null() || body["tools"].as_array().is_some_and(Vec::is_empty));
+        probe.child_ready.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let wake = probe.wake.notified();
+                if probe.release_child.load(Ordering::SeqCst) {
+                    break;
+                }
+                wake.await;
+            }
+        })
+        .await
+        .expect("bounded actual Child provider response gate");
+        (json!({"content":"F2_CHILD_COMPLETED"}), "stop")
+    } else if body["model"] == "plain-root" && body["tools"].to_string().contains("SubAgent") {
+        let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            let schema = &body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == "SubAgent")
+                .unwrap()["function"]["parameters"];
+            assert!(schema["properties"]["message"].is_object());
+            assert!(schema["properties"].get("action").is_none());
+            assert!(schema["required"]
+                .as_array()
+                .is_none_or(|required| { required.iter().all(|field| field == "message") }));
+            (
+                json!({"tool_calls":[{"index":0,"id":MESSAGE_ONLY_CALL,"type":"function",
+                    "function":{"name":"SubAgent","arguments":json!({"message":MESSAGE_ONLY_TASK}).to_string()}}]}),
+                "tool_calls",
+            )
+        } else {
+            assert_eq!(round, 1, "Root only delegates and reports progress");
+            let results: Vec<_> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool" && m["tool_call_id"] == MESSAGE_ONLY_CALL)
+                .collect();
+            assert_eq!(results.len(), 1, "actual SubAgent Tool result reached Root");
+            let result: Value =
+                serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(result["observed_status"], "running_in_background");
+            assert!(result["actor_id"].as_str().is_some_and(|id| !id.is_empty()));
+            (json!({"content":"F2_ROOT_DELEGATION_DONE"}), "stop")
+        }
+    } else {
+        (json!({"content":"auxiliary"}), "stop")
+    };
+    let event = json!({"id":"f2-message-only","object":"chat.completion.chunk",
+        "choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+fn message_only_root_result(root: &bamboo_domain::Session) -> Value {
+    let calls: Vec<_> = root
+        .messages
+        .iter()
+        .filter(|m| m.role == bamboo_domain::Role::Assistant)
+        .flat_map(|m| m.tool_calls.iter().flatten())
+        .collect();
+    assert_eq!(calls.len(), 1, "one actual Root call, no direct task tools");
+    assert_eq!(calls[0].id, MESSAGE_ONLY_CALL);
+    assert_eq!(calls[0].function.name, "SubAgent");
+    let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args, json!({"message":MESSAGE_ONLY_TASK}));
+    assert_eq!(
+        args.as_object().unwrap().len(),
+        1,
+        "only message is supplied"
+    );
+    let results: Vec<_> = root
+        .messages
+        .iter()
+        .filter(|m| m.role == bamboo_domain::Role::Tool)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].tool_call_id.as_deref(), Some(MESSAGE_ONLY_CALL));
+    assert_eq!(results[0].tool_success, Some(true));
+    let result: Value = serde_json::from_str(&results[0].content).unwrap();
+    assert_eq!(result["observed_status"], "running_in_background");
+    assert_eq!(
+        result.as_object().unwrap().len(),
+        2,
+        "compact identity and status"
+    );
+    assert!(result["actor_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty() && id != root.id));
+    let replies: Vec<_> = root
+        .messages
+        .iter()
+        .filter(|m| m.role == bamboo_domain::Role::Assistant && !m.content.is_empty())
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(replies, ["F2_ROOT_DELEGATION_DONE"]);
+    result
+}
+
+async fn message_only_fixture() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let data = root.join("host");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let projects = bamboo_projects::ProjectStore::open(&data).unwrap();
+    let project = projects
+        .create_with_project_path("message-only", None, workspace.to_string_lossy(), vec![])
+        .unwrap();
+    let agents = projects.paths().project_home(&project.id).join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    // Ordinary catalog input bounds the existing zero-tool route. The caller
+    // supplies neither a role nor a resolved permission/profile binding.
+    std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n").unwrap();
+    let probe = web::Data::new(MessageOnlyProbe {
+        root_calls: AtomicUsize::new(0),
+        child_calls: AtomicUsize::new(0),
+        child_ready: AtomicBool::new(false),
+        release_child: AtomicBool::new(false),
+        wake: Default::default(),
+        requests: Mutex::new(vec![]),
+    });
+    let server_probe = probe.clone();
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(server_probe.clone())
+            .route(
+                "/v1/chat/completions",
+                web::post().to(message_only_provider),
+            )
+            .route(
+                "/v1/models",
+                web::get().to(|| async {
+                    HttpResponse::Ok()
+                        .json(json!({"data":[{"id":"plain-root"},{"id":"plain-child"}]}))
+                }),
+            )
+    })
+    .workers(1)
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+    let provider_url = format!("http://{}/v1", server.addrs()[0]);
+    let running = server.run();
+    let handle = running.handle();
+    actix_web::rt::spawn(running);
+    std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"plain-root"}},"defaults":{"chat":{"provider":"openai","model":"plain-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}})).unwrap()).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut host = start(&data, port);
+    let base = format!("http://127.0.0.1:{port}/api/v1");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let chat = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Delegate one bounded assignment and report that it was delegated. The Child performs it.","model":"plain-root","provider":"openai","model_ref":{"provider":"openai","model":"plain-root"},"thinking_mode":"ultra","permission_mode":"bypass","workspace_path":workspace,"project_id":project.id})).send().await.unwrap();
+    assert!(
+        chat.status().is_success(),
+        "chat: {}",
+        chat.text().await.unwrap()
+    );
+    assert!(client
+        .post(format!("{base}/execute/plain-root"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let store = SessionStoreV2::new(data.clone()).await.unwrap();
+    let parent = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            let parent = store.load_session("plain-root").await.unwrap().unwrap();
+            let rows: Value = client
+                .get(format!("{base}/sessions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let settled = rows["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == "plain-root" && r["is_running"] == false);
+            if settled
+                && parent.last_run_status().as_deref() == Some("completed")
+                && probe.child_ready.load(Ordering::SeqCst)
+            {
+                break parent;
+            }
+            assert_ne!(
+                parent.last_run_status().as_deref(),
+                Some("error"),
+                "Root: {:?}",
+                parent.last_run_error()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = message_only_root_result(&parent);
+    let id = result["actor_id"].as_str().unwrap().to_owned();
+    let before = store.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
+    assert_eq!(before.root_session_id, "plain-root");
+    assert_eq!(before.spawn_depth, 1);
+    assert_eq!(
+        before.project_id_meta().as_deref(),
+        Some(project.id.as_str())
+    );
+    assert_eq!(before.workspace.as_deref(), workspace.to_str());
+    assert_eq!(
+        store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .filter(|row| row.parent_session_id.as_deref() == Some("plain-root"))
+            .count(),
+        1
+    );
+    let binding: Value = serde_json::from_str(&before.metadata["child.named_profile.v1"]).unwrap();
+    assert_eq!(binding["name"], "worker");
+    assert_eq!(binding["source"], "project");
+    assert_eq!(binding["project_id"], project.id.as_str());
+    assert_eq!(binding["child_id"], id);
+    assert_eq!(binding["parent_id"], "plain-root");
+    assert_eq!(binding["root_id"], "plain-root");
+    assert_eq!(binding["model"], "plain-child");
+    assert_eq!(binding["tools"], json!([]));
+    assert_eq!(
+        before
+            .messages
+            .iter()
+            .filter(|m| m.role == bamboo_domain::Role::User)
+            .map(|m| m.content.matches(MESSAGE_ONLY_TASK).count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(!before
+        .messages
+        .iter()
+        .any(|m| m.role == bamboo_domain::Role::Assistant));
+    let child_requests: Vec<_> = probe
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["model"] == "plain-child")
+        .cloned()
+        .collect();
+    assert_eq!(child_requests.len(), 1);
+    assert_eq!(
+        child_requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"]
+                .as_str()
+                .unwrap()
+                .matches(MESSAGE_ONLY_TASK)
+                .count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(
+        child_requests[0]["tools"].is_null()
+            || child_requests[0]["tools"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+    );
+    let running = store.inspect_actor(&id).await.unwrap();
+    assert_eq!(running.actor.actor_id, id);
+    assert_eq!(running.actor.session_created_at, before.created_at);
+    assert_eq!(running.actor.current_attempt, 1);
+    let activation = running.activation.unwrap();
+    assert_eq!(activation.status, ActorActivationStatus::Running);
+    assert_eq!(
+        activation.placement_ref.as_ref().unwrap().class,
+        bamboo_domain::ActorPlacementClass::Local
+    );
+    let runs = claimed_required_runs(&data);
+    assert_eq!(
+        runs.len(),
+        1,
+        "one actual local worker Run before provider release"
+    );
+    assert_eq!(
+        runs[0].2.activation_run_id.as_deref(),
+        Some(activation.run_id.as_str())
+    );
+    let logical = runs[0].2.logical_session.as_ref().unwrap();
+    assert_eq!(logical.session_id, id);
+    assert_eq!(
+        logical.creation.as_ref().unwrap().created_at,
+        before.created_at
+    );
+    probe.release_child.store(true, Ordering::SeqCst);
+    probe.wake.notify_waiters();
+    let (completed, parent_completed) = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+            let child = store.load_session(&id).await.unwrap().unwrap();
+            let parent = store.load_session("plain-root").await.unwrap().unwrap();
+            assert_ne!(
+                child.last_run_status().as_deref(),
+                Some("error"),
+                "Child: {:?}",
+                child.last_run_error()
+            );
+            let actor = store.inspect_actor(&id).await.unwrap();
+            let rows: Value = client
+                .get(format!("{base}/sessions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let settled = [id.as_str(), "plain-root"].iter().all(|target| {
+                rows["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == *target && row["is_running"] == false)
+            });
+            if settled
+                && child.last_run_status().as_deref() == Some("completed")
+                && actor.activation.as_ref().unwrap().status == ActorActivationStatus::Succeeded
+            {
+                assert_eq!(actor.actor.current_attempt, 1);
+                assert_eq!(actor.activation.as_ref().unwrap().run_id, activation.run_id);
+                break (child, parent);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(message_only_root_result(&parent_completed), result);
+    assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+    let answers: Vec<_> = completed
+        .messages
+        .iter()
+        .filter(|m| m.role == bamboo_domain::Role::Assistant)
+        .collect();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].content, "F2_CHILD_COMPLETED");
+    assert!(answers[0].tool_calls.as_ref().is_none_or(Vec::is_empty));
+    assert_eq!(completed.messages.len(), before.messages.len() + 1);
+    assert_eq!(
+        serde_json::to_value(&completed.messages[..before.messages.len()]).unwrap(),
+        serde_json::to_value(&before.messages).unwrap()
+    );
+    drop(host); // Host guard kills and waits; no live Host/worker cache is reused.
+    drop(store);
+    let cold_store = SessionStoreV2::new(data).await.unwrap();
+    let cold = cold_store.load_session(&id).await.unwrap().unwrap();
+    let cold_root = cold_store
+        .load_session("plain-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cold.id, before.id);
+    assert_eq!(cold.created_at, before.created_at);
+    assert_eq!(cold.parent_session_id, before.parent_session_id);
+    assert_eq!(cold.root_session_id, before.root_session_id);
+    assert_eq!(cold.spawn_depth, before.spawn_depth);
+    assert_eq!(cold.project_id_meta(), before.project_id_meta());
+    assert_eq!(cold.workspace, before.workspace);
+    assert_eq!(cold.model_ref, before.model_ref);
+    assert_eq!(
+        cold.metadata["child.named_profile.v1"],
+        before.metadata["child.named_profile.v1"]
+    );
+    assert_eq!(
+        serde_json::to_value(&cold.messages).unwrap(),
+        serde_json::to_value(&completed.messages).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&cold_root.messages).unwrap(),
+        serde_json::to_value(&parent_completed.messages).unwrap()
+    );
+    assert_eq!(message_only_root_result(&cold_root), result);
+    assert_eq!(cold.last_run_status().as_deref(), Some("completed"));
+    assert_eq!(cold_root.last_run_status().as_deref(), Some("completed"));
+    let cold_actor = cold_store.inspect_actor(&id).await.unwrap();
+    assert_eq!(
+        cold_actor.activation.as_ref().unwrap().status,
+        ActorActivationStatus::Succeeded
+    );
+    assert_eq!(cold_actor.activation.unwrap().run_id, activation.run_id);
+    eprintln!(
+        "message-only native evidence: {}",
+        json!({"call_id":MESSAGE_ONLY_CALL,"caller_keys":["message"],"actor_id":id,"root_provider_calls":2,"child_provider_calls":1,"actual_runs":runs.len(),"default_role":"worker","cold_answer":cold.messages.last().unwrap().content,"host_killed_and_waited":true})
+    );
+    handle.stop(true).await;
+}
+
+#[actix_web::test]
+async fn actual_message_only_subagent_creates_and_completes_one_local_child() {
+    Box::pin(message_only_fixture()).await;
+}
