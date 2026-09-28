@@ -157,6 +157,15 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
             runner.set_actor_directory_store(store.clone());
         }
     }
+
+    fn set_actor_event_observer(
+        &self,
+        observer: Option<Arc<dyn super::actor_event_stream::ActorEventObserver>>,
+    ) {
+        for runner in &self.runners {
+            runner.set_actor_event_observer(observer.clone());
+        }
+    }
 }
 
 /// Build the child runner from the application config.

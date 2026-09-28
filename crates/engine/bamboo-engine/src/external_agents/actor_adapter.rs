@@ -40,6 +40,7 @@ use bamboo_subagent::provision::{
 };
 
 use super::actor_event_router::{ActorEventRoute, ActorEventRouteError, ActorEventRouter};
+use super::actor_event_stream::{ActorEventObserver, PublicActorEvent};
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
 /// Default cap on simultaneously running actor activations. The event and
@@ -624,6 +625,7 @@ pub struct ActorChildRunner {
     /// runtime. Kept per runner/runtime; never process-global.
     session_inbox_runtime: Arc<std::sync::Mutex<Option<SessionInboxRuntimeBinding>>>,
     actor_directory_store: std::sync::Mutex<Option<Arc<bamboo_storage::SessionStoreV2>>>,
+    actor_event_observer: std::sync::Mutex<Option<Arc<dyn ActorEventObserver>>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -827,6 +829,7 @@ impl ActorChildRunner {
             codex_run_tokens: None,
             session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
             actor_directory_store: std::sync::Mutex::new(None),
+            actor_event_observer: std::sync::Mutex::new(None),
         }
     }
 
@@ -1614,6 +1617,10 @@ impl ExternalChildRunner for ActorChildRunner {
         *self.actor_directory_store.lock().recover_poison() = store;
     }
 
+    fn set_actor_event_observer(&self, observer: Option<Arc<dyn ActorEventObserver>>) {
+        *self.actor_event_observer.lock().recover_poison() = observer;
+    }
+
     async fn execute_external_child(
         &self,
         session: &mut Session,
@@ -1634,6 +1641,7 @@ impl ExternalChildRunner for ActorChildRunner {
         let escalation = self.escalation_bridge.lock().recover_poison().clone();
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let actor_directory_store = self.actor_directory_store.lock().recover_poison().clone();
+        let actor_event_observer = self.actor_event_observer.lock().recover_poison().clone();
         let required_context = bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
         if crate::session_app::child_session::named_profile::has_named_profile(session)
@@ -2408,6 +2416,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 local_history_tools: local_history_tools.as_deref(),
                 local_history_read_only: spec.capabilities.read_only_enforced(),
                 plain_input: plain_activation.as_ref(),
+                actor_event_observer: actor_event_observer.as_deref(),
                 // BrokerChildLink replaces the actual correlation for each Run;
                 // direct legacy WS Terminal frames carry no such identity.
                 plain_run: self
@@ -4335,6 +4344,7 @@ struct ActorDriveContext<'a> {
     local_history_tools: Option<&'a [String]>,
     local_history_read_only: bool,
     plain_input: Option<&'a PlainActorActivation>,
+    actor_event_observer: Option<&'a dyn ActorEventObserver>,
     plain_run: Option<(&'a RunSpec, &'a AtomicU64)>,
     first_frame_timeout: Option<Duration>,
 }
@@ -5178,6 +5188,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         local_history_tools,
         local_history_read_only,
         plain_input,
+        actor_event_observer,
         plain_run,
     } = context;
 
@@ -5413,6 +5424,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     .map_err(actor_event_route_error)?
                                 {
                                     ActorEventRoute::Publish(envelope) => {
+                                        let public_event = PublicActorEvent::from(&envelope);
                                         tracing::trace!(
                                             actor_id = %envelope.actor_id,
                                             event_id = %envelope.event_id,
@@ -5428,6 +5440,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                             event_tx,
                                             &mut display,
                                         ).await?;
+                                        if let Some(observer) = actor_event_observer {
+                                            observer.publish(public_event);
+                                        }
                                     }
                                     ActorEventRoute::Duplicate | ActorEventRoute::Suppressed => {}
                                 }
@@ -6453,6 +6468,7 @@ mod tests {
                 local_history_tools: Some(&tools),
                 local_history_read_only: true,
                 plain_input: None,
+                actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: Some(Duration::from_secs(1)),
             })
@@ -8993,6 +9009,7 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -10198,6 +10215,7 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -11212,6 +11230,7 @@ mod tests {
                 local_history_tools: None,
                 local_history_read_only: false,
                 plain_input: None,
+                actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: None,
             }),
@@ -11283,6 +11302,7 @@ mod tests {
                 local_history_tools: None,
                 local_history_read_only: false,
                 plain_input: None,
+                actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: None,
             }),
@@ -11351,6 +11371,7 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(100)),
         })
@@ -11397,6 +11418,7 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(50)),
         })

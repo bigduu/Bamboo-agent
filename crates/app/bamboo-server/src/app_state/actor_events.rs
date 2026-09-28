@@ -1,0 +1,318 @@
+//! Lazy, process-local delivery of redacted canonical Actor change markers.
+//! Only actors with a live gateway subscriber have a sender or replay window.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use bamboo_engine::external_agents::actor_event_stream::{ActorEventObserver, PublicActorEvent};
+use serde::Serialize;
+use tokio::sync::broadcast;
+
+const REPLAY_EVENTS: usize = 64;
+const REPLAY_BYTES: usize = 64 * 1024;
+const RING_EVENTS: usize = 64;
+const MAX_CHANNELS: usize = 256;
+// The outer WS seq is a JavaScript-safe integer. Its high bits distinguish a
+// new channel after all observers leave, so an old `since` cannot look current.
+const COUNTER_BITS: u32 = 32;
+const MAX_GENERATION: u64 = (1 << 21) - 1;
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ActorChange {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    pub event: PublicActorEvent,
+}
+
+impl ActorChange {
+    fn new(event: PublicActorEvent) -> Self {
+        Self {
+            kind: "actor_changed",
+            event,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SequencedActorChange {
+    pub cursor: u64,
+    pub change: ActorChange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ActorHubMessage {
+    Change(SequencedActorChange),
+    Reset(u64),
+}
+
+pub(crate) enum ActorReplay {
+    Events(Vec<SequencedActorChange>),
+    SnapshotRequired { cursor: u64, reason: &'static str },
+}
+
+struct ChannelEntry {
+    generation: u64,
+    counter: u32,
+    refs: usize,
+    replay_floor: u64,
+    replay_bytes: usize,
+    replay: VecDeque<(SequencedActorChange, usize)>,
+    sender: broadcast::Sender<ActorHubMessage>,
+}
+
+impl ChannelEntry {
+    fn cursor(&self) -> u64 {
+        (self.generation << COUNTER_BITS) | u64::from(self.counter)
+    }
+
+    fn replay_after(&self, since: Option<u64>) -> ActorReplay {
+        let cursor = self.cursor();
+        let Some(since) = since else {
+            return ActorReplay::SnapshotRequired {
+                cursor,
+                reason: "initial",
+            };
+        };
+        if (since >> COUNTER_BITS) != self.generation || since < self.replay_floor || since > cursor
+        {
+            return ActorReplay::SnapshotRequired {
+                cursor,
+                reason: "gap",
+            };
+        }
+        ActorReplay::Events(
+            self.replay
+                .iter()
+                .filter(|(event, _)| event.cursor > since)
+                .map(|(event, _)| event.clone())
+                .collect(),
+        )
+    }
+}
+
+#[derive(Default)]
+struct HubState {
+    next_generation: u64,
+    channels: HashMap<String, ChannelEntry>,
+}
+
+#[derive(Default)]
+pub(crate) struct ActorEventHub {
+    state: Mutex<HubState>,
+}
+
+pub(crate) struct ActorSubscription {
+    hub: Arc<ActorEventHub>,
+    actor_id: String,
+    pub receiver: broadcast::Receiver<ActorHubMessage>,
+    pub initial: ActorReplay,
+}
+
+impl ActorSubscription {
+    pub fn replay_after(&self, since: u64) -> ActorReplay {
+        let state = self.hub.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .channels
+            .get(&self.actor_id)
+            .map(|entry| entry.replay_after(Some(since)))
+            .unwrap_or(ActorReplay::SnapshotRequired {
+                cursor: since,
+                reason: "gap",
+            })
+    }
+}
+
+impl Drop for ActorSubscription {
+    fn drop(&mut self) {
+        let mut state = self.hub.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.channels.get_mut(&self.actor_id) {
+            entry.refs -= 1;
+            if entry.refs == 0 {
+                state.channels.remove(&self.actor_id);
+            }
+        }
+    }
+}
+
+impl ActorEventHub {
+    pub fn subscribe(
+        self: &Arc<Self>,
+        actor_id: &str,
+        since: Option<u64>,
+    ) -> Option<ActorSubscription> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.channels.contains_key(actor_id) {
+            if state.channels.len() >= MAX_CHANNELS || state.next_generation >= MAX_GENERATION {
+                return None;
+            }
+            state.next_generation += 1;
+            let generation = state.next_generation;
+            let (sender, _) = broadcast::channel(RING_EVENTS);
+            state.channels.insert(
+                actor_id.to_owned(),
+                ChannelEntry {
+                    generation,
+                    counter: 0,
+                    refs: 0,
+                    replay_floor: generation << COUNTER_BITS,
+                    replay_bytes: 0,
+                    replay: VecDeque::new(),
+                    sender,
+                },
+            );
+        }
+        let entry = state.channels.get_mut(actor_id)?;
+        entry.refs += 1;
+        // Receiver creation and replay planning are serialized with publish.
+        let receiver = entry.sender.subscribe();
+        let initial = entry.replay_after(since);
+        Some(ActorSubscription {
+            hub: self.clone(),
+            actor_id: actor_id.to_owned(),
+            receiver,
+            initial,
+        })
+    }
+
+    #[cfg(test)]
+    fn active_channels(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .channels
+            .len()
+    }
+}
+
+impl ActorEventObserver for ActorEventHub {
+    fn publish(&self, event: PublicActorEvent) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = state.channels.get(&event.actor_id) else {
+            return;
+        };
+        let rollover = entry.counter == u32::MAX;
+        if rollover {
+            // An extremely long-lived channel gets a new cursor epoch and a
+            // reset signal. Existing receivers must refetch before trusting it.
+            if state.next_generation >= MAX_GENERATION {
+                return;
+            }
+            state.next_generation += 1;
+            let generation = state.next_generation;
+            let entry = state.channels.get_mut(&event.actor_id).expect("present");
+            entry.generation = generation;
+            entry.counter = 0;
+            entry.replay.clear();
+            entry.replay_bytes = 0;
+            entry.replay_floor = entry.cursor();
+            let _ = entry.sender.send(ActorHubMessage::Reset(entry.cursor()));
+        }
+        let entry = state.channels.get_mut(&event.actor_id).expect("present");
+        entry.counter += 1;
+        let change = ActorChange::new(event);
+        let bytes = serde_json::to_vec(&change).map_or(REPLAY_BYTES + 1, |value| value.len());
+        let item = SequencedActorChange {
+            cursor: entry.cursor(),
+            change,
+        };
+        if bytes <= REPLAY_BYTES {
+            entry.replay_bytes += bytes;
+            entry.replay.push_back((item.clone(), bytes));
+            while entry.replay.len() > REPLAY_EVENTS || entry.replay_bytes > REPLAY_BYTES {
+                if let Some((removed, size)) = entry.replay.pop_front() {
+                    entry.replay_bytes -= size;
+                    entry.replay_floor = removed.cursor;
+                }
+            }
+        } else {
+            entry.replay.clear();
+            entry.replay_bytes = 0;
+            entry.replay_floor = item.cursor;
+        }
+        let _ = entry.sender.send(ActorHubMessage::Change(item));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_engine::external_agents::actor_event_stream::PublicActorEventClass;
+
+    fn event(actor_id: &str, n: usize) -> PublicActorEvent {
+        PublicActorEvent {
+            actor_id: actor_id.into(),
+            root_actor_id: "root".into(),
+            parent_actor_id: Some("root".into()),
+            activation_id: "safe-activation".into(),
+            attempt: 1,
+            event_id: format!("ae1-{n:064x}"),
+            class: PublicActorEventClass::Semantic,
+        }
+    }
+
+    #[test]
+    fn only_visible_actors_have_channels_and_last_drop_retires_cursor() {
+        let hub = Arc::new(ActorEventHub::default());
+        for id in 0..134 {
+            hub.publish(event(&format!("actor-{id}"), 1));
+        }
+        assert_eq!(hub.active_channels(), 0);
+        let selected = hub.subscribe("actor-42", None).unwrap();
+        let peer = hub.subscribe("actor-42", None).unwrap();
+        assert_eq!(hub.active_channels(), 1);
+        let first_cursor = match &selected.initial {
+            ActorReplay::SnapshotRequired {
+                cursor,
+                reason: "initial",
+            } => *cursor,
+            _ => panic!("fresh subscription needs snapshot"),
+        };
+        assert!(first_cursor > 0 && first_cursor < (1 << 53));
+        drop(selected);
+        assert_eq!(hub.active_channels(), 1);
+        drop(peer);
+        assert_eq!(hub.active_channels(), 0);
+        let resumed = hub.subscribe("actor-42", Some(first_cursor)).unwrap();
+        assert!(matches!(
+            &resumed.initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+    }
+
+    #[test]
+    fn replay_is_bounded_and_redacted() {
+        let hub = Arc::new(ActorEventHub::default());
+        let mut first = hub.subscribe("child", None).unwrap();
+        let cursor = match &first.initial {
+            ActorReplay::SnapshotRequired { cursor, .. } => *cursor,
+            _ => unreachable!(),
+        };
+        for n in 0..80 {
+            hub.publish(event("child", n));
+        }
+        let recent = hub.subscribe("child", Some(cursor + 75)).unwrap();
+        let ActorReplay::Events(replay) = &recent.initial else {
+            panic!("recent cursor must replay");
+        };
+        assert_eq!(replay.len(), 5);
+        assert_eq!(replay[0].cursor, cursor + 76);
+        assert!(matches!(
+            &hub.subscribe("child", Some(cursor)).unwrap().initial,
+            ActorReplay::SnapshotRequired { reason: "gap", .. }
+        ));
+        let wire = serde_json::to_value(&replay[0].change).unwrap();
+        assert_eq!(wire["type"], "actor_changed");
+        assert!(wire.get("payload").is_none());
+        assert!(wire.get("project_id").is_none());
+        assert!(wire.get("lease_epoch").is_none());
+        assert!(wire.get("worker_endpoint").is_none());
+        assert_eq!(wire.as_object().unwrap().len(), 8);
+        // A slow receiver overruns; the retained critical window still covers
+        // recent cursors, while an older cursor requires a snapshot.
+        assert!(matches!(
+            first.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+    }
+}

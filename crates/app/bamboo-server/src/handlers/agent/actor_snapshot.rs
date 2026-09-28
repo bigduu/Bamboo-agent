@@ -31,13 +31,9 @@ fn failure(error: ActorSnapshotError) -> HttpResponse {
         .json(serde_json::json!({"schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION, "error": error}))
 }
 
-pub async fn handler(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-    req: HttpRequest,
-) -> HttpResponse {
-    // The existing middleware limits bcx credentials to Responses/models.
-    // Retain that restriction even when this handler is mounted independently.
+/// The same HostOwner gate is used by snapshot REST and lazy Actor WS channels.
+/// Open-policy access and Codex run tokens do not confer subtree visibility.
+pub(crate) async fn host_owner_authorized(state: &web::Data<AppState>, req: &HttpRequest) -> bool {
     let codex_token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -48,13 +44,24 @@ pub async fn handler(
         })
         .map(str::trim)
         .is_some_and(|token| token.starts_with("bcx1_"));
+    if codex_token {
+        return false;
+    }
     let config = state.config.read().await;
-    let host_owner = matches!(
-        bootstrap_access_snapshot(&config, &req).request_state,
+    matches!(
+        bootstrap_access_snapshot(&config, req).request_state,
         BootstrapRequestState::LocalBypass | BootstrapRequestState::Authenticated
-    );
-    drop(config);
-    if codex_token || !host_owner {
+    )
+}
+
+pub async fn handler(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: HttpRequest,
+) -> HttpResponse {
+    // The existing middleware limits bcx credentials to Responses/models.
+    // Retain that restriction even when this handler is mounted independently.
+    if !host_owner_authorized(&state, &req).await {
         return HttpResponse::Unauthorized().json(serde_json::json!({"schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION, "error": "host_authentication_required"}));
     }
     let query = match web::Query::<Query>::from_query(req.query_string()) {

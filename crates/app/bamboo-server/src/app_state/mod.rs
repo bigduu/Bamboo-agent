@@ -430,6 +430,9 @@ pub struct AppState {
     /// - sub-session forwarding (child -> parent)
     pub session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
 
+    /// Canonical, redacted Actor stream windows exist only for subscribed IDs.
+    pub(crate) actor_event_hub: Arc<actor_events::ActorEventHub>,
+
     /// Account-scoped durable change feed (powers `GET /api/v1/stream`).
     ///
     /// Unlike `session_event_senders`, this is a single account-wide sink: all
@@ -518,6 +521,7 @@ impl AppState {
     }
 }
 
+pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
 mod config_runtime;

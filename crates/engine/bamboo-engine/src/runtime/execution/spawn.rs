@@ -164,6 +164,13 @@ pub trait ExternalChildRunner: Send + Sync {
     /// Optional actual host Store for the local zero-tool named-profile route.
     /// This does not enable owned Inbox claims or grant authority to custom runners.
     fn set_actor_directory_store(&self, _store: Option<Arc<bamboo_storage::SessionStoreV2>>) {}
+
+    /// Optional host-owned, redacted canonical Actor event observer.
+    fn set_actor_event_observer(
+        &self,
+        _observer: Option<Arc<dyn crate::external_agents::actor_event_stream::ActorEventObserver>>,
+    ) {
+    }
 }
 
 #[derive(Clone)]

@@ -1,6 +1,7 @@
 pub mod a2a_adapter;
 pub mod actor_adapter;
 mod actor_event_router;
+pub mod actor_event_stream;
 pub mod approval_registry;
 pub mod config;
 pub mod live;

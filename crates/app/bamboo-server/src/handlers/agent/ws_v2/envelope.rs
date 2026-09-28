@@ -213,6 +213,17 @@ pub(crate) fn gap_control(skipped: u64) -> Value {
     serde_json::json!({ "type": "gap", "skipped": skipped })
 }
 
+/// A canonical Actor channel has no durable event journal. After a fresh
+/// subscription or a lost replay window, fetch its authorized subtree snapshot
+/// while keeping the channel subscribed; later events remain buffered.
+pub(crate) fn actor_snapshot_required_control(reason: &str, cursor: u64) -> Value {
+    serde_json::json!({
+        "type": "actor_snapshot_required",
+        "reason": reason,
+        "cursor": cursor,
+    })
+}
+
 /// The app-level keepalive envelope sent on every ping tick (#533):
 /// `{ch:"sys", seq:0, control:{type:"keepalive"}}`.
 ///
@@ -267,6 +278,8 @@ pub(crate) enum Channel {
     Feed,
     /// A per-session agent event stream.
     Agent(String),
+    /// Redacted, Directory-fenced Actor changes (separate from legacy agent).
+    Actor(String),
     /// A strictly message-only visible assistant text stream.
     Message(String),
 }
@@ -281,6 +294,12 @@ impl Channel {
                 None
             } else {
                 Some(Channel::Agent(sid.to_string()))
+            }
+        } else if let Some(actor_id) = ch.strip_prefix("actor.") {
+            if actor_id.is_empty() {
+                None
+            } else {
+                Some(Channel::Actor(actor_id.to_string()))
             }
         } else if let Some(sid) = ch.strip_prefix("message.") {
             if sid.is_empty() {

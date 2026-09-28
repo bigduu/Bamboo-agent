@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamMap;
 
+use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal};
 use serde::Deserialize;
 
 use self::envelope::{
@@ -78,8 +79,8 @@ use self::envelope::{
     Encoding, OutFrame,
 };
 use self::forwarders::{
-    spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder,
-    spawn_message_forwarder, OutboundTx,
+    spawn_actor_forwarder, spawn_agent_forwarder, spawn_agent_terminal_forwarder,
+    spawn_feed_forwarder, spawn_message_forwarder, OutboundTx,
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -341,6 +342,8 @@ pub async fn handler(
         let config = state.config.read().await.clone();
         crate::handlers::settings::request_is_authorized(&req, &config)
     };
+    let actor_host_owner =
+        crate::handlers::agent::actor_snapshot::host_owner_authorized(&state, &req).await;
 
     let (mut response, session, msg_stream) = actix_ws::handle(&req, body)?;
 
@@ -360,6 +363,7 @@ pub async fn handler(
         msg_stream,
         batch_ms,
         pre_authorized,
+        actor_host_owner,
         encoding,
     ));
 
@@ -375,6 +379,7 @@ async fn drive(
     mut msg_stream: actix_ws::MessageStream,
     batch_ms: u64,
     pre_authorized: bool,
+    initial_actor_host_owner: bool,
     encoding: Encoding,
 ) {
     // Per-channel outbound (RFC §10-Q3): every subscribed channel owns its OWN
@@ -394,6 +399,7 @@ async fn drive(
     // / cookie / header clients are authorized immediately; everything else must
     // present a valid `hello` before any channel is served.
     let mut authorized = pre_authorized;
+    let mut actor_host_owner = initial_actor_host_owner;
     // The protocol acknowledges only the first successfully authorized `hello`
     // on a socket. Later token-less/valid hellos remain harmless and a later
     // credentialed hello is still re-verified, but none duplicates `welcome`.
@@ -481,6 +487,7 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            actor_host_owner: &mut actor_host_owner,
                             welcome_sent,
                         }, text.as_bytes())
                         .await;
@@ -508,6 +515,7 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            actor_host_owner: &mut actor_host_owner,
                             welcome_sent,
                         }, &bytes)
                         .await;
@@ -569,6 +577,7 @@ struct ClientDispatchContext<'a> {
     batch_ms: u64,
     encoding: Encoding,
     authorized: &'a mut bool,
+    actor_host_owner: &'a mut bool,
     /// Whether this socket has already completed its one successful welcome
     /// write. Passed by value so only the sole socket writer marks it after the
     /// direct write succeeds.
@@ -652,6 +661,7 @@ async fn handle_client_frame(
         batch_ms,
         encoding,
         authorized,
+        actor_host_owner,
         welcome_sent,
     } = context;
 
@@ -662,6 +672,7 @@ async fn handle_client_frame(
         GateOutcome::Handled => return ClientFrameOutcome::Continue,
         GateOutcome::Close => return ClientFrameOutcome::Close,
         GateOutcome::AcknowledgeHello => {
+            *actor_host_owner = true;
             return acknowledge_hello(encoding, welcome_sent);
         }
         GateOutcome::Dispatch => {}
@@ -687,6 +698,7 @@ async fn handle_client_frame(
                 (Some(device_id), Some(token)) => {
                     let config = state.config.read().await.clone();
                     if crate::handlers::settings::verify_device_token(&config, &device_id, &token) {
+                        *actor_host_owner = true;
                         // Neither the credential nor its device identity belongs in logs.
                         tracing::debug!("ws_v2: hello credential verified");
                     } else {
@@ -703,7 +715,17 @@ async fn handle_client_frame(
             return acknowledge_hello(encoding, welcome_sent);
         }
         ClientFrame::Subscribe { ch, since } => {
-            subscribe(state, forwarders, queues, batch_ms, encoding, &ch, since).await;
+            subscribe(
+                state,
+                forwarders,
+                queues,
+                batch_ms,
+                encoding,
+                &ch,
+                since,
+                *actor_host_owner,
+            )
+            .await;
         }
         ClientFrame::Unsubscribe { ch } => {
             if let Some(handle) = forwarders.remove(&ch) {
@@ -738,6 +760,7 @@ async fn subscribe(
     encoding: Encoding,
     ch: &str,
     since: Option<u64>,
+    actor_host_owner: bool,
 ) {
     let Some(channel) = Channel::parse(ch) else {
         tracing::debug!("ws_v2: ignoring subscribe to unknown channel {ch}");
@@ -855,6 +878,38 @@ async fn subscribe(
                 critical_events_to_replay,
                 batch_ms,
             )
+        }
+        Channel::Actor(actor_id) => {
+            if !actor_host_owner {
+                return;
+            }
+            // Index metadata only selects a root. The bounded snapshot reader
+            // proves the full root/child lineage before this channel is opened.
+            let Some(index) = state.session_store.get_index_entry(&actor_id).await else {
+                return;
+            };
+            let root_id = if index.root_session_id.is_empty() {
+                actor_id.as_str()
+            } else {
+                index.root_session_id.as_str()
+            };
+            if state
+                .session_store
+                .actor_subtree_snapshot(
+                    ActorSnapshotPrincipal::host_owner(),
+                    root_id,
+                    &actor_id,
+                    ActorSnapshotLimits::default(),
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let Some(subscription) = state.actor_event_hub.subscribe(&actor_id, since) else {
+                return;
+            };
+            spawn_actor_forwarder(out_tx, encoding, ch.to_string(), subscription, since)
         }
         Channel::Message(sid) => {
             if state.session_store.get_index_entry(&sid).await.is_none() {
@@ -1148,6 +1203,7 @@ mod tests {
         let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
 
         let mut authorized = false;
+        let mut actor_host_owner = false;
         assert_eq!(
             handle_client_frame(
                 ClientDispatchContext {
@@ -1158,6 +1214,7 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    actor_host_owner: &mut actor_host_owner,
                     welcome_sent: false,
                 },
                 ClientFrame::Ping,
@@ -1181,6 +1238,7 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    actor_host_owner: &mut actor_host_owner,
                     welcome_sent: false,
                 },
                 ClientFrame::Ping,
@@ -1201,6 +1259,7 @@ mod tests {
         let mut queues = StreamMap::new();
         let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
         let mut authorized = true;
+        let mut actor_host_owner = false;
 
         let first = handle_client_frame(
             ClientDispatchContext {
@@ -1211,6 +1270,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: false,
             },
             hello(None, None),
@@ -1235,6 +1295,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(None, None),
@@ -1255,6 +1316,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(Some(&cred.device_id), Some(&token)),
@@ -1275,6 +1337,7 @@ mod tests {
                 batch_ms: 0,
                 encoding: Encoding::Json,
                 authorized: &mut authorized,
+                actor_host_owner: &mut actor_host_owner,
                 welcome_sent: true,
             },
             hello(Some(&cred.device_id), Some("bd1_wrongwrongwrong")),
@@ -1295,6 +1358,7 @@ mod tests {
         let (sys_tx, sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
         queues.insert(SYS_CHANNEL.to_string(), ReceiverStream::new(sys_rx));
         let mut authorized = true;
+        let mut actor_host_owner = false;
 
         for frame in [
             ClientFrame::Subscribe {
@@ -1315,6 +1379,7 @@ mod tests {
                         batch_ms: 0,
                         encoding: Encoding::Json,
                         authorized: &mut authorized,
+                        actor_host_owner: &mut actor_host_owner,
                         welcome_sent: false,
                     },
                     frame,
@@ -1415,6 +1480,7 @@ mod tests {
             Encoding::Json,
             &channel,
             None,
+            false,
         )
         .await;
 

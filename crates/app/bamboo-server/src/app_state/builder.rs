@@ -463,6 +463,7 @@ impl AppState {
         // session's live channel — see `app_state::tools::build_base_tools`.
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let actor_event_hub = Arc::new(super::actor_events::ActorEventHub::default());
 
         // Shared bundle of always-on notification relay deps (see
         // `session_events::NotificationRelayDeps`). Built once and cloned into
@@ -786,6 +787,7 @@ impl AppState {
             },
         ));
         external_runner.set_actor_directory_store(Some(session_store.clone()));
+        external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -1204,6 +1206,7 @@ impl AppState {
             agent_runners,
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
+            actor_event_hub,
             account_sink,
             process_registry,
             metrics_bus: None, // Will be set by server if needed
