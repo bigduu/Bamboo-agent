@@ -405,7 +405,8 @@ impl SessionStoreV2 {
         }
         let side = side.ok_or_else(|| conflict("canonical runtime file is missing or corrupt"))?;
         Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)?;
-        self.validate_root_tool_proof(side).await
+        self.validate_root_tool_proof(side).await?;
+        self.validate_supervisor_proof(side).await
     }
 
     fn validate_root_tool_authority_pair(
@@ -436,6 +437,18 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    /// The one-time Supervisor upgrade verifies the existing Root proof and
+    /// canonical pair before the new Supervisor proof exists. Normal readers
+    /// must use `validate_root_tool_authority_overlay` instead.
+    pub(super) async fn validate_root_tool_pair_for_supervisor_migration(
+        &self,
+        main: &Session,
+        side: &Session,
+    ) -> io::Result<()> {
+        Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)?;
+        self.validate_root_tool_proof(side).await
+    }
+
     /// Operational control-plane loads use only the bounded runtime sidecar
     /// and committed proof. The main transcript is checked on full loads.
     pub(super) async fn validate_root_tool_authority_against_proof(
@@ -464,7 +477,8 @@ impl SessionStoreV2 {
         if !regular_file_exists(&path).await? {
             return Err(conflict("canonical main file is missing"));
         }
-        self.validate_root_tool_proof(side).await
+        self.validate_root_tool_proof(side).await?;
+        self.validate_supervisor_proof(side).await
     }
 
     /// The caller holds either the ordinary per-session writer lock or the
@@ -559,6 +573,7 @@ impl SessionStoreV2 {
             ));
         }
         self.validate_root_tool_proof(&current).await?;
+        self.validate_supervisor_proof(&current).await?;
         if full && has_main {
             // A full save already serializes the transcript and must not
             // replace damaged or stale canonical history from a caller's
@@ -568,6 +583,8 @@ impl SessionStoreV2 {
                 .map_err(|error| conflict(format!("canonical main file: {error}")))?;
             let main: Session = serde_json::from_slice(&bytes)
                 .map_err(|error| conflict(format!("invalid canonical main: {error}")))?;
+            supervisor::validate_overlay(&main, Some(&current))
+                .map_err(|error| conflict(error.to_string()))?;
             Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(&main), &current)?;
         }
         if incoming.metadata_version < current.metadata_version {
