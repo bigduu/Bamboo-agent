@@ -247,8 +247,8 @@ impl BrokerClient {
     }
 
     /// Connect a parent-side actor link. Unlike the general mailbox client,
-    /// durable Event/Outcome messages stay on the same ordered receive lane as
-    /// live event batches.
+    /// durable Event/Outcome messages and initial release controls stay on the
+    /// same ordered receive lane as live event batches.
     pub(crate) async fn connect_actor(
         endpoint: &str,
         agent: AgentRef,
@@ -350,7 +350,9 @@ impl BrokerClient {
                     Some(Ok(Message::Text(t))) => match BrokerFrame::from_text(&t) {
                         Ok(BrokerFrame::Message { message }) => {
                             if actor_stream_mode
-                                && matches!(message.kind, InboxKind::Event | InboxKind::Outcome)
+                                && (matches!(message.kind, InboxKind::Event | InboxKind::Outcome)
+                                    || (message.kind == InboxKind::SessionMessageAdmitted
+                                        && message.body.get("initial_input_control").is_some()))
                             {
                                 let _ = actor_tx.send(ActorStreamItem::Message(message));
                             } else {
@@ -912,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_mode_preserves_live_event_and_outcome_wire_order() {
+    async fn actor_mode_preserves_event_release_control_and_outcome_wire_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -951,12 +953,19 @@ mod tests {
             ))
             .await
             .unwrap();
-            for kind in [InboxKind::Event, InboxKind::Outcome] {
+            for (kind, body) in [
+                (InboxKind::Event, serde_json::json!({})),
+                (
+                    InboxKind::SessionMessageAdmitted,
+                    serde_json::json!({"initial_input_control": "request"}),
+                ),
+                (InboxKind::Outcome, serde_json::json!({})),
+            ] {
                 let message = InboxMessage {
                     id: MsgId::new(),
                     from: test_agent("worker"),
                     kind,
-                    body: serde_json::json!({}),
+                    body,
                     created_at: Utc::now(),
                     correlation_id: Some(server_run_id.clone()),
                 };
@@ -970,6 +979,15 @@ mod tests {
             .await
             .unwrap();
         client.subscribe().await.unwrap();
+        // Exercise the ready-on-both-lanes case that used to let the biased
+        // control queue overtake a preceding durable audit Event.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.actor_stream.len() + client.messages.len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all actor frames buffered");
         assert!(matches!(
             client.next_message_or_event_batch().await,
             BrokerStreamEvent::EventBatch(Some(ActorEventDelivery { batch, .. }))
@@ -979,6 +997,13 @@ mod tests {
             client.next_message_or_event_batch().await,
             BrokerStreamEvent::Message(Some(InboxMessage {
                 kind: InboxKind::Event,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            client.next_message_or_event_batch().await,
+            BrokerStreamEvent::Message(Some(InboxMessage {
+                kind: InboxKind::SessionMessageAdmitted,
                 ..
             }))
         ));

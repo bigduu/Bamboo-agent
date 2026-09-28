@@ -1114,8 +1114,39 @@ async fn fixture_with_followups(
             "actual pending correction timeout: {}",
             bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
         );
-        // Settle the Root ancestor before the Child captures its exact
-        // checkpoint lineage; this fault must exercise ACK, not a moving Root.
+        // The receipt can become durable while the Root turn still owns a
+        // writer. Let that turn settle before checking the Child's exact
+        // ancestor bytes at the pre-ACK fault boundary.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows: Value = client
+                    .get(format!("{base}/sessions"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if rows["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == "plain-root" && row["is_running"] == false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual Root turn settles before the Child pre-ACK cut");
+        let fault = AckWriteFault::new(
+            data.join(store.resolve_rel_path(&id).await.unwrap())
+                .join("inbox/admitted"),
+        );
+        probe.release.store(true, Ordering::SeqCst);
+        probe.wake.notify_waiters();
+        let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
         let parent_done = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let parent = store.load_session("plain-root").await.unwrap().unwrap();
@@ -1137,13 +1168,6 @@ async fn fixture_with_followups(
             probe.root_calls.load(Ordering::SeqCst),
             bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
         );
-        let fault = AckWriteFault::new(
-            data.join(store.resolve_rel_path(&id).await.unwrap())
-                .join("inbox/admitted"),
-        );
-        probe.release.store(true, Ordering::SeqCst);
-        probe.wake.notify_waiters();
-        let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
         drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
         drop(fault);
