@@ -39,6 +39,7 @@ use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
 };
 
+use super::actor_event_router::{ActorEventRoute, ActorEventRouteError, ActorEventRouter};
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
 /// Default cap on simultaneously running actor activations. The event and
@@ -4489,7 +4490,7 @@ async fn validate_directory_actor_event(
     fence: &ActorActivationFence,
     session: &Session,
     run_id: Option<&str>,
-) -> Result<(), AgentError> {
+) -> Result<bamboo_domain::ActorDirectoryEntry, AgentError> {
     store
         .validate_fence(fence, chrono::Utc::now())
         .await
@@ -4508,7 +4509,27 @@ async fn validate_directory_actor_event(
     {
         return Err(AgentError::LLM("actor event authority changed".into()));
     }
-    Ok(())
+    Ok(entry)
+}
+
+fn actor_event_route_error(error: ActorEventRouteError) -> AgentError {
+    let message = match error {
+        ActorEventRouteError::SequenceGap { .. } => {
+            "actor event sequence gap; authoritative session snapshot is required"
+        }
+        ActorEventRouteError::LifecycleMissing => {
+            "actor emitted live content before its activation lifecycle event"
+        }
+        ActorEventRouteError::ForgedSession => {
+            "actor event payload targets a different canonical session"
+        }
+        ActorEventRouteError::ConflictingReplay => {
+            "actor replay reused an event sequence with different content"
+        }
+        ActorEventRouteError::StaleAuthority => "actor event owner is stale",
+        ActorEventRouteError::SequenceExhausted => "actor event sequence is exhausted",
+    };
+    AgentError::LLM(message.into())
 }
 
 const MAX_DISPLAY_CALLS: usize = 4_096;
@@ -5017,6 +5038,30 @@ async fn process_actor_event(
             return Ok(());
         }
     };
+    process_typed_actor_event(
+        event,
+        strict_permission_events,
+        permission_handshake,
+        expected_permission_posture,
+        session_inbox_runtime,
+        logical_session,
+        event_tx,
+        display,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_typed_actor_event(
+    event: AgentEvent,
+    strict_permission_events: bool,
+    permission_handshake: &mut PermissionPostureHandshake,
+    expected_permission_posture: Option<&ExpectedPermissionPosture>,
+    session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
+    logical_session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    display: &mut ActorEventDisplay,
+) -> crate::runtime::runner::Result<()> {
     if matches!(&event, AgentEvent::PermissionPostureActivated { .. }) {
         if permission_handshake.posture_was_confirmed() {
             return Err(AgentError::LLM(
@@ -5166,6 +5211,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
     let mut next_actor_event_seq = 1u64;
+    let mut canonical_router: Option<ActorEventRouter> = None;
     let mut display = ActorEventDisplay::default();
     let mut readonly = readonly_output
         .as_ref()
@@ -5283,14 +5329,29 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             expected_source_actor_id,
                             expected_creation,
                         )?;
-                        if let Some(activation) = plain_input {
-                            validate_directory_actor_event(
+                        let directory_entry = if let Some(activation) = plain_input {
+                            Some(validate_directory_actor_event(
                                 activation.store.as_ref(),
                                 &activation.fence,
                                 logical_session,
                                 batch.activation_id.as_deref(),
                             )
-                            .await?;
+                            .await?)
+                        } else {
+                            None
+                        };
+                        if let (Some(entry), Some(activation)) = (&directory_entry, plain_input) {
+                            if canonical_router.is_none() {
+                                canonical_router = Some(
+                                    ActorEventRouter::new(
+                                        entry,
+                                        &activation.fence,
+                                        current_epoch,
+                                        strict_permission_events && permission_handshake.is_awaiting(),
+                                    )
+                                    .map_err(actor_event_route_error)?,
+                                );
+                            }
                         }
                         if local_history.is_some() && batch.first_seq != next_actor_event_seq {
                             return Err(local_tool_history_unsupported());
@@ -5320,20 +5381,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .min(batch.events.len() as u64) as usize;
                         for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
                             let seq = batch.first_seq + offset as u64;
+                            let mut publish = true;
                             if let Some(collector) = local_history.as_mut() {
                                 if permission_handshake.is_awaiting() && event["type"] != "permission_posture_activated" {
                                     return Err(local_tool_history_unsupported());
                                 }
-                                if !collector.event(&event)? {
-                                    next_actor_event_seq = seq.saturating_add(1);
-                                    continue;
-                                }
+                                publish = collector.event(&event)?;
                             } else if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
                                 // Completion DATA is private and grants nothing on an unselected route.
-                                next_actor_event_seq = seq.saturating_add(1);
-                                continue;
+                                publish = false;
                             }
-                            let publish = if let Some(collector) = readonly.as_mut() {
+                            if publish { publish = if let Some(collector) = readonly.as_mut() {
                                 if permission_handshake.is_awaiting()
                                     && event["type"] != "permission_posture_activated" {
                                     return Err(plain_actor_unsupported());
@@ -5343,6 +5401,42 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 if plain_actor { return Err(plain_actor_unsupported()); }
                                 false // A worker cache observation is not a legacy Host commit.
                             } else if plain_actor { plain_actor_event(&event)? } else { true };
+                            }
+                            if let (Some(router), Some(entry), Some(activation)) =
+                                (canonical_router.as_mut(), directory_entry.as_ref(), plain_input)
+                            {
+                                let typed = if publish {
+                                    Some(serde_json::from_value::<AgentEvent>(event.clone())
+                                        .map_err(|_| plain_actor_unsupported())?)
+                                } else {
+                                    None
+                                };
+                                match router.route(entry, &activation.fence, current_epoch, seq, typed)
+                                    .map_err(actor_event_route_error)?
+                                {
+                                    ActorEventRoute::Publish(envelope) => {
+                                        tracing::trace!(
+                                            actor_id = %envelope.actor_id,
+                                            event_id = %envelope.event_id,
+                                            class = ?envelope.class,
+                                            "publishing canonical Actor event"
+                                        );
+                                        process_typed_actor_event(
+                                            envelope.payload,
+                                            strict_permission_events,
+                                            &mut permission_handshake,
+                                            expected_permission_posture.as_ref(),
+                                            session_inbox_runtime,
+                                            logical_session,
+                                            event_tx,
+                                            &mut display,
+                                        ).await?;
+                                    }
+                                    ActorEventRoute::Duplicate | ActorEventRoute::Suppressed => {}
+                                }
+                                next_actor_event_seq = seq.saturating_add(1);
+                                continue;
+                            }
                             if !publish {
                                 next_actor_event_seq = seq.saturating_add(1);
                                 continue;
@@ -5635,6 +5729,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         // These are native coordinates scoped to the newly
                                         // correlated epoch. Public Host feed seq is untouched.
                                         next_actor_event_seq = 1;
+                                        canonical_router = None;
                                         permission_handshake = PermissionPostureHandshake::new(expected_permission_posture.as_ref());
                                         display = ActorEventDisplay::default();
                                         continue;
