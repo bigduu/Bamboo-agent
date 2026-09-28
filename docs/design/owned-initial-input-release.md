@@ -13,3 +13,10 @@ The existing Local placement reference records `owned-initial-release-v1:<physic
 This slice covers initial typed input on fresh owned executions, including the already supported second Run/correction and Failed/new-input Run. It does not add old-claim/Already recovery, replacement activation, live-input release, renewal, remote authority, a journal or exactly-once provider effects.
 
 Focused source fixtures use real Host Store/owned Inbox, broker and BambooRuntime with a recorded provider: ACK failure and retry, unreleased live worker past expiry, wrong nonce/epoch, cancellation, current-prefix rejection, same-receipt retransmission and cold single-input readback. The actual serve/current-exe correction/retry fixture requires the Host receipt immediately at provider entry. Compilation and runtime results belong to the shared verification lane; source fixtures are not execution evidence.
+
+The builtin turn-boundary bridge is a legacy unowned Inbox consumer. If its
+claim fails, including when an Actor has upgraded the queue to owned format 3,
+it reports unresolved admission to the checked runtime path. That path stops
+before prompt/provider execution and preserves the owned claim for its actual
+owner. This is a fail-closed compatibility boundary, not lease renewal or
+recovery of an expired Actor.

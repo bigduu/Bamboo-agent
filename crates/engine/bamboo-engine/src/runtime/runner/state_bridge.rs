@@ -17,6 +17,8 @@ use bamboo_domain::{
 const METADATA_KEY: &str = "agent.runtime.state";
 const INBOX_ACK_UNRESOLVED: &str =
     "SessionInbox ACK unresolved; durable input is preserved; retry this activation";
+const INBOX_CLAIM_UNRESOLVED: &str =
+    "SessionInbox claim unresolved; durable input is preserved; retry with its current owner";
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
@@ -504,13 +506,19 @@ async fn admit_session_inbox(
             session_id = %session.id,
             "SessionInbox cannot admit without durable runtime persistence"
         );
-        return InboxAdmission::default();
+        return InboxAdmission {
+            admission_error: Some(INBOX_CLAIM_UNRESOLVED.to_string()),
+            ..Default::default()
+        };
     };
     let claims = match inbox.claim_for_turn(&session.id, 128, active_run_id).await {
         Ok(claims) => claims,
         Err(error) => {
             tracing::warn!(session_id = %session.id, %error, "failed to claim SessionInbox");
-            return InboxAdmission::default();
+            return InboxAdmission {
+                admission_error: Some(INBOX_CLAIM_UNRESOLVED.to_string()),
+                ..Default::default()
+            };
         }
     };
 
@@ -1670,6 +1678,59 @@ mod tests {
             .await
             .unwrap();
         receipt
+    }
+
+    #[tokio::test]
+    async fn owned_inbox_claim_requires_current_owner_before_provider_admission() {
+        use bamboo_domain::{SessionInboxConsumerId, SessionInboxLeaseRequest};
+
+        let (_home, store, locked, inbox, mut running) =
+            durable_inbox_fixture("owned-claim-boundary").await;
+        let envelope = SessionMessageEnvelope::user_input(&running.id, "leased input");
+        deliver_interrupt_eligible(&inbox, &envelope).await;
+        let lease = SessionInboxLeaseRequest {
+            consumer: SessionInboxConsumerId::new(),
+            now: chrono::Utc::now(),
+            duration: chrono::Duration::seconds(30),
+        };
+        let owned = inbox
+            .claim_owned(&running.id, 1, None, &lease)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1);
+
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        let refresh = refresh_turn_boundary_with_inbox(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+        )
+        .await;
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
+        assert_eq!(refresh.merged, 0);
+        assert!(!running
+            .messages
+            .iter()
+            .any(|message| message.id == envelope.id.as_str()));
+        assert!(!inbox.was_admitted(&running.id, &envelope.id).await.unwrap());
+        let cold = store.load_session(&running.id).await.unwrap().unwrap();
+        assert!(!cold
+            .messages
+            .iter()
+            .any(|message| message.id == envelope.id.as_str()));
+        assert_eq!(
+            inbox
+                .inspect_owned_leases(&running.id, 1, lease.now)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
