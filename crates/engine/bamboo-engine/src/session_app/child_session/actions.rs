@@ -415,42 +415,99 @@ pub async fn get_child_action(
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
 
-    let status = metadata_text(&child, "last_run_status");
+    let status = child.last_run_status();
     let runner_info = port.get_child_runner_info(&child.id).await;
+    let mut truncated_fields = Vec::new();
+    let title = bounded_overview_field(Some(child.title.clone()), "title", &mut truncated_fields);
+    let model = bounded_overview_field(Some(child.model.clone()), "model", &mut truncated_fields);
+    let error = bounded_overview_field(
+        child.last_run_error(),
+        "last_run_error",
+        &mut truncated_fields,
+    );
+    let responsibility = bounded_overview_field(
+        metadata_text(&child, "responsibility"),
+        "responsibility",
+        &mut truncated_fields,
+    );
+    let subagent_type = bounded_overview_field(
+        metadata_text(&child, "subagent_type"),
+        "subagent_type",
+        &mut truncated_fields,
+    );
+    let prompt = bounded_overview_field(
+        metadata_text(&child, "assignment_prompt"),
+        "prompt",
+        &mut truncated_fields,
+    );
+    let latest_user_message = bounded_overview_field(
+        child
+            .messages
+            .iter()
+            .rfind(|message| matches!(message.role, bamboo_agent_core::Role::User))
+            .map(|message| message.content.clone()),
+        "latest_user_message",
+        &mut truncated_fields,
+    );
+    let guidance = bounded_overview_field(
+        Some(compute_status_guidance(
+            status.as_deref(),
+            runner_info.as_ref(),
+            child.has_pending_injected_messages(),
+        )),
+        "guidance",
+        &mut truncated_fields,
+    );
 
     Ok(json!({
         "child_session_id": child.id,
-        "title": child.title,
-        "model": child.model,
+        "title": title,
+        "model": model,
         "pinned": child.pinned,
         "message_count": child.messages.len(),
         "is_running": port.is_child_running(&child.id).await,
-        "last_run_status": status,
-        "last_run_error": metadata_text(&child, "last_run_error"),
-        "responsibility": metadata_text(&child, "responsibility"),
-        "subagent_type": metadata_text(&child, "subagent_type"),
-        "prompt": metadata_text(&child, "assignment_prompt"),
-        "latest_user_message": child
-            .messages
-            .iter()
-            .rposition(|message| matches!(message.role, bamboo_agent_core::Role::User))
-            .and_then(|idx| child.messages.get(idx))
-            .map(|message| message.content.clone()),
-        "runtime_kind": metadata_text(&child, "runtime.kind"),
-        "external_protocol": metadata_text(&child, "external.protocol"),
-        "external_agent_id": metadata_text(&child, "external.agent_id"),
-        "a2a_context_id": metadata_text(&child, "a2a.context_id"),
-        "a2a_latest_task_id": metadata_text(&child, "a2a.latest_task_id"),
-        "a2a_last_state": metadata_text(&child, "a2a.last_state"),
+        "last_run_status": bounded_overview_field(status.clone(), "last_run_status", &mut truncated_fields),
+        "last_run_error": error,
+        "responsibility": responsibility,
+        "subagent_type": subagent_type,
+        "prompt": prompt,
+        "latest_user_message": latest_user_message,
+        "runtime_kind": bounded_overview_field(metadata_text(&child, "runtime.kind"), "runtime_kind", &mut truncated_fields),
+        "external_protocol": bounded_overview_field(metadata_text(&child, "external.protocol"), "external_protocol", &mut truncated_fields),
+        "external_agent_id": bounded_overview_field(metadata_text(&child, "external.agent_id"), "external_agent_id", &mut truncated_fields),
+        "a2a_context_id": bounded_overview_field(metadata_text(&child, "a2a.context_id"), "a2a_context_id", &mut truncated_fields),
+        "a2a_latest_task_id": bounded_overview_field(metadata_text(&child, "a2a.latest_task_id"), "a2a_latest_task_id", &mut truncated_fields),
+        "a2a_last_state": bounded_overview_field(metadata_text(&child, "a2a.last_state"), "a2a_last_state", &mut truncated_fields),
         "runner_started_at": runner_info.as_ref().and_then(|r| r.started_at.map(|t| t.to_rfc3339())),
         "runner_completed_at": runner_info.as_ref().and_then(|r| r.completed_at.map(|t| t.to_rfc3339())),
-        "last_tool_name": runner_info.as_ref().and_then(|r| r.last_tool_name.clone()),
-        "last_tool_phase": runner_info.as_ref().and_then(|r| r.last_tool_phase.clone()),
+        "last_tool_name": bounded_overview_field(runner_info.as_ref().and_then(|r| r.last_tool_name.clone()), "last_tool_name", &mut truncated_fields),
+        "last_tool_phase": bounded_overview_field(runner_info.as_ref().and_then(|r| r.last_tool_phase.clone()), "last_tool_phase", &mut truncated_fields),
         "last_event_at": runner_info.as_ref().and_then(|r| r.last_event_at.map(|t| t.to_rfc3339())),
         "round_count": runner_info.as_ref().map(|r| r.round_count).unwrap_or(0),
         "has_pending_injected_messages": child.has_pending_injected_messages(),
-        "guidance": compute_status_guidance(status.as_deref(), runner_info.as_ref(), child.has_pending_injected_messages()),
+        "guidance": guidance,
+        "truncated_fields": truncated_fields,
+        "inspection_hint": "This overview contains metadata and bounded previews, not the child transcript. Use view=messages for paginated previews and view=result for bounded final-answer slices.",
     }))
+}
+
+fn bounded_overview_field(
+    value: Option<String>,
+    field: &'static str,
+    truncated_fields: &mut Vec<&'static str>,
+) -> Option<String> {
+    const MAX_BYTES: usize = 2048;
+    value.map(|value| {
+        if value.len() <= MAX_BYTES {
+            return value;
+        }
+        let mut end = MAX_BYTES;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        truncated_fields.push(field);
+        value[..end].to_string()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -614,6 +671,8 @@ fn apply_model_ref_override(
     Ok(())
 }
 
+/// Prepare an existing child for a fresh run without making it runnable. The
+/// caller must durably arm any synchronous parent wait before enqueueing it.
 pub async fn run_child_action(
     port: &dyn ChildSessionPort,
     parent: &Session,
@@ -642,8 +701,6 @@ pub async fn run_child_action(
     child.updated_at = Utc::now();
     port.save_child_session(&mut child).await?;
 
-    port.enqueue_child_run(parent, &child).await?;
-
     Ok(json!({
         "child_session_id": child.id,
         "status": "queued",
@@ -652,6 +709,7 @@ pub async fn run_child_action(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message_to_child_action(
     port: &dyn ChildSessionPort,
     parent: &Session,
@@ -660,6 +718,33 @@ pub async fn send_message_to_child_action(
     auto_run: Option<bool>,
     interrupt_running: Option<bool>,
     idempotency_key: Option<&str>,
+    wait_if_queued: bool,
+) -> Result<serde_json::Value, ChildSessionError> {
+    send_message_to_child_action_with_gate(
+        port,
+        parent,
+        child_session_id,
+        message,
+        auto_run,
+        interrupt_running,
+        idempotency_key,
+        wait_if_queued,
+        &|| true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_message_to_child_action_with_gate(
+    port: &dyn ChildSessionPort,
+    parent: &Session,
+    child_session_id: String,
+    message: String,
+    auto_run: Option<bool>,
+    interrupt_running: Option<bool>,
+    idempotency_key: Option<&str>,
+    wait_if_queued: bool,
+    begin_delivery: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(&parent.id, &child_session_id)
@@ -678,6 +763,14 @@ pub async fn send_message_to_child_action(
     let should_interrupt = interrupt_running.unwrap_or(false);
 
     if is_running && should_interrupt {
+        // Interrupting an existing run is itself an irreversible part of this
+        // delivery. Once it starts, the owner must finish preparing the new
+        // message even if the caller disappears.
+        if !begin_delivery() {
+            return Err(ChildSessionError::Execution(
+                "SubAgent tool cancelled before child delivery".to_string(),
+            ));
+        }
         port.cancel_child_run_and_wait(&child.id).await?;
         child = port
             .load_child_for_parent(&parent.id, &child_session_id)
@@ -693,9 +786,53 @@ pub async fn send_message_to_child_action(
     // On an idle child, `auto_run=false` must retain the historical draft-only
     // behavior regardless of that otherwise-inert flag.
     if should_route_child_message_through_inbox(is_running, should_auto_run) {
-        let delivery = port
+        // An idle child's SessionInbox delivery can reserve and execute its
+        // activation inside send_session_message. Arm the parent's durable wait
+        // first, then remove it if delivery did not actually queue a new run.
+        // Live messages intentionally retain their non-suspending semantics.
+        let armed_wait = wait_if_queued && !is_running;
+        let had_wait = if armed_wait {
+            port.load_root_session(&parent.id)
+                .await?
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_some_and(|wait| wait.child_session_ids.iter().any(|id| id == &child.id))
+        } else {
+            false
+        };
+        if armed_wait {
+            if let Err(error) = port
+                .register_parent_wait_for_child(&parent.id, &child.id, idempotency_key)
+                .await
+            {
+                return Err(if had_wait {
+                    error
+                } else {
+                    rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+                });
+            }
+        }
+        if !begin_delivery() {
+            let error = ChildSessionError::Execution(
+                "SubAgent tool cancelled before child delivery".to_string(),
+            );
+            return Err(if armed_wait && !had_wait {
+                rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+            } else {
+                error
+            });
+        }
+        let delivery = match port
             .send_session_message(&parent.id, &child.id, &message, idempotency_key)
-            .await?;
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(error) if armed_wait && !had_wait => {
+                return Err(rollback_failed_wait_launch(port, &parent.id, &child.id, error).await);
+            }
+            Err(error) => return Err(error),
+        };
         let (delivery, activation, status, note, activation_error) = match delivery {
             super::ChildSessionMessageDelivery::Activated(receipt) => {
                 let (status, note) = match receipt.activation {
@@ -728,6 +865,10 @@ pub async fn send_message_to_child_action(
                 Some(error),
             ),
         };
+        if armed_wait && !had_wait && status != "queued" {
+            port.rollback_parent_wait_for_child(&parent.id, &child.id)
+                .await?;
+        }
         return Ok(json!({
             "child_session_id": child.id,
             "status": status,
@@ -747,6 +888,11 @@ pub async fn send_message_to_child_action(
     // Explicit `auto_run=false` on an idle child retains its historical
     // draft-only behavior. All runnable/live delivery paths above converge on
     // SessionMessenger and never rewrite a snapshot to enqueue.
+    if !begin_delivery() {
+        return Err(ChildSessionError::Execution(
+            "SubAgent tool cancelled before child delivery".to_string(),
+        ));
+    }
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
     child.set_last_run_status("pending");
     child.clear_last_run_error();
@@ -760,6 +906,25 @@ pub async fn send_message_to_child_action(
         "message_count": child.messages.len(),
         "note": "Follow-up message appended. Use action=run to execute the child session.",
     }))
+}
+
+/// Undo only this child's wait entry when a launch fails after the wait was
+/// armed. Keep the original failure visible even if compensation also fails.
+pub async fn rollback_failed_wait_launch(
+    port: &dyn ChildSessionPort,
+    parent_session_id: &str,
+    child_session_id: &str,
+    error: ChildSessionError,
+) -> ChildSessionError {
+    match port
+        .rollback_parent_wait_for_child(parent_session_id, child_session_id)
+        .await
+    {
+        Ok(()) => error,
+        Err(rollback_error) => ChildSessionError::Execution(format!(
+            "{error}; parent-wait rollback failed: {rollback_error}"
+        )),
+    }
 }
 
 fn should_route_child_message_through_inbox(is_running: bool, should_auto_run: bool) -> bool {

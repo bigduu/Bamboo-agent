@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
@@ -16,6 +16,9 @@ use bamboo_domain::{
     SessionActivationDisposition, SessionActivationError, SessionActivationPort, SessionInboxPort,
 };
 use bamboo_engine::session_app::child_session;
+use bamboo_engine::session_app::child_session::{
+    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
+};
 
 use crate::app_state::{AgentRunner, AgentStatus};
 use crate::tools::{ChildSessionAdapter, PlanTool, SubAgentTool};
@@ -108,6 +111,10 @@ struct RecordingActivation {
     calls: AtomicUsize,
     failures_remaining: AtomicUsize,
     delegate: StdRwLock<Option<Arc<dyn SessionActivationPort>>>,
+    forced_disposition: StdRwLock<Option<SessionActivationDisposition>>,
+    pause_next: AtomicBool,
+    activation_entered: tokio::sync::Notify,
+    release_activation: tokio::sync::Notify,
 }
 
 impl RecordingActivation {
@@ -117,6 +124,10 @@ impl RecordingActivation {
 
     fn set_delegate(&self, delegate: Arc<dyn SessionActivationPort>) {
         *self.delegate.write().unwrap() = Some(delegate);
+    }
+
+    fn force_disposition(&self, disposition: SessionActivationDisposition) {
+        *self.forced_disposition.write().unwrap() = Some(disposition);
     }
 }
 
@@ -128,6 +139,10 @@ impl SessionActivationPort for RecordingActivation {
         inbox_generation: u64,
     ) -> Result<SessionActivationDisposition, SessionActivationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.pause_next.swap(false, Ordering::SeqCst) {
+            self.activation_entered.notify_one();
+            self.release_activation.notified().await;
+        }
         if self
             .failures_remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -138,6 +153,9 @@ impl SessionActivationPort for RecordingActivation {
             return Err(SessionActivationError::Internal(
                 "injected activation failure".to_string(),
             ));
+        }
+        if let Some(disposition) = *self.forced_disposition.read().unwrap() {
+            return Ok(disposition);
         }
         let delegate = self.delegate.read().unwrap().clone();
         match delegate {
@@ -399,6 +417,970 @@ async fn build_test_harness_with_storage(
         project_store,
         workspace_path,
     }
+}
+
+/// A scheduler/SessionInbox gate that makes the fast-completion ordering
+/// deterministic: a child is allowed to activate only after its parent's
+/// wait can already be read from durable storage. It can also fail a launch
+/// at that exact boundary to exercise per-child wait compensation.
+struct WaitOrderPort {
+    inner: Arc<ChildSessionAdapter>,
+    storage: Arc<dyn Storage>,
+    fail_launch: AtomicBool,
+    checked_launches: AtomicUsize,
+    hold_first_enqueue: AtomicBool,
+    hold_wait_after_persist: AtomicBool,
+    fail_wait_after_persist: AtomicBool,
+    first_enqueue_entered: tokio::sync::Notify,
+    release_first_enqueue: tokio::sync::Notify,
+    wait_persisted: tokio::sync::Notify,
+    release_wait: tokio::sync::Notify,
+    last_wait_child_id: StdRwLock<Option<String>>,
+    skip_successful_enqueue: AtomicBool,
+    parent_load_count: AtomicUsize,
+    clear_wait_after_second_parent_load: AtomicBool,
+}
+
+impl WaitOrderPort {
+    fn new(inner: Arc<ChildSessionAdapter>, storage: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            storage,
+            fail_launch: AtomicBool::new(false),
+            checked_launches: AtomicUsize::new(0),
+            hold_first_enqueue: AtomicBool::new(false),
+            hold_wait_after_persist: AtomicBool::new(false),
+            fail_wait_after_persist: AtomicBool::new(false),
+            first_enqueue_entered: tokio::sync::Notify::new(),
+            release_first_enqueue: tokio::sync::Notify::new(),
+            wait_persisted: tokio::sync::Notify::new(),
+            release_wait: tokio::sync::Notify::new(),
+            last_wait_child_id: StdRwLock::new(None),
+            skip_successful_enqueue: AtomicBool::new(false),
+            parent_load_count: AtomicUsize::new(0),
+            clear_wait_after_second_parent_load: AtomicBool::new(false),
+        }
+    }
+
+    async fn assert_wait_armed(&self, parent_id: &str, child_id: &str) {
+        let parent = self
+            .storage
+            .load_session(parent_id)
+            .await
+            .expect("load durable parent")
+            .expect("parent exists");
+        let wait = parent
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.waiting_for_children.as_ref())
+            .expect("wait must be durable before child activation");
+        assert!(
+            wait.child_session_ids.iter().any(|id| id == child_id),
+            "child {child_id} could complete before its parent wait was armed"
+        );
+        self.checked_launches.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn maybe_fail_launch(&self) -> Result<(), ChildSessionError> {
+        if self.fail_launch.load(Ordering::SeqCst) {
+            Err(ChildSessionError::Execution(
+                "injected launch failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChildSessionPort for WaitOrderPort {
+    async fn validate_child_workspace(
+        &self,
+        project_id: Option<&bamboo_domain::ProjectId>,
+        requested_workspace: &str,
+    ) -> Result<String, ChildSessionError> {
+        self.inner
+            .validate_child_workspace(project_id, requested_workspace)
+            .await
+    }
+
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: PathBuf,
+        source: &str,
+    ) -> PathBuf {
+        self.inner
+            .publish_child_workspace(session_id, workspace, source)
+    }
+
+    async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError> {
+        let parent = self.inner.load_root_session(root_id).await?;
+        if self
+            .clear_wait_after_second_parent_load
+            .load(Ordering::SeqCst)
+            && self.parent_load_count.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            let child_id = parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.waiting_for_children.as_ref())
+                .and_then(|wait| wait.child_session_ids.first())
+                .cloned()
+                .expect("test parent has a pre-existing child wait");
+            self.inner
+                .rollback_parent_wait_for_child(root_id, &child_id)
+                .await?;
+        }
+        Ok(parent)
+    }
+
+    async fn load_child_for_parent(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.inner.load_child_for_parent(parent_id, child_id).await
+    }
+
+    async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
+        self.inner.save_child_session(child).await
+    }
+
+    async fn save_child_session_authoritative_flags(
+        &self,
+        child: &mut Session,
+    ) -> Result<(), ChildSessionError> {
+        self.inner
+            .save_child_session_authoritative_flags(child)
+            .await
+    }
+
+    async fn send_session_message(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<child_session::ChildSessionMessageDelivery, ChildSessionError> {
+        self.assert_wait_armed(source_session_id, target_session_id)
+            .await;
+        self.maybe_fail_launch()?;
+        self.inner
+            .send_session_message(
+                source_session_id,
+                target_session_id,
+                message,
+                idempotency_key,
+            )
+            .await
+    }
+
+    async fn is_child_running(&self, child_id: &str) -> bool {
+        self.inner.is_child_running(child_id).await
+    }
+
+    async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry> {
+        self.inner.list_children(parent_id).await
+    }
+
+    async fn enqueue_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+    ) -> Result<(), ChildSessionError> {
+        self.assert_wait_armed(&parent.id, &child.id).await;
+        if self.hold_first_enqueue.swap(false, Ordering::SeqCst) {
+            self.first_enqueue_entered.notify_one();
+            self.release_first_enqueue.notified().await;
+            return Err(ChildSessionError::Execution(
+                "injected first launch failure".to_string(),
+            ));
+        }
+        self.maybe_fail_launch()?;
+        if self.skip_successful_enqueue.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.enqueue_child_run(parent, child).await
+    }
+
+    async fn cancel_child_run_and_wait(&self, child_id: &str) -> Result<(), ChildSessionError> {
+        self.inner.cancel_child_run_and_wait(child_id).await
+    }
+
+    async fn delete_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<DeleteChildResult, ChildSessionError> {
+        self.inner.delete_child_session(parent_id, child_id).await
+    }
+
+    async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo> {
+        self.inner.get_child_runner_info(child_id).await
+    }
+
+    async fn register_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError> {
+        *self.last_wait_child_id.write().unwrap() = Some(child_session_id.to_string());
+        self.inner
+            .register_parent_wait_for_child(parent_session_id, child_session_id, tool_call_id)
+            .await?;
+        if self.hold_wait_after_persist.swap(false, Ordering::SeqCst) {
+            self.wait_persisted.notify_one();
+            self.release_wait.notified().await;
+        }
+        if self.fail_wait_after_persist.swap(false, Ordering::SeqCst) {
+            return Err(ChildSessionError::Execution(
+                "injected parent wait acknowledgement failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        self.inner
+            .rollback_parent_wait_for_child(parent_session_id, child_session_id)
+            .await
+    }
+
+    async fn register_parent_wait_for_children(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+    ) -> Result<usize, ChildSessionError> {
+        self.inner
+            .register_parent_wait_for_children(parent_session_id, child_session_ids, policy)
+            .await
+    }
+
+    async fn register_parent_wait_for_children_tagged(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+        tool_call_id: &str,
+    ) -> Result<usize, ChildSessionError> {
+        self.inner
+            .register_parent_wait_for_children_tagged(
+                parent_session_id,
+                child_session_ids,
+                policy,
+                tool_call_id,
+            )
+            .await
+    }
+
+    async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
+        self.inner.active_child_ids(parent_session_id).await
+    }
+
+    async fn terminal_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidates: &[String],
+    ) -> Vec<(String, String)> {
+        self.inner
+            .terminal_child_ids(parent_session_id, candidates)
+            .await
+    }
+
+    async fn find_resident_child(
+        &self,
+        root_session_id: &str,
+        resident_name: &str,
+    ) -> Option<String> {
+        self.inner
+            .find_resident_child(root_session_id, resident_name)
+            .await
+    }
+
+    async fn ensure_child_indexed(&self, child_session_id: &str) {
+        self.inner.ensure_child_indexed(child_session_id).await;
+    }
+}
+
+fn synchronous_launch_args(action: &str, child_id: &str, workspace: &str) -> serde_json::Value {
+    match action {
+        "create" => json!({
+            "action": "create",
+            "title": "Fast child",
+            "responsibility": "Return immediately",
+            "prompt": "Return immediately",
+            "workspace": workspace,
+            "wait": true,
+        }),
+        "update" => json!({
+            "action": "update",
+            "child_session_id": child_id,
+            "responsibility": "Return immediately",
+            "subagent_type": "worker",
+            "prompt": "Return immediately",
+            "auto_run": true,
+        }),
+        "run" => json!({"action": "run", "child_session_id": child_id}),
+        "send_message" => json!({
+            "action": "send_message",
+            "child_session_id": child_id,
+            "message": "Return immediately",
+        }),
+        other => panic!("unexpected synchronous action: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn synchronous_subagent_paths_arm_wait_before_a_fast_child_can_activate() {
+    for action in ["create", "update", "run", "send_message"] {
+        let harness = build_test_harness().await;
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        let tool = SubAgentTool::new(port.clone(), harness.adapter.clone());
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let result = invoke_completed(
+            &tool,
+            args,
+            subagent_test_ctx(&harness.parent_session_id, action),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{action} launch failed: {error}"));
+        assert_eq!(
+            result.display_preference.as_deref(),
+            Some("runtime_control:waiting_for_children"),
+            "{action} must suspend after launch"
+        );
+        assert_eq!(
+            port.checked_launches.load(Ordering::SeqCst),
+            1,
+            "{action} must cross the checked activation gate exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fast_synchronous_child_completion_clears_wait_and_queues_resume() {
+    let mut harness = build_test_harness().await;
+    let result = invoke_completed(
+        &harness.tool,
+        synchronous_launch_args(
+            "create",
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        ),
+        subagent_test_ctx(&harness.parent_session_id, "fast-completion"),
+    )
+    .await
+    .expect("launch fast synchronous child");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["child_session_id"].as_str().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match harness.parent_rx.recv().await {
+                Ok(AgentEvent::SubAgentCompleted {
+                    child_session_id, ..
+                }) if child_session_id == child_id => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("parent stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("fast child must complete before the watchdog interval");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fast child completion must clear parent wait without watchdog");
+    let resume_backlog = harness
+        .session_inbox
+        .inspect(&harness.parent_session_id)
+        .await
+        .expect("inspect parent resume inbox");
+    assert!(
+        resume_backlog.generation > 0,
+        "completion must admit a parent resume message"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_child_run_failure_cannot_rollback_successor_wait() {
+    let harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.hold_first_enqueue.store(true, Ordering::SeqCst);
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let workspace = harness.workspace_path.to_string_lossy().to_string();
+
+    let first_entered = port.first_enqueue_entered.notified();
+    let first_tool = tool.clone();
+    let first_child = child_id.clone();
+    let first_workspace = workspace.clone();
+    let first_parent = parent_id.clone();
+    let first = tokio::spawn(async move {
+        invoke_completed(
+            &first_tool,
+            synchronous_launch_args("run", &first_child, &first_workspace),
+            subagent_test_ctx(&first_parent, "same-child-first"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), first_entered)
+        .await
+        .expect("first run reaches enqueue after arming wait");
+
+    let second_tool = tool;
+    let second_child = child_id.clone();
+    let second_started = Arc::new(tokio::sync::Notify::new());
+    let second_started_wait = second_started.notified();
+    let second_started_signal = second_started.clone();
+    let second = tokio::spawn(async move {
+        second_started_signal.notify_one();
+        invoke_completed(
+            &second_tool,
+            synchronous_launch_args("run", &second_child, &workspace),
+            subagent_test_ctx(&parent_id, "same-child-second"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), second_started_wait)
+        .await
+        .expect("second run task starts while first enqueue is held");
+    let reached_second_enqueue = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            if port.checked_launches.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        reached_second_enqueue.is_err(),
+        "second same-child run must wait until first launch compensates"
+    );
+
+    port.release_first_enqueue.notify_one();
+    let first_error = first.await.unwrap().unwrap_err();
+    assert!(format!("{first_error}").contains("injected first launch failure"));
+    let second_result = second
+        .await
+        .unwrap()
+        .expect("second run queues after rollback");
+    assert_eq!(
+        second_result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+    let durable = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|runtime| runtime.waiting_for_children.as_ref())
+        .is_some_and(|wait| wait.child_session_ids.contains(&child_id)));
+}
+
+#[tokio::test]
+async fn run_rechecks_terminal_child_after_already_running_race() {
+    let harness = build_test_harness().await;
+    // Simulate the narrow race where the runner is still published as running
+    // while the durable child status has already become terminal.
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.child_session_id.clone(), runner);
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({"action": "run", "child_session_id": harness.child_session_id}),
+        subagent_test_ctx(&harness.parent_session_id, "already-running-race"),
+    )
+    .await
+    .expect("already-running run should return");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["status"], "already_terminal");
+    assert_eq!(payload["last_run_status"], "completed");
+    assert_ne!(
+        result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+}
+
+#[tokio::test]
+async fn run_terminal_recheck_preserves_an_existing_wait_for_the_same_child() {
+    let harness = build_test_harness().await;
+    harness
+        .adapter
+        .register_parent_wait_for_child(
+            &harness.parent_session_id,
+            &harness.child_session_id,
+            Some("original-wait"),
+        )
+        .await
+        .expect("seed an existing child wait");
+
+    // The runner is still published as active, while the durable child status
+    // has become terminal. This Run call must not remove the earlier wait.
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.child_session_id.clone(), runner);
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({"action": "run", "child_session_id": harness.child_session_id}),
+        subagent_test_ctx(&harness.parent_session_id, "second-run"),
+    )
+    .await
+    .expect("already-running run should return");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["status"], "already_terminal");
+    assert_ne!(
+        result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let wait = parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .expect("earlier child wait must remain armed");
+    assert_eq!(wait.child_session_ids, [harness.child_session_id]);
+    assert_eq!(
+        wait.registered_by_tool_call_id.as_deref(),
+        Some("original-wait")
+    );
+}
+
+#[tokio::test]
+async fn run_does_not_rearm_wait_cleared_after_parent_snapshot() {
+    let harness = build_test_harness().await;
+    harness
+        .adapter
+        .register_parent_wait_for_child(
+            &harness.parent_session_id,
+            &harness.child_session_id,
+            Some("original-wait"),
+        )
+        .await
+        .unwrap();
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.child_session_id.clone(), runner);
+
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.clear_wait_after_second_parent_load
+        .store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port, harness.adapter.clone());
+    let result = invoke_completed(
+        &tool,
+        json!({"action": "run", "child_session_id": harness.child_session_id}),
+        subagent_test_ctx(
+            &harness.parent_session_id,
+            "cleared-between-snapshot-register",
+        ),
+    )
+    .await
+    .expect("already-running run returns after completion");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["status"], "already_terminal");
+    assert_ne!(
+        result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|runtime| runtime.waiting_for_children.as_ref())
+        .is_none());
+}
+
+#[tokio::test]
+async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
+    for action in ["create", "update", "run", "send_message"] {
+        let harness = build_test_harness().await;
+        harness
+            .adapter
+            .register_parent_wait_for_child(&harness.parent_session_id, "sibling", None)
+            .await
+            .expect("seed sibling wait");
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        port.fail_launch.store(true, Ordering::SeqCst);
+        let tool = SubAgentTool::new(port.clone(), harness.adapter.clone());
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let error = invoke_completed(
+            &tool,
+            args,
+            subagent_test_ctx(&harness.parent_session_id, action),
+        )
+        .await
+        .expect_err("injected launch failure must fail tool");
+        assert!(error.to_string().contains("injected launch failure"));
+        assert_eq!(port.checked_launches.load(Ordering::SeqCst), 1);
+        assert!(
+            harness
+                .adapter
+                .active_child_ids(&harness.parent_session_id)
+                .await
+                .is_empty(),
+            "{action} failed launch must not be rediscovered by the end-of-turn auto-wait"
+        );
+        let parent = harness
+            .storage
+            .load_session(&harness.parent_session_id)
+            .await
+            .expect("load parent")
+            .expect("parent exists");
+        let wait = parent
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.waiting_for_children.as_ref())
+            .expect("sibling wait survives rollback");
+        assert_eq!(
+            wait.child_session_ids,
+            ["sibling"],
+            "{action} must roll back only its own child wait"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_synchronous_launch_still_compensates_a_rejected_enqueue() {
+    for action in ["create", "update", "run"] {
+        let harness = build_test_harness().await;
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        port.hold_first_enqueue.store(true, Ordering::SeqCst);
+        let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let parent_id = harness.parent_session_id.clone();
+        let entered = port.first_enqueue_entered.notified();
+        let outer = tokio::spawn(async move {
+            invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("launch owner must reach enqueue with durable wait armed");
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        port.release_first_enqueue.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let parent = harness
+                    .storage
+                    .load_session(&harness.parent_session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let wait_cleared = parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| state.waiting_for_children.as_ref())
+                    .is_none();
+                let active = harness
+                    .adapter
+                    .active_child_ids(&harness.parent_session_id)
+                    .await;
+                if wait_cleared && active.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{action} cancellation stranded a pending child or wait"));
+        assert_eq!(port.checked_launches.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
+    for action in ["create", "update", "run", "send_message"] {
+        let harness = build_test_harness().await;
+        let port = Arc::new(WaitOrderPort::new(
+            harness.adapter.clone(),
+            harness.storage.clone(),
+        ));
+        port.hold_wait_after_persist.store(true, Ordering::SeqCst);
+        let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+        let args = synchronous_launch_args(
+            action,
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        );
+        let parent_id = harness.parent_session_id.clone();
+        let wait_persisted = port.wait_persisted.notified();
+        let outer = tokio::spawn(async move {
+            invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_persisted)
+            .await
+            .expect("parent wait must be persisted before cancellation");
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        port.release_wait.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let parent = harness
+                    .storage
+                    .load_session(&harness.parent_session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let wait_cleared = parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| state.waiting_for_children.as_ref())
+                    .is_none();
+                if wait_cleared {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{action} cancellation did not clear its durable wait"));
+        assert_eq!(port.checked_launches.load(Ordering::SeqCst), 0);
+        assert!(harness
+            .adapter
+            .active_child_ids(&harness.parent_session_id)
+            .await
+            .is_empty());
+        if action != "send_message" {
+            let child_id = port.last_wait_child_id.read().unwrap().clone().unwrap();
+            let child = harness
+                .storage
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                child.last_run_status().as_deref(),
+                Some("error"),
+                "{action} left its prepared child non-terminal"
+            );
+        }
+        let child_backlog = harness
+            .session_inbox
+            .inspect(&harness.child_session_id)
+            .await
+            .unwrap();
+        assert_eq!(child_backlog.generation, 0, "{action} delivered a message");
+        let parent_backlog = harness
+            .session_inbox
+            .inspect(&harness.parent_session_id)
+            .await
+            .unwrap();
+        assert_eq!(parent_backlog.generation, 0, "{action} enqueued a child");
+    }
+}
+
+#[tokio::test]
+async fn failed_parent_wait_acknowledgement_marks_prepared_child_terminal() {
+    let harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.fail_wait_after_persist.store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port.clone(), harness.adapter.clone());
+    let error = invoke_completed(
+        &tool,
+        synchronous_launch_args(
+            "create",
+            &harness.child_session_id,
+            &harness.workspace_path.to_string_lossy(),
+        ),
+        subagent_test_ctx(&harness.parent_session_id, "failed-wait-ack"),
+    )
+    .await
+    .expect_err("uncertain wait acknowledgement must not launch child");
+    assert!(error
+        .to_string()
+        .contains("injected parent wait acknowledgement failure"));
+    assert_eq!(port.checked_launches.load(Ordering::SeqCst), 0);
+    assert!(harness
+        .adapter
+        .active_child_ids(&harness.parent_session_id)
+        .await
+        .is_empty());
+    let child_id = port.last_wait_child_id.read().unwrap().clone().unwrap();
+    let child = harness
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.last_run_status().as_deref(), Some("error"));
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+}
+
+#[tokio::test]
+async fn cancelled_send_message_finishes_activation_failure_after_inbox_admission() {
+    let harness = build_test_harness().await;
+    harness.activation.pause_next.store(true, Ordering::SeqCst);
+    harness.activation.fail_next();
+    let tool = Arc::new(SubAgentTool::new(
+        harness.adapter.clone(),
+        harness.adapter.clone(),
+    ));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let entered = harness.activation.activation_entered.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "action": "send_message",
+                "child_session_id": child_id,
+                "message": "retry after the activation failure"
+            }),
+            subagent_test_ctx(&parent_id, "cancelled-send-message"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("message must reach activation after durable inbox admission");
+    let admitted = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(admitted.generation, 1);
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+    harness.activation.release_activation.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("activation failure after caller cancellation must clear unsatisfiable wait");
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.generation, 1);
+    assert_eq!(backlog.pending + backlog.claimed, 1);
 }
 
 // -----------------------------------------------------------------------
@@ -1235,6 +2217,7 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
         .await
         .unwrap()
         .unwrap();
+    let mut stale_runner = parent.clone();
     let wait = parent
         .agent_runtime_state
         .unwrap()
@@ -1245,6 +2228,36 @@ async fn wait_action_with_explicit_children_suspends_and_registers() {
         vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
     );
     assert_eq!(wait.wait_for, ChildWaitPolicy::Any);
+    assert_eq!(wait.registered_by_tool_call_id.as_deref(), Some("tc_wait"));
+
+    // Completion after the runner's pipeline read must still win at the final
+    // merge-save boundary for this explicit tool wait.
+    let mut completed = stale_runner.clone();
+    let runtime = completed.agent_runtime_state.as_mut().unwrap();
+    runtime.waiting_for_children = None;
+    runtime.status = bamboo_domain::session::runtime_state::AgentStatusState::Idle;
+    runtime.suspension = None;
+    completed.metadata.remove("runtime.suspend_reason");
+    harness.storage.save_session(&completed).await.unwrap();
+    harness
+        .adapter
+        .persistence
+        .merge_save_finalized_runtime(&mut stale_runner)
+        .await
+        .unwrap();
+    let finalized = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(finalized
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .is_none());
+    assert!(!finalized.metadata.contains_key("runtime.suspend_reason"));
 }
 
 #[tokio::test]
@@ -3038,6 +4051,20 @@ async fn send_message_same_tool_call_retries_activation_without_duplicate_delive
         serde_json::from_str(&first.result).expect("first tool result should be JSON");
     assert_eq!(first_payload["status"], "activation_pending");
     assert_eq!(first_payload["inbox_generation"], 1);
+    let parent_after_pending = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        parent_after_pending
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.waiting_for_children.as_ref())
+            .is_none(),
+        "a durable message with failed activation must not leave an unsatisfiable parent wait"
+    );
     assert_eq!(
         first_payload["activation_error"],
         "session activation failed: injected activation failure"
@@ -3122,6 +4149,119 @@ async fn send_message_same_tool_call_retries_activation_without_duplicate_delive
             || (final_backlog.pending + final_backlog.claimed == 0 && final_admitted),
         "conflicting retry must neither duplicate nor lose the original \
          delivery: backlog={final_backlog:?}, admitted={final_admitted}"
+    );
+}
+
+#[tokio::test]
+async fn send_message_coalesced_retry_preserves_prior_child_wait() {
+    let harness = build_test_harness().await;
+    harness
+        .activation
+        .force_disposition(SessionActivationDisposition::ActivationReserved);
+    let args = json!({
+        "action": "send_message",
+        "child_session_id": harness.child_session_id,
+        "message": "same durable correction"
+    });
+    let first = invoke_completed(
+        &harness.tool,
+        args.clone(),
+        subagent_test_ctx(&harness.parent_session_id, "coalesced-retry"),
+    )
+    .await
+    .expect("first delivery queues child");
+    let first_payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+    assert_eq!(first_payload["status"], "queued");
+
+    harness
+        .activation
+        .force_disposition(SessionActivationDisposition::ActivationCoalesced);
+    let retry = invoke_completed(
+        &harness.tool,
+        args,
+        subagent_test_ctx(&harness.parent_session_id, "coalesced-retry"),
+    )
+    .await
+    .expect("idempotent retry is coalesced");
+    let retry_payload: serde_json::Value = serde_json::from_str(&retry.result).unwrap();
+    assert_eq!(retry_payload["status"], "message_queued");
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let wait = parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .expect("first queued delivery still owns the parent wait");
+    assert_eq!(wait.child_session_ids, [harness.child_session_id]);
+}
+
+#[tokio::test]
+async fn resident_accumulate_coalesced_retry_keeps_synchronous_wait_result() {
+    let harness = build_test_harness().await;
+    let initial = json!({
+        "action": "create",
+        "title": "Resident",
+        "responsibility": "Handle recurring work",
+        "prompt": "First task",
+        "workspace": harness.workspace_path.to_string_lossy(),
+        "lifecycle": "resident",
+        "name": "resident-retry",
+        "context": "accumulate",
+        "auto_run": false,
+    });
+    invoke_completed(
+        &harness.tool,
+        initial,
+        subagent_test_ctx(&harness.parent_session_id, "resident-initial"),
+    )
+    .await
+    .expect("create idle resident");
+
+    let retry_args = json!({
+        "action": "create",
+        "title": "Resident",
+        "responsibility": "Handle recurring work",
+        "prompt": "Second task",
+        "workspace": harness.workspace_path.to_string_lossy(),
+        "lifecycle": "resident",
+        "name": "resident-retry",
+        "context": "accumulate",
+        "wait": true,
+    });
+    harness
+        .activation
+        .force_disposition(SessionActivationDisposition::ActivationReserved);
+    let first = invoke_completed(
+        &harness.tool,
+        retry_args.clone(),
+        subagent_test_ctx(&harness.parent_session_id, "resident-wait-retry"),
+    )
+    .await
+    .expect("first resident activation");
+    assert_eq!(
+        first.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+
+    harness
+        .activation
+        .force_disposition(SessionActivationDisposition::ActivationCoalesced);
+    let retry = invoke_completed(
+        &harness.tool,
+        retry_args,
+        subagent_test_ctx(&harness.parent_session_id, "resident-wait-retry"),
+    )
+    .await
+    .expect("coalesced resident retry");
+    assert_eq!(
+        retry.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children"),
+        "a preserved wait must still suspend the retried resident call"
     );
 }
 
@@ -3338,6 +4478,219 @@ async fn get_returns_runner_diagnostics() {
     assert_eq!(payload["round_count"], 3);
     assert!(payload["runner_started_at"].is_string());
     assert!(payload.get("guidance").is_some());
+}
+
+fn child_inspection_ctx(parent_session_id: &str) -> ToolCtx {
+    ToolExecutionContext {
+        executing_supervisor: None,
+        session_id: Some(parent_session_id),
+        root_session_id: None,
+        tool_call_id: "tool_call_inspect_child",
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    }
+    .to_tool_ctx()
+}
+
+async fn inspect_child(
+    tool: &SubAgentTool,
+    parent_session_id: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    let result = invoke_completed(tool, args, child_inspection_ctx(parent_session_id))
+        .await
+        .expect("authorized child inspection");
+    serde_json::from_str(&result.result).expect("inspection JSON")
+}
+
+#[tokio::test]
+async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let answer = "汉字🙂résumé\n".repeat(1600);
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.add_message(Message::assistant(answer.clone(), None));
+    child
+        .metadata
+        .insert("assignment_prompt".into(), "任务".repeat(4000));
+    harness.storage.save_session(&child).await.unwrap();
+
+    let overview = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({"action": "get", "child_session_id": harness.child_session_id}),
+    )
+    .await;
+    assert!(overview["prompt"].as_str().unwrap().len() <= 2048);
+    assert!(overview["truncated_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "prompt"));
+    assert!(overview["inspection_hint"]
+        .as_str()
+        .unwrap()
+        .contains("metadata"));
+
+    let messages = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "limit": 2,
+        }),
+    )
+    .await;
+    assert_eq!(messages["messages"].as_array().unwrap().len(), 2);
+    assert!(messages["next_cursor"].is_string());
+    assert!(
+        messages["messages"][0]["content_preview"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= 512
+    );
+
+    let first_result = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "result",
+            "max_bytes": 113,
+        }),
+    )
+    .await;
+    assert_eq!(first_result["available"], true);
+    assert!(first_result["next_cursor"].is_string());
+    assert!(first_result["text"].as_str().unwrap().len() <= 113);
+
+    // Re-open the durable V2 store with a fresh adapter/tool, as a server
+    // restart would. The old in-memory cache cannot supply any next slice.
+    let bamboo_home = harness.workspace_path.parent().unwrap().to_path_buf();
+    let reopened_store = Arc::new(SessionStoreV2::new(bamboo_home).await.unwrap());
+    let reopened_storage: Arc<dyn Storage> = reopened_store.clone();
+    let reopened_adapter = Arc::new(ChildSessionAdapter {
+        session_store: reopened_store,
+        storage: reopened_storage.clone(),
+        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(reopened_storage)),
+        session_messenger: None,
+        scheduler: harness.adapter.scheduler.clone(),
+        sessions_cache: Arc::default(),
+        agent_runners: Arc::new(RwLock::new(HashMap::new())),
+        session_event_senders: Arc::new(RwLock::new(HashMap::new())),
+        subagent_model_resolver: None,
+        config: harness.adapter.config.clone(),
+        project_store: harness.adapter.project_store.clone(),
+        workspace_resolver: harness.adapter.workspace_resolver.clone(),
+        parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+    });
+    let reopened_tool = SubAgentTool::new(reopened_adapter.clone(), reopened_adapter);
+    let message_next = inspect_child(
+        &reopened_tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "cursor": messages["next_cursor"],
+            "limit": 2,
+        }),
+    )
+    .await;
+    assert_eq!(message_next["messages"][0]["index"], 2);
+
+    let mut reassembled = first_result["text"].as_str().unwrap().to_string();
+    let mut cursor = first_result["next_cursor"].as_str().map(str::to_string);
+    while let Some(next) = cursor {
+        let page = inspect_child(
+            &reopened_tool,
+            &harness.parent_session_id,
+            json!({
+                "action": "get",
+                "child_session_id": harness.child_session_id,
+                "view": "result",
+                "cursor": next,
+                "max_bytes": 113,
+            }),
+        )
+        .await;
+        assert!(page["text"].as_str().unwrap().len() <= 113);
+        reassembled.push_str(page["text"].as_str().unwrap());
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+    }
+    assert_eq!(reassembled, answer);
+}
+
+#[tokio::test]
+async fn child_inspection_only_allows_the_direct_parent() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let nested_parent = Session::new_child_of("nested-parent", &root, "gpt-5", "Nested parent");
+    let mut grandchild = Session::new_child_of("grandchild", &nested_parent, "gpt-5", "Grandchild");
+    grandchild.add_message(Message::assistant("nested answer", None));
+    harness.storage.save_session(&nested_parent).await.unwrap();
+    harness.storage.save_session(&grandchild).await.unwrap();
+
+    let root_error = invoke_completed(
+        &harness.tool,
+        json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
+        child_inspection_ctx(&harness.parent_session_id),
+    )
+    .await
+    .unwrap_err();
+    assert!(root_error.to_string().contains("does not belong to parent"));
+
+    let nested = inspect_child(
+        &harness.tool,
+        &nested_parent.id,
+        json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
+    )
+    .await;
+    assert_eq!(nested["text"], "nested answer");
+
+    let wrong_cursor = inspect_child(
+        &harness.tool,
+        &harness.parent_session_id,
+        json!({
+            "action": "get",
+            "child_session_id": harness.child_session_id,
+            "view": "messages",
+            "limit": 1,
+        }),
+    )
+    .await;
+    let cursor_error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "get",
+            "child_session_id": grandchild.id,
+            "view": "messages",
+            "cursor": wrong_cursor["next_cursor"],
+        }),
+        child_inspection_ctx(&nested_parent.id),
+    )
+    .await
+    .unwrap_err();
+    assert!(cursor_error.to_string().contains("invalid or stale"));
 }
 
 #[tokio::test]
