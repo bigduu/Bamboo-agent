@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{BrokerError, BrokerResult};
-use crate::proto::{BrokerFrame, ClientFrame};
+use crate::proto::{BrokerFrame, ClientFrame, WorkerHostObservation};
 
 /// Build a rustls [`rustls::ClientConfig`] that trusts exactly the
 /// certificate(s) in `cert_file` (PEM) — for connecting to a broker or
@@ -218,6 +218,8 @@ pub struct BrokerClient {
     /// queried role (Phase 3 presence query). One reply per request; `&mut self`
     /// on `list_connected` keeps requests serialized.
     connected: mpsc::UnboundedReceiver<Vec<String>>,
+    /// Exact-target trusted host observations; separate from legacy presence.
+    host_observations: mpsc::UnboundedReceiver<(MsgId, Option<WorkerHostObservation>)>,
     /// Cleared by [`reader_supervisor`] the instant the background reader exits
     /// (clean close / panic / cancellation), so callers can tell "no messages
     /// right now" (`next_message() -> None` but still alive) apart from "the
@@ -328,6 +330,7 @@ impl BrokerClient {
         let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
         let (conn_tx, connected) = mpsc::unbounded_channel();
+        let (host_tx, host_observations) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let reader_cancellation = cancellation.clone();
         // The demux loop pushes `Message`/`Delivered`/`Cancel`/`Error` frames
@@ -408,6 +411,12 @@ impl BrokerClient {
                         Ok(BrokerFrame::Connected { ids }) => {
                             let _ = conn_tx.send(ids);
                         }
+                        Ok(BrokerFrame::HostObservation {
+                            request_id,
+                            observation,
+                        }) => {
+                            let _ = host_tx.send((request_id, observation));
+                        }
                         _ => {}
                     },
                     Some(Ok(Message::Close(_))) => break ReaderExit::PeerClose,
@@ -449,6 +458,7 @@ impl BrokerClient {
             errors,
             cancels,
             connected,
+            host_observations,
             reader_alive,
             #[cfg(test)]
             fail_next_ack: Arc::new(AtomicBool::new(false)),
@@ -573,6 +583,55 @@ impl BrokerClient {
             Err(_) => Err(BrokerError::Transport(
                 "timed out waiting for connected-actors reply from broker".into(),
             )),
+        }
+    }
+
+    /// Query one authorized scoped WorkerHost connection. This observation is
+    /// current health evidence only; callers must not use it as an activation
+    /// or Run delivery lease.
+    pub async fn observe_host(
+        &mut self,
+        mailbox: &str,
+        role: &str,
+    ) -> BrokerResult<Option<WorkerHostObservation>> {
+        let request_id = MsgId::new();
+        self.send(ClientFrame::ObserveHost {
+            request_id: request_id.clone(),
+            mailbox: mailbox.into(),
+            role: role.into(),
+        })
+        .await?;
+        let deadline = tokio::time::Instant::now() + DELIVER_RECEIPT_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.host_observations.recv()).await {
+                Ok(Some((id, _))) if id != request_id => continue,
+                Ok(Some((_, observation))) => {
+                    if observation.as_ref().is_some_and(|current| {
+                        current.mailbox != mailbox || current.role.as_deref() != Some(role)
+                    }) {
+                        return Err(BrokerError::Protocol(
+                            "host observation target mismatch".into(),
+                        ));
+                    }
+                    if observation
+                        .as_ref()
+                        .is_some_and(|current| current.credential_expires_at <= chrono::Utc::now())
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(observation);
+                }
+                Ok(None) => {
+                    return Err(BrokerError::Transport(
+                        "connection closed before host observation reply".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(BrokerError::Transport(
+                        "timed out waiting for host observation reply from broker".into(),
+                    ))
+                }
+            }
         }
     }
 

@@ -20,9 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bamboo_subagent::{ActorEventBatch, ActorEventQos, InboxMessage, Mailbox, MsgId};
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::error::{BrokerError, BrokerResult};
+use crate::proto::WorkerHostObservation;
 
 fn is_ordered_actor_message(message: &InboxMessage) -> bool {
     matches!(
@@ -88,6 +90,14 @@ struct Subscriber {
     /// Role announced in the `Hello` (`subagent_type`), if any — lets the bus
     /// answer "which connected actors serve role X" without a separate registry.
     role: Option<String>,
+    /// Only set after a scoped Subscribe has completed its backlog preload.
+    host_observation: Option<WorkerHostObservation>,
+}
+
+/// The host identity comes only from an authenticated operator PeerPolicy.
+pub(crate) struct AuthenticatedHost {
+    pub host_ref: String,
+    pub credential_expires_at: DateTime<Utc>,
 }
 
 /// Opaque proof that one server connection installed the current subscriber.
@@ -218,7 +228,7 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
-        self.subscribe_streams(session_id, role, false)
+        self.subscribe_streams(session_id, role, false, None)
             .await
             .map(|(streams, _lease)| streams.control)
     }
@@ -231,7 +241,17 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
-        self.subscribe_streams(session_id, role, true).await
+        self.subscribe_streams(session_id, role, true, None).await
+    }
+
+    pub(crate) async fn subscribe_scoped_with_lease(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        host: AuthenticatedHost,
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        self.subscribe_streams(session_id, role, true, Some(host))
+            .await
     }
 
     async fn subscribe_streams(
@@ -239,6 +259,7 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
         ordered_actor_events: bool,
+        host: Option<AuthenticatedHost>,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -254,6 +275,7 @@ impl BrokerCore {
                 live_event_capacity,
                 ordered_actor_events,
                 role: role.map(str::to_string),
+                host_observation: None,
             },
         );
 
@@ -281,6 +303,20 @@ impl BrokerCore {
         if let Err(error) = preload {
             self.unsubscribe_if_owner(session_id, &lease).await;
             return Err(error);
+        }
+        if let Some(host) = host {
+            let mut subscribers = self.subscribers.write().await;
+            if let Some(current) = subscribers.get_mut(session_id) {
+                if current.control_sink.same_channel(&lease.control_sink) {
+                    current.host_observation = Some(WorkerHostObservation {
+                        host_ref: host.host_ref,
+                        mailbox: session_id.to_owned(),
+                        role: role.map(str::to_string),
+                        credential_expires_at: host.credential_expires_at,
+                        connection_generation: MsgId::new().0,
+                    });
+                }
+            }
         }
         Ok((
             SubscriptionStreams {
@@ -541,6 +577,24 @@ impl BrokerCore {
             .filter(|(_, sub)| sub.role.as_deref() == Some(role))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Current trusted scoped connection only. Ordinary presence never grants
+    /// a host identity, and an expired credential is unavailable immediately.
+    pub(crate) async fn current_host_observation(
+        &self,
+        mailbox: &str,
+        role: &str,
+    ) -> Option<WorkerHostObservation> {
+        let subscribers = self.subscribers.read().await;
+        subscribers
+            .get(mailbox)
+            .and_then(|subscriber| subscriber.host_observation.as_ref())
+            .filter(|observation| {
+                observation.role.as_deref() == Some(role)
+                    && observation.credential_expires_at > Utc::now()
+            })
+            .cloned()
     }
 
     /// Claim newly-delivered messages for `session_id` and push to its live
@@ -859,6 +913,85 @@ mod tests {
             c.connected_by_role("explorer").await,
             vec!["w2".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_host_observation_tracks_only_current_scoped_subscription() {
+        let (dir, core) = core();
+        let deadline = Utc::now() + chrono::Duration::minutes(1);
+        let host = |name: &str, expiry| AuthenticatedHost {
+            host_ref: name.into(),
+            credential_expires_at: expiry,
+        };
+        let (_first_streams, first_lease) = core
+            .subscribe_scoped_with_lease("worker", Some("gpu"), host("host-a", deadline))
+            .await
+            .unwrap();
+        let first = core
+            .current_host_observation("worker", "gpu")
+            .await
+            .unwrap();
+        assert_eq!(first.host_ref, "host-a");
+        assert_eq!(first.mailbox, "worker");
+        assert_eq!(first.role.as_deref(), Some("gpu"));
+        assert_eq!(first.credential_expires_at, deadline);
+        assert!(!first.connection_generation.is_empty());
+        assert!(core
+            .current_host_observation("worker", "other")
+            .await
+            .is_none());
+
+        let (_replacement_streams, replacement_lease) = core
+            .subscribe_scoped_with_lease("worker", Some("gpu"), host("host-b", deadline))
+            .await
+            .unwrap();
+        let replacement = core
+            .current_host_observation("worker", "gpu")
+            .await
+            .unwrap();
+        assert_eq!(replacement.host_ref, "host-b");
+        assert_ne!(
+            replacement.connection_generation,
+            first.connection_generation
+        );
+        assert!(!core.unsubscribe_if_owner("worker", &first_lease).await);
+        assert_eq!(
+            core.current_host_observation("worker", "gpu").await,
+            Some(replacement)
+        );
+        assert!(
+            core.unsubscribe_if_owner("worker", &replacement_lease)
+                .await
+        );
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+
+        let (_legacy, legacy_lease) = core
+            .subscribe_with_lease("worker", Some("gpu"))
+            .await
+            .unwrap();
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+        assert!(core.unsubscribe_if_owner("worker", &legacy_lease).await);
+        core.subscribe_scoped_with_lease(
+            "worker",
+            Some("gpu"),
+            host("expired", Utc::now() - chrono::Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+        assert!(core
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
+        assert!(BrokerCore::new(dir.path())
+            .current_host_observation("worker", "gpu")
+            .await
+            .is_none());
     }
 
     #[tokio::test]

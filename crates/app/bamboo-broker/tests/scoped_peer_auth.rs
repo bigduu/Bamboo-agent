@@ -477,6 +477,184 @@ async fn wss_scoped_frames_current_ack_and_expiry_preserve_real_maildir() {
 }
 
 #[tokio::test]
+async fn scoped_wss_observes_only_authorized_current_worker_host() {
+    use bamboo_broker::BrokerClient;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = cert(dir.path());
+    let expiry = Utc::now() + ChronoDuration::minutes(5);
+    let policy = json!({"peers":[
+        {"credential":A,"host":"host-parent","mailbox":"a","role":"host",
+         "expires_at":expiry,"destinations":[{"mailbox":"b","kinds":["run"]}],
+         "cancel":[],"presence":["worker"]},
+        {"credential":B,"host":"host-worker","mailbox":"b","role":"worker",
+         "expires_at":expiry,"destinations":[],"cancel":[],"presence":[]},
+        {"credential":"ask-only-fixture-credential-00000001","host":"host-ask",
+         "mailbox":"c","role":"host","expires_at":expiry,
+         "destinations":[{"mailbox":"b","kinds":["ask"]}],
+         "cancel":[],"presence":["worker"]}
+    ]});
+    let core = Arc::new(BrokerCore::new_scoped(dir.path().join("broker")));
+    let (url, server) = listen(core.clone(), policy, &cert, &key, BrokerLimits::default()).await;
+    let tls = || Some(client_config_trusting_cert(&cert).unwrap());
+    let mut worker = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
+        .await
+        .unwrap();
+    worker.subscribe().await.unwrap();
+    let mut parent = BrokerClient::connect_with_tls(
+        &url,
+        AgentRef {
+            session_id: "a".into(),
+            role: Some("host".into()),
+        },
+        A,
+        tls(),
+    )
+    .await
+    .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.host_ref, "host-worker");
+    assert_eq!(first.mailbox, "b");
+    assert_eq!(first.role.as_deref(), Some("worker"));
+    assert_eq!(first.credential_expires_at, expiry);
+    assert!(!first.connection_generation.is_empty());
+    assert_eq!(
+        parent.list_connected("worker").await.unwrap(),
+        vec!["b".to_string()]
+    );
+    assert!(!serde_json::to_string(&first).unwrap().contains(A));
+    assert!(!serde_json::to_string(&first).unwrap().contains(B));
+    assert!(!serde_json::to_string(&first).unwrap().contains(&url));
+
+    for (mailbox, role, token, target, requested_role) in [
+        ("a", "host", A, "other", "worker"),
+        ("a", "host", A, "b", "other"),
+        (
+            "c",
+            "host",
+            "ask-only-fixture-credential-00000001",
+            "b",
+            "worker",
+        ),
+    ] {
+        let mut ws = socket(&url, &cert).await;
+        send(
+            &mut ws,
+            ClientFrame::Hello {
+                agent: AgentRef {
+                    session_id: mailbox.into(),
+                    role: Some(role.into()),
+                },
+                token: token.into(),
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ws).await, BrokerFrame::Welcome));
+        send(
+            &mut ws,
+            ClientFrame::ObserveHost {
+                request_id: MsgId::new(),
+                mailbox: target.into(),
+                role: requested_role.into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(recv(&mut ws).await, BrokerFrame::Error { reason, .. }
+            if reason == "scoped peer admission denied")
+        );
+    }
+
+    let mut replacement = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
+        .await
+        .unwrap();
+    replacement.subscribe().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+                if current.connection_generation != first.connection_generation {
+                    break current;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(second.host_ref, first.host_ref);
+    assert_ne!(second.connection_generation, first.connection_generation);
+    worker.close().await.unwrap();
+    assert!(core.is_subscribed("b").await);
+    assert_eq!(
+        parent.observe_host("b", "worker").await.unwrap(),
+        Some(second)
+    );
+    replacement.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while core.is_subscribed("b").await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(parent.observe_host("b", "worker").await.unwrap().is_none());
+    server.abort();
+
+    let legacy_core = Arc::new(BrokerCore::new(dir.path().join("legacy")));
+    let legacy_server = Arc::new(
+        BrokerServer::new(legacy_core, "legacy-fixture-token")
+            .with_tls(&cert, &key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let legacy_url = format!("wss://{}", listener.local_addr().unwrap());
+    let legacy_task = tokio::spawn(async move { legacy_server.serve(listener).await });
+    let mut legacy = socket(&legacy_url, &cert).await;
+    send(
+        &mut legacy,
+        ClientFrame::Hello {
+            agent: agent("b"),
+            token: "legacy-fixture-token".into(),
+        },
+    )
+    .await;
+    assert!(matches!(recv(&mut legacy).await, BrokerFrame::Welcome));
+    send(&mut legacy, ClientFrame::Subscribe).await;
+    send(
+        &mut legacy,
+        ClientFrame::ListConnected {
+            role: "worker".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut legacy).await, BrokerFrame::Connected { ids } if ids == vec!["b".to_string()])
+    );
+    send(
+        &mut legacy,
+        ClientFrame::ObserveHost {
+            request_id: MsgId::new(),
+            mailbox: "b".into(),
+            role: "worker".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut legacy).await, BrokerFrame::Error { reason, .. }
+        if reason == "scoped peer admission denied")
+    );
+    legacy_task.abort();
+}
+
+#[tokio::test]
 async fn strict_actor_link_fences_source_run_birth_and_order_over_real_wss() {
     use bamboo_broker::{BrokerChildLink, BrokerClient};
     use bamboo_subagent::{
