@@ -183,7 +183,10 @@ async fn deployment_uses_host_actor_identity_and_rejects_stale_or_foreign_contro
     assert_eq!(entry.actor.session_created_at, canonical.created_at);
     assert_eq!(entry.actor.state, ActorLogicalState::Active);
     assert_eq!(entry.actor.current_attempt, 1);
-    assert_eq!(entry.activation.unwrap().status, ActorActivationStatus::Running);
+    assert_eq!(
+        entry.activation.unwrap().status,
+        ActorActivationStatus::Running
+    );
 
     let answer = ask
         .invoke(

@@ -3681,11 +3681,12 @@ mod tests {
             outcome.status,
             bamboo_subagent::proto::TerminalStatus::Error
         );
-        assert!(outcome.error.as_deref().is_some_and(|error| {
-            error.contains(
-                "worker cache Child creation identity or Project mismatch",
-            )
-        }), "{outcome:?}");
+        assert!(
+            outcome.error.as_deref().is_some_and(|error| {
+                error.contains("worker cache Child creation identity or Project mismatch")
+            }),
+            "{outcome:?}"
+        );
         assert!(confirmations.is_empty());
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
         let durable = store.load_session(session_id).await.unwrap().unwrap();
