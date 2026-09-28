@@ -13,6 +13,14 @@ retains its registered and timeout timestamps. Child completion wins over a
 stale finalizing runner.
 
 A distinct immutable terminal message records one Approved or Denied winner.
+The forced-ask request now carries a typed `ParentRequest` projection with
+the Child and direct Parent births, fixed Host attempt/run/epoch/reply scope,
+exact operation digest, policy revision, one-shot maximum delegation, deadline
+and bounded Deny/ApproveOnce options. The terminal carries a typed
+`ParentResolution` bound to that exact request. Both projections are checked
+against their existing canonical fields before review or replay; the owning
+direct Parent may inspect a canonical transcript proof, including when that
+Parent is itself a Child. They remain audit facts, not portable grants.
 Both messages are bounded to 8 KiB and protected from compression. The existing
 typed-message preservation in SessionRepository full/finalized/checkpoint saves
 retains them even after the bounded admission cursor evicts the request ID.

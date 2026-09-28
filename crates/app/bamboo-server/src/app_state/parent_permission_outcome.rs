@@ -1,8 +1,10 @@
 //! Immutable request and terminal proofs in the canonical Parent transcript.
 //! Neither record is a grant. The caller must still hold a current live scope.
 use bamboo_domain::{
-    is_matching_session_message, Session, SessionMessageBody, SessionMessageContent,
-    SessionMessageEnvelope, SessionMessageId, SessionProviderMessage,
+    is_matching_session_message, ParentRequest, ParentRequestActivation, ParentRequestActor,
+    ParentRequestDelegation, ParentRequestKind, ParentRequestOption, ParentResolution, Session,
+    SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+    SessionProviderMessage, PARENT_REQUEST_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,7 @@ struct Terminal {
     request: String,
     live: serde_json::Value,
     approved: bool,
+    parent_resolution: ParentResolution,
 }
 
 fn bounded(envelope: &SessionMessageEnvelope) -> Option<()> {
@@ -47,6 +50,40 @@ pub(super) fn bind(
     data.insert("live".into(), scope.stamp().clone());
     data.insert("lineage".into(), serde_json::to_value(lineage).ok()?);
     envelope.created_at = scope.deadline() - chrono::Duration::seconds(240);
+    let child = lineage.first()?;
+    let parent = lineage.get(1)?;
+    let live = scope.stamp();
+    let request = ParentRequest {
+        version: PARENT_REQUEST_VERSION,
+        id: envelope.id.clone(),
+        generation: data.get("request_generation")?.as_str()?.into(),
+        child: ParentRequestActor {
+            session_id: child.actor_id.clone(),
+            created_at: child.session_created_at,
+        },
+        parent: ParentRequestActor {
+            session_id: parent.actor_id.clone(),
+            created_at: parent.session_created_at,
+        },
+        root_session_id: child.root_actor_id.clone(),
+        project_id: child.project_id.clone(),
+        activation: ParentRequestActivation {
+            host_scope: live.get("host_scope")?.as_str()?.into(),
+            attempt: u32::try_from(live.get("attempt")?.as_u64()?).ok()?,
+            run: live.get("run")?.as_str()?.into(),
+            epoch: live.get("epoch")?.as_u64()?,
+            reply: live.get("reply")?.as_str()?.into(),
+        },
+        deadline: scope.deadline(),
+        kind: ParentRequestKind::ForcedPermission {
+            operation_digest: data.get("operation_digest")?.as_str()?.into(),
+            policy_revision: data.get("policy_revision")?.as_u64()?,
+            maximum_delegation: ParentRequestDelegation::ExactOperationOnce,
+            options: vec![ParentRequestOption::Deny, ParentRequestOption::ApproveOnce],
+        },
+    };
+    data.insert("parent_request".into(), serde_json::to_value(request).ok()?);
+    ParentRequest::from_forced_permission_envelope(envelope)?;
     bounded(envelope)
 }
 
@@ -62,6 +99,7 @@ fn terminal(
     approved: bool,
     resolved_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<SessionMessageEnvelope> {
+    let typed = ParentRequest::from_forced_permission_envelope(request)?;
     let SessionMessageBody::RuntimeInstruction(original) = &request.body else {
         return None;
     };
@@ -75,6 +113,7 @@ fn terminal(
     )
     .ok()?;
     let approved = approved && resolved_at < deadline;
+    let resolution = ParentResolution::for_forced_permission(&typed, resolved_at, approved);
     let mut result = request.clone();
     result.id = terminal_id(request);
     result.created_at = resolved_at;
@@ -98,6 +137,7 @@ fn terminal(
             request: request.id.to_string(),
             live: original.data.as_ref()?.get("live")?.clone(),
             approved,
+            parent_resolution: resolution,
         })
         .ok()?,
     );
@@ -106,11 +146,14 @@ fn terminal(
 }
 
 pub(super) fn state(session: &Session, request: &SessionMessageEnvelope) -> Result<State, ()> {
+    let typed = ParentRequest::from_forced_permission_envelope(request).ok_or(())?;
     let SessionMessageBody::RuntimeInstruction(body) = &request.body else {
         return Err(());
     };
     let data = body.data.as_ref().ok_or(())?;
     if session.id != request.target_session_id
+        || typed.parent.session_id != session.id
+        || typed.parent.created_at != session.created_at
         || serde_json::to_value(session.created_at).map_err(|_| ())? != data["parent_created_at"]
         || serde_json::to_value(session.project_id_meta()).map_err(|_| ())? != data["project_id"]
     {
@@ -152,17 +195,20 @@ pub(super) fn state(session: &Session, request: &SessionMessageEnvelope) -> Resu
             let envelope: SessionMessageEnvelope =
                 serde_json::from_value(marker.clone()).map_err(|_| ())?;
             let resolved_at = envelope.created_at;
-            let SessionMessageBody::RuntimeInstruction(body) = envelope.body else {
+            let SessionMessageBody::RuntimeInstruction(body) = &envelope.body else {
                 return Err(());
             };
-            let value: Terminal = serde_json::from_value(body.data.ok_or(())?).map_err(|_| ())?;
+            let value: Terminal =
+                serde_json::from_value(body.data.clone().ok_or(())?).map_err(|_| ())?;
             let deadline: chrono::DateTime<chrono::Utc> =
                 serde_json::from_value(value.live["deadline"].clone()).map_err(|_| ())?;
             if resolved_at < request.created_at || (value.approved && resolved_at >= deadline) {
                 return Err(());
             }
             let expected = terminal(request, value.approved, resolved_at).ok_or(())?;
-            if !canonical(message, &expected) {
+            if !canonical(message, &expected)
+                || ParentResolution::from_forced_permission_terminal(request, &envelope).is_none()
+            {
                 return Err(());
             }
             outcome = Some(value.approved);

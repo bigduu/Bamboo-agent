@@ -497,13 +497,22 @@ mod tests {
     }
     impl Fixture {
         async fn new() -> Self {
+            Self::new_with_nested_parent(false).await
+        }
+        async fn new_with_nested_parent(nested: bool) -> Self {
             let home = tempfile::tempdir().unwrap();
             let store = Arc::new(
                 bamboo_storage::SessionStoreV2::new(home.path().into())
                     .await
                     .unwrap(),
             );
-            let mut parent = Session::new("approval-parent", "review-model");
+            let mut parent = if nested {
+                let root = Session::new("approval-root", "review-model");
+                store.save_session(&root).await.unwrap();
+                Session::new_child_of("approval-parent", &root, "review-model", "Parent")
+            } else {
+                Session::new("approval-parent", "review-model")
+            };
             parent.model_ref = Some(bamboo_domain::ProviderModelRef::new("test", "review-model"));
             store.save_session(&parent).await.unwrap();
             let child = Session::new_child_of("approval-child", &parent, "child-model", "Child");
@@ -563,7 +572,7 @@ mod tests {
                 suggested_matchers: vec![],
             };
             let body = json!({"tool_name":request.tool_name, "permission":request.permission_type.description(), "resource":request.resource, "permission_request":request,
-                "approval_identity":{"logical_session":{"session_id":child.id,"parent_session_id":parent.id,"root_session_id":parent.id,"creation":{"created_at":child.created_at,"spawn_depth":child.spawn_depth}},"project_id":null}});
+                "approval_identity":{"logical_session":{"session_id":child.id,"parent_session_id":parent.id,"root_session_id":child.root_session_id,"creation":{"created_at":child.created_at,"spawn_depth":child.spawn_depth}},"project_id":null}});
             let router = bamboo_engine::SessionActivationRouter::new();
             let registration = router
                 .register_run("approval-child", "fixture-run")
@@ -651,6 +660,79 @@ mod tests {
             1,
             "same generation different operation cannot reach review"
         );
+    }
+
+    #[tokio::test]
+    async fn nested_direct_parent_can_inspect_only_its_canonical_typed_request() {
+        use bamboo_domain::{
+            ParentRequest, ParentRequestKind, ParentRequestOption, ParentResolution,
+            SessionMessageEnvelope,
+        };
+
+        let f = Fixture::new_with_nested_parent(true).await;
+        assert!(!f.review(&f.body).await);
+        assert_eq!(f.probe.0.load(Ordering::SeqCst), 1);
+
+        let cold = Arc::new(
+            bamboo_storage::SessionStoreV2::new(f.home.path().into())
+                .await
+                .unwrap(),
+        );
+        let parent = cold.load_session("approval-parent").await.unwrap().unwrap();
+        let root = cold.load_session("approval-root").await.unwrap().unwrap();
+        let child = cold.load_session("approval-child").await.unwrap().unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(cold, Default::default());
+        let claims = inbox.claim("approval-parent", 2).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let envelope = &claims[0].envelope;
+        let typed = ParentRequest::inspect_direct_parent(&parent, &child, &envelope.id).unwrap();
+        assert_eq!(typed.id, envelope.id);
+        assert_eq!(typed.parent.session_id, parent.id);
+        assert_eq!(typed.child.session_id, child.id);
+        assert_eq!(typed.root_session_id, root.id);
+        assert_eq!(typed.activation.attempt, 1);
+        assert_eq!(typed.activation.run, "fixture-run");
+        assert!(typed.deadline > chrono::Utc::now());
+        let ParentRequestKind::ForcedPermission { options, .. } = typed.kind;
+        assert_eq!(
+            options,
+            [ParentRequestOption::Deny, ParentRequestOption::ApproveOnce]
+        );
+        assert!(ParentRequest::inspect_direct_parent(&root, &child, &envelope.id).is_none());
+
+        let terminal_marker = parent.messages[1]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("session_message")
+            .unwrap();
+        let terminal: SessionMessageEnvelope =
+            serde_json::from_value(terminal_marker.clone()).unwrap();
+        let resolution =
+            ParentResolution::from_forced_permission_terminal(envelope, &terminal).unwrap();
+        assert_eq!(resolution.request_id, envelope.id);
+        assert_eq!(resolution.decision, ParentRequestOption::Deny);
+
+        let mut changed = envelope.clone();
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(body) = &mut changed.body else {
+            unreachable!()
+        };
+        body.data.as_mut().unwrap()["parent_request"]["kind"]["options"] = json!(["approve_once"]);
+        assert!(ParentRequest::from_forced_permission_envelope(&changed).is_none());
+        let mut changed_terminal = terminal.clone();
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(body) =
+            &mut changed_terminal.body
+        else {
+            unreachable!()
+        };
+        body.data.as_mut().unwrap()["parent_resolution"]["decision"] = json!("approve_once");
+        assert!(
+            ParentResolution::from_forced_permission_terminal(envelope, &changed_terminal)
+                .is_none()
+        );
+        let serialized = serde_json::to_string(envelope).unwrap();
+        assert!(!serialized.contains("SECRET_SENTINEL"));
+        assert!(serialized.len() <= 8192);
     }
 
     #[tokio::test]
