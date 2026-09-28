@@ -444,7 +444,7 @@ async fn fixture(case: Case) {
     assert!(executed.status().is_success());
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let mut seen_wait = false;
-    let mut checked_audit_boundaries = false;
+    let mut checked_pending_request = false;
     let parent = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             assert!(
@@ -455,41 +455,38 @@ async fn fixture(case: Case) {
             let parent = store.load_session("native-root").await.unwrap().unwrap();
             if case.forced()
                 && probe.reviews.load(Ordering::SeqCst) == 1
-                && !checked_audit_boundaries
+                && !checked_pending_request
             {
-                let mut other = Session::new("native-other-root", "native-root");
-                other.set_project_id_meta(project.id.to_string());
-                other.workspace = Some(workspace.to_string_lossy().into_owned());
-                SessionStoreV2::new(data.clone())
-                    .await
-                    .unwrap()
-                    .save_session(&other)
-                    .await
-                    .unwrap();
-                let other = SessionStoreV2::new(data.clone())
-                    .await
-                    .unwrap()
-                    .load_session("native-other-root")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(other.kind, SessionKind::Root);
-                assert_eq!(other.root_session_id, other.id);
-                assert_eq!(other.parent_session_id, None);
-                assert_eq!(other.project_id_meta(), Some(project.id.to_string()));
-                let tool = audit_tool(&data).await;
-                let foreign = inspect_audit(&tool, "native-other-root").await.unwrap();
-                assert_eq!(foreign["records"], json!([]));
-                let request = probe.audit_request.lock().unwrap().clone().unwrap();
-                let child = request["body"]["data"]["child_session_id"]
-                    .as_str()
-                    .unwrap();
-                let denied = inspect_audit(&tool, child).await.unwrap_err();
-                assert!(
-                    denied.contains("Root"),
-                    "Child caller must be rejected: {denied}"
+                // A cold AppState starts boot reconciliation; while this Host
+                // owns a live Child, that observer could mistake it for an
+                // orphan. Read Main directly until both runs have completed.
+                let request = parent
+                    .messages
+                    .iter()
+                    .find_map(|message| {
+                        message
+                            .metadata
+                            .as_ref()?
+                            .get("session_message")
+                            .filter(|marker| {
+                                marker["body"]["instruction"]
+                                    == "direct_parent_forced_permission_request_v1"
+                            })
+                    })
+                    .expect("canonical request is durable before parent review");
+                assert_eq!(
+                    request,
+                    probe.audit_request.lock().unwrap().as_ref().unwrap()
                 );
-                checked_audit_boundaries = true;
+                assert!(!parent.messages.iter().any(|message| {
+                    message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.pointer("/session_message/body/instruction"))
+                        .and_then(Value::as_str)
+                        == Some("direct_parent_forced_permission_terminal_v1")
+                }));
+                checked_pending_request = true;
             }
             if parent
                 .agent_runtime_state
@@ -514,7 +511,7 @@ async fn fixture(case: Case) {
                     }
                     if probe.reviews.load(Ordering::SeqCst) == 1
                         && probe.audit_seen.load(Ordering::SeqCst)
-                        && checked_audit_boundaries
+                        && checked_pending_request
                         && probe.root.load(Ordering::SeqCst) >= 5
                         && state.status
                             == bamboo_domain::session::runtime_state::AgentStatusState::Suspended
@@ -565,8 +562,17 @@ async fn fixture(case: Case) {
                 .messages
                 .iter()
                 .any(|m| m.content.contains("NATIVE_ROOT_COMPLETED")),
-            "Root error: {:?}",
-            parent.last_run_error()
+            "Root error: {:?}; recent Host log: {}",
+            parent.last_run_error(),
+            std::fs::read_to_string(data.join("host.log"))
+                .unwrap_or_default()
+                .chars()
+                .rev()
+                .take(4_000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
         );
         let requests = probe.requests.lock().unwrap();
         let child: Vec<_> = requests
@@ -601,7 +607,7 @@ async fn fixture(case: Case) {
         if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
             assert!(probe.audit_seen.load(Ordering::SeqCst));
-            assert!(checked_audit_boundaries);
+            assert!(checked_pending_request);
             assert_eq!(
                 workspace.join("child-write.txt").exists(),
                 case == Case::ForcedApprove
@@ -697,6 +703,35 @@ async fn fixture(case: Case) {
                 .waiting_for_children
                 .is_none(),
             "completion wins, no wait resurrection"
+        );
+        let mut other = Session::new("native-other-root", "native-root");
+        other.set_project_id_meta(project.id.to_string());
+        other.workspace = Some(workspace.to_string_lossy().into_owned());
+        cold.save_session(&other).await.unwrap();
+        let other = cold
+            .load_session("native-other-root")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.kind, SessionKind::Root);
+        assert_eq!(other.root_session_id, other.id);
+        assert_eq!(other.parent_session_id, None);
+        assert_eq!(other.project_id_meta(), Some(project.id.to_string()));
+        let tool = audit_tool(&data).await;
+        let own = inspect_audit(&tool, "native-root").await.unwrap();
+        let rows = own["records"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["audit_envelope_id"], request["id"]);
+        assert_eq!(rows[0]["observed_status"], "audit_recorded");
+        let foreign = inspect_audit(&tool, "native-other-root").await.unwrap();
+        assert_eq!(foreign["records"], json!([]));
+        let child = request["body"]["data"]["child_session_id"]
+            .as_str()
+            .unwrap();
+        let denied = inspect_audit(&tool, child).await.unwrap_err();
+        assert!(
+            denied.contains("Root"),
+            "Child caller must be rejected: {denied}"
         );
     }
     handle.stop(true).await;
