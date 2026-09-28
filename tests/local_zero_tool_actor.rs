@@ -776,10 +776,20 @@ async fn await_host_pre_ack_cut(
             if entry.activation.as_ref().unwrap().status == ActorActivationStatus::Failed
                 && child.last_run_status().as_deref() == Some("error")
             {
+                let host_log =
+                    std::fs::read_to_string(probe.data.join("host.log")).unwrap_or_default();
+                let checkpoint_error = host_log
+                    .lines()
+                    .rev()
+                    .find(|line| {
+                        line.contains("Actor correction checkpoint rejected or unconfirmed")
+                    })
+                    .unwrap_or("checkpoint log unavailable");
                 assert!(
                     child.last_run_error().unwrap().contains("ACK unresolved"),
-                    "actual error: {}",
-                    bounded_diagnostic(&child.last_run_error().unwrap(), 512)
+                    "actual error: {}; checkpoint: {}",
+                    bounded_diagnostic(&child.last_run_error().unwrap(), 512),
+                    bounded_diagnostic(checkpoint_error, 512)
                 );
                 assert_eq!(entry.actor.current_attempt, 1);
                 let placement = entry.activation.unwrap().placement_ref.unwrap();
@@ -1104,13 +1114,8 @@ async fn fixture_with_followups(
             "actual pending correction timeout: {}",
             bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
         );
-        let fault = AckWriteFault::new(
-            data.join(store.resolve_rel_path(&id).await.unwrap())
-                .join("inbox/admitted"),
-        );
-        probe.release.store(true, Ordering::SeqCst);
-        probe.wake.notify_waiters();
-        let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
+        // Settle the Root ancestor before the Child captures its exact
+        // checkpoint lineage; this fault must exercise ACK, not a moving Root.
         let parent_done = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let parent = store.load_session("plain-root").await.unwrap().unwrap();
@@ -1132,6 +1137,13 @@ async fn fixture_with_followups(
             probe.root_calls.load(Ordering::SeqCst),
             bounded_diagnostic(&provider_host_phase(&probe).await.to_string(), 2048)
         );
+        let fault = AckWriteFault::new(
+            data.join(store.resolve_rel_path(&id).await.unwrap())
+                .join("inbox/admitted"),
+        );
+        probe.release.store(true, Ordering::SeqCst);
+        probe.wake.notify_waiters();
+        let (cut, deadline) = await_host_pre_ack_cut(&probe, &id).await;
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
         drop(host); // Actual kill/wait; absence of Host is not our pre-release proof.
         drop(fault);

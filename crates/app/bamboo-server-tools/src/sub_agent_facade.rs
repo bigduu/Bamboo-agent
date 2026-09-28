@@ -3,8 +3,9 @@
 
 use bamboo_agent_core::tools::{ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{
-    is_matching_session_message, ActorSession, Message, Session, SessionKind, SessionMessageBody,
-    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    is_matching_session_message, ActorSession, Message, ParentRequest, Session, SessionKind,
+    SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource,
 };
 use bamboo_engine::session_app::child_session::{self, ChildSessionPort};
 use bamboo_tools::permission::{PermissionReasonCode, PermissionType};
@@ -418,6 +419,8 @@ struct ForcedAuditData {
     resource: String,
     live: Value,
     lineage: Vec<ActorSession>,
+    #[serde(default)]
+    parent_request: Option<ParentRequest>,
 }
 
 struct ForcedAuditMarker {
@@ -483,6 +486,15 @@ fn forced_audit_marker(
     }
     let data: ForcedAuditData =
         serde_json::from_value(raw_data.clone()).map_err(|_| invalid_audit())?;
+    // Older durable audits have no typed ParentRequest. New ones must carry a
+    // proof that matches the complete canonical envelope, not merely a field
+    // accepted by the audit projection's strict decoder.
+    if raw_data.get("parent_request").is_some() {
+        let typed = data.parent_request.as_ref().ok_or_else(invalid_audit)?;
+        if ParentRequest::from_forced_permission_envelope(&envelope).as_ref() != Some(typed) {
+            return Err(invalid_audit());
+        }
+    }
     let generation = Uuid::parse_str(&data.request_generation).map_err(|_| invalid_audit())?;
     let digest = data
         .operation_digest
@@ -931,10 +943,14 @@ mod tests {
         let mut forged = message.clone();
         forged.content.push_str(" raw operation");
         assert!(forced_audit_marker(&forged, &root, &root_actor).is_err());
-        let mut wrong_project = message;
+        let mut wrong_project = message.clone();
         wrong_project.metadata.as_mut().unwrap()["session_message"]["body"]["data"]["project_id"] =
             json!("foreign");
         assert!(forced_audit_marker(&wrong_project, &root, &root_actor).is_err());
+        let mut invalid_typed = message;
+        invalid_typed.metadata.as_mut().unwrap()["session_message"]["body"]["data"]
+            ["parent_request"] = json!(null);
+        assert!(forced_audit_marker(&invalid_typed, &root, &root_actor).is_err());
     }
 
     #[test]
