@@ -481,6 +481,10 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
             body["receipt"]["decision"]["request_generation"],
             decision.request_generation
         );
+        // The HTTP reply only confirms that auto-resume started. A concurrent
+        // Supervisor save may briefly hold a Prepared proof, which readers
+        // correctly reject until the final runtime/proof commit completes.
+        fixture.settled(usize::from(!corrupt), corrupt).await;
         let completed = fixture.reload().await;
         let result = completed
             .messages
@@ -502,7 +506,6 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
                 ["expected_policy_revision"],
             1
         );
-        fixture.settled(usize::from(!corrupt), corrupt).await;
     }
 }
 
