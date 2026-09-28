@@ -1465,7 +1465,6 @@ async fn fixture_with_followups(
             &base,
             before,
             original_activation.unwrap(),
-            completed,
         )
         .await;
         handle.stop(true).await;
@@ -1832,7 +1831,6 @@ async fn finish_two_fixture(
     base: &str,
     before: bamboo_domain::Session,
     original: bamboo_domain::ActorActivation,
-    completed: bamboo_domain::Session,
 ) {
     let id = before.id.clone();
     let expected_calls = if mode == TwoFollowups::SecondAckFailure {
@@ -1892,6 +1890,10 @@ async fn finish_two_fixture(
     assert_eq!(activation.lease_owner, original.lease_owner);
     assert_eq!(activation.lease_epoch, original.lease_epoch);
     assert_eq!(activation.lease_expires_at, original.lease_expires_at);
+    // A pending Inbox item can start an unsupported successor and replace the
+    // original Session error. Use the settled Session only for final status;
+    // the Actor activation and cold Inbox state below carry the durable proof.
+    let completed = store.load_session(&id).await.unwrap().unwrap();
     assert_eq!(
         activation.status,
         if mode == TwoFollowups::Complete {
@@ -1905,17 +1907,24 @@ async fn finish_two_fixture(
             .last_run_error()
             .map(|e| e.chars().take(384).collect::<String>())
     );
-    if mode == TwoFollowups::Overflow {
-        assert!(completed
-            .last_run_error()
-            .unwrap()
-            .contains("completed reply committed"));
-    }
+    assert_eq!(
+        completed.last_run_status().as_deref(),
+        Some(if mode == TwoFollowups::Complete {
+            "completed"
+        } else {
+            "error"
+        })
+    );
     if mode == TwoFollowups::SecondAckFailure {
-        assert!(completed
-            .last_run_error()
-            .unwrap()
-            .contains("ACK unresolved"));
+        // The unadmitted successor may fail after the original ACK failure and
+        // replace the Session's latest error. The Host log records the ACK
+        // failure while the durable Inbox state below proves it was preserved.
+        let host_log = std::fs::read_to_string(probe.data.join("host.log")).unwrap();
+        assert!(
+            host_log.contains("Actor correction ACK unresolved"),
+            "actual Host did not log the ACK failure; final Child error: {:?}",
+            completed.last_run_error()
+        );
     }
     host.0.kill().unwrap();
     host.0.wait().unwrap();
