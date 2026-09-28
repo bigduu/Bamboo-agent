@@ -365,11 +365,14 @@ fn claimed_required_runs(data: &Path) -> Vec<(PathBuf, Vec<u8>, bamboo_subagent:
         {
             let path = entry.unwrap().path();
             let mut bytes = Vec::new();
-            std::fs::File::open(&path)
-                .unwrap()
-                .take(256 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .unwrap();
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                // A completed Run can be ACKed between directory enumeration
+                // and open; that no longer represents a claimed mailbox entry.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("cannot open claimed Run {}: {error}", path.display()),
+            };
+            file.take(256 * 1024 + 1).read_to_end(&mut bytes).unwrap();
             assert!(bytes.len() <= 256 * 1024);
             let message: bamboo_subagent::InboxMessage = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(message.kind, bamboo_subagent::InboxKind::Run);
@@ -409,18 +412,28 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     assert!(runs[0].2.initial_session_messages.is_empty());
                     *first = Some((runs[0].0.clone(), runs[0].1.clone()));
                 } else if child_call == 1 {
-                    assert_eq!(runs.len(), 2);
                     let (old_path, old_bytes) = first.as_ref().unwrap();
-                    let old = runs.iter().find(|r| &r.0 == old_path).unwrap();
-                    assert_eq!(&old.1, old_bytes, "old unACKed Run remains untouched");
-                    let new = runs.iter().find(|r| &r.0 != old_path).unwrap();
+                    let old_message: bamboo_subagent::InboxMessage =
+                        serde_json::from_slice(old_bytes).unwrap();
+                    let old_spec: bamboo_subagent::RunSpec =
+                        serde_json::from_value(old_message.body).unwrap();
+                    // Once the first failed Outcome is durable, the worker may
+                    // ACK and reclaim that Run before the retry reaches its
+                    // provider. If it is still unACKed, its bytes stay intact.
+                    if let Some(old) = runs.iter().find(|r| &r.0 == old_path) {
+                        assert_eq!(&old.1, old_bytes, "old unACKed Run remains untouched");
+                    }
+                    let new = runs
+                        .iter()
+                        .find(|r| &r.0 != old_path)
+                        .expect("new retry Run is claimed before provider entry");
                     assert_ne!(
                         new.0.parent().unwrap().parent(),
                         old_path.parent().unwrap().parent()
                     );
-                    assert_eq!(new.2.logical_session, old.2.logical_session);
-                    assert_eq!(new.2.project_id, old.2.project_id);
-                    assert_ne!(new.2.activation_run_id, old.2.activation_run_id);
+                    assert_eq!(new.2.logical_session, old_spec.logical_session);
+                    assert_eq!(new.2.project_id, old_spec.project_id);
+                    assert_ne!(new.2.activation_run_id, old_spec.activation_run_id);
                     assert_eq!(new.2.initial_session_messages.len(), 1);
                     let mailbox = |path: &Path| {
                         path.parent()
@@ -434,7 +447,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                             .to_owned()
                     };
                     eprintln!(
-                        "actual distinct worker mailboxes old={} new={} old Run still unACKed",
+                        "actual distinct worker mailboxes old={} new={}",
                         mailbox(old_path),
                         mailbox(&new.0)
                     );
