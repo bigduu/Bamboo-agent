@@ -55,6 +55,9 @@ mod supervisor;
 mod supervisor_management;
 #[cfg(test)]
 mod supervisor_management_tests;
+mod supervisor_proof;
+#[cfg(test)]
+mod supervisor_proof_tests;
 #[cfg(test)]
 mod supervisor_tests;
 
@@ -1054,6 +1057,8 @@ pub struct SessionStoreV2 {
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
     #[cfg(test)]
     root_tool_proof_fault: std::sync::Mutex<Option<root_context::RootToolProofFault>>,
+    #[cfg(test)]
+    supervisor_proof_fault: std::sync::Mutex<Option<supervisor_proof::SupervisorProofFault>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1354,6 +1359,8 @@ impl SessionStoreV2 {
             root_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_tool_proof_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            supervisor_proof_fault: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -1373,6 +1380,7 @@ impl SessionStoreV2 {
             // strict sidecar writer. Scan again afterward for any Root a copy
             // recovery completed, then publish the one-shot migration marker.
             storage.migrate_root_tool_authority_proofs(false).await?;
+            storage.migrate_supervisor_proof(false).await?;
             storage
                 .recover_all_runtime_task_transactions_locked()
                 .await?;
@@ -1380,6 +1388,7 @@ impl SessionStoreV2 {
                 .recover_all_session_copy_transactions_locked()
                 .await?;
             storage.migrate_root_tool_authority_proofs(true).await?;
+            storage.migrate_supervisor_proof(true).await?;
             storage.reconcile_root_revocations().await?;
         }
 
@@ -4417,6 +4426,7 @@ impl SessionStoreV2 {
             serde_json::to_vec_pretty(copied).map_err(|error| other_io_error(error.to_string()))?;
         durable_atomic_write(&staging_dir.join("session.json"), &session_json).await?;
         Self::write_staged_root_tool_proof(staging_dir, copied).await?;
+        Self::write_staged_supervisor_proof(staging_dir, copied).await?;
         // Flush the staging directory after its children/attachments are all
         // complete, before its name is published under `sessions/`.
         sync_parent_directory_entry(&staging_dir.join("session.json")).await?;
@@ -5127,9 +5137,18 @@ impl Storage for SessionStoreV2 {
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Prepared)?;
         }
+        let supervisor_proof_prepared = self
+            .prepare_supervisor_proof_for_full_save(&abs_dir, session)
+            .await?;
+        if supervisor_proof_prepared {
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
+        }
         durable_atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Runtime)?;
+        }
+        if supervisor_proof_prepared {
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
         }
         durable_atomic_write(&path, &session_bytes).await?;
         if root_proof_prepared {
@@ -5139,6 +5158,11 @@ impl Storage for SessionStoreV2 {
             .await?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Committed)?;
+        }
+        Self::commit_supervisor_proof_after_full_save(&abs_dir, session, supervisor_proof_prepared)
+            .await?;
+        if supervisor_proof_prepared {
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
         let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
         stages.filesystem_commit = filesystem_started.elapsed();

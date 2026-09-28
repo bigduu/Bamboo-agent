@@ -231,10 +231,17 @@ fn build_child_completion_envelope(
         .map(|bytes| bytes.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES)
         .unwrap_or(true);
     if provider_oversized || compact {
-        let mut content = format!(
-            "Runtime notification: child session `{}` finished with status `{}`.",
-            completion.child_session_id, completion.status
-        );
+        // A short provider presentation can carry an important instruction or
+        // guardian verdict. Keep it when only the typed fields' JSON escaping
+        // forced a compact envelope.
+        let mut content = if provider_oversized {
+            format!(
+                "Runtime notification: child session `{}` finished with status `{}`.",
+                completion.child_session_id, completion.status
+            )
+        } else {
+            bounded_provider_message.content.clone()
+        };
         if let Some(result) = stored_result.as_deref() {
             content.push_str("\n\n");
             content.push_str(result);
@@ -244,7 +251,9 @@ fn build_child_completion_envelope(
             content.push_str(error);
         }
         bounded_provider_message.content = content;
-        bounded_provider_message.content_parts = None;
+        if provider_oversized {
+            bounded_provider_message.content_parts = None;
+        }
         // The runtime resume also carries the raw error in metadata. Bounding
         // only its visible content leaves the durable inbox envelope oversized
         // and strands the parent's wait when admission rejects it.
@@ -3371,6 +3380,57 @@ mod tests {
             &runtime_resume_message(&completion, 8, None),
         );
         assert_eq!(envelope.id, retry.id);
+    }
+
+    #[test]
+    fn compact_guardian_outcome_keeps_rejected_verdict_and_result_retrieval() {
+        let completion = make_completion("completed");
+        let result = format!(
+            "{}{{\"approve\":false,\"findings\":[\"needs fix\"]}}",
+            "\u{0001}".repeat(CHILD_COMPLETION_INLINE_FIELD_BYTES - 80)
+        );
+        assert!(result.len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES);
+        let verdict = parse_guardian_verdict(&result).expect("trailing guardian verdict");
+        let presentation = guardian_resume_message(&completion, &verdict);
+        assert!(
+            serde_json::to_vec(&presentation).unwrap().len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES,
+            "the original guardian presentation must fit the inline cap"
+        );
+        let wait_registered_at = Utc::now();
+        let expanded = build_child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(&result),
+            &presentation,
+            false,
+        );
+        assert!(
+            serde_json::to_vec(&expanded).unwrap().len()
+                > bamboo_domain::SessionInboxLimits::default().max_payload_bytes,
+            "JSON escaping must trigger the compact fallback"
+        );
+
+        let envelope =
+            child_completion_envelope(&completion, wait_registered_at, Some(result), &presentation);
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len()
+                <= bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &envelope.body else {
+            panic!("typed child outcome");
+        };
+        let provider = outcome.provider_message.as_ref().unwrap();
+        assert!(provider.content.text.contains("Guardian review REJECTED"));
+        assert!(provider.content.text.contains("view=\"result\""));
+        assert_eq!(
+            provider.metadata.get("guardian_approved"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(envelope
+            .to_provider_message()
+            .unwrap()
+            .content
+            .contains("Guardian review REJECTED"));
     }
 
     #[tokio::test]

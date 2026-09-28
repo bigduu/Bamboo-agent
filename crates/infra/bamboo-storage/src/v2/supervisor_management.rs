@@ -304,6 +304,8 @@ impl SessionStoreV2 {
             // update a target, or publish a history-free snapshot into a cache.
             let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&current))
                 .map_err(|error| other_io_error(error.to_string()))?;
+            self.prepare_supervisor_management_proof(&current).await?;
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
             durable_atomic_write(
                 &self
                     .sessions_dir
@@ -312,6 +314,9 @@ impl SessionStoreV2 {
                 &bytes,
             )
             .await?;
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
+            self.commit_supervisor_management_proof(&current).await?;
+            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
         Ok(SupervisorManagementReceipt {
             supervisor: request.supervisor.clone(),
