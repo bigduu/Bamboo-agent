@@ -815,7 +815,7 @@ pub fn apply_child_session_update(
     }
 
     if let Some(model_ref) = update.model_ref_override {
-        apply_model_ref_override(&mut child, model_ref)?;
+        apply_model_ref_override(child, model_ref)?;
     }
 
     if let Some(effort) = update.reasoning_effort {
@@ -867,9 +867,6 @@ pub fn apply_child_session_update(
         child.advance_child_launch_generation().ok_or_else(|| {
             ChildSessionError::Execution("child launch generation exhausted".into())
         })?;
-        if auto_run {
-            child.mark_child_auto_run_launch_intent();
-        }
         child.clear_last_run_error();
 
         let assignment = format_child_assignment_with_background(
@@ -879,10 +876,10 @@ pub fn apply_child_session_update(
             &effective_prompt,
             update.assignment_background.as_deref(),
         );
-        let user_index = replace_or_append_last_user_message(&mut child, assignment);
+        let user_index = replace_or_append_last_user_message(child, assignment);
 
         if update.reset_after_update.unwrap_or(true) {
-            messages_removed = truncate_after_index(&mut child, user_index);
+            messages_removed = truncate_after_index(child, user_index);
         }
     }
 
