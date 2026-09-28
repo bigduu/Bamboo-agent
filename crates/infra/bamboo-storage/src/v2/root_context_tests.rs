@@ -1294,6 +1294,46 @@ async fn recovery_fence_prevents_late_root_mode_commit_across_stores_and_restart
 }
 
 #[tokio::test]
+async fn policy_neutral_recovery_rejects_stale_main_on_authority_read() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let main_path = directory(&fixture.first, &initial.id).join("session.json");
+    let stale_main = fs::read(&main_path).await.unwrap();
+    let recover = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Recover,
+    );
+    fixture.first.root_mode_operation(&recover).await.unwrap();
+    let current_main = fs::read(&main_path).await.unwrap();
+    assert!(fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    fs::write(&main_path, &stale_main).await.unwrap();
+    let error = fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+    fs::write(&main_path, current_main).await.unwrap();
+    assert!(fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap()
+        .is_some());
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn started_select_blocked_before_admission_cannot_pass_recovery_fence() {
     let initial = root();
     let fixture = Fixture::new(&initial, false).await;

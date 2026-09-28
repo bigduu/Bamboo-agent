@@ -152,6 +152,10 @@ struct MainIdentity {
     root_orchestration_only: bool,
     #[serde(default)]
     root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl SessionStoreV2 {
@@ -226,6 +230,8 @@ impl SessionStoreV2 {
                 || side.root_tool_authority_revision < main.root_tool_authority_revision
                 || (side.root_tool_authority_revision == main.root_tool_authority_revision
                     && side.root_orchestration_only != main.root_orchestration_only)
+                || side.root_mode_transition_epoch != main.root_mode_transition_epoch
+                || side.root_mode_operations != main.root_mode_operations
             {
                 return Err(invalid("canonical Root identity mismatch"));
             }
