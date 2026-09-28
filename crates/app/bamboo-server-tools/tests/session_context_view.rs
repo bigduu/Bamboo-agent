@@ -51,14 +51,26 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_projects(None, None).await
+    }
+
+    async fn new_with_projects(root_project: Option<&str>, child_project: Option<&str>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(
             SessionStoreV2::new(home.path().to_path_buf())
                 .await
                 .unwrap(),
         );
-        let root = Session::new("context-root", "test-model");
-        let child = Session::new_child_of("context-child", &root, "test-model", "Child preview");
+        let mut root = Session::new("context-root", "test-model");
+        let mut child =
+            Session::new_child_of("context-child", &root, "test-model", "Child preview");
+        if let Some(project) = root_project {
+            root.set_project_id_meta(project);
+            root.metadata_version = root.metadata_version.checked_add(1).unwrap();
+        }
+        if let Some(project) = child_project {
+            child.set_project_id_meta(project);
+        }
         for session in [&root, &child] {
             store.save_session(session).await.unwrap();
         }
@@ -253,40 +265,55 @@ async fn readonly_export_requests_control_plane_and_never_leaks_private_payloads
 }
 
 #[tokio::test]
-async fn valid_runtime_sidecars_allow_export_with_corrupt_full_session_files() {
+async fn valid_child_runtime_sidecar_allows_export_with_corrupt_full_session_file() {
     let f = Fixture::new().await;
-    for id in [&f.root.id, &f.child.id] {
-        let directory = f.session_dir(id).await;
-        assert!(directory.join("runtime.json").is_file());
-        std::fs::write(directory.join("session.json"), "invalid full Session JSON").unwrap();
-        assert!(f.store.load_session(id).await.is_err());
-    }
+    let directory = f.session_dir(&f.child.id).await;
+    assert!(directory.join("runtime.json").is_file());
+    std::fs::write(directory.join("session.json"), "invalid full Session JSON").unwrap();
+    assert!(f.store.load_session(&f.child.id).await.is_err());
     let receipt = export(&f.tool, &f.root.id, &f.child.id).await;
     verify_bundle(&receipt, f.home.path());
     assert_eq!(receipt["scope"]["target_session_id"], f.child.id);
-    for id in [&f.root.id, &f.child.id] {
-        assert_eq!(
-            std::fs::read_to_string(f.session_dir(id).await.join("session.json")).unwrap(),
-            "invalid full Session JSON"
-        );
-    }
+    assert_eq!(
+        std::fs::read_to_string(directory.join("session.json")).unwrap(),
+        "invalid full Session JSON"
+    );
 }
 
 #[tokio::test]
-async fn legacy_missing_sidecars_fall_back_without_exporting_or_rewriting_transcript() {
+async fn missing_root_sidecar_fails_closed_child_legacy_fallback_stays_readonly() {
     let mut f = Fixture::new().await;
     f.child
         .add_message(Message::user("PRIVATE-LEAK-LEGACY-TRANSCRIPT"));
     f.store.save_session(&f.child).await.unwrap();
-    let mut originals = Vec::new();
-    for id in [&f.root.id, &f.child.id] {
-        let directory = f.session_dir(id).await;
-        std::fs::remove_file(directory.join("runtime.json")).unwrap();
-        originals.push((
-            directory.clone(),
-            std::fs::read(directory.join("session.json")).unwrap(),
-        ));
-    }
+    let root_directory = f.session_dir(&f.root.id).await;
+    let root_runtime = std::fs::read(root_directory.join("runtime.json")).unwrap();
+    let root_main = std::fs::read(root_directory.join("session.json")).unwrap();
+    std::fs::remove_file(root_directory.join("runtime.json")).unwrap();
+    let error = f
+        .tool
+        .invoke(
+            json!({"action": "export_context", "session_id": f.child.id}),
+            ctx(&f.root.id),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("canonical runtime file is missing or corrupt"),
+        "{error}"
+    );
+    assert!(!f.cache().exists(), "unproved Root published a snapshot");
+    assert_eq!(
+        std::fs::read(root_directory.join("session.json")).unwrap(),
+        root_main
+    );
+    std::fs::write(root_directory.join("runtime.json"), &root_runtime).unwrap();
+
+    let child_directory = f.session_dir(&f.child.id).await;
+    let child_main = std::fs::read(child_directory.join("session.json")).unwrap();
+    std::fs::remove_file(child_directory.join("runtime.json")).unwrap();
     let receipt = export(&f.tool, &f.root.id, &f.child.id).await;
     verify_bundle(&receipt, f.home.path());
     let published = format!(
@@ -296,13 +323,19 @@ async fn legacy_missing_sidecars_fall_back_without_exporting_or_rewriting_transc
         contents(&receipt, "brief")
     );
     assert!(!published.contains("PRIVATE-LEAK-LEGACY-TRANSCRIPT"));
-    for (directory, original) in originals {
-        assert!(!directory.join("runtime.json").exists());
-        assert_eq!(
-            std::fs::read(directory.join("session.json")).unwrap(),
-            original
-        );
-    }
+    assert!(!child_directory.join("runtime.json").exists());
+    assert_eq!(
+        std::fs::read(child_directory.join("session.json")).unwrap(),
+        child_main
+    );
+    assert_eq!(
+        std::fs::read(root_directory.join("runtime.json")).unwrap(),
+        root_runtime
+    );
+    assert_eq!(
+        std::fs::read(root_directory.join("session.json")).unwrap(),
+        root_main
+    );
 }
 
 #[tokio::test]
@@ -400,17 +433,7 @@ async fn optional_project_identity_must_match_exactly_and_be_valid() {
         (Some("../invalid"), Some("../invalid"), false),
         (Some(""), Some(""), false),
     ] {
-        let mut f = Fixture::new().await;
-        if let Some(project) = root_project {
-            f.root.set_project_id_meta(project);
-            f.root.metadata_version = f.root.metadata_version.checked_add(1).unwrap();
-        }
-        if let Some(project) = child_project {
-            f.child.set_project_id_meta(project);
-        }
-        for session in [&f.root, &f.child] {
-            f.store.save_session(session).await.unwrap();
-        }
+        let f = Fixture::new_with_projects(root_project, child_project).await;
         let result = f
             .tool
             .invoke(
