@@ -182,7 +182,7 @@ async fn durable_missing_invalid_archived_foreign_and_unrecoverable_project_fail
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             test::read_body_json::<serde_json::Value, _>(rejected).await,
-            serde_json::json!({"error":"project_unavailable"})
+            serde_json::json!({"error": crate::error::error_value("project_unavailable")})
         );
     }
     let wrong = Session::new("wrong-session", "model");
@@ -199,7 +199,7 @@ async fn durable_missing_invalid_archived_foreign_and_unrecoverable_project_fail
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         test::read_body_json::<serde_json::Value, _>(rejected).await,
-        serde_json::json!({"error":"session_unavailable"})
+        serde_json::json!({"error": crate::error::error_value("session_unavailable")})
     );
     assert!(!home.join("projects/missing").exists());
     let projects = ["archived", "foreign", "corrupt"].map(|kind| {
@@ -243,7 +243,7 @@ async fn durable_missing_invalid_archived_foreign_and_unrecoverable_project_fail
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             test::read_body_json::<serde_json::Value, _>(rejected).await,
-            serde_json::json!({"error":"project_unavailable"})
+            serde_json::json!({"error": crate::error::error_value("project_unavailable")})
         );
     }
 }

@@ -1407,7 +1407,25 @@ async fn fixture_with_followups(
                         .current_attempt
                         == 2)
             {
-                break child;
+                if !ultra && !reasoning {
+                    assert_eq!(
+                        status.as_deref(),
+                        Some("completed"),
+                        "actual Child failed before its reply was durable: {:?}",
+                        child.last_run_error()
+                    );
+                    // Legacy runtime status and the canonical transcript live
+                    // in separate files. Wait for both writes to be visible.
+                    if child
+                        .messages
+                        .iter()
+                        .any(|message| message.content == "FENCED_PLAIN_REPLY")
+                    {
+                        break child;
+                    }
+                } else {
+                    break child;
+                }
             }
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
             tokio::time::sleep(Duration::from_millis(50)).await;

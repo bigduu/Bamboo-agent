@@ -277,6 +277,10 @@ async fn build_test_harness() -> TestHarness {
     build_test_harness_with_resolver(None).await
 }
 
+async fn build_running_child_harness() -> TestHarness {
+    build_test_harness_with_hook(None, None, true, None, true).await
+}
+
 async fn build_test_harness_with_resolver(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
 ) -> TestHarness {
@@ -300,6 +304,7 @@ async fn build_test_harness_with_storage(
         workspace_resolver,
         use_v2_storage,
         None,
+        false,
     )
     .await
 }
@@ -309,9 +314,13 @@ async fn build_test_harness_with_hook(
     workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
     use_v2_storage: bool,
     launch_hook: Option<Arc<dyn bamboo_engine::execution::ChildRunLaunchHook>>,
+    initial_child_running: bool,
 ) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
+    // The named-profile reader rejects symlinked path components. On macOS,
+    // std::env::temp_dir() can start with /var, which aliases /private/var.
+    let bamboo_home = tokio::fs::canonicalize(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
     tokio::fs::create_dir_all(&workspace_path).await.unwrap();
     let workspace_path = tokio::fs::canonicalize(workspace_path).await.unwrap();
@@ -359,9 +368,15 @@ async fn build_test_harness_with_hook(
         "gpt-5",
         "Child session",
     );
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "completed".to_string());
+    child.metadata.insert(
+        "last_run_status".to_string(),
+        if initial_child_running {
+            "running"
+        } else {
+            "completed"
+        }
+        .to_string(),
+    );
     child.add_message(Message::system("child system"));
     child.add_message(Message::user("initial assignment"));
     child.add_message(Message::assistant("initial answer", None));
@@ -596,6 +611,24 @@ impl WaitOrderPort {
 
 #[async_trait::async_trait]
 impl ChildSessionPort for WaitOrderPort {
+    async fn resolve_named_profile(
+        &self,
+        parent: &Session,
+        name: &str,
+    ) -> Result<Option<child_session::named_profile::ResolvedChildProfile>, ChildSessionError> {
+        self.inner.resolve_named_profile(parent, name).await
+    }
+
+    async fn validate_required_child_context_route(
+        &self,
+        runtime_metadata: &HashMap<String, String>,
+        subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        self.inner
+            .validate_required_child_context_route(runtime_metadata, subagent_type)
+            .await
+    }
+
     async fn validate_child_workspace(
         &self,
         project_id: Option<&bamboo_domain::ProjectId>,
@@ -647,6 +680,28 @@ impl ChildSessionPort for WaitOrderPort {
 
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
         self.inner.save_child_session(child).await
+    }
+
+    async fn update_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        update: child_session::ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        self.inner
+            .update_child_session(parent_id, child_id, update)
+            .await
+    }
+
+    async fn append_draft_child_message(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.inner
+            .append_draft_child_message(parent_id, child_id, message)
+            .await
     }
 
     async fn save_child_session_authoritative_flags(
@@ -891,7 +946,7 @@ fn synchronous_launch_args(action: &str, child_id: &str, workspace: &str) -> ser
 #[tokio::test]
 async fn synchronous_subagent_paths_arm_wait_before_a_fast_child_can_activate() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1225,7 +1280,7 @@ async fn run_does_not_rearm_wait_cleared_after_parent_snapshot() {
 #[tokio::test]
 async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         harness
             .adapter
             .register_parent_wait_for_child(&harness.parent_session_id, "sibling", None)
@@ -1281,7 +1336,7 @@ async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
 #[tokio::test]
 async fn cancelled_synchronous_launch_still_compensates_a_rejected_enqueue() {
     for action in ["create", "update", "run"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1527,7 +1582,7 @@ async fn cancelled_background_create_cannot_admit_a_late_child_job() {
 #[tokio::test]
 async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1541,12 +1596,17 @@ async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
         );
         let parent_id = harness.parent_session_id.clone();
         let wait_persisted = port.wait_persisted.notified();
-        let outer = tokio::spawn(async move {
+        let mut outer = tokio::spawn(async move {
             invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
         });
-        tokio::time::timeout(Duration::from_secs(5), wait_persisted)
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = wait_persisted => {}
+                outcome = &mut outer => panic!("{action} ended before persisting its parent wait: {outcome:?}"),
+            }
+        })
             .await
-            .expect("parent wait must be persisted before cancellation");
+            .unwrap_or_else(|_| panic!("{action} parent wait must be persisted before cancellation"));
         outer.abort();
         assert!(outer.await.unwrap_err().is_cancelled());
         port.release_wait.notify_one();
@@ -1818,7 +1878,7 @@ async fn plan_workspace_selection_uses_durable_metadata_and_current_project_defa
 
 #[tokio::test]
 async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persistence() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, false).await;
     let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
     let mut parent = harness
         .adapter
@@ -1924,7 +1984,7 @@ async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_w
             ))
         })
     });
-    let harness = build_test_harness_with_resolver(Some(resolver)).await;
+    let harness = build_test_harness_with_storage(Some(resolver), None, false).await;
 
     // A permissive root is useful regression pressure: Plan must preserve the
     // root's posture while the child receives an independent read-only overlay.
@@ -2104,7 +2164,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
             title: "Confined child".to_string(),
             responsibility: "Inspect".to_string(),
             assignment_prompt: "Inspect".to_string(),
-            subagent_type: "explorer".to_string(),
+            subagent_type: "workspace-probe".to_string(),
             workspace: foreign_workspace.path().to_string_lossy().into_owned(),
             workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
             model_override: None,
@@ -2134,7 +2194,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
 
 #[tokio::test]
 async fn supervisor_common_child_constructor_keeps_ordinary_identity_for_all_role_labels() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let store = &harness.adapter.session_store;
     let receipt = store
         .get_or_create_default_supervisor("test-model")
@@ -2247,7 +2307,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
         .expect("save parent");
 
     for (role, lifecycle, resident_name) in [
-        ("explorer", None, None),
+        ("workspace-probe", None, None),
         ("resident", Some("resident"), Some("stable")),
         ("guardian", None, None),
     ] {
@@ -3274,7 +3334,7 @@ async fn root_stays_contract_free_while_oneshot_and_resident_children_get_it_onc
             "title": title,
             "responsibility": "Inspect one bounded path",
             "prompt": "Read one file and report evidence.",
-            "subagent_type": "reviewer",
+            "subagent_type": "contract-probe",
             "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false
         });
@@ -3444,7 +3504,10 @@ async fn resident_reuse_caller_cancel_after_stop_still_queues_replacement_task()
     outer.abort();
     assert!(outer.await.unwrap_err().is_cancelled());
     port.release_interrupt.notify_one();
-    waiter.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("resident old run cancellation must signal the waiter")
+        .expect("waiter task should finish");
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -3473,7 +3536,7 @@ async fn resident_reuse_caller_cancel_after_stop_still_queues_replacement_task()
 
 #[tokio::test]
 async fn resident_create_reset_and_accumulate_share_complete_background_aware_frame() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let mut parent = harness
         .storage
         .load_session(&harness.parent_session_id)
@@ -3561,7 +3624,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
             "title": "Reset resident task",
             "responsibility": "Inspect reset path",
             "prompt": reset_brief,
-            "subagent_type": "reviewer",
+            "subagent_type": "audit-worker",
             "workspace": harness.workspace_path.to_string_lossy(),
             "fork_last_messages": 1,
             "auto_run": false
@@ -3582,7 +3645,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
     let reset_expected = child_session::format_child_assignment_with_background(
         "Reset resident task",
         "Inspect reset path",
-        "reviewer",
+        "audit-worker",
         reset_brief,
         Some(&reset_background),
     );
@@ -3619,7 +3682,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
             "title": "Accumulated resident task",
             "responsibility": "Inspect accumulated path",
             "prompt": accumulate_brief,
-            "subagent_type": "reviewer",
+            "subagent_type": "audit-worker",
             "workspace": harness.workspace_path.to_string_lossy(),
             "fork_last_messages": 1,
             "auto_run": false
@@ -3640,7 +3703,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
     let accumulated_expected = child_session::format_child_assignment_with_background(
         "Accumulated resident task",
         "Inspect accumulated path",
-        "reviewer",
+        "audit-worker",
         accumulate_brief,
         Some(&accumulated_background),
     );
@@ -4272,7 +4335,7 @@ async fn direct_update_uses_the_canonical_complete_assignment_frame() {
 
 #[tokio::test]
 async fn send_message_appends_follow_up_without_replacing_history() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let raw_message = "\n  continue with the failing parser path  \n";
 
     let result = invoke_completed(
@@ -4694,7 +4757,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
 
 #[tokio::test]
 async fn send_message_can_interrupt_running_child() {
-    let harness = build_test_harness().await;
+    let harness = build_running_child_harness().await;
     let cancel_token = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
@@ -4705,9 +4768,17 @@ async fn send_message_can_interrupt_running_child() {
     };
 
     let runners_for_status = harness.agent_runners.clone();
+    let storage_for_status = harness.storage.clone();
     let child_id_for_status = harness.child_session_id.clone();
     let waiter = tokio::spawn(async move {
         cancel_token.cancelled().await;
+        let mut child = storage_for_status
+            .load_session(&child_id_for_status)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_last_run_status("cancelled");
+        storage_for_status.save_session(&child).await.unwrap();
         let mut runners = runners_for_status.write().await;
         if let Some(runner) = runners.get_mut(&child_id_for_status) {
             runner.status = AgentStatus::Cancelled;
@@ -4742,7 +4813,10 @@ async fn send_message_can_interrupt_running_child() {
     .await
     .expect("send_message should interrupt running child");
 
-    waiter.await.expect("waiter task should finish");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter task should finish");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -4843,7 +4917,7 @@ async fn interrupt_running_cancel_before_stop_leaves_old_run_and_inbox_untouched
 
 #[tokio::test]
 async fn interrupt_running_caller_cancel_after_stop_still_delivers_new_inbox_message() {
-    let harness = build_test_harness().await;
+    let harness = build_running_child_harness().await;
     let cancel_token = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
@@ -4853,9 +4927,17 @@ async fn interrupt_running_caller_cancel_after_stop_still_delivers_new_inbox_mes
         cancel_token
     };
     let runners_for_status = harness.agent_runners.clone();
+    let storage_for_status = harness.storage.clone();
     let child_id_for_status = harness.child_session_id.clone();
     let waiter = tokio::spawn(async move {
         cancel_token.cancelled().await;
+        let mut child = storage_for_status
+            .load_session(&child_id_for_status)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_last_run_status("cancelled");
+        storage_for_status.save_session(&child).await.unwrap();
         let mut runners = runners_for_status.write().await;
         if let Some(runner) = runners.get_mut(&child_id_for_status) {
             runner.status = AgentStatus::Cancelled;
@@ -4889,7 +4971,10 @@ async fn interrupt_running_caller_cancel_after_stop_still_delivers_new_inbox_mes
     outer.abort();
     assert!(outer.await.unwrap_err().is_cancelled());
     port.release_interrupt.notify_one();
-    waiter.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter task should finish");
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -5346,7 +5431,10 @@ async fn cancel_stops_running_child() {
     .await
     .expect("cancel should succeed");
 
-    waiter.await.expect("waiter should finish");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter should finish");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -5370,7 +5458,7 @@ async fn queued_child_cancel_fences_duplicate_deliveries_and_explicit_retry() {
         during_entered: during_entered.clone(),
         during_release: during_release.clone(),
     });
-    let harness = build_test_harness_with_hook(None, None, true, Some(hook)).await;
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook), false).await;
     let parent = harness
         .storage
         .load_session(&harness.parent_session_id)
@@ -5692,7 +5780,7 @@ async fn repeated_reconcile_during_queued_launch_admits_one_recovery() {
         during_entered: Arc::new(tokio::sync::Semaphore::new(0)),
         during_release: Arc::new(tokio::sync::Semaphore::new(0)),
     });
-    let harness = build_test_harness_with_hook(None, None, true, Some(hook)).await;
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook), false).await;
     let mut child = Session::new_child(
         "recover-queued",
         harness.parent_session_id.clone(),

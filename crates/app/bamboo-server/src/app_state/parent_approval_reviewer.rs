@@ -1080,6 +1080,35 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let main_path = f
+            .home
+            .path()
+            .join(f.store.resolve_rel_path("approval-parent").await.unwrap())
+            .join("session.json");
+        let original_main = std::fs::read(&main_path).unwrap();
+        // Preserve the compact authority frame and every ordinary Main field
+        // except the deliberately damaged transcript. A supported full save
+        // now correctly rejects erasing this durable request/terminal pair.
+        let prefix = b"{\"_bamboo_main_authority\":{\"version\":1,\"payload_bytes\":\"";
+        let middle = b"\",\"payload\":";
+        assert!(original_main.starts_with(prefix));
+        let length_start = prefix.len();
+        let payload_len: usize =
+            std::str::from_utf8(&original_main[length_start..length_start + 10])
+                .unwrap()
+                .parse()
+                .unwrap();
+        let frame_end = length_start + 10 + middle.len() + payload_len + 2;
+        assert_eq!(
+            &original_main[length_start + 10..length_start + 10 + middle.len()],
+            middle
+        );
+        assert_eq!(&original_main[frame_end - 2..frame_end], b"},");
+        let mut main_body: Value = serde_json::from_slice(&original_main).unwrap();
+        main_body
+            .as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
         for damage in 0..7 {
             let mut damaged = original.clone();
             match damage {
@@ -1099,12 +1128,16 @@ mod tests {
                 5 => damaged.messages.swap(0, 1),
                 _ => damaged.messages[0].reasoning = Some("not a canonical typed request".into()),
             }
-            // Intentional destructive source fault: never offered as a supported writer.
-            f.store.save_session(&damaged).await.unwrap();
+            main_body["messages"] = serde_json::to_value(&damaged.messages).unwrap();
+            let flat = serde_json::to_vec_pretty(&main_body).unwrap();
+            let mut fault = original_main[..frame_end].to_vec();
+            fault.extend_from_slice(&flat[1..]);
+            // Intentional destructive source fault, never a supported writer.
+            std::fs::write(&main_path, fault).unwrap();
             assert!(!f.review(&f.body).await);
             assert_eq!(f.probe.0.load(Ordering::SeqCst), 1);
         }
-        f.store.save_session(&original).await.unwrap();
+        std::fs::write(&main_path, &original_main).unwrap();
         f.scopes.lock().unwrap().clear(); // A restarted Host cannot reconstruct an old grant.
         assert!(!f.review(&f.body).await);
         assert_eq!(f.probe.0.load(Ordering::SeqCst), 1);

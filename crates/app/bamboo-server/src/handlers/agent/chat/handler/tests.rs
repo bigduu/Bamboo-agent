@@ -904,7 +904,9 @@ mod optional_model_e2e {
                 .configure(configure_routes),
         )
         .await;
-        let switched = test::call_service(
+        // Existing Roots change mode through a recoverable operation. First
+        // retire the Workflow in chat, while its user turn is committed.
+        let cleared = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/api/v1/chat")
@@ -912,13 +914,32 @@ mod optional_model_e2e {
                     "session_id": id,
                     "message": "delegate bounded work",
                     "model": "test-model",
-                    "root_orchestration_only": true,
                     "selected_skill_ids": selected_skill_ids,
                 }))
                 .to_request(),
         )
         .await;
-        assert_eq!(switched.status(), StatusCode::CREATED);
+        assert_eq!(cleared.status(), StatusCode::CREATED);
+        let cleared = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!cleared.root_orchestration_only_enabled());
+        assert!(cleared.selected_skill_ids().is_none());
+        let epoch = cleared.root_mode_transition_epoch;
+        let operation_id = format!("{epoch}:{}", uuid::Uuid::new_v4());
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/sessions/{id}/root-mode-operations/{operation_id}"
+                ))
+                .set_json(serde_json::json!({
+                    "birth_token": cleared.root_mode_birth_token(),
+                    "expected_epoch": epoch,
+                    "enabled": true,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::OK);
         let saved = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(saved.root_orchestration_only_enabled());
         assert!(saved.selected_skill_ids().is_none());

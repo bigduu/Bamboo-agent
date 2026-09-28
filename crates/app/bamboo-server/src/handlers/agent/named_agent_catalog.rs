@@ -31,12 +31,14 @@ pub async fn handler(
     );
     drop(config);
     if codex || !authenticated {
-        return HttpResponse::Unauthorized()
-            .json(serde_json::json!({"error":"host_authentication_required"}));
+        return HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": crate::error::error_value("host_authentication_required")
+        }));
     }
     if !req.query_string().is_empty() {
-        return HttpResponse::BadRequest()
-            .json(serde_json::json!({"error":"invalid_catalog_selector"}));
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value("invalid_catalog_selector")
+        }));
     }
     match named_agent_catalog::discover(&state, &path.into_inner(), NamedAgentLimits::default())
         .await
@@ -45,12 +47,26 @@ pub async fn handler(
             .insert_header((header::CACHE_CONTROL, "private, no-store"))
             .json(catalog.metadata()),
         Err(error) => {
-            let status = match error {
-                CatalogError::SessionNotFound => StatusCode::NOT_FOUND,
-                CatalogError::CatalogRejected(_) => StatusCode::PAYLOAD_TOO_LARGE,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
+            let (status, message) = match error {
+                CatalogError::SessionNotFound => (StatusCode::NOT_FOUND, "session_not_found"),
+                CatalogError::SessionUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "session_unavailable")
+                }
+                CatalogError::ProjectUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "project_unavailable")
+                }
+                CatalogError::CatalogUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "catalog_unavailable")
+                }
+                CatalogError::CatalogRejected(_) => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "catalog_rejected")
+                }
             };
-            HttpResponse::build(status).json(serde_json::json!({"error":error}))
+            let mut body = serde_json::json!({"error": crate::error::error_value(message)});
+            if let CatalogError::CatalogRejected(code) = error {
+                body["error"]["code"] = serde_json::json!(code);
+            }
+            HttpResponse::build(status).json(body)
         }
     }
 }

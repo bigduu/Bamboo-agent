@@ -1011,11 +1011,30 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
-    if root_mode_selection.is_some()
-        && authoritative_session.as_ref().is_some_and(|session| {
-            session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
-        })
-    {
+    let existing_root = authoritative_session.as_ref().is_some_and(|session| {
+        session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
+    });
+    let existing_ordinary_root = existing_root
+        && authoritative_session
+            .as_ref()
+            .is_some_and(|session| !session.root_orchestration_only_enabled());
+    let existing_workflow_authority = authoritative_session.as_ref().is_some_and(|session| {
+        let metadata = &session.metadata;
+        metadata.contains_key(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY)
+            || metadata
+                .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+                .is_some_and(|raw| {
+                    serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw)
+                        .map(|workflow| {
+                            workflow.status != bamboo_skills::WorkflowActivationStatus::Deactivated
+                        })
+                        .unwrap_or(true)
+                })
+            || metadata.contains_key(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+            || metadata
+                .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
+    });
+    if root_mode_selection.is_some() && existing_root {
         return HttpResponse::build(actix_web::http::StatusCode::PRECONDITION_REQUIRED).json(
             serde_json::json!({
                 "error": {
@@ -1164,9 +1183,10 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .metadata
         .get(bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
         .is_some_and(|source| source == "startup");
-    // An explicit empty Skill selection can retire an existing Workflow while
-    // enabling the narrow Root. Its durable snapshot and live pin must be
-    // retired together with the final user turn, not at the early checkpoint.
+    // Explicitly clearing a Workflow on an existing ordinary Root must retire
+    // its durable snapshot and live pin with the final user turn. The separate
+    // recoverable Root mode operation can then enable orchestration-only mode.
+    // Keep the first-chat combined switch on the same guarded commit path.
     let root_workflow_switch = req.root_orchestration_only == Some(true)
         && req
             .selected_skill_ids
@@ -1174,6 +1194,14 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             .is_some_and(|ids| ids.iter().all(|id| id.trim().is_empty()))
         && !root_tool_authority_checkpoint.orchestration_only
         && session.root_orchestration_only_enabled();
+    let explicit_workflow_retirement = existing_ordinary_root
+        && existing_workflow_authority
+        && req.workflow_selection.is_none()
+        && req
+            .selected_skill_ids
+            .as_ref()
+            .is_some_and(|ids| ids.iter().all(|id| id.trim().is_empty()));
+    let retire_workflow = root_workflow_switch || explicit_workflow_retirement;
     if requested_workflow_selection.is_some() && session.root_orchestration_only_enabled() {
         return HttpResponse::Conflict().json(serde_json::json!({
             "error": {
@@ -1303,13 +1331,13 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     #[cfg(test)]
     wait_at_workflow_commit_test_barrier(&session_id).await;
 
-    // A typed activation replaces both durable Workflow metadata and the
-    // session-id keyed immutable skill pin. Re-check after all fallible hook
-    // work, then retain the runners read guard through attachment persistence,
-    // the final session save and pin handoff. The persistence lock linearizes
-    // HTTP execute startup; the runners guard closes reservation races from
-    // resume, schedule and connect entry points.
-    let workflow_commit_guard = if staged_workflow_activation.is_some() || root_workflow_switch {
+    // Workflow activation or retirement changes both durable Workflow metadata
+    // and the session-id keyed immutable skill pin. Re-check after all fallible
+    // hook work, then retain the runners read guard through attachment
+    // persistence, the final session save and pin handoff. The persistence lock
+    // linearizes HTTP execute startup; the runners guard closes reservation
+    // races from resume, schedule and connect entry points.
+    let workflow_commit_guard = if staged_workflow_activation.is_some() || retire_workflow {
         let runners = state.agent_runners.clone().read_owned().await;
         let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
         let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
@@ -1342,7 +1370,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         return response;
     }
 
-    if root_workflow_switch {
+    if retire_workflow {
         // The old candidate can otherwise be restored on the next execute,
         // even after the visible Workflow selection was removed. Preserve the
         // deactivation event and run history while retiring executable state.
@@ -1359,7 +1387,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
     }
 
-    if staged_workflow_activation.is_some() || root_workflow_switch {
+    if staged_workflow_activation.is_some() || retire_workflow {
         let mut staging = staged_workflow_activation;
         if let Some(staging) = staging.as_ref() {
             staging.apply(&mut session.metadata);
@@ -1368,7 +1396,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         let commit_session_id = session_id.clone();
         let commit = tokio::spawn(async move {
             // Keep final save -> old pin release cancellation-resistant for
-            // both a replacement Workflow and a Workflow-to-Root switch.
+            // replacement, retirement, and the first-chat Root switch.
             let _persistence_guard = persistence_guard;
             let _workflow_commit_guard = workflow_commit_guard;
             if let Err(error) =

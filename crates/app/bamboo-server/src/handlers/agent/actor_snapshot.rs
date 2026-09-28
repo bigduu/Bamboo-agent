@@ -27,8 +27,10 @@ fn failure(error: ActorSnapshotError) -> HttpResponse {
         ActorSnapshotError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
     };
-    HttpResponse::build(status)
-        .json(serde_json::json!({"schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION, "error": error}))
+    HttpResponse::build(status).json(serde_json::json!({
+        "schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION,
+        "error": crate::error::error_value(error.to_string())
+    }))
 }
 
 /// The same HostOwner gate is used by snapshot REST and lazy Actor WS channels.
@@ -62,7 +64,10 @@ pub async fn handler(
     // The existing middleware limits bcx credentials to Responses/models.
     // Retain that restriction even when this handler is mounted independently.
     if !host_owner_authorized(&state, &req).await {
-        return HttpResponse::Unauthorized().json(serde_json::json!({"schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION, "error": "host_authentication_required"}));
+        return HttpResponse::Unauthorized().json(serde_json::json!({
+            "schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION,
+            "error": crate::error::error_value("host_authentication_required")
+        }));
     }
     let query = match web::Query::<Query>::from_query(req.query_string()) {
         Ok(query) => query.into_inner(),
@@ -228,6 +233,14 @@ mod tests {
             };
             let denied = test::call_service(&direct, request()).await;
             assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+            let denied_body: serde_json::Value = test::read_body_json(denied).await;
+            assert_eq!(
+                denied_body,
+                serde_json::json!({
+                    "schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION,
+                    "error": crate::error::error_value("host_authentication_required")
+                })
+            );
             let canonical = test::call_service(&app, request()).await;
             assert_eq!(canonical.status(), StatusCode::UNAUTHORIZED);
         }
@@ -241,5 +254,13 @@ mod tests {
         )
         .await;
         assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
+        let forged_body: serde_json::Value = test::read_body_json(forged).await;
+        assert_eq!(
+            forged_body,
+            serde_json::json!({
+                "schema_version": ACTOR_SNAPSHOT_SCHEMA_VERSION,
+                "error": crate::error::error_value("invalid_selector")
+            })
+        );
     }
 }

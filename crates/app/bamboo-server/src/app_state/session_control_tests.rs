@@ -242,7 +242,7 @@ impl Fixture {
             .unwrap())
             .into();
         service
-            .configure_project_scope(&reference, 0, [project.id].into())
+            .configure_project_scope(&reference, 0, [project.id.clone()].into())
             .await
             .unwrap();
         service.attach(&reference, 1, TARGET).await.unwrap();
@@ -262,10 +262,13 @@ impl Fixture {
                 },
             )
             .unwrap();
-        // Prewarm existing catalog watchers before bounded runtime assertions.
+        // Prewarm the exact Project/workspace store used by the Root runner.
+        // Warming only the workspace store leaves a second watcher registration
+        // in the bounded execution path.
+        let project_home = state.project_store.paths().project_home(&project.id);
         state
             .skill_manager
-            .store_for_workspace(Some(&workspace))
+            .store_for_project_workspace(&project.id, &project_home, Some(&workspace))
             .await
             .unwrap();
         Self {
