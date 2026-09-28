@@ -234,6 +234,27 @@ impl DeployedAgent {
     }
 }
 
+async fn feed_spec_to_process(handle: &mut DeployedAgent, spec_json: &str) -> BrokerResult<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let DeployedInner::Process { child, .. } = &mut handle.inner else {
+        return Err(BrokerError::Transport(
+            "deployed worker has no process stdin".into(),
+        ));
+    };
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        BrokerError::Transport("deployed worker spec stdin is unavailable".into())
+    })?;
+    stdin
+        .write_all(spec_json.as_bytes())
+        .await
+        .map_err(|error| BrokerError::Transport(format!("write spec to stdin: {error}")))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|error| BrokerError::Transport(format!("close worker stdin: {error}")))
+}
+
 /// Send SIGTERM to `pid` by shelling out to `kill -TERM` — deliberately NOT
 /// `libc::kill`/`nix` (mirrors the precedent in
 /// `bamboo_server::service_manager::lifecycle::send_graceful_signal`, which
@@ -334,22 +355,16 @@ impl Deployer for LocalProcessDeployer {
                 }
             }
         }
-        let mut child = cmd.spawn().map_err(spawn_err)?;
+        let child = cmd.spawn().map_err(spawn_err)?;
+        let mut handle = DeployedAgent::from_parts(d.id.clone(), child, None);
         // Feed the spec, then close stdin so the worker reads to EOF.
         if let Some(spec_json) = &d.spec_json {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(spec_json.as_bytes())
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
-                stdin
-                    .shutdown()
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
+            if let Err(error) = feed_spec_to_process(&mut handle, spec_json).await {
+                handle.shutdown_with_timeout(Duration::ZERO).await;
+                return Err(error);
             }
         }
-        Ok(DeployedAgent::from_parts(d.id.clone(), child, None))
+        Ok(handle)
     }
 
     async fn tail_log(&self, log_path: &str, lines: usize) -> BrokerResult<String> {
@@ -498,23 +513,8 @@ impl Deployer for DockerDeployer {
         if d.spec_json.is_some() {
             cmd.stdin(std::process::Stdio::piped());
         }
-        let mut child = cmd.spawn().map_err(spawn_err)?;
-        // Feed the spec, then close stdin so the worker reads to EOF (same
-        // handshake as `LocalProcessDeployer`).
-        if let Some(spec_json) = &d.spec_json {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(spec_json.as_bytes())
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("write spec to stdin: {e}")))?;
-                stdin
-                    .shutdown()
-                    .await
-                    .map_err(|e| BrokerError::Transport(format!("close worker stdin: {e}")))?;
-            }
-        }
-        Ok(DeployedAgent::from_parts(
+        let child = cmd.spawn().map_err(spawn_err)?;
+        let mut handle = DeployedAgent::from_parts(
             d.id.clone(),
             child,
             Some(vec![
@@ -523,7 +523,16 @@ impl Deployer for DockerDeployer {
                 "-f".into(),
                 container,
             ]),
-        ))
+        );
+        // Feed the spec, then close stdin so the worker reads to EOF (same
+        // handshake as `LocalProcessDeployer`).
+        if let Some(spec_json) = &d.spec_json {
+            if let Err(error) = feed_spec_to_process(&mut handle, spec_json).await {
+                handle.shutdown_with_timeout(Duration::ZERO).await;
+                return Err(error);
+            }
+        }
+        Ok(handle)
     }
 }
 
@@ -891,6 +900,39 @@ pub(crate) fn broker_scheme(endpoint: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_spec_write_failure_removes_spawned_container() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let docker = home.path().join("fake-docker");
+        let marker = home.path().join("container-running");
+        let cleaned = home.path().join("cleanup-called");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rm ]; then\n  rm -f {marker}\n  touch {cleaned}\n  exit 0\nfi\ntouch {marker}\nexec 0<&-\nexec sleep 60\n",
+                marker = sh_quote(&marker.to_string_lossy()),
+                cleaned = sh_quote(&cleaned.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut deployment = dep();
+        deployment.spec_json = Some("x".repeat(8 * 1024 * 1024));
+        let mut deployer = DockerDeployer::new("fake-image");
+        deployer.docker_bin = docker.to_string_lossy().into_owned();
+
+        let result = deployer.deploy(&deployment).await;
+        assert!(result.is_err(), "closed stdin must fail spec publication");
+        assert!(cleaned.exists(), "spawned Docker worker must run cleanup");
+        assert!(
+            !marker.exists(),
+            "failed deployment must leave no container"
+        );
+    }
 
     fn dep() -> AgentDeployment {
         AgentDeployment {

@@ -221,7 +221,7 @@ fn renew_resident_activation(
                 tracing::warn!(actor_id = %fence.actor_id, process_exited, "resident worker lost Host activation; stopping worker");
                 deployment.handle.shutdown().await;
                 let _ = store
-                    .retire_actor(&fence.actor_id, chrono::Utc::now())
+                    .retire_actor_if_activation(&fence, chrono::Utc::now())
                     .await;
             }
             break;
@@ -473,9 +473,9 @@ impl DeployAgentTool {
         let handle = match deployer.deploy(&deployment).await {
             Ok(handle) => handle,
             Err(error) => {
-                if let (Some(store), Some(actor)) = (&self.actor_store, &actor) {
+                if let (Some(store), Some(fence)) = (&self.actor_store, &activation) {
                     let _ = store
-                        .retire_actor(&actor.actor_id, chrono::Utc::now())
+                        .retire_actor_if_activation(fence, chrono::Utc::now())
                         .await;
                     tracing::warn!(%error, "deployment launcher failed after logical identity persistence");
                     return Err(ToolError::Execution(
@@ -501,7 +501,7 @@ impl DeployAgentTool {
             {
                 handle.shutdown().await;
                 let _ = store
-                    .retire_actor(&fence.actor_id, chrono::Utc::now())
+                    .retire_actor_if_activation(fence, chrono::Utc::now())
                     .await;
                 return Err(ToolError::Execution(
                     "deployment Actor activation could not start; worker was stopped".into(),
@@ -530,9 +530,9 @@ impl DeployAgentTool {
         // Concurrent launches must never replace an already published handle.
         if let Some(duplicate) = duplicate {
             duplicate.handle.shutdown().await;
-            if let (Some(store), Some(actor)) = (&self.actor_store, duplicate.actor) {
+            if let (Some(store), Some(fence)) = (&self.actor_store, duplicate.activation) {
                 let _ = store
-                    .retire_actor(&actor.actor_id, chrono::Utc::now())
+                    .retire_actor_if_activation(&fence, chrono::Utc::now())
                     .await;
             }
             return Err(ToolError::Execution(
@@ -583,12 +583,17 @@ impl DeployAgentTool {
             Some(d) => {
                 d.handle.shutdown().await;
                 let public_id = if let Some(actor) = d.actor {
+                    let fence = d.activation.as_ref().ok_or_else(|| {
+                        ToolError::Execution(
+                            "worker stopped; Actor activation is unavailable".into(),
+                        )
+                    })?;
                     self.actor_store
                         .as_ref()
                         .ok_or_else(|| {
                             ToolError::Execution("deployment Host store is unavailable".into())
                         })?
-                        .retire_actor(&actor.actor_id, chrono::Utc::now())
+                        .retire_actor_if_activation(fence, chrono::Utc::now())
                         .await
                         .map_err(|_| {
                             ToolError::Execution(

@@ -499,6 +499,37 @@ impl SessionStoreV2 {
         }
         Ok(value)
     }
+
+    /// Retire a resident only while its exact physical activation is still
+    /// the Directory owner. A delayed launcher/renewal cleanup may run after
+    /// expiry and replacement; it must not retire that successor by ActorId.
+    pub async fn retire_actor_if_activation(
+        &self,
+        fence: &ActorActivationFence,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ActorDirectoryError> {
+        self.actor_transaction(&fence.actor_id, |entry| {
+            if entry.actor.state == ActorLogicalState::Retired
+                || !entry
+                    .activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.matches_fence(fence))
+            {
+                return Ok(Mutation::unchanged(false));
+            }
+            if let Some(activation) = entry.activation.as_mut() {
+                if activation.status.is_live() {
+                    activation.lease_epoch = checked_next(activation.lease_epoch)?;
+                    activation.status = ActorActivationStatus::Cancelled;
+                    activation.finished_at = Some(now);
+                    activation.lease_expires_at = now;
+                }
+            }
+            entry.actor.state = ActorLogicalState::Retired;
+            Ok(Mutation::changed(true))
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -934,6 +965,62 @@ mod tests {
                 .await
                 .unwrap_err(),
             ActorDirectoryError::StaleFence
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_resident_cleanup_cannot_retire_replacement_activation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let old_store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        old_store
+            .save_session(&Session::new("resident-replacement", "model"))
+            .await?;
+        let now = Utc::now();
+        let old = old_store
+            .claim_activation(&claim("resident-replacement", "old", "old-host", now))
+            .await?;
+        old_store.start_activation(&old.fence(), now).await?;
+
+        let replacement_store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let after_expiry = now + Duration::minutes(6);
+        let replacement = replacement_store
+            .claim_activation(&claim(
+                "resident-replacement",
+                "replacement",
+                "new-host",
+                after_expiry,
+            ))
+            .await?;
+        replacement_store
+            .start_activation(&replacement.fence(), after_expiry)
+            .await?;
+
+        assert!(
+            !old_store
+                .retire_actor_if_activation(&old.fence(), after_expiry)
+                .await?
+        );
+        let current = old_store.inspect_actor("resident-replacement").await?;
+        assert_eq!(current.actor.state, ActorLogicalState::Active);
+        assert_eq!(current.activation.unwrap().fence(), replacement.fence());
+        replacement_store
+            .validate_fence(&replacement.fence(), after_expiry)
+            .await?;
+
+        assert!(
+            old_store
+                .retire_actor_if_activation(&replacement.fence(), after_expiry)
+                .await?
+        );
+        let retired = replacement_store
+            .inspect_actor("resident-replacement")
+            .await?;
+        assert_eq!(retired.actor.state, ActorLogicalState::Retired);
+        assert_eq!(
+            retired.activation.unwrap().status,
+            ActorActivationStatus::Cancelled
         );
         Ok(())
     }
