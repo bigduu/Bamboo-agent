@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
 /// * `system_prompt` - Optional custom system prompt. If empty, uses the default
 /// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
+/// * `root_orchestration_prompt` - Explicit root-only delegation guidance selection
 /// * `workspace_path` - Optional workspace path to include in the system prompt
 /// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
 /// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
@@ -26,6 +27,10 @@ pub struct ChatRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub enhance_prompt: Option<String>,
+    /// Set `true` or `false` to change the durable root delegation mode;
+    /// omission keeps the Session's prior selection.
+    #[serde(default)]
+    pub root_orchestration_prompt: Option<bool>,
     #[serde(default)]
     pub workspace_path: Option<String>,
     #[serde(default)]
@@ -104,6 +109,19 @@ mod tests {
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req.images.is_none());
+        assert!(req.root_orchestration_prompt.is_none());
+    }
+
+    #[test]
+    fn root_orchestration_prompt_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_prompt":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_prompt, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_prompt":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_prompt, Some(false));
     }
 
     #[test]
@@ -165,6 +183,7 @@ mod tests {
             project_id: None,
             system_prompt: None,
             enhance_prompt: None,
+            root_orchestration_prompt: None,
             workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,

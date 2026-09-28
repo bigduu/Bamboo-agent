@@ -53,6 +53,45 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
     )
 }
 
+/// A session-selected prompt enhancement for a root that coordinates child
+/// work. Keep this independent of the current SubAgent action schema: the
+/// runtime will continue to own the concrete delegation and inspection calls.
+const ROOT_ORCHESTRATION_GUIDANCE: &str = "Root delegation mode (explicitly selected for this Session):\n\
+Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate.\n\
+For uncertain or multi-step work, delegate a read-only Plan to a child and review its plan and evidence before assigning implementation.\n\
+Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
+Inspect authoritative child progress and results when needed. Correct or revise the same child's assignment, then confirm the child received the change.\n\
+If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
+Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
+
+pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
+    session.root_orchestration_prompt_enabled().then(|| {
+        ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::Critical,
+            ContextBlockStability::SessionStable,
+            "Root Delegation Mode",
+            ROOT_ORCHESTRATION_GUIDANCE,
+        )
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn root_orchestration_guidance_is_bounded_and_schema_independent() {
+    assert!(ROOT_ORCHESTRATION_GUIDANCE.len() <= 1_200);
+    for concept in [
+        "Plan", "progress", "Correct", "scope", "approval", "evidence",
+    ] {
+        assert!(
+            ROOT_ORCHESTRATION_GUIDANCE.contains(concept),
+            "missing {concept}"
+        );
+    }
+    assert!(!ROOT_ORCHESTRATION_GUIDANCE.contains("\"action\""));
+    assert!(!ROOT_ORCHESTRATION_GUIDANCE.contains("\"intent\""));
+}
+
 /// Build the single provider-visible Workspace block from authoritative
 /// session metadata. Project identity is included only in its redacted,
 /// path-free form so the active workspace path appears exactly once.

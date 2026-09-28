@@ -191,6 +191,13 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     // ---- Resolve enhance prompt ----
     resolve_enhance_prompt(&mut session, input.enhance_prompt.as_deref());
     let enhance_prompt = session.enhance_prompt();
+    if let Some(enabled) = input.root_orchestration_prompt {
+        // Only a root can select this host-owned prompt. The runtime repeats
+        // the same root check before model assembly for persisted sessions.
+        if session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none() {
+            session.set_root_orchestration_prompt_enabled(enabled);
+        }
+    }
 
     // ---- Resolve workspace path (metadata only, no filesystem) ----
     let allow_legacy_workspace_fallback = matches!(
@@ -905,6 +912,7 @@ mod tests {
             message: "hello".to_string(),
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
+            root_orchestration_prompt: None,
             workspace_path: None,
             permission_mode: None,
             default_workspace_path: None,
@@ -1205,6 +1213,38 @@ mod tests {
             .metadata
             .get(PROMPT_COMPONENT_FLAGS_KEY)
             .is_some_and(|flags| flags.contains("enhance=0")));
+    }
+
+    #[test]
+    fn root_orchestration_selection_survives_omitted_resume_and_can_be_cleared() {
+        let mut start = chat_turn_input(None);
+        start.root_orchestration_prompt = Some(true);
+        let started =
+            prepare_chat_turn_from_authoritative_session(None, start, "", "Builtin fallback")
+                .expect("start opted-in root");
+        assert!(started.root_orchestration_prompt_enabled());
+
+        let reloaded = serde_json::from_str(&serde_json::to_string(&started).unwrap())
+            .expect("reload persisted session");
+        let resumed = prepare_chat_turn_from_authoritative_session(
+            Some(reloaded),
+            chat_turn_input(None),
+            "",
+            "Builtin fallback",
+        )
+        .expect("resume without changing selection");
+        assert!(resumed.root_orchestration_prompt_enabled());
+
+        let mut disable = chat_turn_input(None);
+        disable.root_orchestration_prompt = Some(false);
+        let disabled = prepare_chat_turn_from_authoritative_session(
+            Some(resumed),
+            disable,
+            "",
+            "Builtin fallback",
+        )
+        .expect("disable root guidance");
+        assert!(!disabled.root_orchestration_prompt_enabled());
     }
 
     #[test]

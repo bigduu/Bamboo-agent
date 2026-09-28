@@ -43,6 +43,14 @@ bounded; omitting the header preserves the normal behavior.
 }
 ```
 
+Root sessions can opt into delegation guidance with
+`"root_orchestration_prompt": true` in the chat request. The choice is stored
+with the session and applies to the first execution and later resumes; omitting
+the field keeps the current choice, and `false` turns it off. The guidance
+covers child planning, progress checks, correction, scope control, and final
+evidence. Child sessions do not receive it. This prompt choice does not change
+tool permissions.
+
 **Response:** `201 Created`
 
 ```json
