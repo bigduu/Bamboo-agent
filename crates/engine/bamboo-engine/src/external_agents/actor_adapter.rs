@@ -5040,7 +5040,6 @@ async fn process_actor_event(
     };
     process_typed_actor_event(
         event,
-        strict_permission_events,
         permission_handshake,
         expected_permission_posture,
         session_inbox_runtime,
@@ -5054,7 +5053,6 @@ async fn process_actor_event(
 #[allow(clippy::too_many_arguments)]
 async fn process_typed_actor_event(
     event: AgentEvent,
-    strict_permission_events: bool,
     permission_handshake: &mut PermissionPostureHandshake,
     expected_permission_posture: Option<&ExpectedPermissionPosture>,
     session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
@@ -5423,7 +5421,6 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         );
                                         process_typed_actor_event(
                                             envelope.payload,
-                                            strict_permission_events,
                                             &mut permission_handshake,
                                             expected_permission_posture.as_ref(),
                                             session_inbox_runtime,
