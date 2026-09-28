@@ -4340,6 +4340,194 @@ async fn send_message_appends_follow_up_without_replacing_history() {
 }
 
 #[tokio::test]
+async fn update_rejects_active_assignment_but_allows_transcript_safe_title() {
+    let harness = build_test_harness().await;
+    let mut active = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    active.set_last_run_status("running");
+    harness.storage.save_session(&active).await.unwrap();
+    let original_messages = serde_json::to_value(&active.messages).unwrap();
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(active.id.clone(), runner);
+
+    let rejected = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "prompt": "replace the task",
+            "auto_run": false,
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "active-assignment-update"),
+    )
+    .await
+    .expect_err("active assignment replacement must fail");
+    assert!(
+        rejected.to_string().contains("send_message"),
+        "error must tell the parent how to steer the live child: {rejected}"
+    );
+
+    invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "title": "Current analysis",
+            "auto_run": false,
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "active-title-update"),
+    )
+    .await
+    .expect("title-only update is safe while running");
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Current analysis");
+    assert_eq!(saved.title_version, active.title_version + 1);
+    assert_eq!(saved.metadata_version, active.metadata_version + 1);
+    assert_eq!(
+        serde_json::to_value(&saved.messages).unwrap(),
+        original_messages
+    );
+    assert_eq!(saved.last_run_status().as_deref(), Some("running"));
+}
+
+#[tokio::test]
+async fn title_update_and_draft_append_preserve_both_changes() {
+    let harness = build_test_harness().await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let update = child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &parent.id,
+        harness.child_session_id.clone(),
+        Some("Renamed draft".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let append = child_session::send_message_to_child_action(
+        harness.adapter.as_ref(),
+        &parent,
+        harness.child_session_id.clone(),
+        "Keep this follow-up".into(),
+        Some(false),
+        None,
+        None,
+        false,
+    );
+    let (updated, appended) = tokio::join!(update, append);
+    updated.expect("title update");
+    appended.expect("draft append");
+
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Renamed draft");
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.content == "Keep this follow-up"));
+    assert_eq!(saved.messages.len(), 4);
+}
+
+#[tokio::test]
+async fn queued_child_update_waits_for_launch_fence_and_rejects_assignment_change() {
+    let harness = build_test_harness().await;
+    let mut queued = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    queued.set_last_run_status("pending");
+    assert_eq!(queued.advance_child_launch_generation(), Some(1));
+    queued.mark_child_auto_run_launch_intent();
+    harness.storage.save_session(&queued).await.unwrap();
+    let original_messages = serde_json::to_value(&queued.messages).unwrap();
+
+    let launch_guard = harness
+        .adapter
+        .scheduler
+        .lock_child_launch(&harness.child_session_id)
+        .await;
+    let mut update = Box::pin(child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &harness.parent_session_id,
+        harness.child_session_id.clone(),
+        None,
+        None,
+        Some("replace queued assignment".into()),
+        None,
+        None,
+        None,
+        None,
+        false,
+    ));
+    assert!(matches!(
+        futures::poll!(update.as_mut()),
+        std::task::Poll::Pending
+    ));
+    drop(launch_guard);
+    let error = update
+        .await
+        .expect_err("queued generation must reject update");
+    assert!(error.to_string().contains("send_message"));
+
+    child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &harness.parent_session_id,
+        harness.child_session_id.clone(),
+        Some("Queued analysis".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("title-only metadata edit must remain available");
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Queued analysis");
+    assert_eq!(saved.recoverable_child_launch_generation(), Some(1));
+    assert_eq!(
+        serde_json::to_value(&saved.messages).unwrap(),
+        original_messages
+    );
+}
+
+#[tokio::test]
 async fn send_message_blank_unknown_child_preserves_not_found_priority() {
     let harness = build_test_harness().await;
     let unknown_child_id = Uuid::new_v4().to_string();

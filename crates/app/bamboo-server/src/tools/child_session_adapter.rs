@@ -19,8 +19,8 @@ use bamboo_domain::session::runtime_state::{
 };
 use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_engine::session_app::child_session::{
-    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
-    SubagentResolutionPort,
+    apply_child_session_update, ChildRunnerInfo, ChildSessionEntry, ChildSessionError,
+    ChildSessionPort, ChildSessionUpdate, DeleteChildResult, SubagentResolutionPort,
 };
 use bamboo_llm::Config;
 use bamboo_storage::{LockedSessionStore, SessionIndexEntry, SessionStoreV2};
@@ -1000,6 +1000,134 @@ impl ChildSessionPort for ChildSessionAdapter {
         // child must still win over this control write. #540.
         let saved = self.persistence.merge_save_runtime(child).await;
         self.finish_child_save(child, saved)
+    }
+
+    async fn update_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        update: ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        // A queued worker holds this guard through its eligibility check and
+        // runner reservation. Keep it until the latest-session mutation is
+        // committed, so update cannot validate an idle snapshot and then race
+        // an activation of that same generation.
+        let _launch_guard = self.scheduler.lock_child_launch(child_id).await;
+        // Keep the runner registry read guard through the durable commit.
+        // SessionInbox reservations do not use the scheduler launch lock, but
+        // they must acquire this registry's write lock before activation.
+        let runners = self.agent_runners.read().await;
+        let runner_active = runners.get(child_id).is_some_and(|runner| {
+            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+        });
+        let execution_change = update.changes_execution();
+        let mut messages_removed = 0usize;
+        let saved = self
+            .persistence
+            .mutate_runtime_session_and_publish(
+                child_id,
+                || None,
+                |latest| {
+                    if latest.kind != SessionKind::Child {
+                        return Err(ChildSessionError::NotChildSession(child_id.to_string()));
+                    }
+                    if latest.parent_session_id.as_deref() != Some(parent_id) {
+                        return Err(ChildSessionError::NotChildOfParent {
+                            child_id: child_id.to_string(),
+                            parent_id: parent_id.to_string(),
+                        });
+                    }
+                    if execution_change
+                        && (runner_active
+                            || latest.recoverable_child_launch_generation().is_some()
+                            || matches!(latest.last_run_status().as_deref(), Some("running" | "suspended")))
+                    {
+                        return Err(ChildSessionError::InvalidArguments(
+                            "child generation is active; use send_message for live correction, or cancel and retry to replace its assignment or model".into(),
+                        ));
+                    }
+                    messages_removed = apply_child_session_update(latest, update)?;
+                    Ok(())
+                },
+                |saved| {
+                    self.sessions_cache.insert(
+                        saved.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!("failed to update child session: {error}"))
+            })??;
+        drop(runners);
+        saved
+            .map(|saved| (saved, messages_removed))
+            .ok_or_else(|| ChildSessionError::NotFound(child_id.to_string()))
+    }
+
+    async fn append_draft_child_message(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        let _launch_guard = self.scheduler.lock_child_launch(child_id).await;
+        let runners = self.agent_runners.read().await;
+        let runner_active = runners.get(child_id).is_some_and(|runner| {
+            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+        });
+        let saved = self
+            .persistence
+            .mutate_runtime_session_and_publish(
+                child_id,
+                || None,
+                |latest| {
+                    if latest.kind != SessionKind::Child {
+                        return Err(ChildSessionError::NotChildSession(child_id.to_string()));
+                    }
+                    if latest.parent_session_id.as_deref() != Some(parent_id) {
+                        return Err(ChildSessionError::NotChildOfParent {
+                            child_id: child_id.to_string(),
+                            parent_id: parent_id.to_string(),
+                        });
+                    }
+                    if runner_active
+                        || latest.recoverable_child_launch_generation().is_some()
+                        || matches!(
+                            latest.last_run_status().as_deref(),
+                            Some("running" | "suspended")
+                        )
+                    {
+                        return Err(ChildSessionError::InvalidArguments(
+                            "child generation is active; use send_message for live correction"
+                                .into(),
+                        ));
+                    }
+                    latest.add_message(bamboo_agent_core::Message::user(message.to_string()));
+                    latest.set_last_run_status("pending");
+                    latest.advance_child_launch_generation().ok_or_else(|| {
+                        ChildSessionError::Execution("child launch generation exhausted".into())
+                    })?;
+                    latest.clear_last_run_error();
+                    latest.updated_at = Utc::now();
+                    Ok(())
+                },
+                |saved| {
+                    self.sessions_cache.insert(
+                        saved.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!(
+                    "failed to append draft child message: {error}"
+                ))
+            })??;
+        drop(runners);
+        saved.ok_or_else(|| ChildSessionError::NotFound(child_id.to_string()))
     }
 
     async fn save_child_session_authoritative_flags(

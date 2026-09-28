@@ -724,27 +724,88 @@ pub async fn update_child_action_with_background(
     assignment_background: Option<String>,
     auto_run: bool,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    let mut child = port
-        .load_child_for_parent(parent_id, &child_session_id)
+    let update = ChildSessionUpdate {
+        title: normalize_non_empty_optional(title, "title")?,
+        responsibility: normalize_non_empty_optional(responsibility, "responsibility")?,
+        prompt: normalize_non_empty_optional(prompt, "prompt")?,
+        subagent_type: normalize_non_empty_optional(subagent_type, "subagent_type")?,
+        reset_after_update,
+        model_ref_override,
+        reasoning_effort,
+        assignment_background,
+        auto_run,
+    };
+
+    if update.title.is_none()
+        && !update.refreshes_assignment()
+        && update.model_ref_override.is_none()
+        && update.reasoning_effort.is_none()
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "update requires at least one field: title/responsibility/prompt/subagent_type/model/reasoning_effort"
+                .to_string(),
+        ));
+    }
+
+    let (child, messages_removed) = port
+        .update_child_session(parent_id, &child_session_id, update)
         .await?;
 
-    let title = normalize_non_empty_optional(title, "title")?;
-    let responsibility = normalize_non_empty_optional(responsibility, "responsibility")?;
-    let prompt = normalize_non_empty_optional(prompt, "prompt")?;
-    let subagent_type = normalize_non_empty_optional(subagent_type, "subagent_type")?;
+    Ok(json!({
+        "child_session_id": child.id,
+        "title": child.title,
+        "model": child.model,
+        "model_ref": child.model_ref,
+        "reasoning_effort": child.reasoning_effort.map(|effort| effort.as_str()),
+        "messages_removed": messages_removed,
+        "last_run_status": metadata_text(&child, "last_run_status"),
+        "note": "Child session updated in place. Use action=run to execute the same child session.",
+    }))
+}
 
-    let should_refresh_assignment =
-        responsibility.is_some() || prompt.is_some() || subagent_type.is_some();
+/// The fields of one update request. The server applies this to the latest
+/// durable child while holding both the launch fence and session write lock.
+#[derive(Clone)]
+pub struct ChildSessionUpdate {
+    pub title: Option<String>,
+    pub responsibility: Option<String>,
+    pub prompt: Option<String>,
+    pub subagent_type: Option<String>,
+    pub reset_after_update: Option<bool>,
+    pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    pub assignment_background: Option<String>,
+    pub auto_run: bool,
+}
+
+impl ChildSessionUpdate {
+    pub fn refreshes_assignment(&self) -> bool {
+        self.responsibility.is_some() || self.prompt.is_some() || self.subagent_type.is_some()
+    }
+
+    pub fn changes_execution(&self) -> bool {
+        self.refreshes_assignment()
+            || self.model_ref_override.is_some()
+            || self.reasoning_effort.is_some()
+            || self.auto_run
+    }
+}
+
+pub fn apply_child_session_update(
+    child: &mut Session,
+    update: ChildSessionUpdate,
+) -> Result<usize, ChildSessionError> {
+    let should_refresh_assignment = update.refreshes_assignment();
     if super::named_profile::has_named_profile(&child)
         && (should_refresh_assignment
-            || assignment_background.is_some()
-            || model_ref_override.is_some()
-            || reasoning_effort.is_some())
+            || update.assignment_background.is_some()
+            || update.model_ref_override.is_some()
+            || update.reasoning_effort.is_some())
     {
         return Err(ChildSessionError::InvalidArguments(
             "named_profile_contract_is_frozen; create a new Child to select another profile or model".into()));
     }
-    if (should_refresh_assignment || assignment_background.is_some())
+    if (should_refresh_assignment || update.assignment_background.is_some())
         && bamboo_domain::ChildContextBinding::from_session(&child)
             .map_err(|error| ChildSessionError::Execution(error.to_string()))?
             .is_some()
@@ -753,42 +814,42 @@ pub async fn update_child_action_with_background(
             "required_child_context_unsupported: immutable assignment cannot be updated in place; create a new Child".into()));
     }
 
-    if title.is_none()
-        && !should_refresh_assignment
-        && model_ref_override.is_none()
-        && reasoning_effort.is_none()
-    {
-        return Err(ChildSessionError::InvalidArguments(
-            "update requires at least one field: title/responsibility/prompt/subagent_type/model/reasoning_effort"
-                .to_string(),
-        ));
-    }
-
-    if let Some(model_ref) = model_ref_override {
+    if let Some(model_ref) = update.model_ref_override {
         apply_model_ref_override(&mut child, model_ref)?;
     }
 
-    if let Some(effort) = reasoning_effort {
+    if let Some(effort) = update.reasoning_effort {
         child.reasoning_effort = Some(effort);
     }
 
-    if let Some(title) = title {
-        child.title = title;
+    if let Some(title) = update.title {
+        if child.title != title {
+            child.title = title;
+            child.title_generated = false;
+            child.title_version = child.title_version.saturating_add(1);
+            child.metadata_version = child.metadata_version.saturating_add(1);
+        }
     }
 
     let mut messages_removed = 0usize;
 
     if should_refresh_assignment {
         let effective_responsibility = normalize_required_text(
-            responsibility.or_else(|| metadata_text(&child, "responsibility")),
+            update
+                .responsibility
+                .or_else(|| metadata_text(&child, "responsibility")),
             "responsibility",
         )?;
         let effective_subagent_type = normalize_required_text(
-            subagent_type.or_else(|| metadata_text(&child, "subagent_type")),
+            update
+                .subagent_type
+                .or_else(|| metadata_text(&child, "subagent_type")),
             "subagent_type",
         )?;
         let effective_prompt = normalize_required_text(
-            prompt.or_else(|| metadata_text(&child, "assignment_prompt")),
+            update
+                .prompt
+                .or_else(|| metadata_text(&child, "assignment_prompt")),
             "prompt",
         )?;
 
@@ -816,28 +877,28 @@ pub async fn update_child_action_with_background(
             &effective_responsibility,
             &effective_subagent_type,
             &effective_prompt,
-            assignment_background.as_deref(),
+            update.assignment_background.as_deref(),
         );
         let user_index = replace_or_append_last_user_message(&mut child, assignment);
 
-        if reset_after_update.unwrap_or(true) {
+        if update.reset_after_update.unwrap_or(true) {
             messages_removed = truncate_after_index(&mut child, user_index);
         }
     }
 
-    child.updated_at = Utc::now();
-    port.save_child_session(&mut child).await?;
+    if update.auto_run {
+        if !should_refresh_assignment {
+            child.set_last_run_status("pending");
+            child.advance_child_launch_generation().ok_or_else(|| {
+                ChildSessionError::Execution("child launch generation exhausted".into())
+            })?;
+            child.clear_last_run_error();
+        }
+        child.mark_child_auto_run_launch_intent();
+    }
 
-    Ok(json!({
-        "child_session_id": child.id,
-        "title": child.title,
-        "model": child.model,
-        "model_ref": child.model_ref,
-        "reasoning_effort": child.reasoning_effort.map(|effort| effort.as_str()),
-        "messages_removed": messages_removed,
-        "last_run_status": metadata_text(&child, "last_run_status"),
-        "note": "Child session updated in place. Use action=run to execute the same child session.",
-    }))
+    child.updated_at = Utc::now();
+    Ok(messages_removed)
 }
 
 fn apply_model_ref_override(
@@ -1131,13 +1192,9 @@ pub async fn send_message_to_child_action_with_gate(
             "SubAgent tool cancelled before child delivery".to_string(),
         ));
     }
-    child.add_message(bamboo_agent_core::Message::user(message.clone()));
-    child.set_last_run_status("pending");
-    child
-        .advance_child_launch_generation()
-        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
-    child.clear_last_run_error();
-    port.save_child_session(&mut child).await?;
+    let child = port
+        .append_draft_child_message(&parent.id, &child.id, &message)
+        .await?;
 
     Ok(json!({
         "child_session_id": child.id,

@@ -20,10 +20,11 @@ mod result_projection;
 mod tests;
 
 pub use actions::{
-    assemble_session_tree, build_session_tree_action, cancel_child_action, create_child_action,
-    delete_child_action, get_child_action, list_children_action, rollback_failed_wait_launch,
-    run_child_action, send_message_to_child_action, send_message_to_child_action_with_gate,
-    update_child_action, update_child_action_with_background, SessionTreeNode,
+    apply_child_session_update, assemble_session_tree, build_session_tree_action,
+    cancel_child_action, create_child_action, delete_child_action, get_child_action,
+    list_children_action, rollback_failed_wait_launch, run_child_action,
+    send_message_to_child_action, send_message_to_child_action_with_gate, update_child_action,
+    update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
 };
 pub use helpers::{
     append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
@@ -335,6 +336,33 @@ pub trait ChildSessionPort: Send + Sync {
         Ok(())
     }
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
+    /// Atomically apply an update to the latest child snapshot. The adapter
+    /// must fence activation, reject execution changes to active generations,
+    /// and preserve concurrent transcript appends. Embeddings without those
+    /// boundaries fail closed.
+    async fn update_child_session(
+        &self,
+        _parent_id: &str,
+        _child_id: &str,
+        _update: ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "atomic child session update is unavailable in this runtime".into(),
+        ))
+    }
+    /// Append a draft-only parent message from the latest durable transcript.
+    /// This shares the update transaction boundary so a concurrent update
+    /// cannot overwrite the message or be overwritten by a stale draft save.
+    async fn append_draft_child_message(
+        &self,
+        _parent_id: &str,
+        _child_id: &str,
+        _message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "atomic draft child message append is unavailable in this runtime".into(),
+        ))
+    }
     /// Save a child session whose `agent_runtime_state` posture
     /// (`permission_mode` / `no_human_approver`) the caller just set
     /// authoritatively (the #74 resident-reuse re-seed) — persists them as-is
