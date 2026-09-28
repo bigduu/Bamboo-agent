@@ -993,6 +993,25 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             );
         }
     };
+    // An existing Root changes tool authority through the recoverable
+    // mode-only operation. Keeping an unfenced inline path would allow a late
+    // chat POST to undo a recovery result after the client has read detail.
+    if req.root_orchestration_only.is_some()
+        && authoritative_session.as_ref().is_some_and(|session| {
+            session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
+        })
+    {
+        return HttpResponse::build(actix_web::http::StatusCode::PRECONDITION_REQUIRED).json(
+            serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "root_mode_operation_required",
+                    "message": "Change an existing Root mode with a recoverable mode operation before chat",
+                },
+                "session_id": session_id,
+            }),
+        );
+    }
     let workflow_metadata_checkpoint =
         WorkflowMetadataCheckpoint::capture(authoritative_session.as_ref());
     let root_tool_authority_checkpoint =

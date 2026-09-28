@@ -60,16 +60,13 @@ tool execution identities: `SubAgent`, `Plan`, `Task`,
 to that Root; delegated children retain their own tool authority. The mode and
 the prompt-only choice are independent.
 
-The `root_orchestration_only` field is optional. Omitting it on a follow-up
-preserves the Root's durable selection; sending `false` explicitly disables
-the limit. A Child cannot enable or clear it. A request that would combine
-orchestration-only mode with a selected Skill or Workflow, or with active legacy
-PlanMode, returns an API error before the chat turn is persisted. An explicit
-`false` permits switching to a Skill or Workflow in that follow-up. The
-authoritative value is returned as `root_orchestration_only` in
-`GET /api/v1/sessions/{session_id}`;
-clients should read that value after reload instead of treating a local choice
-as persisted state.
+The first chat request for a new Root may select this mode with
+`root_orchestration_only`. For an **existing** Root, omit that field from
+`POST /chat` and use the recoverable mode operation below. An explicit value
+on an existing Root chat returns `428 root_mode_operation_required` before a
+message is appended. A Child cannot select or clear the mode. The authoritative
+selection is returned by `GET /api/v1/sessions/{session_id}`; clients should
+read it after reload instead of treating a local choice as persisted state.
 
 **Response:** `201 Created`
 
@@ -82,6 +79,91 @@ as persisted state.
 ```
 
 **Next Steps:** After creating a chat, call `POST /api/v1/execute/{session_id}` to start the agent.
+
+---
+
+#### Select or Recover an Existing Root Mode
+
+`GET /api/v1/sessions/{session_id}` returns these detail-only fields for a Root:
+
+```json
+{
+  "session": {
+    "root_orchestration_only": false,
+    "root_mode_transition_epoch": 0,
+    "root_mode_birth_token": "opaque-64-character-hex-token"
+  }
+}
+```
+
+To change an existing Root, generate one canonical lowercase UUID and form the
+operation ID as `<expected_epoch>:<uuid>`, for example
+`0:550e8400-e29b-41d4-a716-446655440000`. Send the detail's birth token,
+epoch, and desired mode to:
+
+```http
+POST /api/v1/sessions/{session_id}/root-mode-operations/{operation_id}
+```
+
+```json
+{
+  "birth_token": "opaque-64-character-hex-token",
+  "expected_epoch": 0,
+  "enabled": true
+}
+```
+
+A committed response is `200 OK`, with `Cache-Control: no-store`:
+
+```json
+{
+  "status": "committed",
+  "operation_id": "0:550e8400-e29b-41d4-a716-446655440000",
+  "expected_epoch": 0,
+  "resulting_epoch": 1,
+  "enabled_at_completion": true,
+  "root_tool_authority_revision": 1
+}
+```
+
+If the response is lost or times out, keep the **same** operation ID and body
+and call `POST /api/v1/sessions/{session_id}/root-mode-operations/{operation_id}/recover`.
+Recovery returns the committed terminal receipt if selection finished first.
+If recovery reaches the durable writer first, it records a terminal `fenced`
+receipt and prevents a late selection from changing the mode. An ordinary
+selection replay after that fence returns `409 root_mode_operation_fenced`.
+If a later operation has already advanced the epoch after this receipt was
+evicted, recovery returns `200` with `status: "fenced_by_successor"`,
+the validated `operation_id` and `expected_epoch`, `current_epoch`,
+`current_enabled`, and `root_tool_authority_revision`; the old
+selection remains unable to commit.
+
+The server retains the latest eight terminal receipts for exact retries across
+process restarts. Older receipts are replaced by the durable successor epoch;
+their original operation ID cannot be rebound to another epoch. Reuse of a
+retained operation ID with a different `enabled` value returns
+`409 root_mode_operation_conflict`. A stale epoch or changed Root birth returns
+`412`; a selected Skill or Workflow, or active legacy PlanMode, gives a durable
+`rejected_incompatible` terminal result (`409` on selection, `200` on
+recovery). A storage backend without this operation returns `503` and makes
+no mode change. Other storage or proof errors return
+`503 root_mode_outcome_unconfirmed`: the commit may already have happened, so
+retain the operation ID and recover it. The default Supervisor uses its
+existing strict management proof when refreshing the next provider catalog.
+
+Roots with no terminal mode operation remain readable with their legacy v1
+authority proof. The first terminal operation writes a v2 proof, so an older
+backend's v1-only writer fails closed rather than discarding its epoch/history.
+Run current backend versions for mode operations; old processes cannot serve
+that Root after this upgrade. Downgrading an authority proof is unsupported.
+
+A successful mode response and a subsequent ordinary chat are separate
+operations. Another client can change the mode between them; clients should
+check session detail if the mode used by that chat matters. A running tool
+batch retains its admitted catalog snapshot, while later tool boundaries
+adopt durable Root authority. Legacy clients that hold an ambiguous combined
+`POST /chat` marker cannot clear it with this new operation: that old POST had
+no operation ID, so its terminal result cannot be proven here.
 
 ---
 

@@ -128,6 +128,11 @@ pub struct SessionSummary {
     /// authoritative record; index-only list rows omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_orchestration_only: Option<bool>,
+    /// The Root-mode CAS epoch and opaque lifetime token are detail-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode_transition_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode_birth_token: Option<String>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -213,6 +218,8 @@ impl SessionSummary {
             plan_mode: entry.plan_mode,
             active_workflow: None,
             root_orchestration_only: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
@@ -672,6 +679,8 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             root_orchestration_only: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -725,6 +734,8 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             root_orchestration_only: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -865,6 +876,8 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             root_orchestration_only: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,

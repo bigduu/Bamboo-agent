@@ -550,8 +550,8 @@ mod optional_model_e2e {
         let before_conflict = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(before_conflict.root_orchestration_only_enabled());
 
-        // A late attachment failure must not publish the requested loosening
-        // from the early session checkpoint.
+        // Existing-Root inline mode changes are rejected before attachment
+        // processing or message persistence.
         let failed_disable = test::call_service(
             &app,
             test::TestRequest::post()
@@ -566,7 +566,7 @@ mod optional_model_e2e {
                 .to_request(),
         )
         .await;
-        assert_eq!(failed_disable.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(failed_disable.status(), StatusCode::PRECONDITION_REQUIRED);
         let after_failed_disable = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(after_failed_disable.root_orchestration_only_enabled());
         assert_eq!(
@@ -619,7 +619,7 @@ mod optional_model_e2e {
             before_conflict.root_tool_authority_revision
         );
 
-        let switched = test::call_service(
+        let unfenced_switch = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/api/v1/chat")
@@ -628,6 +628,38 @@ mod optional_model_e2e {
                     "message": "review the task",
                     "model": "test-model",
                     "root_orchestration_only": false,
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unfenced_switch.status(), StatusCode::PRECONDITION_REQUIRED);
+        let before_switch = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before_switch.root_orchestration_only_enabled());
+        let operation_id = format!("0:{}", uuid::Uuid::new_v4());
+        let switched_mode = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/sessions/{id}/root-mode-operations/{operation_id}"
+                ))
+                .set_json(serde_json::json!({
+                    "birth_token": before_switch.root_mode_birth_token(),
+                    "expected_epoch": 0,
+                    "enabled": false,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched_mode.status(), StatusCode::OK);
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "review the task",
+                    "model": "test-model",
                     "workflow_selection": workflow_selection,
                 }))
                 .to_request(),
@@ -643,8 +675,8 @@ mod optional_model_e2e {
         .await;
         assert_eq!(detail["session"]["root_orchestration_only"], false);
 
-        // Clearing an existing Workflow and selecting the narrow Root mode is
-        // allowed, but a failed turn must leave both old authorities intact.
+        // A combined Workflow clear and inline mode change has no fence and
+        // cannot use the old chat path.
         let before_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
         let failed_enable = test::call_service(
             &app,
@@ -661,7 +693,7 @@ mod optional_model_e2e {
                 .to_request(),
         )
         .await;
-        assert_eq!(failed_enable.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(failed_enable.status(), StatusCode::PRECONDITION_REQUIRED);
         let after_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(!after_failed_enable.root_orchestration_only_enabled());
         assert_eq!(
@@ -888,7 +920,7 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
-    async fn root_tool_mode_rejects_active_legacy_plan_before_persistence() {
+    async fn root_tool_mode_records_legacy_plan_rejection_without_changing_authority() {
         let state = new_state().await;
         let id = "root-tool-plan-conflict";
         let mut root = Session::new(id, "test-model");
@@ -909,16 +941,18 @@ mod optional_model_e2e {
         )
         .await;
 
+        let operation_id = format!("0:{}", uuid::Uuid::new_v4());
+        let path = format!("/api/v1/sessions/{id}/root-mode-operations/{operation_id}");
+        let body = serde_json::json!({
+            "birth_token": root.root_mode_birth_token(),
+            "expected_epoch": 0,
+            "enabled": true,
+        });
         let rejected = test::call_service(
             &app,
             test::TestRequest::post()
-                .uri("/api/v1/chat")
-                .set_json(serde_json::json!({
-                    "session_id": id,
-                    "message": "must not persist",
-                    "model": "test-model",
-                    "root_orchestration_only": true,
-                }))
+                .uri(&path)
+                .set_json(&body)
                 .to_request(),
         )
         .await;
@@ -931,11 +965,24 @@ mod optional_model_e2e {
         let after = state.storage.load_session(id).await.unwrap().unwrap();
         assert!(!after.root_orchestration_only_enabled());
         assert_eq!(after.root_tool_authority_revision, 0);
+        assert_eq!(after.root_mode_transition_epoch, 1);
         assert!(after.messages.is_empty());
         assert!(after
             .agent_runtime_state
             .as_ref()
             .is_some_and(|runtime| runtime.plan_mode.is_some()));
+        let recovered = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("{path}/recover"))
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let recovered: Value = test::read_body_json(recovered).await;
+        assert_eq!(recovered["status"], "rejected_incompatible");
+        assert_eq!(recovered["resulting_epoch"], 1);
     }
 
     #[actix_web::test]

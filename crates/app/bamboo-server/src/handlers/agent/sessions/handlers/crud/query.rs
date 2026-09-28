@@ -172,6 +172,13 @@ pub async fn get_session(
             };
             summary.root_orchestration_only =
                 Some(durable_session.root_orchestration_only_enabled());
+            if durable_session.kind == SessionKind::Root
+                && durable_session.parent_session_id.is_none()
+            {
+                summary.root_mode_transition_epoch =
+                    Some(durable_session.root_mode_transition_epoch);
+                summary.root_mode_birth_token = Some(durable_session.root_mode_birth_token());
+            }
             let selected_catalog = durable_session
                 .metadata
                 .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY)
