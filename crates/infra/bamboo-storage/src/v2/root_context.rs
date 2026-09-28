@@ -140,6 +140,12 @@ impl SessionStoreV2 {
     /// recovery error instead of silently reporting a nonexistent Session.
     pub(super) async fn ensure_no_unindexed_root(&self, id: &str) -> io::Result<()> {
         validate_session_id(id)?;
+        // A stale path in an existing index row is handled by the caller's
+        // normal recovery path. It does not mean the Root is unindexed, and
+        // returning None here never grants tool authority from canonical files.
+        if self.get_index_entry(id).await.is_some() {
+            return Ok(());
+        }
         let directory = self.sessions_dir.join(id);
         match fs::symlink_metadata(&directory).await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
