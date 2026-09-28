@@ -1148,6 +1148,27 @@ impl LockedSessionStore {
             })?;
 
         if let Some(latest) = self.storage.load_session(&session.id).await? {
+            // A warm worker constructs a fresh in-memory Session for each RunSpec.
+            // Preserve the durable Child birth only after the new activation has
+            // matched the immutable identity and Project under this write lock.
+            if session.kind == bamboo_domain::SessionKind::Child {
+                if latest.kind != bamboo_domain::SessionKind::Child
+                    || latest.id != session.id
+                    || latest.root_session_id != session.root_session_id
+                    || latest.parent_session_id != session.parent_session_id
+                    || latest.spawn_depth != session.spawn_depth
+                    || latest.project_id_meta() != session.project_id_meta()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "warm Child activation disagrees with durable creation identity or Project"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                session.created_at = latest.created_at;
+            }
             apply_authoritative_metadata(session, &latest);
             bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
             bamboo_domain::merge_session_inbox_admission(session, &latest);
