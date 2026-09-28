@@ -4,7 +4,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use bamboo_engine::external_agents::actor_event_stream::{ActorEventObserver, PublicActorEvent};
+use bamboo_engine::external_agents::actor_event_stream::{
+    ActorEventObserver, PublicActorEvent, PublicActorEventClass,
+};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -187,6 +189,13 @@ impl ActorEventHub {
 
 impl ActorEventObserver for ActorEventHub {
     fn publish(&self, event: PublicActorEvent) {
+        // Ephemeral content (tokens and other non-durable progress) has no
+        // authoritative snapshot meaning and can arrive at token rate. Do not
+        // let it consume a public cursor or evict bounded lifecycle/semantic
+        // replay; legacy agent channels retain their separate content stream.
+        if event.class == PublicActorEventClass::Ephemeral {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = state.channels.get(&event.actor_id) else {
             return;
@@ -237,7 +246,6 @@ impl ActorEventObserver for ActorEventHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_engine::external_agents::actor_event_stream::PublicActorEventClass;
 
     fn event(actor_id: &str, n: usize) -> PublicActorEvent {
         PublicActorEvent {
@@ -313,6 +321,55 @@ mod tests {
         assert!(matches!(
             first.receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+    }
+
+    #[test]
+    fn ephemeral_burst_does_not_displace_critical_replay_or_advance_cursor() {
+        let hub = Arc::new(ActorEventHub::default());
+        let mut live = hub.subscribe("child", None).unwrap();
+        let anchor = match &live.initial {
+            ActorReplay::SnapshotRequired { cursor, .. } => *cursor,
+            _ => unreachable!(),
+        };
+        let mut lifecycle = event("child", 1);
+        lifecycle.class = PublicActorEventClass::Lifecycle;
+        hub.publish(lifecycle);
+        for n in 0..1000 {
+            let mut ephemeral = event("child", n);
+            ephemeral.class = PublicActorEventClass::Ephemeral;
+            hub.publish(ephemeral);
+        }
+        let mut snapshot = event("child", 2);
+        snapshot.class = PublicActorEventClass::Snapshot;
+        hub.publish(snapshot);
+
+        let resumed = hub.subscribe("child", Some(anchor)).unwrap();
+        let ActorReplay::Events(replay) = &resumed.initial else {
+            panic!("critical events must remain replayable");
+        };
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].cursor, anchor + 1);
+        assert_eq!(replay[1].cursor, anchor + 2);
+        assert_eq!(
+            replay[0].change.event.class,
+            PublicActorEventClass::Lifecycle
+        );
+        assert_eq!(
+            replay[1].change.event.class,
+            PublicActorEventClass::Snapshot
+        );
+        assert!(matches!(
+            live.receiver.try_recv(),
+            Ok(ActorHubMessage::Change(_))
+        ));
+        assert!(matches!(
+            live.receiver.try_recv(),
+            Ok(ActorHubMessage::Change(_))
+        ));
+        assert!(matches!(
+            live.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
         ));
     }
 }

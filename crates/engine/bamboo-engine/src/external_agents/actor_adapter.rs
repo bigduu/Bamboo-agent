@@ -39,7 +39,9 @@ use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
 };
 
-use super::actor_event_router::{ActorEventRoute, ActorEventRouteError, ActorEventRouter};
+use super::actor_event_router::{
+    ActorEventClass, ActorEventRoute, ActorEventRouteError, ActorEventRouter,
+};
 use super::actor_event_stream::{ActorEventObserver, PublicActorEvent};
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
@@ -5424,7 +5426,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     .map_err(actor_event_route_error)?
                                 {
                                     ActorEventRoute::Publish(envelope) => {
-                                        let public_event = PublicActorEvent::from(&envelope);
+                                        let public_event = actor_event_observer
+                                            .filter(|_| envelope.class != ActorEventClass::Ephemeral)
+                                            .map(|_| PublicActorEvent::from(&envelope));
                                         tracing::trace!(
                                             actor_id = %envelope.actor_id,
                                             event_id = %envelope.event_id,
@@ -5440,7 +5444,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                             event_tx,
                                             &mut display,
                                         ).await?;
-                                        if let Some(observer) = actor_event_observer {
+                                        if let (Some(observer), Some(public_event)) =
+                                            (actor_event_observer, public_event)
+                                        {
                                             observer.publish(public_event);
                                         }
                                     }

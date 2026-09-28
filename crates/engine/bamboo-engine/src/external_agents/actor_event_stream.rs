@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 
 use super::actor_event_router::{ActorEventClass, ActorEventEnvelope};
 
@@ -32,6 +33,11 @@ pub struct PublicActorEvent {
 impl From<&ActorEventEnvelope> for PublicActorEvent {
     fn from(envelope: &ActorEventEnvelope) -> Self {
         let digest = Sha256::digest(envelope.event_id.as_bytes());
+        let mut event_id = String::with_capacity(68);
+        event_id.push_str("ae1-");
+        for byte in digest {
+            write!(&mut event_id, "{byte:02x}").expect("String formatting cannot fail");
+        }
         let class = match envelope.class {
             ActorEventClass::Lifecycle => PublicActorEventClass::Lifecycle,
             ActorEventClass::Semantic => PublicActorEventClass::Semantic,
@@ -44,7 +50,7 @@ impl From<&ActorEventEnvelope> for PublicActorEvent {
             parent_actor_id: envelope.parent_actor_id.clone(),
             activation_id: envelope.activation_id.clone(),
             attempt: envelope.attempt,
-            event_id: format!("ae1-{digest:x}"),
+            event_id,
             class,
         }
     }
@@ -54,4 +60,45 @@ impl From<&ActorEventEnvelope> for PublicActorEvent {
 /// browser. Implementations may drop an event; consumers recover via snapshot.
 pub trait ActorEventObserver: Send + Sync {
     fn publish(&self, event: PublicActorEvent);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::AgentEvent;
+
+    #[test]
+    fn public_projection_hashes_internal_identity_and_excludes_content() {
+        let envelope = ActorEventEnvelope {
+            actor_id: "child".into(),
+            parent_actor_id: Some("root".into()),
+            root_actor_id: "root".into(),
+            project_id: Some("private-project".into()),
+            activation_id: "safe-activation".into(),
+            attempt: 1,
+            lease_epoch: 7,
+            execution_epoch: 9,
+            sequence: 3,
+            event_id: "safe-activation:7:9:3".into(),
+            class: ActorEventClass::Semantic,
+            payload: AgentEvent::Token {
+                content: "private-token".into(),
+            },
+        };
+        let public = PublicActorEvent::from(&envelope);
+        assert_eq!(public.event_id.len(), 68);
+        assert!(public.event_id.starts_with("ae1-"));
+        assert!(public.event_id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let json = serde_json::to_string(&public).unwrap();
+        for private in [
+            "private-token",
+            "private-project",
+            "lease_epoch",
+            "execution_epoch",
+        ] {
+            assert!(!json.contains(private));
+        }
+    }
 }
