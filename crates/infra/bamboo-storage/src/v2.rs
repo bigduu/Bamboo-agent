@@ -1694,6 +1694,7 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
+        Self::validate_root_tool_authority_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -2230,6 +2231,7 @@ impl SessionStoreV2 {
         let sidecar =
             Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), session_id).await?;
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
+        Self::validate_root_tool_authority_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         if session.id != session_id || session.kind != SessionKind::Root {
@@ -2488,6 +2490,8 @@ impl SessionStoreV2 {
             // Only canonical Root absence permits its normal control-plane read.
         }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
+            self.validate_root_tool_authority_against_main(session_id, &side)
+                .await?;
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
@@ -2501,6 +2505,7 @@ impl SessionStoreV2 {
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
+        Self::validate_root_tool_authority_overlay(&session, None)?;
         if !self.session_lifetime_is_live(&session).await? {
             return Ok(None);
         }
@@ -3783,11 +3788,11 @@ impl SessionStoreV2 {
 
     /// One-shot migration of legacy Child sidecars (`runtime.json`).
     ///
-    /// Loading already tolerates a missing sidecar (it falls back to the embedded
-    /// control-plane in `session.json`). A main-only Root is indistinguishable
-    /// from a Root that lost a newer Project revision, so it remains readable
-    /// but cannot be reconstructed here. Its canonical runtime must be restored
-    /// before any mutation; this migration cannot establish that authority.
+    /// Child loading tolerates a missing sidecar by falling back to the
+    /// embedded control-plane in `session.json`. A main-only Root is
+    /// indistinguishable from one that lost a newer Project or tool revision,
+    /// so operational Root reads and writes reject it. Its canonical runtime
+    /// must be restored; this migration cannot establish that authority.
     ///
     /// Idempotent and cheap on later boots: guarded by a marker file, and any
     /// session that already has a sidecar is skipped. Returns the number of
@@ -4988,6 +4993,7 @@ impl SessionStoreV2 {
         }
         let sidecar = self.read_runtime_sidecar(session_id).await?;
         supervisor::validate_overlay(&session, sidecar.as_ref())?;
+        Self::validate_root_tool_authority_overlay(&session, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
         session.clear_stale_root_token_budget();
@@ -7089,16 +7095,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_sidecar_is_ignored_and_session_still_loads() -> io::Result<()> {
+    async fn corrupt_child_sidecar_is_ignored_and_session_still_loads() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
-        let s = session_with_history("sc-4", 2, "run-A");
+        let parent = Session::new("sc-parent", "test-model");
+        storage.save_session(&parent).await?;
+        let mut s = Session::new_child("sc-4", &parent.id, "test-model", "child");
+        s.add_message(Message::user("msg-0"));
+        s.add_message(Message::user("msg-1"));
+        s.agent_runtime_state = Some(AgentRuntimeState::new("run-A"));
         storage.save_session(&s).await?;
 
         // Corrupt the sidecar.
         let sidecar_path = storage.runtime_json_path("sc-4").await?.unwrap();
         tokio::fs::write(&sidecar_path, b"{ not valid json").await?;
 
-        // Session still loads from session.json; corrupt sidecar is ignored.
+        // A Child still loads from session.json; its corrupt sidecar is ignored.
         let loaded = storage.load_session("sc-4").await?.unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
@@ -8322,8 +8333,10 @@ mod tests {
         let source = Session::new("copy-source", "model");
         storage.save_session(&source).await?;
         let source_dir = storage.sessions_root_dir().join(&source.id);
+        let main_path = source_dir.join("session.json");
+        let before_main = fs::read(&main_path).await?;
 
-        fs::write(source_dir.join("session.json"), b"not-json").await?;
+        fs::write(&main_path, b"not-json").await?;
         let error = storage
             .copy_session(&source.id, "copy-main-corrupt")
             .await
@@ -8331,7 +8344,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(storage.get_index_entry("copy-main-corrupt").await.is_none());
 
-        storage.save_session(&source).await?;
+        // A corrupt Root main cannot be republished from runtime alone.
+        // Restore independently recorded bytes before testing sidecar damage.
+        fs::write(&main_path, before_main).await?;
         fs::write(source_dir.join(RUNTIME_SIDECAR_FILE), b"not-json").await?;
         let error = storage
             .copy_session(&source.id, "copy-sidecar-corrupt")

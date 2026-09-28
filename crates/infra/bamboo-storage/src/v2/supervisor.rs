@@ -147,6 +147,10 @@ struct MainIdentity {
     authority_identity: SessionAuthorityIdentity,
     #[serde(default)]
     supervisor_management: Option<SupervisorManagementState>,
+    #[serde(default)]
+    root_orchestration_only: bool,
+    #[serde(default)]
+    root_tool_authority_revision: u64,
 }
 
 impl SessionStoreV2 {
@@ -209,6 +213,11 @@ impl SessionStoreV2 {
             || side.spawn_depth != 0
             || main.authority_identity != side.authority_identity
             || main.created_at != side.created_at
+            || (main.root_orchestration_only && main.root_tool_authority_revision == 0)
+            || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
+            || side.root_tool_authority_revision < main.root_tool_authority_revision
+            || (side.root_tool_authority_revision == main.root_tool_authority_revision
+                && side.root_orchestration_only != main.root_orchestration_only)
         {
             return Err(invalid("canonical Root identity mismatch"));
         }
