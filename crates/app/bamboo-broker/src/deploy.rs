@@ -164,6 +164,15 @@ impl DeployedAgent {
         }
     }
 
+    /// Observe whether a process-backed worker has exited without waiting for
+    /// it. In-process remote handles have no process status through this API.
+    pub fn process_exited(&mut self) -> std::io::Result<Option<bool>> {
+        match &mut self.inner {
+            DeployedInner::Process { child, .. } => Ok(Some(child.try_wait()?.is_some())),
+            DeployedInner::Remote(_) => Ok(None),
+        }
+    }
+
     /// Stop the deployment: SIGTERM the launched process / remote worker, then
     /// run cleanup if any. Uses [`DEFAULT_GRACEFUL_STOP_TIMEOUT`] as the grace
     /// window before falling back to a hard kill; see

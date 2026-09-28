@@ -178,6 +178,22 @@ impl Tool for AskAgentTool {
             ToolError::Execution("ask_agent could not obtain a reply from the deployment".into())
         })?;
 
+        // A deployment may be stopped or its alias reused while the broker
+        // call is in flight. Do not return a reply from an owner that has lost
+        // its Host activation since dispatch.
+        if let (Some(bound), Some((registry, store))) = (&resolved, &self.deployments) {
+            let current =
+                resolve_deployed_target(registry, Some(store), Some(caller), &parsed.target)
+                    .await?;
+            if current.is_none_or(|current| {
+                current.worker_id != bound.worker_id || current.activation != bound.activation
+            }) {
+                return Err(ToolError::Execution(
+                    "deployment changed while ask_agent was in flight".into(),
+                ));
+            }
+        }
+
         let mode_str = if matches!(mode, AskMode::Steer) {
             "steer"
         } else {

@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -24,7 +25,9 @@ use bamboo_broker::{
 };
 use bamboo_config::Config;
 use bamboo_domain::{
-    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session, SessionKind,
+    ActorActivationClaim, ActorActivationFence, ActorActivationStatus, ActorDirectoryPort,
+    ActorLogicalState, ActorPlacementClass, ActorPlacementRef, ActorSession, ProjectId, Session,
+    SessionKind,
 };
 use bamboo_storage::SessionStoreV2;
 
@@ -36,6 +39,8 @@ pub type DeployedRegistry = Arc<Mutex<HashMap<String, Deployed>>>;
 pub struct Deployed {
     /// Host logical identity; None retains existing cluster/legacy compatibility.
     pub actor: Option<ActorSession>,
+    /// Exact Host activation owning this physical worker; absent for legacy cluster peers.
+    pub activation: Option<ActorActivationFence>,
     pub env: String,
     pub handle: DeployedAgent,
 }
@@ -81,10 +86,11 @@ pub(crate) struct ResolvedDeployment {
     pub key: String,
     pub worker_id: String,
     pub actor: Option<ActorSession>,
+    pub activation: Option<ActorActivationFence>,
 }
 
-/// Resolve a live physical handle only after checking its saved Host identity.
-/// This does not reserve an activation or grant transcript/permission authority.
+/// Resolve a live physical handle only after checking its saved Host identity
+/// and exact running activation. This does not grant transcript authority.
 pub(crate) async fn resolve_deployed_target(
     registry: &DeployedRegistry,
     store: Option<&Arc<SessionStoreV2>>,
@@ -104,6 +110,7 @@ pub(crate) async fn resolve_deployed_target(
                 key: key.clone(),
                 worker_id: d.handle.id.clone(),
                 actor: d.actor.clone(),
+                activation: d.activation.clone(),
             })
     };
     let Some(resolved) = resolved else {
@@ -126,17 +133,100 @@ pub(crate) async fn resolve_deployed_target(
             .inspect_actor(&saved.actor_id)
             .await
             .map_err(|_| invalid())?;
-        if current.actor.state != ActorLogicalState::Cold
+        if current.actor.state != ActorLogicalState::Active
             || current.actor.session_created_at != saved.session_created_at
             || current.actor.parent_actor_id != saved.parent_actor_id
             || current.actor.root_actor_id != saved.root_actor_id
             || current.actor.project_id != saved.project_id
             || current.actor.spawn_depth != saved.spawn_depth
+            || !current.activation.as_ref().is_some_and(|activation| {
+                activation.status == ActorActivationStatus::Running
+                    && resolved.activation.as_ref() == Some(&activation.fence())
+                    && activation
+                        .placement_ref
+                        .as_ref()
+                        .is_some_and(|placement| placement.lease_id == resolved.worker_id)
+            })
         {
             return Err(invalid());
         }
+        store
+            .validate_fence(
+                resolved.activation.as_ref().ok_or_else(invalid)?,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|_| invalid())?;
     }
     Ok(Some(resolved))
+}
+
+const RESIDENT_LEASE: chrono::Duration = chrono::Duration::minutes(5);
+const RESIDENT_RENEW_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A lost Host authority stops the physical worker. The weak registry reference
+/// lets server shutdown drop the kill-on-drop handle even while this task sleeps.
+fn renew_resident_activation(
+    registry: &DeployedRegistry,
+    key: String,
+    worker_id: String,
+    store: Arc<SessionStoreV2>,
+    fence: ActorActivationFence,
+) {
+    let registry = Arc::downgrade(registry);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RESIDENT_RENEW_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(registry) = registry.upgrade() else {
+                break;
+            };
+            let process_exited = registry.lock().await.get_mut(&key).and_then(|deployment| {
+                (deployment.handle.id == worker_id
+                    && deployment.activation.as_ref() == Some(&fence))
+                .then(|| {
+                    deployment
+                        .handle
+                        .process_exited()
+                        .unwrap_or(Some(true))
+                        .unwrap_or(false)
+                })
+            });
+            let Some(process_exited) = process_exited else {
+                break;
+            };
+            let now = chrono::Utc::now();
+            if !process_exited
+                && store
+                    .renew_activation(&fence, now, now + RESIDENT_LEASE)
+                    .await
+                    .is_ok()
+            {
+                continue;
+            }
+            let removed = {
+                let mut live = registry.lock().await;
+                if live.get(&key).is_some_and(|deployment| {
+                    deployment.handle.id == worker_id
+                        && deployment.activation.as_ref() == Some(&fence)
+                }) {
+                    live.remove(&key)
+                } else {
+                    None
+                }
+            };
+            if let Some(deployment) = removed {
+                tracing::warn!(actor_id = %fence.actor_id, process_exited, "resident worker lost Host activation; stopping worker");
+                deployment.handle.shutdown().await;
+                let _ = store
+                    .retire_actor(&fence.actor_id, chrono::Utc::now())
+                    .await;
+            }
+            break;
+        }
+    });
 }
 
 /// Parameters for `action=deploy`, grouped so the deploy call stays tidy.
@@ -295,7 +385,7 @@ impl DeployAgentTool {
             // (or a self-signed one whose CA is already in the OS trust store).
             tls_ca_cert: None,
         };
-        let actor = if let Some(store) = &self.actor_store {
+        let (actor, activation) = if let Some(store) = &self.actor_store {
             let caller = caller.ok_or_else(|| {
                 ToolError::Execution("deploy requires a saved calling Root".into())
             })?;
@@ -333,20 +423,52 @@ impl DeployAgentTool {
                     "deployment Actor Session could not be persisted; no worker launched".into(),
                 )
             })?;
-            Some(
-                store
-                    .ensure_actor(&child.id)
-                    .await
-                    .map_err(|_| {
-                        ToolError::Execution(
-                            "deployment Actor identity could not be persisted; no worker launched"
-                                .into(),
-                        )
-                    })?
-                    .actor,
-            )
+            let actor = store
+                .ensure_actor(&child.id)
+                .await
+                .map_err(|_| {
+                    ToolError::Execution(
+                        "deployment Actor identity could not be persisted; no worker launched"
+                            .into(),
+                    )
+                })?
+                .actor;
+            let now = chrono::Utc::now();
+            let placement_class = match env.as_str() {
+                "local" => ActorPlacementClass::Local,
+                "docker" => ActorPlacementClass::Docker,
+                "ssh" => ActorPlacementClass::Ssh,
+                _ => unreachable!("deployment environment was validated above"),
+            };
+            let activation = store
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: actor.actor_id.clone(),
+                    run_id: format!("resident-{}", uuid::Uuid::new_v4()),
+                    lease_owner: format!("host-resident-{}", uuid::Uuid::new_v4()),
+                    lease_expires_at: now + RESIDENT_LEASE,
+                    inbox_generation: 0,
+                    placement_ref: Some(ActorPlacementRef {
+                        class: placement_class,
+                        lease_id: id.clone(),
+                    }),
+                    now,
+                })
+                .await;
+            let activation = match activation {
+                Ok(activation) => activation,
+                Err(_) => {
+                    let _ = store
+                        .retire_actor(&actor.actor_id, chrono::Utc::now())
+                        .await;
+                    return Err(ToolError::Execution(
+                        "deployment Actor activation could not be reserved; no worker launched"
+                            .into(),
+                    ));
+                }
+            };
+            (Some(actor), Some(activation.fence()))
         } else {
-            None
+            (None, None)
         };
         let handle = match deployer.deploy(&deployment).await {
             Ok(handle) => handle,
@@ -371,10 +493,27 @@ impl DeployAgentTool {
             .map(|actor| actor.actor_id.clone())
             .unwrap_or_else(|| id.clone());
 
+        if let (Some(store), Some(fence)) = (&self.actor_store, &activation) {
+            if store
+                .start_activation(fence, chrono::Utc::now())
+                .await
+                .is_err()
+            {
+                handle.shutdown().await;
+                let _ = store
+                    .retire_actor(&fence.actor_id, chrono::Utc::now())
+                    .await;
+                return Err(ToolError::Execution(
+                    "deployment Actor activation could not start; worker was stopped".into(),
+                ));
+            }
+        }
+
         // Namespace the registry key so an agent-chosen id can never collide
         // with a cluster-fabric node id in the SHARED registry (cross-eviction).
         let pending = Deployed {
             actor,
+            activation: activation.clone(),
             env: env.clone(),
             handle,
         };
@@ -401,11 +540,21 @@ impl DeployAgentTool {
             ));
         }
 
+        if let (Some(store), Some(fence)) = (&self.actor_store, activation) {
+            renew_resident_activation(
+                &self.registry,
+                crate::registry_keys::agent_key(&alias),
+                id.clone(),
+                store.clone(),
+                fence,
+            );
+        }
+
         Ok(tool_json(json!({
             "id": public_id,
             "env": env,
             "status": "deployed",
-            "note": format!("deployment is connecting; use ask_agent(target=\"{public_id}\", ...). Actor activation is not yet integrated"),
+            "note": format!("deployment is connecting; use ask_agent(target=\"{public_id}\", ...)"),
         })))
     }
 
@@ -593,6 +742,7 @@ impl Tool for DeployAgentTool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn empty_registry() -> DeployedRegistry {
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
@@ -648,6 +798,7 @@ mod tests {
             crate::registry_keys::agent_key("w1"),
             Deployed {
                 actor: None,
+                activation: None,
                 env: "local".into(),
                 handle: agent,
             },
@@ -717,8 +868,76 @@ mod tests {
         assert_eq!(child.parent_session_id.as_deref(), Some(root.id.as_str()));
         let entry = store.inspect_actor(&actor_id).await.unwrap();
         assert_eq!(entry.actor.state, ActorLogicalState::Retired);
-        assert_eq!(entry.actor.current_attempt, 0);
-        assert!(entry.activation.is_none());
+        assert_eq!(entry.actor.current_attempt, 1);
+        assert_eq!(
+            entry.activation.unwrap().status,
+            ActorActivationStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_worker_is_bound_to_host_activation_until_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("resident-worker");
+        std::fs::write(&bin, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(
+            SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let root = Session::new("resident-root", "echo-model");
+        store.save_session(&root).await.unwrap();
+        let registry = empty_registry();
+        let tool = DeployAgentTool::new(
+            "ws://127.0.0.1:1",
+            "test-token",
+            bin,
+            registry.clone(),
+            Arc::new(RwLock::new(Config::default())),
+        )
+        .with_actor_store(store.clone());
+        let params = serde_json::from_value(serde_json::json!({
+            "id": "resident-alias",
+            "echo": true
+        }))
+        .unwrap();
+        let actor_id = parse(tool.deploy(params, Some(&root.id)).await.unwrap())["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bound =
+            resolve_deployed_target(&registry, Some(&store), Some(&root.id), "resident-alias")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(bound.actor.as_ref().unwrap().actor_id, actor_id);
+        let entry = store.inspect_actor(&actor_id).await.unwrap();
+        assert_eq!(entry.actor.state, ActorLogicalState::Active);
+        let activation = entry.activation.unwrap();
+        assert_eq!(activation.status, ActorActivationStatus::Running);
+        assert_eq!(bound.activation, Some(activation.fence()));
+        assert_eq!(
+            activation.placement_ref.unwrap(),
+            ActorPlacementRef {
+                class: ActorPlacementClass::Local,
+                lease_id: bound.worker_id,
+            }
+        );
+
+        let stopped = parse(tool.stop(actor_id.clone(), Some(&root.id)).await.unwrap());
+        assert_eq!(stopped["status"], "stopped");
+        let entry = store.inspect_actor(&actor_id).await.unwrap();
+        assert_eq!(entry.actor.state, ActorLogicalState::Retired);
+        assert_eq!(
+            entry.activation.unwrap().status,
+            ActorActivationStatus::Cancelled
+        );
+        assert!(
+            resolve_deployed_target(&registry, Some(&store), Some(&root.id), &actor_id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
