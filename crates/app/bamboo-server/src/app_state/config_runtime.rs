@@ -6715,6 +6715,7 @@ mod live_reload_tests {
             key,
             bamboo_server_tools::Deployed {
                 actor: None,
+                activation: None,
                 env: "test".to_string(),
                 handle: bamboo_broker::DeployedAgent::from_parts(worker_id, child, None),
             },
