@@ -39,7 +39,9 @@ use uuid::Uuid;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
-    MessagePart, ProjectId, Role, Session, SessionAuthorityIdentity, SessionKind,
+    MessagePart, ProjectId, Role, RootModeOperationAction, RootModeOperationDecision,
+    RootModeOperationOutcome, RootModeOperationReceipt, RootModeOperationRequest,
+    RootToolAuthorityError, Session, SessionAuthorityIdentity, SessionKind,
     SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
@@ -1124,6 +1126,8 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.title_version = 0;
     copy.title_generated = true;
     copy.metadata_version = 0;
+    copy.root_mode_transition_epoch = 0;
+    copy.root_mode_operations.clear();
     copy.pinned = false;
     copy.created_at = now;
     copy.updated_at = now;
@@ -5044,60 +5048,11 @@ impl SessionStoreV2 {
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
-}
-
-#[async_trait::async_trait]
-impl Storage for SessionStoreV2 {
-    async fn recreate_root_session(
+    async fn save_session_after_lock(
         &self,
-        session_id: &str,
-        initial_model: &str,
-    ) -> io::Result<Session> {
-        self.recreate_ordinary_root(session_id, initial_model).await
-    }
-
-    async fn get_or_create_default_supervisor(
-        &self,
-        initial_model: &str,
-    ) -> io::Result<SupervisorBootstrapReceipt> {
-        self.bootstrap_default_supervisor(initial_model).await
-    }
-
-    async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _task = self.lock_runtime_task_sidecar_shared().await?;
-        let _session = self.acquire_session_maintenance_lock(session_id).await?;
-        self.load_root_authority_unchecked(session_id).await
-    }
-
-    async fn inspect_supervisor_scope(
-        &self,
-        supervisor: &bamboo_domain::SupervisorReference,
-    ) -> io::Result<bamboo_domain::SupervisorScopeObservation> {
-        self.management_scope(supervisor).await
-    }
-
-    async fn mutate_supervisor_management(
-        &self,
-        request: &bamboo_domain::SupervisorManagementRequest,
-    ) -> io::Result<bamboo_domain::SupervisorManagementReceipt> {
-        self.management_mutate(request).await
-    }
-
-    async fn inspect_supervisor_link(
-        &self,
-        supervisor: &bamboo_domain::SupervisorReference,
-        target_session_id: &str,
-    ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
-        self.management_link(supervisor, target_session_id).await
-    }
-
-    async fn save_session(&self, session: &Session) -> io::Result<()> {
-        let total_started = Instant::now();
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let _session_write = self
-            .acquire_session_write_lock(&session.id, SaveKind::Full)
-            .await?;
+        session: &Session,
+        total_started: Instant,
+    ) -> io::Result<()> {
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_full_save(session).await?;
         self.validate_child_project_for_write(session, true, None)
@@ -5199,6 +5154,172 @@ impl Storage for SessionStoreV2 {
             "session durable commit completed; search indexing deferred"
         );
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for SessionStoreV2 {
+    async fn root_mode_operation(
+        &self,
+        request: &RootModeOperationRequest,
+    ) -> io::Result<RootModeOperationDecision> {
+        validate_session_id(&request.session_id)?;
+        if !bamboo_domain::root_mode_operation_id_matches_epoch(
+            &request.operation_id,
+            request.expected_epoch,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Root mode operation_id must be <expected_epoch>:<canonical UUID>",
+            ));
+        }
+        let total_started = Instant::now();
+        // Deletion and trusted same-ID recreation hold the exclusive form.
+        // Keep one Root birth stable from the authoritative load through the
+        // completed operation proof, before taking runtime-task and writer locks.
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session_write = self
+            .acquire_session_write_lock(&request.session_id, SaveKind::Full)
+            .await?;
+        let Some(mut session) = self.load_session_unlocked(&request.session_id).await? else {
+            return Ok(RootModeOperationDecision::NotFound);
+        };
+        if session.kind != SessionKind::Root || session.parent_session_id.is_some() {
+            return Ok(RootModeOperationDecision::NotRoot);
+        }
+        if session.root_mode_birth_token() != request.birth_token {
+            return Ok(RootModeOperationDecision::BirthMismatch);
+        }
+        if let Some(receipt) = session.root_mode_operation(&request.operation_id) {
+            if receipt.expected_epoch != request.expected_epoch
+                || receipt.requested_enabled != request.requested_enabled
+            {
+                return Ok(RootModeOperationDecision::OperationConflict);
+            }
+            return Ok(RootModeOperationDecision::Terminal(receipt.clone()));
+        }
+        if request.expected_epoch > session.root_mode_transition_epoch {
+            return Ok(RootModeOperationDecision::FutureEpoch);
+        }
+        if request.expected_epoch < session.root_mode_transition_epoch {
+            return Ok(RootModeOperationDecision::FencedBySuccessor {
+                operation_id: request.operation_id.clone(),
+                expected_epoch: request.expected_epoch,
+                current_epoch: session.root_mode_transition_epoch,
+                current_enabled: session.root_orchestration_only_enabled(),
+                current_tool_revision: session.root_tool_authority_revision,
+            });
+        }
+
+        let outcome = match request.action {
+            RootModeOperationAction::Recover => RootModeOperationOutcome::Fenced,
+            RootModeOperationAction::Select => {
+                let mut candidate = session.clone();
+                let compatible =
+                    match candidate.set_root_orchestration_only(request.requested_enabled) {
+                        Ok(()) => true,
+                        Err(RootToolAuthorityError::LegacyPlanActive)
+                        | Err(RootToolAuthorityError::WorkflowSelected) => false,
+                        Err(error) => return Err(other_io_error(error.to_string())),
+                    } && (!request.requested_enabled || {
+                        let pending = candidate
+                            .metadata
+                            .contains_key(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY);
+                        let active = candidate
+                            .metadata
+                            .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+                            .is_some_and(|raw| {
+                                serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw)
+                                    .map(|workflow| {
+                                        workflow.status
+                                            != bamboo_skills::WorkflowActivationStatus::Deactivated
+                                    })
+                                    .unwrap_or(true)
+                            });
+                        !pending && !active
+                    });
+                if compatible {
+                    session = candidate;
+                    RootModeOperationOutcome::Committed
+                } else {
+                    RootModeOperationOutcome::RejectedIncompatible
+                }
+            }
+        };
+        let receipt = RootModeOperationReceipt {
+            operation_id: request.operation_id.clone(),
+            expected_epoch: request.expected_epoch,
+            resulting_epoch: 0,
+            requested_enabled: request.requested_enabled,
+            enabled_at_completion: false,
+            tool_authority_revision: 0,
+            outcome,
+        };
+        session
+            .record_root_mode_operation(receipt)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        self.save_session_after_lock(&session, total_started)
+            .await?;
+        Ok(RootModeOperationDecision::Terminal(
+            session
+                .root_mode_operation(&request.operation_id)
+                .expect("just-recorded terminal Root mode operation")
+                .clone(),
+        ))
+    }
+
+    async fn recreate_root_session(
+        &self,
+        session_id: &str,
+        initial_model: &str,
+    ) -> io::Result<Session> {
+        self.recreate_ordinary_root(session_id, initial_model).await
+    }
+
+    async fn get_or_create_default_supervisor(
+        &self,
+        initial_model: &str,
+    ) -> io::Result<SupervisorBootstrapReceipt> {
+        self.bootstrap_default_supervisor(initial_model).await
+    }
+
+    async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_root_authority_unchecked(session_id).await
+    }
+
+    async fn inspect_supervisor_scope(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorScopeObservation> {
+        self.management_scope(supervisor).await
+    }
+
+    async fn mutate_supervisor_management(
+        &self,
+        request: &bamboo_domain::SupervisorManagementRequest,
+    ) -> io::Result<bamboo_domain::SupervisorManagementReceipt> {
+        self.management_mutate(request).await
+    }
+
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
+        self.management_link(supervisor, target_session_id).await
+    }
+
+    async fn save_session(&self, session: &Session) -> io::Result<()> {
+        let total_started = Instant::now();
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        self.save_session_after_lock(session, total_started).await
     }
 
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {

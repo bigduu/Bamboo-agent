@@ -2,11 +2,25 @@
 //! This uses the small canonical sidecar, never the transcript or index.
 
 use super::*;
-use bamboo_domain::SessionAuthorityConflict;
+use bamboo_domain::{
+    RootModeOperationOutcome, RootModeOperationReceipt, SessionAuthorityConflict,
+    ROOT_MODE_OPERATION_HISTORY_LIMIT,
+};
 
 pub(super) const ROOT_TOOL_AUTHORITY_PROOF_FILE: &str = "root-tool-authority.json";
 const ROOT_TOOL_AUTHORITY_PROOF_MIGRATION_MARKER: &str = ".root_tool_authority_proof_v1";
 const ROOT_TOOL_AUTHORITY_PROOF_MAX_BYTES: u64 = 4096;
+
+fn root_tool_proof_version(session: &Session) -> u32 {
+    // Pre-mode Roots retain their readable v1 proof. The first terminal mode
+    // operation upgrades it to v2, which an older v1-only final writer rejects
+    // instead of dropping the operation epoch/history during a mixed rollout.
+    if session.root_mode_transition_epoch > 0 || !session.root_mode_operations.is_empty() {
+        2
+    } else {
+        1
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,28 +46,36 @@ struct RootToolAuthorityProof {
     authority_identity: SessionAuthorityIdentity,
     root_orchestration_only: bool,
     root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl RootToolAuthorityProof {
     fn from_session(session: &Session, state: ProofState) -> Self {
         Self {
-            version: 1,
+            version: root_tool_proof_version(session),
             state,
             id: session.id.clone(),
             created_at: session.created_at,
             authority_identity: session.authority_identity.clone(),
             root_orchestration_only: session.root_orchestration_only,
             root_tool_authority_revision: session.root_tool_authority_revision,
+            root_mode_transition_epoch: session.root_mode_transition_epoch,
+            root_mode_operations: session.root_mode_operations.clone(),
         }
     }
 
     fn matches(&self, session: &Session) -> bool {
-        self.version == 1
+        self.version == root_tool_proof_version(session)
             && self.id == session.id
             && self.created_at == session.created_at
             && self.authority_identity == session.authority_identity
             && self.root_orchestration_only == session.root_orchestration_only
             && self.root_tool_authority_revision == session.root_tool_authority_revision
+            && self.root_mode_transition_epoch == session.root_mode_transition_epoch
+            && self.root_mode_operations == session.root_mode_operations
     }
 }
 
@@ -77,6 +99,10 @@ struct RootToolAuthorityMain {
     root_orchestration_only: bool,
     #[serde(default)]
     root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl From<&Session> for RootToolAuthorityMain {
@@ -91,6 +117,8 @@ impl From<&Session> for RootToolAuthorityMain {
             authority_identity: session.authority_identity.clone(),
             root_orchestration_only: session.root_orchestration_only,
             root_tool_authority_revision: session.root_tool_authority_revision,
+            root_mode_transition_epoch: session.root_mode_transition_epoch,
+            root_mode_operations: session.root_mode_operations.clone(),
         }
     }
 }
@@ -428,6 +456,8 @@ impl SessionStoreV2 {
             || side.root_tool_authority_revision < main.root_tool_authority_revision
             || (side.root_tool_authority_revision == main.root_tool_authority_revision
                 && side.root_orchestration_only != main.root_orchestration_only)
+            || side.root_mode_transition_epoch != main.root_mode_transition_epoch
+            || side.root_mode_operations != main.root_mode_operations
             || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(conflict(
@@ -591,6 +621,59 @@ impl SessionStoreV2 {
             return Err(conflict(
                 "metadata revision regressed; reload before saving",
             ));
+        }
+        if incoming.root_mode_operations.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {
+            return Err(conflict("Root mode operation history exceeds its bound"));
+        }
+        if incoming.root_mode_transition_epoch == current.root_mode_transition_epoch {
+            if incoming.root_mode_operations != current.root_mode_operations {
+                return Err(conflict(
+                    "Root mode operation changed without advancing its epoch",
+                ));
+            }
+        } else {
+            if !full
+                || current.root_mode_transition_epoch.checked_add(1)
+                    != Some(incoming.root_mode_transition_epoch)
+            {
+                return Err(conflict("Root mode transition epoch is stale or skipped"));
+            }
+            let Some(receipt) = incoming.root_mode_operations.last() else {
+                return Err(conflict("Root mode transition has no terminal receipt"));
+            };
+            if receipt.expected_epoch != current.root_mode_transition_epoch
+                || receipt.resulting_epoch != incoming.root_mode_transition_epoch
+                || receipt.enabled_at_completion != incoming.root_orchestration_only
+                || receipt.tool_authority_revision != incoming.root_tool_authority_revision
+                || current
+                    .root_mode_operations
+                    .iter()
+                    .any(|previous| previous.operation_id == receipt.operation_id)
+            {
+                return Err(conflict(
+                    "Root mode terminal receipt does not match its transition",
+                ));
+            }
+            let mut expected_history = current.root_mode_operations.clone();
+            expected_history.push(receipt.clone());
+            if expected_history.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {
+                expected_history.remove(0);
+            }
+            if incoming.root_mode_operations != expected_history {
+                return Err(conflict(
+                    "Root mode terminal history is stale or inconsistent",
+                ));
+            }
+            match receipt.outcome {
+                RootModeOperationOutcome::Committed
+                    if receipt.requested_enabled == incoming.root_orchestration_only => {}
+                RootModeOperationOutcome::Fenced
+                | RootModeOperationOutcome::RejectedIncompatible
+                    if incoming.root_orchestration_only == current.root_orchestration_only
+                        && incoming.root_tool_authority_revision
+                            == current.root_tool_authority_revision => {}
+                _ => return Err(conflict("Root mode terminal outcome is inconsistent")),
+            }
         }
         if (current.root_orchestration_only && current.root_tool_authority_revision == 0)
             || incoming.root_tool_authority_revision < current.root_tool_authority_revision

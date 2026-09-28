@@ -2299,6 +2299,15 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
         session.authority_identity = latest.authority_identity.clone();
     }
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+    {
+        // Runtime writes own transcript/runtime changes, never Root mode
+        // authority. Adopt the coherent durable tuple, including a recovery
+        // epoch that changed no tool policy. Invalid birth/revision pairs stay
+        // untouched so the final V2 writer rejects them instead of rebinding.
+        let _ = session.adopt_root_tool_authority_from(latest);
+    }
     // Relationships are a separate monotonic authority, independent of UI
     // metadata. Adopt the canonical state into the actual caller snapshot only
     // for the same Root lifetime/incarnation; never rebind stale identities.
