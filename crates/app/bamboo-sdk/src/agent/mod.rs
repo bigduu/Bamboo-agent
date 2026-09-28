@@ -1880,15 +1880,18 @@ mod reexecute_and_child_approval_tests {
         let mut session = Session::new("sdk-root-context-stale-index", "claude-test");
         session.add_message(Message::user("continue"));
         second.save_session(&session).await.unwrap();
-        assert!(
-            agent
-                .storage()
-                .load_session(&session.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "SDK instance intentionally predates this Root"
-        );
+        let error = agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .expect_err("stale SDK index must not report a canonical Root as absent");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+        assert!(error
+            .to_string()
+            .contains("Root index is missing while canonical files require recovery"));
         agent.run_session(&mut session).await.unwrap();
         let persisted = second
             .load_root_authority(&session.id)
