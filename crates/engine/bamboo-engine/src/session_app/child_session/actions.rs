@@ -1189,9 +1189,15 @@ async fn cancel_child_action_inner(
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
     let latest_status = child.last_run_status().unwrap_or_default();
+    if latest_status == "cancelled" {
+        return Ok(json!({
+            "child_session_id": child_session_id,
+            "status": "cancelled",
+        }));
+    }
     if matches!(
         latest_status.as_str(),
-        "completed" | "error" | "timeout" | "skipped" | "cancelled"
+        "completed" | "error" | "timeout" | "skipped"
     ) {
         return Ok(json!({
             "child_session_id": child_session_id,
