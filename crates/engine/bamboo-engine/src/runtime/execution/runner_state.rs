@@ -12,16 +12,10 @@ use uuid::Uuid;
 
 use bamboo_agent_core::AgentEvent;
 
-fn subagent_lifecycle_child_id(event: &AgentEvent) -> Option<&str> {
-    match event {
-        AgentEvent::SubAgentStarted {
-            child_session_id, ..
-        }
-        | AgentEvent::SubAgentCompleted {
-            child_session_id, ..
-        } => Some(child_session_id),
-        _ => None,
-    }
+fn subagent_lifecycle_key(event: &AgentEvent) -> Option<(&str, &str)> {
+    event
+        .legacy_child_lifecycle_observation()
+        .map(|observation| (observation.parent_session_id, observation.child_session_id))
 }
 
 /// Status of an agent execution runner.
@@ -197,9 +191,9 @@ impl AgentRunner {
         }) {
             return;
         }
-        if let Some(child_session_id) = subagent_lifecycle_child_id(&event) {
+        if let Some(key) = subagent_lifecycle_key(&event) {
             self.last_critical_events
-                .retain(|existing| subagent_lifecycle_child_id(existing) != Some(child_session_id));
+                .retain(|existing| subagent_lifecycle_key(existing) != Some(key));
         }
         if self.last_critical_events.len() >= Self::CRITICAL_EVENTS_CAPACITY {
             self.last_critical_events.remove(0);
@@ -226,6 +220,14 @@ mod tests {
             child_session_id: child_session_id.to_string(),
             status: status.to_string(),
             error: None,
+        }
+    }
+
+    fn wrapped(inner: AgentEvent) -> AgentEvent {
+        AgentEvent::SubAgentEvent {
+            parent_session_id: "root".into(),
+            child_session_id: "parent".into(),
+            event: Box::new(inner),
         }
     }
 
@@ -288,5 +290,34 @@ mod tests {
                 child_session_id, ..
             } if child_session_id == "child-a"
         ));
+    }
+
+    #[test]
+    fn wrapped_legacy_lifecycle_replays_once_and_cannot_double_count_direct_lifecycle() {
+        let mut runner = AgentRunner::new();
+        let legacy_start = wrapped(started("child-a", "initial"));
+        assert!(legacy_start.is_replayable_session_state());
+        runner.push_critical_event(legacy_start);
+        runner.push_critical_event(started("child-a", "direct"));
+        assert_eq!(runner.last_critical_events.len(), 1);
+        assert!(matches!(
+            &runner.last_critical_events[0],
+            AgentEvent::SubAgentStarted { title: Some(title), .. } if title == "direct"
+        ));
+        runner.push_critical_event(wrapped(completed("child-a", "completed")));
+        assert_eq!(runner.last_critical_events.len(), 1);
+        assert!(matches!(
+            &runner.last_critical_events[0],
+            AgentEvent::SubAgentEvent { .. }
+        ));
+        assert!(runner.last_critical_events.len() <= AgentRunner::CRITICAL_EVENTS_CAPACITY);
+
+        let invalid = AgentEvent::SubAgentEvent {
+            parent_session_id: "root".into(),
+            child_session_id: "unrelated".into(),
+            event: Box::new(started("child-b", "forged")),
+        };
+        assert!(!invalid.is_replayable_session_state());
+        assert!(invalid.legacy_child_lifecycle_observation().is_none());
     }
 }

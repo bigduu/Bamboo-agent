@@ -141,9 +141,9 @@ impl ActorEventRouter {
             // Compare it with the bounded published window when available;
             // a reused sequence with different content is never a valid replay.
             if let Some(candidate) = self
-                .replay_after(sequence.saturating_sub(1))
-                .ok()
-                .and_then(|events| events.into_iter().find(|event| event.sequence == sequence))
+                .replay_after(sequence.saturating_sub(1))?
+                .into_iter()
+                .find(|event| event.sequence == sequence)
             {
                 if payload.as_ref().is_some_and(|payload| {
                     serde_json::to_value(payload).ok()
@@ -377,6 +377,21 @@ mod tests {
             ActorEventRoute::Suppressed
         ));
         assert!(router.replay_after(0).is_err());
+        assert!(matches!(
+            router.route(
+                &entry,
+                &fence,
+                7,
+                2,
+                Some(AgentEvent::Token {
+                    content: "live".into()
+                })
+            ),
+            Err(ActorEventRouteError::SequenceGap {
+                expected: 2,
+                received: 4
+            })
+        ));
     }
 
     #[test]

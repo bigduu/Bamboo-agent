@@ -834,7 +834,105 @@ pub enum AgentEvent {
     },
 }
 
+/// Read-only interpretation of one legacy parent-visible child lifecycle.
+/// The IDs in a worker frame are observations, not ActorDirectory authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyChildLifecycleObservation<'a> {
+    pub parent_session_id: &'a str,
+    pub child_session_id: &'a str,
+    pub completed: bool,
+}
+
 impl AgentEvent {
+    /// Interpret direct and one-level parent-wrapped child lifecycle events
+    /// identically for the bounded legacy replay cache. A wrapped event is
+    /// admitted only when its inner parent equals the wrapper's child. This
+    /// never changes canonical actor state or expands a token/event tree.
+    pub fn legacy_child_lifecycle_observation(
+        &self,
+    ) -> Option<LegacyChildLifecycleObservation<'_>> {
+        const MAX_ID_BYTES: usize = 256;
+        const MAX_DETAIL_BYTES: usize = 4096;
+        let leaf = match self {
+            Self::SubAgentEvent {
+                parent_session_id,
+                child_session_id,
+                event,
+            } => {
+                if parent_session_id.is_empty()
+                    || parent_session_id.len() > MAX_ID_BYTES
+                    || child_session_id.is_empty()
+                    || child_session_id.len() > MAX_ID_BYTES
+                    || parent_session_id == child_session_id
+                {
+                    return None;
+                }
+                let inner = event.as_ref();
+                let inner_parent = match inner {
+                    Self::SubAgentStarted {
+                        parent_session_id, ..
+                    }
+                    | Self::SubAgentCompleted {
+                        parent_session_id, ..
+                    } => parent_session_id,
+                    _ => return None,
+                };
+                if inner_parent != child_session_id {
+                    return None;
+                }
+                inner
+            }
+            other => other,
+        };
+        let observation = match leaf {
+            Self::SubAgentStarted {
+                parent_session_id,
+                child_session_id,
+                title,
+            } => {
+                if title
+                    .as_ref()
+                    .is_some_and(|title| title.len() > MAX_DETAIL_BYTES)
+                {
+                    return None;
+                }
+                LegacyChildLifecycleObservation {
+                    parent_session_id,
+                    child_session_id,
+                    completed: false,
+                }
+            }
+            Self::SubAgentCompleted {
+                parent_session_id,
+                child_session_id,
+                error,
+                ..
+            } => {
+                if error
+                    .as_ref()
+                    .is_some_and(|error| error.len() > MAX_DETAIL_BYTES)
+                {
+                    return None;
+                }
+                LegacyChildLifecycleObservation {
+                    parent_session_id,
+                    child_session_id,
+                    completed: true,
+                }
+            }
+            _ => return None,
+        };
+        if observation.parent_session_id.is_empty()
+            || observation.parent_session_id.len() > MAX_ID_BYTES
+            || observation.child_session_id.is_empty()
+            || observation.child_session_id.len() > MAX_ID_BYTES
+            || observation.parent_session_id == observation.child_session_id
+        {
+            return None;
+        }
+        Some(observation)
+    }
+
     /// Returns the session this event pertains to, when it carries one.
     ///
     /// Used by the account change-feed to route each event to the right
@@ -900,24 +998,25 @@ impl AgentEvent {
     /// broadcasting a clarification (or other critical state) without first
     /// populating the runner replay cache.
     pub fn is_replayable_session_state(&self) -> bool {
-        matches!(
-            self,
-            AgentEvent::TaskListUpdated { .. }
-                | AgentEvent::TaskListCompleted { .. }
-                | AgentEvent::SubAgentStarted { .. }
-                | AgentEvent::SubAgentCompleted { .. }
-                | AgentEvent::ChildApprovalRequested { .. }
-                | AgentEvent::ChildApprovalChanged { .. }
-                | AgentEvent::BashCompleted { .. }
-                | AgentEvent::SessionTitleUpdated { .. }
-                | AgentEvent::SessionPinnedUpdated { .. }
-                | AgentEvent::PlanModeEntered { .. }
-                | AgentEvent::PlanModeExited { .. }
-                | AgentEvent::BudgetExceeded { .. }
-                | AgentEvent::NeedClarification { .. }
-                | AgentEvent::WorkflowActivated { .. }
-                | AgentEvent::WorkflowDeactivated { .. }
-        )
+        self.legacy_child_lifecycle_observation().is_some()
+            || matches!(
+                self,
+                AgentEvent::TaskListUpdated { .. }
+                    | AgentEvent::TaskListCompleted { .. }
+                    | AgentEvent::SubAgentStarted { .. }
+                    | AgentEvent::SubAgentCompleted { .. }
+                    | AgentEvent::ChildApprovalRequested { .. }
+                    | AgentEvent::ChildApprovalChanged { .. }
+                    | AgentEvent::BashCompleted { .. }
+                    | AgentEvent::SessionTitleUpdated { .. }
+                    | AgentEvent::SessionPinnedUpdated { .. }
+                    | AgentEvent::PlanModeEntered { .. }
+                    | AgentEvent::PlanModeExited { .. }
+                    | AgentEvent::BudgetExceeded { .. }
+                    | AgentEvent::NeedClarification { .. }
+                    | AgentEvent::WorkflowActivated { .. }
+                    | AgentEvent::WorkflowDeactivated { .. }
+            )
     }
 
     /// Whether this event belongs on the durable account change feed.

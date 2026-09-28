@@ -454,6 +454,49 @@ mod tests {
             "old Started/Need/Complete must all be suppressed"
         );
     }
+
+    #[tokio::test]
+    async fn wrapped_child_lifecycle_reaches_bounded_legacy_replay_consumer() {
+        let session_id = "root";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(8);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(session_id.into(), runner)])));
+        let (input, forwarder) = create_event_forwarder(
+            session_id.into(),
+            run_id,
+            broadcast_tx,
+            runners.clone(),
+            None,
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        let legacy = AgentEvent::SubAgentEvent {
+            parent_session_id: "root".into(),
+            child_session_id: "parent".into(),
+            event: Box::new(AgentEvent::SubAgentStarted {
+                parent_session_id: "parent".into(),
+                child_session_id: "grandchild".into(),
+                title: Some("work".into()),
+            }),
+        };
+        input.send(legacy).await.unwrap();
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::SubAgentEvent { .. }
+        ));
+        let guard = runners.read().await;
+        let cached = &guard[session_id].last_critical_events;
+        assert_eq!(cached.len(), 1);
+        assert!(matches!(&cached[0], AgentEvent::SubAgentEvent { .. }));
+        drop(guard);
+        drop(input);
+        forwarder.await.unwrap();
+    }
 }
 
 /// Create an MPSC channel for agent events and spawn a forwarding task
