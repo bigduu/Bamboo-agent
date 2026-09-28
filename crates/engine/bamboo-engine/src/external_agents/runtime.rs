@@ -649,29 +649,9 @@ fn node_display_name(n: &bamboo_config::cluster_fabric::Node) -> String {
     }
 }
 
-/// Resolve config `remote_placements` into runner-ready handles (#193), keyed by
-/// role. The bearer is read from `token_env` HERE (mirroring the A2A `auth_ref`
-/// handling at ~runtime.rs:142): if the env var is set use it; if `token_env` is
-/// `Some` but the var is UNSET, log an error and SKIP that placement so a
-/// misconfig fails SAFE to the local path rather than connecting to a remote
-/// worker with no bearer. A placement with no `token_env` connects tokenless
-/// (trusted/loopback link only). Duplicate roles: last one wins.
-/// Heuristic: does this endpoint reach off-box (so a missing bearer is a real
-/// exposure)? `wss://` is always public-grade; for `ws://` we flag any host that
-/// is not loopback/localhost.
-fn endpoint_looks_public(endpoint: &str) -> bool {
-    if endpoint.starts_with("wss://") {
-        return true;
-    }
-    let host = endpoint
-        .strip_prefix("ws://")
-        .unwrap_or(endpoint)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    !(host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty())
-}
-
+/// Resolve pinned remote placements. Broker peer selection is required to run;
+/// old direct-worker configurations remain visible but unavailable, without
+/// exposing their credentials or silently rerouting to Local.
 fn resolve_remote_placements(
     placements: &[bamboo_config::RemoteActorPlacement],
     nodes: &[bamboo_config::cluster_fabric::Node],
@@ -735,45 +715,16 @@ fn resolve_remote_placements(
             );
             continue; // Invalid explicit routes remain selected, never Local fallback.
         }
-        let token = match p.token_env.as_deref() {
-            Some(env_var) => match std::env::var(env_var) {
-                Ok(token) => Some(token),
-                Err(_) => {
-                    tracing::error!(
-                        "remote placement for role '{}' token_env '{}' is not set; \
-                         skipping (role falls back to local, NOT unauthenticated remote)",
-                        p.role,
-                        env_var
-                    );
-                    continue;
-                }
-            },
-            None => {
-                // A tokenless placement is only safe on a trusted link. Warn if
-                // it targets what looks like a public endpoint (wss:// or a
-                // non-loopback host) so an operator footgun is visible in logs.
-                if endpoint_looks_public(&p.endpoint) {
-                    tracing::warn!(
-                        "remote placement for role '{}' has no token_env but targets a \
-                         public-looking endpoint '{}'; work will be dispatched with NO bearer. \
-                         Set token_env (and use wss://) for any non-loopback worker.",
-                        p.role,
-                        p.endpoint
-                    );
-                }
-                None
-            }
-        };
         out.insert(
             p.role.clone(),
             super::actor_adapter::ResolvedRemotePlacement {
                 endpoint: p.endpoint.clone(),
-                token,
+                token: None,
                 ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
                 // Badge from the node's own metadata when the endpoint points at
                 // a known cluster node; else the endpoint host is used downstream.
                 host_label: node_label_for_endpoint(nodes, &p.endpoint),
-                broker_peer: None,
+                broker_peer: Some(Err(())),
             },
         );
     }
@@ -1336,6 +1287,8 @@ mod placement_resolver_tests {
             out.get("explorer").unwrap().host_label.as_deref(),
             Some("mini")
         );
+        assert!(matches!(out["explorer"].broker_peer, Some(Err(()))));
+        assert!(out["explorer"].token.is_none());
     }
 
     #[test]

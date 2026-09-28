@@ -394,8 +394,8 @@ pub enum Placement {
     /// Parent spawns a local subprocess (current behavior).
     #[default]
     Local,
-    /// Connect to a resident worker already serving at `endpoint` (e.g.
-    /// `wss://gpu-host:8443`).
+    /// Connect through the scoped broker at `endpoint`; the selected worker
+    /// mailbox is held by Host policy, outside the child RunSpec.
     Remote { endpoint: String },
     /// Ask a control plane to assign an endpoint from a named pool.
     Schedulable { pool: String },

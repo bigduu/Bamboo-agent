@@ -38,7 +38,6 @@ use bamboo_subagent::proto::{
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
 };
-use bamboo_subagent::transport::{client_config_trusting_cert, ChildClient};
 
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
@@ -459,9 +458,8 @@ async fn reap_worker_pool_once(pool: &Arc<tokio::sync::Mutex<WorkerPool>>) -> us
 
 /// A role pinned to a remote resident worker (remote-actor-plan §3.4 / P1.5,
 /// #193), resolved at runner-build time from `SubagentsConfig.remote_placements`:
-/// the env-named bearer is already READ into `token` here (the raw token never
-/// rides the config), and `ca_cert_file` is the path to a PEM pinning a
-/// self-signed worker cert (`None` ⇒ default webpki roots / plaintext `ws://`).
+/// the env-named broker bearer is already READ into `token` here (the raw token
+/// never rides the config), and `ca_cert_file` pins the broker's TLS cert.
 #[derive(Clone)]
 pub struct ResolvedRemotePlacement {
     pub endpoint: String,
@@ -500,8 +498,7 @@ pub struct ResolvedSchedulablePlacement {
 /// How `execute_external_child` should obtain its worker connection, decided
 /// once from `spec.placement`. Splits the divergent acquire/connect + retire
 /// logic three ways while the shared middle (Run dispatch, live registration,
-/// drive, close) stays identical. `Local` is the unchanged pre-#193 path;
-/// `Remote` is the unchanged #194 path; `Schedulable` (#181, P2b) is new.
+/// drive, close) stays identical. Remote uses a scoped broker peer route.
 enum PlacementKind {
     Local,
     Remote,
@@ -1403,17 +1400,14 @@ impl ActorChildRunner {
             permission_resolution.effective.as_str().to_string();
         // #193: route this role to a REMOTE resident worker when one is pinned.
         // `spec.identity.role` was just computed from `subagent_type` above; a
-        // match flips the placement to Remote and rides the worker's bearer on the
-        // scoped secrets envelope (TLS handshake / Authorization header only — the
-        // token is never logged). No match leaves the default `Placement::Local`,
+        // match flips the placement to Remote. The scoped broker credential stays
+        // on the Host transport and never enters the child RunSpec. No match
+        // leaves the default `Placement::Local`,
         // so the local path is byte-for-byte unchanged for every non-pinned role.
         if let Some(placement) = self.remote_placements.get(spec.identity.role.as_str()) {
             spec.placement = Placement::Remote {
                 endpoint: placement.endpoint.clone(),
             };
-            if placement.broker_peer.is_none() {
-                spec.secrets.worker_auth_token = placement.token.clone();
-            }
         } else if let Some(placement) = self.schedulable_placements.get(spec.identity.role.as_str())
         {
             // #181 (P2b): route this role to a SCHEDULED worker — ONLY when it is
@@ -1657,7 +1651,8 @@ impl ExternalChildRunner for ActorChildRunner {
             .remote_placements
             .get(spec.identity.role.as_str())
             .and_then(|p| p.broker_peer.as_ref());
-        if strict_remote.is_some_and(|route| route.is_err())
+        if (matches!(spec.placement, Placement::Remote { .. }) && strict_remote.is_none())
+            || strict_remote.is_some_and(|route| route.is_err())
             || strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime)
         {
             return Err(remote_broker_unavailable());
@@ -1969,7 +1964,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // the end. Everything between (Run dispatch, live-actor registration,
         // drive, the close) is identical for all three. `kind` is the single guard.
         //   - Local       (#0):  byte-for-byte the pre-#193 reuse-or-spawn path.
-        //   - Remote       (#194): connect to a FIXED resident endpoint, no spawn.
+        //   - Remote       (#1311): connect to a scoped broker peer, no spawn.
         //   - Schedulable  (#181): resolve a live worker from the registry, connect.
         let kind = match spec.placement {
             Placement::Remote { .. } => PlacementKind::Remote,
@@ -2000,7 +1995,7 @@ impl ExternalChildRunner for ActorChildRunner {
             let execution_epoch = self.next_execution_epoch.fetch_add(1, Ordering::Relaxed) + 1;
             let (actor, mut client) = match kind {
                 PlacementKind::Remote => {
-                    // REMOTE branch: connect to a resident worker. No spawn, no pool
+                    // REMOTE branch: connect to a broker-selected resident worker. No spawn, no pool
                     // touch, no drain. We do not own the worker, so a connect failure
                     // has NO respawn fallback — it is a clear, terminal error.
                     let placement = self
@@ -2060,49 +2055,7 @@ impl ExternalChildRunner for ActorChildRunner {
                             Box::new(link) as Box<dyn bamboo_subagent::ChildLink>,
                         )
                     } else {
-                        let endpoint = placement.endpoint.clone();
-                        // Build the TLS trust: a pinned CA pins a self-signed worker cert;
-                        // otherwise default webpki roots (or plaintext for `ws://`).
-                        let trust_cfg = match placement.ca_cert_file.as_deref() {
-                            Some(path) => Some(client_config_trusting_cert(path).map_err(|e| {
-                                AgentError::LLM(format!(
-                                    "remote worker CA cert '{}': {e}",
-                                    path.display()
-                                ))
-                            })?),
-                            None => None,
-                        };
-                        let client = ChildClient::connect_with_auth_tls(
-                            &endpoint,
-                            placement.token.as_deref(),
-                            trust_cfg,
-                        )
-                        .await
-                        .map_err(|e| {
-                            AgentError::LLM(format!(
-                                "remote actor connect to '{endpoint}' failed: {e}"
-                            ))
-                        })?;
-                        // Process-less handle so live-actor registration (in-band steering)
-                        // works exactly as for a local worker; `kill()` is a no-op.
-                        let record = AgentRecord {
-                            agent_id: job.child_session_id.clone(),
-                            role: spec.identity.role.clone(),
-                            labels: Vec::new(),
-                            endpoint: endpoint.clone(),
-                            pid: 0,
-                            version: String::new(),
-                            started_at: chrono::Utc::now(),
-                            lease_expires_at: chrono::Utc::now(),
-                        };
-                        let _ = endpoint;
-                        let actor = PooledWorker {
-                            worker: SpawnedChild::remote(record),
-                            mailbox_id: job.child_session_id.clone(),
-                            parked_at: None,
-                        };
-                        let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
-                        (actor, client)
+                        return Err(remote_broker_unavailable());
                     }
                 }
                 PlacementKind::Schedulable => {
@@ -11555,14 +11508,14 @@ mod tests {
         );
         let runner = bogus_runner(placements);
 
-        // Matching role -> Placement::Remote + the bearer on the secrets envelope.
+        // The broker credential never rides the child RunSpec secrets envelope.
         let s = session_of_role("explorer", "do the thing");
         let spec = runner.build_spec(&s, &job_for("child-1"));
         match &spec.placement {
             Placement::Remote { endpoint } => assert_eq!(endpoint, "wss://gpu-host:8443"),
             other => panic!("expected Remote, got {other:?}"),
         }
-        assert_eq!(spec.secrets.worker_auth_token.as_deref(), Some("T-secret"));
+        assert!(spec.secrets.worker_auth_token.is_none());
     }
 
     #[test]
@@ -12123,93 +12076,37 @@ mod tests {
         assert_eq!(p.host, "mini");
     }
 
-    /// End-to-end remote run through `execute_external_child`: a resident worker
-    /// (Bearer-gated `WsServer` + `EchoExecutor`) serves the role; the runner is
-    /// built with a `remote_placements` entry pointing at it AND a BOGUS
-    /// worker_bin (`/bin/false`). A passing test proves the remote path CONNECTS
-    /// to the resident worker and NEVER spawns (a spawn would fail on /bin/false),
-    /// and that a terminal/echo result flows back.
+    /// A legacy direct worker endpoint cannot bypass the broker activation
+    /// contract, even when the endpoint is reachable and has a bearer token.
     #[tokio::test]
-    async fn execute_external_child_routes_role_to_remote_worker_without_spawning() {
-        // 1. Stand up the resident worker on loopback with a required bearer.
-        let token = "remote-test-token";
-        let server = bamboo_subagent::transport::WsServer::bind_with_token(
-            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            Some(token.to_string()),
-        )
-        .await
-        .expect("bind resident worker");
-        let endpoint = server.ws_endpoint(); // ws://127.0.0.1:<port>
-        let srv = tokio::spawn(async move {
-            // serve() loops connection-after-connection; the test exits, dropping it.
-            let _ = server
-                .serve(Arc::new(bamboo_subagent::executor::EchoExecutor))
-                .await;
-        });
-
-        // 2. Build the runner: role "explorer" pinned remote, bogus worker_bin.
+    async fn execute_external_child_rejects_direct_remote_worker() {
         let mut placements = HashMap::new();
         placements.insert(
             "explorer".to_string(),
             ResolvedRemotePlacement {
-                endpoint: endpoint.clone(),
-                token: Some(token.to_string()),
+                endpoint: "ws://127.0.0.1:1".into(),
+                token: Some("remote-test-token".into()),
                 ca_cert_file: None,
-                host_label: Some("mini-e2e".into()), // node label, surfaced on the badge
+                host_label: Some("mini-e2e".into()),
                 broker_peer: None,
             },
         );
         let runner = bogus_runner(placements);
-
-        // 3. Drive a real run for that role.
         let mut session = session_of_role("explorer", "hello remote");
         let job = job_for("child-1");
-        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
-        let cancel = CancellationToken::new();
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            runner.execute_external_child(&mut session, &job, event_tx, cancel),
-        )
-        .await
-        .expect("run did not hang")
-        .expect("remote run succeeded (connected to resident worker, did not spawn)");
-
-        let _ = result;
-        // The EchoExecutor's reply is written back onto the child session as an
-        // assistant message — proof a terminal result flowed back over the link.
-        let last = session
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+        let error = runner
+            .execute_external_child(&mut session, &job, event_tx, CancellationToken::new())
+            .await
+            .err()
+            .expect("direct remote transport must fail closed");
+        assert!(error
+            .to_string()
+            .contains("remote_broker_activation_unavailable"));
+        assert!(session
             .messages
             .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::Assistant))
-            .expect("an assistant reply was written back");
-        assert!(
-            last.content.contains("echo:"),
-            "expected echo reply, got {:?}",
-            last.content
-        );
-
-        // A remote run must stamp WHICH machine it ran on onto the child session
-        // (mirrored to the UI badge) using the placement's node label.
-        let placement = session
-            .metadata
-            .get("placement")
-            .expect("remote child session stamped with a placement");
-        assert!(placement.contains(r#""kind":"remote""#), "{placement}");
-        assert!(placement.contains(r#""host":"mini-e2e""#), "{placement}");
-
-        // Drain a couple of streamed events to confirm the event pipe carried the
-        // worker's tokens too (best-effort; the reply assertion above is primary).
-        let mut saw_event = false;
-        while let Ok(Some(_ev)) =
-            tokio::time::timeout(Duration::from_millis(50), event_rx.recv()).await
-        {
-            saw_event = true;
-        }
-        let _ = saw_event;
-
-        srv.abort();
+            .all(|message| message.role != Role::Assistant));
     }
 
     // ---- #181 (P2b): schedulable placement routing --------------------------
@@ -12292,7 +12189,7 @@ mod tests {
             Placement::Remote { endpoint } => assert_eq!(endpoint, "wss://fixed-host:8443"),
             other => panic!("expected Remote (precedence), got {other:?}"),
         }
-        assert_eq!(spec.secrets.worker_auth_token.as_deref(), Some("T-remote"));
+        assert!(spec.secrets.worker_auth_token.is_none());
     }
 
     #[test]

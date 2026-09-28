@@ -919,15 +919,15 @@ pub struct SchedulablePlacement {
 /// The bearer token is NEVER stored here in the clear: `token_env` names the
 /// environment variable that holds it (mirroring the A2A `auth_ref` pattern),
 /// read once at runner-build time. A `token_env` that is set-but-unset at build
-/// time skips a legacy direct placement. An explicit `broker_peer` selection
-/// remains configured-unavailable instead of falling back to Local.
+/// time leaves an explicit placement unavailable. A `broker_peer` selection
+/// is required for execution; legacy direct-worker config remains readable.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RemoteActorPlacement {
     /// Sub-agent role this targets (matches the child session's
     /// `metadata["subagent_type"]`).
     pub role: String,
-    /// Resident worker endpoint, e.g. `wss://gpu-host:8443` (or `ws://` only on
-    /// a trusted/loopback link).
+    /// Broker endpoint for a scoped peer route. Legacy worker endpoints remain
+    /// readable but are unavailable until migrated to a broker route.
     pub endpoint: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
     /// `auth_ref`). `None` ⇒ connect without a bearer (trusted link only).
@@ -937,8 +937,8 @@ pub struct RemoteActorPlacement {
     /// (or plaintext `ws://`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
-    /// Explicit scoped broker route. Existing endpoint/env/CA fields select the
-    /// broker only in this mode; absence retains the legacy direct-worker route.
+    /// Explicit scoped broker route. Absence keeps the placement selected but
+    /// unavailable, never a direct parent-to-worker connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_peer: Option<RemoteBrokerPeer>,
 }
