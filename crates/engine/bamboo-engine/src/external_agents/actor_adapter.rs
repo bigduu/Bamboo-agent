@@ -4528,6 +4528,36 @@ fn validate_actor_event_batch(
     Ok(())
 }
 
+/// The plain Actor path already owns a durable Directory activation. Check that
+/// exact owner before admitting either batched or rolling-upgrade live frames;
+/// worker-provided batch identity alone is never an activation authority.
+async fn validate_directory_actor_event(
+    store: &bamboo_storage::SessionStoreV2,
+    fence: &ActorActivationFence,
+    session: &Session,
+    run_id: Option<&str>,
+) -> Result<(), AgentError> {
+    store
+        .validate_fence(fence, chrono::Utc::now())
+        .await
+        .map_err(|_| AgentError::LLM("actor event owner is stale".into()))?;
+    let entry = store
+        .inspect_actor(&fence.actor_id)
+        .await
+        .map_err(|_| AgentError::LLM("actor event authority is unavailable".into()))?;
+    if !entry.actor.matches_session(session)
+        || entry.actor.project_id != project_id_for_actor_run(session)?.map(|id| id.to_string())
+        || !entry.activation.as_ref().is_some_and(|current| {
+            current.matches_fence(fence)
+                && current.status == bamboo_domain::ActorActivationStatus::Running
+        })
+        || run_id.is_some_and(|id| id != fence.run_id)
+    {
+        return Err(AgentError::LLM("actor event authority changed".into()));
+    }
+    Ok(())
+}
+
 const MAX_DISPLAY_CALLS: usize = 4_096;
 const MAX_NESTED_DISPLAY_DEPTH: usize = 8;
 const MAX_DISPLAY_ID_BYTES: usize = 256;
@@ -5267,6 +5297,14 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             continue;
                         }
                         if plain_actor && !plain_actor_event(&event)? { continue; }
+                        if let Some(activation) = plain_input {
+                            validate_directory_actor_event(
+                                activation.store.as_ref(),
+                                &activation.fence,
+                                logical_session,
+                                None,
+                            ).await?;
+                        }
                         // Rolling-upgrade compatibility: old actors have no
                         // route/sequence metadata, but retain the same typed
                         // permission handshake and event validation.
@@ -5292,6 +5330,15 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             expected_source_actor_id,
                             expected_creation,
                         )?;
+                        if let Some(activation) = plain_input {
+                            validate_directory_actor_event(
+                                activation.store.as_ref(),
+                                &activation.fence,
+                                logical_session,
+                                batch.activation_id.as_deref(),
+                            )
+                            .await?;
+                        }
                         if local_history.is_some() && batch.first_seq != next_actor_event_seq {
                             return Err(local_tool_history_unsupported());
                         }
@@ -5299,7 +5346,11 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             continue;
                         }
                         if batch.first_seq > next_actor_event_seq {
-                            if plain_actor { return Err(plain_actor_unsupported()); }
+                            if plain_actor {
+                                return Err(AgentError::LLM(
+                                    "actor event sequence gap; authoritative session snapshot is required".into(),
+                                ));
+                            }
                             tracing::warn!(
                                 child_session_id,
                                 expected_seq = next_actor_event_seq,
@@ -8775,6 +8826,72 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("different physical actor"));
+    }
+
+    #[tokio::test]
+    async fn directory_event_ingress_rejects_old_attempt_and_forged_identity() {
+        use bamboo_domain::Storage;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let parent = Session::new("event-parent", "model");
+        let child = Session::new_child_of("event-child", &parent, "model", "task");
+        store.save_session(&parent).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        store.ensure_actor(&child.id).await.unwrap();
+        let now = chrono::Utc::now();
+        let claim = |run_id: &str| ActorActivationClaim {
+            actor_id: child.id.clone(),
+            run_id: run_id.into(),
+            lease_owner: "event-owner".into(),
+            lease_expires_at: now + chrono::Duration::minutes(2),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        };
+        let first = store.claim_activation(&claim("run-one")).await.unwrap();
+        store.start_activation(&first.fence(), now).await.unwrap();
+        let first_fence = first.fence();
+        validate_directory_actor_event(&store, &first_fence, &child, Some("run-one"))
+            .await
+            .unwrap();
+        validate_directory_actor_event(&store, &first_fence, &child, None)
+            .await
+            .unwrap(); // rolling-upgrade frame uses the same owner
+        assert!(
+            validate_directory_actor_event(&store, &first_fence, &child, Some("forged-run"))
+                .await
+                .is_err()
+        );
+        let mut forged = child.clone();
+        forged.root_session_id = "foreign-root".into();
+        assert!(
+            validate_directory_actor_event(&store, &first_fence, &forged, Some("run-one"))
+                .await
+                .is_err()
+        );
+
+        store
+            .finish_activation(&first_fence, now, ActorActivationFinish::Failed)
+            .await
+            .unwrap();
+        let second = store.claim_activation(&claim("run-two")).await.unwrap();
+        store.start_activation(&second.fence(), now).await.unwrap();
+        assert!(
+            validate_directory_actor_event(&store, &first_fence, &child, Some("run-one"))
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_directory_actor_event(&store, &first_fence, &child, None)
+                .await
+                .is_err()
+        );
+        validate_directory_actor_event(&store, &second.fence(), &child, Some("run-two"))
+            .await
+            .unwrap();
     }
 
     fn completed_actor_frame() -> ChildFrame {
