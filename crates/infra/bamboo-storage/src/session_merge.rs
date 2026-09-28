@@ -571,6 +571,56 @@ impl LockedSessionStore {
         self.save_runtime_only_and_publish(session, |_| {}).await
     }
 
+    /// Commit an auto-run promise for the exact child generation the caller
+    /// prepared. The adapter uses this for launch paths (such as Plan) that
+    /// first saved a draft and only later chose to enqueue it. Read and write
+    /// the lightweight control plane under one per-session lock, so a stale
+    /// enqueue cannot give an older generation a new launch promise.
+    pub async fn ensure_child_auto_run_launch_intent(
+        &self,
+        expected: &Session,
+    ) -> std::io::Result<Option<Session>> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        let Some(mut latest) = self
+            .storage
+            .load_runtime_control_plane(&expected.id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let generation = expected.child_launch_generation();
+        if latest.kind != bamboo_domain::SessionKind::Child
+            || latest.created_at != expected.created_at
+            || latest.parent_session_id != expected.parent_session_id
+            || latest.root_session_id != expected.root_session_id
+            || latest.child_launch_generation() != generation
+            || latest.is_child_launch_cancelled(generation)
+        {
+            return Ok(None);
+        }
+        if latest.last_run_status().as_deref() != Some("pending") {
+            // Keep the scheduler's existing AlreadyCommitted behavior for a
+            // duplicate delivery after this same promised run has started.
+            // Recovery itself still filters strictly to pending sessions.
+            let already_promised = latest
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.child_auto_run_launch_intent_generation)
+                == Some(generation);
+            let already_started = matches!(
+                latest.last_run_status().as_deref(),
+                Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended")
+            );
+            return Ok((already_promised && already_started).then_some(latest));
+        }
+        if latest.recoverable_child_launch_generation() != Some(generation) {
+            latest.mark_child_auto_run_launch_intent();
+            self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+                .await?;
+        }
+        Ok(Some(latest))
+    }
+
     /// Save the runtime control-plane and synchronously publish the committed
     /// snapshot before releasing this session's serialization lock.
     ///
@@ -2370,6 +2420,20 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
                 .runtime_metadata
                 .get_or_insert_with(Default::default)
                 .child_cancelled_generation = latest_cancelled;
+        }
+        let latest_intent = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation);
+        let incoming_intent = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation);
+        if latest_intent > incoming_intent {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_auto_run_launch_intent_generation = latest_intent;
         }
     }
     // Identity is independent of the UI metadata revision. Preserve it in the

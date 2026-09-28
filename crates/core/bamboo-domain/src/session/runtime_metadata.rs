@@ -71,6 +71,10 @@ pub struct SessionRuntimeMetadata {
     /// Highest child launch generation cancelled by its parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_cancelled_generation: Option<u64>,
+    /// Explicit auto-run intent committed before queue admission. Only this
+    /// exact pending launch generation is eligible for startup recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_auto_run_launch_intent_generation: Option<u64>,
     /// Provider name pinned to this session (legacy `metadata["provider_name"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,

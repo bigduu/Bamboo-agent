@@ -52,6 +52,10 @@ pub struct ChildSessionAdapter {
     /// calls at once → `join_all`) into a single parent persist. See
     /// [`ChildSessionAdapter::register_parent_wait_for_child`].
     pub(crate) parent_wait_slots: Arc<dashmap::DashMap<String, Arc<ParentWaitSlot>>>,
+    /// A boot reconciliation pass may be repeated while its first enqueue is
+    /// still pending. Retain one queue admission per child/generation in this
+    /// process; a new process reconstructs it from durable intent.
+    pub(crate) recovered_launches: Arc<dashmap::DashMap<String, u64>>,
 }
 
 /// Per-parent coalescing slot for batched wait registration.
@@ -180,7 +184,120 @@ impl ChildSessionAdapter {
             // Fresh per-adapter wait-coalescing map (the type is private to this
             // crate, so out-of-crate callers can't supply it).
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            recovered_launches: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Re-enqueue only durable auto-run intents that have not begun running.
+    /// This pass is safe to repeat during boot and after a process restart:
+    /// the scheduler rechecks the exact generation under its launch guard.
+    pub async fn reconcile_pending_child_launches(&self) -> Result<usize, ChildSessionError> {
+        let mut enqueued = 0;
+        let mut first_error = None;
+        for entry in self.session_store.list_index_entries().await {
+            if entry.kind != SessionKind::Child
+                || entry.last_run_status.as_deref() != Some("pending")
+            {
+                continue;
+            }
+            let child = match self.storage.load_runtime_control_plane(&entry.id).await {
+                Ok(Some(child)) => child,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(child_id = %entry.id, %error, "failed to load pending child launch");
+                    first_error
+                        .get_or_insert_with(|| ChildSessionError::Execution(error.to_string()));
+                    continue;
+                }
+            };
+            let Some(generation) = child.recoverable_child_launch_generation() else {
+                continue;
+            };
+            let Some(parent_id) = child.parent_session_id.as_deref() else {
+                continue;
+            };
+            let parent = match self.storage.load_runtime_control_plane(parent_id).await {
+                Ok(Some(parent)) => parent,
+                Ok(None) => {
+                    tracing::warn!(child_id = %child.id, parent_id, "pending child launch has no parent");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(child_id = %child.id, parent_id, %error, "failed to load parent for pending child launch");
+                    first_error
+                        .get_or_insert_with(|| ChildSessionError::Execution(error.to_string()));
+                    continue;
+                }
+            };
+            if parent.root_session_id != child.root_session_id || parent.id == child.id {
+                tracing::warn!(child_id = %child.id, parent_id, "pending child launch has invalid parent authority");
+                continue;
+            }
+            let already_enqueued = match self.recovered_launches.entry(child.id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(slot) if *slot.get() == generation => true,
+                dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                    slot.insert(generation);
+                    false
+                }
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(generation);
+                    false
+                }
+            };
+            if already_enqueued {
+                continue;
+            }
+            let job = match Self::child_spawn_job(&parent, &child) {
+                Ok(job) => job,
+                Err(error) => {
+                    self.recovered_launches
+                        .remove_if(&child.id, |_, value| *value == generation);
+                    tracing::warn!(child_id = %child.id, %error, "invalid pending child launch");
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            let admission = self
+                .scheduler
+                .enqueue_announced_for_generation(
+                    job,
+                    Some(child.title.clone()),
+                    None,
+                    Some(generation),
+                )
+                .await;
+            match admission {
+                Ok(bamboo_domain::AdmissionCommit::Committed(())) => enqueued += 1,
+                Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => {}
+                Ok(bamboo_domain::AdmissionCommit::Cancelled) | Err(_) => {
+                    self.recovered_launches
+                        .remove_if(&child.id, |_, value| *value == generation);
+                    if let Err(error) = admission {
+                        tracing::warn!(child_id = %child.id, %error, "failed to recover pending child launch");
+                        first_error.get_or_insert(ChildSessionError::Execution(error));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(enqueued),
+        }
+    }
+
+    async fn ensure_child_launch_intent(
+        &self,
+        child: &Session,
+    ) -> Result<Session, ChildSessionError> {
+        self.persistence
+            .ensure_child_auto_run_launch_intent(child)
+            .await
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+            .ok_or_else(|| {
+                ChildSessionError::Execution(
+                    "child launch is no longer the current pending generation".into(),
+                )
+            })
     }
 
     /// Resolve the provider+model ref for a given subagent_type using the configured resolver.
@@ -1095,10 +1212,11 @@ impl ChildSessionPort for ChildSessionAdapter {
         // step so the model can spawn several children without each one
         // suspending it — see `register_parent_wait_for_child` /
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
+        let child = self.ensure_child_launch_intent(child).await?;
         let admission = self
             .scheduler
             .enqueue_announced_for_generation(
-                Self::child_spawn_job(parent, child)?,
+                Self::child_spawn_job(parent, &child)?,
                 Some(child.title.clone()),
                 None,
                 Some(child.child_launch_generation()),
@@ -1120,9 +1238,10 @@ impl ChildSessionPort for ChildSessionAdapter {
         child: &Session,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        let child = self.ensure_child_launch_intent(child).await?;
         self.scheduler
             .enqueue_announced_for_generation(
-                Self::child_spawn_job(parent, child)?,
+                Self::child_spawn_job(parent, &child)?,
                 Some(child.title.clone()),
                 gate,
                 Some(child.child_launch_generation()),

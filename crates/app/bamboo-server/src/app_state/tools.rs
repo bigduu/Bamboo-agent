@@ -352,6 +352,7 @@ pub(super) fn build_root_tools(
         project_store: Some(project_store.clone()),
         workspace_resolver: workspace_resolver.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.

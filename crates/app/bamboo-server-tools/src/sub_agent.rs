@@ -1358,6 +1358,7 @@ impl SubAgentTool {
                                 None,
                                 reasoning_effort,
                                 assignment_background,
+                                should_auto_run,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1675,6 +1676,7 @@ impl SubAgentTool {
                     reset_after_update,
                     model_ref_override,
                     reasoning_effort,
+                    auto_run.unwrap_or(false),
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;

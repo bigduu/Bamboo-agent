@@ -1074,6 +1074,7 @@ impl AppState {
             project_store: Some(project_store.clone()),
             workspace_resolver: workspace_resolver.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            recovered_launches: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         // Wire the spawner into the completion coordinator too, so a resumed run
@@ -1081,6 +1082,13 @@ impl AppState {
         child_completion_coordinator
             .set_guardian_spawner(guardian_spawner.clone())
             .await;
+
+        // Recover an accepted auto-run after a crash between its durable save,
+        // queue admission, and worker reservation. Draft children have no
+        // launch intent, and the scheduler fences any stale generation again.
+        if let Err(error) = child_adapter.reconcile_pending_child_launches().await {
+            tracing::warn!(%error, "failed to reconcile pending child launches on startup");
+        }
 
         // The completion coordinator doubles as the bash self-resume hook
         // (issue #84 Phase 2b): it polls the live shell registry and resumes a

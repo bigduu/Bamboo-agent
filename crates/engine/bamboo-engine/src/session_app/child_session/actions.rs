@@ -341,6 +341,9 @@ pub async fn create_child_action(
     child
         .advance_child_launch_generation()
         .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
+    if input.auto_run {
+        child.mark_child_auto_run_launch_intent();
+    }
     child.clear_last_run_error();
 
     // Apply runtime metadata (e.g. external agent routing).
@@ -684,6 +687,7 @@ pub async fn update_child_action(
     reset_after_update: Option<bool>,
     model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    auto_run: bool,
 ) -> Result<serde_json::Value, ChildSessionError> {
     update_child_action_with_background(
         port,
@@ -697,6 +701,7 @@ pub async fn update_child_action(
         model_ref_override,
         reasoning_effort,
         None,
+        auto_run,
     )
     .await
 }
@@ -717,6 +722,7 @@ pub async fn update_child_action_with_background(
     model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
     assignment_background: Option<String>,
+    auto_run: bool,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(parent_id, &child_session_id)
@@ -800,6 +806,9 @@ pub async fn update_child_action_with_background(
         child.advance_child_launch_generation().ok_or_else(|| {
             ChildSessionError::Execution("child launch generation exhausted".into())
         })?;
+        if auto_run {
+            child.mark_child_auto_run_launch_intent();
+        }
         child.clear_last_run_error();
 
         let assignment = format_child_assignment_with_background(
@@ -884,6 +893,7 @@ pub async fn run_child_action(
     child
         .advance_child_launch_generation()
         .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
+    child.mark_child_auto_run_launch_intent();
     child.clear_last_run_error();
     child.updated_at = Utc::now();
     port.save_child_session(&mut child).await?;

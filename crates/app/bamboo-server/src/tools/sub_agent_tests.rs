@@ -476,6 +476,7 @@ async fn build_test_harness_with_hook(
             bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals,
         ),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
 
@@ -5359,6 +5360,251 @@ async fn queued_child_cancel_fences_duplicate_deliveries_and_explicit_retry() {
 }
 
 #[tokio::test]
+async fn startup_recovers_only_matching_pending_auto_run_intents() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Durable snapshots model a crash at the save-before-enqueue boundary.
+    // A draft beside the accepted auto-run must remain inert.
+    for (id, auto_run) in [("recover-saved", true), ("recover-draft", false)] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("bounded task"));
+        child.set_last_run_status("pending");
+        child.advance_child_launch_generation().unwrap();
+        if auto_run {
+            child.mark_child_auto_run_launch_intent();
+        }
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    for (id, status, stale, cancelled) in [
+        ("recover-running", "running", false, false),
+        ("recover-terminal", "completed", false, false),
+        ("recover-stale", "pending", true, false),
+        ("recover-cancelled", "pending", false, true),
+    ] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("bounded task"));
+        child.set_last_run_status(status);
+        child.advance_child_launch_generation().unwrap();
+        child.mark_child_auto_run_launch_intent();
+        if stale {
+            child.advance_child_launch_generation().unwrap();
+        }
+        if cancelled {
+            child.cancel_child_launch_generation();
+        }
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    let saved = harness
+        .storage
+        .load_session("recover-saved")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.recoverable_child_launch_generation(), Some(1));
+    let draft = harness
+        .storage
+        .load_session("recover-draft")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.recoverable_child_launch_generation(), None);
+
+    let reopened_store = Arc::new(
+        SessionStoreV2::new(harness.workspace_path.parent().unwrap().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let reopened_storage: Arc<dyn Storage> = reopened_store.clone();
+    let reopened_adapter = ChildSessionAdapter::new(
+        reopened_store,
+        reopened_storage.clone(),
+        Arc::new(bamboo_storage::LockedSessionStore::new(reopened_storage)),
+        harness.adapter.scheduler.clone(),
+        harness.adapter.sessions_cache.clone(),
+        harness.agent_runners.clone(),
+        harness.adapter.session_event_senders.clone(),
+        harness.adapter.session_messenger.clone(),
+        None,
+        harness.adapter.config.clone(),
+    );
+    assert_eq!(
+        reopened_adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("recover-saved")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saved launch intent should finish after restart");
+    assert_eq!(
+        reopened_adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    for (id, status) in [
+        ("recover-draft", "pending"),
+        ("recover-running", "running"),
+        ("recover-terminal", "completed"),
+        ("recover-stale", "pending"),
+        ("recover-cancelled", "pending"),
+    ] {
+        assert_eq!(
+            harness
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some(status),
+            "{id} must not launch"
+        );
+        assert!(harness.agent_runners.read().await.get(id).is_none());
+    }
+}
+
+#[tokio::test]
+async fn repeated_reconcile_during_queued_launch_admits_one_recovery() {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hook = Arc::new(QueueBoundaryHook {
+        before_child: "recover-queued".into(),
+        before_once: AtomicBool::new(true),
+        before_entered: entered.clone(),
+        before_release: release.clone(),
+        during_child: "unused".into(),
+        during_once: AtomicBool::new(false),
+        during_entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        during_release: Arc::new(tokio::sync::Semaphore::new(0)),
+    });
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook)).await;
+    let mut child = Session::new_child(
+        "recover-queued",
+        harness.parent_session_id.clone(),
+        "gpt-5",
+        "recover-queued",
+    );
+    child.add_message(Message::system("child system"));
+    child.add_message(Message::user("bounded task"));
+    child.set_last_run_status("pending");
+    child.advance_child_launch_generation().unwrap();
+    harness.storage.save_session(&child).await.unwrap();
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The admission boundary itself must persist the launch promise before
+    // acknowledging a queue entry (Plan promotes a draft this way).
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &child)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .storage
+            .load_session("recover-queued")
+            .await
+            .unwrap()
+            .unwrap()
+            .recoverable_child_launch_generation(),
+        Some(1)
+    );
+    entered.acquire().await.unwrap().forget();
+    // Model a fresh reconcile while the original admitted job has not run.
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        1
+    );
+    // The first job is admitted but has not reserved a runner. Repeated boot
+    // reconciliation must not add another copy to the process queue.
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get("recover-queued")
+        .is_none());
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("recover-queued")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued launch should finish once released");
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn list_returns_children() {
     let harness = build_test_harness().await;
 
@@ -5562,6 +5808,7 @@ async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
         project_store: harness.adapter.project_store.clone(),
         workspace_resolver: harness.adapter.workspace_resolver.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
     let reopened_tool = SubAgentTool::new(reopened_adapter.clone(), reopened_adapter);
     let message_next = inspect_child(

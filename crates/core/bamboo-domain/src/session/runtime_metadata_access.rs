@@ -125,6 +125,27 @@ impl Session {
         self.runtime_metadata_mut().child_cancelled_generation = Some(generation);
     }
 
+    /// Explicitly promise to launch the current Child generation. A draft
+    /// never acquires this marker merely by being `pending`.
+    pub fn mark_child_auto_run_launch_intent(&mut self) {
+        let generation = self.child_launch_generation();
+        self.runtime_metadata_mut()
+            .child_auto_run_launch_intent_generation = Some(generation);
+    }
+
+    /// Reconciliation is deliberately narrower than a `pending` status:
+    /// an old intent cannot borrow a later draft/retry generation.
+    pub fn recoverable_child_launch_generation(&self) -> Option<u64> {
+        if self.kind != SessionKind::Child || self.last_run_status().as_deref() != Some("pending") {
+            return None;
+        }
+        let generation = self.child_launch_generation();
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation)
+            .filter(|intent| *intent == generation && !self.is_child_launch_cancelled(*intent))
+    }
+
     // ------------------------------------------------------------------
     // provider_name
     // ------------------------------------------------------------------
