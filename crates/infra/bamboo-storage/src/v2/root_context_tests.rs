@@ -61,11 +61,14 @@ fn directory(store: &SessionStoreV2, id: &str) -> PathBuf {
     store.sessions_root_dir().join(id)
 }
 
-async fn files(store: &SessionStoreV2, id: &str) -> [Option<Vec<u8>>; 3] {
+async fn files(store: &SessionStoreV2, id: &str) -> [Option<Vec<u8>>; 4] {
     let directory = directory(store, id);
     [
         fs::read(directory.join("session.json")).await.ok(),
         fs::read(directory.join(RUNTIME_SIDECAR_FILE)).await.ok(),
+        fs::read(directory.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .ok(),
         fs::read(store.index_path()).await.ok(),
     ]
 }
@@ -292,7 +295,7 @@ async fn restored_stale_valid_root_sidecar_cannot_reopen_or_overwrite_tool_autho
                 .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
             "{error:?}"
         );
-        assert!(error.to_string().contains("tool authority is stale"));
+        assert!(error.to_string().contains("stale"));
     }
     let before = files(&fixture.first, &initial.id).await;
     for candidate in [&initial, &selected] {
@@ -811,6 +814,12 @@ async fn missing_main_allows_only_full_retry_with_the_exact_runtime_root_context
         .await
         .unwrap();
     let before = files(&fixture.first, &initial.id).await;
+    assert!(fixture.second.load_session(&initial.id).await.is_err());
+    assert!(fixture
+        .second
+        .load_runtime_control_plane(&initial.id)
+        .await
+        .is_err());
     for changed in [
         "created_at",
         "identity",
@@ -942,4 +951,721 @@ async fn runtime_save_with_a_stale_index_preserves_canonical_history_and_task_ge
         .finish()
         .await;
     }
+}
+
+#[tokio::test]
+async fn root_tool_proof_crash_order_fails_closed_for_enable_and_explicit_disable() {
+    use root_context::RootToolProofFault;
+
+    for enable in [true, false] {
+        for fault in [
+            RootToolProofFault::Prepared,
+            RootToolProofFault::Runtime,
+            RootToolProofFault::Main,
+            RootToolProofFault::Committed,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let writer = SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            let mut initial = root();
+            if !enable {
+                initial.set_root_orchestration_only(true).unwrap();
+            }
+            writer.save_session(&initial).await.unwrap();
+            let mut incoming = initial.clone();
+            incoming.set_root_orchestration_only(enable).unwrap();
+            *writer.root_tool_proof_fault.lock().unwrap() = Some(fault);
+            assert!(writer.save_session(&incoming).await.is_err());
+            writer.flush_search_index().await;
+            drop(writer);
+
+            let reopened = SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            if fault == RootToolProofFault::Committed {
+                for loaded in [
+                    reopened.load_session(&incoming.id).await.unwrap().unwrap(),
+                    reopened
+                        .load_runtime_control_plane(&incoming.id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                ] {
+                    assert_eq!(loaded.root_orchestration_only, enable);
+                    assert_eq!(
+                        loaded.root_tool_authority_revision,
+                        incoming.root_tool_authority_revision
+                    );
+                }
+                reject_without_writes(&reopened, &initial).await;
+            } else {
+                for error in [
+                    reopened.load_session(&incoming.id).await.unwrap_err(),
+                    reopened
+                        .load_runtime_control_plane(&incoming.id)
+                        .await
+                        .unwrap_err(),
+                    reopened
+                        .recover_root_session_from_disk(&incoming.id)
+                        .await
+                        .unwrap_err(),
+                ] {
+                    assert!(
+                        error
+                            .get_ref()
+                            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                        "enable={enable}, fault={fault:?}: {error:?}"
+                    );
+                }
+                reject_without_writes(&reopened, &initial).await;
+                reject_without_writes(&reopened, &incoming).await;
+            }
+            reopened.flush_search_index().await;
+            drop(reopened);
+            home.close().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_corrupt_or_stale_root_tool_proof_never_reopens_authority() {
+    for damage in ["missing", "corrupt", "stale"] {
+        let home = tempfile::tempdir().unwrap();
+        let writer = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let initial = root();
+        writer.save_session(&initial).await.unwrap();
+        let proof =
+            directory(&writer, &initial.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+        let stale_proof = fs::read(&proof).await.unwrap();
+        let mut selected = initial.clone();
+        selected.set_root_orchestration_only(true).unwrap();
+        writer.save_session(&selected).await.unwrap();
+        match damage {
+            "missing" => fs::remove_file(&proof).await.unwrap(),
+            "corrupt" => fs::write(&proof, b"{bad").await.unwrap(),
+            "stale" => fs::write(&proof, stale_proof).await.unwrap(),
+            _ => unreachable!(),
+        }
+        writer.flush_search_index().await;
+        drop(writer);
+        let reopened = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        for error in [
+            reopened.load_session(&selected.id).await.unwrap_err(),
+            reopened
+                .load_runtime_control_plane(&selected.id)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                "damage={damage}: {error:?}"
+            );
+        }
+        reject_without_writes(&reopened, &initial).await;
+        reject_without_writes(&reopened, &selected).await;
+        reopened.flush_search_index().await;
+        drop(reopened);
+        home.close().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn one_time_root_tool_proof_migration_requires_a_valid_existing_pair() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let initial = root();
+    writer.save_session(&initial).await.unwrap();
+    let proof = directory(&writer, &initial.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    fs::remove_file(&proof).await.unwrap();
+    fs::remove_file(home.path().join(".root_tool_authority_proof_v1"))
+        .await
+        .unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+
+    let migrated = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(proof.exists());
+    assert!(migrated.load_session(&initial.id).await.unwrap().is_some());
+    fs::remove_file(&proof).await.unwrap();
+    migrated.flush_search_index().await;
+    drop(migrated);
+    let later = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(!proof.exists());
+    assert!(later.load_session(&initial.id).await.is_err());
+    later.flush_search_index().await;
+    drop(later);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn migration_does_not_commit_a_legacy_sidecar_ahead_of_main_selection() {
+    for enable in [true, false] {
+        let home = tempfile::tempdir().unwrap();
+        let writer = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut main = root();
+        if !enable {
+            main.set_root_orchestration_only(true).unwrap();
+        }
+        writer.save_session(&main).await.unwrap();
+        let mut side = main.clone();
+        side.set_root_orchestration_only(enable).unwrap();
+        let directory = directory(&writer, &main.id);
+        fs::write(
+            directory.join(RUNTIME_SIDECAR_FILE),
+            serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&side)).unwrap(),
+        )
+        .await
+        .unwrap();
+        fs::remove_file(directory.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .unwrap();
+        fs::remove_file(home.path().join(".root_tool_authority_proof_v1"))
+            .await
+            .unwrap();
+        writer.flush_search_index().await;
+        drop(writer);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(!directory
+            .join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)
+            .exists());
+        for error in [
+            reopened.load_session(&main.id).await.unwrap_err(),
+            reopened
+                .load_runtime_control_plane(&main.id)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+                "enable={enable}: {error:?}"
+            );
+        }
+        reopened.flush_search_index().await;
+        drop(reopened);
+        home.close().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn migration_does_not_prove_a_structurally_damaged_legacy_main() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let initial = root();
+    writer.save_session(&initial).await.unwrap();
+    let directory = directory(&writer, &initial.id);
+    let main = directory.join("session.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&main).await.unwrap()).unwrap();
+    value["messages"] = serde_json::json!(42);
+    fs::write(&main, serde_json::to_vec(&value).unwrap())
+        .await
+        .unwrap();
+    fs::remove_file(directory.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+        .await
+        .unwrap();
+    fs::remove_file(home.path().join(".root_tool_authority_proof_v1"))
+        .await
+        .unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(!directory
+        .join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)
+        .exists());
+    assert!(reopened
+        .load_runtime_control_plane(&initial.id)
+        .await
+        .is_err());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_main_only_root_without_index_reports_recovery_not_absence() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let initial = root();
+    writer.save_session(&initial).await.unwrap();
+    fs::remove_file(directory(&writer, &initial.id).join(RUNTIME_SIDECAR_FILE))
+        .await
+        .unwrap();
+    fs::remove_file(writer.index_path()).await.unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    for error in [
+        reopened.load_session(&initial.id).await.unwrap_err(),
+        reopened
+            .load_runtime_control_plane(&initial.id)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("Root index is missing"));
+    }
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn retained_revoked_root_miss_uses_bounded_identity_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let mut initial = root();
+    initial.add_message(Message::user("x".repeat(4 * 1024 * 1024)));
+    let foreign = Session::new("foreign-root", "model");
+    writer.save_session(&initial).await.unwrap();
+    writer.save_session(&foreign).await.unwrap();
+    writer.flush_search_index().await;
+    {
+        let _lifecycle = writer.lock_session_lifecycle_exclusive().await.unwrap();
+        let _task = writer
+            .lock_runtime_task_transaction_exclusive()
+            .await
+            .unwrap();
+        assert!(writer.revoke_root_lifetime(&initial.id).await.unwrap());
+    }
+    fs::remove_file(writer.index_path()).await.unwrap();
+    drop(writer);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(reopened.get_index_entry(&initial.id).await.is_none());
+    let retained = directory(&reopened, &initial.id);
+    let runtime = retained.join(RUNTIME_SIDECAR_FILE);
+    let original_runtime = fs::read(&runtime).await.unwrap();
+    for _ in 0..8 {
+        assert!(reopened
+            .load_runtime_control_plane(&initial.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reopened.load_session(&initial.id).await.unwrap().is_none());
+    }
+    // A revoked miss must not parse the potentially transcript-sized main.
+    fs::write(retained.join("session.json"), b"{invalid")
+        .await
+        .unwrap();
+    assert!(reopened
+        .load_runtime_control_plane(&initial.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(reopened.load_session(&initial.id).await.unwrap().is_none());
+
+    fs::copy(
+        directory(&reopened, &foreign.id).join(RUNTIME_SIDECAR_FILE),
+        &runtime,
+    )
+    .await
+    .unwrap();
+    for error in [
+        reopened
+            .load_runtime_control_plane(&initial.id)
+            .await
+            .unwrap_err(),
+        reopened.load_session(&initial.id).await.unwrap_err(),
+    ] {
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    }
+    fs::write(&runtime, original_runtime).await.unwrap();
+    fs::remove_file(retained.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+        .await
+        .unwrap();
+    assert!(reopened
+        .load_runtime_control_plane(&initial.id)
+        .await
+        .is_err());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_root_proof_migration_precedes_prepared_task_journal_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let initial = root();
+    let child = Session::new_child("z-task-child", &initial.id, "model", "child");
+    writer.save_session(&initial).await.unwrap();
+    writer.save_session(&child).await.unwrap();
+    let proof = directory(&writer, &initial.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    fs::remove_file(&proof).await.unwrap();
+    fs::remove_file(home.path().join(".root_tool_authority_proof_v1"))
+        .await
+        .unwrap();
+    let transaction_id = Uuid::new_v4().to_string();
+    let journal = RuntimeTaskTransactionJournal {
+        version: RUNTIME_TASK_TRANSACTION_VERSION,
+        transaction_id,
+        first: TaskControlPlaneUndo {
+            session_id: initial.id.clone(),
+            task_list: None,
+            task_list_version: String::new(),
+        },
+        second: TaskControlPlaneUndo {
+            session_id: child.id.clone(),
+            task_list: None,
+            task_list_version: String::new(),
+        },
+    };
+    writer.write_runtime_task_journal(&journal).await.unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(proof.exists());
+    assert!(reopened
+        .runtime_task_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened.load_session(&initial.id).await.unwrap().is_some());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_root_proof_migration_precedes_committed_copy_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let source = Session::new("copy-source", "model");
+    writer.save_session(&source).await.unwrap();
+    let copied = writer
+        .copy_session(&source.id, "copy-target")
+        .await
+        .unwrap()
+        .unwrap();
+    let journal = SessionCopyTransactionJournal {
+        version: SESSION_COPY_TRANSACTION_VERSION,
+        transaction_id: Uuid::new_v4().to_string(),
+        source_id: source.id.clone(),
+        target_id: copied.id.clone(),
+    };
+    let prepared = writer.write_session_copy_journal(&journal).await.unwrap();
+    let committed = prepared.with_extension("committed");
+    atomic_rename(&prepared, &committed).await.unwrap();
+    sync_parent_directory_entry(&committed).await.unwrap();
+    writer
+        .update_index(|index| {
+            index.sessions.remove(&copied.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for id in [&source.id, &copied.id] {
+        fs::remove_file(directory(&writer, id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .unwrap();
+    }
+    fs::remove_file(home.path().join(".root_tool_authority_proof_v1"))
+        .await
+        .unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(reopened.get_index_entry(&copied.id).await.is_some());
+    assert!(reopened.load_session(&source.id).await.unwrap().is_some());
+    assert!(reopened.load_session(&copied.id).await.unwrap().is_some());
+    assert!(reopened
+        .session_copy_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn invalid_proof_during_index_rebuild_retains_recovery_lookup_without_sidecar_projection() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let mut selected = root();
+    selected.set_root_orchestration_only(true).unwrap();
+    writer.save_session(&selected).await.unwrap();
+    let proof = directory(&writer, &selected.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    fs::write(&proof, b"{invalid").await.unwrap();
+    fs::write(writer.index_path(), b"{invalid").await.unwrap();
+    writer.flush_search_index().await;
+    drop(writer);
+
+    let rebuilt = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(rebuilt.get_index_entry(&selected.id).await.is_some());
+    let error = rebuilt.load_session(&selected.id).await.unwrap_err();
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    assert!(rebuilt
+        .load_runtime_control_plane(&selected.id)
+        .await
+        .is_err());
+    rebuilt.flush_search_index().await;
+    drop(rebuilt);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn full_root_reads_reject_child_kind_and_foreign_identity_even_after_index_rebuild() {
+    for tamper in ["child-kind", "foreign-id"] {
+        let home = tempfile::tempdir().unwrap();
+        let writer = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut selected = root();
+        selected.set_root_orchestration_only(true).unwrap();
+        writer.save_session(&selected).await.unwrap();
+        let foreign = Session::new("foreign-proof-root", "model");
+        writer.save_session(&foreign).await.unwrap();
+        let target = directory(&writer, &selected.id);
+        match tamper {
+            "child-kind" => {
+                let main = target.join("session.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&main).await.unwrap()).unwrap();
+                value["kind"] = serde_json::json!("child");
+                fs::write(main, serde_json::to_vec(&value).unwrap())
+                    .await
+                    .unwrap();
+            }
+            "foreign-id" => {
+                let source = directory(&writer, &foreign.id);
+                for file in ["session.json", RUNTIME_SIDECAR_FILE] {
+                    fs::copy(source.join(file), target.join(file))
+                        .await
+                        .unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        fs::remove_file(target.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .unwrap();
+        assert!(writer.load_session(&selected.id).await.is_err());
+        assert!(writer
+            .load_runtime_control_plane(&selected.id)
+            .await
+            .is_err());
+        fs::write(writer.index_path(), b"{invalid").await.unwrap();
+        writer.flush_search_index().await;
+        drop(writer);
+
+        let rebuilt = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(!matches!(
+            rebuilt.load_session(&selected.id).await,
+            Ok(Some(_))
+        ));
+        assert!(!matches!(
+            rebuilt.load_runtime_control_plane(&selected.id).await,
+            Ok(Some(_))
+        ));
+        rebuilt.flush_search_index().await;
+        drop(rebuilt);
+        home.close().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn indexed_runtime_save_preserves_tool_proof_when_main_is_later_damaged() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let main = directory(&fixture.first, &initial.id).join("session.json");
+    let proof =
+        directory(&fixture.first, &initial.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    let proof_before = fs::read(&proof).await.unwrap();
+    fs::write(&main, b"{invalid").await.unwrap();
+    let mut runtime = initial.clone();
+    runtime
+        .metadata
+        .insert("last_run_status".into(), "completed".into());
+    fixture.second.save_runtime_state(&runtime).await.unwrap();
+    assert_eq!(fs::read(&proof).await.unwrap(), proof_before);
+    assert_eq!(fs::read(&main).await.unwrap(), b"{invalid");
+    assert!(fixture.second.load_session(&initial.id).await.is_err());
+    assert!(fixture.second.save_session(&runtime).await.is_err());
+    let control = fixture
+        .second
+        .load_runtime_control_plane(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        control.root_orchestration_only,
+        initial.root_orchestration_only
+    );
+    assert_eq!(
+        control.root_tool_authority_revision,
+        initial.root_tool_authority_revision
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn full_save_does_not_overwrite_a_structurally_invalid_main_transcript() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let main = directory(&fixture.first, &initial.id).join("session.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&main).await.unwrap()).unwrap();
+    value["messages"] = serde_json::json!(42);
+    let damaged = serde_json::to_vec(&value).unwrap();
+    fs::write(&main, &damaged).await.unwrap();
+    let error = fixture.second.save_session(&initial).await.unwrap_err();
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    assert_eq!(fs::read(&main).await.unwrap(), damaged);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn selected_root_copy_has_an_independent_durable_proof() {
+    let home = tempfile::tempdir().unwrap();
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let mut selected = root();
+    selected.set_root_orchestration_only(true).unwrap();
+    writer.save_session(&selected).await.unwrap();
+    let copied = writer
+        .copy_session(&selected.id, "copied-selected-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        copied.root_orchestration_only,
+        selected.root_orchestration_only
+    );
+    assert_eq!(
+        copied.root_tool_authority_revision,
+        selected.root_tool_authority_revision
+    );
+    let source_proof = fs::read(
+        directory(&writer, &selected.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE),
+    )
+    .await
+    .unwrap();
+    let copy_proof =
+        fs::read(directory(&writer, &copied.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .unwrap();
+    assert_ne!(source_proof, copy_proof);
+    writer.flush_search_index().await;
+    drop(writer);
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(reopened
+        .load_runtime_control_plane(&copied.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .root_orchestration_only_enabled());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn root_control_plane_read_cost_is_bounded_for_large_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let small = Session::new("small-proof-root", "model");
+    store.save_session(&small).await.unwrap();
+    let mut large = Session::new("large-proof-root", "model");
+    large.add_message(Message::user("x".repeat(4 * 1024 * 1024)));
+    store.save_session(&large).await.unwrap();
+    let large_dir = directory(&store, &large.id);
+    assert!(
+        fs::metadata(large_dir.join("session.json"))
+            .await
+            .unwrap()
+            .len()
+            > 4 * 1024 * 1024
+    );
+    assert!(
+        fs::metadata(large_dir.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+            .await
+            .unwrap()
+            .len()
+            < 4096
+    );
+    let mut durations = Vec::new();
+    for id in [&small.id, &large.id] {
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let side = store.load_runtime_control_plane(id).await.unwrap().unwrap();
+            assert!(side.messages.is_empty());
+        }
+        durations.push(started.elapsed());
+    }
+    eprintln!(
+        "Root control-plane 20 reads: small={:?}, 4MiB={:?}",
+        durations[0], durations[1]
+    );
+    let started = std::time::Instant::now();
+    store.save_runtime_state(&large).await.unwrap();
+    eprintln!("Root 4MiB runtime-only save: {:?}", started.elapsed());
+    store.flush_search_index().await;
+    drop(store);
+    home.close().unwrap();
 }
