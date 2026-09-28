@@ -1130,6 +1130,16 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         .metadata
         .get(bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
         .is_some_and(|source| source == "startup");
+    // An explicit empty Skill selection can retire an existing Workflow while
+    // enabling the narrow Root. Its durable snapshot and live pin must be
+    // retired together with the final user turn, not at the early checkpoint.
+    let root_workflow_switch = req.root_orchestration_only == Some(true)
+        && req
+            .selected_skill_ids
+            .as_ref()
+            .is_some_and(|ids| ids.iter().all(|id| id.trim().is_empty()))
+        && !root_tool_authority_checkpoint.orchestration_only
+        && session.root_orchestration_only_enabled();
     if requested_workflow_selection.is_some() && session.root_orchestration_only_enabled() {
         return HttpResponse::Conflict().json(serde_json::json!({
             "error": {
@@ -1265,7 +1275,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // the final session save and pin handoff. The persistence lock linearizes
     // HTTP execute startup; the runners guard closes reservation races from
     // resume, schedule and connect entry points.
-    let workflow_commit_guard = if staged_workflow_activation.is_some() {
+    let workflow_commit_guard = if staged_workflow_activation.is_some() || root_workflow_switch {
         let runners = state.agent_runners.clone().read_owned().await;
         let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
         let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
@@ -1298,21 +1308,41 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         return response;
     }
 
-    if let Some(mut staging) = staged_workflow_activation {
-        staging.apply(&mut session.metadata);
+    if root_workflow_switch {
+        // The old candidate can otherwise be restored on the next execute,
+        // even after the visible Workflow selection was removed. Preserve the
+        // deactivation event and run history while retiring executable state.
+        session.metadata.retain(|key, _| {
+            !key.starts_with("skill_runtime_")
+                && !matches!(
+                    key.as_str(),
+                    "skill.context"
+                        | "workflow.context_cache.v1"
+                        | "workflow.dynamic_context.last.v1"
+                        | "workflow.catalog_diagnostic.v1"
+                )
+        });
+        bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
+    }
+
+    if staged_workflow_activation.is_some() || root_workflow_switch {
+        let mut staging = staged_workflow_activation;
+        if let Some(staging) = staging.as_ref() {
+            staging.apply(&mut session.metadata);
+        }
         let commit_state = state.clone();
         let commit_session_id = session_id.clone();
         let commit = tokio::spawn(async move {
-            // These owned guards make the exact save -> pin handoff
-            // cancellation-resistant. Dropping the caller's HTTP future only
-            // detaches this task; it cannot expose committed B metadata while
-            // the session-id pin still serves A.
+            // Keep final save -> old pin release cancellation-resistant for
+            // both a replacement Workflow and a Workflow-to-Root switch.
             let _persistence_guard = persistence_guard;
             let _workflow_commit_guard = workflow_commit_guard;
             if let Err(error) =
                 persist_and_cache_session_locked(commit_state.as_ref(), &session).await
             {
-                staging.release().await;
+                if let Some(staging) = staging.as_mut() {
+                    staging.release().await;
+                }
                 return Err(error.to_string());
             }
             #[cfg(test)]
@@ -1331,7 +1361,9 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
                     "failed to release prior Workflow activation after commit"
                 );
             }
-            staging.release().await;
+            if let Some(staging) = staging.as_mut() {
+                staging.release().await;
+            }
             publish_committed_chat(&commit_state, &session);
             Ok::<(), String>(())
         });
@@ -1345,10 +1377,10 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
                 }));
             }
             Err(error) => {
-                tracing::error!(%error, "typed Workflow chat commit task failed");
+                tracing::error!(%error, "Workflow authority chat commit task failed");
                 return crate::error::json_error(
                     actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to commit typed Workflow chat",
+                    "Failed to commit Workflow authority chat",
                 );
             }
         }

@@ -478,7 +478,7 @@ mod optional_model_e2e {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::sync::Semaphore;
 
@@ -676,6 +676,160 @@ mod optional_model_e2e {
             after_failed_enable.messages.len(),
             before_failed_enable.messages.len()
         );
+    }
+
+    struct RootSwitchProvider {
+        system_prompts: Mutex<Vec<String>>,
+        started: Semaphore,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RootSwitchProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let system_prompt = messages
+                .iter()
+                .filter(|message| message.role == bamboo_agent_core::Role::System)
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.system_prompts.lock().unwrap().push(system_prompt);
+            self.started.add_permits(1);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token("done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn assert_workflow_to_root_switch_retires_pin_before_next_execute(
+        id: &str,
+        selected_skill_ids: Value,
+    ) {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("test-model".into()),
+            ..Default::default()
+        });
+        let provider = Arc::new(RootSwitchProvider {
+            system_prompts: Mutex::new(Vec::new()),
+            started: Semaphore::new(0),
+        });
+        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
+        let mut app_state = AppState::new_with_provider(data_dir, config, provider_trait)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert("openai".into(), provider.clone() as Arc<dyn LLMProvider>);
+        app_state.provider_registry = Arc::new(ProviderRegistry::new(providers, "openai".into()));
+        app_state.provider_router = Arc::new(ProviderModelRouter::new(
+            app_state.provider_registry.clone(),
+        ));
+        let state = web::Data::new(app_state);
+        seed_active_instruction_workflow(&state, id, "review").await;
+        let mut seeded = state.storage.load_session(id).await.unwrap().unwrap();
+        seeded.title_generated = true;
+        seeded.metadata.insert(
+            "skill.context".into(),
+            "STALE_WORKFLOW_INSTRUCTION_DO_NOT_RENDER".into(),
+        );
+        state.save_and_cache_session(&mut seeded).await;
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(id, None)
+            .await
+            .unwrap()
+            .is_some());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "delegate bounded work",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                    "selected_skill_ids": selected_skill_ids,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::CREATED);
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(saved.root_orchestration_only_enabled());
+        assert!(saved.selected_skill_ids().is_none());
+        for key in [
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+            "skill.context",
+        ] {
+            assert!(!saved.metadata.contains_key(key), "stale {key}");
+        }
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(id, None)
+            .await
+            .unwrap()
+            .is_none());
+
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.started.acquire(),
+        )
+        .await
+        .expect("next execute reached provider")
+        .expect("provider semaphore open")
+        .forget();
+        let prompts = provider.system_prompts.lock().unwrap().join("\n");
+        assert!(!prompts.contains("STALE_WORKFLOW_INSTRUCTION_DO_NOT_RENDER"));
+        assert!(!prompts.contains("Required Explicit Workflow Activation"));
+        assert!(!prompts.contains("Explicit Workflow Already Activated"));
+    }
+
+    #[actix_web::test]
+    async fn successful_workflow_to_root_switch_retires_pin_before_next_execute() {
+        assert_workflow_to_root_switch_retires_pin_before_next_execute(
+            "root-workflow-retire-empty",
+            serde_json::json!([]),
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn whitespace_only_workflow_to_root_switch_retires_pin_before_next_execute() {
+        assert_workflow_to_root_switch_retires_pin_before_next_execute(
+            "root-workflow-retire-blank",
+            serde_json::json!([" "]),
+        )
+        .await;
     }
 
     #[actix_web::test]

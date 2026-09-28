@@ -374,157 +374,163 @@ impl Agent {
     /// Shared execution path: prepare the session (system prompt + model), build
     /// the [`ExecuteRequest`], and delegate to the canonical engine execution
     /// path. Tool restriction is applied via the agent's executor (built time).
-    async fn execute_internal(
-        &self,
-        session: &mut Session,
+    fn execute_internal<'a>(
+        &'a self,
+        session: &'a mut Session,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
-    ) -> Result<(), AgentError> {
-        // Own the logical session before any pre-execution mutation or approved
-        // tool replay. Two cloned SDK Session values must collide before either
-        // can duplicate a mutating side effect.
-        let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
-        if session.project_id_meta().is_none() {
-            if let Some(project_id) = self.project_id.as_ref() {
-                let existing = if session.kind == bamboo_domain::SessionKind::Root {
-                    match self.storage().load_root_authority(&session.id).await {
-                        // Preserve compatibility for custom Storage backends that
-                        // predate the strict Root port. V2 always uses its canonical
-                        // directory lookup, even when this instance's index is stale.
-                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                            self.storage().load_session(&session.id).await
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
+    {
+        // Keep the shared execution body off nested public run/resume futures.
+        // The boxed future retains the existing ownership and cancellation order.
+        Box::pin(async move {
+            // Own the logical session before any pre-execution mutation or approved
+            // tool replay. Two cloned SDK Session values must collide before either
+            // can duplicate a mutating side effect.
+            let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
+            if session.project_id_meta().is_none() {
+                if let Some(project_id) = self.project_id.as_ref() {
+                    let existing = if session.kind == bamboo_domain::SessionKind::Root {
+                        match self.storage().load_root_authority(&session.id).await {
+                            // Preserve compatibility for custom Storage backends that
+                            // predate the strict Root port. V2 always uses its canonical
+                            // directory lookup, even when this instance's index is stale.
+                            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                                self.storage().load_session(&session.id).await
+                            }
+                            result => result,
                         }
-                        result => result,
+                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?
+                    } else {
+                        None
+                    };
+                    if let Some(current) = existing {
+                        if current.kind != bamboo_domain::SessionKind::Root
+                            || current.created_at != session.created_at
+                            || current.metadata_version != session.metadata_version
+                            || current.authority_identity != session.authority_identity
+                            || current.project_id_meta().is_some()
+                        {
+                            return Err(AgentError::ProjectContext(
+                                "Session context changed; reload before assigning its first Project"
+                                    .to_string(),
+                            ));
+                        }
+                        let next_version =
+                            current.metadata_version.checked_add(1).ok_or_else(|| {
+                                AgentError::ProjectContext(
+                                    "Session metadata revision cannot advance".to_string(),
+                                )
+                            })?;
+                        let mut candidate = session.clone();
+                        candidate.set_project_id_meta(project_id.to_string());
+                        candidate.metadata_version = next_version;
+                        candidate.updated_at = std::time::SystemTime::now().into();
+                        self.inner
+                            .prepare_external_project_assignment_read_only(&mut candidate)
+                            .await?;
+                        #[cfg(test)]
+                        reexecute_and_child_approval_tests::pause_project_assignment(&session.id)
+                            .await;
+                        // Commit the narrow context change before publishing a runtime
+                        // workspace or replaying an approved tool. The final writer
+                        // fences an independent store's competing assignment. The
+                        // V2 runtime path leaves conversation history untouched.
+                        self.storage()
+                            .save_runtime_state(&candidate)
+                            .await
+                            .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
+                        *session = candidate;
+                    } else {
+                        // First creation keeps its existing revision and persistence
+                        // lifecycle; Child assignment keeps its prior SDK semantics.
+                        session.set_project_id_meta(project_id.to_string());
                     }
-                    .map_err(|error| AgentError::ProjectContext(error.to_string()))?
-                } else {
-                    None
-                };
-                if let Some(current) = existing {
-                    if current.kind != bamboo_domain::SessionKind::Root
-                        || current.created_at != session.created_at
-                        || current.metadata_version != session.metadata_version
-                        || current.authority_identity != session.authority_identity
-                        || current.project_id_meta().is_some()
-                    {
-                        return Err(AgentError::ProjectContext(
-                            "Session context changed; reload before assigning its first Project"
-                                .to_string(),
-                        ));
-                    }
-                    let next_version =
-                        current.metadata_version.checked_add(1).ok_or_else(|| {
-                            AgentError::ProjectContext(
-                                "Session metadata revision cannot advance".to_string(),
-                            )
-                        })?;
-                    let mut candidate = session.clone();
-                    candidate.set_project_id_meta(project_id.to_string());
-                    candidate.metadata_version = next_version;
-                    candidate.updated_at = std::time::SystemTime::now().into();
-                    self.inner
-                        .prepare_external_project_assignment_read_only(&mut candidate)
-                        .await?;
-                    #[cfg(test)]
-                    reexecute_and_child_approval_tests::pause_project_assignment(&session.id).await;
-                    // Commit the narrow context change before publishing a runtime
-                    // workspace or replaying an approved tool. The final writer
-                    // fences an independent store's competing assignment. The
-                    // V2 runtime path leaves conversation history untouched.
-                    self.storage()
-                        .save_runtime_state(&candidate)
-                        .await
-                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
-                    *session = candidate;
-                } else {
-                    // First creation keeps its existing revision and persistence
-                    // lifecycle; Child assignment keeps its prior SDK semantics.
-                    session.set_project_id_meta(project_id.to_string());
                 }
             }
-        }
 
-        // Complete the external Project/Workspace handoff before replaying an
-        // approved mutating tool. The replay executor reads the runtime
-        // workspace registry, so deferring this until the loop's first round
-        // would execute against stale process state. Assigned sessions fail
-        // closed here when this runtime has no Project resolver; the pending
-        // replay marker remains intact for a correctly configured retry.
-        self.inner
-            .prepare_external_session_for_execution(session)
-            .await?;
+            // Complete the external Project/Workspace handoff before replaying an
+            // approved mutating tool. The replay executor reads the runtime
+            // workspace registry, so deferring this until the loop's first round
+            // would execute against stale process state. Assigned sessions fail
+            // closed here when this runtime has no Project resolver; the pending
+            // replay marker remains intact for a correctly configured retry.
+            self.inner
+                .prepare_external_session_for_execution(session)
+                .await?;
 
-        // If `answer()` just approved a gated tool call, `session.metadata` carries
-        // the re-execution marker `submit_pending_response` set — the gated tool
-        // never actually ran (the permission gate intercepted it before
-        // execution), so re-run it now for real and write the genuine output back
-        // before the loop resumes. An unanswered typed request also keeps this
-        // entry waiting after its replay markers have been cleared. Check every
-        // ergonomic entry into the loop, not just `resume`. See
-        // `reexecute_approved_tool_if_pending` for the full rationale.
-        match self
-            .reexecute_approved_tool_if_pending(session, &event_tx)
-            .await
-        {
-            Ok(ReplayDisposition::Continue) => {}
-            Ok(ReplayDisposition::AwaitingApproval(pending)) => {
-                direct_lease.abandon().await;
-                let _ = event_tx
-                    .send(AgentEvent::NeedClarification {
-                        question: pending.question,
-                        options: (!pending.options.is_empty()).then_some(pending.options),
-                        tool_call_id: Some(pending.tool_call_id),
-                        tool_name: Some(pending.tool_name),
-                        allow_custom: pending.allow_custom,
-                        source: Some(pending.source),
-                    })
-                    .await;
-                return Ok(());
+            // If `answer()` just approved a gated tool call, `session.metadata` carries
+            // the re-execution marker `submit_pending_response` set — the gated tool
+            // never actually ran (the permission gate intercepted it before
+            // execution), so re-run it now for real and write the genuine output back
+            // before the loop resumes. An unanswered typed request also keeps this
+            // entry waiting after its replay markers have been cleared. Check every
+            // ergonomic entry into the loop, not just `resume`. See
+            // `reexecute_approved_tool_if_pending` for the full rationale.
+            match self
+                .reexecute_approved_tool_if_pending(session, &event_tx)
+                .await
+            {
+                Ok(ReplayDisposition::Continue) => {}
+                Ok(ReplayDisposition::AwaitingApproval(pending)) => {
+                    direct_lease.abandon().await;
+                    let _ = event_tx
+                        .send(AgentEvent::NeedClarification {
+                            question: pending.question,
+                            options: (!pending.options.is_empty()).then_some(pending.options),
+                            tool_call_id: Some(pending.tool_call_id),
+                            tool_name: Some(pending.tool_name),
+                            allow_custom: pending.allow_custom,
+                            source: Some(pending.source),
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    direct_lease.abandon().await;
+                    let _ = event_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                direct_lease.abandon().await;
-                let _ = event_tx
-                    .send(AgentEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                return Err(error);
+
+            // Apply the instruction as the session's leading System message, set
+            // the configured model, and refresh the typed prompt snapshot via the
+            // single authoritative pre-execution mutation point. This intentionally
+            // follows replay: a failed replay remains observable without replacing
+            // caller System bytes, while a successful handoff always reaches the
+            // provider with one clean configured System message.
+            bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
+                session,
+                self.system_prompt.as_deref(),
+                self.model.as_deref(),
+            );
+
+            // The last user message in the session drives execution (the engine
+            // skips echoing `initial_message`, so we surface it for logging only).
+            let initial_message = session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::User))
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            // Tool restriction is handled at build time: the agent's executor is
+            // built from exactly the configured tool set, so no per-run
+            // `disabled_tools` filter is needed here.
+            let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
+            if let Some(model) = self.model.clone() {
+                builder = builder.model(model);
             }
-        }
 
-        // Apply the instruction as the session's leading System message, set
-        // the configured model, and refresh the typed prompt snapshot via the
-        // single authoritative pre-execution mutation point. This intentionally
-        // follows replay: a failed replay remains observable without replacing
-        // caller System bytes, while a successful handoff always reaches the
-        // provider with one clean configured System message.
-        bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
-            session,
-            self.system_prompt.as_deref(),
-            self.model.as_deref(),
-        );
-
-        // The last user message in the session drives execution (the engine
-        // skips echoing `initial_message`, so we surface it for logging only).
-        let initial_message = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::User))
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
-        // Tool restriction is handled at build time: the agent's executor is
-        // built from exactly the configured tool set, so no per-run
-        // `disabled_tools` filter is needed here.
-        let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
-        if let Some(model) = self.model.clone() {
-            builder = builder.model(model);
-        }
-
-        self.inner
-            .execute_direct_registered(session, builder.build(), direct_lease)
-            .await
+            self.inner
+                .execute_direct_registered(session, builder.build(), direct_lease)
+                .await
+        })
     }
 
     /// Access the shared storage backend.
@@ -1874,15 +1880,18 @@ mod reexecute_and_child_approval_tests {
         let mut session = Session::new("sdk-root-context-stale-index", "claude-test");
         session.add_message(Message::user("continue"));
         second.save_session(&session).await.unwrap();
-        assert!(
-            agent
-                .storage()
-                .load_session(&session.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "SDK instance intentionally predates this Root"
-        );
+        let error = agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .expect_err("stale SDK index must not report a canonical Root as absent");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+        assert!(error
+            .to_string()
+            .contains("Root index is missing while canonical files require recovery"));
         agent.run_session(&mut session).await.unwrap();
         let persisted = second
             .load_root_authority(&session.id)
