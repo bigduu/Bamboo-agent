@@ -227,12 +227,15 @@ pub async fn handler(
             }
         }
 
-        // Unlike the full-fidelity response, this projection is intentionally
-        // lightweight and is loaded for only one selected child. Return every
-        // visible text message so opening a child never hides old transcript
-        // content behind the generic 2,000-message cold-fetch cap.
         let total_message_count = messages.len();
-        let truncated = false;
+        // A selected child can still have a very long transcript. Bound both
+        // cold and delta responses, and tell the client when older projected
+        // messages were omitted. Projected records have no tool pairs to keep
+        // together, so a plain tail trim is sufficient.
+        let truncated = messages.len() > MAX_HISTORY_MESSAGES;
+        if truncated {
+            messages.drain(..messages.len() - MAX_HISTORY_MESSAGES);
+        }
 
         return HttpResponse::Ok().json(serde_json::json!({
             "session_id": session_id,
@@ -475,6 +478,17 @@ mod tests {
         );
         assistant.reasoning_signature = Some("PRIVATE_SIGNATURE".to_string());
         assistant.metadata = Some(serde_json::json!({"private": "PRIVATE_METADATA"}));
+        assistant.content_parts = Some(vec![serde_json::from_value(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": "PRIVATE_IMAGE_DATA"}
+        }))
+        .unwrap()]);
+        assistant.tool_calls = Some(vec![serde_json::from_value(serde_json::json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "PRIVATE_TOOL_NAME", "arguments": "PRIVATE_TOOL_ARGUMENTS"}
+        }))
+        .unwrap()]);
 
         let (state, id) = app_state_with_session(vec![
             Message::system("PRIVATE_SYSTEM_TEXT"),
@@ -524,6 +538,9 @@ mod tests {
             "PRIVATE_REASONING",
             "PRIVATE_SIGNATURE",
             "PRIVATE_METADATA",
+            "PRIVATE_IMAGE_DATA",
+            "PRIVATE_TOOL_NAME",
+            "PRIVATE_TOOL_ARGUMENTS",
             "reasoning",
             "tool_calls",
             "content_parts",
@@ -540,7 +557,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn message_projection_returns_all_text_while_full_history_keeps_its_cold_cap() {
+    async fn message_projection_caps_long_responses_and_reports_truncation() {
         let messages: Vec<_> = (0..(super::MAX_HISTORY_MESSAGES + 5))
             .map(|index| Message::user(format!("message-{index}")))
             .collect();
@@ -561,14 +578,14 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(projected["truncated"], false);
+        assert_eq!(projected["truncated"], true);
         assert_eq!(
             projected["total_message_count"],
             super::MAX_HISTORY_MESSAGES + 5
         );
         let projected_messages = projected["messages"].as_array().unwrap();
-        assert_eq!(projected_messages.len(), super::MAX_HISTORY_MESSAGES + 5);
-        assert_eq!(projected_messages.first().unwrap()["content"], "message-0");
+        assert_eq!(projected_messages.len(), super::MAX_HISTORY_MESSAGES);
+        assert_eq!(projected_messages.first().unwrap()["content"], "message-5");
         assert_eq!(
             projected_messages.last().unwrap()["content"],
             format!("message-{}", super::MAX_HISTORY_MESSAGES + 4)
@@ -587,6 +604,67 @@ mod tests {
             super::MAX_HISTORY_MESSAGES
         );
         assert_eq!(full["messages"][0]["content"], "message-5");
+    }
+
+    #[actix_web::test]
+    async fn message_projection_cursor_uses_only_projected_ids() {
+        let (state, id) = app_state_with_session(vec![
+            Message::user("first"),
+            Message::tool_result("call-1", "PRIVATE_TOOL_RESULT"),
+            Message::assistant("second", None),
+            Message::user("third"),
+        ])
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let base = format!("/api/v1/sessions/{id}/history?projection=messages");
+        let projected: Value =
+            test::call_and_read_body_json(&app, test::TestRequest::get().uri(&base).to_request())
+                .await;
+        let first_id = projected["messages"][0]["id"].as_str().unwrap();
+        let delta: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{base}&since_message_id={first_id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(delta["is_delta"], true);
+        assert_eq!(seqs(&delta["messages"]), vec!["second", "third"]);
+
+        let full: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}/history"))
+                .to_request(),
+        )
+        .await;
+        let tool_id = full["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["content"] == "PRIVATE_TOOL_RESULT")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        for cursor in ["unknown", tool_id] {
+            let recovery: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("{base}&since_message_id={cursor}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(recovery["is_delta"], false);
+            assert_eq!(
+                seqs(&recovery["messages"]),
+                vec!["first", "second", "third"]
+            );
+        }
     }
 
     #[actix_web::test]

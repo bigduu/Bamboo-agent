@@ -911,6 +911,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         system_prompt: request::optional_non_empty(req.system_prompt.as_deref()).map(String::from),
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())
             .map(String::from),
+        root_orchestration_prompt: req.root_orchestration_prompt,
         // Preserve field presence. An omitted workspace must be resolved from
         // the fresh durable session after acquiring the lock, not from this
         // lock-free preflight snapshot.

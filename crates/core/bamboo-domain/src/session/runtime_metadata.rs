@@ -37,6 +37,7 @@ pub mod keys {
     pub const SKILL_MODE_LEGACY: &str = "mode";
     pub const REASONING_EFFORT: &str = "reasoning_effort";
     pub const ENHANCE_PROMPT: &str = "enhance_prompt";
+    pub const ROOT_ORCHESTRATION_PROMPT: &str = "root_orchestration_prompt";
     pub const TASK_LIST_VERSION: &str = "task_list_version";
     pub const TODO_LIST_VERSION: &str = "todo_list_version";
     pub const WORKSPACE_PATH: &str = "workspace_path";
@@ -87,6 +88,9 @@ pub struct SessionRuntimeMetadata {
     /// System-prompt enhancement text (legacy `metadata["enhance_prompt"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enhance_prompt: Option<String>,
+    /// Explicit opt-in to root-only delegation guidance. Never inherited by children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestration_prompt: Option<bool>,
     /// Monotonic task-list version, stored as its decimal string form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_list_version: Option<String>,

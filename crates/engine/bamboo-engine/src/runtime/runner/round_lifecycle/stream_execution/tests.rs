@@ -2701,6 +2701,115 @@ fn workspace_prepared_context() -> PreparedContext {
 }
 
 #[test]
+fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_only() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let mut ordinary = Session::new("ordinary-root", "test-model");
+    let ordinary_envelope = super::build_request_envelope_reconciled(
+        &mut ordinary,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(ordinary_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut root = Session::new("selected-root", "test-model");
+    root.set_root_orchestration_prompt_enabled(true);
+    let initial =
+        super::build_request_envelope_reconciled(&mut root, &prepared, &config, &[], "test-model");
+    assert_eq!(initial.ir.system_text, ordinary_envelope.ir.system_text);
+    assert_eq!(
+        message_shape(initial.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(
+            ordinary_envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+        ),
+        "the selected enhancement must not duplicate or move the tool schema"
+    );
+    let first_blocks = initial
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .filter(|message| message.content.contains("context_type: root_orchestration"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_blocks.len(), 1);
+    assert!(first_blocks[0]
+        .content
+        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0]
+        .content
+        .contains("Inspect authoritative child progress"));
+
+    let stored = serde_json::to_string(&root).expect("persist selected root");
+    let mut resumed: Session = serde_json::from_str(&stored).expect("reload selected root");
+    let mut resumed_prepared = workspace_prepared_context();
+    resumed_prepared.messages.push(Message::user("continue"));
+    let resumed_envelope = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == "continue"));
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == first_blocks[0].content));
+    assert_eq!(
+        resumed
+            .model_context_state
+            .as_ref()
+            .expect("durable context ledger")
+            .events
+            .iter()
+            .filter(|event| event.block_type == bamboo_domain::ContextBlockType::RootOrchestration)
+            .count(),
+        1,
+        "resuming must replay the one durable instruction, not append a duplicate"
+    );
+
+    resumed.set_root_orchestration_prompt_enabled(false);
+    let disabled = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(disabled.prefix_epoch > initial.prefix_epoch);
+    assert!(disabled
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut child = Session::new_child_of("child", &resumed, "test-model", "child");
+    child.set_root_orchestration_prompt_enabled(true);
+    let child_envelope =
+        super::build_request_envelope_reconciled(&mut child, &prepared, &config, &[], "test-model");
+    assert!(child_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+}
+
+#[test]
 fn session_identity_is_model_visible_after_invariant_prefix_without_cross_session_drift() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut config = test_config("BASE_IDENTITY");
