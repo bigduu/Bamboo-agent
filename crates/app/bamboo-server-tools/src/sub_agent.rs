@@ -423,6 +423,11 @@ async fn mark_failed_child_enqueue(
         let mut child = sessions
             .load_child_for_parent(&parent.id, child_session_id)
             .await?;
+        if child.last_run_status().as_deref().is_some_and(|status| {
+            matches!(status, "completed" | "cancelled" | "timeout" | "skipped")
+        }) {
+            return Ok(());
+        }
         child.set_last_run_status("error");
         child.set_last_run_error(format!("Child launch failed: {error}"));
         child.updated_at = chrono::Utc::now();

@@ -98,6 +98,33 @@ impl Session {
         self.prune_runtime_metadata();
     }
 
+    /// The queued launch identity is durable on the logical Child session,
+    /// independent of a process-local runner or scheduler entry.
+    pub fn child_launch_generation(&self) -> u64 {
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation)
+            .unwrap_or(0)
+    }
+
+    pub fn advance_child_launch_generation(&mut self) -> Option<u64> {
+        let next = self.child_launch_generation().checked_add(1)?;
+        self.runtime_metadata_mut().child_launch_generation = Some(next);
+        Some(next)
+    }
+
+    pub fn is_child_launch_cancelled(&self, generation: u64) -> bool {
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation)
+            .is_some_and(|cancelled| cancelled >= generation)
+    }
+
+    pub fn cancel_child_launch_generation(&mut self) {
+        let generation = self.child_launch_generation();
+        self.runtime_metadata_mut().child_cancelled_generation = Some(generation);
+    }
+
     // ------------------------------------------------------------------
     // provider_name
     // ------------------------------------------------------------------

@@ -2337,6 +2337,41 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if session.kind == bamboo_domain::SessionKind::Child
+        && latest.kind == bamboo_domain::SessionKind::Child
+        && session.created_at == latest.created_at
+    {
+        // A runner's earlier snapshot must not erase a parent's durable
+        // cancellation fence during a later transcript checkpoint.
+        let latest_launch = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation);
+        let incoming_launch = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation);
+        if latest_launch > incoming_launch {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_launch_generation = latest_launch;
+        }
+        let latest_cancelled = latest
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation);
+        let incoming_cancelled = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation);
+        if latest_cancelled > incoming_cancelled {
+            session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .child_cancelled_generation = latest_cancelled;
+        }
+    }
     // Identity is independent of the UI metadata revision. Preserve it in the
     // caller snapshot too, so a successful merge-save cannot downgrade the cache.
     // Never replace an explicit Supervisor incarnation: the final storage guard

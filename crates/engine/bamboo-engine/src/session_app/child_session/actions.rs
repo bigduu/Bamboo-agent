@@ -338,6 +338,9 @@ pub async fn create_child_action(
         );
     }
     child.set_last_run_status("pending");
+    child
+        .advance_child_launch_generation()
+        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
     child.clear_last_run_error();
 
     // Apply runtime metadata (e.g. external agent routing).
@@ -794,6 +797,9 @@ pub async fn update_child_action_with_background(
             .metadata
             .insert("assignment_prompt".to_string(), effective_prompt.clone());
         child.set_last_run_status("pending");
+        child.advance_child_launch_generation().ok_or_else(|| {
+            ChildSessionError::Execution("child launch generation exhausted".into())
+        })?;
         child.clear_last_run_error();
 
         let assignment = format_child_assignment_with_background(
@@ -875,6 +881,9 @@ pub async fn run_child_action(
     }
 
     child.set_last_run_status("pending");
+    child
+        .advance_child_launch_generation()
+        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
     child.clear_last_run_error();
     child.updated_at = Utc::now();
     port.save_child_session(&mut child).await?;
@@ -1114,6 +1123,9 @@ pub async fn send_message_to_child_action_with_gate(
     }
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
     child.set_last_run_status("pending");
+    child
+        .advance_child_launch_generation()
+        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
     child.clear_last_run_error();
     port.save_child_session(&mut child).await?;
 
@@ -1177,7 +1189,10 @@ async fn cancel_child_action_inner(
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
     let latest_status = child.last_run_status().unwrap_or_default();
-    if matches!(latest_status.as_str(), "completed" | "error") {
+    if matches!(
+        latest_status.as_str(),
+        "completed" | "error" | "timeout" | "skipped" | "cancelled"
+    ) {
         return Ok(json!({
             "child_session_id": child_session_id,
             "status": latest_status,

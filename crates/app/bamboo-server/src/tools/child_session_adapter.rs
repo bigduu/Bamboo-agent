@@ -1095,15 +1095,23 @@ impl ChildSessionPort for ChildSessionAdapter {
         // step so the model can spawn several children without each one
         // suspending it — see `register_parent_wait_for_child` /
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
-        self.scheduler
-            .enqueue_announced(
+        let admission = self
+            .scheduler
+            .enqueue_announced_for_generation(
                 Self::child_spawn_job(parent, child)?,
                 Some(child.title.clone()),
+                None,
+                Some(child.child_launch_generation()),
             )
             .await
             .map_err(ChildSessionError::Execution)?;
-
-        Ok(())
+        match admission {
+            bamboo_domain::AdmissionCommit::Cancelled => Err(ChildSessionError::Execution(
+                "child launch generation was cancelled before activation".into(),
+            )),
+            bamboo_domain::AdmissionCommit::Committed(())
+            | bamboo_domain::AdmissionCommit::AlreadyCommitted => Ok(()),
+        }
     }
 
     async fn admit_child_run(
@@ -1113,10 +1121,11 @@ impl ChildSessionPort for ChildSessionAdapter {
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
         self.scheduler
-            .enqueue_announced_with_gate(
+            .enqueue_announced_for_generation(
                 Self::child_spawn_job(parent, child)?,
                 Some(child.title.clone()),
                 gate,
+                Some(child.child_launch_generation()),
             )
             .await
             .map_err(ChildSessionError::Execution)
@@ -1126,21 +1135,65 @@ impl ChildSessionPort for ChildSessionAdapter {
         &self,
         child_session_id: &str,
     ) -> Result<(), ChildSessionError> {
-        let cancelled = {
-            let mut runners = self.agent_runners.write().await;
-            if let Some(runner) = runners.get_mut(child_session_id) {
-                if matches!(runner.status, AgentStatus::Running) {
-                    runner.cancel_token.cancel();
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        let launch_guard = self.scheduler.lock_child_launch(child_session_id).await;
+        let running_token = {
+            let runners = self.agent_runners.read().await;
+            runners
+                .get(child_session_id)
+                .filter(|runner| matches!(runner.status, AgentStatus::Running))
+                .map(|runner| runner.cancel_token.clone())
         };
+        let mut already_terminal = false;
+        let mut queued_parent = None;
+        let saved = self
+            .persistence
+            .update_runtime_config_and_publish(
+                child_session_id,
+                |child| {
+                    if child
+                        .last_run_status()
+                        .as_deref()
+                        .is_some_and(is_terminal_child_status)
+                    {
+                        already_terminal = true;
+                        return;
+                    }
+                    child.cancel_child_launch_generation();
+                    if running_token.is_none() {
+                        child.set_last_run_status("cancelled");
+                        child.set_last_run_error("Cancelled by parent before activation");
+                        queued_parent = child.parent_session_id.clone();
+                    }
+                },
+                |child| {
+                    self.sessions_cache.insert(
+                        child.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if saved.is_none() {
+            return Err(ChildSessionError::Execution(
+                "child session disappeared during cancellation".into(),
+            ));
+        }
+        if already_terminal {
+            return Ok(());
+        }
+        if let Some(token) = running_token.as_ref() {
+            token.cancel();
+        }
+        drop(launch_guard);
+        if let Some(parent_id) = queued_parent {
+            self.scheduler
+                .publish_queued_child_cancellation(&parent_id, child_session_id)
+                .await;
+            return Ok(());
+        }
 
-        if !cancelled {
+        if running_token.is_none() {
             return Ok(());
         }
 

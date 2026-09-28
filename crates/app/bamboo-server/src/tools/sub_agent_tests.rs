@@ -193,6 +193,66 @@ impl bamboo_engine::execution::spawn::ExternalChildRunner for NoopChildRunner {
     }
 }
 
+struct QueueBoundaryHook {
+    before_child: String,
+    before_once: AtomicBool,
+    before_entered: Arc<tokio::sync::Semaphore>,
+    before_release: Arc<tokio::sync::Semaphore>,
+    during_child: String,
+    during_once: AtomicBool,
+    during_entered: Arc<tokio::sync::Semaphore>,
+    during_release: Arc<tokio::sync::Semaphore>,
+}
+
+impl bamboo_engine::execution::ChildRunLaunchHook for QueueBoundaryHook {
+    fn before_child_launch(
+        &self,
+        _job: &bamboo_engine::execution::spawn::SpawnJob,
+        _child_events: broadcast::Sender<AgentEvent>,
+    ) {
+    }
+
+    fn before_queued_dequeue(
+        &self,
+        job: &bamboo_engine::execution::spawn::SpawnJob,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let matches = job.child_session_id == self.before_child
+            && self.before_once.swap(false, Ordering::SeqCst);
+        let entered = self.before_entered.clone();
+        let release = self.before_release.clone();
+        Box::pin(async move {
+            if matches {
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release queue barrier")
+                    .forget();
+            }
+        })
+    }
+
+    fn before_queued_reservation(
+        &self,
+        job: &bamboo_engine::execution::spawn::SpawnJob,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let matches = job.child_session_id == self.during_child
+            && self.during_once.swap(false, Ordering::SeqCst);
+        let entered = self.during_entered.clone();
+        let release = self.during_release.clone();
+        Box::pin(async move {
+            if matches {
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release reservation barrier")
+                    .forget();
+            }
+        })
+    }
+}
+
 fn make_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
 }
@@ -234,6 +294,21 @@ async fn build_test_harness_with_storage(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
     use_v2_storage: bool,
+) -> TestHarness {
+    build_test_harness_with_hook(
+        subagent_model_resolver,
+        workspace_resolver,
+        use_v2_storage,
+        None,
+    )
+    .await
+}
+
+async fn build_test_harness_with_hook(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+    use_v2_storage: bool,
+    launch_hook: Option<Arc<dyn bamboo_engine::execution::ChildRunLaunchHook>>,
 ) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
@@ -373,11 +448,13 @@ async fn build_test_harness_with_storage(
         provider_router: Some(provider_router),
         app_data_dir: Some(bamboo_home.clone()),
         completion_handler: Some(completion_coordinator.clone()),
-        child_run_launch_hook: Some(Arc::new(
-            crate::app_state::session_events::NotificationRelayLaunchHook::new(
-                notification_relay_deps,
-            ),
-        )),
+        child_run_launch_hook: launch_hook.or_else(|| {
+            Some(Arc::new(
+                crate::app_state::session_events::NotificationRelayLaunchHook::new(
+                    notification_relay_deps,
+                ),
+            ))
+        }),
         account_feed_inbox: None,
     }));
     completion_coordinator.set_spawn_scheduler(&scheduler).await;
@@ -5086,6 +5163,199 @@ async fn cancel_stops_running_child() {
         serde_json::from_str(&result.result).expect("tool result should be JSON");
     assert_eq!(payload["status"], "cancelled");
     assert_eq!(payload["child_session_id"], harness.child_session_id);
+}
+
+#[tokio::test]
+async fn queued_child_cancel_fences_duplicate_deliveries_and_explicit_retry() {
+    let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let before_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let during_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let during_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hook = Arc::new(QueueBoundaryHook {
+        before_child: "queued-target".into(),
+        before_once: AtomicBool::new(true),
+        before_entered: before_entered.clone(),
+        before_release: before_release.clone(),
+        during_child: "race-target".into(),
+        during_once: AtomicBool::new(true),
+        during_entered: during_entered.clone(),
+        during_release: during_release.clone(),
+    });
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook)).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for id in ["queued-target", "queue-sentinel", "race-target"] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("finish the bounded task"));
+        child.set_last_run_status("pending");
+        assert_eq!(child.advance_child_launch_generation(), Some(1));
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    let target = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    // Duplicate delivery of one generation must never create a second run.
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &target)
+        .await
+        .unwrap();
+    before_entered.acquire().await.unwrap().forget();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &target)
+        .await
+        .unwrap();
+    let cancelled = invoke_completed(
+        &harness.tool,
+        json!({"action":"cancel", "child_session_id":"queued-target"}),
+        subagent_test_ctx(&parent.id, "cancel-before-dequeue"),
+    )
+    .await
+    .expect("cancel queued generation");
+    let cancelled: serde_json::Value = serde_json::from_str(&cancelled.result).unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    let durable = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.child_launch_generation(), 1);
+    assert!(durable.is_child_launch_cancelled(1));
+    assert_eq!(durable.last_run_status().as_deref(), Some("cancelled"));
+
+    // A later sentinel completing proves both stale queue copies were
+    // dequeued. Neither copy may reserve the target's runner.
+    let sentinel = harness
+        .storage
+        .load_session("queue-sentinel")
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &sentinel)
+        .await
+        .unwrap();
+    before_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("queue-sentinel")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sentinel must finish after stale queue entries");
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get("queued-target")
+        .is_none());
+
+    // A parent's explicit retry prepares a fresh durable generation. It may
+    // run even though the old generation remains cancelled.
+    child_session::run_child_action(
+        harness.adapter.as_ref(),
+        &parent,
+        "queued-target".into(),
+        None,
+    )
+    .await
+    .expect("prepare explicit retry");
+    let retry = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.child_launch_generation(), 2);
+    assert!(!retry.is_child_launch_cancelled(2));
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &retry)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("queued-target")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit retry must complete");
+
+    // The dequeue hook now stops a second generation after eligibility was
+    // checked while the launch guard is held. Cancellation must wait for the
+    // reservation handoff, then stop the runner or retain its real terminal.
+    let racing = harness
+        .storage
+        .load_session("race-target")
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &racing)
+        .await
+        .unwrap();
+    during_entered.acquire().await.unwrap().forget();
+    let adapter = harness.adapter.clone();
+    let cancel_race =
+        tokio::spawn(async move { adapter.cancel_child_run_and_wait("race-target").await });
+    tokio::task::yield_now().await;
+    assert!(
+        !cancel_race.is_finished(),
+        "cancel must wait for dequeue guard"
+    );
+    during_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), cancel_race)
+        .await
+        .expect("racing cancellation must finish")
+        .unwrap()
+        .unwrap();
+    let racing = harness
+        .storage
+        .load_session("race-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        racing.last_run_status().as_deref(),
+        Some("cancelled" | "completed")
+    ));
 }
 
 #[tokio::test]
