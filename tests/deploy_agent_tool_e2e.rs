@@ -118,7 +118,7 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
 #[tokio::test]
 async fn deployment_uses_host_actor_identity_and_rejects_stale_or_foreign_controls() {
     use bamboo_agent_core::storage::Storage;
-    use bamboo_domain::{ActorDirectoryPort, ActorLogicalState, Session};
+    use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, ActorLogicalState, Session};
     use bamboo_server_tools::AskAgentTool;
     use bamboo_storage::SessionStoreV2;
 
@@ -181,9 +181,9 @@ async fn deployment_uses_host_actor_identity_and_rejects_stale_or_foreign_contro
     );
     let entry = store.inspect_actor(&actor_id).await.unwrap();
     assert_eq!(entry.actor.session_created_at, canonical.created_at);
-    assert_eq!(entry.actor.state, ActorLogicalState::Cold);
-    assert_eq!(entry.actor.current_attempt, 0);
-    assert!(entry.activation.is_none());
+    assert_eq!(entry.actor.state, ActorLogicalState::Active);
+    assert_eq!(entry.actor.current_attempt, 1);
+    assert_eq!(entry.activation.unwrap().status, ActorActivationStatus::Running);
 
     let answer = ask
         .invoke(
