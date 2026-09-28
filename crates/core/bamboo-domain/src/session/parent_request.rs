@@ -248,7 +248,6 @@ impl ParentRequest {
             || *policy_revision != data.get("policy_revision")?.as_u64()?
             || *maximum_delegation != ParentRequestDelegation::ExactOperationOnce
             || options.as_slice() != [ParentRequestOption::Deny, ParentRequestOption::ApproveOnce]
-            || request.activation.attempt == 0
             || request.activation.run.is_empty()
             || request.activation.run.len() > 256
             || request.activation.reply.is_empty()

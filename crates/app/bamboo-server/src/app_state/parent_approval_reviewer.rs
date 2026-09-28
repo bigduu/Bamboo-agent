@@ -607,7 +607,7 @@ mod tests {
                         "approval-parent",
                         "approval-child",
                         (
-                            1,
+                            0,
                             "fixture-run",
                             1,
                             "fixture-reply",
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(typed.parent.session_id, parent.id);
         assert_eq!(typed.child.session_id, child.id);
         assert_eq!(typed.root_session_id, root.id);
-        assert_eq!(typed.activation.attempt, 1);
+        assert_eq!(typed.activation.attempt, 0);
         assert_eq!(typed.activation.run, "fixture-run");
         assert!(typed.deadline > chrono::Utc::now());
         let ParentRequestKind::ForcedPermission { options, .. } = typed.kind;
