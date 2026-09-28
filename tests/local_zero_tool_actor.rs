@@ -1276,6 +1276,34 @@ async fn fixture_with_followups(
         })
         .await
         .unwrap();
+        // The Inbox receipt is durable before the Root turn finishes its own
+        // transcript write. Keep the Child's first provider response held until
+        // that ordinary Root writer settles, so this fixture tests a live
+        // correction without racing the ancestor-byte publication barrier.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows: Value = client
+                    .get(format!("{base}/sessions"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if rows["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == "plain-root" && row["is_running"] == false)
+                {
+                    break;
+                }
+                assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual Root correction turn settles before Child reply release");
     }
     if let Some(mode) = two {
         let inbox = bamboo_storage::FileSessionInbox::new(
