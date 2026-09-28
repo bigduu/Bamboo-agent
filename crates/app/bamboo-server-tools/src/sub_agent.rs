@@ -181,6 +181,18 @@ enum SubAgentArgs {
     List,
     Get {
         child_session_id: String,
+        /// Overview is metadata only. Other views return bounded, durable
+        /// transcript previews or UTF-8 content slices.
+        #[serde(default)]
+        view: Option<String>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
     },
     Update {
         child_session_id: String,
@@ -595,7 +607,7 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
 pub fn subagent_tool_description() -> &'static str {
     "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context and only the tools and permissions exposed to it by the runtime, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
 PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
-Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+Use list/get to inspect existing children; plain get returns metadata, get with view=messages returns bounded transcript pages, view=result returns UTF-8 slices of the child's last assistant answer, and view=error reads the last run error. Follow next_cursor for more; view=message with message_id reads a selected message in slices. Use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
 }
 
 /// The `SubAgent` parameters schema. Exposed standalone (mirroring
@@ -615,6 +627,31 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             "child_session_id": {
                 "type": "string",
                 "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
+            },
+            "view": {
+                "type": "string",
+                "enum": ["overview", "messages", "message", "result", "error"],
+                "description": "For get: overview (default) is metadata only; messages returns bounded transcript previews; message reads one selected message; result reads the child's latest assistant answer; error reads the last run error. Content views return UTF-8 slices with next_cursor."
+            },
+            "cursor": {
+                "type": "string",
+                "description": "For get: opaque next_cursor from the prior page or content slice. A reset or rewrite of the selected transcript invalidates it."
+            },
+            "message_id": {
+                "type": "string",
+                "description": "For get with view=message: message_id from a messages page."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16,
+                "description": "For get with view=messages: previews per page, default 8, capped at 16."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 4,
+                "maximum": 8192,
+                "description": "For get with view=message, result, or error: maximum UTF-8 content bytes per slice, default 4096, capped at 8192."
             },
             "child_session_ids": {
                 "type": "array",
@@ -809,6 +846,55 @@ impl SubAgentTool {
                 "usage": "Pass create.model as 'provider:model' (or a bare model id to use the parent's provider).",
             }))
             .map(ToolOutcome::Completed);
+        }
+
+        // Inspection only needs the trusted current session id. A nested
+        // child is also a direct parent of its own children, while the
+        // lifecycle path below still loads the root session as before.
+        if let SubAgentArgs::Get {
+            child_session_id,
+            view,
+            cursor,
+            message_id,
+            limit,
+            max_bytes,
+        } = &parsed
+        {
+            let result = match view.as_deref().unwrap_or("overview") {
+                "overview" => {
+                    if cursor.is_some()
+                        || message_id.is_some()
+                        || limit.is_some()
+                        || max_bytes.is_some()
+                    {
+                        return Err(ToolError::InvalidArguments(
+                            "overview does not accept cursor, message_id, limit, or max_bytes"
+                                .to_string(),
+                        ));
+                    }
+                    child_session::get_child_action(
+                        self.sessions.as_ref(),
+                        parent_session_id,
+                        child_session_id.clone(),
+                    )
+                    .await
+                }
+                view => {
+                    child_session::inspect_child_action(
+                        self.sessions.as_ref(),
+                        parent_session_id,
+                        child_session_id,
+                        view,
+                        cursor.as_deref(),
+                        message_id.as_deref(),
+                        *limit,
+                        *max_bytes,
+                    )
+                    .await
+                }
+            }
+            .map_err(tool_error_from_child_session)?;
+            return tool_result(result).map(ToolOutcome::Completed);
         }
 
         let parent = self
@@ -1382,7 +1468,7 @@ impl SubAgentTool {
                         "wait_for": policy.as_str(),
                         "note": "The wait policy is already satisfied by finished child \
                                  session(s) — the parent was NOT suspended. Use SubAgent.get \
-                                 to read their results; call wait again (without those ids) \
+                                 with view=result to read their answers; call wait again (without those ids) \
                                  if you still need the remaining children.",
                     }))
                     .map(ToolOutcome::Completed);
@@ -1400,7 +1486,7 @@ impl SubAgentTool {
                     } else {
                         format!(
                             "The requested child session(s) [{}] are already finished; nothing \
-                             to wait for. Use SubAgent.get to read their results.",
+                             to wait for. Use SubAgent.get with view=result to read their answers.",
                             dropped_ids.join(", ")
                         )
                     };
@@ -1438,16 +1524,7 @@ impl SubAgentTool {
                     child_session::list_children_action(self.sessions.as_ref(), &parent.id).await;
                 tool_result(result)
             }
-            SubAgentArgs::Get { child_session_id } => {
-                let result = child_session::get_child_action(
-                    self.sessions.as_ref(),
-                    &parent.id,
-                    child_session_id,
-                )
-                .await
-                .map_err(tool_error_from_child_session)?;
-                tool_result(result)
-            }
+            SubAgentArgs::Get { .. } => unreachable!("get returns before loading the root"),
             SubAgentArgs::Update {
                 child_session_id,
                 title,
@@ -1799,11 +1876,15 @@ mod tests {
             "child_session_id",
             "child_session_ids",
             "context",
+            "cursor",
             "description",
             "fork_last_messages",
             "interrupt_running",
             "lifecycle",
+            "limit",
+            "max_bytes",
             "message",
+            "message_id",
             "model",
             "name",
             "prompt",
@@ -1813,6 +1894,7 @@ mod tests {
             "responsibility",
             "subagent_type",
             "title",
+            "view",
             "wait",
             "wait_for",
             "workspace",
