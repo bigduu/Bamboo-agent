@@ -64,14 +64,28 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
 /// One retained instance of the existing authority lock set, never a durable
 /// grant or a second lifecycle protocol. Constructed only by the strict reader.
 pub(crate) struct SupervisorFollowupGuard {
-    lifecycle: SessionLifecycleReadGuard,
+    sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
-    _sessions: Vec<SessionWriteGuard>,
+    _lifecycle: SessionLifecycleReadGuard,
 }
 
-impl SupervisorFollowupGuard {
-    pub(crate) fn lifecycle(&self) -> &SessionLifecycleReadGuard {
-        &self.lifecycle
+/// Management publication owns the existing locks, not a new authority grant.
+/// Fields release Sessions → Task → lifecycle; pop reverses sorted acquisition.
+pub(super) struct SupervisorManagementGuards {
+    sessions: Vec<SessionWriteGuard>,
+    _task: RuntimeTaskTransactionReadGuard,
+    _lifecycle: SessionLifecycleReadGuard,
+}
+
+impl Drop for SupervisorManagementGuards {
+    fn drop(&mut self) {
+        while let Some(_guard) = self.sessions.pop() {}
+    }
+}
+
+impl Drop for SupervisorFollowupGuard {
+    fn drop(&mut self) {
+        while let Some(_guard) = self.sessions.pop() {}
     }
 }
 
@@ -89,6 +103,39 @@ fn link_authorizes_target(
 }
 
 impl SessionStoreV2 {
+    /// Each started job owns the complete physical guard set through sync and
+    /// error cleanup, even if its caller or originating runtime disappears.
+    /// This does not promise that the next management stage will be started.
+    pub(super) async fn write_management_bytes(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        stage: supervisor_proof::SupervisorProofFault,
+        guards: &Arc<SupervisorManagementGuards>,
+    ) -> io::Result<()> {
+        let path = path.to_path_buf();
+        let guards = Arc::clone(guards);
+        #[cfg(test)]
+        let hook = self.management_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            durable_atomic_write_blocking(&path, &bytes, |phase| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    return hook.visit(stage, &path, phase);
+                }
+                let _ = (stage, phase);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| {
+            other_io_error(format!(
+                "join Supervisor management filesystem job: {error}"
+            ))
+        })?
+    }
+
     /// Acquire in the canonical lifecycle → Task → sorted Session order.
     /// FileSessionInbox keeps this guard alive until its own receipt commits.
     pub(crate) async fn lock_supervisor_followup(
@@ -119,9 +166,9 @@ impl SessionStoreV2 {
             ));
         }
         Ok(SupervisorFollowupGuard {
-            lifecycle,
+            sessions,
             _task: task,
-            _sessions: sessions,
+            _lifecycle: lifecycle,
         })
     }
 
@@ -201,8 +248,8 @@ impl SessionStoreV2 {
                 Some(target_session_id.as_str())
             }
         };
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
         // Detach needs only the verified Supervisor and its stored tombstone.
         // Target corruption/deletion must never prevent revocation.
         let lock_target = matches!(
@@ -211,7 +258,12 @@ impl SessionStoreV2 {
         )
         .then_some(target)
         .flatten();
-        let _sessions = self.management_session_locks(lock_target).await?;
+        let sessions = self.management_session_locks(lock_target).await?;
+        let guards = Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+        });
         let mut current = self
             .management_supervisor_locked(&request.supervisor)
             .await?;
@@ -304,18 +356,22 @@ impl SessionStoreV2 {
             // update a target, or publish a history-free snapshot into a cache.
             let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&current))
                 .map_err(|error| other_io_error(error.to_string()))?;
-            self.prepare_supervisor_management_proof(&current).await?;
+            self.prepare_supervisor_management_proof(&current, &guards)
+                .await?;
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
-            durable_atomic_write(
+            self.write_management_bytes(
                 &self
                     .sessions_dir
                     .join(&current.id)
                     .join(RUNTIME_SIDECAR_FILE),
-                &bytes,
+                bytes,
+                supervisor_proof::SupervisorProofFault::Runtime,
+                &guards,
             )
             .await?;
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
-            self.commit_supervisor_management_proof(&current).await?;
+            self.commit_supervisor_management_proof(&current, &guards)
+                .await?;
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
         Ok(SupervisorManagementReceipt {

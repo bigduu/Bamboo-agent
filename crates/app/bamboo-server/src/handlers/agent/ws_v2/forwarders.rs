@@ -52,7 +52,11 @@ use bamboo_engine::{
 use actix_web::web;
 
 use super::envelope::{
-    feed_reset_control, gap_control, terminal_control, Encoding, OutFrame, ServerEnvelope,
+    actor_snapshot_required_control, feed_reset_control, gap_control, terminal_control, Encoding,
+    OutFrame, ServerEnvelope,
+};
+use crate::app_state::actor_events::{
+    ActorHubMessage, ActorReplay, ActorSubscription, SequencedActorChange,
 };
 use crate::app_state::{AgentStatus, AppState};
 use crate::handlers::agent::events::{
@@ -78,6 +82,126 @@ async fn send_env(out: &OutboundTx, encoding: Encoding, env: ServerEnvelope) -> 
         // alive (matches the v1 SSE `serde_json::to_string(...).ok()` discipline).
         None => true,
     }
+}
+
+async fn send_actor_change(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    item: &SequencedActorChange,
+) -> bool {
+    match serde_json::to_value(&item.change) {
+        Ok(change) => {
+            send_env(
+                out,
+                encoding,
+                ServerEnvelope::event(ch, item.cursor, change),
+            )
+            .await
+        }
+        Err(_) => false,
+    }
+}
+
+async fn send_actor_plan(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    plan: ActorReplay,
+    last: &mut u64,
+) -> bool {
+    match plan {
+        ActorReplay::Events(events) => {
+            for event in events {
+                if event.cursor > *last {
+                    if !send_actor_change(out, encoding, ch, &event).await {
+                        return false;
+                    }
+                    *last = event.cursor;
+                }
+            }
+        }
+        ActorReplay::SnapshotRequired { cursor, reason } => {
+            if !send_env(
+                out,
+                encoding,
+                ServerEnvelope::control(
+                    ch,
+                    cursor,
+                    actor_snapshot_required_control(reason, cursor),
+                ),
+            )
+            .await
+            {
+                return false;
+            }
+            *last = cursor;
+        }
+    }
+    true
+}
+
+/// One lazy canonical Actor channel. The subscription lease drops on abort,
+/// closing the source sender and replay window after the final observer leaves.
+pub(crate) fn spawn_actor_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    mut subscription: ActorSubscription,
+    since: Option<u64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = since.unwrap_or(0);
+        let initial = std::mem::replace(&mut subscription.initial, ActorReplay::Events(Vec::new()));
+        if !send_actor_plan(&out, encoding, &ch, initial, &mut last).await {
+            return;
+        }
+        loop {
+            match subscription.receiver.recv().await {
+                Ok(ActorHubMessage::Change(item)) => {
+                    if item.cursor <= last {
+                        continue; // replay/live overlap
+                    }
+                    if item.cursor != last.saturating_add(1) {
+                        let plan = subscription.replay_after(last);
+                        if !send_actor_plan(&out, encoding, &ch, plan, &mut last).await {
+                            return;
+                        }
+                        if item.cursor <= last {
+                            continue;
+                        }
+                    }
+                    if !send_actor_change(&out, encoding, &ch, &item).await {
+                        return;
+                    }
+                    last = item.cursor;
+                }
+                Ok(ActorHubMessage::Reset(cursor)) => {
+                    if !send_actor_plan(
+                        &out,
+                        encoding,
+                        &ch,
+                        ActorReplay::SnapshotRequired {
+                            cursor,
+                            reason: "gap",
+                        },
+                        &mut last,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let plan = subscription.replay_after(last);
+                    if !send_actor_plan(&out, encoding, &ch, plan, &mut last).await {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 /// Spawn the `feed` forwarder.

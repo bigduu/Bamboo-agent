@@ -193,6 +193,66 @@ impl bamboo_engine::execution::spawn::ExternalChildRunner for NoopChildRunner {
     }
 }
 
+struct QueueBoundaryHook {
+    before_child: String,
+    before_once: AtomicBool,
+    before_entered: Arc<tokio::sync::Semaphore>,
+    before_release: Arc<tokio::sync::Semaphore>,
+    during_child: String,
+    during_once: AtomicBool,
+    during_entered: Arc<tokio::sync::Semaphore>,
+    during_release: Arc<tokio::sync::Semaphore>,
+}
+
+impl bamboo_engine::execution::ChildRunLaunchHook for QueueBoundaryHook {
+    fn before_child_launch(
+        &self,
+        _job: &bamboo_engine::execution::spawn::SpawnJob,
+        _child_events: broadcast::Sender<AgentEvent>,
+    ) {
+    }
+
+    fn before_queued_dequeue(
+        &self,
+        job: &bamboo_engine::execution::spawn::SpawnJob,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let matches = job.child_session_id == self.before_child
+            && self.before_once.swap(false, Ordering::SeqCst);
+        let entered = self.before_entered.clone();
+        let release = self.before_release.clone();
+        Box::pin(async move {
+            if matches {
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release queue barrier")
+                    .forget();
+            }
+        })
+    }
+
+    fn before_queued_reservation(
+        &self,
+        job: &bamboo_engine::execution::spawn::SpawnJob,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let matches = job.child_session_id == self.during_child
+            && self.during_once.swap(false, Ordering::SeqCst);
+        let entered = self.during_entered.clone();
+        let release = self.during_release.clone();
+        Box::pin(async move {
+            if matches {
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release reservation barrier")
+                    .forget();
+            }
+        })
+    }
+}
+
 fn make_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
 }
@@ -217,6 +277,10 @@ async fn build_test_harness() -> TestHarness {
     build_test_harness_with_resolver(None).await
 }
 
+async fn build_running_child_harness() -> TestHarness {
+    build_test_harness_with_hook(None, None, true, None, true).await
+}
+
 async fn build_test_harness_with_resolver(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
 ) -> TestHarness {
@@ -235,8 +299,28 @@ async fn build_test_harness_with_storage(
     workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
     use_v2_storage: bool,
 ) -> TestHarness {
+    build_test_harness_with_hook(
+        subagent_model_resolver,
+        workspace_resolver,
+        use_v2_storage,
+        None,
+        false,
+    )
+    .await
+}
+
+async fn build_test_harness_with_hook(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+    use_v2_storage: bool,
+    launch_hook: Option<Arc<dyn bamboo_engine::execution::ChildRunLaunchHook>>,
+    initial_child_running: bool,
+) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
+    // The named-profile reader rejects symlinked path components. On macOS,
+    // std::env::temp_dir() can start with /var, which aliases /private/var.
+    let bamboo_home = tokio::fs::canonicalize(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
     tokio::fs::create_dir_all(&workspace_path).await.unwrap();
     let workspace_path = tokio::fs::canonicalize(workspace_path).await.unwrap();
@@ -284,9 +368,15 @@ async fn build_test_harness_with_storage(
         "gpt-5",
         "Child session",
     );
-    child
-        .metadata
-        .insert("last_run_status".to_string(), "completed".to_string());
+    child.metadata.insert(
+        "last_run_status".to_string(),
+        if initial_child_running {
+            "running"
+        } else {
+            "completed"
+        }
+        .to_string(),
+    );
     child.add_message(Message::system("child system"));
     child.add_message(Message::user("initial assignment"));
     child.add_message(Message::assistant("initial answer", None));
@@ -373,11 +463,13 @@ async fn build_test_harness_with_storage(
         provider_router: Some(provider_router),
         app_data_dir: Some(bamboo_home.clone()),
         completion_handler: Some(completion_coordinator.clone()),
-        child_run_launch_hook: Some(Arc::new(
-            crate::app_state::session_events::NotificationRelayLaunchHook::new(
-                notification_relay_deps,
-            ),
-        )),
+        child_run_launch_hook: launch_hook.or_else(|| {
+            Some(Arc::new(
+                crate::app_state::session_events::NotificationRelayLaunchHook::new(
+                    notification_relay_deps,
+                ),
+            ))
+        }),
         account_feed_inbox: None,
     }));
     completion_coordinator.set_spawn_scheduler(&scheduler).await;
@@ -399,6 +491,7 @@ async fn build_test_harness_with_storage(
             bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals,
         ),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
 
@@ -429,13 +522,25 @@ struct WaitOrderPort {
     fail_launch: AtomicBool,
     checked_launches: AtomicUsize,
     hold_first_enqueue: AtomicBool,
+    hold_before_admission: AtomicBool,
+    hold_message_delivery: AtomicBool,
+    hold_running_probe: AtomicBool,
+    hold_after_interrupt: AtomicBool,
+    expect_wait_on_enqueue: AtomicBool,
     hold_wait_after_persist: AtomicBool,
     fail_wait_after_persist: AtomicBool,
     first_enqueue_entered: tokio::sync::Notify,
     release_first_enqueue: tokio::sync::Notify,
+    message_delivery_entered: tokio::sync::Notify,
+    release_message_delivery: tokio::sync::Notify,
+    running_probe_entered: tokio::sync::Notify,
+    release_running_probe: tokio::sync::Notify,
+    interrupt_completed: tokio::sync::Notify,
+    release_interrupt: tokio::sync::Notify,
     wait_persisted: tokio::sync::Notify,
     release_wait: tokio::sync::Notify,
     last_wait_child_id: StdRwLock<Option<String>>,
+    last_admit_child_id: StdRwLock<Option<String>>,
     skip_successful_enqueue: AtomicBool,
     parent_load_count: AtomicUsize,
     clear_wait_after_second_parent_load: AtomicBool,
@@ -449,13 +554,25 @@ impl WaitOrderPort {
             fail_launch: AtomicBool::new(false),
             checked_launches: AtomicUsize::new(0),
             hold_first_enqueue: AtomicBool::new(false),
+            hold_before_admission: AtomicBool::new(false),
+            hold_message_delivery: AtomicBool::new(false),
+            hold_running_probe: AtomicBool::new(false),
+            hold_after_interrupt: AtomicBool::new(false),
+            expect_wait_on_enqueue: AtomicBool::new(true),
             hold_wait_after_persist: AtomicBool::new(false),
             fail_wait_after_persist: AtomicBool::new(false),
             first_enqueue_entered: tokio::sync::Notify::new(),
             release_first_enqueue: tokio::sync::Notify::new(),
+            message_delivery_entered: tokio::sync::Notify::new(),
+            release_message_delivery: tokio::sync::Notify::new(),
+            running_probe_entered: tokio::sync::Notify::new(),
+            release_running_probe: tokio::sync::Notify::new(),
+            interrupt_completed: tokio::sync::Notify::new(),
+            release_interrupt: tokio::sync::Notify::new(),
             wait_persisted: tokio::sync::Notify::new(),
             release_wait: tokio::sync::Notify::new(),
             last_wait_child_id: StdRwLock::new(None),
+            last_admit_child_id: StdRwLock::new(None),
             skip_successful_enqueue: AtomicBool::new(false),
             parent_load_count: AtomicUsize::new(0),
             clear_wait_after_second_parent_load: AtomicBool::new(false),
@@ -494,6 +611,24 @@ impl WaitOrderPort {
 
 #[async_trait::async_trait]
 impl ChildSessionPort for WaitOrderPort {
+    async fn resolve_named_profile(
+        &self,
+        parent: &Session,
+        name: &str,
+    ) -> Result<Option<child_session::named_profile::ResolvedChildProfile>, ChildSessionError> {
+        self.inner.resolve_named_profile(parent, name).await
+    }
+
+    async fn validate_required_child_context_route(
+        &self,
+        runtime_metadata: &HashMap<String, String>,
+        subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        self.inner
+            .validate_required_child_context_route(runtime_metadata, subagent_type)
+            .await
+    }
+
     async fn validate_child_workspace(
         &self,
         project_id: Option<&bamboo_domain::ProjectId>,
@@ -547,6 +682,28 @@ impl ChildSessionPort for WaitOrderPort {
         self.inner.save_child_session(child).await
     }
 
+    async fn update_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        update: child_session::ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        self.inner
+            .update_child_session(parent_id, child_id, update)
+            .await
+    }
+
+    async fn append_draft_child_message(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.inner
+            .append_draft_child_message(parent_id, child_id, message)
+            .await
+    }
+
     async fn save_child_session_authoritative_flags(
         &self,
         child: &mut Session,
@@ -563,21 +720,49 @@ impl ChildSessionPort for WaitOrderPort {
         message: &str,
         idempotency_key: Option<&str>,
     ) -> Result<child_session::ChildSessionMessageDelivery, ChildSessionError> {
+        self.send_session_message_with_gate(
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    async fn send_session_message_with_gate(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<child_session::ChildSessionMessageDelivery, ChildSessionError> {
         self.assert_wait_armed(source_session_id, target_session_id)
             .await;
+        if self.hold_message_delivery.swap(false, Ordering::SeqCst) {
+            self.message_delivery_entered.notify_one();
+            self.release_message_delivery.notified().await;
+        }
         self.maybe_fail_launch()?;
         self.inner
-            .send_session_message(
+            .send_session_message_with_gate(
                 source_session_id,
                 target_session_id,
                 message,
                 idempotency_key,
+                gate,
             )
             .await
     }
 
     async fn is_child_running(&self, child_id: &str) -> bool {
-        self.inner.is_child_running(child_id).await
+        let running = self.inner.is_child_running(child_id).await;
+        if self.hold_running_probe.swap(false, Ordering::SeqCst) {
+            self.running_probe_entered.notify_one();
+            self.release_running_probe.notified().await;
+        }
+        running
     }
 
     async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry> {
@@ -589,7 +774,23 @@ impl ChildSessionPort for WaitOrderPort {
         parent: &Session,
         child: &Session,
     ) -> Result<(), ChildSessionError> {
-        self.assert_wait_armed(&parent.id, &child.id).await;
+        self.admit_child_run(parent, child, None).await.map(|_| ())
+    }
+
+    async fn admit_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        *self.last_admit_child_id.write().unwrap() = Some(child.id.clone());
+        if self.expect_wait_on_enqueue.load(Ordering::SeqCst) {
+            self.assert_wait_armed(&parent.id, &child.id).await;
+        }
+        if self.hold_before_admission.swap(false, Ordering::SeqCst) {
+            self.first_enqueue_entered.notify_one();
+            self.release_first_enqueue.notified().await;
+        }
         if self.hold_first_enqueue.swap(false, Ordering::SeqCst) {
             self.first_enqueue_entered.notify_one();
             self.release_first_enqueue.notified().await;
@@ -599,13 +800,18 @@ impl ChildSessionPort for WaitOrderPort {
         }
         self.maybe_fail_launch()?;
         if self.skip_successful_enqueue.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(bamboo_domain::AdmissionCommit::Committed(()));
         }
-        self.inner.enqueue_child_run(parent, child).await
+        self.inner.admit_child_run(parent, child, gate).await
     }
 
     async fn cancel_child_run_and_wait(&self, child_id: &str) -> Result<(), ChildSessionError> {
-        self.inner.cancel_child_run_and_wait(child_id).await
+        self.inner.cancel_child_run_and_wait(child_id).await?;
+        if self.hold_after_interrupt.swap(false, Ordering::SeqCst) {
+            self.interrupt_completed.notify_one();
+            self.release_interrupt.notified().await;
+        }
+        Ok(())
     }
 
     async fn delete_child_session(
@@ -740,7 +946,7 @@ fn synchronous_launch_args(action: &str, child_id: &str, workspace: &str) -> ser
 #[tokio::test]
 async fn synchronous_subagent_paths_arm_wait_before_a_fast_child_can_activate() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1074,7 +1280,7 @@ async fn run_does_not_rearm_wait_cleared_after_parent_snapshot() {
 #[tokio::test]
 async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         harness
             .adapter
             .register_parent_wait_for_child(&harness.parent_session_id, "sibling", None)
@@ -1130,7 +1336,7 @@ async fn failed_synchronous_launch_rolls_back_only_its_child_wait() {
 #[tokio::test]
 async fn cancelled_synchronous_launch_still_compensates_a_rejected_enqueue() {
     for action in ["create", "update", "run"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1184,9 +1390,199 @@ async fn cancelled_synchronous_launch_still_compensates_a_rejected_enqueue() {
 }
 
 #[tokio::test]
+async fn cancelled_run_clears_wait_without_releasing_precommit_scheduler_block() {
+    let harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.hold_before_admission.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let entered = port.first_enqueue_entered.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({"action": "run", "child_session_id": child_id}),
+            subagent_test_ctx(&parent_id, "run-precommit-cancel"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("scheduler must reach a pre-commit block after arming the wait");
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let wait_cleared = parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_none();
+            let active = harness
+                .adapter
+                .active_child_ids(&harness.parent_session_id)
+                .await;
+            if wait_cleared && active.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation must clear the wait without releasing scheduler");
+}
+
+#[tokio::test]
+async fn compact_chat_cancellation_clears_wait_without_releasing_precommit_inbox_block() {
+    let harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.hold_message_delivery.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let entered = port.message_delivery_entered.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "target": child_id,
+                "message": "Do this only if admitted",
+            }),
+            subagent_test_ctx(&parent_id, "send-message-precommit-cancel"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("delivery must reach a pre-commit block after arming the wait");
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = harness
+                .storage
+                .load_session(&harness.parent_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation must clear the parent wait without releasing Inbox");
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.pending + backlog.claimed, 0);
+}
+
+#[tokio::test]
+async fn cancelled_background_create_cannot_admit_a_late_child_job() {
+    let mut harness = build_test_harness().await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.expect_wait_on_enqueue.store(false, Ordering::SeqCst);
+    port.hold_before_admission.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let workspace = harness.workspace_path.to_string_lossy().to_string();
+    let entered = port.first_enqueue_entered.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "action": "create",
+                "title": "Cancelled background child",
+                "responsibility": "Return immediately",
+                "prompt": "Return immediately",
+                "workspace": workspace,
+                "wait": false,
+            }),
+            subagent_test_ctx(&parent_id, "cancelled-background-create"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("prepared child must reach the scheduler admission boundary");
+    let child_id = port.last_admit_child_id.read().unwrap().clone().unwrap();
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+    port.release_first_enqueue.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let child = harness
+                .storage
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if child.last_run_status().as_deref() == Some("error") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled background child must become terminal");
+    assert!(harness
+        .adapter
+        .active_child_ids(&harness.parent_session_id)
+        .await
+        .is_empty());
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_none());
+    while let Ok(event) = harness.parent_rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AgentEvent::SubAgentStarted { child_session_id, .. }
+                    if child_session_id == child_id
+            ),
+            "a cancelled pre-admission child must not publish SubAgentStarted"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
     for action in ["create", "update", "run", "send_message"] {
-        let harness = build_test_harness().await;
+        let harness = build_test_harness_with_storage(None, None, true).await;
         let port = Arc::new(WaitOrderPort::new(
             harness.adapter.clone(),
             harness.storage.clone(),
@@ -1200,12 +1596,17 @@ async fn cancelled_before_delivery_rolls_back_wait_without_sending() {
         );
         let parent_id = harness.parent_session_id.clone();
         let wait_persisted = port.wait_persisted.notified();
-        let outer = tokio::spawn(async move {
+        let mut outer = tokio::spawn(async move {
             invoke_completed(&tool, args, subagent_test_ctx(&parent_id, action)).await
         });
-        tokio::time::timeout(Duration::from_secs(5), wait_persisted)
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = wait_persisted => {}
+                outcome = &mut outer => panic!("{action} ended before persisting its parent wait: {outcome:?}"),
+            }
+        })
             .await
-            .expect("parent wait must be persisted before cancellation");
+            .unwrap_or_else(|_| panic!("{action} parent wait must be persisted before cancellation"));
         outer.abort();
         assert!(outer.await.unwrap_err().is_cancelled());
         port.release_wait.notify_one();
@@ -1388,6 +1789,191 @@ async fn cancelled_send_message_finishes_activation_failure_after_inbox_admissio
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn plan_workspace_selection_uses_durable_metadata_and_current_project_default() {
+    use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .adapter
+        .load_root_session(&harness.parent_session_id)
+        .await
+        .unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let selected_path = selected
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    parent.workspace = Some(harness.workspace_path.to_string_lossy().into_owned());
+    parent.set_workspace_path_meta(&selected_path);
+    // A prior publication cache and legacy field cannot beat durable metadata.
+    bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        &parent.id,
+        harness.workspace_path.clone(),
+    );
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(path, selected_path);
+    assert_eq!(source, WorkspaceSource::Session);
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, Some(harness.workspace_path.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(path, harness.workspace_path.to_string_lossy());
+    assert_eq!(source, WorkspaceSource::Explicit);
+    parent.metadata.remove("workspace_path");
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(path, harness.workspace_path.to_string_lossy());
+    assert_eq!(source, WorkspaceSource::Session);
+
+    let project = harness
+        .project_store
+        .create_with_project_path("Plan Project", None, selected_path.as_str(), Vec::new())
+        .unwrap();
+    parent.set_project_id_meta(project.id.to_string());
+    parent.set_workspace_path_meta(&selected_path);
+    parent.metadata.insert(
+        WORKSPACE_SOURCE_METADATA_KEY.into(),
+        "project_default".into(),
+    );
+    let moved = tempfile::tempdir().unwrap();
+    let project = harness
+        .project_store
+        .update_with_project_path(
+            &project.id,
+            project.revision,
+            moved.path().to_str().unwrap(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(Some(path.as_str()), project.project_path.as_deref());
+    assert_eq!(source, WorkspaceSource::ProjectDefault);
+    // Assigned parents without durable metadata also use the current Project,
+    // even if an older legacy workspace field remains populated.
+    parent.metadata.remove("workspace_path");
+    parent.metadata.remove(WORKSPACE_SOURCE_METADATA_KEY);
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    let (path, source) = harness
+        .adapter
+        .resolve_child_workspace(&parent, None)
+        .await
+        .unwrap();
+    assert_eq!(Some(path.as_str()), project.project_path.as_deref());
+    assert_eq!(source, WorkspaceSource::ProjectDefault);
+}
+
+#[tokio::test]
+async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persistence() {
+    let harness = build_test_harness_with_storage(None, None, false).await;
+    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+    let mut parent = harness
+        .adapter
+        .load_root_session(&harness.parent_session_id)
+        .await
+        .unwrap();
+    parent.workspace = None;
+    // Deliberately leave a cached fallback present: it supplies no authority.
+    bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        &parent.id,
+        harness.workspace_path.clone(),
+    );
+    let storage_dir = harness.workspace_path.parent().unwrap().join("storage");
+    let before = std::fs::read_dir(&storage_dir).unwrap().count();
+    let invalid = tempfile::NamedTempFile::new().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    harness
+        .project_store
+        .create_with_project_path(
+            "Foreign Plan Project",
+            None,
+            foreign.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .unwrap();
+    for workspace in [None, Some(invalid.path()), Some(foreign.path())] {
+        if let Some(path) = workspace {
+            parent.set_workspace_path_meta(path.to_string_lossy());
+        } else {
+            parent.metadata.remove("workspace_path");
+            if let Some(metadata) = parent.runtime_metadata.as_mut() {
+                metadata.workspace_path = None;
+            }
+        }
+        harness.storage.save_session(&parent).await.unwrap();
+        let error = invoke_plan_completed(
+            &tool,
+            json!({"task":"Inspect without writes"}),
+            subagent_test_ctx(&parent.id, "tc_invalid_plan_workspace"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_dir(&storage_dir).unwrap().count(),
+            before,
+            "invalid default must not persist a Child"
+        );
+        assert!(!harness
+            .storage
+            .load_session(&parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|runtime| runtime.waiting_for_children.is_some()));
+    }
+    // Explicit override remains subject to the same foreign ownership check.
+    let error = invoke_plan_completed(
+        &tool,
+        json!({"task":"Inspect", "workspace":foreign.path()}),
+        subagent_test_ctx(&parent.id, "tc_explicit_foreign_plan"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArguments(_)));
+    assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
+
+    // An assigned legacy path is not a canonical Project selection. Neither
+    // a relative cwd nor an older valid path repairs an unconfigured Project.
+    let unconfigured = harness
+        .project_store
+        .create("Unconfigured Plan Project", None)
+        .unwrap();
+    parent.set_project_id_meta(unconfigured.id.to_string());
+    parent.metadata.remove("workspace_path");
+    parent.runtime_metadata.as_mut().unwrap().workspace_path = None;
+    for legacy in [".", harness.workspace_path.to_str().unwrap()] {
+        parent.workspace = Some(legacy.into());
+        harness.storage.save_session(&parent).await.unwrap();
+        let error = invoke_plan_completed(
+            &tool,
+            json!({"task":"Inspect without writes"}),
+            subagent_test_ctx(&parent.id, "tc_assigned_legacy_plan"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert!(error.to_string().contains("project_path"), "{error}");
+        assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
+    }
+}
+
+#[tokio::test]
 async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_wait() {
     let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
         Box::pin(async move {
@@ -1398,7 +1984,7 @@ async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_w
             ))
         })
     });
-    let harness = build_test_harness_with_resolver(Some(resolver)).await;
+    let harness = build_test_harness_with_storage(Some(resolver), None, false).await;
 
     // A permissive root is useful regression pressure: Plan must preserve the
     // root's posture while the child receives an independent read-only overlay.
@@ -1578,7 +2164,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
             title: "Confined child".to_string(),
             responsibility: "Inspect".to_string(),
             assignment_prompt: "Inspect".to_string(),
-            subagent_type: "explorer".to_string(),
+            subagent_type: "workspace-probe".to_string(),
             workspace: foreign_workspace.path().to_string_lossy().into_owned(),
             workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
             model_override: None,
@@ -1608,7 +2194,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
 
 #[tokio::test]
 async fn supervisor_common_child_constructor_keeps_ordinary_identity_for_all_role_labels() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let store = &harness.adapter.session_store;
     let receipt = store
         .get_or_create_default_supervisor("test-model")
@@ -1721,7 +2307,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
         .expect("save parent");
 
     for (role, lifecycle, resident_name) in [
-        ("explorer", None, None),
+        ("workspace-probe", None, None),
         ("resident", Some("resident"), Some("stable")),
         ("guardian", None, None),
     ] {
@@ -2748,7 +3334,7 @@ async fn root_stays_contract_free_while_oneshot_and_resident_children_get_it_onc
             "title": title,
             "responsibility": "Inspect one bounded path",
             "prompt": "Read one file and report evidence.",
-            "subagent_type": "reviewer",
+            "subagent_type": "contract-probe",
             "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false
         });
@@ -2830,8 +3416,127 @@ async fn root_stays_contract_free_while_oneshot_and_resident_children_get_it_onc
 }
 
 #[tokio::test]
+async fn resident_reuse_caller_cancel_after_stop_still_queues_replacement_task() {
+    let mut harness = build_test_harness_with_storage(None, None, true).await;
+    let first = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "steady-worker",
+            "title": "First task",
+            "responsibility": "Handle one task",
+            "prompt": "Original task",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "auto_run": false,
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-initial"),
+    )
+    .await
+    .unwrap();
+    let first_payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+    let child_id = first_payload["child_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        harness
+            .adapter
+            .find_resident_child(&harness.parent_session_id, "steady-worker")
+            .await
+            .as_deref(),
+        Some(child_id.as_str())
+    );
+    let cancel_token = {
+        let mut runners = harness.agent_runners.write().await;
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let cancel_token = runner.cancel_token.clone();
+        runners.insert(child_id.clone(), runner);
+        cancel_token
+    };
+    let runners_for_status = harness.agent_runners.clone();
+    let child_id_for_status = child_id.clone();
+    let waiter = tokio::spawn(async move {
+        cancel_token.cancelled().await;
+        let mut runners = runners_for_status.write().await;
+        if let Some(runner) = runners.get_mut(&child_id_for_status) {
+            runner.status = AgentStatus::Cancelled;
+        }
+    });
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.expect_wait_on_enqueue.store(false, Ordering::SeqCst);
+    port.hold_after_interrupt.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let workspace = harness.workspace_path.to_string_lossy().to_string();
+    let entered = port.interrupt_completed.notified();
+    let mut outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "action": "create",
+                "lifecycle": "resident",
+                "name": "steady-worker",
+                "context": "reset",
+                "title": "Replacement task",
+                "responsibility": "Handle replacement",
+                "prompt": "Replacement task after stop",
+                "workspace": workspace,
+                "auto_run": true,
+                "wait": false,
+            }),
+            subagent_test_ctx(&parent_id, "resident-reuse-after-stop"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = entered => {}
+            outcome = &mut outer => panic!("resident reuse ended before stopping old run: {outcome:?}"),
+        }
+    })
+    .await
+    .expect("resident old run must stop before caller cancellation");
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+    port.release_interrupt.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("resident old run cancellation must signal the waiter")
+        .expect("waiter task should finish");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match harness.parent_rx.recv().await {
+                Ok(AgentEvent::SubAgentStarted {
+                    child_session_id, ..
+                }) if child_session_id == child_id => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("parent event stream closed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("replacement resident task must be queued after caller abort");
+    let child = harness
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child.metadata.get("assignment_prompt").map(String::as_str),
+        Some("Replacement task after stop")
+    );
+}
+
+#[tokio::test]
 async fn resident_create_reset_and_accumulate_share_complete_background_aware_frame() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let mut parent = harness
         .storage
         .load_session(&harness.parent_session_id)
@@ -2919,7 +3624,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
             "title": "Reset resident task",
             "responsibility": "Inspect reset path",
             "prompt": reset_brief,
-            "subagent_type": "reviewer",
+            "subagent_type": "audit-worker",
             "workspace": harness.workspace_path.to_string_lossy(),
             "fork_last_messages": 1,
             "auto_run": false
@@ -2940,7 +3645,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
     let reset_expected = child_session::format_child_assignment_with_background(
         "Reset resident task",
         "Inspect reset path",
-        "reviewer",
+        "audit-worker",
         reset_brief,
         Some(&reset_background),
     );
@@ -2977,7 +3682,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
             "title": "Accumulated resident task",
             "responsibility": "Inspect accumulated path",
             "prompt": accumulate_brief,
-            "subagent_type": "reviewer",
+            "subagent_type": "audit-worker",
             "workspace": harness.workspace_path.to_string_lossy(),
             "fork_last_messages": 1,
             "auto_run": false
@@ -2998,7 +3703,7 @@ async fn resident_create_reset_and_accumulate_share_complete_background_aware_fr
     let accumulated_expected = child_session::format_child_assignment_with_background(
         "Accumulated resident task",
         "Inspect accumulated path",
-        "reviewer",
+        "audit-worker",
         accumulate_brief,
         Some(&accumulated_background),
     );
@@ -3630,7 +4335,7 @@ async fn direct_update_uses_the_canonical_complete_assignment_frame() {
 
 #[tokio::test]
 async fn send_message_appends_follow_up_without_replacing_history() {
-    let harness = build_test_harness().await;
+    let harness = build_test_harness_with_storage(None, None, true).await;
     let raw_message = "\n  continue with the failing parser path  \n";
 
     let result = invoke_completed(
@@ -3695,6 +4400,194 @@ async fn send_message_appends_follow_up_without_replacing_history() {
         "auto_run=false on an idle child must remain a draft and not activate"
     );
     assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn update_rejects_active_assignment_but_allows_transcript_safe_title() {
+    let harness = build_test_harness().await;
+    let mut active = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    active.set_last_run_status("running");
+    harness.storage.save_session(&active).await.unwrap();
+    let original_messages = serde_json::to_value(&active.messages).unwrap();
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(active.id.clone(), runner);
+
+    let rejected = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "prompt": "replace the task",
+            "auto_run": false,
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "active-assignment-update"),
+    )
+    .await
+    .expect_err("active assignment replacement must fail");
+    assert!(
+        rejected.to_string().contains("send_message"),
+        "error must tell the parent how to steer the live child: {rejected}"
+    );
+
+    invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "title": "Current analysis",
+            "auto_run": false,
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "active-title-update"),
+    )
+    .await
+    .expect("title-only update is safe while running");
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Current analysis");
+    assert_eq!(saved.title_version, active.title_version + 1);
+    assert_eq!(saved.metadata_version, active.metadata_version + 1);
+    assert_eq!(
+        serde_json::to_value(&saved.messages).unwrap(),
+        original_messages
+    );
+    assert_eq!(saved.last_run_status().as_deref(), Some("running"));
+}
+
+#[tokio::test]
+async fn title_update_and_draft_append_preserve_both_changes() {
+    let harness = build_test_harness().await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let update = child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &parent.id,
+        harness.child_session_id.clone(),
+        Some("Renamed draft".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let append = child_session::send_message_to_child_action(
+        harness.adapter.as_ref(),
+        &parent,
+        harness.child_session_id.clone(),
+        "Keep this follow-up".into(),
+        Some(false),
+        None,
+        None,
+        false,
+    );
+    let (updated, appended) = tokio::join!(update, append);
+    updated.expect("title update");
+    appended.expect("draft append");
+
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Renamed draft");
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.content == "Keep this follow-up"));
+    assert_eq!(saved.messages.len(), 4);
+}
+
+#[tokio::test]
+async fn queued_child_update_waits_for_launch_fence_and_rejects_assignment_change() {
+    let harness = build_test_harness().await;
+    let mut queued = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    queued.set_last_run_status("pending");
+    assert_eq!(queued.advance_child_launch_generation(), Some(1));
+    queued.mark_child_auto_run_launch_intent();
+    harness.storage.save_session(&queued).await.unwrap();
+    let original_messages = serde_json::to_value(&queued.messages).unwrap();
+
+    let launch_guard = harness
+        .adapter
+        .scheduler
+        .lock_child_launch(&harness.child_session_id)
+        .await;
+    let mut update = Box::pin(child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &harness.parent_session_id,
+        harness.child_session_id.clone(),
+        None,
+        None,
+        Some("replace queued assignment".into()),
+        None,
+        None,
+        None,
+        None,
+        false,
+    ));
+    assert!(matches!(
+        futures::poll!(update.as_mut()),
+        std::task::Poll::Pending
+    ));
+    drop(launch_guard);
+    let error = update
+        .await
+        .expect_err("queued generation must reject update");
+    assert!(error.to_string().contains("send_message"));
+
+    child_session::update_child_action(
+        harness.adapter.as_ref(),
+        &harness.parent_session_id,
+        harness.child_session_id.clone(),
+        Some("Queued analysis".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("title-only metadata edit must remain available");
+    let saved = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Queued analysis");
+    assert_eq!(saved.recoverable_child_launch_generation(), Some(1));
+    assert_eq!(
+        serde_json::to_value(&saved.messages).unwrap(),
+        original_messages
+    );
 }
 
 #[tokio::test]
@@ -3864,7 +4757,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
 
 #[tokio::test]
 async fn send_message_can_interrupt_running_child() {
-    let harness = build_test_harness().await;
+    let harness = build_running_child_harness().await;
     let cancel_token = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
@@ -3875,9 +4768,17 @@ async fn send_message_can_interrupt_running_child() {
     };
 
     let runners_for_status = harness.agent_runners.clone();
+    let storage_for_status = harness.storage.clone();
     let child_id_for_status = harness.child_session_id.clone();
     let waiter = tokio::spawn(async move {
         cancel_token.cancelled().await;
+        let mut child = storage_for_status
+            .load_session(&child_id_for_status)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_last_run_status("cancelled");
+        storage_for_status.save_session(&child).await.unwrap();
         let mut runners = runners_for_status.write().await;
         if let Some(runner) = runners.get_mut(&child_id_for_status) {
             runner.status = AgentStatus::Cancelled;
@@ -3912,7 +4813,10 @@ async fn send_message_can_interrupt_running_child() {
     .await
     .expect("send_message should interrupt running child");
 
-    waiter.await.expect("waiter task should finish");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter task should finish");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
@@ -3948,6 +4852,148 @@ async fn send_message_can_interrupt_running_child() {
         "interrupt=true + auto_run=false must remain a draft and not activate"
     );
     assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn interrupt_running_cancel_before_stop_leaves_old_run_and_inbox_untouched() {
+    let harness = build_test_harness().await;
+    let cancel_token = {
+        let mut runners = harness.agent_runners.write().await;
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let cancel_token = runner.cancel_token.clone();
+        runners.insert(harness.child_session_id.clone(), runner);
+        cancel_token
+    };
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.hold_running_probe.store(true, Ordering::SeqCst);
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let child_id = harness.child_session_id.clone();
+    let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+    let entered = port.running_probe_entered.notified();
+    let task = {
+        let gate = gate.clone();
+        let port = port.clone();
+        tokio::spawn(async move {
+            child_session::send_message_to_child_action_with_gate(
+                port.as_ref(),
+                &parent,
+                child_id,
+                "new task".to_string(),
+                Some(true),
+                Some(true),
+                Some("interrupt-before-stop"),
+                true,
+                Some(&gate),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("running probe must pause before stop ownership commits");
+    gate.cancel_if_pending();
+    port.release_running_probe.notify_one();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cancelled before child interruption"));
+    assert!(!cancel_token.is_cancelled());
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(backlog.pending + backlog.claimed, 0);
+}
+
+#[tokio::test]
+async fn interrupt_running_caller_cancel_after_stop_still_delivers_new_inbox_message() {
+    let harness = build_running_child_harness().await;
+    let cancel_token = {
+        let mut runners = harness.agent_runners.write().await;
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let cancel_token = runner.cancel_token.clone();
+        runners.insert(harness.child_session_id.clone(), runner);
+        cancel_token
+    };
+    let runners_for_status = harness.agent_runners.clone();
+    let storage_for_status = harness.storage.clone();
+    let child_id_for_status = harness.child_session_id.clone();
+    let waiter = tokio::spawn(async move {
+        cancel_token.cancelled().await;
+        let mut child = storage_for_status
+            .load_session(&child_id_for_status)
+            .await
+            .unwrap()
+            .unwrap();
+        child.set_last_run_status("cancelled");
+        storage_for_status.save_session(&child).await.unwrap();
+        let mut runners = runners_for_status.write().await;
+        if let Some(runner) = runners.get_mut(&child_id_for_status) {
+            runner.status = AgentStatus::Cancelled;
+        }
+    });
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    port.hold_after_interrupt.store(true, Ordering::SeqCst);
+    let tool = Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone()));
+    let parent_id = harness.parent_session_id.clone();
+    let child_id = harness.child_session_id.clone();
+    let entered = port.interrupt_completed.notified();
+    let outer = tokio::spawn(async move {
+        invoke_completed(
+            &tool,
+            json!({
+                "action": "send_message",
+                "child_session_id": child_id,
+                "message": "deliver after stop",
+                "interrupt_running": true,
+            }),
+            subagent_test_ctx(&parent_id, "interrupt-after-stop-cancel"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("old run must stop before caller cancellation");
+    outer.abort();
+    assert!(outer.await.unwrap_err().is_cancelled());
+    port.release_interrupt.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter task should finish");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let backlog = harness
+                .session_inbox
+                .inspect(&harness.child_session_id)
+                .await
+                .unwrap();
+            if backlog.pending + backlog.claimed == 1
+                && harness.activation.calls.load(Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached owner must deliver after stopping the old run");
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -4385,12 +5431,453 @@ async fn cancel_stops_running_child() {
     .await
     .expect("cancel should succeed");
 
-    waiter.await.expect("waiter should finish");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("running Child cancellation must signal the waiter")
+        .expect("waiter should finish");
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.result).expect("tool result should be JSON");
     assert_eq!(payload["status"], "cancelled");
     assert_eq!(payload["child_session_id"], harness.child_session_id);
+}
+
+#[tokio::test]
+async fn queued_child_cancel_fences_duplicate_deliveries_and_explicit_retry() {
+    let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let before_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let during_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let during_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hook = Arc::new(QueueBoundaryHook {
+        before_child: "queued-target".into(),
+        before_once: AtomicBool::new(true),
+        before_entered: before_entered.clone(),
+        before_release: before_release.clone(),
+        during_child: "race-target".into(),
+        during_once: AtomicBool::new(true),
+        during_entered: during_entered.clone(),
+        during_release: during_release.clone(),
+    });
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook), false).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for id in ["queued-target", "queue-sentinel", "race-target"] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("finish the bounded task"));
+        child.set_last_run_status("pending");
+        assert_eq!(child.advance_child_launch_generation(), Some(1));
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    let target = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    // Duplicate delivery of one generation must never create a second run.
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &target)
+        .await
+        .unwrap();
+    before_entered.acquire().await.unwrap().forget();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &target)
+        .await
+        .unwrap();
+    let cancelled = invoke_completed(
+        &harness.tool,
+        json!({"action":"cancel", "child_session_id":"queued-target"}),
+        subagent_test_ctx(&parent.id, "cancel-before-dequeue"),
+    )
+    .await
+    .expect("cancel queued generation");
+    let cancelled: serde_json::Value = serde_json::from_str(&cancelled.result).unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    let durable = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.child_launch_generation(), 1);
+    assert!(durable.is_child_launch_cancelled(1));
+    assert_eq!(durable.last_run_status().as_deref(), Some("cancelled"));
+
+    // A later sentinel completing proves both stale queue copies were
+    // dequeued. Neither copy may reserve the target's runner.
+    let sentinel = harness
+        .storage
+        .load_session("queue-sentinel")
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &sentinel)
+        .await
+        .unwrap();
+    before_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("queue-sentinel")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sentinel must finish after stale queue entries");
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get("queued-target")
+        .is_none());
+
+    // A parent's explicit retry prepares a fresh durable generation. It may
+    // run even though the old generation remains cancelled.
+    child_session::run_child_action(
+        harness.adapter.as_ref(),
+        &parent,
+        "queued-target".into(),
+        None,
+    )
+    .await
+    .expect("prepare explicit retry");
+    let retry = harness
+        .storage
+        .load_session("queued-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.child_launch_generation(), 2);
+    assert!(!retry.is_child_launch_cancelled(2));
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &retry)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("queued-target")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit retry must complete");
+
+    // The dequeue hook now stops a second generation after eligibility was
+    // checked while the launch guard is held. Cancellation must wait for the
+    // reservation handoff, then stop the runner or retain its real terminal.
+    let racing = harness
+        .storage
+        .load_session("race-target")
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &racing)
+        .await
+        .unwrap();
+    during_entered.acquire().await.unwrap().forget();
+    let adapter = harness.adapter.clone();
+    let cancel_race =
+        tokio::spawn(async move { adapter.cancel_child_run_and_wait("race-target").await });
+    tokio::task::yield_now().await;
+    assert!(
+        !cancel_race.is_finished(),
+        "cancel must wait for dequeue guard"
+    );
+    during_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), cancel_race)
+        .await
+        .expect("racing cancellation must finish")
+        .unwrap()
+        .unwrap();
+    let racing = harness
+        .storage
+        .load_session("race-target")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        racing.last_run_status().as_deref(),
+        Some("cancelled" | "completed")
+    ));
+}
+
+#[tokio::test]
+async fn startup_recovers_only_matching_pending_auto_run_intents() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Durable snapshots model a crash at the save-before-enqueue boundary.
+    // A draft beside the accepted auto-run must remain inert.
+    for (id, auto_run) in [("recover-saved", true), ("recover-draft", false)] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("bounded task"));
+        child.set_last_run_status("pending");
+        child.advance_child_launch_generation().unwrap();
+        if auto_run {
+            child.mark_child_auto_run_launch_intent();
+        }
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    for (id, status, stale, cancelled) in [
+        ("recover-running", "running", false, false),
+        ("recover-terminal", "completed", false, false),
+        ("recover-stale", "pending", true, false),
+        ("recover-cancelled", "pending", false, true),
+    ] {
+        let mut child = Session::new_child(id, parent.id.clone(), "gpt-5", id);
+        child.add_message(Message::system("child system"));
+        child.add_message(Message::user("bounded task"));
+        child.set_last_run_status(status);
+        child.advance_child_launch_generation().unwrap();
+        child.mark_child_auto_run_launch_intent();
+        if stale {
+            child.advance_child_launch_generation().unwrap();
+        }
+        if cancelled {
+            child.cancel_child_launch_generation();
+        }
+        harness.storage.save_session(&child).await.unwrap();
+    }
+    let saved = harness
+        .storage
+        .load_session("recover-saved")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.recoverable_child_launch_generation(), Some(1));
+    let draft = harness
+        .storage
+        .load_session("recover-draft")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(draft.recoverable_child_launch_generation(), None);
+
+    let reopened_store = Arc::new(
+        SessionStoreV2::new(harness.workspace_path.parent().unwrap().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let reopened_storage: Arc<dyn Storage> = reopened_store.clone();
+    let reopened_adapter = ChildSessionAdapter::new(
+        reopened_store,
+        reopened_storage.clone(),
+        Arc::new(bamboo_storage::LockedSessionStore::new(reopened_storage)),
+        harness.adapter.scheduler.clone(),
+        harness.adapter.sessions_cache.clone(),
+        harness.agent_runners.clone(),
+        harness.adapter.session_event_senders.clone(),
+        harness.adapter.session_messenger.clone(),
+        None,
+        harness.adapter.config.clone(),
+    );
+    assert_eq!(
+        reopened_adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("recover-saved")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saved launch intent should finish after restart");
+    assert_eq!(
+        reopened_adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    for (id, status) in [
+        ("recover-draft", "pending"),
+        ("recover-running", "running"),
+        ("recover-terminal", "completed"),
+        ("recover-stale", "pending"),
+        ("recover-cancelled", "pending"),
+    ] {
+        assert_eq!(
+            harness
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some(status),
+            "{id} must not launch"
+        );
+        assert!(harness.agent_runners.read().await.get(id).is_none());
+    }
+}
+
+#[tokio::test]
+async fn repeated_reconcile_during_queued_launch_admits_one_recovery() {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hook = Arc::new(QueueBoundaryHook {
+        before_child: "recover-queued".into(),
+        before_once: AtomicBool::new(true),
+        before_entered: entered.clone(),
+        before_release: release.clone(),
+        during_child: "unused".into(),
+        during_once: AtomicBool::new(false),
+        during_entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        during_release: Arc::new(tokio::sync::Semaphore::new(0)),
+    });
+    let harness = build_test_harness_with_hook(None, None, true, Some(hook), false).await;
+    let mut child = Session::new_child(
+        "recover-queued",
+        harness.parent_session_id.clone(),
+        "gpt-5",
+        "recover-queued",
+    );
+    child.add_message(Message::system("child system"));
+    child.add_message(Message::user("bounded task"));
+    child.set_last_run_status("pending");
+    child.advance_child_launch_generation().unwrap();
+    harness.storage.save_session(&child).await.unwrap();
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The admission boundary itself must persist the launch promise before
+    // acknowledging a queue entry (Plan promotes a draft this way).
+    harness
+        .adapter
+        .enqueue_child_run(&parent, &child)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .storage
+            .load_session("recover-queued")
+            .await
+            .unwrap()
+            .unwrap()
+            .recoverable_child_launch_generation(),
+        Some(1)
+    );
+    entered.acquire().await.unwrap().forget();
+    // Model a fresh reconcile while the original admitted job has not run.
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        1
+    );
+    // The first job is admitted but has not reserved a runner. Repeated boot
+    // reconciliation must not add another copy to the process queue.
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get("recover-queued")
+        .is_none());
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .storage
+                .load_session("recover-queued")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref()
+                == Some("completed")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued launch should finish once released");
+    assert_eq!(
+        harness
+            .adapter
+            .reconcile_pending_child_launches()
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -4597,6 +6084,7 @@ async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
         project_store: harness.adapter.project_store.clone(),
         workspace_resolver: harness.adapter.workspace_resolver.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
     let reopened_tool = SubAgentTool::new(reopened_adapter.clone(), reopened_adapter);
     let message_next = inspect_child(
@@ -5197,4 +6685,672 @@ async fn create_sets_child_workspace() {
         Some(harness.workspace_path.to_string_lossy().into_owned()),
         "child workspace should be set from create args"
     );
+}
+
+fn child_report_fixture() -> serde_json::Value {
+    json!({"version":1,"outcome":"blocked","summary":"Reported claim 🪷",
+        "reported_evidence":[{"description":"Not host verified","reference":"/unreadable/reported/path","sha256":null}],
+        "reported_verification":[{"check":"focused check","reported_status":"unknown","details":""}],
+        "proposals":[],"blockers":["Need a decision"],"open_decisions":[]})
+}
+
+#[tokio::test]
+async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = h.workspace_path.to_string_lossy().into_owned();
+    parent.workspace = None;
+    parent.set_workspace_path_meta(workspace);
+    parent.metadata_version += 1;
+    h.storage.save_session(&parent).await.unwrap();
+    let port = Arc::new(WaitOrderPort::new(h.adapter.clone(), h.storage.clone()));
+    port.expect_wait_on_enqueue.store(false, Ordering::SeqCst);
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port.clone(), h.adapter.clone());
+    let message = "  Analyze this complete task 🪷\n\nPreserve every instruction and the trailing whitespace.  ";
+    let result = invoke_completed(
+        &tool,
+        json!({"message":message}),
+        subagent_test_ctx(&h.parent_session_id, "compact-create"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["actor_id"].as_str().unwrap();
+    assert_eq!(payload["observed_status"], "running_in_background");
+    assert_eq!(
+        port.last_admit_child_id.read().unwrap().as_deref(),
+        Some(child_id)
+    );
+    let child = h.storage.load_session(child_id).await.unwrap().unwrap();
+    assert_eq!(
+        child.parent_session_id.as_deref(),
+        Some(h.parent_session_id.as_str())
+    );
+    assert_eq!(child.metadata["assignment_prompt"], message);
+    assert!(child
+        .messages
+        .iter()
+        .any(|m| m.role == Role::User && m.content.contains(message)));
+    assert_eq!(
+        child.workspace.as_deref(),
+        Some(h.workspace_path.to_str().unwrap())
+    );
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+    assert!(payload.get("child_session_id").is_none());
+    assert!(payload.get("runtime_kind").is_none());
+    let schema = tool.parameters_schema();
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
+    assert!(schema["properties"].get("action").is_none());
+}
+
+#[tokio::test]
+async fn compact_owned_inspection_correction_and_control_keep_one_logical_child() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.metadata.insert(
+        "external.agent_id".into(),
+        "physical-worker-sentinel".into(),
+    );
+    child.set_last_run_error("physical-endpoint-sentinel");
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+    for query in [
+        "overview".to_string(),
+        "messages".to_string(),
+        "result".to_string(),
+        "error".to_string(),
+    ] {
+        let result = invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect", "target":h.child_session_id, "message":query}),
+            subagent_test_ctx(&h.parent_session_id, "compact-inspect"),
+        )
+        .await
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["actor_id"], h.child_session_id);
+        assert!(!result.result.contains("physical-worker-sentinel"));
+        assert!(!result.result.contains("physical-endpoint-sentinel"));
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        if query == "messages" {
+            assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
+            let cursor = payload["next_cursor"].as_str().unwrap();
+            let page = invoke_completed(
+                &h.tool,
+                json!({"intent":"inspect", "target":h.child_session_id,
+                "message":json!({"view":"messages", "cursor":cursor}).to_string()}),
+                subagent_test_ctx(&h.parent_session_id, "compact-page"),
+            )
+            .await
+            .unwrap();
+            let page: serde_json::Value = serde_json::from_str(&page.result).unwrap();
+            assert_eq!(page["messages"][0]["index"], 1);
+            assert_eq!(page["messages"][0]["content_preview"], "initial assignment");
+        }
+        if query == "result" {
+            assert_eq!(payload["text"], "initial answer");
+        }
+    }
+    let legacy = invoke_completed(
+        &h.tool,
+        json!({"action":"get", "child_session_id":h.child_session_id}),
+        subagent_test_ctx(&h.parent_session_id, "legacy-inspect"),
+    )
+    .await
+    .unwrap();
+    let legacy: serde_json::Value = serde_json::from_str(&legacy.result).unwrap();
+    assert_eq!(legacy["child_session_id"], h.child_session_id);
+    assert_eq!(legacy["external_agent_id"], "physical-worker-sentinel");
+
+    let foreign = Session::new("other-root", "gpt-5");
+    h.storage.save_session(&foreign).await.unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id}),
+        subagent_test_ctx(&foreign.id, "foreign-inspect")
+    )
+    .await
+    .is_err());
+    let before = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"cancel"}),
+        subagent_test_ctx(&foreign.id, "foreign-cancel")
+    )
+    .await
+    .is_err());
+    let after = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    let correction = "  Keep the same child 🪷\nDo not broaden the task.  ";
+    h.activation
+        .force_disposition(SessionActivationDisposition::ActiveNotified);
+    let delivered = invoke_completed(
+        &h.tool,
+        json!({"target":h.child_session_id, "message":correction}),
+        subagent_test_ctx(&h.parent_session_id, "compact-correction"),
+    )
+    .await
+    .unwrap();
+    let delivered: serde_json::Value = serde_json::from_str(&delivered.result).unwrap();
+    assert_eq!(delivered["actor_id"], h.child_session_id);
+    assert_eq!(delivered["observed_status"], "message_delivered_live");
+    let claims = h.session_inbox.claim(&h.child_session_id, 1).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].envelope.id.as_str(),
+        delivered["delivery_message_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        claims[0].envelope.body,
+        bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
+            correction
+        ))
+    );
+
+    let cancelled = invoke_completed(
+        &h.tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"cancel"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-cancel"),
+    )
+    .await
+    .unwrap();
+    let cancelled: serde_json::Value = serde_json::from_str(&cancelled.result).unwrap();
+    assert_eq!(cancelled["actor_id"], h.child_session_id);
+    assert_eq!(cancelled["observed_status"], "completed");
+    let port = Arc::new(WaitOrderPort::new(h.adapter.clone(), h.storage.clone()));
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let retry_tool = SubAgentTool::new(port.clone(), h.adapter.clone());
+    let retried = invoke_completed(
+        &retry_tool,
+        json!({"intent":"control", "target":h.child_session_id, "message":"retry"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-retry"),
+    )
+    .await
+    .unwrap();
+    let retried: serde_json::Value = serde_json::from_str(&retried.result).unwrap();
+    assert_eq!(retried["actor_id"], h.child_session_id);
+    assert_eq!(retried["runtime_control"], "waiting_for_children");
+    assert_eq!(
+        port.last_admit_child_id.read().unwrap().as_deref(),
+        Some(h.child_session_id.as_str())
+    );
+    assert_eq!(h.adapter.list_children(&h.parent_session_id).await.len(), 1);
+    assert_eq!(
+        h.storage
+            .load_session(&h.child_session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        child.created_at
+    );
+}
+
+#[tokio::test]
+async fn compact_tree_bounds_owned_observations_without_physical_identity() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    for n in 0..35 {
+        let child = Session::new_child(
+            format!("tree-child-{n}"),
+            h.parent_session_id.clone(),
+            "gpt-5",
+            "Tree child",
+        );
+        h.storage.save_session(&child).await.unwrap();
+    }
+    let foreign = Session::new("foreign-root", "gpt-5");
+    h.storage.save_session(&foreign).await.unwrap();
+    let foreign_child = Session::new_child("foreign-child", foreign.id, "gpt-5", "Not owned");
+    h.storage.save_session(&foreign_child).await.unwrap();
+    let result = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-tree"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["actor_id"], h.parent_session_id);
+    assert_eq!(payload["truncated"], true);
+    let nodes = payload["nodes"].as_array().unwrap();
+    assert!(nodes.len() <= 32);
+    assert_eq!(nodes[0]["actor_id"], h.parent_session_id);
+    assert!(nodes
+        .iter()
+        .skip(1)
+        .all(|node| node["parent_actor_id"] == h.parent_session_id));
+    assert!(nodes
+        .iter()
+        .all(|node| node.get("parent_actor_id").is_some()));
+    assert!(!result.result.contains("foreign-child"));
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+}
+
+async fn required_result_harness() -> (
+    TestHarness,
+    Session,
+    Session,
+    bamboo_domain::ChildContextBinding,
+) {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut user = Message::user("Do not expand scope");
+    user.id = "required-source".into();
+    let mut background = Message::assistant("optional facts", None);
+    background.id = "optional-source".into();
+    parent.messages.extend([user, background]);
+    harness.storage.save_session(&parent).await.unwrap();
+    let packet = bamboo_domain::ChildContextPacket {
+        version: 1,
+        objective: "Report bounded result".into(),
+        constraints: vec![],
+        acceptance: vec!["Return the strict report".into()],
+        non_goals: vec![],
+        necessary_user_instructions: vec![],
+        recorded_decisions: vec![],
+        source_user_message_ids: vec!["required-source".into()],
+        background_message_ids: vec!["optional-source".into()],
+    };
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = packet.resolve(&parent, "Produce report").unwrap();
+    let binding = bamboo_domain::ChildContextBinding::new(
+        &parent,
+        &child.id,
+        resolved.required_brief.clone(),
+        resolved,
+    )
+    .unwrap();
+    binding.install(&mut child).unwrap();
+    child.messages = vec![
+        Message::system("Child"),
+        binding.assignment_message(),
+        Message::assistant(child_report_fixture().to_string(), None),
+    ];
+    child.set_last_run_status("completed");
+    harness.storage.save_session(&child).await.unwrap();
+    (harness, parent, child, binding)
+}
+fn result_args(child: &Session, binding: &bamboo_domain::ChildContextBinding) -> serde_json::Value {
+    json!({"action":"get","child_session_id":child.id,"view":"typed_result",
+        "expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256})
+}
+fn result_files(directory: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(path: &std::path::Path, result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, result);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                result.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut result = Default::default();
+    visit(directory, &mut result);
+    result
+}
+async fn assert_result_unavailable(h: &TestHarness, args: serde_json::Value, reason: &str) {
+    let directory = h.workspace_path.parent().unwrap().join("sessions");
+    let before = result_files(&directory);
+    let result = invoke_completed(&h.tool, args, child_inspection_ctx(&h.parent_session_id))
+        .await
+        .unwrap();
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+    let value: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(value["available"], false);
+    assert_eq!(value["reason"], reason);
+    assert!(value.get("child_report").is_none());
+    assert_eq!(result_files(&directory), before);
+}
+
+#[tokio::test]
+async fn typed_child_result_rejects_latest_nonfinal_without_older_winner() {
+    let (h, _, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    let value = inspect_child(&h.tool, &h.parent_session_id, args.clone()).await;
+    assert_eq!(value["child_report"]["outcome"], "blocked");
+    assert_eq!(value["host_observation"]["last_run_status"], "completed");
+    for variant in 0..10 {
+        let mut changed = child.clone();
+        match variant {
+            0 => changed.add_message(Message::assistant("Newest malformed report", None)),
+            1 => changed.add_message(Message::user("Later task")),
+            2 => {
+                changed.messages.last_mut().unwrap().phase =
+                    Some(bamboo_domain::MessagePhase::Commentary)
+            }
+            3 => changed.messages.last_mut().unwrap().compressed = true,
+            4 => changed.messages.last_mut().unwrap().compressed_by_event_id = Some("event".into()),
+            5 => changed.messages.last_mut().unwrap().compression_level = 1,
+            6 => changed.set_last_run_status("running"),
+            7 => changed.set_last_run_status("error"),
+            8 => {
+                changed.messages.last_mut().unwrap().content_parts =
+                    Some(vec![serde_json::from_value(
+                        json!({"type":"text","text":"extra"}),
+                    )
+                    .unwrap()])
+            }
+            _ => {
+                changed.messages.last_mut().unwrap().tool_calls =
+                    Some(vec![bamboo_agent_core::tools::ToolCall {
+                        id: "call".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "Read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }])
+            }
+        }
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(
+            &h,
+            args.clone(),
+            if variant == 0 {
+                "report_malformed"
+            } else {
+                "report_not_current_final"
+            },
+        )
+        .await;
+    }
+    let mut changed = child.clone();
+    changed.messages.retain(|m| m.role != Role::Assistant);
+    h.storage.save_session(&changed).await.unwrap();
+    assert_result_unavailable(&h, args, "report_absent").await;
+}
+
+#[tokio::test]
+async fn typed_child_result_checks_authority_selectors_and_durable_context() {
+    let (h, parent, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    for view in ["result_binding", "typed_result"] {
+        let foreign = invoke_completed(
+            &h.tool,
+            json!({"action":"get","child_session_id":child.id,"view":view,
+            "expected_assignment_sha256":"malformed"}),
+            child_inspection_ctx("foreign-root"),
+        )
+        .await
+        .unwrap_err();
+        assert!(foreign.to_string().contains("does not belong to parent"));
+    }
+    let nested = Session::new_child_of("result-nested", &parent, "model", "nested");
+    let grandchild = Session::new_child_of("result-grandchild", &nested, "model", "grandchild");
+    h.storage.save_session(&nested).await.unwrap();
+    h.storage.save_session(&grandchild).await.unwrap();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"action":"get","child_session_id":grandchild.id,"view":"typed_result",
+        "expected_child_created_at":"bad"}),
+        child_inspection_ctx(&parent.id)
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("does not belong to parent"));
+    for bad in [
+        json!({}),
+        json!({"expected_child_created_at":"bad","expected_assignment_sha256":"a".repeat(64)}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":"A".repeat(64)}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256,"cursor":null}),
+        json!({"expected_child_created_at":child.created_at,"expected_assignment_sha256":binding.assignment_sha256,"parent_session_id":parent.id}),
+    ] {
+        let mut input = json!({"action":"get","child_session_id":child.id,"view":"typed_result"});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        assert!(
+            invoke_completed(&h.tool, input, child_inspection_ctx(&parent.id))
+                .await
+                .is_err()
+        );
+    }
+    let mut wrong = args.clone();
+    wrong["expected_child_created_at"] = json!(child.created_at + chrono::Duration::nanoseconds(1));
+    assert_result_unavailable(&h, wrong, "stale_result_selector").await;
+    wrong = args.clone();
+    wrong["expected_assignment_sha256"] = json!("a".repeat(64));
+    assert_result_unavailable(&h, wrong, "stale_result_selector").await;
+    let discovered = inspect_child(
+        &h.tool,
+        &parent.id,
+        json!({"action":"get","child_session_id":child.id,"view":"result_binding"}),
+    )
+    .await;
+    assert_eq!(discovered["assignment_sha256"], binding.assignment_sha256);
+    assert_eq!(discovered["child_created_at"], json!(child.created_at));
+    // Explicit trusted Store fault injection. Inspect must never repair it.
+    let runtime = h
+        .workspace_path
+        .parent()
+        .unwrap()
+        .join("sessions")
+        .join(&parent.id)
+        .join("children")
+        .join(&child.id)
+        .join("runtime.json");
+    let original = std::fs::read(&runtime).unwrap();
+    for (key, value, reason) in [
+        (
+            "child.context_packet.binding.v1",
+            json!("corrupt"),
+            "result_binding_invalid",
+        ),
+        ("lifecycle", json!("resident"), "typed_result_unsupported"),
+        ("project_id", json!("bad/path"), "stale_parent_context"),
+        ("project_id", json!("other-project"), "stale_parent_context"),
+    ] {
+        let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        raw["metadata"][key] = value;
+        std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_result_unavailable(&h, args.clone(), reason).await;
+    }
+    std::fs::write(&runtime, &original).unwrap();
+    for variant in 0..6 {
+        let mut changed = parent.clone();
+        match variant {
+            0 | 1 => changed.messages[variant].content.push('!'),
+            2 | 3 => {
+                changed.messages.remove(variant - 2);
+            }
+            _ => changed.messages.push(parent.messages[variant - 4].clone()),
+        }
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(&h, args.clone(), "stale_parent_context").await;
+    }
+    h.storage.save_session(&parent).await.unwrap();
+    let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    raw["created_at"] = json!(child.created_at + chrono::Duration::nanoseconds(1));
+    std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_result_unavailable(&h, args.clone(), "stale_result_selector").await;
+    for key in ["spawn_depth", "root_session_id"] {
+        let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        raw[key] = if key == "spawn_depth" {
+            json!(child.spawn_depth + 1)
+        } else {
+            json!("foreign-root")
+        };
+        std::fs::write(&runtime, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_result_unavailable(&h, args.clone(), "stale_parent_context").await;
+    }
+    std::fs::write(&runtime, &original).unwrap();
+    // A coherent trusted replacement binding is still stale against the actual parent.
+    for variant in 0..2 {
+        use sha2::{Digest, Sha256};
+        let mut wrong_binding = binding.clone();
+        if variant == 0 {
+            wrong_binding.payload.parent_created_at += chrono::Duration::nanoseconds(1);
+        } else {
+            wrong_binding
+                .payload
+                .sources
+                .push(binding.payload.sources[0].clone());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"bamboo/immutable-child-assignment/v1\0");
+        digest.update(serde_json::to_vec(&wrong_binding.payload).unwrap());
+        wrong_binding.assignment_sha256 = hex::encode(digest.finalize());
+        let mut changed = child.clone();
+        wrong_binding.install(&mut changed).unwrap();
+        changed.messages[1] = wrong_binding.assignment_message();
+        h.storage.save_session(&changed).await.unwrap();
+        assert_result_unavailable(
+            &h,
+            result_args(&changed, &wrong_binding),
+            "stale_parent_context",
+        )
+        .await;
+    }
+    h.storage.save_session(&child).await.unwrap();
+    let mut changed = child.clone();
+    let assignment = changed
+        .messages
+        .iter_mut()
+        .find(|m| m.id == binding.assignment_message().id)
+        .unwrap();
+    assignment.content.push('!');
+    h.storage.save_session(&changed).await.unwrap();
+    assert_result_unavailable(&h, args.clone(), "result_binding_invalid").await;
+    let main = runtime.with_file_name("session.json");
+    let original_main = std::fs::read(&main).unwrap();
+    std::fs::write(&main, b"not JSON").unwrap();
+    assert!(
+        invoke_completed(&h.tool, args.clone(), child_inspection_ctx(&parent.id))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("failed to load child")
+    );
+    std::fs::write(&main, &original_main).unwrap();
+    // A real same-ID recreation has coherent Main/Runtime birth, but cannot win an old selector.
+    h.storage.delete_session(&child.id).await.unwrap();
+    let mut replacement = Session::new_child_of(&child.id, &parent, "gpt-5", "replacement");
+    assert_ne!(replacement.created_at, child.created_at);
+    binding.install(&mut replacement).unwrap();
+    replacement.messages = vec![
+        binding.assignment_message(),
+        Message::assistant(child_report_fixture().to_string(), None),
+    ];
+    replacement.set_last_run_status("completed");
+    h.storage.save_session(&replacement).await.unwrap();
+    assert_result_unavailable(&h, args.clone(), "stale_result_selector").await;
+    h.storage.delete_session(&parent.id).await.unwrap();
+    h.storage
+        .recreate_root_session(&parent.id, "model")
+        .await
+        .unwrap();
+    assert!(
+        invoke_completed(&h.tool, args, child_inspection_ctx(&parent.id))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn typed_child_result_enforces_actual_double_escaped_tool_budget() {
+    let (h, _, child, binding) = required_result_harness().await;
+    let args = result_args(&child, &binding);
+    let base = inspect_child(&h.tool, &h.parent_session_id, args.clone()).await;
+    let mut last_valid = 0;
+    let mut double_escaped_rejected = false;
+    for count in (1..1001).step_by(16) {
+        let mut report = child_report_fixture();
+        report["proposals"] = json!(vec!["\"".repeat(count); 3]);
+        assert!(report.to_string().len() <= 8192);
+        let mut changed = child.clone();
+        changed.messages.last_mut().unwrap().content = report.to_string();
+        h.storage.save_session(&changed).await.unwrap();
+        let result = invoke_completed(
+            &h.tool,
+            args.clone(),
+            child_inspection_ctx(&h.parent_session_id),
+        )
+        .await
+        .unwrap();
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert!(bytes.len() <= 8192);
+        let value: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        if value["available"] == true {
+            last_valid = bytes.len();
+        } else {
+            assert_eq!(value["reason"], "result_budget_exceeded");
+            let mut candidate = base.clone();
+            candidate["child_report"] = report;
+            assert!(
+                candidate.to_string().len() <= 8192,
+                "first compact JSON layer fits"
+            );
+            let unbounded = ToolResult {
+                success: true,
+                result: candidate.to_string(),
+                display_preference: Some("Collapsible".into()),
+                images: vec![],
+            };
+            assert!(serde_json::to_vec(&unbounded).unwrap().len() > 8192);
+            double_escaped_rejected = true;
+            break;
+        }
+    }
+    assert!(
+        last_valid >= 7900,
+        "near-boundary valid actual ToolResult: {last_valid}"
+    );
+    assert!(double_escaped_rejected);
+    let h = build_test_harness_with_storage(None, None, true).await;
+    assert_result_unavailable(
+        &h,
+        json!({"action":"get","child_session_id":h.child_session_id,"view":"result_binding"}),
+        "typed_result_unsupported",
+    )
+    .await;
+    for view in ["overview", "messages", "message", "result", "error"] {
+        assert!(invoke_completed(
+            &h.tool,
+            json!({"action":"get","child_session_id":h.child_session_id,"view":view,
+            "expected_assignment_sha256":null}),
+            child_inspection_ctx(&h.parent_session_id)
+        )
+        .await
+        .is_err());
+    }
 }

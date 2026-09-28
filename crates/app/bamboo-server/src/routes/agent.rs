@@ -168,6 +168,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::subagent_snapshot::handler),
         )
         .route(
+            "/actors/{root_id}/snapshot",
+            web::get().to(agent::actor_snapshot::handler),
+        )
+        .route(
             "/sessions/{session_id}/guidance",
             web::get().to(agent::guidance::list),
         )
@@ -228,6 +232,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}",
             web::get().to(agent::sessions::get_session),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}",
+            web::post().to(agent::sessions::select_root_mode),
+        )
+        .route(
+            "/sessions/{session_id}/named-agent-profiles",
+            web::get().to(agent::named_agent_catalog::handler),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}/recover",
+            web::post().to(agent::sessions::recover_root_mode),
         )
         .route(
             "/sessions/{session_id}/copy",

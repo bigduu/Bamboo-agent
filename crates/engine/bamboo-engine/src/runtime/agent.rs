@@ -272,9 +272,9 @@ impl Agent {
     }
 
     /// Execute the same durable SessionInbox boundary used by the agent loop
-    /// before its first provider call. Actor workers use this after embedding
-    /// initial RunSpec deliveries, so those messages cannot race the first
-    /// reasoning context.
+    /// before its first provider call. This compatibility method reports only
+    /// the merge count; it cannot confirm successful ACK. Execution entry points
+    /// must use [`Self::admit_session_inbox_at_safe_boundary_checked`] instead.
     pub async fn admit_session_inbox_at_safe_boundary(
         &self,
         session: &mut bamboo_agent_core::Session,
@@ -287,6 +287,26 @@ impl Agent {
         )
         .await
         .merged
+    }
+
+    /// Confirm the durable admission boundary before entering provider execution.
+    /// An ACK error is unresolved even after receipt publication. Preserve the
+    /// checkpoint and existing claim recovery, but reject this activation.
+    pub async fn admit_session_inbox_at_safe_boundary_checked(
+        &self,
+        session: &mut bamboo_agent_core::Session,
+    ) -> Result<usize, bamboo_agent_core::AgentError> {
+        let refresh = crate::runtime::runner::state_bridge::refresh_turn_boundary_with_inbox(
+            session,
+            Some(self.storage()),
+            Some(self.persistence()),
+            self.session_inbox(),
+        )
+        .await;
+        if let Some(error) = refresh.admission_error {
+            return Err(bamboo_agent_core::AgentError::Tool(error));
+        }
+        Ok(refresh.merged)
     }
 
     pub fn activation_router(

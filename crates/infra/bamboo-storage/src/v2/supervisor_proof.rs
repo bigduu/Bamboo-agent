@@ -3,6 +3,7 @@
 //! operational readers require the matching canonical runtime sidecar and a
 //! real main file at the deterministic Root placement.
 
+use super::supervisor_management::SupervisorManagementGuards;
 use super::*;
 use bamboo_domain::{SessionAuthorityConflict, SupervisorManagementState};
 
@@ -123,6 +124,23 @@ impl SessionStoreV2 {
         }
         supervisor::validate_identity(side).map_err(|error| conflict(error.to_string()))?;
         let proof = self.read_supervisor_proof().await?;
+        Self::validate_supervisor_proof_value(side, proof)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_supervisor_proof(
+        side: &Session,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        supervisor::validate_identity(side).map_err(|_| conflict("invalid identity"))?;
+        let proof = serde_json::from_slice(bytes).map_err(|_| conflict("invalid proof"))?;
+        Self::validate_supervisor_proof_value(side, proof)
+    }
+
+    fn validate_supervisor_proof_value(
+        side: &Session,
+        proof: SupervisorAuthorityProof,
+    ) -> io::Result<()> {
         if proof.state != ProofState::Committed || !proof.matches(side) {
             return Err(conflict("canonical proof is pending or stale"));
         }
@@ -155,10 +173,27 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    async fn write_default_supervisor_proof(
+        &self,
+        directory: &Path,
+        session: &Session,
+        state: ProofState,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&SupervisorAuthorityProof::from_session(session, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        if bytes.len() as u64 > SUPERVISOR_PROOF_MAX_BYTES {
+            return Err(conflict("Supervisor proof exceeds bounded capacity"));
+        }
+        self.write_default_bytes(&directory.join(SUPERVISOR_PROOF_FILE), bytes, guards)
+            .await
+    }
+
     pub(super) async fn prepare_supervisor_proof_for_full_save(
         &self,
         directory: &Path,
         incoming: &Session,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<bool> {
         if !matches!(
             incoming.authority_identity,
@@ -170,17 +205,21 @@ impl SessionStoreV2 {
         if proof.state == ProofState::Committed && proof.matches(incoming) {
             return Ok(false);
         }
-        Self::write_proof_at(directory, incoming, ProofState::Prepared).await?;
+        self.write_default_supervisor_proof(directory, incoming, ProofState::Prepared, guards)
+            .await?;
         Ok(true)
     }
 
     pub(super) async fn commit_supervisor_proof_after_full_save(
+        &self,
         directory: &Path,
         incoming: &Session,
         prepared: bool,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         if prepared {
-            Self::write_proof_at(directory, incoming, ProofState::Committed).await?;
+            self.write_default_supervisor_proof(directory, incoming, ProofState::Committed, guards)
+                .await?;
         }
         Ok(())
     }
@@ -188,27 +227,48 @@ impl SessionStoreV2 {
     pub(super) async fn prepare_supervisor_management_proof(
         &self,
         updated: &Session,
+        guards: &Arc<SupervisorManagementGuards>,
     ) -> io::Result<()> {
         let current = self.read_supervisor_proof().await?;
         if current.state != ProofState::Committed {
             return Err(conflict("canonical proof is pending"));
         }
-        Self::write_proof_at(
-            &self.sessions_dir.join(&updated.id),
-            updated,
-            ProofState::Prepared,
-        )
-        .await
+        self.write_management_supervisor_proof(updated, ProofState::Prepared, guards)
+            .await
     }
 
     pub(super) async fn commit_supervisor_management_proof(
         &self,
         updated: &Session,
+        guards: &Arc<SupervisorManagementGuards>,
     ) -> io::Result<()> {
-        Self::write_proof_at(
-            &self.sessions_dir.join(&updated.id),
-            updated,
-            ProofState::Committed,
+        self.write_management_supervisor_proof(updated, ProofState::Committed, guards)
+            .await
+    }
+
+    async fn write_management_supervisor_proof(
+        &self,
+        updated: &Session,
+        state: ProofState,
+        guards: &Arc<SupervisorManagementGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&SupervisorAuthorityProof::from_session(updated, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        if bytes.len() as u64 > SUPERVISOR_PROOF_MAX_BYTES {
+            return Err(conflict("Supervisor proof exceeds bounded capacity"));
+        }
+        let stage = match state {
+            ProofState::Prepared => SupervisorProofFault::Prepared,
+            ProofState::Committed => SupervisorProofFault::Committed,
+        };
+        self.write_management_bytes(
+            &self
+                .sessions_dir
+                .join(&updated.id)
+                .join(SUPERVISOR_PROOF_FILE),
+            bytes,
+            stage,
+            guards,
         )
         .await
     }
@@ -240,6 +300,7 @@ impl SessionStoreV2 {
                 let pair = async {
                     let main_bytes = fs::read(directory.join("session.json")).await?;
                     let side_bytes = fs::read(directory.join(RUNTIME_SIDECAR_FILE)).await?;
+                    compact_main::validate_full_main(&main_bytes)?;
                     let main: Session = serde_json::from_slice(&main_bytes)?;
                     let side: Session = serde_json::from_slice(&side_bytes)?;
                     if main.id != DEFAULT_SUPERVISOR_SESSION_ID

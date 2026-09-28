@@ -1,4 +1,302 @@
 use std::collections::BTreeMap;
+
+fn required_packet_session() -> Session {
+    let mut parent = Session::new("packet-parent", "test-model");
+    let background = Message::assistant("optional background words ".repeat(60), None);
+    let packet = bamboo_domain::ChildContextPacket {
+        version: 1,
+        objective: "required exact objective 🪷".into(),
+        constraints: vec!["preserve the user constraint".into()],
+        acceptance: vec!["return evidence".into()],
+        non_goals: vec![],
+        necessary_user_instructions: vec![],
+        recorded_decisions: vec![],
+        source_user_message_ids: vec![],
+        background_message_ids: vec![background.id.clone()],
+    };
+    parent.add_message(background);
+    let resolved = packet.resolve(&parent, "bounded task").unwrap();
+    let mut binding = bamboo_domain::ChildContextBinding::new(
+        &parent,
+        "packet-child",
+        resolved.required_brief.clone(),
+        resolved,
+    )
+    .unwrap();
+    let mut child = Session::new_child_of("packet-child", &parent, "test-model", "packet");
+    child.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        64,
+        Default::default(),
+        0,
+    ));
+    binding.bind_host_budget(&child).unwrap();
+    binding.install(&mut child).unwrap();
+    child.add_message(Message::system("system"));
+    child.add_message(binding.assignment_message());
+    child.messages.extend(binding.background_messages());
+    child
+}
+
+#[tokio::test]
+async fn required_packet_midturn_manual_archive_and_overflow_do_not_call_lossy_provider() {
+    let (llm, model_calls) = recording_llm();
+    for strategy in [
+        ContextManagementStrategy::Summary,
+        ContextManagementStrategy::RetrievalWindow,
+    ] {
+        let mut config = AgentLoopConfig::default();
+        config.context_management.strategy = strategy;
+        let mut session = required_packet_session();
+        let required = bamboo_domain::ChildContextBinding::from_session(&session)
+            .unwrap()
+            .unwrap()
+            .assignment_message();
+        assert!(!maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .unwrap());
+        session.force_manual_compression = Some("compact".into());
+        assert!(maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .is_err());
+        session.force_manual_compression = None;
+        append_archive_context_request(&mut session, "packet-archive");
+        assert!(maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .is_err());
+        assert!(super::force_overflow_context_recovery(
+            &mut session,
+            &config,
+            "test-model",
+            "packet-child",
+            &[],
+            &llm,
+            None
+        )
+        .await
+        .is_err());
+        assert!(session
+            .messages
+            .iter()
+            .any(|message| message.id == required.id
+                && message.content == required.content
+                && !message.compressed));
+        assert!(model_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn required_packet_later_round_overflow_fails_before_any_provider_or_compression() {
+    let (llm, model_calls) = recording_llm();
+    let mut session = required_packet_session();
+    session.add_message(Message::assistant(
+        "later round tool evidence ".repeat(30_000),
+        None,
+    ));
+    let error = prepare_round_context(
+        &mut session,
+        &AgentLoopConfig::default(),
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("context_budget_exceeded"));
+    assert!(bamboo_domain::ChildContextBinding::from_session(&session)
+        .unwrap()
+        .is_some());
+    assert!(model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn required_packet_optional_fit_and_final_safe_cap_guard() {
+    let (llm, model_calls) = recording_llm();
+    let config = AgentLoopConfig::default();
+    let mut session = required_packet_session();
+    let mut binding = bamboo_domain::ChildContextBinding::from_session(&session)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.payload.background.len(), 1);
+    let mut minimal = session.clone();
+    minimal
+        .messages
+        .retain(|message| !binding.is_background(message));
+    let prepared = prepare_round_context(
+        &mut minimal,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    let usage = super::super::stream_execution::project_request_usage(
+        &minimal,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm,
+    )
+    .await
+    .unwrap();
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        usage.input_tokens + 65,
+        64,
+        Default::default(),
+        0,
+    ));
+    binding.bind_host_budget(&session).unwrap();
+    binding.install(&mut session).unwrap();
+    session.messages = vec![Message::system("system"), binding.assignment_message()];
+    session.messages.extend(binding.background_messages());
+    let fitted = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    binding
+        .validate_messages(&session.id, &fitted.prepared_context.messages)
+        .unwrap();
+    let model_budget = super::super::token_budget::resolve_token_budget(
+        &mut Session::new("model-budget-proof", "test-model"),
+        &config,
+        "test-model",
+        llm.as_ref(),
+    )
+    .await;
+    assert!(fitted.budget.max_request_input_tokens() <= model_budget.max_request_input_tokens());
+    assert!(
+        fitted.budget.max_request_input_tokens()
+            <= session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .max_request_input_tokens()
+    );
+    assert!(!fitted
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| binding.is_background(message)));
+    assert_eq!(
+        session.metadata["child.context_packet.provider_background_omitted.v1"],
+        "1"
+    );
+    assert!(model_calls.lock().unwrap().is_empty());
+    // A final known tool footprint added after fitting must also respect the
+    // safe input cap, even when it still fits the old context-minus-output cap.
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        usage.input_tokens + 1 + 64 + 1_000,
+        64,
+        Default::default(),
+        1_000,
+    ));
+    binding.bind_host_budget(&session).unwrap();
+    binding.install(&mut session).unwrap();
+    session.messages = vec![Message::system("system"), binding.assignment_message()];
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "packet-child",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    let tools = vec![ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "bounded_lookup".into(),
+            description: "Known provider tool".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+        },
+    }];
+    let final_usage = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .unwrap();
+    assert!(final_usage.tool_schema_input_tokens > 0);
+    assert!(final_usage.input_tokens > prepared.budget.max_request_input_tokens());
+    assert!(
+        final_usage.input_tokens
+            <= prepared.budget.max_context_tokens - prepared.budget.max_output_tokens
+    );
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let error = super::super::stream_execution::execute_llm_stream(
+        &mut session,
+        &config,
+        &llm,
+        &prepared.prepared_context,
+        &tools,
+        &super::super::stream_execution::LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &tokio_util::sync::CancellationToken::new(),
+            session_id: "packet-child",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: prepared.budget.max_context_tokens,
+            max_output_tokens: prepared.budget.max_output_tokens,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error
+        .to_string()
+        .contains("final known provider-visible request exceeds"));
+    assert!(model_calls.lock().unwrap().is_empty());
+}
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

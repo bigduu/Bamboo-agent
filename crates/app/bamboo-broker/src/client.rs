@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{BrokerError, BrokerResult};
-use crate::proto::{BrokerFrame, ClientFrame};
+use crate::proto::{BrokerFrame, ClientFrame, WorkerHostObservation};
 
 /// Build a rustls [`rustls::ClientConfig`] that trusts exactly the
 /// certificate(s) in `cert_file` (PEM) — for connecting to a broker or
@@ -218,6 +218,8 @@ pub struct BrokerClient {
     /// queried role (Phase 3 presence query). One reply per request; `&mut self`
     /// on `list_connected` keeps requests serialized.
     connected: mpsc::UnboundedReceiver<Vec<String>>,
+    /// Exact-target trusted host observations; separate from legacy presence.
+    host_observations: mpsc::UnboundedReceiver<(MsgId, Option<WorkerHostObservation>)>,
     /// Cleared by [`reader_supervisor`] the instant the background reader exits
     /// (clean close / panic / cancellation), so callers can tell "no messages
     /// right now" (`next_message() -> None` but still alive) apart from "the
@@ -245,14 +247,24 @@ impl BrokerClient {
     }
 
     /// Connect a parent-side actor link. Unlike the general mailbox client,
-    /// durable Event/Outcome messages stay on the same ordered receive lane as
-    /// live event batches.
+    /// durable Event/Outcome messages and initial release controls stay on the
+    /// same ordered receive lane as live event batches.
     pub(crate) async fn connect_actor(
         endpoint: &str,
         agent: AgentRef,
         token: &str,
     ) -> BrokerResult<Self> {
         Self::connect_with_tls_mode(endpoint, agent, token, None, true).await
+    }
+
+    /// Ordered Actor stream with operator-selected TLS trust.
+    pub(crate) async fn connect_actor_with_tls(
+        endpoint: &str,
+        agent: AgentRef,
+        token: &str,
+        tls_config: Option<rustls::ClientConfig>,
+    ) -> BrokerResult<Self> {
+        Self::connect_with_tls_mode(endpoint, agent, token, tls_config, true).await
     }
 
     /// Like [`connect`](Self::connect), but for `wss://` lets the caller
@@ -318,6 +330,7 @@ impl BrokerClient {
         let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
         let (conn_tx, connected) = mpsc::unbounded_channel();
+        let (host_tx, host_observations) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let reader_cancellation = cancellation.clone();
         // The demux loop pushes `Message`/`Delivered`/`Cancel`/`Error` frames
@@ -337,7 +350,9 @@ impl BrokerClient {
                     Some(Ok(Message::Text(t))) => match BrokerFrame::from_text(&t) {
                         Ok(BrokerFrame::Message { message }) => {
                             if actor_stream_mode
-                                && matches!(message.kind, InboxKind::Event | InboxKind::Outcome)
+                                && (matches!(message.kind, InboxKind::Event | InboxKind::Outcome)
+                                    || (message.kind == InboxKind::SessionMessageAdmitted
+                                        && message.body.get("initial_input_control").is_some()))
                             {
                                 let _ = actor_tx.send(ActorStreamItem::Message(message));
                             } else {
@@ -398,6 +413,12 @@ impl BrokerClient {
                         Ok(BrokerFrame::Connected { ids }) => {
                             let _ = conn_tx.send(ids);
                         }
+                        Ok(BrokerFrame::HostObservation {
+                            request_id,
+                            observation,
+                        }) => {
+                            let _ = host_tx.send((request_id, observation));
+                        }
                         _ => {}
                     },
                     Some(Ok(Message::Close(_))) => break ReaderExit::PeerClose,
@@ -439,6 +460,7 @@ impl BrokerClient {
             errors,
             cancels,
             connected,
+            host_observations,
             reader_alive,
             #[cfg(test)]
             fail_next_ack: Arc::new(AtomicBool::new(false)),
@@ -563,6 +585,55 @@ impl BrokerClient {
             Err(_) => Err(BrokerError::Transport(
                 "timed out waiting for connected-actors reply from broker".into(),
             )),
+        }
+    }
+
+    /// Query one authorized scoped WorkerHost connection. This observation is
+    /// current health evidence only; callers must not use it as an activation
+    /// or Run delivery lease.
+    pub async fn observe_host(
+        &mut self,
+        mailbox: &str,
+        role: &str,
+    ) -> BrokerResult<Option<WorkerHostObservation>> {
+        let request_id = MsgId::new();
+        self.send(ClientFrame::ObserveHost {
+            request_id: request_id.clone(),
+            mailbox: mailbox.into(),
+            role: role.into(),
+        })
+        .await?;
+        let deadline = tokio::time::Instant::now() + DELIVER_RECEIPT_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.host_observations.recv()).await {
+                Ok(Some((id, _))) if id != request_id => continue,
+                Ok(Some((_, observation))) => {
+                    if observation.as_ref().is_some_and(|current| {
+                        current.mailbox != mailbox || current.role.as_deref() != Some(role)
+                    }) {
+                        return Err(BrokerError::Protocol(
+                            "host observation target mismatch".into(),
+                        ));
+                    }
+                    if observation
+                        .as_ref()
+                        .is_some_and(|current| current.credential_expires_at <= chrono::Utc::now())
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(observation);
+                }
+                Ok(None) => {
+                    return Err(BrokerError::Transport(
+                        "connection closed before host observation reply".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(BrokerError::Transport(
+                        "timed out waiting for host observation reply from broker".into(),
+                    ))
+                }
+            }
         }
     }
 
@@ -843,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_mode_preserves_live_event_and_outcome_wire_order() {
+    async fn actor_mode_preserves_event_release_control_and_outcome_wire_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -882,12 +953,19 @@ mod tests {
             ))
             .await
             .unwrap();
-            for kind in [InboxKind::Event, InboxKind::Outcome] {
+            for (kind, body) in [
+                (InboxKind::Event, serde_json::json!({})),
+                (
+                    InboxKind::SessionMessageAdmitted,
+                    serde_json::json!({"initial_input_control": "request"}),
+                ),
+                (InboxKind::Outcome, serde_json::json!({})),
+            ] {
                 let message = InboxMessage {
                     id: MsgId::new(),
                     from: test_agent("worker"),
                     kind,
-                    body: serde_json::json!({}),
+                    body,
                     created_at: Utc::now(),
                     correlation_id: Some(server_run_id.clone()),
                 };
@@ -901,6 +979,15 @@ mod tests {
             .await
             .unwrap();
         client.subscribe().await.unwrap();
+        // Exercise the ready-on-both-lanes case that used to let the biased
+        // control queue overtake a preceding durable audit Event.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.actor_stream.len() + client.messages.len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all actor frames buffered");
         assert!(matches!(
             client.next_message_or_event_batch().await,
             BrokerStreamEvent::EventBatch(Some(ActorEventDelivery { batch, .. }))
@@ -910,6 +997,13 @@ mod tests {
             client.next_message_or_event_batch().await,
             BrokerStreamEvent::Message(Some(InboxMessage {
                 kind: InboxKind::Event,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            client.next_message_or_event_batch().await,
+            BrokerStreamEvent::Message(Some(InboxMessage {
+                kind: InboxKind::SessionMessageAdmitted,
                 ..
             }))
         ));

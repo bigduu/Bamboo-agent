@@ -46,7 +46,12 @@ pub(super) fn build_base_tools(
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
-) -> Arc<dyn ToolExecutor> {
+) -> (
+    Arc<dyn ToolExecutor>,
+    Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
+) {
+    let ceiling_config = config.clone();
+    let ceiling_projects = project_store.clone();
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
     // compatibility and opt-in behavior.
@@ -57,7 +62,7 @@ pub(super) fn build_base_tools(
         )
         .with_tool_event_publisher(tool_event_publisher),
     );
-    let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor;
+    let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor.clone();
 
     // Create composite tool executor (builtin + MCP)
     let mcp_tools = Arc::new(bamboo_mcp::executor::McpToolExecutor::new(
@@ -200,10 +205,113 @@ pub(super) fn build_base_tools(
         session_store,
         storage,
     ));
-    Arc::new(crate::tools::OverlayToolExecutor::new(
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_legacy_history,
         current_history_tool,
-    ))
+    ));
+    let ceiling = Arc::new(HostNativeToolCeiling {
+        builtin: builtin_executor,
+        base: base.clone(),
+        config: ceiling_config,
+        projects: ceiling_projects,
+    });
+    (base, ceiling)
+}
+
+/// Keep the actual instances and complete resolver assembled above. No Root
+/// role filter, catalog reconstruction, or client-supplied list is authority.
+struct HostNativeToolCeiling {
+    builtin: Arc<bamboo_tools::BuiltinToolExecutor>,
+    base: Arc<dyn ToolExecutor>,
+    config: Arc<RwLock<Config>>,
+    projects: Arc<bamboo_projects::ProjectStore>,
+}
+
+impl HostNativeToolCeiling {
+    fn native_owner(&self, name: &str) -> bool {
+        self.base.exact_tool_owner(name).is_some_and(|owner| {
+            std::ptr::addr_eq(owner, self.builtin.as_ref() as &dyn ToolExecutor)
+        }) && self.builtin.eligible_native_tool(name)
+    }
+
+    fn resolve(&self, reference: &str) -> Option<String> {
+        bamboo_domain::resolve_tool_reference_name(reference, |name| {
+            self.base.owns_exact_tool(name)
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNativeToolCeiling {
+    async fn observe(&self, session: &bamboo_domain::Session) -> Result<Vec<String>, String> {
+        let invalid = || "native_tool_ceiling_project_unavailable".to_string();
+        let typed = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|meta| meta.project_id.as_deref());
+        let legacy = session.metadata.get("project_id").map(String::as_str);
+        let parse = |raw: &str| bamboo_domain::ProjectId::parse(raw.trim()).map_err(|_| invalid());
+        let typed = typed.map(parse).transpose()?;
+        let legacy = legacy.map(parse).transpose()?;
+        if typed.is_some() && legacy.is_some() && typed != legacy {
+            return Err(invalid());
+        }
+        if let Some(project_id) = typed.or(legacy) {
+            let projects = self.projects.clone();
+            tokio::task::spawn_blocking(move || {
+                let manifest = projects
+                    .get(&project_id)
+                    .map_err(|_| "native_tool_ceiling_project_unavailable".to_string())?;
+                if manifest.id != project_id
+                    || manifest.status != bamboo_domain::ProjectStatus::Active
+                {
+                    return Err("native_tool_ceiling_project_unavailable".to_string());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| invalid())??;
+        }
+        let disabled = self.config.read().await.disabled_tool_references();
+        let disabled: std::collections::BTreeSet<_> = disabled
+            .iter()
+            .filter_map(|reference| self.resolve(reference))
+            .collect();
+        for name in bamboo_subagent::proto::NativeToolCeiling::NAMES {
+            if self.base.owns_exact_tool(name) && self.base.exact_tool_owner(name).is_none() {
+                return Err("native_tool_ceiling_owner_unknown".into());
+            }
+        }
+        let profile =
+            bamboo_engine::session_app::child_session::named_profile::named_profile_tool_names(
+                session,
+            )
+            .map_err(|_| "named_profile_binding_invalid".to_string())?;
+        let child_denied: std::collections::BTreeSet<_> = session
+            .metadata
+            .get("disabled_tools")
+            .map(|raw| {
+                serde_json::from_str::<Vec<String>>(raw)
+                    .map_err(|_| "named_profile_parent_tools_invalid".to_string())
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| self.resolve(name))
+            .collect();
+        Ok(bamboo_subagent::proto::NativeToolCeiling::NAMES
+            .iter()
+            .filter(|name| {
+                self.native_owner(name)
+                    && !disabled.contains(**name)
+                    && !child_denied.contains(**name)
+                    && profile
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool == **name))
+            })
+            .map(|name| (*name).to_string())
+            .collect())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -244,6 +352,7 @@ pub(super) fn build_root_tools(
         project_store: Some(project_store.clone()),
         workspace_resolver: workspace_resolver.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+        recovered_launches: Arc::new(dashmap::DashMap::new()),
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.
@@ -287,7 +396,7 @@ pub(super) fn build_root_tools(
     // Intentional same-name overlay replacement: Root keeps every privileged
     // cross-session action while Base/Child expose only current-Session reads.
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
-        session_store,
+        session_store.clone(),
         storage,
     ));
     let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
@@ -308,10 +417,10 @@ pub(super) fn build_root_tools(
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools_with_control,
-                Arc::new(crate::tools::AskAgentTool::new(
-                    b.endpoint.clone(),
-                    b.token.clone(),
-                )),
+                Arc::new(
+                    crate::tools::AskAgentTool::new(b.endpoint.clone(), b.token.clone())
+                        .with_deployments(fabric_deployer.registry(), session_store.clone()),
+                ),
             ));
             // deploy_agent shares the fabric deployer's registry, so its
             // list/stop covers cluster-deployed workers too (and vice versa).
@@ -320,13 +429,16 @@ pub(super) fn build_root_tools(
             let with_deploy: Arc<dyn ToolExecutor> =
                 Arc::new(crate::tools::OverlayToolExecutor::new(
                     with_ask,
-                    Arc::new(crate::tools::DeployAgentTool::new(
-                        b.endpoint,
-                        b.token,
-                        bamboo_bin,
-                        fabric_deployer.registry(),
-                        config.clone(),
-                    )),
+                    Arc::new(
+                        crate::tools::DeployAgentTool::new(
+                            b.endpoint,
+                            b.token,
+                            bamboo_bin,
+                            fabric_deployer.registry(),
+                            config.clone(),
+                        )
+                        .with_actor_store(session_store),
+                    ),
                 ));
             // `cluster`: progressive-disclosure inventory (list/describe/status)
             // + dispatch (deploy/stop) via the SAME shared deploy engine.
@@ -336,5 +448,142 @@ pub(super) fn build_root_tools(
             ))
         }
         _ => tools_with_control,
+    }
+}
+
+#[cfg(test)]
+mod native_ceiling_tests {
+    use super::*;
+    use bamboo_agent_core::{
+        Tool, ToolCall, ToolCtx, ToolError, ToolOutcome, ToolResult, ToolSchema,
+    };
+    use bamboo_engine::external_agents::runtime::NativeToolCeilingSource;
+    use serde_json::json;
+
+    struct Foreign(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for Foreign {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "foreign owner"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolCtx) -> Result<ToolOutcome, ToolError> {
+            panic!("ownership observation must not invoke")
+        }
+    }
+    struct Unknown(Arc<dyn ToolExecutor>);
+    #[async_trait::async_trait]
+    impl ToolExecutor for Unknown {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            panic!("must not dispatch")
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.0.list_tools()
+        }
+    }
+    fn source(home: &std::path::Path) -> HostNativeToolCeiling {
+        let builtin = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+        HostNativeToolCeiling {
+            base: builtin.clone(),
+            builtin,
+            config: Arc::new(RwLock::new(Config::default())),
+            projects: Arc::new(bamboo_projects::ProjectStore::open(home).unwrap()),
+        }
+    }
+    #[tokio::test]
+    async fn native_owner_uses_complete_composite_overlay_exact_before_alias_and_config() {
+        let home = tempfile::tempdir().unwrap();
+        let mut source = source(home.path());
+        let secondary = Arc::new(
+            bamboo_tools::BuiltinToolExecutorBuilder::new()
+                .with_tool(Foreign("apply_patch"))
+                .unwrap()
+                .build(),
+        );
+        source.base = Arc::new(bamboo_mcp::executor::CompositeToolExecutor::new(
+            source.builtin.clone(),
+            secondary,
+        ));
+        source.config.write().await.tools.disabled =
+            vec!["apply_patch".into(), "Bash".into(), "Write".into()];
+        let session = bamboo_domain::Session::new("owner-root", "");
+        assert_eq!(
+            source.observe(&session).await.unwrap(),
+            ["Edit", "Glob", "Read"]
+        );
+        source.base = Arc::new(crate::tools::OverlayToolExecutor::new(
+            source.base.clone(),
+            Arc::new(Foreign("apply_patch")),
+        ));
+        assert_eq!(
+            source.observe(&session).await.unwrap(),
+            ["Edit", "Glob", "Read"]
+        );
+        source.base = Arc::new(crate::tools::OverlayToolExecutor::new(
+            source.base.clone(),
+            Arc::new(Foreign("Edit")),
+        ));
+        assert_eq!(source.observe(&session).await.unwrap(), ["Glob", "Read"]);
+        source.base = source.builtin.clone();
+        // No actual apply_patch owner now: the same disabled reference aliases Edit.
+        assert_eq!(source.observe(&session).await.unwrap(), ["Glob", "Read"]);
+        source.config.write().await.tools.disabled.clear();
+        source.base = Arc::new(Unknown(source.builtin.clone()));
+        assert_eq!(
+            source.observe(&session).await.unwrap_err(),
+            "native_tool_ceiling_owner_unknown"
+        );
+    }
+    #[tokio::test]
+    async fn native_owner_rejects_spoofed_actual_registry_and_closed_project_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let source = source(home.path());
+        let mut session = bamboo_domain::Session::new("project-root", "");
+        let project = source
+            .projects
+            .create("active without workspace", None)
+            .unwrap();
+        let mut foreign = source.projects.create("foreign fixture", None).unwrap();
+        session.set_project_id_meta(project.id.as_str());
+        assert_eq!(source.observe(&session).await.unwrap().len(), 5);
+        session
+            .metadata
+            .insert("project_id".into(), "another-project".into());
+        assert!(source.observe(&session).await.is_err());
+        session.set_project_id_meta("malformed/project");
+        assert!(source.observe(&session).await.is_err());
+        session.set_project_id_meta("missing-project");
+        assert!(source.observe(&session).await.is_err());
+        session.set_project_id_meta(project.id.as_str());
+        source
+            .projects
+            .archive(&project.id, project.revision)
+            .unwrap();
+        assert!(source.observe(&session).await.is_err());
+        let foreign_id = foreign.id.clone();
+        let path = source.projects.paths().manifest_path(&foreign_id);
+        foreign.id = bamboo_domain::ProjectId::new();
+        std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let backup = path.with_file_name("project.json.bak");
+        if backup.exists() {
+            std::fs::remove_file(backup).unwrap();
+        }
+        session.set_project_id_meta(foreign_id.as_str());
+        assert!(source.observe(&session).await.is_err());
+        std::fs::write(&path, "invalid manifest").unwrap();
+        assert!(source.observe(&session).await.is_err());
+        session.clear_project_id_meta();
+        assert!(source.builtin.registry().unregister("Write"));
+        source.builtin.register_tool(Foreign("Write")).unwrap();
+        assert!(!source
+            .observe(&session)
+            .await
+            .unwrap()
+            .contains(&"Write".into()));
     }
 }

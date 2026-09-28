@@ -6,19 +6,32 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_domain::{
     ActorActivation, ActorActivationClaim, ActorActivationFence, ActorActivationFinish,
     ActorActivationStatus, ActorAncestorObservation, ActorDirectoryEntry, ActorDirectoryError,
-    ActorDirectoryPort, ActorLogicalState, ActorSession,
+    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::{durable_atomic_write, validate_session_id, SessionStoreV2};
+use super::{
+    durable_atomic_write_blocking, validate_session_id, RuntimeTaskTransactionReadGuard,
+    SessionLifecycleReadGuard, SessionStoreV2, SessionWriteGuard,
+};
+
+/// Every started filesystem job keeps the same physical and in-process locks
+/// alive, even when its async caller or Tokio runtime stops waiting. Field
+/// order releases the locks in reverse acquisition order.
+struct ActorAuthorityGuards {
+    _session: SessionWriteGuard,
+    _task: RuntimeTaskTransactionReadGuard,
+    _lifecycle: SessionLifecycleReadGuard,
+}
 
 const ACTOR_AUTHORITY_FILE: &str = "actor-authority.json";
 const ACTOR_INITIALIZED_FILE: &str = "actor-authority.initialized.json";
@@ -33,6 +46,28 @@ struct ActorInitializedMarker {
     session_created_at: DateTime<Utc>,
 }
 
+/// Pure census validation only; never initialize, refresh or claim an Actor.
+pub(super) fn validate_census_witnesses(
+    record: &[u8],
+    marker: &[u8],
+    session: &Session,
+    project: Option<&ProjectId>,
+) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid census Actor witness");
+    let record: ActorDirectoryEntry = serde_json::from_slice(record).map_err(|_| invalid())?;
+    let marker: ActorInitializedMarker = serde_json::from_slice(marker).map_err(|_| invalid())?;
+    if record.validate().is_err()
+        || !record.actor.matches_session(session)
+        || record.actor.project_id.as_deref() != project.map(ProjectId::as_str)
+        || marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+        || marker.actor_id != session.id
+        || marker.session_created_at != session.created_at
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn storage(error: io::Error) -> ActorDirectoryError {
     ActorDirectoryError::Storage(error.to_string())
 }
@@ -43,7 +78,7 @@ fn checked_next(value: u64) -> Result<u64, ActorDirectoryError> {
         .ok_or(ActorDirectoryError::CounterOverflow)
 }
 
-fn current_live<'a>(
+pub(super) fn current_live<'a>(
     entry: &'a ActorDirectoryEntry,
     fence: &ActorActivationFence,
     now: DateTime<Utc>,
@@ -176,7 +211,7 @@ impl SessionStoreV2 {
     /// lock. Cached and global indexes can each point to one of two physical
     /// Sessions with the same id; trusting either would split activation
     /// authority between Store instances. The scan rejects that ambiguity.
-    async fn actor_authority_location(
+    pub(super) async fn actor_authority_location(
         &self,
         actor_id: &str,
     ) -> Result<(String, PathBuf), ActorDirectoryError> {
@@ -190,7 +225,7 @@ impl SessionStoreV2 {
     /// middle Child currently leaves its nested descendants on disk. Verify
     /// the complete parent chain, root identity, depth and Project before
     /// publishing or accepting any activation sidecar for the descendant.
-    async fn validate_actor_lineage(
+    pub(super) async fn validate_actor_lineage(
         &self,
         actor: &ActorSession,
     ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
@@ -249,6 +284,7 @@ impl SessionStoreV2 {
         actor_id: &str,
         rel: &str,
         path: &Path,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<ActorDirectoryEntry, ActorDirectoryError> {
         let (kind, root_id) =
             Self::copy_source_identity_from_rel(actor_id, rel).map_err(storage)?;
@@ -298,7 +334,8 @@ impl SessionStoreV2 {
                     {
                         return Err(ActorDirectoryError::Corrupt);
                     }
-                    self.write_actor_marker(&marker_path, &expected).await?;
+                    self.write_actor_marker(&marker_path, &expected, guards)
+                        .await?;
                 }
                 entry
             }
@@ -307,8 +344,9 @@ impl SessionStoreV2 {
                 // crash before the marker leaves an inert Cold actor. No claim
                 // is returned until BOTH files have been durably published.
                 let entry = ActorDirectoryEntry::new(expected.clone());
-                self.write_actor_entry(path, &entry).await?;
-                self.write_actor_marker(&marker_path, &expected).await?;
+                self.write_actor_entry(path, &entry, guards).await?;
+                self.write_actor_marker(&marker_path, &expected, guards)
+                    .await?;
                 entry
             }
             false => return Err(ActorDirectoryError::Corrupt),
@@ -358,7 +396,7 @@ impl SessionStoreV2 {
             entry.actor.observed_metadata_version = current;
             entry.actor.ancestor_observations = expected.ancestor_observations;
             entry.revision = checked_next(entry.revision)?;
-            self.write_actor_entry(path, &entry).await?;
+            self.write_actor_entry(path, &entry, guards).await?;
         }
         Ok(entry)
     }
@@ -367,6 +405,7 @@ impl SessionStoreV2 {
         &self,
         path: &Path,
         actor: &ActorSession,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
         let marker = ActorInitializedMarker {
             schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
@@ -374,17 +413,50 @@ impl SessionStoreV2 {
             session_created_at: actor.session_created_at,
         };
         let bytes = serde_json::to_vec(&marker).map_err(|_| ActorDirectoryError::Corrupt)?;
-        durable_atomic_write(path, &bytes).await.map_err(storage)
+        self.write_actor_bytes(path, bytes, guards).await
     }
 
     async fn write_actor_entry(
         &self,
         path: &Path,
         entry: &ActorDirectoryEntry,
+        guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
         entry.validate()?;
         let bytes = serde_json::to_vec_pretty(entry).map_err(|_| ActorDirectoryError::Corrupt)?;
-        durable_atomic_write(path, &bytes).await.map_err(storage)
+        self.write_actor_bytes(path, bytes, guards).await
+    }
+
+    async fn write_actor_bytes(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
+        let path = path.to_path_buf();
+        let guards = Arc::clone(guards);
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        #[cfg(test)]
+        let transcript_hook = self.transcript_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            durable_atomic_write_blocking(&path, &bytes, |phase| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    return hook.visit(&path, phase);
+                }
+                #[cfg(test)]
+                if let Some(hook) = &transcript_hook {
+                    hook.visit(phase)?;
+                }
+                let _ = phase;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| storage(io::Error::other(format!("join actor write: {error}"))))?
+        .map_err(storage)
     }
 
     async fn actor_transaction<T, F>(
@@ -399,28 +471,64 @@ impl SessionStoreV2 {
         // Same lock order as strict Session control-plane writes: lifecycle,
         // Task sidecar, then the exact Session maintenance/file lock. The last
         // lock spans read/CAS/durable rename, including independent processes.
-        let _lifecycle = self
+        let lifecycle = self
             .lock_session_lifecycle_shared()
             .await
             .map_err(storage)?;
-        let _task = self
+        let task = self
             .lock_runtime_task_sidecar_shared()
             .await
             .map_err(storage)?;
-        let _session = self
+        let session = self
             .acquire_session_maintenance_lock(actor_id)
             .await
             .map_err(storage)?;
+        let guards = Arc::new(ActorAuthorityGuards {
+            _session: session,
+            _task: task,
+            _lifecycle: lifecycle,
+        });
         let (rel, path) = self.actor_authority_location(actor_id).await?;
         let mut entry = self
-            .read_or_create_actor_entry(actor_id, &rel, &path)
+            .read_or_create_actor_entry(actor_id, &rel, &path, &guards)
             .await?;
         let Mutation { value, changed } = operation(&mut entry)?;
         if changed {
             entry.revision = checked_next(entry.revision)?;
-            self.write_actor_entry(&path, &entry).await?;
+            self.write_actor_entry(&path, &entry, &guards).await?;
         }
         Ok(value)
+    }
+
+    /// Retire a resident only while its exact physical activation is still
+    /// the Directory owner. A delayed launcher/renewal cleanup may run after
+    /// expiry and replacement; it must not retire that successor by ActorId.
+    pub async fn retire_actor_if_activation(
+        &self,
+        fence: &ActorActivationFence,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ActorDirectoryError> {
+        self.actor_transaction(&fence.actor_id, |entry| {
+            if entry.actor.state == ActorLogicalState::Retired
+                || !entry
+                    .activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.matches_fence(fence))
+            {
+                return Ok(Mutation::unchanged(false));
+            }
+            if let Some(activation) = entry.activation.as_mut() {
+                if activation.status.is_live() {
+                    activation.lease_epoch = checked_next(activation.lease_epoch)?;
+                    activation.status = ActorActivationStatus::Cancelled;
+                    activation.finished_at = Some(now);
+                    activation.lease_expires_at = now;
+                }
+            }
+            entry.actor.state = ActorLogicalState::Retired;
+            Ok(Mutation::changed(true))
+        })
+        .await
     }
 }
 
@@ -857,6 +965,62 @@ mod tests {
                 .await
                 .unwrap_err(),
             ActorDirectoryError::StaleFence
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_resident_cleanup_cannot_retire_replacement_activation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let old_store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        old_store
+            .save_session(&Session::new("resident-replacement", "model"))
+            .await?;
+        let now = Utc::now();
+        let old = old_store
+            .claim_activation(&claim("resident-replacement", "old", "old-host", now))
+            .await?;
+        old_store.start_activation(&old.fence(), now).await?;
+
+        let replacement_store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let after_expiry = now + Duration::minutes(6);
+        let replacement = replacement_store
+            .claim_activation(&claim(
+                "resident-replacement",
+                "replacement",
+                "new-host",
+                after_expiry,
+            ))
+            .await?;
+        replacement_store
+            .start_activation(&replacement.fence(), after_expiry)
+            .await?;
+
+        assert!(
+            !old_store
+                .retire_actor_if_activation(&old.fence(), after_expiry)
+                .await?
+        );
+        let current = old_store.inspect_actor("resident-replacement").await?;
+        assert_eq!(current.actor.state, ActorLogicalState::Active);
+        assert_eq!(current.activation.unwrap().fence(), replacement.fence());
+        replacement_store
+            .validate_fence(&replacement.fence(), after_expiry)
+            .await?;
+
+        assert!(
+            old_store
+                .retire_actor_if_activation(&replacement.fence(), after_expiry)
+                .await?
+        );
+        let retired = replacement_store
+            .inspect_actor("resident-replacement")
+            .await?;
+        assert_eq!(retired.actor.state, ActorLogicalState::Retired);
+        assert_eq!(
+            retired.activation.unwrap().status,
+            ActorActivationStatus::Cancelled
         );
         Ok(())
     }

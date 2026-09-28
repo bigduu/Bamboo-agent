@@ -12,6 +12,8 @@ use bamboo_llm::{Config, LLMProvider, ProviderModelRouter, ProviderRegistry};
 use bamboo_tools::permission::{PermissionDecision, PermissionDecisionKind, PermissionRequest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -135,7 +137,11 @@ impl Fixture {
         web::Data::new(state)
     }
 
-    pub(crate) async fn pending() -> Self {
+    pub(crate) fn pending() -> Pin<Box<impl Future<Output = Self>>> {
+        Box::pin(Self::pending_inner())
+    }
+
+    async fn pending_inner() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let state = Self::open(directory.path(), probe.clone()).await;
@@ -206,7 +212,11 @@ impl Fixture {
         assert_eq!(self.probe.provider_calls.load(Ordering::SeqCst), 1);
     }
 
-    async fn park(&self) {
+    fn park(&self) -> Pin<Box<impl Future<Output = ()> + '_>> {
+        Box::pin(self.park_inner())
+    }
+
+    async fn park_inner(&self) {
         self.probe.next_call.store(true, Ordering::SeqCst);
         let mut session = self.reload().await;
         let workspace = self.directory.path().join("workspace");
@@ -471,6 +481,10 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
             body["receipt"]["decision"]["request_generation"],
             decision.request_generation
         );
+        // The HTTP reply only confirms that auto-resume started. A concurrent
+        // Supervisor save may briefly hold a Prepared proof, which readers
+        // correctly reject until the final runtime/proof commit completes.
+        fixture.settled(usize::from(!corrupt), corrupt).await;
         let completed = fixture.reload().await;
         let result = completed
             .messages
@@ -492,8 +506,52 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
                 ["expected_policy_revision"],
             1
         );
-        fixture.settled(usize::from(!corrupt), corrupt).await;
     }
+}
+
+#[actix_web::test]
+async fn server_resume_consumes_approved_call_after_root_tool_tightening() {
+    let body = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            actix_web::rt::System::new().block_on(async {
+                let fixture = Box::pin(Fixture::pending()).await;
+                fixture.prepare_workspace_catalog().await;
+                fixture.formal_approve().await;
+                let mut selected = fixture.reload().await;
+                selected.set_root_orchestration_only(true).unwrap();
+                fixture.state.storage.save_session(&selected).await.unwrap();
+                let session = fixture.reload().await;
+                let config = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
+                    &*fixture.state.config.read().await,
+                    &fixture.state.provider_registry,
+                    &session,
+                    None,
+                );
+                let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+                    &AppStateResumeRef(fixture.state.clone()),
+                    &session.id,
+                    config,
+                )
+                .await;
+                assert!(matches!(
+                    outcome,
+                    bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
+                ));
+                fixture.settled(0, false).await;
+                let saved = fixture.reload().await;
+                let result = saved
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+                    .unwrap();
+                assert_eq!(result.tool_success, Some(false));
+                assert!(result.content.contains("Root orchestration policy blocked"));
+            });
+        })
+        .expect("spawn test thread");
+    body.join().expect("test thread completed");
 }
 
 #[actix_web::test]

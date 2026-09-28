@@ -19,6 +19,17 @@ use crate::app_state::AppState;
 /// and is never trimmed.
 const MAX_HISTORY_MESSAGES: usize = 2000;
 
+fn authority_unavailable_response(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_authority_unavailable",
+            "message": "Session authority could not be verified; recover the session before retrying",
+        },
+        "session_id": session_id,
+    }))
+}
+
 /// Cold-fetch cap for the history response: when returning a full (non-delta)
 /// history that exceeds [`MAX_HISTORY_MESSAGES`], drop the oldest overflow so
 /// only the newest `MAX_HISTORY_MESSAGES` remain. Returns whether it trimmed.
@@ -163,22 +174,65 @@ pub async fn handler(
         match state.storage.load_session(&session_id).await {
             Ok(Some(s)) => Some(s),
             Ok(None) => {
-                // Fallback to memory (shouldn't happen but be defensive).
-                bamboo_engine::read_cached_session(&state.sessions, &session_id)
+                // A Root cache cannot replace missing durable authority.
+                let cached = bamboo_engine::read_cached_session(&state.sessions, &session_id);
+                if cached
+                    .as_ref()
+                    .is_some_and(|session| session.kind == bamboo_agent_core::SessionKind::Root)
+                {
+                    return authority_unavailable_response(&session_id);
+                }
+                cached
+            }
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()) =>
+            {
+                tracing::error!(%session_id, %e, "session history authority unavailable during active execution");
+                return authority_unavailable_response(&session_id);
             }
             Err(e) => {
-                tracing::warn!(
-                    "[{}] Disk read failed during active execution, falling back to memory: {}",
-                    session_id,
-                    e
-                );
-                bamboo_engine::read_cached_session(&state.sessions, &session_id)
+                let cached = bamboo_engine::read_cached_session(&state.sessions, &session_id);
+                if cached
+                    .as_ref()
+                    .is_some_and(|session| session.kind == bamboo_agent_core::SessionKind::Root)
+                {
+                    tracing::error!(%session_id, %e, "active Root history authority could not be verified");
+                    return authority_unavailable_response(&session_id);
+                }
+                tracing::warn!(%session_id, %e, "disk read failed during active execution; using cached history");
+                cached
             }
         }
     } else {
         // No active runner – memory cache is authoritative.
         bamboo_engine::read_cached_session(&state.sessions, &session_id)
     };
+
+    // A quiet Root can still have a cached transcript while its durable main
+    // record or tool authority proof has become unreadable or belongs to a new
+    // Session birth. Validate the full record before serving cached history.
+    if !runner_active {
+        if let Some(cached) = session
+            .as_ref()
+            .filter(|cached| cached.kind == bamboo_agent_core::SessionKind::Root)
+        {
+            match state.storage.load_session(&session_id).await {
+                Ok(Some(durable))
+                    if cached
+                        .clone()
+                        .adopt_root_tool_authority_from(&durable)
+                        .is_ok() => {}
+                Ok(Some(_)) | Ok(None) => {
+                    return authority_unavailable_response(&session_id);
+                }
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "cached history Root record or authority unavailable");
+                    return authority_unavailable_response(&session_id);
+                }
+            }
+        }
+    }
 
     if session.is_none() {
         match state.storage.load_session(&session_id).await {
@@ -191,6 +245,13 @@ pub async fn handler(
                     "error": crate::error::error_value("Session not found"),
                     "session_id": session_id
                 }));
+            }
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()) =>
+            {
+                tracing::error!(%session_id, %e, "session history authority unavailable on cold load");
+                return authority_unavailable_response(&session_id);
             }
             Err(e) => {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -405,13 +466,9 @@ mod tests {
     use bamboo_agent_core::{Message, Session};
 
     async fn app_state_with_session(messages: Vec<Message>) -> (web::Data<AppState>, String) {
-        let temp_dir = tempdir().expect("tempdir");
-        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
-        let state = web::Data::new(
-            AppState::new(temp_dir.path().to_path_buf())
-                .await
-                .expect("app state"),
-        );
+        let temp_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(temp_dir.clone());
+        let state = web::Data::new(AppState::new(temp_dir).await.expect("app state"));
         let mut session = Session::new("hist-delta", "model");
         for m in messages {
             session.add_message(m);
@@ -427,6 +484,84 @@ mod tests {
             .iter()
             .map(|m| m["content"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[actix_web::test]
+    async fn active_history_rejects_broken_root_authority_instead_of_cached_transcript() {
+        let home = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(home.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(home.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let id = "hist-root-authority";
+        let mut root = Session::new(id, "model");
+        root.add_message(Message::user("cached text"));
+        state.save_and_cache_session(&mut root).await;
+        root.set_root_orchestration_only(true).unwrap();
+        state.storage.save_session(&root).await.unwrap();
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(id.to_string(), bamboo_engine::AgentRunner::new());
+        let proof = state
+            .session_store
+            .sessions_root_dir()
+            .join(id)
+            .join("root-tool-authority.json");
+        let valid_proof = tokio::fs::read(&proof).await.unwrap();
+        tokio::fs::write(&proof, b"{").await.unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}/history"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_unavailable");
+
+        assert!(!body.to_string().contains("cached text"));
+
+        state.agent_runners.write().await.remove(id);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}/history"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_unavailable");
+
+        tokio::fs::write(&proof, valid_proof).await.unwrap();
+        let main = state
+            .session_store
+            .sessions_root_dir()
+            .join(id)
+            .join("session.json");
+        tokio::fs::write(&main, b"{").await.unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}/history"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_unavailable");
     }
 
     #[actix_web::test]

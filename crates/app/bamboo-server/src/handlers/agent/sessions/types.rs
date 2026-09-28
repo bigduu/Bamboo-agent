@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_domain::ProviderModelRef;
+use bamboo_domain::{ProviderModelRef, RootThinkingMode};
 use bamboo_engine::config::GoldConfig;
 use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
@@ -55,6 +55,17 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// Preserve even JSON null/invalid values so PATCH cannot silently ignore a
+/// mode selector. Mode changes belong to the recoverable Root operation.
+fn deserialize_thinking_mode_presence<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +135,18 @@ pub struct SessionSummary {
     /// depend on an already-consumed account-feed event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_workflow: Option<SessionActiveWorkflow>,
+    /// Durable Root tool authority. Session detail sets this from the
+    /// authoritative record; index-only list rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestration_only: Option<bool>,
+    /// Detail-only projection from durable Root authority, not the list index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<RootThinkingMode>,
+    /// The Root-mode CAS epoch and opaque lifetime token are detail-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode_transition_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode_birth_token: Option<String>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -208,6 +231,10 @@ impl SessionSummary {
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
             active_workflow: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
@@ -436,6 +463,8 @@ pub struct PatchSessionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub clear_reasoning_effort: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_thinking_mode_presence")]
+    pub thinking_mode: Option<serde_json::Value>,
     #[serde(default)]
     pub gold_config: Option<serde_json::Value>,
     /// Legacy toggle for per-session Bypass. New clients should use
@@ -666,6 +695,10 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -718,6 +751,10 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,
@@ -857,6 +894,10 @@ mod tests {
             has_pending_question: false,
             plan_mode: None,
             active_workflow: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
+            root_mode_transition_epoch: None,
+            root_mode_birth_token: None,
             running_child_count: 0,
             subagent_count: 0,
             gold_config: None,

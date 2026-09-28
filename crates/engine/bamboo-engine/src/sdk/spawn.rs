@@ -25,7 +25,7 @@ use crate::runtime::execution::runner_lifecycle::{finalize_runner, try_reserve_r
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
     publish_child_completion_parts, watch_child_liveness, watchdog_policy_for_session,
-    SpawnContext, SpawnJob,
+    ChildLaunchGuard, SpawnContext, SpawnJob,
 };
 use crate::runtime::execution::SessionExecutionReservation;
 
@@ -123,7 +123,17 @@ fn reconcile_actor_host_wait(
 /// - Full real [`ExecuteRequest`] field set incl. split provider fields.
 /// - Terminal status strings `completed | cancelled | error | skipped | timeout`.
 pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
-    run_child_spawn_inner(ctx, job, None).await
+    run_child_spawn_inner(ctx, job, None, None).await
+}
+
+/// The scheduler holds the same child launch guard used by parent cancellation
+/// until this invocation owns a runner and has attempted its running marker.
+pub(crate) async fn run_child_spawn_fenced(
+    ctx: SpawnContext,
+    job: SpawnJob,
+    guard: ChildLaunchGuard,
+) -> Result<(), String> {
+    run_child_spawn_inner(ctx, job, None, Some(guard)).await
 }
 
 /// Canonical child activation using a runner slot already reserved by the
@@ -133,13 +143,14 @@ pub(crate) async fn run_child_spawn_reserved(
     job: SpawnJob,
     reservation: SessionExecutionReservation,
 ) -> Result<(), String> {
-    run_child_spawn_inner(ctx, job, Some(reservation)).await
+    run_child_spawn_inner(ctx, job, Some(reservation), None).await
 }
 
 async fn run_child_spawn_inner(
     ctx: SpawnContext,
     job: SpawnJob,
     reserved: Option<SessionExecutionReservation>,
+    launch_guard: Option<ChildLaunchGuard>,
 ) -> Result<(), String> {
     // Ensure both session event streams exist.
     let parent_tx =
@@ -393,6 +404,10 @@ async fn run_child_spawn_inner(
         .persistence()
         .save_runtime_session(&mut session)
         .await;
+    // From here cancellation sees the exact Running runner, cancels its token,
+    // and waits for its terminal snapshot. Before here it can only invalidate
+    // the queued generation, which this guard has kept stable.
+    drop(launch_guard);
 
     // Parent projection is intentionally lifecycle-only. The child's complete
     // event stream already lives on `agent.{child_session_id}` and can be

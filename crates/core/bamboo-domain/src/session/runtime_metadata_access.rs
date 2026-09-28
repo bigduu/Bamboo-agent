@@ -98,6 +98,54 @@ impl Session {
         self.prune_runtime_metadata();
     }
 
+    /// The queued launch identity is durable on the logical Child session,
+    /// independent of a process-local runner or scheduler entry.
+    pub fn child_launch_generation(&self) -> u64 {
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_launch_generation)
+            .unwrap_or(0)
+    }
+
+    pub fn advance_child_launch_generation(&mut self) -> Option<u64> {
+        let next = self.child_launch_generation().checked_add(1)?;
+        self.runtime_metadata_mut().child_launch_generation = Some(next);
+        Some(next)
+    }
+
+    pub fn is_child_launch_cancelled(&self, generation: u64) -> bool {
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_cancelled_generation)
+            .is_some_and(|cancelled| cancelled >= generation)
+    }
+
+    pub fn cancel_child_launch_generation(&mut self) {
+        let generation = self.child_launch_generation();
+        self.runtime_metadata_mut().child_cancelled_generation = Some(generation);
+    }
+
+    /// Explicitly promise to launch the current Child generation. A draft
+    /// never acquires this marker merely by being `pending`.
+    pub fn mark_child_auto_run_launch_intent(&mut self) {
+        let generation = self.child_launch_generation();
+        self.runtime_metadata_mut()
+            .child_auto_run_launch_intent_generation = Some(generation);
+    }
+
+    /// Reconciliation is deliberately narrower than a `pending` status:
+    /// an old intent cannot borrow a later draft/retry generation.
+    pub fn recoverable_child_launch_generation(&self) -> Option<u64> {
+        if self.kind != SessionKind::Child || self.last_run_status().as_deref() != Some("pending") {
+            return None;
+        }
+        let generation = self.child_launch_generation();
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.child_auto_run_launch_intent_generation)
+            .filter(|intent| *intent == generation && !self.is_child_launch_cancelled(*intent))
+    }
+
     // ------------------------------------------------------------------
     // provider_name
     // ------------------------------------------------------------------

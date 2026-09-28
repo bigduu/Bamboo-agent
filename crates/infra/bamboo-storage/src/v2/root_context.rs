@@ -2,11 +2,25 @@
 //! This uses the small canonical sidecar, never the transcript or index.
 
 use super::*;
-use bamboo_domain::SessionAuthorityConflict;
+use bamboo_domain::{
+    RootModeOperationOutcome, RootModeOperationReceipt, SessionAuthorityConflict,
+    ROOT_MODE_OPERATION_HISTORY_LIMIT,
+};
 
 pub(super) const ROOT_TOOL_AUTHORITY_PROOF_FILE: &str = "root-tool-authority.json";
 const ROOT_TOOL_AUTHORITY_PROOF_MIGRATION_MARKER: &str = ".root_tool_authority_proof_v1";
 const ROOT_TOOL_AUTHORITY_PROOF_MAX_BYTES: u64 = 4096;
+
+fn root_tool_proof_version(session: &Session) -> u32 {
+    // Pre-mode Roots retain their readable v1 proof. The first terminal mode
+    // operation upgrades it to v2, which an older v1-only final writer rejects
+    // instead of dropping the operation epoch/history during a mixed rollout.
+    if session.root_mode_transition_epoch > 0 || !session.root_mode_operations.is_empty() {
+        2
+    } else {
+        1
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,28 +46,36 @@ struct RootToolAuthorityProof {
     authority_identity: SessionAuthorityIdentity,
     root_orchestration_only: bool,
     root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl RootToolAuthorityProof {
     fn from_session(session: &Session, state: ProofState) -> Self {
         Self {
-            version: 1,
+            version: root_tool_proof_version(session),
             state,
             id: session.id.clone(),
             created_at: session.created_at,
             authority_identity: session.authority_identity.clone(),
             root_orchestration_only: session.root_orchestration_only,
             root_tool_authority_revision: session.root_tool_authority_revision,
+            root_mode_transition_epoch: session.root_mode_transition_epoch,
+            root_mode_operations: session.root_mode_operations.clone(),
         }
     }
 
     fn matches(&self, session: &Session) -> bool {
-        self.version == 1
+        self.version == root_tool_proof_version(session)
             && self.id == session.id
             && self.created_at == session.created_at
             && self.authority_identity == session.authority_identity
             && self.root_orchestration_only == session.root_orchestration_only
             && self.root_tool_authority_revision == session.root_tool_authority_revision
+            && self.root_mode_transition_epoch == session.root_mode_transition_epoch
+            && self.root_mode_operations == session.root_mode_operations
     }
 }
 
@@ -77,6 +99,10 @@ struct RootToolAuthorityMain {
     root_orchestration_only: bool,
     #[serde(default)]
     root_tool_authority_revision: u64,
+    #[serde(default)]
+    root_mode_transition_epoch: u64,
+    #[serde(default)]
+    root_mode_operations: Vec<RootModeOperationReceipt>,
 }
 
 impl From<&Session> for RootToolAuthorityMain {
@@ -91,6 +117,8 @@ impl From<&Session> for RootToolAuthorityMain {
             authority_identity: session.authority_identity.clone(),
             root_orchestration_only: session.root_orchestration_only,
             root_tool_authority_revision: session.root_tool_authority_revision,
+            root_mode_transition_epoch: session.root_mode_transition_epoch,
+            root_mode_operations: session.root_mode_operations.clone(),
         }
     }
 }
@@ -223,6 +251,38 @@ impl SessionStoreV2 {
     }
 
     pub(super) async fn validate_root_tool_proof(&self, side: &Session) -> io::Result<()> {
+        Self::validate_root_tool_proof_identity(side)?;
+        let proof = self.read_root_tool_proof(&side.id).await?;
+        Self::validate_root_tool_proof_value(side, proof)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_root_pair(main: &Session, side: &Session) -> io::Result<()> {
+        Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)
+    }
+
+    /// Pure validation for callers that already read the proof under their own
+    /// bounded capability/transaction boundary. This never opens or repairs files.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn validate_snapshot_root_proof(side: &Session, bytes: &[u8]) -> io::Result<()> {
+        let proof = serde_json::from_slice(bytes).map_err(|_| conflict("invalid proof"))?;
+        Self::validate_root_tool_proof_value(side, proof)
+    }
+
+    fn validate_root_tool_proof_value(
+        side: &Session,
+        proof: RootToolAuthorityProof,
+    ) -> io::Result<()> {
+        Self::validate_root_tool_proof_identity(side)?;
+        if proof.state != ProofState::Committed || !proof.matches(side) {
+            return Err(conflict(
+                "canonical Root authority proof is pending or stale",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_root_tool_proof_identity(side: &Session) -> io::Result<()> {
         if side.kind != SessionKind::Root
             || side.parent_session_id.is_some()
             || side.spawn_depth != 0
@@ -230,12 +290,6 @@ impl SessionStoreV2 {
             || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(conflict("canonical Root authority proof identity mismatch"));
-        }
-        let proof = self.read_root_tool_proof(&side.id).await?;
-        if proof.state != ProofState::Committed || !proof.matches(side) {
-            return Err(conflict(
-                "canonical Root authority proof is pending or stale",
-            ));
         }
         Ok(())
     }
@@ -262,12 +316,30 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    async fn write_default_root_tool_proof(
+        &self,
+        directory: &Path,
+        session: &Session,
+        state: ProofState,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state))
+            .map_err(|error| conflict(error.to_string()))?;
+        self.write_default_bytes(
+            &directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE),
+            bytes,
+            guards,
+        )
+        .await
+    }
+
     /// A selection publishes a durable Prepared marker before the sidecar and
     /// main writes. Any interrupted phase is unavailable to operational reads.
     pub(super) async fn prepare_root_tool_proof_for_full_save(
         &self,
         directory: &Path,
         incoming: &Session,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<bool> {
         if incoming.kind != SessionKind::Root {
             return Ok(false);
@@ -279,17 +351,21 @@ impl SessionStoreV2 {
                 return Ok(false);
             }
         }
-        Self::write_root_tool_proof_at(directory, incoming, ProofState::Prepared).await?;
+        self.write_default_root_tool_proof(directory, incoming, ProofState::Prepared, guards)
+            .await?;
         Ok(true)
     }
 
     pub(super) async fn commit_root_tool_proof_after_full_save(
+        &self,
         directory: &Path,
         incoming: &Session,
         prepared: bool,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         if prepared {
-            Self::write_root_tool_proof_at(directory, incoming, ProofState::Committed).await?;
+            self.write_default_root_tool_proof(directory, incoming, ProofState::Committed, guards)
+                .await?;
         }
         Ok(())
     }
@@ -338,6 +414,7 @@ impl SessionStoreV2 {
                 }
                 let main_bytes = fs::read(main_path).await?;
                 let side_bytes = fs::read(side_path).await?;
+                compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
                 let side: Session = serde_json::from_slice(&side_bytes)?;
                 Self::validate_root_tool_authority_pair(
@@ -428,6 +505,8 @@ impl SessionStoreV2 {
             || side.root_tool_authority_revision < main.root_tool_authority_revision
             || (side.root_tool_authority_revision == main.root_tool_authority_revision
                 && side.root_orchestration_only != main.root_orchestration_only)
+            || side.root_mode_transition_epoch != main.root_mode_transition_epoch
+            || side.root_mode_operations != main.root_mode_operations
             || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(conflict(
@@ -581,6 +660,8 @@ impl SessionStoreV2 {
             let bytes = fs::read(directory.join("session.json"))
                 .await
                 .map_err(|error| conflict(format!("canonical main file: {error}")))?;
+            compact_main::validate_full_main(&bytes)
+                .map_err(|error| conflict(error.to_string()))?;
             let main: Session = serde_json::from_slice(&bytes)
                 .map_err(|error| conflict(format!("invalid canonical main: {error}")))?;
             supervisor::validate_overlay(&main, Some(&current))
@@ -591,6 +672,59 @@ impl SessionStoreV2 {
             return Err(conflict(
                 "metadata revision regressed; reload before saving",
             ));
+        }
+        if incoming.root_mode_operations.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {
+            return Err(conflict("Root mode operation history exceeds its bound"));
+        }
+        if incoming.root_mode_transition_epoch == current.root_mode_transition_epoch {
+            if incoming.root_mode_operations != current.root_mode_operations {
+                return Err(conflict(
+                    "Root mode operation changed without advancing its epoch",
+                ));
+            }
+        } else {
+            if !full
+                || current.root_mode_transition_epoch.checked_add(1)
+                    != Some(incoming.root_mode_transition_epoch)
+            {
+                return Err(conflict("Root mode transition epoch is stale or skipped"));
+            }
+            let Some(receipt) = incoming.root_mode_operations.last() else {
+                return Err(conflict("Root mode transition has no terminal receipt"));
+            };
+            if receipt.expected_epoch != current.root_mode_transition_epoch
+                || receipt.resulting_epoch != incoming.root_mode_transition_epoch
+                || receipt.enabled_at_completion != incoming.root_orchestration_only
+                || receipt.tool_authority_revision != incoming.root_tool_authority_revision
+                || current
+                    .root_mode_operations
+                    .iter()
+                    .any(|previous| previous.operation_id == receipt.operation_id)
+            {
+                return Err(conflict(
+                    "Root mode terminal receipt does not match its transition",
+                ));
+            }
+            let mut expected_history = current.root_mode_operations.clone();
+            expected_history.push(receipt.clone());
+            if expected_history.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {
+                expected_history.remove(0);
+            }
+            if incoming.root_mode_operations != expected_history {
+                return Err(conflict(
+                    "Root mode terminal history is stale or inconsistent",
+                ));
+            }
+            match receipt.outcome {
+                RootModeOperationOutcome::Committed
+                    if receipt.requested_enabled == incoming.root_orchestration_only => {}
+                RootModeOperationOutcome::Fenced
+                | RootModeOperationOutcome::RejectedIncompatible
+                    if incoming.root_orchestration_only == current.root_orchestration_only
+                        && incoming.root_tool_authority_revision
+                            == current.root_tool_authority_revision => {}
+                _ => return Err(conflict("Root mode terminal outcome is inconsistent")),
+            }
         }
         if (current.root_orchestration_only && current.root_tool_authority_revision == 0)
             || incoming.root_tool_authority_revision < current.root_tool_authority_revision

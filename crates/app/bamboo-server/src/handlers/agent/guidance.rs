@@ -1,8 +1,10 @@
 //! Durable multimodal guidance for a model boundary or successor run.
 use crate::app_state::AppState;
-use crate::error::json_error;
+use crate::error::{error_value, json_error};
 use actix_web::{http::StatusCode, web, HttpResponse};
-use bamboo_domain::{SessionInboxError, SessionMessageEnvelope, SessionMessageId};
+use bamboo_domain::{
+    SessionInboxError, SessionInboxReceipt, SessionMessageEnvelope, SessionMessageId,
+};
 use bamboo_engine::session_messaging::SessionMessengerError;
 use serde::Deserialize;
 use serde_json::json;
@@ -42,6 +44,16 @@ fn inbox_error(error: SessionInboxError) -> HttpResponse {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Guidance storage failed")
         }
     }
+}
+
+fn activation_eligibility_error(receipt: &SessionInboxReceipt) -> HttpResponse {
+    // The Inbox rename committed, but its activation watermark did not. A 2xx
+    // acknowledgement would make Lotus Next discard the stable retry id.
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": error_value("Guidance was saved, but activation needs a retry with the same id"),
+        "id": receipt.id,
+        "activation_retry_required": true,
+    }))
 }
 
 pub async fn list(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
@@ -141,7 +153,6 @@ pub async fn send(
         },
     });
     let result = async {
-        let admission = state.session_messenger.admit(envelope).await?;
         let policy = match body.mode {
             GuidanceMode::AfterRound => {
                 bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
@@ -150,7 +161,7 @@ pub async fn send(
         };
         state
             .session_messenger
-            .activate_with_policy(&admission, policy)
+            .send_with_policy(envelope, policy)
             .await
     }
     .await;
@@ -159,6 +170,9 @@ pub async fn send(
             .json(json!({"id": receipt.delivery.id, "activation_pending": false})),
         Err(SessionMessengerError::Activation { receipt, .. }) => {
             HttpResponse::Accepted().json(json!({"id": receipt.id, "activation_pending": true}))
+        }
+        Err(SessionMessengerError::ActivationEligibility { receipt, .. }) => {
+            activation_eligibility_error(&receipt)
         }
         Err(SessionMessengerError::TargetNotFound(_)) => {
             json_error(StatusCode::NOT_FOUND, "Session not found")
@@ -177,6 +191,23 @@ pub async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn unpersisted_activation_watermark_returns_retryable_error_with_stable_id() {
+        let receipt = SessionInboxReceipt {
+            id: SessionMessageId::parse("stable-guidance-id").unwrap(),
+            generation: 1,
+        };
+        let response = activation_eligibility_error(&receipt);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["id"], "stable-guidance-id");
+        assert_eq!(body["activation_retry_required"], true);
+        assert_eq!(body["error"]["type"], "api_error");
+    }
 
     #[actix_web::test]
     async fn queued_images_use_durable_references_and_retries_do_not_duplicate_attachments() {

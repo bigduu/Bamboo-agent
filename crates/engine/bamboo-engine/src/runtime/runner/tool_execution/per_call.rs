@@ -68,6 +68,9 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
     pub session_id: &'a str,
+    /// Snapshotted from the durable Root authority at this dispatch boundary.
+    /// A parallel batch shares one snapshot across its already-admitted calls.
+    pub root_orchestration_only: bool,
     /// Root-session identity snapshotted from the executing Session before any
     /// parallel dispatch borrow begins.
     pub root_session_id: &'a str,
@@ -183,6 +186,32 @@ async fn execute_tool_call_only_with_execution_name(
     execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
+    // Recheck the resolved exact executor identity even if the provider cites a
+    // stale schema or the round's EffectiveCallableSet predates live tightening.
+    // Reject before ToolStart, hooks, replay handling, and executor entry.
+    if ctx.root_orchestration_only
+        && !bamboo_domain::orchestration_only_allows_execution_name(execution_name)
+    {
+        tracing::warn!(
+            "[{}][round:{}] Tool call rejected by Root authority before ToolStart: tool_call_id={}, tool_name={}, execution_name={}",
+            ctx.session_id,
+            ctx.round,
+            ctx.tool_call.id,
+            ctx.tool_call.function.name,
+            execution_name,
+        );
+        return Ok(ToolExecutionOutcome {
+            permission_replay_origin: None,
+            needs_human: None,
+            post_tool_hook_eligible: false,
+            result: Err(format!(
+                "Tool '{}' is outside orchestration-only Root authority",
+                ctx.tool_call.function.name
+            )),
+            tool_duration: std::time::Duration::ZERO,
+        });
+    }
+
     if let Err(policy_error) = policy::validate_tool_call_arguments(ctx.tool_call) {
         tracing::warn!(
             "[{}][round:{}] Tool call blocked by strict argument policy before ToolStart: tool_call_id={}, tool_name={}, error={}",
@@ -1256,6 +1285,23 @@ mod hook_tests {
         tool_call: &ToolCall,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> ToolExecutionOutcome {
+        execute_without_hooks_with_root_authority(
+            effective_callable_set,
+            tools,
+            tool_call,
+            event_tx,
+            false,
+        )
+        .await
+    }
+
+    async fn execute_without_hooks_with_root_authority(
+        effective_callable_set: &EffectiveCallableSet,
+        tools: &Arc<dyn ToolExecutor>,
+        tool_call: &ToolCall,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        root_orchestration_only: bool,
+    ) -> ToolExecutionOutcome {
         let session = Session::new("capability-gate-session", "model");
         execute_model_requested_tool_call_only(
             effective_callable_set,
@@ -1265,6 +1311,7 @@ mod hook_tests {
                 event_tx,
                 metrics_collector: None,
                 session_id: "capability-gate-session",
+                root_orchestration_only,
                 root_session_id: "capability-gate-session",
                 round_id: "round-1",
                 round: 0,
@@ -1315,6 +1362,61 @@ mod hook_tests {
                 .count(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn selected_root_final_gate_rejects_stale_schema_and_exact_alias_before_tool_start() {
+        let concrete_tools = Arc::new(NameRecordingExecutor::new(&[
+            "Read",
+            "Bash",
+            "Edit",
+            "apply_patch",
+            "default::Read",
+        ]));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        // Deliberately stale: the loaded callable set still contains names that
+        // the live Root authority now denies.
+        let stale = effective_callable_set(
+            &["Read", "Bash", "Edit", "apply_patch", "default::Read"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        for name in [
+            "Bash",
+            "default::Bash",
+            "Edit",
+            "apply_patch",
+            "default::Read",
+        ] {
+            let outcome = execute_without_hooks_with_root_authority(
+                &stale,
+                &tools,
+                &probe_call(name),
+                &event_tx,
+                true,
+            )
+            .await;
+            assert!(matches!(
+                outcome.result,
+                Err(ref error) if error.contains("outside orchestration-only Root authority")
+            ));
+            assert!(!outcome.post_tool_hook_eligible);
+        }
+        let allowed = execute_without_hooks_with_root_authority(
+            &stale,
+            &tools,
+            &probe_call("read_file"),
+            &event_tx,
+            true,
+        )
+        .await;
+        assert!(allowed.result.is_ok());
+        assert_eq!(concrete_tools.entered(), ["Read"]);
+        let starts = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+            .count();
+        assert_eq!(starts, 1);
     }
 
     #[tokio::test]
@@ -1370,6 +1472,7 @@ mod hook_tests {
                 event_tx: &event_tx,
                 metrics_collector: None,
                 session_id: "capability-gate-hook-session",
+                root_orchestration_only: false,
                 root_session_id: "capability-gate-hook-session",
                 round_id: "round-1",
                 round: 0,
@@ -1640,6 +1743,7 @@ mod hook_tests {
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-deny-session",
+            root_orchestration_only: false,
             root_session_id: "hook-deny-session",
             round_id: "round-1",
             round: 0,
@@ -1700,6 +1804,7 @@ mod hook_tests {
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "configured-hook-deny",
+            root_orchestration_only: false,
             root_session_id: "configured-hook-deny",
             round_id: "round-1",
             round: 0,
@@ -1779,6 +1884,7 @@ mod hook_tests {
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-allow-engine",
+            root_orchestration_only: false,
             root_session_id: "hook-allow-engine",
             round_id: "round-1",
             round: 0,
@@ -1834,6 +1940,7 @@ mod hook_tests {
                 event_tx: &event_tx,
                 metrics_collector: None,
                 session_id: "hook-ask-session",
+                root_orchestration_only: false,
                 root_session_id: "hook-ask-session",
                 round_id: "round-1",
                 round: 0,
@@ -2493,6 +2600,7 @@ mod hook_tests {
                 metrics_collector: None,
                 session_id,
                 root_session_id: session_id,
+                root_orchestration_only: false,
                 round_id: "round-1",
                 round: 0,
                 tools: &tools,
@@ -2551,6 +2659,7 @@ mod hook_tests {
             event_tx: &event_tx,
             metrics_collector: None,
             session_id: "hook-ask-no-parent",
+            root_orchestration_only: false,
             root_session_id: "hook-ask-no-parent",
             round_id: "round-1",
             round: 0,

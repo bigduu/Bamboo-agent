@@ -29,6 +29,8 @@ pub struct BrokerChildLink {
     run_id: Option<MsgId>,
     /// True once a terminal frame has been surfaced for the current run.
     done: bool,
+    selected_worker: Option<AgentRef>,
+    expected_run: Option<bamboo_subagent::RunSpec>,
 }
 
 impl BrokerChildLink {
@@ -47,7 +49,60 @@ impl BrokerChildLink {
             me: parent,
             run_id: None,
             done: false,
+            selected_worker: None,
+            expected_run: None,
         })
+    }
+
+    /// Explicit scoped peer route; the credential belongs only to this client.
+    pub async fn connect_strict_with_tls(
+        endpoint: &str,
+        parent: AgentRef,
+        token: &str,
+        worker: AgentRef,
+        tls: rustls::ClientConfig,
+    ) -> BrokerResult<Self> {
+        let mut client =
+            BrokerClient::connect_actor_with_tls(endpoint, parent.clone(), token, Some(tls))
+                .await?;
+        client.subscribe().await?;
+        // This connection's ordered control reply confirms subscription admission
+        // and the selected role's current connection presence, not Host ownership.
+        let role = worker.role.as_deref().ok_or_else(strict_link_error)?;
+        if !client
+            .list_connected(role)
+            .await?
+            .contains(&worker.session_id)
+        {
+            return Err(strict_link_error());
+        }
+        Ok(Self {
+            client,
+            child: worker.session_id.clone(),
+            me: parent,
+            run_id: None,
+            done: false,
+            selected_worker: Some(worker),
+            expected_run: None,
+        })
+    }
+
+    fn validate_selected_batch(
+        &self,
+        batch: &bamboo_subagent::ActorEventBatch,
+    ) -> BrokerResult<()> {
+        if let Some(worker) = &self.selected_worker {
+            let run = self.expected_run.as_ref().ok_or_else(strict_link_error)?;
+            if batch.validate().is_err()
+                || batch.logical_session != run.logical_session
+                || batch.activation_id != run.activation_run_id
+                || batch.execution_epoch != run.execution_epoch
+                || batch.source_actor_id.as_deref() != Some(worker.session_id.as_str())
+            {
+                return Err(strict_link_error());
+            }
+        }
+        Ok(())
     }
 
     fn msg(
@@ -70,6 +125,33 @@ impl BrokerChildLink {
     pub async fn send(&mut self, frame: ParentFrame) -> BrokerResult<()> {
         match frame {
             ParentFrame::Run(spec) => {
+                if self.selected_worker.is_some() {
+                    if spec
+                        .logical_session
+                        .as_ref()
+                        .and_then(|id| id.creation.as_ref())
+                        .is_none()
+                        || spec
+                            .activation_run_id
+                            .as_deref()
+                            .map_or(true, str::is_empty)
+                        || spec.execution_epoch == 0
+                    {
+                        return Err(strict_link_error());
+                    }
+                    self.expected_run = Some(bamboo_subagent::RunSpec {
+                        assignment: String::new(),
+                        logical_session: spec.logical_session.clone(),
+                        project_id: spec.project_id.clone(),
+                        reasoning_effort: None,
+                        permission_policy: None,
+                        messages: Vec::new(),
+                        activation_run_id: spec.activation_run_id.clone(),
+                        execution_epoch: spec.execution_epoch,
+                        initial_session_messages: Vec::new(),
+                        secrets: Default::default(),
+                    });
+                }
                 let body = serde_json::to_value(spec)
                     .map_err(|e| BrokerError::Transport(format!("encode RunSpec: {e}")))?;
                 let m = self.msg(InboxKind::Run, body, None);
@@ -90,6 +172,15 @@ impl BrokerChildLink {
                     serde_json::json!({ "text": text }),
                     self.run_id.clone(),
                 );
+                self.client.deliver(&self.child, m).await?;
+            }
+            ParentFrame::InitialInputRelease { release } => {
+                let body =
+                    serde_json::to_value(bamboo_subagent::proto::InitialInputControl::Release {
+                        release,
+                    })
+                    .map_err(|e| BrokerError::Transport(format!("encode initial release: {e}")))?;
+                let m = self.msg(InboxKind::Steer, body, self.run_id.clone());
                 self.client.deliver(&self.child, m).await?;
             }
             ParentFrame::SessionMessage { delivery } => {
@@ -126,6 +217,7 @@ impl BrokerChildLink {
                     if self.run_id.as_ref() != Some(&delivery.correlation_id) {
                         continue;
                     }
+                    self.validate_selected_batch(&delivery.batch)?;
                     delivery.batch.validate().map_err(|error| {
                         BrokerError::Transport(format!("invalid actor event batch: {error}"))
                     })?;
@@ -143,13 +235,49 @@ impl BrokerChildLink {
                 self.client.ack(id).await.ok();
                 continue;
             }
+            if self
+                .selected_worker
+                .as_ref()
+                .is_some_and(|worker| &msg.from != worker)
+            {
+                return Err(strict_link_error());
+            }
             let frame = match msg.kind {
                 InboxKind::Event => {
                     match serde_json::from_value::<bamboo_subagent::ActorEventBatch>(
                         msg.body.clone(),
                     ) {
-                        Ok(batch) => Some(ChildFrame::EventBatch { batch }),
+                        Ok(batch) => {
+                            self.validate_selected_batch(&batch)?;
+                            Some(ChildFrame::EventBatch { batch })
+                        }
+                        Err(_) if self.selected_worker.is_some() => return Err(strict_link_error()),
                         Err(_) => Some(ChildFrame::Event { event: msg.body }),
+                    }
+                }
+                InboxKind::SessionMessageAdmitted
+                    if msg.body.get("initial_input_control").is_some() =>
+                {
+                    match bamboo_subagent::proto::InitialInputControl::decode(msg.body).map_err(
+                        |e| BrokerError::Transport(format!("decode initial control: {e}")),
+                    )? {
+                        bamboo_subagent::proto::InitialInputControl::Request { request } => {
+                            Some(ChildFrame::Event {
+                                event: serde_json::to_value(
+                                    bamboo_subagent::proto::InitialInputControl::Request {
+                                        request,
+                                    },
+                                )
+                                .map_err(|e| {
+                                    BrokerError::Transport(format!("encode initial control: {e}"))
+                                })?,
+                            })
+                        }
+                        _ => {
+                            return Err(BrokerError::Transport(
+                                "unexpected initial release direction".into(),
+                            ))
+                        }
                     }
                 }
                 InboxKind::SessionMessageAdmitted => {
@@ -195,6 +323,10 @@ impl BrokerChildLink {
             }
         }
     }
+}
+
+fn strict_link_error() -> BrokerError {
+    BrokerError::Transport("remote broker frame rejected".into())
 }
 
 /// Drive a child over the bus with the SAME interface as a direct-WS
@@ -389,6 +521,7 @@ mod tests {
             assert_eq!(
                 spec.logical_session,
                 Some(bamboo_subagent::LogicalSessionIdentity {
+                    creation: None,
                     session_id: "logical-child".to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),
@@ -450,6 +583,7 @@ mod tests {
         link.send(ParentFrame::Run(RunSpec {
             assignment: "go".into(),
             logical_session: Some(bamboo_subagent::LogicalSessionIdentity {
+                creation: None,
                 session_id: "logical-child".to_string(),
                 parent_session_id: Some("logical-parent".to_string()),
                 root_session_id: "logical-root".to_string(),
@@ -504,6 +638,7 @@ mod tests {
         link.send(ParentFrame::Run(RunSpec {
             assignment: "go".into(),
             logical_session: Some(bamboo_subagent::LogicalSessionIdentity {
+                creation: None,
                 session_id: "logical-child".to_string(),
                 parent_session_id: Some("logical-parent".to_string()),
                 root_session_id: "logical-root".to_string(),

@@ -3,6 +3,7 @@ use crate::reasoning::ReasoningEffort;
 use crate::session::authority::SessionAuthorityIdentity;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
 use crate::session::message_part::{ImageUrlRef, MessagePart};
+use crate::session::root_mode_transition::RootModeOperationReceipt;
 use crate::session::supervisor_management::SupervisorManagementState;
 use crate::session::task::{TaskItemStatus, TaskList};
 use crate::session::tool_types::ToolCall;
@@ -767,6 +768,13 @@ pub struct Session {
     /// CAS fence for changing Root execution authority across Store instances.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub root_tool_authority_revision: u64,
+    /// Monotonic CAS for terminal Root-mode operations, including fences that
+    /// leave the tool policy unchanged. Independent of tool authority revision.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub root_mode_transition_epoch: u64,
+    /// Bounded terminal receipts. V2 binds this history into the Root proof.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_mode_operations: Vec<RootModeOperationReceipt>,
     #[serde(default)]
     pub kind: SessionKind,
     /// Trusted identity; raw metadata and ordinary persistence cannot assign it.
@@ -910,6 +918,8 @@ impl Session {
             metadata_version: 0,
             root_orchestration_only: false,
             root_tool_authority_revision: 0,
+            root_mode_transition_epoch: 0,
+            root_mode_operations: Vec::new(),
             kind: SessionKind::Root,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
@@ -1000,6 +1010,8 @@ impl Session {
             metadata_version: 0,
             root_orchestration_only: false,
             root_tool_authority_revision: 0,
+            root_mode_transition_epoch: 0,
+            root_mode_operations: Vec::new(),
             kind: SessionKind::Child,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,

@@ -3,6 +3,7 @@
 use super::*;
 use bamboo_domain::{
     AgentRuntimeState, Message, SessionAuthorityConflict, SessionPermissionMode, TaskItem,
+    ROOT_MODE_OPERATION_HISTORY_LIMIT,
 };
 use tempfile::TempDir;
 
@@ -1108,6 +1109,547 @@ async fn one_time_root_tool_proof_migration_requires_a_valid_existing_pair() {
     later.flush_search_index().await;
     drop(later);
     home.close().unwrap();
+}
+
+fn mode_request(
+    root: &Session,
+    operation_id: &str,
+    expected_epoch: u64,
+    enabled: bool,
+    action: RootModeOperationAction,
+) -> RootModeOperationRequest {
+    RootModeOperationRequest {
+        session_id: root.id.clone(),
+        operation_id: format!("{expected_epoch}:{operation_id}"),
+        birth_token: root.root_mode_birth_token(),
+        expected_epoch,
+        requested_enabled: enabled,
+        action,
+    }
+}
+
+/// Model the pre-mode final writer's v1-only proof guard. Serde deliberately
+/// ignores the new fields, as the older deployed reader did; version rejection
+/// is therefore what prevents that writer from erasing a policy-neutral fence.
+async fn legacy_v1_save_if_proof_matches(
+    store: &SessionStoreV2,
+    incoming: &Session,
+) -> io::Result<()> {
+    #[derive(Deserialize)]
+    struct LegacyProof {
+        version: u32,
+        state: String,
+        id: String,
+        created_at: DateTime<Utc>,
+        authority_identity: SessionAuthorityIdentity,
+        root_orchestration_only: bool,
+        root_tool_authority_revision: u64,
+    }
+    let proof: LegacyProof = serde_json::from_slice(
+        &fs::read(
+            directory(store, &incoming.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE),
+        )
+        .await?,
+    )
+    .unwrap();
+    if proof.version != 1
+        || proof.state != "committed"
+        || proof.id != incoming.id
+        || proof.created_at != incoming.created_at
+        || proof.authority_identity != incoming.authority_identity
+        || proof.root_orchestration_only != incoming.root_orchestration_only
+        || proof.root_tool_authority_revision != incoming.root_tool_authority_revision
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "legacy v1 proof guard",
+        ));
+    }
+    store.save_session(incoming).await
+}
+
+#[tokio::test]
+async fn first_terminal_root_mode_fence_upgrades_legacy_proof_and_blocks_v1_writer() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let proof_path =
+        directory(&fixture.first, &initial.id).join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    let legacy = serde_json::json!({
+        "version": 1,
+        "state": "committed",
+        "id": initial.id,
+        "created_at": initial.created_at,
+        "authority_identity": initial.authority_identity,
+        "root_orchestration_only": initial.root_orchestration_only,
+        "root_tool_authority_revision": initial.root_tool_authority_revision,
+    });
+    fs::write(&proof_path, serde_json::to_vec(&legacy).unwrap())
+        .await
+        .unwrap();
+    assert!(fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    let recover = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Recover,
+    );
+    let fenced = fixture.first.root_mode_operation(&recover).await.unwrap();
+    let proof: serde_json::Value =
+        serde_json::from_slice(&fs::read(&proof_path).await.unwrap()).unwrap();
+    assert_eq!(proof["version"], 2);
+    let durable = fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.root_tool_authority_revision, 0);
+    let before = files(&fixture.first, &initial.id).await;
+    assert!(legacy_v1_save_if_proof_matches(&fixture.second, &durable)
+        .await
+        .is_err());
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
+
+    let restarted = SessionStoreV2::new(fixture.home.path().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.root_mode_operation(&recover).await.unwrap(),
+        fenced
+    );
+    restarted.flush_search_index().await;
+    drop(restarted);
+
+    let mut downgraded = proof;
+    downgraded["version"] = serde_json::json!(1);
+    fs::write(&proof_path, serde_json::to_vec(&downgraded).unwrap())
+        .await
+        .unwrap();
+    let before = files(&fixture.first, &initial.id).await;
+    assert!(fixture.second.load_session(&initial.id).await.is_err());
+    assert!(fixture.second.save_session(&durable).await.is_err());
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn recovery_fence_prevents_late_root_mode_commit_across_stores_and_restart() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let operation_id = Uuid::new_v4().to_string();
+    let select = mode_request(
+        &initial,
+        &operation_id,
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    let recover = RootModeOperationRequest {
+        action: RootModeOperationAction::Recover,
+        ..select.clone()
+    };
+    let fence = fixture.first.root_mode_operation(&recover).await.unwrap();
+    assert!(matches!(
+        fence,
+        RootModeOperationDecision::Terminal(RootModeOperationReceipt {
+            outcome: RootModeOperationOutcome::Fenced,
+            ..
+        })
+    ));
+    let late = fixture.second.root_mode_operation(&select).await.unwrap();
+    assert!(matches!(
+        late,
+        RootModeOperationDecision::Terminal(RootModeOperationReceipt {
+            outcome: RootModeOperationOutcome::Fenced,
+            ..
+        })
+    ));
+    let durable = fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!durable.root_orchestration_only_enabled());
+    assert_eq!(durable.root_tool_authority_revision, 0);
+    assert_eq!(durable.root_mode_transition_epoch, 1);
+    assert_eq!(durable.messages.len(), initial.messages.len());
+    let restarted = SessionStoreV2::new(fixture.home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.root_mode_operation(&recover).await.unwrap(),
+        fence
+    );
+    restarted.flush_search_index().await;
+    drop(restarted);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn policy_neutral_recovery_rejects_stale_main_on_authority_read() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let main_path = directory(&fixture.first, &initial.id).join("session.json");
+    let stale_main = fs::read(&main_path).await.unwrap();
+    let recover = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Recover,
+    );
+    fixture.first.root_mode_operation(&recover).await.unwrap();
+    let current_main = fs::read(&main_path).await.unwrap();
+    assert!(fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    fs::write(&main_path, &stale_main).await.unwrap();
+    let error = fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+    fs::write(&main_path, current_main).await.unwrap();
+    assert!(fixture
+        .second
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap()
+        .is_some());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn started_select_blocked_before_admission_cannot_pass_recovery_fence() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let select = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    let recover = RootModeOperationRequest {
+        action: RootModeOperationAction::Recover,
+        ..select.clone()
+    };
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let first = &fixture.first;
+    let second = &fixture.second;
+    let (selected, fenced) = tokio::join!(
+        async {
+            started.notify_one();
+            // The caller has started its Select but is paused before V2
+            // admission, like a timed-out request still queued for storage.
+            release.notified().await;
+            first.root_mode_operation(&select).await.unwrap()
+        },
+        async {
+            started.notified().await;
+            let fenced = second.root_mode_operation(&recover).await.unwrap();
+            release.notify_one();
+            fenced
+        }
+    );
+    assert_eq!(selected, fenced);
+    assert!(matches!(
+        fenced,
+        RootModeOperationDecision::Terminal(RootModeOperationReceipt {
+            outcome: RootModeOperationOutcome::Fenced,
+            ..
+        })
+    ));
+    let durable = fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!durable.root_orchestration_only_enabled());
+    assert_eq!(durable.root_mode_transition_epoch, 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn stale_full_and_runtime_saves_cannot_erase_terminal_root_mode_receipt() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let select = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    fixture.first.root_mode_operation(&select).await.unwrap();
+    assert!(fixture.second.save_session(&initial).await.is_err());
+    assert!(fixture.second.save_runtime_state(&initial).await.is_err());
+
+    let mut fresh = fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    fresh.set_last_run_status("succeeded");
+    fixture.second.save_runtime_state(&fresh).await.unwrap();
+    let durable = fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.root_mode_transition_epoch, 1);
+    assert_eq!(durable.root_mode_operations.len(), 1);
+    assert!(durable.root_orchestration_only_enabled());
+    assert_eq!(durable.root_tool_authority_revision, 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn root_mode_commit_replays_and_conflicting_concurrent_revision_cannot_win() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let first = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    let committed = fixture.first.root_mode_operation(&first).await.unwrap();
+    assert!(matches!(
+        committed,
+        RootModeOperationDecision::Terminal(RootModeOperationReceipt {
+            outcome: RootModeOperationOutcome::Committed,
+            ..
+        })
+    ));
+    assert_eq!(
+        fixture.second.root_mode_operation(&first).await.unwrap(),
+        committed
+    );
+    let different_payload = RootModeOperationRequest {
+        requested_enabled: false,
+        ..first.clone()
+    };
+    assert_eq!(
+        fixture
+            .second
+            .root_mode_operation(&different_payload)
+            .await
+            .unwrap(),
+        RootModeOperationDecision::OperationConflict
+    );
+    let stale = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        false,
+        RootModeOperationAction::Select,
+    );
+    assert!(matches!(
+        fixture.second.root_mode_operation(&stale).await.unwrap(),
+        RootModeOperationDecision::FencedBySuccessor {
+            current_epoch: 1,
+            ..
+        }
+    ));
+    let durable = fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable.root_orchestration_only_enabled());
+    assert_eq!(durable.root_tool_authority_revision, 1);
+    assert_eq!(durable.root_mode_transition_epoch, 1);
+    assert_eq!(durable.messages.len(), initial.messages.len());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn root_mode_recovery_waits_for_cross_process_commit_and_reads_terminal_result() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let (reached, release) = fixture
+        .first
+        .pause_full_save_before_filesystem_commit_for_test(&initial.id);
+    let select = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    let recover = RootModeOperationRequest {
+        action: RootModeOperationAction::Recover,
+        ..select.clone()
+    };
+    let first = &fixture.first;
+    let second = &fixture.second;
+    let (selected, recovered) = tokio::join!(
+        async { first.root_mode_operation(&select).await.unwrap() },
+        async {
+            reached.wait().await;
+            let pending = second.root_mode_operation(&recover);
+            tokio::pin!(pending);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending)
+                    .await
+                    .is_err()
+            );
+            release.wait().await;
+            pending.await.unwrap()
+        }
+    );
+    assert_eq!(selected, recovered);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn root_mode_commit_holds_birth_against_delete_and_old_token_cannot_retarget_recreation() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let (reached, release) = fixture
+        .first
+        .pause_full_save_before_filesystem_commit_for_test(&initial.id);
+    let select = mode_request(
+        &initial,
+        &Uuid::new_v4().to_string(),
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    let first = &fixture.first;
+    let second = &fixture.second;
+    let (selected, deleted) = tokio::join!(
+        async { first.root_mode_operation(&select).await.unwrap() },
+        async {
+            reached.wait().await;
+            let deletion = second.delete_session_recursive(&initial.id, true);
+            tokio::pin!(deletion);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut deletion)
+                    .await
+                    .is_err()
+            );
+            release.wait().await;
+            deletion.await.unwrap()
+        }
+    );
+    assert!(matches!(selected, RootModeOperationDecision::Terminal(_)));
+    assert!(deleted);
+    let recreated = fixture
+        .second
+        .recreate_root_session(&initial.id, "new-model")
+        .await
+        .unwrap();
+    assert_ne!(
+        recreated.root_mode_birth_token(),
+        initial.root_mode_birth_token()
+    );
+    assert_eq!(
+        fixture.second.root_mode_operation(&select).await.unwrap(),
+        RootModeOperationDecision::BirthMismatch
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn evicted_root_mode_receipt_cannot_reuse_its_operation_identity_at_new_epoch() {
+    let initial = root();
+    let fixture = Fixture::new(&initial, false).await;
+    let first_uuid = Uuid::new_v4().to_string();
+    let first = mode_request(
+        &initial,
+        &first_uuid,
+        0,
+        true,
+        RootModeOperationAction::Select,
+    );
+    fixture.first.root_mode_operation(&first).await.unwrap();
+    for epoch in 1..=ROOT_MODE_OPERATION_HISTORY_LIMIT as u64 {
+        let next = mode_request(
+            &initial,
+            &Uuid::new_v4().to_string(),
+            epoch,
+            epoch % 2 == 0,
+            RootModeOperationAction::Select,
+        );
+        fixture.second.root_mode_operation(&next).await.unwrap();
+    }
+    let durable = fixture
+        .first
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.root_mode_transition_epoch, 9);
+    assert_eq!(
+        durable.root_mode_operations.len(),
+        ROOT_MODE_OPERATION_HISTORY_LIMIT
+    );
+    assert!(durable.root_mode_operation(&first.operation_id).is_none());
+    assert!(matches!(
+        fixture.second.root_mode_operation(&first).await.unwrap(),
+        RootModeOperationDecision::FencedBySuccessor {
+            current_epoch: 9,
+            ..
+        }
+    ));
+    let reepoch = RootModeOperationRequest {
+        expected_epoch: 9,
+        requested_enabled: !durable.root_orchestration_only_enabled(),
+        ..first
+    };
+    assert_eq!(
+        fixture
+            .second
+            .root_mode_operation(&reepoch)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let after = fixture
+        .second
+        .load_session(&initial.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.root_mode_transition_epoch, 9);
+    assert_eq!(
+        after.root_tool_authority_revision,
+        durable.root_tool_authority_revision
+    );
+    assert!(
+        fs::metadata(
+            directory(&fixture.first, &initial.id)
+                .join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)
+        )
+        .await
+        .unwrap()
+        .len()
+            <= 4096
+    );
+    fixture.finish().await;
 }
 
 #[tokio::test]

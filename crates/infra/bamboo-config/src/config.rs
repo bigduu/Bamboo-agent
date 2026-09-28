@@ -919,15 +919,15 @@ pub struct SchedulablePlacement {
 /// The bearer token is NEVER stored here in the clear: `token_env` names the
 /// environment variable that holds it (mirroring the A2A `auth_ref` pattern),
 /// read once at runner-build time. A `token_env` that is set-but-unset at build
-/// time fails SAFE — the placement is skipped and the role falls back to Local
-/// rather than connecting unauthenticated.
+/// time leaves an explicit placement unavailable. A `broker_peer` selection
+/// is required for execution; legacy direct-worker config remains readable.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RemoteActorPlacement {
     /// Sub-agent role this targets (matches the child session's
     /// `metadata["subagent_type"]`).
     pub role: String,
-    /// Resident worker endpoint, e.g. `wss://gpu-host:8443` (or `ws://` only on
-    /// a trusted/loopback link).
+    /// Broker endpoint for a scoped peer route. Legacy worker endpoints remain
+    /// readable but are unavailable until migrated to a broker route.
     pub endpoint: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
     /// `auth_ref`). `None` ⇒ connect without a bearer (trusted link only).
@@ -937,6 +937,44 @@ pub struct RemoteActorPlacement {
     /// (or plaintext `ws://`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
+    /// Explicit scoped broker route. Absence keeps the placement selected but
+    /// unavailable, never a direct parent-to-worker connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_peer: Option<RemoteBrokerPeer>,
+}
+
+/// Operator-pinned transport identities; these do not grant Actor ownership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteBrokerPeer {
+    pub parent_mailbox: String,
+    pub worker_mailbox: String,
+    pub parent_role: Option<String>,
+    pub worker_role: Option<String>,
+}
+impl RemoteBrokerPeer {
+    pub fn valid(&self) -> bool {
+        fn identifier(s: &str, mailbox: bool) -> bool {
+            !s.is_empty()
+                && s.len() <= 256
+                && s != "."
+                && s != ".."
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                && (!mailbox || !s.bytes().any(|b| b.is_ascii_uppercase()))
+        }
+        identifier(&self.parent_mailbox, true)
+            && identifier(&self.worker_mailbox, true)
+            && self.parent_mailbox != self.worker_mailbox
+            && self
+                .parent_role
+                .as_deref()
+                .map_or(true, |s| identifier(s, false))
+            && self
+                .worker_role
+                .as_deref()
+                .is_some_and(|s| identifier(s, false))
+    }
 }
 
 /// How to reach the central sub-agent message broker (`bamboo broker serve`).

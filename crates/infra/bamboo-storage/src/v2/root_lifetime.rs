@@ -4,7 +4,7 @@
 use super::*;
 use bamboo_domain::SessionAuthorityConflict;
 
-const ROOT_REVOCATIONS_DIR: &str = ".root-revocations";
+pub(super) const ROOT_REVOCATIONS_DIR: &str = ".root-revocations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RootPublicationFault {
@@ -17,6 +17,23 @@ struct RootRevocation {
     version: u32,
     session_id: String,
     revoked_through: DateTime<Utc>,
+}
+
+/// Stricter opt-in observation; existing writer and async reader stay unchanged.
+pub(super) fn census_revocation(bytes: &[u8], id: &str) -> io::Result<DateTime<Utc>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Closed {
+        version: u32,
+        session_id: String,
+        revoked_through: DateTime<Utc>,
+    }
+    let value: Closed =
+        serde_json::from_slice(bytes).map_err(|_| invalid("invalid census revocation"))?;
+    if value.version != 1 || value.session_id != id {
+        return Err(invalid("census revocation identity or version mismatch"));
+    }
+    Ok(value.revoked_through)
 }
 
 #[derive(Deserialize)]
@@ -136,6 +153,9 @@ impl SessionStoreV2 {
             let Some(bytes) = read_regular(&directory.join(name)).await? else {
                 continue;
             };
+            if name == "session.json" {
+                compact_main::validate_full_main(&bytes)?;
+            }
             let identity: RootBirth = serde_json::from_slice(&bytes)
                 .map_err(|error| invalid(format!("invalid Root deletion identity: {error}")))?;
             if identity.id != session_id
@@ -380,7 +400,8 @@ impl SessionStoreV2 {
         }
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_runtime_task_transactions_locked(&_task)
+            .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         if self.root_revocation(session_id).await?.is_none() {
             return Err(io::Error::new(
@@ -398,10 +419,12 @@ impl SessionStoreV2 {
             debug_assert_eq!(existing.created_at, full.created_at);
             return Ok(full);
         }
-        self.remove_revoked_root_directory(session_id).await?;
         let mut session = Session::new(session_id, initial_model.trim());
         session.created_at = self.fresh_root_birth(session_id).await?;
         session.updated_at = session.created_at;
+        let main_bytes = compact_main::serialize_main(&session)?;
+        let runtime_bytes = serde_json::to_vec_pretty(&session).map_err(io::Error::other)?;
+        self.remove_revoked_root_directory(session_id).await?;
         let staging = self
             .bamboo_home_dir
             .join(format!(".root-recreation-{}", Uuid::new_v4()));
@@ -410,10 +433,8 @@ impl SessionStoreV2 {
         let result = async {
             fs::create_dir(staging.join("children")).await?;
             fs::create_dir(staging.join("attachments")).await?;
-            let bytes =
-                serde_json::to_vec_pretty(&session).map_err(|error| invalid(error.to_string()))?;
-            durable_atomic_write(&staging.join("session.json"), &bytes).await?;
-            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
+            durable_atomic_write(&staging.join("session.json"), &main_bytes).await?;
+            durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
             Self::write_staged_root_tool_proof(&staging, &session).await?;
             sync_directory(&staging).await?;
             self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;

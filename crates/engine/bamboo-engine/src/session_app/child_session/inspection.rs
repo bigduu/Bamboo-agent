@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::{future::Future, pin::Pin};
 
 use super::{ChildSessionError, ChildSessionPort};
 
@@ -447,6 +448,153 @@ pub async fn inspect_child_action(
             "view must be overview, messages, message, result, or error".to_string(),
         )),
     }
+}
+
+/// Explicit required-packet reads authorize before interpreting selectors or reports.
+pub fn inspect_child_report_action<'a>(
+    port: &'a dyn ChildSessionPort,
+    parent_id: &'a str,
+    child_id: &'a str,
+    view: &'a str,
+    arguments: &'a Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, ChildSessionError>> + Send + 'a>> {
+    Box::pin(inspect_child_report_action_inner(
+        port, parent_id, child_id, view, arguments,
+    ))
+}
+
+async fn inspect_child_report_action_inner(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_id: &str,
+    view: &str,
+    arguments: &Value,
+) -> Result<Value, ChildSessionError> {
+    use super::result_projection::{
+        decode_report, lowercase_sha256, unavailable_child_result as unavailable,
+    };
+    use crate::project_context::{ProjectContextResolver, SessionProjectIdentity};
+    use bamboo_domain::ChildContextBinding;
+    let child = port.load_child_for_parent(parent_id, child_id).await?;
+    let allowed = [
+        "action",
+        "child_session_id",
+        "view",
+        "expected_child_created_at",
+        "expected_assignment_sha256",
+    ];
+    let invalid =
+        || ChildSessionError::InvalidArguments("invalid required-child result arguments".into());
+    if !matches!(view, "result_binding" | "typed_result")
+        || arguments
+            .as_object()
+            .is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
+    {
+        return Err(invalid());
+    }
+    let selectors = if view == "typed_result" {
+        let birth = arguments["expected_child_created_at"]
+            .as_str()
+            .ok_or_else(invalid)?;
+        let birth = chrono::DateTime::parse_from_rfc3339(birth)
+            .map_err(|_| invalid())?
+            .with_timezone(&chrono::Utc);
+        let digest = arguments["expected_assignment_sha256"]
+            .as_str()
+            .filter(|s| lowercase_sha256(s))
+            .ok_or_else(invalid)?;
+        Some((birth, digest))
+    } else {
+        if arguments.get("expected_child_created_at").is_some()
+            || arguments.get("expected_assignment_sha256").is_some()
+        {
+            return Err(invalid());
+        }
+        None
+    };
+    let parent = port.load_root_session(parent_id).await?;
+    let binding = match ChildContextBinding::from_session(&child) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => return Ok(unavailable(view, "typed_result_unsupported")),
+        Err(_) => return Ok(unavailable(view, "result_binding_invalid")),
+    };
+    if child
+        .metadata
+        .get("lifecycle")
+        .is_some_and(|s| s == "resident")
+    {
+        return Ok(unavailable(view, "typed_result_unsupported"));
+    }
+    if selectors.is_some_and(|(birth, digest)| {
+        birth != child.created_at || digest != binding.assignment_sha256
+    }) {
+        return Ok(unavailable(view, "stale_result_selector"));
+    }
+    let parent_project = ProjectContextResolver::session_project_identity(&parent);
+    let child_project = ProjectContextResolver::session_project_identity(&child);
+    if binding.payload.child_session_id != child.id
+        || child.root_session_id != parent.root_session_id
+        || parent.spawn_depth.checked_add(1) != Some(child.spawn_depth)
+        || matches!(parent_project, SessionProjectIdentity::Invalid { .. })
+        || matches!(child_project, SessionProjectIdentity::Invalid { .. })
+        || parent_project != child_project
+        || binding.validate_parent_sources(&parent).is_err()
+    {
+        return Ok(unavailable(view, "stale_parent_context"));
+    }
+    if view == "result_binding" {
+        return Ok(
+            json!({"view":view,"version":1,"available":true,"provenance_kind":"durable_snapshot",
+            "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}),
+        );
+    }
+    let Some((index, message)) = child
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == Role::Assistant)
+    else {
+        return Ok(unavailable(view, "report_absent"));
+    };
+    if child.last_run_status().as_deref() != Some("completed")
+        || message.phase == Some(MessagePhase::Commentary)
+        || message.tool_calls.as_ref().is_some_and(|v| !v.is_empty())
+        || message
+            .content_parts
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+        || message.content.trim().is_empty()
+        || message.compressed
+        || message.compressed_by_event_id.is_some()
+        || message.compression_level != 0
+        || message.content.starts_with("[post-compaction-recovery]")
+        || child
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .is_some_and(|last| index <= last)
+    {
+        return Ok(unavailable(view, "report_not_current_final"));
+    }
+    let report = match decode_report(&message.content) {
+        Ok(report) => report,
+        Err(reason) => return Ok(unavailable(view, reason)),
+    };
+    let project_id = match parent_project {
+        SessionProjectIdentity::Assigned(id) => Some(id.to_string()),
+        _ => None,
+    };
+    Ok(
+        json!({"view":view,"version":1,"available":true,"child_report":report,"host_observation":{
+        "kind":"durable_snapshot","parent_session_id":parent.id,"parent_created_at":parent.created_at,
+        "child_session_id":child.id,"child_created_at":child.created_at,"root_session_id":child.root_session_id,
+        "spawn_depth":child.spawn_depth,"current_project_id":project_id,"assignment_sha256":binding.assignment_sha256,
+        "source_contents_match":true,"required_source_count":binding.payload.sources.iter().filter(|s|s.required).count(),
+        "optional_source_count":binding.payload.sources.iter().filter(|s|!s.required).count(),
+        "message_id":inspection_message_id(message),"content_sha256":sha256(message.content.as_bytes()),
+        "last_run_status":"completed","current_run_final_snapshot":true}}),
+    )
 }
 
 #[cfg(test)]

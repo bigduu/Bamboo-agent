@@ -19,8 +19,8 @@ use bamboo_domain::session::runtime_state::{
 };
 use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_engine::session_app::child_session::{
-    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, ChildSessionPort, DeleteChildResult,
-    SubagentResolutionPort,
+    apply_child_session_update, ChildRunnerInfo, ChildSessionEntry, ChildSessionError,
+    ChildSessionPort, ChildSessionUpdate, DeleteChildResult, SubagentResolutionPort,
 };
 use bamboo_llm::Config;
 use bamboo_storage::{LockedSessionStore, SessionIndexEntry, SessionStoreV2};
@@ -52,6 +52,10 @@ pub struct ChildSessionAdapter {
     /// calls at once → `join_all`) into a single parent persist. See
     /// [`ChildSessionAdapter::register_parent_wait_for_child`].
     pub(crate) parent_wait_slots: Arc<dashmap::DashMap<String, Arc<ParentWaitSlot>>>,
+    /// A boot reconciliation pass may be repeated while its first enqueue is
+    /// still pending. Retain one queue admission per child/generation in this
+    /// process; a new process reconstructs it from durable intent.
+    pub(crate) recovered_launches: Arc<dashmap::DashMap<String, u64>>,
 }
 
 /// Per-parent coalescing slot for batched wait registration.
@@ -102,6 +106,31 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    fn child_spawn_job(parent: &Session, child: &Session) -> Result<SpawnJob, ChildSessionError> {
+        let model = if child.model.trim().is_empty() {
+            parent.model.clone()
+        } else {
+            child.model.clone()
+        };
+        if model.trim().is_empty() {
+            return Err(ChildSessionError::Execution(
+                "child model is empty and parent model is unavailable".to_string(),
+            ));
+        }
+        let disabled_tools = child
+            .metadata
+            .get("disabled_tools")
+            .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
+            .filter(|set| !set.is_empty())
+            .map(|set| set.into_iter().collect::<Vec<String>>());
+        Ok(SpawnJob {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child.id.clone(),
+            model,
+            disabled_tools,
+        })
+    }
+
     /// Shared tail of the two child-save methods: map the persist error and
     /// refresh the in-memory cache. The two public methods differ ONLY in which
     /// persistence call they make (adopting vs authoritative); everything after
@@ -155,7 +184,120 @@ impl ChildSessionAdapter {
             // Fresh per-adapter wait-coalescing map (the type is private to this
             // crate, so out-of-crate callers can't supply it).
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            recovered_launches: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Re-enqueue only durable auto-run intents that have not begun running.
+    /// This pass is safe to repeat during boot and after a process restart:
+    /// the scheduler rechecks the exact generation under its launch guard.
+    pub async fn reconcile_pending_child_launches(&self) -> Result<usize, ChildSessionError> {
+        let mut enqueued = 0;
+        let mut first_error = None;
+        for entry in self.session_store.list_index_entries().await {
+            if entry.kind != SessionKind::Child
+                || entry.last_run_status.as_deref() != Some("pending")
+            {
+                continue;
+            }
+            let child = match self.storage.load_runtime_control_plane(&entry.id).await {
+                Ok(Some(child)) => child,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(child_id = %entry.id, %error, "failed to load pending child launch");
+                    first_error
+                        .get_or_insert_with(|| ChildSessionError::Execution(error.to_string()));
+                    continue;
+                }
+            };
+            let Some(generation) = child.recoverable_child_launch_generation() else {
+                continue;
+            };
+            let Some(parent_id) = child.parent_session_id.as_deref() else {
+                continue;
+            };
+            let parent = match self.storage.load_runtime_control_plane(parent_id).await {
+                Ok(Some(parent)) => parent,
+                Ok(None) => {
+                    tracing::warn!(child_id = %child.id, parent_id, "pending child launch has no parent");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(child_id = %child.id, parent_id, %error, "failed to load parent for pending child launch");
+                    first_error
+                        .get_or_insert_with(|| ChildSessionError::Execution(error.to_string()));
+                    continue;
+                }
+            };
+            if parent.root_session_id != child.root_session_id || parent.id == child.id {
+                tracing::warn!(child_id = %child.id, parent_id, "pending child launch has invalid parent authority");
+                continue;
+            }
+            let already_enqueued = match self.recovered_launches.entry(child.id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(slot) if *slot.get() == generation => true,
+                dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                    slot.insert(generation);
+                    false
+                }
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(generation);
+                    false
+                }
+            };
+            if already_enqueued {
+                continue;
+            }
+            let job = match Self::child_spawn_job(&parent, &child) {
+                Ok(job) => job,
+                Err(error) => {
+                    self.recovered_launches
+                        .remove_if(&child.id, |_, value| *value == generation);
+                    tracing::warn!(child_id = %child.id, %error, "invalid pending child launch");
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            let admission = self
+                .scheduler
+                .enqueue_announced_for_generation(
+                    job,
+                    Some(child.title.clone()),
+                    None,
+                    Some(generation),
+                )
+                .await;
+            match admission {
+                Ok(bamboo_domain::AdmissionCommit::Committed(())) => enqueued += 1,
+                Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => {}
+                Ok(bamboo_domain::AdmissionCommit::Cancelled) | Err(_) => {
+                    self.recovered_launches
+                        .remove_if(&child.id, |_, value| *value == generation);
+                    if let Err(error) = admission {
+                        tracing::warn!(child_id = %child.id, %error, "failed to recover pending child launch");
+                        first_error.get_or_insert(ChildSessionError::Execution(error));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(enqueued),
+        }
+    }
+
+    async fn ensure_child_launch_intent(
+        &self,
+        child: &Session,
+    ) -> Result<Session, ChildSessionError> {
+        self.persistence
+            .ensure_child_auto_run_launch_intent(child)
+            .await
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+            .ok_or_else(|| {
+                ChildSessionError::Execution(
+                    "child launch is no longer the current pending generation".into(),
+                )
+            })
     }
 
     /// Resolve the provider+model ref for a given subagent_type using the configured resolver.
@@ -603,6 +745,102 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn resolve_named_profile(
+        &self,
+        parent: &Session,
+        name: &str,
+    ) -> Result<
+        Option<bamboo_engine::session_app::child_session::named_profile::ResolvedChildProfile>,
+        ChildSessionError,
+    > {
+        use bamboo_skills::named_agents::{
+            NamedAgentLimits, NamedAgentProfileStatus, ScopedNamedAgentCatalogStatus,
+        };
+        let invalid = || ChildSessionError::Execution("named_profile_catalog_unavailable".into());
+        // Reuse this adapter's actual data home and durable authority. A worker
+        // embedding without ProjectStore has no supported profile producer.
+        let Some(projects) = self.project_store.clone() else {
+            return Ok(None);
+        };
+        let durable = self
+            .storage
+            .load_session(&parent.id)
+            .await
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if durable.id != parent.id
+            || durable.created_at != parent.created_at
+            || bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                &durable,
+            ) != bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                parent,
+            )
+        {
+            return Err(invalid());
+        }
+        let catalog = crate::services::named_agent_catalog::discover_for_session(
+            &durable,
+            projects,
+            self.session_store.bamboo_home_dir().to_path_buf(),
+            NamedAgentLimits::default(),
+        )
+        .await
+        .map_err(|_| invalid())?;
+        if catalog.metadata().status != ScopedNamedAgentCatalogStatus::Available
+            || catalog
+                .metadata()
+                .entries
+                .iter()
+                .any(|row| row.identity.is_none())
+        {
+            return Err(invalid());
+        }
+        let rows: Vec<_> = catalog
+            .metadata()
+            .entries
+            .iter()
+            .filter(|row| {
+                row.identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.name == name)
+            })
+            .collect();
+        let selected = rows
+            .iter()
+            .find(|row| row.status == NamedAgentProfileStatus::Selectable);
+        let Some(selected) = selected else {
+            return if rows.is_empty() {
+                Ok(None)
+            } else {
+                Err(ChildSessionError::Execution(
+                    "named_profile_not_selectable".into(),
+                ))
+            };
+        };
+        let identity = selected.identity.as_ref().unwrap();
+        let definition = catalog.get(identity).ok_or_else(invalid)?;
+        let default_provider = self
+            .config
+            .read()
+            .await
+            .effective_default_provider()
+            .to_owned();
+        bamboo_engine::session_app::child_session::named_profile::ResolvedChildProfile::from_catalog(
+            identity.clone(), definition, &durable, &default_provider,
+        ).map(Some)
+    }
+
+    async fn validate_required_child_context_route(
+        &self,
+        runtime_metadata: &HashMap<String, String>,
+        subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        self.scheduler
+            .validate_required_child_context_route(runtime_metadata, subagent_type)
+            .await
+            .map_err(ChildSessionError::Execution)
+    }
+
     fn publish_child_workspace(
         &self,
         session_id: &str,
@@ -711,12 +949,185 @@ impl ChildSessionPort for ChildSessionAdapter {
         Ok(child)
     }
 
+    async fn validate_child_run_request(
+        &self,
+        parent: &Session,
+        child: &Session,
+        reset: Option<bool>,
+    ) -> Result<(), ChildSessionError> {
+        // A marker only selects a strict request check. The actual replacement
+        // owner, provenance and complete Already prefix are rechecked by runner/Storage.
+        if child.messages.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .is_some_and(|v| v.get("_bamboo_owned_input_checkpoint").is_some())
+        }) {
+            if reset != Some(false)
+                || child.parent_session_id.as_deref() != Some(parent.id.as_str())
+            {
+                return Err(ChildSessionError::InvalidArguments("Checkpointed Actor input recovery requires SubAgent.run(reset_to_last_user=false); history is preserved".into()));
+            }
+            let current = self.load_child_for_parent(&parent.id, &child.id).await?;
+            let messages = |session: &Session| {
+                serde_json::to_value(&session.messages)
+                    .map_err(|e| ChildSessionError::Execution(e.to_string()))
+            };
+            if messages(&current)? != messages(child)?
+                || current.created_at != child.created_at
+                || current.root_session_id != child.root_session_id
+                || current.project_id_meta() != child.project_id_meta()
+            {
+                return Err(ChildSessionError::Execution(
+                    "Actor recovery snapshot changed; reload before retry".into(),
+                ));
+            }
+            let inbox = bamboo_storage::FileSessionInbox::new(
+                self.session_store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &child.id)
+                .await
+                .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+            if backlog.pending != 0 || backlog.claimed != 1 || !backlog.activation_pending() {
+                return Err(ChildSessionError::Execution("Actor recovery requires one eligible unconfirmed claim; no new input is queued".into()));
+            }
+        }
+        Ok(())
+    }
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError> {
         // Adopting save: most child actions (update/run/send_message/cancel)
         // don't touch bypass_permissions, so a concurrent `PATCH` to a running
         // child must still win over this control write. #540.
         let saved = self.persistence.merge_save_runtime(child).await;
         self.finish_child_save(child, saved)
+    }
+
+    async fn update_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        update: ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        // A queued worker holds this guard through its eligibility check and
+        // runner reservation. Keep it until the latest-session mutation is
+        // committed, so update cannot validate an idle snapshot and then race
+        // an activation of that same generation.
+        let _launch_guard = self.scheduler.lock_child_launch(child_id).await;
+        // Keep the runner registry read guard through the durable commit.
+        // SessionInbox reservations do not use the scheduler launch lock, but
+        // they must acquire this registry's write lock before activation.
+        let runners = self.agent_runners.read().await;
+        let runner_active = runners.get(child_id).is_some_and(|runner| {
+            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+        });
+        let execution_change = update.changes_execution();
+        let mut messages_removed = 0usize;
+        let saved = self
+            .persistence
+            .mutate_runtime_session_and_publish(
+                child_id,
+                || None,
+                |latest| {
+                    if latest.kind != SessionKind::Child {
+                        return Err(ChildSessionError::NotChildSession(child_id.to_string()));
+                    }
+                    if latest.parent_session_id.as_deref() != Some(parent_id) {
+                        return Err(ChildSessionError::NotChildOfParent {
+                            child_id: child_id.to_string(),
+                            parent_id: parent_id.to_string(),
+                        });
+                    }
+                    if execution_change
+                        && (runner_active
+                            || latest.recoverable_child_launch_generation().is_some()
+                            || matches!(latest.last_run_status().as_deref(), Some("running" | "suspended")))
+                    {
+                        return Err(ChildSessionError::InvalidArguments(
+                            "child generation is active; use send_message for live correction, or cancel and retry to replace its assignment or model".into(),
+                        ));
+                    }
+                    messages_removed = apply_child_session_update(latest, update)?;
+                    Ok(())
+                },
+                |saved| {
+                    self.sessions_cache.insert(
+                        saved.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!("failed to update child session: {error}"))
+            })??;
+        drop(runners);
+        saved
+            .map(|saved| (saved, messages_removed))
+            .ok_or_else(|| ChildSessionError::NotFound(child_id.to_string()))
+    }
+
+    async fn append_draft_child_message(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        let _launch_guard = self.scheduler.lock_child_launch(child_id).await;
+        let runners = self.agent_runners.read().await;
+        let runner_active = runners.get(child_id).is_some_and(|runner| {
+            matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+        });
+        let saved = self
+            .persistence
+            .mutate_runtime_session_and_publish(
+                child_id,
+                || None,
+                |latest| {
+                    if latest.kind != SessionKind::Child {
+                        return Err(ChildSessionError::NotChildSession(child_id.to_string()));
+                    }
+                    if latest.parent_session_id.as_deref() != Some(parent_id) {
+                        return Err(ChildSessionError::NotChildOfParent {
+                            child_id: child_id.to_string(),
+                            parent_id: parent_id.to_string(),
+                        });
+                    }
+                    if runner_active
+                        || latest.recoverable_child_launch_generation().is_some()
+                        || matches!(
+                            latest.last_run_status().as_deref(),
+                            Some("running" | "suspended")
+                        )
+                    {
+                        return Err(ChildSessionError::InvalidArguments(
+                            "child generation is active; use send_message for live correction"
+                                .into(),
+                        ));
+                    }
+                    latest.add_message(bamboo_agent_core::Message::user(message.to_string()));
+                    latest.set_last_run_status("pending");
+                    latest.advance_child_launch_generation().ok_or_else(|| {
+                        ChildSessionError::Execution("child launch generation exhausted".into())
+                    })?;
+                    latest.clear_last_run_error();
+                    latest.updated_at = Utc::now();
+                    Ok(())
+                },
+                |saved| {
+                    self.sessions_cache.insert(
+                        saved.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!(
+                    "failed to append draft child message: {error}"
+                ))
+            })??;
+        drop(runners);
+        saved.ok_or_else(|| ChildSessionError::NotFound(child_id.to_string()))
     }
 
     async fn save_child_session_authoritative_flags(
@@ -794,6 +1205,27 @@ impl ChildSessionPort for ChildSessionAdapter {
         bamboo_engine::session_app::child_session::ChildSessionMessageDelivery,
         ChildSessionError,
     > {
+        self.send_session_message_with_gate(
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    async fn send_session_message_with_gate(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<
+        bamboo_engine::session_app::child_session::ChildSessionMessageDelivery,
+        ChildSessionError,
+    > {
         let messenger = self.session_messenger.as_ref().ok_or_else(|| {
             ChildSessionError::Execution(
                 "logical SessionMessenger is not configured for this runtime".to_string(),
@@ -825,7 +1257,7 @@ impl ChildSessionPort for ChildSessionAdapter {
             attempt: None,
             correlation_id: None,
         };
-        match messenger.send(envelope).await {
+        match messenger.send_with_gate(envelope, gate).await {
             Ok(receipt) => Ok(
                 bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::Activated(
                     receipt,
@@ -835,6 +1267,14 @@ impl ChildSessionPort for ChildSessionAdapter {
                 receipt, source, ..
             }) => Ok(
                 bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::ActivationPending {
+                    delivery: receipt,
+                    error: source.to_string(),
+                },
+            ),
+            Err(bamboo_engine::SessionMessengerError::ActivationEligibility {
+                receipt, source, ..
+            }) => Ok(
+                bamboo_engine::session_app::child_session::ChildSessionMessageDelivery::ActivationAuthorizationPending {
                     delivery: receipt,
                     error: source.to_string(),
                 },
@@ -895,69 +1335,112 @@ impl ChildSessionPort for ChildSessionAdapter {
         parent: &Session,
         child: &Session,
     ) -> Result<(), ChildSessionError> {
-        let model = if child.model.trim().is_empty() {
-            parent.model.clone()
-        } else {
-            child.model.clone()
-        };
-        if model.trim().is_empty() {
-            return Err(ChildSessionError::Execution(
-                "child model is empty and parent model is unavailable".to_string(),
-            ));
-        }
-
-        // Per-child tool denylist: persisted onto the child session by
-        // `create_child_action` (JSON in metadata). Most sub-agents are full
-        // agents and carry none; a read-only Guardian reviewer carries a
-        // denylist here so the worker trims its toolset. `SpawnJob` wants a
-        // `Vec<String>`, so collect the set.
-        let disabled_tools = child
-            .metadata
-            .get("disabled_tools")
-            .and_then(|raw| serde_json::from_str::<std::collections::BTreeSet<String>>(raw).ok())
-            .filter(|set| !set.is_empty())
-            .map(|set| set.into_iter().collect::<Vec<String>>());
-
         // NOTE: enqueue only *runs* the child in the background. Registering the
         // parent's wait (which suspends the parent) is now an explicit, separate
         // step so the model can spawn several children without each one
         // suspending it — see `register_parent_wait_for_child` /
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
-        self.scheduler
-            .enqueue_announced(
-                SpawnJob {
-                    parent_session_id: parent.id.clone(),
-                    child_session_id: child.id.clone(),
-                    model,
-                    disabled_tools,
-                },
+        let child = self.ensure_child_launch_intent(child).await?;
+        let admission = self
+            .scheduler
+            .enqueue_announced_for_generation(
+                Self::child_spawn_job(parent, &child)?,
                 Some(child.title.clone()),
+                None,
+                Some(child.child_launch_generation()),
             )
             .await
             .map_err(ChildSessionError::Execution)?;
+        match admission {
+            bamboo_domain::AdmissionCommit::Cancelled => Err(ChildSessionError::Execution(
+                "child launch generation was cancelled before activation".into(),
+            )),
+            bamboo_domain::AdmissionCommit::Committed(())
+            | bamboo_domain::AdmissionCommit::AlreadyCommitted => Ok(()),
+        }
+    }
 
-        Ok(())
+    async fn admit_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        let child = self.ensure_child_launch_intent(child).await?;
+        self.scheduler
+            .enqueue_announced_for_generation(
+                Self::child_spawn_job(parent, &child)?,
+                Some(child.title.clone()),
+                gate,
+                Some(child.child_launch_generation()),
+            )
+            .await
+            .map_err(ChildSessionError::Execution)
     }
 
     async fn cancel_child_run_and_wait(
         &self,
         child_session_id: &str,
     ) -> Result<(), ChildSessionError> {
-        let cancelled = {
-            let mut runners = self.agent_runners.write().await;
-            if let Some(runner) = runners.get_mut(child_session_id) {
-                if matches!(runner.status, AgentStatus::Running) {
-                    runner.cancel_token.cancel();
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        let launch_guard = self.scheduler.lock_child_launch(child_session_id).await;
+        let running_token = {
+            let runners = self.agent_runners.read().await;
+            runners
+                .get(child_session_id)
+                .filter(|runner| matches!(runner.status, AgentStatus::Running))
+                .map(|runner| runner.cancel_token.clone())
         };
+        let mut already_terminal = false;
+        let mut queued_parent = None;
+        let saved = self
+            .persistence
+            .update_runtime_config_and_publish(
+                child_session_id,
+                |child| {
+                    if child
+                        .last_run_status()
+                        .as_deref()
+                        .is_some_and(is_terminal_child_status)
+                    {
+                        already_terminal = true;
+                        return;
+                    }
+                    child.cancel_child_launch_generation();
+                    if running_token.is_none() {
+                        child.set_last_run_status("cancelled");
+                        child.set_last_run_error("Cancelled by parent before activation");
+                        queued_parent = child.parent_session_id.clone();
+                    }
+                },
+                |child| {
+                    self.sessions_cache.insert(
+                        child.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if saved.is_none() {
+            return Err(ChildSessionError::Execution(
+                "child session disappeared during cancellation".into(),
+            ));
+        }
+        if already_terminal {
+            return Ok(());
+        }
+        if let Some(token) = running_token.as_ref() {
+            token.cancel();
+        }
+        drop(launch_guard);
+        if let Some(parent_id) = queued_parent {
+            self.scheduler
+                .publish_queued_child_cancellation(&parent_id, child_session_id)
+                .await;
+            return Ok(());
+        }
 
-        if !cancelled {
+        if running_token.is_none() {
             return Ok(());
         }
 

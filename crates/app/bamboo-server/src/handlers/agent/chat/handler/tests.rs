@@ -478,7 +478,7 @@ mod optional_model_e2e {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::sync::Semaphore;
 
@@ -491,6 +491,676 @@ mod optional_model_e2e {
         let temp_dir = tempdir().expect("tempdir").keep();
         bamboo_config::paths::init_bamboo_dir(temp_dir.clone());
         web::Data::new(AppState::new(temp_dir).await.expect("app state"))
+    }
+
+    #[actix_web::test]
+    async fn ultra_first_chat_is_independent_and_cannot_change_existing_or_child_authority() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for (id, selector, expected) in [
+            (
+                "ultra-first",
+                serde_json::json!({"thinking_mode": "ultra"}),
+                "ultra",
+            ),
+            (
+                "standard-first",
+                serde_json::json!({"thinking_mode": "standard"}),
+                "standard",
+            ),
+            ("ordinary-first", serde_json::json!({}), "standard"),
+            (
+                "legacy-ultra-first",
+                serde_json::json!({"root_orchestration_only": true}),
+                "ultra",
+            ),
+        ] {
+            let mut body = selector;
+            body["session_id"] = id.into();
+            body["message"] = "Preserve required constraints while coordinating".into();
+            body["model"] = "test-model".into();
+            body["reasoning_effort"] = "max".into();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED, "{id}");
+            let detail: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(detail["session"]["thinking_mode"], expected);
+            assert_eq!(detail["session"]["reasoning_effort"], "max");
+        }
+        let root_before = state
+            .storage
+            .load_session("ultra-first")
+            .await
+            .unwrap()
+            .unwrap();
+        for mode in ["standard", "ultra"] {
+            let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").set_json(serde_json::json!({"session_id":"ultra-first", "message":"must not admit", "model":"test-model", "thinking_mode":mode})).to_request()).await;
+            assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "root_mode_operation_required");
+        }
+        let root_after = state
+            .storage
+            .load_session("ultra-first")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_after.messages.len(), root_before.messages.len());
+        assert_eq!(
+            root_after.root_tool_authority_revision,
+            root_before.root_tool_authority_revision
+        );
+        for extra in [
+            serde_json::json!({"thinking_mode":"ultra", "root_orchestration_only":false}),
+            serde_json::json!({"thinking_mode":"max"}),
+            serde_json::json!({"reasoning_effort":"ultra"}),
+            serde_json::json!({"thinking_mode":null}),
+        ] {
+            let mut body = extra;
+            body["session_id"] = "invalid-ultra-first".into();
+            body["message"] = "must not create".into();
+            body["model"] = "test-model".into();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(&body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(state
+                .storage
+                .load_session("invalid-ultra-first")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut child =
+            Session::new_child_of("ultra-first-child", &root_after, "test-model", "child");
+        state.save_and_cache_session(&mut child).await;
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").set_json(serde_json::json!({"session_id":child.id, "message":"must not enable", "model":"test-model", "thinking_mode":"ultra"})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "root_orchestration_requires_root");
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{}", child.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["thinking_mode"], "standard");
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_chat_create_resume_conflict_disable_and_detail_are_durable() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = "root-tool-chat-selection";
+        let create = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "coordinate the task",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let list: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert!(list["sessions"][0].get("root_orchestration_only").is_none());
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["root_orchestration_only"], true);
+
+        let resume = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "check progress",
+                    "model": "test-model",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resume.status(), StatusCode::CREATED);
+        let before_conflict = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before_conflict.root_orchestration_only_enabled());
+
+        // Existing-Root inline mode changes are rejected before attachment
+        // processing or message persistence.
+        let failed_disable = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "attachment is invalid",
+                    "model": "test-model",
+                    "root_orchestration_only": false,
+                    "images": [{"base64": "not-valid-base64%%%", "type": "image/png"}],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed_disable.status(), StatusCode::PRECONDITION_REQUIRED);
+        let after_failed_disable = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(after_failed_disable.root_orchestration_only_enabled());
+        assert_eq!(
+            after_failed_disable.root_tool_authority_revision,
+            before_conflict.root_tool_authority_revision
+        );
+        assert_eq!(
+            after_failed_disable.messages.len(),
+            before_conflict.messages.len()
+        );
+
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let workflow_selection = serde_json::json!({
+            "id": review.id,
+            "source": review.source,
+            "revision": review.revision,
+            "args": {},
+        });
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after_conflict = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after_conflict.messages.len(),
+            before_conflict.messages.len()
+        );
+        assert_eq!(
+            after_conflict.root_tool_authority_revision,
+            before_conflict.root_tool_authority_revision
+        );
+
+        let unfenced_switch = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "review the task",
+                    "model": "test-model",
+                    "root_orchestration_only": false,
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unfenced_switch.status(), StatusCode::PRECONDITION_REQUIRED);
+        let before_switch = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before_switch.root_orchestration_only_enabled());
+        let operation_id = format!("0:{}", uuid::Uuid::new_v4());
+        let switched_mode = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/sessions/{id}/root-mode-operations/{operation_id}"
+                ))
+                .set_json(serde_json::json!({
+                    "birth_token": before_switch.root_mode_birth_token(),
+                    "expected_epoch": 0,
+                    "enabled": false,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched_mode.status(), StatusCode::OK);
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "review the task",
+                    "model": "test-model",
+                    "workflow_selection": workflow_selection,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::CREATED);
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["root_orchestration_only"], false);
+
+        // A combined Workflow clear and inline mode change has no fence and
+        // cannot use the old chat path.
+        let before_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
+        let failed_enable = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "attachment is invalid",
+                    "model": "test-model",
+                    "root_orchestration_only": true,
+                    "selected_skill_ids": [],
+                    "images": [{"base64": "not-valid-base64%%%", "type": "image/png"}],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed_enable.status(), StatusCode::PRECONDITION_REQUIRED);
+        let after_failed_enable = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!after_failed_enable.root_orchestration_only_enabled());
+        assert_eq!(
+            after_failed_enable.root_tool_authority_revision,
+            before_failed_enable.root_tool_authority_revision
+        );
+        assert_eq!(
+            workflow_runtime_metadata(&after_failed_enable),
+            workflow_runtime_metadata(&before_failed_enable)
+        );
+        assert_eq!(
+            after_failed_enable.messages.len(),
+            before_failed_enable.messages.len()
+        );
+    }
+
+    struct RootSwitchProvider {
+        system_prompts: Mutex<Vec<String>>,
+        started: Semaphore,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RootSwitchProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let system_prompt = messages
+                .iter()
+                .filter(|message| message.role == bamboo_agent_core::Role::System)
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.system_prompts.lock().unwrap().push(system_prompt);
+            self.started.add_permits(1);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token("done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn assert_workflow_to_root_switch_retires_pin_before_next_execute(
+        id: &str,
+        selected_skill_ids: Value,
+    ) {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("test-model".into()),
+            ..Default::default()
+        });
+        let provider = Arc::new(RootSwitchProvider {
+            system_prompts: Mutex::new(Vec::new()),
+            started: Semaphore::new(0),
+        });
+        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
+        let mut app_state = AppState::new_with_provider(data_dir, config, provider_trait)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert("openai".into(), provider.clone() as Arc<dyn LLMProvider>);
+        app_state.provider_registry = Arc::new(ProviderRegistry::new(providers, "openai".into()));
+        app_state.provider_router = Arc::new(ProviderModelRouter::new(
+            app_state.provider_registry.clone(),
+        ));
+        let state = web::Data::new(app_state);
+        seed_active_instruction_workflow(&state, id, "review").await;
+        let mut seeded = state.storage.load_session(id).await.unwrap().unwrap();
+        seeded.title_generated = true;
+        seeded.metadata.insert(
+            "skill.context".into(),
+            "STALE_WORKFLOW_INSTRUCTION_DO_NOT_RENDER".into(),
+        );
+        state.save_and_cache_session(&mut seeded).await;
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(id, None)
+            .await
+            .unwrap()
+            .is_some());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        // Existing Roots change mode through a recoverable operation. First
+        // retire the Workflow in chat, while its user turn is committed.
+        let cleared = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "delegate bounded work",
+                    "model": "test-model",
+                    "selected_skill_ids": selected_skill_ids,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::CREATED);
+        let cleared = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!cleared.root_orchestration_only_enabled());
+        assert!(cleared.selected_skill_ids().is_none());
+        let epoch = cleared.root_mode_transition_epoch;
+        let operation_id = format!("{epoch}:{}", uuid::Uuid::new_v4());
+        let switched = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!(
+                    "/api/v1/sessions/{id}/root-mode-operations/{operation_id}"
+                ))
+                .set_json(serde_json::json!({
+                    "birth_token": cleared.root_mode_birth_token(),
+                    "expected_epoch": epoch,
+                    "enabled": true,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(switched.status(), StatusCode::OK);
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(saved.root_orchestration_only_enabled());
+        assert!(saved.selected_skill_ids().is_none());
+        for key in [
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+            "skill.context",
+        ] {
+            assert!(!saved.metadata.contains_key(key), "stale {key}");
+        }
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(id, None)
+            .await
+            .unwrap()
+            .is_none());
+
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.started.acquire(),
+        )
+        .await
+        .expect("next execute reached provider")
+        .expect("provider semaphore open")
+        .forget();
+        let prompts = provider.system_prompts.lock().unwrap().join("\n");
+        assert!(!prompts.contains("STALE_WORKFLOW_INSTRUCTION_DO_NOT_RENDER"));
+        assert!(!prompts.contains("Required Explicit Workflow Activation"));
+        assert!(!prompts.contains("Explicit Workflow Already Activated"));
+    }
+
+    #[actix_web::test]
+    async fn successful_workflow_to_root_switch_retires_pin_before_next_execute() {
+        assert_workflow_to_root_switch_retires_pin_before_next_execute(
+            "root-workflow-retire-empty",
+            serde_json::json!([]),
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn whitespace_only_workflow_to_root_switch_retires_pin_before_next_execute() {
+        assert_workflow_to_root_switch_retires_pin_before_next_execute(
+            "root-workflow-retire-blank",
+            serde_json::json!([" "]),
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_child_cannot_select_or_clear_it() {
+        let state = new_state().await;
+        let mut root = Session::new("root-tool-parent", "test-model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.save_and_cache_session(&mut root).await;
+        let mut child = Session::new_child_of("root-tool-child", &root, "test-model", "child");
+        state.save_and_cache_session(&mut child).await;
+        let child_before = state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        for enabled in [false, true] {
+            let rejected = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(serde_json::json!({
+                        "session_id": child.id,
+                        "message": "cannot select Root mode",
+                        "model": "test-model",
+                        "root_orchestration_only": enabled,
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            let rejected: Value = test::read_body_json(rejected).await;
+            assert_eq!(
+                rejected["error"]["code"],
+                "root_orchestration_requires_root"
+            );
+        }
+        let child_after = state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_after.messages.len(), child_before.messages.len());
+        assert_eq!(
+            child_after.root_tool_authority_revision,
+            child_before.root_tool_authority_revision
+        );
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_records_legacy_plan_rejection_without_changing_authority() {
+        let state = new_state().await;
+        let id = "root-tool-plan-conflict";
+        let mut root = Session::new(id, "test-model");
+        root.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState {
+            plan_mode: Some(bamboo_domain::PlanModeState {
+                entered_at: chrono::Utc::now(),
+                pre_permission_mode: "default".into(),
+                plan_file_path: None,
+                status: bamboo_domain::PlanModeStatus::Exploring,
+            }),
+            ..bamboo_domain::AgentRuntimeState::default()
+        });
+        state.save_and_cache_session(&mut root).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let operation_id = format!("0:{}", uuid::Uuid::new_v4());
+        let path = format!("/api/v1/sessions/{id}/root-mode-operations/{operation_id}");
+        let body = serde_json::json!({
+            "birth_token": root.root_mode_birth_token(),
+            "expected_epoch": 0,
+            "enabled": true,
+        });
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&path)
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(!after.root_orchestration_only_enabled());
+        assert_eq!(after.root_tool_authority_revision, 0);
+        assert_eq!(after.root_mode_transition_epoch, 1);
+        assert!(after.messages.is_empty());
+        assert!(after
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|runtime| runtime.plan_mode.is_some()));
+        let recovered = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("{path}/recover"))
+                .set_json(&body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let recovered: Value = test::read_body_json(recovered).await;
+        assert_eq!(recovered["status"], "rejected_incompatible");
+        assert_eq!(recovered["resulting_epoch"], 1);
+    }
+
+    #[actix_web::test]
+    async fn root_tool_mode_rejects_selected_skill_before_persistence() {
+        let state = new_state().await;
+        let id = "root-tool-skill-conflict";
+        let mut root = Session::new(id, "test-model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.save_and_cache_session(&mut root).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "selected_skill_ids": ["review"],
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = test::read_body_json(rejected).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            "root_orchestration_incompatible_mode"
+        );
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(after.root_orchestration_only_enabled());
+        assert_eq!(after.root_tool_authority_revision, 1);
+        assert!(after.messages.is_empty());
+        assert!(after.selected_skill_ids().is_none());
     }
 
     async fn seed_active_instruction_workflow(

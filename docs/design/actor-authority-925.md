@@ -71,6 +71,32 @@ An expired owner is replaced by a higher attempt and lease epoch; stale start,
 checkpoint, finish, and fence checks fail closed. Retirement fences a live
 owner and preserves the Session and its history.
 
+## Filesystem job lifetime (#1349)
+
+The lifecycle shared, Task shared, and exact Session writer guards are owned by
+one Arc holder. Every authority or initialization-marker replacement clones
+that holder into a single `spawn_blocking` job. That job uses synchronous
+filesystem operations for temp creation, write, file sync, replace, directory
+sync and error cleanup. A started job retains all physical locks until it
+terminates, even if its async caller is aborted or its Tokio runtime stops
+waiting during shutdown. Windows preserves replace-existing/write-through
+semantics; the native barrier evidence is for the platform running the tests.
+
+This protects each started filesystem job, not the whole async actor operation.
+Cancellation can occur after a Cold entry commits but before its separate
+marker job starts, or after observation refresh but before activation CAS.
+Existing repair accepts only an inert Cold entry without a marker. A queued
+blocking job that never starts may be cancelled. A replace can commit before a
+directory-sync error or before the caller receives confirmation; an error or
+cancelled caller therefore does not prove rollback. Independent Stores reopen
+actual state under the same physical locks before repair or successor CAS.
+
+Native tests pause inside the replacement job, probe all three physical locks,
+abort callers and shut down runtimes, then release the job and reopen actual
+files. They cover separate Cold and marker jobs, missing-marker repair,
+observation refresh, successor attempt/epoch/revision, and failures before and
+after replacement. This adds no journal, mandatory executor or runtime caller.
+
 The domain `ActorDirectoryPort` is the narrow runtime/storage seam. It exposes
 ensure/inspect, claim/start/renew/checkpoint/finish/retire, and exact fence
 validation. The supplied clock values must come from the trusted host runtime,

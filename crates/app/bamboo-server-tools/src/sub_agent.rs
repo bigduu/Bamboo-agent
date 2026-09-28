@@ -2,46 +2,21 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use uuid::Uuid;
 
 type SynchronousLaunchLocks = Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>;
 
-const LAUNCH_PENDING: u8 = 0;
-const LAUNCH_COMMITTING: u8 = 1;
-const LAUNCH_CANCELLED: u8 = 2;
-
 #[derive(Default)]
-struct LaunchGate(AtomicU8);
+struct LaunchGate(bamboo_domain::AdmissionGate);
 
 impl LaunchGate {
     fn cancel_if_pending(&self) {
-        let _ = self.0.compare_exchange(
-            LAUNCH_PENDING,
-            LAUNCH_CANCELLED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        self.0.cancel_if_pending();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == LAUNCH_CANCELLED
-    }
-
-    fn begin_commit(&self) -> bool {
-        match self.0.compare_exchange(
-            LAUNCH_PENDING,
-            LAUNCH_COMMITTING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) | Err(LAUNCH_COMMITTING) => true,
-            Err(LAUNCH_CANCELLED) => false,
-            Err(_) => unreachable!("launch gate has an unknown state"),
-        }
+        self.0.is_cancelled()
     }
 }
 
@@ -81,6 +56,7 @@ impl Drop for SynchronousLaunchGuard {
     }
 }
 
+use crate::sub_agent_facade::{self as facade, Projection};
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::ReasoningEffort;
@@ -104,9 +80,8 @@ enum SubAgentArgs {
         #[serde(default)]
         responsibility: Option<String>,
         prompt: String,
-        /// Optional free-text label for this child (cosmetic only — used for
-        /// display and as the warm-worker reuse key). It has NO effect on the
-        /// child's runtime-exposed tools, permissions, or system prompt.
+        /// Exact validated named profile on a supported fresh local route;
+        /// a genuinely unknown name retains the legacy routing/display label.
         #[serde(default)]
         subagent_type: Option<String>,
         /// Working directory for the child. Optional: defaults to the parent
@@ -162,6 +137,9 @@ enum SubAgentArgs {
         /// default) gives the child a clean, freshly-seeded context.
         #[serde(default)]
         fork_last_messages: Option<usize>,
+        /// Opt-in complete instructions for a fresh built-in local worker.
+        #[serde(default)]
+        context_packet: Option<Box<bamboo_domain::ChildContextPacket>>,
     },
     /// Suspend the parent run until its background child sessions finish.
     ///
@@ -193,6 +171,10 @@ enum SubAgentArgs {
         limit: Option<usize>,
         #[serde(default)]
         max_bytes: Option<usize>,
+        #[serde(default)]
+        expected_child_created_at: Option<String>,
+        #[serde(default)]
+        expected_assignment_sha256: Option<String>,
     },
     Update {
         child_session_id: String,
@@ -290,6 +272,20 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
     })
 }
 
+fn bounded_child_result(view: &str, value: serde_json::Value) -> Result<ToolResult, ToolError> {
+    let result = tool_result(value)?;
+    if result.result.len() <= child_session::MAX_CHILD_RESULT_BYTES
+        && serde_json::to_vec(&result)
+            .is_ok_and(|bytes| bytes.len() <= child_session::MAX_CHILD_RESULT_BYTES)
+    {
+        return Ok(result);
+    }
+    tool_result(child_session::unavailable_child_result(
+        view,
+        "result_budget_exceeded",
+    ))
+}
+
 /// The child must not become runnable until its synchronous parent's wait is
 /// durable. This is shared by create, update, and run; background fan-out keeps
 /// its existing enqueue-only path.
@@ -338,43 +334,83 @@ async fn enqueue_waiting_child(
             .await,
         ));
     }
-    if launch_gate.is_some_and(|gate| !gate.begin_commit()) {
-        let error = cancelled_launch_error();
-        if had_wait {
-            return Err(tool_error_from_child_session(error));
+    let admit = sessions.admit_child_run(parent, &child, launch_gate.map(|gate| &gate.0));
+    let admission = match launch_gate {
+        Some(gate) => tokio::select! {
+            biased;
+            _ = gate.0.cancelled() => Ok(bamboo_domain::AdmissionCommit::Cancelled),
+            result = admit => result,
+        },
+        None => admit.await,
+    };
+    let error = match admission {
+        Ok(bamboo_domain::AdmissionCommit::Committed(()))
+        | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => return Ok(()),
+        Ok(bamboo_domain::AdmissionCommit::Cancelled) => cancelled_launch_error(),
+        Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
+            tracing::warn!(child_session_id, %error, "child job was admitted despite a later port error");
+            return Ok(());
         }
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
-        return Err(tool_error_from_child_session(
-            child_session::rollback_failed_wait_launch(
-                sessions,
-                &parent.id,
-                child_session_id,
-                error,
-            )
-            .await,
-        ));
+        Err(error) => error,
+    };
+    // A confirmed scheduler rejection leaves the prepared child pending.
+    // The end-of-turn safety net treats pending as active and would arm a new
+    // orphan wait. Mark this run as retryable terminal failure first. Preserve
+    // any wait that a different operation already owned.
+    if had_wait {
+        return Err(tool_error_from_child_session(error));
     }
-    if let Err(error) = sessions.enqueue_child_run(parent, &child).await {
-        // A confirmed scheduler rejection leaves the prepared child pending.
-        // The end-of-turn safety net treats pending as active and would arm a
-        // new orphan wait. Mark this run as a retryable terminal failure first.
-        // If another operation already owned this child's wait, preserve its
-        // state: this failed enqueue did not acquire that wait entry.
-        if had_wait {
-            return Err(tool_error_from_child_session(error));
+    let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+    Err(tool_error_from_child_session(
+        child_session::rollback_failed_wait_launch(sessions, &parent.id, child_session_id, error)
+            .await,
+    ))
+}
+
+/// Background launches have no explicit parent wait to compensate, but a
+/// prepared Child must become terminal when its queue admission is cancelled
+/// or rejected so the parent's end-of-turn orphan scan cannot arm one later.
+async fn enqueue_background_child(
+    sessions: &dyn ChildSessionPort,
+    parent: &bamboo_agent_core::Session,
+    child_session_id: &str,
+    launch_gate: Option<&LaunchGate>,
+) -> Result<(), ToolError> {
+    let child = sessions
+        .load_child_for_parent(&parent.id, child_session_id)
+        .await
+        .map_err(tool_error_from_child_session)?;
+    let admit = sessions.admit_child_run(parent, &child, launch_gate.map(|gate| &gate.0));
+    let admission = match launch_gate {
+        Some(gate) => tokio::select! {
+            biased;
+            _ = gate.0.cancelled() => Ok(bamboo_domain::AdmissionCommit::Cancelled),
+            result = admit => result,
+        },
+        None => admit.await,
+    };
+    match admission {
+        Ok(bamboo_domain::AdmissionCommit::Committed(()))
+        | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => Ok(()),
+        Ok(bamboo_domain::AdmissionCommit::Cancelled) => {
+            let error = mark_failed_child_enqueue(
+                sessions,
+                parent,
+                child_session_id,
+                cancelled_launch_error(),
+            )
+            .await;
+            Err(tool_error_from_child_session(error))
         }
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
-        return Err(tool_error_from_child_session(
-            child_session::rollback_failed_wait_launch(
-                sessions,
-                &parent.id,
-                child_session_id,
-                error,
-            )
-            .await,
-        ));
+        Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
+            tracing::warn!(child_session_id, %error, "background child job was admitted despite a later port error");
+            Ok(())
+        }
+        Err(error) => {
+            let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+            Err(tool_error_from_child_session(error))
+        }
     }
-    Ok(())
 }
 
 async fn mark_failed_child_enqueue(
@@ -387,6 +423,11 @@ async fn mark_failed_child_enqueue(
         let mut child = sessions
             .load_child_for_parent(&parent.id, child_session_id)
             .await?;
+        if child.last_run_status().as_deref().is_some_and(|status| {
+            matches!(status, "completed" | "cancelled" | "timeout" | "skipped")
+        }) {
+            return Ok(());
+        }
         child.set_last_run_status("error");
         child.set_last_run_error(format!("Child launch failed: {error}"));
         child.updated_at = chrono::Utc::now();
@@ -605,9 +646,7 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
 pub fn subagent_tool_description() -> &'static str {
-    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context and only the tools and permissions exposed to it by the runtime, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
-PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
-Use list/get to inspect existing children; plain get returns metadata, get with view=messages returns bounded transcript pages, view=result returns UTF-8 slices of the child's last assistant answer, and view=error reads the last run error. Follow next_cursor for more; view=message with message_id reads a selected message in slices. Use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
+    facade::description()
 }
 
 /// The `SubAgent` parameters schema. Exposed standalone (mirroring
@@ -615,134 +654,7 @@ Use list/get to inspect existing children; plain get returns metadata, get with 
 /// the IDENTICAL schema to its own LLM — no drift between the real tool and the
 /// proxy.
 pub fn subagent_parameters_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["create", "wait", "list", "get", "update", "run", "send_message", "cancel", "delete", "list_models"],
-                "description": "Sub-agent lifecycle operation. To run work in parallel: call create once per child (this no longer suspends the parent — children run in the background), then call wait ONCE to suspend until they all finish. Use list/get to inspect; update/run/send_message/cancel/delete to manage existing children; list_models to enumerate the models you can pin a child to via create.model. \
-        A create call requires: title, responsibility, and prompt (workspace is optional and defaults to the parent's workspace). EXAMPLE create: {\"action\":\"create\",\"title\":\"Analyze auth module\",\"responsibility\":\"Map the auth flow and list its public API\",\"prompt\":\"Read crates/auth/src/lib.rs, summarize the login flow, and list every pub fn.\",\"workspace\":\"/abs/path/to/repo\"}. Then EXAMPLE wait: {\"action\":\"wait\"}."
-            },
-            "child_session_id": {
-                "type": "string",
-                "description": "Existing child session id. Required for get/update/run/send_message/cancel/delete."
-            },
-            "view": {
-                "type": "string",
-                "enum": ["overview", "messages", "message", "result", "error"],
-                "description": "For get: overview (default) is metadata only; messages returns bounded transcript previews; message reads one selected message; result reads the child's latest assistant answer; error reads the last run error. Content views return UTF-8 slices with next_cursor."
-            },
-            "cursor": {
-                "type": "string",
-                "description": "For get: opaque next_cursor from the prior page or content slice. A reset or rewrite of the selected transcript invalidates it."
-            },
-            "message_id": {
-                "type": "string",
-                "description": "For get with view=message: message_id from a messages page."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 16,
-                "description": "For get with view=messages: previews per page, default 8, capped at 16."
-            },
-            "max_bytes": {
-                "type": "integer",
-                "minimum": 4,
-                "maximum": 8192,
-                "description": "For get with view=message, result, or error: maximum UTF-8 content bytes per slice, default 4096, capped at 8192."
-            },
-            "child_session_ids": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "For wait: optional explicit subset of child sessions to wait on. Omit to wait on every currently-active child."
-            },
-            "wait_for": {
-                "type": "string",
-                "enum": ["all", "any", "first_error"],
-                "description": "For wait: resume policy. all (default) resumes when every tracked child is done; any resumes on the first; first_error resumes early on any error/timeout/cancel."
-            },
-            "wait": {
-                "type": "boolean",
-                "description": "For create: if true, suspend immediately and wait for just THIS child (legacy one-shot behavior). Defaults to false — create returns immediately and the child runs in the background; suspend later with action=wait."
-            },
-            "title": {
-                "type": "string",
-                "description": "Short title for a new or updated child session. Required for create. Displayed in the Sub-agents panel."
-            },
-            "description": {
-                "type": "string",
-                "description": "Legacy alias of title; prefer title."
-            },
-            "responsibility": {
-                "type": "string",
-                "description": "Single explicit responsibility for the child session. Required for create. Keep this narrow and non-overlapping with other child sessions."
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Detailed task instructions, context, constraints, and expected output for the child session. Required for create; optional for update."
-            },
-            "subagent_type": {
-                "type": "string",
-                "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the tools, permissions, or system prompt the runtime exposes to the child. Optional; omit it if you have no useful label."
-            },
-            "workspace": {
-                "type": "string",
-                "description": "For create: absolute path to the child session's working directory for file operations. Optional — defaults to the parent session's workspace when omitted."
-            },
-            "auto_run": {
-                "type": "boolean",
-                "description": "For create/send_message/update: whether to enqueue the child session immediately. Defaults to true for create/send_message and false for update."
-            },
-            "fork_last_messages": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "For create: model-controllable context fork. When > 0, the last N messages of YOUR (the parent's) conversation are carried into the child's task brief as a 'Forked context from parent' block, so the child starts with the recent context it needs. Omit/0 (default) gives the child a clean, freshly-seeded context. Use a small N (e.g. 2-6) to share just the immediately relevant turns; omit it when the task brief is already self-contained."
-            },
-            "reset_after_update": {
-                "type": "boolean",
-                "description": "For update: whether to truncate messages after refreshed assignment. Defaults to true."
-            },
-            "reset_to_last_user": {
-                "type": "boolean",
-                "description": "For run: whether to truncate messages after the last user message before rerun. Defaults to true."
-            },
-            "message": {
-                "type": "string",
-                "description": "Follow-up instruction to append as a new user message for send_message. Required for send_message."
-            },
-            "interrupt_running": {
-                "type": "boolean",
-                "description": "For send_message/cancel: if true, cancel a currently running child session before appending or returning. Defaults to false for send_message. When false on a running child, the message is queued and will be picked up at the next turn boundary without canceling progress."
-            },
-            "reasoning_effort": {
-                "type": "string",
-                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
-                "description": "For create/update: reasoning effort level applied to the child session's own LLM calls. Use \"none\" to explicitly disable reasoning on models that support it, \"low\" for trivial fan-outs (e.g. simple lookups), \"medium\"/\"high\" for normal coding/analysis, and \"xhigh\"/\"max\" for deep reasoning tasks. Omit to use the selected sub-agent model preference, then the provider default; the child does NOT inherit the parent's reasoning_effort."
-            },
-            "model": {
-                "type": "string",
-                "description": "For create/update: explicit model for the child as 'provider:model' (e.g. 'anthropic:claude-sonnet-4-6'), or a bare model id to use the parent's provider. On create it takes precedence over per-subagent_type model routing; on update it changes that existing child session in place. Pick a cheaper/faster model for simple fan-outs and a stronger model for hard reasoning. Call list_models first to see what is available."
-            },
-            "lifecycle": {
-                "type": "string",
-                "enum": ["oneshot", "resident"],
-                "description": "For create: 'oneshot' (default) spins up a fresh throwaway child for this task. 'resident' reuses ONE long-lived agent (identified by 'name', scoped to this conversation) across many tasks — the first resident create spins it up, later creates with the same name route the new task to that same agent instead of spawning another. Use resident for recurring task types (e.g. an 'essayist' that writes many essays — one agent, one panel entry, not N); use oneshot for independent throwaway work."
-            },
-            "name": {
-                "type": "string",
-                "description": "For create with lifecycle=resident: the resident agent's stable reuse key, e.g. 'essayist'. Required to reuse a resident; defaults to subagent_type when omitted. Reusing the same name routes the new task to the existing resident agent."
-            },
-            "context": {
-                "type": "string",
-                "enum": ["reset", "accumulate"],
-                "description": "For create with lifecycle=resident: how the resident treats prior tasks. 'reset' (default) makes each task independent (clears prior context). 'accumulate' makes the agent remember earlier tasks (useful for a researcher building up knowledge). Set on first create; honored on reuse."
-            }
-        },
-        "required": ["action"],
-        "additionalProperties": false
-    })
+    facade::parameters_schema()
 }
 
 #[async_trait]
@@ -764,21 +676,32 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        let normalized = facade::normalize(args)?;
+        let args = normalized.args;
+        let projection = normalized.projection;
+        if projection == Some(Projection::Tree) {
+            let parent_id = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("SubAgent requires a current session".into())
+            })?;
+            return facade::inspect_tree(self.sessions.as_ref(), parent_id).await;
+        }
+        if projection == Some(Projection::ForcedPermissionAudit) {
+            let caller_id = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("SubAgent requires a current session".into())
+            })?;
+            return facade::inspect_forced_permission_audit(self.sessions.as_ref(), caller_id)
+                .await;
+        }
         // The owner outlives a cancelled caller so an in-flight registration or
         // delivery can be resolved. The gate prevents a new launch when the
         // caller's cancellation wins before entering the scheduler or Inbox
         // port. Their internal durable-admission boundary is tracked by #1313.
         let action = args.get("action").and_then(serde_json::Value::as_str);
         let owns_launch = match action.unwrap_or("create") {
-            "create" => {
-                args.get("auto_run")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true)
-                    && args
-                        .get("wait")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-            }
+            "create" => args
+                .get("auto_run")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
             "update" => args
                 .get("auto_run")
                 .and_then(serde_json::Value::as_bool)
@@ -793,44 +716,152 @@ impl Tool for SubAgentTool {
                 gate: gate.clone(),
                 armed: true,
             };
-            let result =
-                tokio::spawn(async move { owner.invoke_inner(args, ctx, Some(gate)).await })
+            let result = tokio::spawn(async move {
+                owner
+                    .invoke_inner(args, ctx, Some(gate), projection.is_some())
                     .await
-                    .map_err(|error| {
-                        ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
-                    })?;
+            })
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
+            })?;
             cancel_on_drop.armed = false;
-            return result;
+            return facade::finish(projection, result);
         }
-        self.invoke_inner(args, ctx, None).await
+        if action == Some("cancel") {
+            let result = self.invoke_cancel(args, ctx).await;
+            return facade::finish(projection, result);
+        }
+        let result = self
+            .invoke_inner(args, ctx, None, projection.is_some())
+            .await;
+        facade::finish(projection, result)
     }
 }
 
+struct ParsedSubAgentInvocation<'a> {
+    parent_session_id: &'a str,
+    parsed: SubAgentArgs,
+    report_args: Option<serde_json::Value>,
+    has_result_selectors: bool,
+}
+
+fn parse_subagent_invocation<'a>(
+    args: serde_json::Value,
+    ctx: &'a ToolCtx,
+) -> Result<ParsedSubAgentInvocation<'a>, ToolError> {
+    let parent_session_id = ctx.session_id().ok_or_else(|| {
+        ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
+    })?;
+
+    // Backward compatibility: legacy SubAgent calls did not include an
+    // "action" field and always meant "create". If action is missing,
+    // default to "create" before deserializing the tagged enum.
+    let mut args = args;
+    if args.get("action").is_none() {
+        args["action"] = json!("create");
+    }
+
+    let has_packet = args.get("context_packet").is_some();
+    if has_packet && !args["context_packet"].is_object() {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+        ));
+    }
+    if has_packet
+        && serde_json::to_vec(&args).map_or(true, |bytes| {
+            bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES
+        })
+    {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Budget.to_string(),
+        ));
+    }
+    let report_args = matches!(
+        args["view"].as_str(),
+        Some("result_binding" | "typed_result")
+    )
+    .then(|| args.clone());
+    let has_result_selectors = args.get("expected_child_created_at").is_some()
+        || args.get("expected_assignment_sha256").is_some();
+    let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
+        ToolError::InvalidArguments(if has_packet {
+            bamboo_domain::ChildContextPacketError::Invalid.to_string()
+        } else {
+            format!("Invalid SubAgent args: {error}")
+        })
+    })?;
+
+    Ok(ParsedSubAgentInvocation {
+        parent_session_id,
+        parsed,
+        report_args,
+        has_result_selectors,
+    })
+}
+
 impl SubAgentTool {
-    async fn invoke_inner(
+    fn invoke_inner<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+        launch_gate: Option<Arc<LaunchGate>>,
+        compact: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolOutcome, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(self.invoke_inner_async(args, ctx, launch_gate, compact))
+    }
+
+    fn invoke_cancel<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolOutcome, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let ParsedSubAgentInvocation {
+                parent_session_id,
+                parsed,
+                ..
+            } = parse_subagent_invocation(args, &ctx)?;
+            let SubAgentArgs::Cancel { child_session_id } = parsed else {
+                unreachable!("cancel route is selected only for normalized cancel args");
+            };
+            let parent = self
+                .sessions
+                .as_ref()
+                .load_root_session(parent_session_id)
+                .await
+                .map_err(tool_error_from_child_session)?;
+            let result = child_session::cancel_child_action(
+                self.sessions.as_ref(),
+                &parent.id,
+                child_session_id,
+            )
+            .await
+            .map_err(tool_error_from_child_session)?;
+            tool_result(result).map(ToolOutcome::Completed)
+        })
+    }
+
+    async fn invoke_inner_async(
         &self,
         args: serde_json::Value,
         ctx: ToolCtx,
         launch_gate: Option<Arc<LaunchGate>>,
+        compact: bool,
     ) -> Result<ToolOutcome, ToolError> {
         if launch_gate.as_ref().is_some_and(|gate| gate.is_cancelled()) {
             return Err(tool_error_from_child_session(cancelled_launch_error()));
         }
-        let parent_session_id = ctx.session_id().ok_or_else(|| {
-            ToolError::Execution("SubAgent requires a session_id in tool context".to_string())
-        })?;
-
-        // Backward compatibility: legacy SubAgent calls did not include an
-        // "action" field and always meant "create". If action is missing,
-        // default to "create" before deserializing the tagged enum.
-        let mut args = args;
-        if args.get("action").is_none() {
-            args["action"] = json!("create");
-        }
-
-        let parsed: SubAgentArgs = serde_json::from_value(args).map_err(|error| {
-            ToolError::InvalidArguments(format!("Invalid SubAgent args: {error}"))
-        })?;
+        let ParsedSubAgentInvocation {
+            parent_session_id,
+            parsed,
+            report_args,
+            has_result_selectors,
+        } = parse_subagent_invocation(args, &ctx)?;
 
         // `list_models` is read-only and session-independent.
         if let SubAgentArgs::ListModels = parsed {
@@ -858,8 +889,31 @@ impl SubAgentTool {
             message_id,
             limit,
             max_bytes,
+            expected_child_created_at,
+            expected_assignment_sha256,
         } = &parsed
         {
+            if let Some(arguments) = report_args.as_ref() {
+                let view = view.as_deref().expect("report view");
+                let value = child_session::inspect_child_report_action(
+                    self.sessions.as_ref(),
+                    parent_session_id,
+                    child_session_id,
+                    view,
+                    arguments,
+                )
+                .await
+                .map_err(tool_error_from_child_session)?;
+                return bounded_child_result(view, value).map(ToolOutcome::Completed);
+            }
+            if has_result_selectors
+                || expected_child_created_at.is_some()
+                || expected_assignment_sha256.is_some()
+            {
+                return Err(ToolError::InvalidArguments(
+                    "result selectors require view=typed_result".into(),
+                ));
+            }
             let result = match view.as_deref().unwrap_or("overview") {
                 "overview" => {
                     if cursor.is_some()
@@ -960,7 +1014,16 @@ impl SubAgentTool {
                 name,
                 context,
                 fork_last_messages,
+                context_packet,
             } => {
+                if let Some(packet) = &context_packet {
+                    packet.validate().map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+                    if lifecycle.as_deref().is_some_and(|value| value != "oneshot")
+                        || name.is_some() || context.is_some() || fork_last_messages.unwrap_or_default() > 0 {
+                        return Err(ToolError::InvalidArguments("required_child_context_unsupported: fresh one-shot only".into()));
+                    }
+                }
+                let mut packet_counts = None;
                 // Phase 6: enforce the max nesting-depth cap. `parent` is this
                 // agent's run session; its `spawn_depth` is the current nesting
                 // level (workers stamp it from the actor spec, so it accumulates
@@ -974,33 +1037,26 @@ impl SubAgentTool {
                 }
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
-                let prompt = normalize_required_text(Some(prompt), "prompt")?;
-                // subagent_type is an optional cosmetic label only (display +
-                // warm-worker reuse key); it has no behavioral effect. An
-                // omitted/blank value falls back to the neutral "worker" label.
+                let prompt = if compact {
+                    if prompt.trim().is_empty() {
+                        return Err(ToolError::InvalidArguments("message must be non-empty".into()));
+                    }
+                    prompt
+                } else {
+                    normalize_required_text(Some(prompt), "prompt")?
+                };
+                // Known catalog names are applied by the canonical creator.
+                // Unknown names retain the old routing/display label.
                 let subagent_type = subagent_type
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "worker".to_string());
-                // workspace is optional: default to the parent's workspace.
-                let explicit_workspace = workspace
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                let workspace_was_explicit = explicit_workspace.is_some();
-                let parent_workspace_is_project_default = parent
-                    .metadata
-                    .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
-                    .map(String::as_str)
-                    == Some(
-                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
-                    );
-                let requested_workspace = explicit_workspace
-                    .or_else(|| {
-                        (!parent_workspace_is_project_default)
-                            .then(|| parent.workspace.clone())
-                            .flatten()
-                    })
-                    .unwrap_or_default();
+                if (lifecycle.as_deref() == Some("resident") || name.is_some())
+                    && self.sessions.resolve_named_profile(&parent, &subagent_type)
+                        .await.map_err(tool_error_from_child_session)?.is_some()
+                {
+                    return Err(ToolError::InvalidArguments("named_profile_requires_fresh_local_child".into()));
+                }
                 let parent_project_id =
                     match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
                         bamboo_engine::project_context::SessionProjectIdentity::Assigned(
@@ -1016,36 +1072,66 @@ impl SubAgentTool {
                             )));
                         }
                     };
-                let workspace_source = if workspace_was_explicit {
-                    bamboo_engine::project_context::WorkspaceSource::Explicit
-                } else if parent_workspace_is_project_default
-                    || (requested_workspace.is_empty() && parent_project_id.is_some())
-                {
-                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                let (workspace, workspace_source) = if compact {
+                    // Chat stores its workspace on the typed metadata plane.
+                    // Use the same canonical resolver as Plan before creation.
+                    self.sessions
+                        .resolve_child_workspace(&parent, workspace.as_deref())
+                        .await
+                        .map_err(tool_error_from_child_session)?
                 } else {
-                    match parent
+                    // workspace is optional: default to the parent's workspace.
+                    let explicit_workspace = workspace
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
+                    let workspace_was_explicit = explicit_workspace.is_some();
+                    let parent_workspace_is_project_default = parent
                         .metadata
                         .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
                         .map(String::as_str)
+                        == Some(
+                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
+                        );
+                    let requested_workspace = explicit_workspace
+                        .or_else(|| {
+                            (!parent_workspace_is_project_default)
+                                .then(|| parent.workspace.clone())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    let workspace_source = if workspace_was_explicit {
+                        bamboo_engine::project_context::WorkspaceSource::Explicit
+                    } else if parent_workspace_is_project_default
+                        || (requested_workspace.is_empty() && parent_project_id.is_some())
                     {
-                        Some("project_default") => {
-                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                    } else {
+                        match parent
+                            .metadata
+                            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                            .map(String::as_str)
+                        {
+                            Some("project_default") => {
+                                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                            }
+                            _ => bamboo_engine::project_context::WorkspaceSource::Session,
                         }
-                        _ => bamboo_engine::project_context::WorkspaceSource::Session,
-                    }
+                    };
+                    // This must precede resident lookup/cancellation and every
+                    // child/session mutation. Reused residents bypass
+                    // `create_child_action`, while new children and guardians use
+                    // it as a second fail-closed boundary.
+                    let workspace = self
+                        .sessions
+                        .validate_child_workspace(
+                            parent_project_id.as_ref(),
+                            &requested_workspace,
+                        )
+                        .await
+                        .map_err(tool_error_from_child_session)?;
+
+                    (workspace, workspace_source)
                 };
-                // This must precede resident lookup/cancellation and every
-                // child/session mutation. Reused residents bypass
-                // `create_child_action`, while new children and guardians use
-                // it as a second fail-closed boundary.
-                let workspace = self
-                    .sessions
-                    .validate_child_workspace(
-                        parent_project_id.as_ref(),
-                        &requested_workspace,
-                    )
-                    .await
-                    .map_err(tool_error_from_child_session)?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(
@@ -1099,6 +1185,7 @@ impl SubAgentTool {
                             .await
                             .map_err(tool_error_from_child_session)?;
                         require_resident_project_identity(parent_project_id.as_ref(), &child)?;
+                        let mut resident_delivery_gate = launch_gate.as_deref();
 
                         // A resident processes tasks serially. If it is still running
                         // a previous task, stop it first: otherwise `reset` would
@@ -1108,14 +1195,26 @@ impl SubAgentTool {
                         // before picking it up (the task would never execute). After
                         // cancel the resident is idle, so both paths apply cleanly.
                         if self.sessions.is_child_running(&existing_id).await {
-                            if launch_gate
-                                .as_ref()
-                                .is_some_and(|gate| !gate.begin_commit())
-                            {
-                                return Err(tool_error_from_child_session(
-                                    cancelled_launch_error(),
-                                ));
+                            if let Some(gate) = resident_delivery_gate {
+                                match gate
+                                    .0
+                                    .commit(|| Ok::<(), std::convert::Infallible>(()))
+                                    .unwrap_or_else(|never| match never {})
+                                {
+                                    bamboo_domain::AdmissionCommit::Cancelled => {
+                                        return Err(tool_error_from_child_session(
+                                            cancelled_launch_error(),
+                                        ));
+                                    }
+                                    bamboo_domain::AdmissionCommit::Committed(())
+                                    | bamboo_domain::AdmissionCommit::AlreadyCommitted => {}
+                                }
                             }
+                            // Stopping the old run is the first irreversible
+                            // effect. The detached owner must finish delivery,
+                            // and this spent gate cannot guard another queue
+                            // or Inbox admission.
+                            resident_delivery_gate = None;
                             self.sessions
                                 .cancel_child_run_and_wait(&existing_id)
                                 .await
@@ -1212,11 +1311,6 @@ impl SubAgentTool {
                                 &prompt,
                                 assignment_background.as_deref(),
                             );
-                            let begin_delivery = || {
-                                launch_gate
-                                    .as_ref()
-                                    .is_none_or(|gate| gate.begin_commit())
-                            };
                             let delivery = child_session::send_message_to_child_action_with_gate(
                                 self.sessions.as_ref(),
                                 &parent,
@@ -1226,7 +1320,7 @@ impl SubAgentTool {
                                 Some(false),
                                 Some(ctx.tool_call_id.as_ref()),
                                 requested_wait,
-                                &begin_delivery,
+                                resident_delivery_gate.map(|gate| &gate.0),
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1264,6 +1358,7 @@ impl SubAgentTool {
                                 None,
                                 reasoning_effort,
                                 assignment_background,
+                                should_auto_run,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1274,19 +1369,17 @@ impl SubAgentTool {
                                         &parent,
                                         &existing_id,
                                         ctx.tool_call_id.as_ref(),
-                                        launch_gate.as_deref(),
+                                        resident_delivery_gate,
                                     )
                                     .await?;
                                 } else {
-                                    let child = self
-                                        .sessions
-                                        .load_child_for_parent(&parent.id, &existing_id)
-                                        .await
-                                        .map_err(tool_error_from_child_session)?;
-                                    self.sessions
-                                        .enqueue_child_run(&parent, &child)
-                                        .await
-                                        .map_err(tool_error_from_child_session)?;
+                                    enqueue_background_child(
+                                        self.sessions.as_ref(),
+                                        &parent,
+                                        &existing_id,
+                                        resident_delivery_gate,
+                                    )
+                                    .await?;
                                 }
                             }
                             requested_wait
@@ -1319,9 +1412,16 @@ impl SubAgentTool {
                                 .as_ref()
                                 .and_then(|model_ref| model_ref.reasoning_effort)
                         });
-                        let runtime_metadata =
+                        let mut runtime_metadata =
                             self.resolver.resolve_runtime_metadata(&subagent_type).await;
-                        let result = child_session::create_child_action(
+                        if model.as_deref().is_some_and(|model| !model.trim().is_empty()) {
+                            runtime_metadata.insert(child_session::named_profile::PROFILE_EXPLICIT_MODEL_KEY.into(), "true".into());
+                        }
+                        if let Some(packet) = &context_packet {
+                            runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                                serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
+                        }
+                        let result = Box::pin(child_session::create_child_action(
                             self.sessions.as_ref(),
                             CreateChildInput {
                                 parent_session: parent.clone(),
@@ -1336,7 +1436,9 @@ impl SubAgentTool {
                                 model_ref_override,
                                 runtime_metadata,
                                 read_only: false,
-                                auto_run: should_auto_run && !requested_wait,
+                                // Both synchronous and background launches use
+                                // the same guarded admission after this save.
+                                auto_run: false,
                                 reasoning_effort: effective_reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),
                                 resident_name: resident_name.clone(),
@@ -1348,9 +1450,19 @@ impl SubAgentTool {
                                 // the last N parent messages into the child's brief.
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
                             },
-                        )
+                        ))
                         .await
                         .map_err(tool_error_from_child_session)?;
+                        {
+                            let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
+                                .await.map_err(tool_error_from_child_session)?;
+                            if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(&child)
+                                .map_err(|error| ToolError::Execution(error.to_string()))? {
+                                packet_counts = Some(json!({"background_admitted": binding.payload.background.len(),
+                                "background_omitted": binding.payload.background_omitted,
+                                "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}));
+                            }
+                        }
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.
                         self.sessions.ensure_child_indexed(&result.child_session_id).await;
@@ -1360,6 +1472,14 @@ impl SubAgentTool {
                                 &parent,
                                 &result.child_session_id,
                                 ctx.tool_call_id.as_ref(),
+                                launch_gate.as_deref(),
+                            )
+                            .await?;
+                        } else if should_auto_run {
+                            enqueue_background_child(
+                                self.sessions.as_ref(),
+                                &parent,
+                                &result.child_session_id,
                                 launch_gate.as_deref(),
                             )
                             .await?;
@@ -1416,6 +1536,7 @@ impl SubAgentTool {
                     "lifecycle": resident_name.as_ref().map(|_| "resident"),
                     "resident_name": resident_name.clone(),
                     "reused": reused,
+                    "context_packet": packet_counts,
                     "note": note,
                 });
                 if should_wait {
@@ -1555,6 +1676,7 @@ impl SubAgentTool {
                     reset_after_update,
                     model_ref_override,
                     reasoning_effort,
+                    auto_run.unwrap_or(false),
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
@@ -1632,7 +1754,7 @@ impl SubAgentTool {
                     }
                     if launch_gate
                         .as_ref()
-                        .is_some_and(|gate| !gate.begin_commit())
+                        .is_some_and(|gate| gate.is_cancelled())
                     {
                         if !had_wait {
                             self.sessions
@@ -1692,11 +1814,6 @@ impl SubAgentTool {
                 interrupt_running,
             } => {
                 let should_auto_run = auto_run.unwrap_or(true);
-                let begin_delivery = || {
-                    launch_gate
-                        .as_ref()
-                        .is_none_or(|gate| gate.begin_commit())
-                };
                 let result = child_session::send_message_to_child_action_with_gate(
                     self.sessions.as_ref(),
                     &parent,
@@ -1706,7 +1823,7 @@ impl SubAgentTool {
                     interrupt_running,
                     Some(ctx.tool_call_id.as_ref()),
                     should_auto_run,
-                    &begin_delivery,
+                    launch_gate.as_deref().map(|gate| &gate.0),
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;
@@ -1844,66 +1961,34 @@ mod tests {
     }
 
     #[test]
-    fn subagent_schema_keeps_actions_arguments_and_only_action_required() {
+    fn subagent_schema_advertises_the_actual_compact_logical_caller() {
         let schema = subagent_parameters_schema();
-        assert_eq!(schema["required"], json!(["action"]));
-        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema.get("required").is_none());
+        assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
-            schema["properties"]["action"]["enum"],
-            json!([
-                "create",
-                "wait",
-                "list",
-                "get",
-                "update",
-                "run",
-                "send_message",
-                "cancel",
-                "delete",
-                "list_models"
-            ])
+            schema["properties"]["intent"]["enum"],
+            json!(["chat", "inspect", "control"])
         );
-
-        let actual: std::collections::BTreeSet<&str> = schema["properties"]
+        let actual: std::collections::BTreeSet<_> = schema["properties"]
             .as_object()
-            .expect("properties object")
+            .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        let expected = std::collections::BTreeSet::from([
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from(["intent", "target", "role", "message", "reply_to",])
+        );
+        for physical_or_runtime in [
+            "model",
+            "workspace",
+            "worker_bin",
+            "endpoint",
             "action",
             "auto_run",
-            "child_session_id",
-            "child_session_ids",
-            "context",
-            "cursor",
-            "description",
-            "fork_last_messages",
-            "interrupt_running",
-            "lifecycle",
-            "limit",
-            "max_bytes",
-            "message",
-            "message_id",
-            "model",
-            "name",
-            "prompt",
-            "reasoning_effort",
-            "reset_after_update",
-            "reset_to_last_user",
-            "responsibility",
-            "subagent_type",
-            "title",
-            "view",
-            "wait",
-            "wait_for",
-            "workspace",
-        ]);
-        assert_eq!(actual, expected);
-        assert!(schema["properties"]["model"]["description"]
-            .as_str()
-            .expect("model description")
-            .contains("create/update"));
+        ] {
+            assert!(schema["properties"].get(physical_or_runtime).is_none());
+        }
     }
 
     #[test]
@@ -1931,10 +2016,14 @@ mod tests {
         assert!(!description.contains("full agent"));
 
         let schema = subagent_parameters_schema();
-        let label_description = schema["properties"]["subagent_type"]["description"]
+        let label_description = schema["properties"]["role"]["description"]
             .as_str()
-            .expect("subagent_type description");
+            .expect("role description");
         assert!(label_description.contains("runtime exposes to the child"));
+        for role in ["explorer", "implementer", "reviewer"] {
+            assert!(label_description.contains(role));
+        }
+        assert!(label_description.contains("no builtin role is implicitly selected"));
         assert!(!label_description.contains("full agent"));
     }
 

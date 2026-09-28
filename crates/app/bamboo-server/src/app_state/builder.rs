@@ -463,6 +463,7 @@ impl AppState {
         // session's live channel — see `app_state::tools::build_base_tools`.
         let session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let actor_event_hub = Arc::new(super::actor_events::ActorEventHub::default());
 
         // Shared bundle of always-on notification relay deps (see
         // `session_events::NotificationRelayDeps`). Built once and cloned into
@@ -510,7 +511,7 @@ impl AppState {
             ))
         })?;
 
-        let base_tools = build_base_tools(
+        let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -758,17 +759,24 @@ impl AppState {
             crate::app_state::parent_approval_reviewer::ParentAgentApprovalReviewer::new(
                 session_repo.clone(),
                 provider_router.clone(),
+                session_messenger.clone(),
+                project_store.clone(),
+            )
+            .with_canonical_store(
+                session_store.clone(),
+                permission_checker.permission_config(),
             ),
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
-            bamboo_engine::external_agents::runtime::build_external_child_runner_with_live_config_and_codex_tokens(
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_native_tool_ceiling(
                 &config_snapshot,
                 config.clone(),
                 Some(approval_registry.clone()),
                 Some(parent_approval_reviewer),
                 permission_checker.permission_config(),
                 Some(codex_run_tokens.clone()),
+                native_tool_ceiling,
             );
         external_runner.set_session_inbox_runtime(Some(
             bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {
@@ -778,6 +786,8 @@ impl AppState {
                 persistence: persistence.clone(),
             },
         ));
+        external_runner.set_actor_directory_store(Some(session_store.clone()));
+        external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -983,10 +993,11 @@ impl AppState {
             .set_root_tools(tools.clone())
             .await;
 
-        // Process restart recovery: only backlog covered by its producer's
-        // durable activation watermark requests a run. A child/Bash coordinator
-        // may intentionally stage sibling outcomes while a specific wait remains
-        // armed; admission by itself is not permission to execute.
+        // Restart recovers each immediate intent published with its message,
+        // even if no later wakeup/watermark write completed. The coordinator
+        // prefix remains separate: an immediate message never promotes an
+        // unauthorized staged child/Bash sibling. inspect and claim share the
+        // same durable eligibility rule.
         for entry in session_store.list_index_entries().await {
             match session_inbox.inspect(&entry.id).await {
                 Ok(backlog) if backlog.activation_pending() => {
@@ -1065,6 +1076,7 @@ impl AppState {
             project_store: Some(project_store.clone()),
             workspace_resolver: workspace_resolver.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
+            recovered_launches: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         // Wire the spawner into the completion coordinator too, so a resumed run
@@ -1072,6 +1084,13 @@ impl AppState {
         child_completion_coordinator
             .set_guardian_spawner(guardian_spawner.clone())
             .await;
+
+        // Recover an accepted auto-run after a crash between its durable save,
+        // queue admission, and worker reservation. Draft children have no
+        // launch intent, and the scheduler fences any stale generation again.
+        if let Err(error) = child_adapter.reconcile_pending_child_launches().await {
+            tracing::warn!(%error, "failed to reconcile pending child launches on startup");
+        }
 
         // The completion coordinator doubles as the bash self-resume hook
         // (issue #84 Phase 2b): it polls the live shell registry and resumes a
@@ -1187,6 +1206,7 @@ impl AppState {
             agent_runners,
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
+            actor_event_hub,
             account_sink,
             process_registry,
             metrics_bus: None, // Will be set by server if needed

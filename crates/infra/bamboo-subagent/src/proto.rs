@@ -76,6 +76,119 @@ pub struct RunSpec {
     pub secrets: RunSecrets,
 }
 
+/// Actual worker message suffix, carried in the existing sequenced event lane.
+/// This cache observation grants nothing; the Host separately validates its
+/// current callable ceiling, event trace and fenced canonical append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum ReadOnlyActorTranscript {
+    #[serde(rename = "owned_readonly_transcript")]
+    Complete { messages: Vec<serde_json::Value> },
+}
+impl ReadOnlyActorTranscript {
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let Self::Complete { messages } = self;
+        if messages.len() != 3
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("owned_readonly_transcript_unsupported");
+        }
+        Ok(())
+    }
+}
+
+/// Completion DATA on the existing durable event lane, never Session authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum LocalToolMessages {
+    #[serde(rename = "local_client_tool_messages_v1")]
+    Complete {
+        version: u32,
+        messages: Vec<serde_json::Value>,
+    },
+}
+
+impl LocalToolMessages {
+    pub const TYPE: &'static str = "local_client_tool_messages_v1";
+    pub const MAX_BYTES: usize = 64 * 1024;
+    pub const MAX_MESSAGES: usize = 128;
+    pub const MAX_PAIRS: usize = 32;
+
+    pub fn supports_tools(tools: &[String], read_only: bool) -> bool {
+        !tools.is_empty()
+            && !(read_only && tools.len() == 1 && tools[0] == "Glob")
+            && tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "Read" | "Glob" | "Write"))
+    }
+
+    pub fn validate(&self) -> Result<Vec<bamboo_domain::Message>, &'static str> {
+        use std::io::Write;
+        struct Limit(usize);
+        impl Write for Limit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= LocalToolMessages::MAX_BYTES)
+                    .ok_or_else(|| std::io::Error::other("local tool history limit"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Self::Complete { version, messages } = self;
+        if *version != 1
+            || messages.is_empty()
+            || messages.len() > Self::MAX_MESSAGES
+            || serde_json::to_writer(Limit(0), self).is_err()
+        {
+            return Err("local_tool_history_unsupported");
+        }
+        let typed: Vec<bamboo_domain::Message> = messages
+            .iter()
+            .map(|value| {
+                let message: bamboo_domain::Message = serde_json::from_value(value.clone())
+                    .map_err(|_| "local_tool_history_unsupported")?;
+                if serde_json::to_value(&message).map_err(|_| "local_tool_history_unsupported")?
+                    != *value
+                    || message.id.is_empty()
+                    || message.id.len() > 128
+                    || message.reasoning.is_some()
+                    || message.reasoning_signature.is_some()
+                    || message.content_parts.is_some()
+                    || message.image_ocr.is_some()
+                    || message.compressed
+                    || message.compressed_by_event_id.is_some()
+                    || message.compression_level != 0
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+                Ok(message)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut ids = std::collections::HashSet::new();
+        let mut calls = std::collections::HashSet::new();
+        for message in &typed {
+            if !ids.insert(&message.id) {
+                return Err("local_tool_history_unsupported");
+            }
+            for call in message.tool_calls.iter().flatten() {
+                if call.id.is_empty()
+                    || call.id.len() > 128
+                    || !calls.insert(&call.id)
+                    || calls.len() > Self::MAX_PAIRS
+                {
+                    return Err("local_tool_history_unsupported");
+                }
+            }
+        }
+        Ok(typed)
+    }
+}
+
 /// Logical session ancestry carried across every actor placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSessionIdentity {
@@ -83,6 +196,82 @@ pub struct LogicalSessionIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
+    /// Host-authored immutable Child birth. Missing only on legacy routes;
+    /// this is identity, not task or permission authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<ChildCreationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildCreationIdentity {
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+}
+
+/// Immutable one-shot native name ceiling. It is startup authority, not a
+/// persisted profile or a grant for workspace/network/secret access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeToolCeiling {
+    pub version: u32,
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    // Explicit null means unassigned; omission is not an authority observation.
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub tools: Vec<String>,
+}
+
+fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ProjectId>, D::Error> {
+    Option::<ProjectId>::deserialize(deserializer)
+}
+
+impl NativeToolCeiling {
+    pub const NAMES: [&'static str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+    pub const MAX_BYTES: usize = 16 * 1024;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut candidate = bamboo_domain::Session::new(self.child_session_id.clone(), "");
+        candidate.kind = bamboo_domain::SessionKind::Child;
+        candidate.parent_session_id = Some(self.parent_session_id.clone());
+        candidate.root_session_id = self.root_session_id.clone();
+        candidate.created_at = self.created_at;
+        candidate.spawn_depth = self.spawn_depth;
+        if self.version != 1
+            || bamboo_domain::ActorSession::from_session(&candidate).is_err()
+            || self.tools.len() > Self::NAMES.len()
+            || self
+                .tools
+                .iter()
+                .any(|name| !Self::NAMES.contains(&name.as_str()))
+            || self.tools.windows(2).any(|pair| pair[0] >= pair[1])
+            || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err("native_tool_ceiling_invalid");
+        }
+        Ok(())
+    }
+
+    pub fn matches_run(&self, run: &RunSpec) -> bool {
+        self.validate().is_ok()
+            && run.project_id == self.project_id
+            && run.logical_session.as_ref().is_some_and(|identity| {
+                identity.session_id == self.child_session_id
+                    && identity.parent_session_id.as_deref()
+                        == Some(self.parent_session_id.as_str())
+                    && identity.root_session_id == self.root_session_id
+                    && identity.creation.as_ref().is_some_and(|creation| {
+                        creation.created_at == self.created_at
+                            && creation.spawn_depth == self.spawn_depth
+                    })
+            })
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -319,6 +508,135 @@ pub struct SessionMessageAdmissionConfirmation {
     pub activation_run_id: String,
 }
 
+/// Closed initial-input barrier. This is not a tool grant or an approval reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputReleaseRequest {
+    pub version: u32,
+    pub nonce: String,
+    pub child_id: String,
+    pub parent_id: String,
+    pub root_id: String,
+    pub created_at: DateTime<Utc>,
+    pub spawn_depth: u32,
+    #[serde(deserialize_with = "deserialize_project_observation")]
+    pub project_id: Option<ProjectId>,
+    pub envelope_id: String,
+    pub generation: u64,
+    pub activation_run_id: String,
+    pub execution_epoch: u64,
+}
+impl InitialInputReleaseRequest {
+    pub fn from_run(
+        run: &RunSpec,
+        delivery: &SessionMessageDelivery,
+        nonce: String,
+    ) -> Result<Self, String> {
+        let logical = run
+            .logical_session
+            .as_ref()
+            .ok_or("initial release logical identity missing")?;
+        let birth = logical
+            .creation
+            .as_ref()
+            .ok_or("initial release birth missing")?;
+        let parent = logical
+            .parent_session_id
+            .as_ref()
+            .ok_or("initial release parent missing")?;
+        if uuid::Uuid::parse_str(&nonce).is_err()
+            || nonce.len() != 36
+            || logical.session_id.is_empty()
+            || parent.is_empty()
+            || logical.root_session_id.is_empty()
+            || birth.spawn_depth == 0
+            || run.execution_epoch == 0
+            || delivery.canonical_claim_generation == 0
+            || run.activation_run_id.as_deref() != Some(delivery.activation_run_id.as_str())
+            || delivery.target_session_id != logical.session_id
+            || delivery.envelope.target_session_id != logical.session_id
+        {
+            return Err("initial release binding invalid".into());
+        }
+        let request = Self {
+            version: 1,
+            nonce,
+            child_id: logical.session_id.clone(),
+            parent_id: parent.clone(),
+            root_id: logical.root_session_id.clone(),
+            created_at: birth.created_at,
+            spawn_depth: birth.spawn_depth,
+            project_id: run.project_id.clone(),
+            envelope_id: delivery.envelope.id.as_str().into(),
+            generation: delivery.canonical_claim_generation,
+            activation_run_id: delivery.activation_run_id.clone(),
+            execution_epoch: run.execution_epoch,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        let identity = NativeToolCeiling {
+            version: self.version,
+            child_session_id: self.child_id.clone(),
+            parent_session_id: self.parent_id.clone(),
+            root_session_id: self.root_id.clone(),
+            created_at: self.created_at,
+            spawn_depth: self.spawn_depth,
+            project_id: self.project_id.clone(),
+            tools: Vec::new(),
+        };
+        if identity.validate().is_err()
+            || uuid::Uuid::parse_str(&self.nonce).is_err()
+            || self.nonce.len() != 36
+            || self.generation == 0
+            || self.execution_epoch == 0
+            || self.activation_run_id.is_empty()
+            || self.activation_run_id.len() > 256
+            || bamboo_domain::SessionMessageId::parse(self.envelope_id.clone()).is_err()
+        {
+            return Err("initial release binding invalid".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialInputRelease {
+    pub request: InitialInputReleaseRequest,
+    pub expires_at: DateTime<Utc>,
+}
+impl InitialInputRelease {
+    pub fn permits(&self, request: &InitialInputReleaseRequest, now: DateTime<Utc>) -> bool {
+        &self.request == request && request.version == 1 && now < self.expires_at
+    }
+}
+/// Reserved discriminator: unknown or malformed values never become text steering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "initial_input_control",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InitialInputControl {
+    Request { request: InitialInputReleaseRequest },
+    Release { release: InitialInputRelease },
+}
+impl InitialInputControl {
+    pub fn decode(body: serde_json::Value) -> Result<Self, String> {
+        if serde_json::to_vec(&body).map_or(true, |bytes| bytes.len() > 4096) {
+            return Err("initial release control exceeds bound".into());
+        }
+        let control: Self =
+            serde_json::from_value(body).map_err(|_| "initial release control malformed")?;
+        match &control {
+            Self::Request { request } => request.validate()?,
+            Self::Release { release } => release.request.validate()?,
+        }
+        Ok(control)
+    }
+}
+
 /// Per-activation secret envelope. A Bamboo-routed Codex token lives here so a
 /// warm worker never reuses a credential from an earlier run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -472,6 +790,9 @@ pub enum ParentFrame {
     SessionMessage {
         delivery: SessionMessageDelivery,
     },
+    InitialInputRelease {
+        release: InitialInputRelease,
+    },
     /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
     /// decision on a gated tool the worker proxied back (Phase 2 child→parent
     /// approval delegation). `id` correlates to the request. When
@@ -552,6 +873,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_tool_messages_are_closed_bounded_and_durable() {
+        let raw = serde_json::to_value(bamboo_domain::Message::user("confirmed")).unwrap();
+        let good = LocalToolMessages::Complete {
+            version: 1,
+            messages: vec![raw.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(good.validate().unwrap()[0].clone()).unwrap(),
+            raw
+        );
+        let event = serde_json::to_value(&good).unwrap();
+        assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
+        for field in ["session", "permission", "version_extra"] {
+            let mut changed = event.clone();
+            changed[field] = serde_json::json!({});
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed).is_err(),
+                "{field}"
+            );
+        }
+        for mutation in [
+            "version",
+            "missing",
+            "unknown_message",
+            "reasoning",
+            "compressed",
+            "duplicate",
+            "bytes",
+            "rows",
+        ] {
+            let mut changed = event.clone();
+            match mutation {
+                "version" => changed["version"] = 2.into(),
+                "missing" => {
+                    changed.as_object_mut().unwrap().remove("messages");
+                }
+                "unknown_message" => changed["messages"][0]["cursor"] = 1.into(),
+                "reasoning" => changed["messages"][0]["reasoning"] = "private".into(),
+                "compressed" => changed["messages"][0]["compression_level"] = 1.into(),
+                "duplicate" => changed["messages"] = serde_json::json!([raw, raw]),
+                "bytes" => {
+                    changed["messages"][0]["content"] =
+                        "\\\"".repeat(LocalToolMessages::MAX_BYTES).into()
+                }
+                "rows" => {
+                    changed["messages"] =
+                        serde_json::to_value(vec![raw.clone(); LocalToolMessages::MAX_MESSAGES + 1])
+                            .unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<LocalToolMessages>(changed)
+                    .map_or(true, |data| data.validate().is_err()),
+                "{mutation}"
+            );
+        }
+        assert!(LocalToolMessages::supports_tools(
+            &["Read".into(), "Write".into()],
+            false
+        ));
+        assert!(!LocalToolMessages::supports_tools(&["Glob".into()], true));
+        assert!(!LocalToolMessages::supports_tools(&["Bash".into()], false));
+    }
+
+    #[test]
+    fn initial_release_schema_is_closed_and_exact() {
+        let request = InitialInputReleaseRequest {
+            version: 1,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            child_id: "child".into(),
+            parent_id: "parent".into(),
+            root_id: "parent".into(),
+            created_at: Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            envelope_id: "input".into(),
+            generation: 1,
+            activation_run_id: "run".into(),
+            execution_epoch: 7,
+        };
+        let release = InitialInputRelease {
+            request: request.clone(),
+            expires_at: Utc::now() + chrono::Duration::seconds(1),
+        };
+        assert!(release.permits(&request, Utc::now()));
+        for change in [
+            "nonce",
+            "generation",
+            "execution_epoch",
+            "child_id",
+            "created_at",
+            "project_id",
+        ] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[change] = match change {
+                "generation" | "execution_epoch" => serde_json::json!(2),
+                "created_at" => serde_json::json!("2020-01-01T00:00:00Z"),
+                _ => serde_json::json!("foreign"),
+            };
+            if let Ok(changed) = serde_json::from_value(value) {
+                assert!(!release.permits(&changed, Utc::now()), "{change}");
+            }
+        }
+        assert!(!release.permits(&request, release.expires_at));
+        let mut absent_project = serde_json::to_value(&request).unwrap();
+        absent_project.as_object_mut().unwrap().remove("project_id");
+        assert!(serde_json::from_value::<InitialInputReleaseRequest>(absent_project).is_err());
+        let bytes = serde_json::to_string(&request).unwrap();
+        let duplicate = bytes.replacen("{", "{\"nonce\":\"foreign\",", 1);
+        assert!(serde_json::from_str::<InitialInputReleaseRequest>(&duplicate).is_err());
+        let mut value = serde_json::to_value(InitialInputControl::Release { release }).unwrap();
+        value["text"] = "cannot become steer".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value.clone()).is_err());
+        value.as_object_mut().unwrap().remove("text");
+        value["initial_input_control"] = "unknown".into();
+        assert!(serde_json::from_value::<InitialInputControl>(value).is_err());
+    }
+
+    #[test]
     fn parent_frames_round_trip() {
         for f in [
             ParentFrame::Run(RunSpec {
@@ -574,6 +1015,34 @@ mod tests {
     }
 
     #[test]
+    fn logical_creation_is_atomic_and_preserves_exact_birth() {
+        let legacy = serde_json::json!({"session_id":"child", "parent_session_id":"parent", "root_session_id":"root"});
+        let mut identity: LogicalSessionIdentity = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(identity.creation.is_none());
+        assert_eq!(serde_json::to_value(&identity).unwrap(), legacy);
+        identity.creation = Some(ChildCreationIdentity {
+            created_at: "2026-09-26T01:02:03.123456789Z".parse().unwrap(),
+            spawn_depth: 3,
+        });
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            serde_json::from_value::<LogicalSessionIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        for creation in [
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z"}),
+            serde_json::json!({"spawn_depth":3}),
+            serde_json::json!({"created_at":"invalid", "spawn_depth":3}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":-1}),
+            serde_json::json!({"created_at":"2026-09-26T01:02:03Z", "spawn_depth":3, "grant":true}),
+        ] {
+            let mut damaged = wire.clone();
+            damaged["creation"] = creation;
+            assert!(serde_json::from_value::<LogicalSessionIdentity>(damaged).is_err());
+        }
+    }
+
+    #[test]
     fn child_frames_round_trip() {
         let e = ChildFrame::Event {
             event: serde_json::json!({"type":"token","content":"hi"}),
@@ -582,6 +1051,7 @@ mod tests {
         let batch = ChildFrame::EventBatch {
             batch: ActorEventBatch {
                 logical_session: Some(LogicalSessionIdentity {
+                    creation: None,
                     session_id: "child".into(),
                     parent_session_id: Some("parent".into()),
                     root_session_id: "root".into(),
@@ -814,6 +1284,7 @@ mod tests {
         let spec = RunSpec {
             assignment: "work".into(),
             logical_session: Some(LogicalSessionIdentity {
+                creation: None,
                 session_id: "child".into(),
                 parent_session_id: Some("parent".into()),
                 root_session_id: "root".into(),

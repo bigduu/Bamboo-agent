@@ -621,6 +621,11 @@ where
                         let _ = steer.send(SteerMessage::Text(text));
                     }
                 }
+                Ok(ParentFrame::InitialInputRelease { release }) => {
+                    if let Some(steer) = &active_steer {
+                        let _ = steer.send(SteerMessage::InitialInputRelease(release));
+                    }
+                }
                 Ok(ParentFrame::SessionMessage { delivery }) => {
                     if let Some(steer) = &active_steer {
                         let _ = steer.send(SteerMessage::SessionMessage(Box::new(delivery)));
@@ -744,6 +749,12 @@ fn start_run<E: ChildExecutor + ?Sized>(
     let mut control = OwnedTask::new(tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
             let frame = match control {
+                ExecutorControl::InitialInputReleaseRequest(request) => ChildFrame::Event {
+                    event: serde_json::to_value(crate::proto::InitialInputControl::Request {
+                        request,
+                    })
+                    .expect("typed initial control"),
+                },
                 ExecutorControl::SessionMessageAdmitted(confirmation) => {
                     ChildFrame::SessionMessageAdmitted { confirmation }
                 }
@@ -1303,6 +1314,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: logical_session_id.to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),
@@ -1486,6 +1498,7 @@ mod tests {
                 assert_eq!(
                     spec.logical_session,
                     Some(crate::proto::LogicalSessionIdentity {
+                        creation: None,
                         session_id: "logical-child".to_string(),
                         parent_session_id: Some("logical-parent".to_string()),
                         root_session_id: "logical-root".to_string(),
@@ -1516,6 +1529,7 @@ mod tests {
             .send(ParentFrame::Run(RunSpec {
                 assignment: "wait".into(),
                 logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    creation: None,
                     session_id: "logical-child".to_string(),
                     parent_session_id: Some("logical-parent".to_string()),
                     root_session_id: "logical-root".to_string(),

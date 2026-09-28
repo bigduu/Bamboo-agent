@@ -964,6 +964,11 @@ enum BrokerCommands {
         #[arg(long)]
         token: Option<String>,
 
+        /// Read a bounded scoped-peer startup policy from stdin. No global
+        /// token fallback; strict mailboxes use a separate scoped namespace.
+        #[arg(long, conflicts_with = "token")]
+        peer_policy_stdin: bool,
+
         /// Durable mailbox storage root. Defaults to `<bamboo_dir>/broker`.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -1678,6 +1683,7 @@ async fn run() {
                 bind,
                 token,
                 root,
+                peer_policy_stdin,
                 cert,
                 key,
                 max_connections,
@@ -1685,16 +1691,45 @@ async fn run() {
                 message_burst,
                 max_pending_per_mailbox,
             } = command;
-            let token = match token
-                .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
-                .filter(|t| !t.is_empty())
-            {
-                Some(t) => t,
-                None => {
-                    eprintln!(
+            let peer_policy = if peer_policy_stdin {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                let parsed = std::io::stdin()
+                    .lock()
+                    .take(bamboo_broker::MAX_PEER_POLICY_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()
+                    .and_then(|_| bamboo_broker::PeerPolicy::from_json(&bytes).ok());
+                let Some(policy) = parsed else {
+                    eprintln!("broker: invalid scoped peer policy");
+                    std::process::exit(2);
+                };
+                let Ok(address) = bind.parse::<std::net::SocketAddr>() else {
+                    eprintln!("broker: scoped mode requires a numeric bind address");
+                    std::process::exit(2);
+                };
+                if !address.ip().is_loopback() && cert.is_none() {
+                    eprintln!("broker: scoped non-loopback listener requires TLS");
+                    std::process::exit(2);
+                }
+                Some(policy)
+            } else {
+                None
+            };
+            let token = if peer_policy.is_some() {
+                String::new()
+            } else {
+                match token
+                    .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
+                    .filter(|t| !t.is_empty())
+                {
+                    Some(t) => t,
+                    None => {
+                        eprintln!(
                         "broker: a Bearer token is required (pass --token or set BAMBOO_BROKER_TOKEN)"
                     );
-                    std::process::exit(1);
+                        std::process::exit(1);
+                    }
                 }
             };
             let root =
@@ -1725,8 +1760,12 @@ async fn run() {
                 "bamboo broker serving"
             );
             let core = std::sync::Arc::new(
-                bamboo_broker::BrokerCore::new(root)
-                    .with_max_pending_per_mailbox(max_pending_per_mailbox),
+                (if peer_policy.is_some() {
+                    bamboo_broker::BrokerCore::new_scoped(root)
+                } else {
+                    bamboo_broker::BrokerCore::new(root)
+                })
+                .with_max_pending_per_mailbox(max_pending_per_mailbox),
             );
             // Reclaim empty, unsubscribed mailbox dirs every 5 minutes.
             let _gc = core
@@ -1742,14 +1781,21 @@ async fn run() {
                 message_burst: std::num::NonZeroU32::new(message_burst)
                     .expect("clap value_parser rejects 0"),
             };
-            let mut server = bamboo_broker::BrokerServer::with_limits(core, token, limits);
+            let mut server = match peer_policy {
+                Some(policy) => bamboo_broker::BrokerServer::with_peer_policy(core, policy, limits),
+                None => bamboo_broker::BrokerServer::with_limits(core, token, limits),
+            };
             // Fail-fast (#48): a bad/missing cert or key must abort startup, never
             // silently downgrade to plaintext.
             if let (Some(cert), Some(key)) = (&cert, &key) {
                 server = match server.with_tls(cert, key) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("broker: failed to load TLS cert/key: {e}");
+                        if peer_policy_stdin {
+                            eprintln!("broker: invalid scoped TLS configuration");
+                        } else {
+                            eprintln!("broker: failed to load TLS cert/key: {e}");
+                        }
                         std::process::exit(1);
                     }
                 };

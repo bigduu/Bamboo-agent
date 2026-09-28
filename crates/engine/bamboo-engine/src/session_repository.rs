@@ -145,6 +145,25 @@ impl SessionRepository {
             .await
     }
 
+    /// Persist a blocked approval replay before starting its successor. A
+    /// A save error may arrive after the rewritten result was committed. When
+    /// the save was attempted, evict the old approval from cache under the
+    /// same session lock so the next attempt reloads durable state.
+    pub async fn save_replay_resolution(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_runtime_and_publish(session, |saved, committed| {
+                if committed {
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                    );
+                } else {
+                    self.cache.remove(&saved.id);
+                }
+            })
+            .await
+    }
+
     /// Atomically mutate the latest durable runtime session and refresh the
     /// cache with the saved value. This is the safe path for narrow metadata
     /// indexes that can be updated concurrently with runner message writes.
@@ -183,13 +202,12 @@ impl SessionRepository {
     }
 
     /// Load a session, reconciling the memory and storage copies via a
-    /// preference heuristic: storage wins when it is strictly newer, or when it
-    /// is the same age but still carries a pending question memory lost. Storage
-    /// is **never** preferred when it is strictly older than memory.
+    /// preference heuristic: a live durable Root birth or mode epoch wins first;
+    /// otherwise storage wins when it is strictly newer, or when it is the same
+    /// age but still carries a pending question memory lost.
     ///
-    /// The cache is refreshed cache-aside but with a no-regression guarantee:
-    /// `load_merged` never overwrites a newer cached session with an older
-    /// storage copy, so it is safe to call from hot read paths.
+    /// The cache is refreshed cache-aside. Timestamps cannot make a stale
+    /// Root birth or mode epoch outrank verified durable authority.
     pub async fn load_merged_checked(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         let _guard = self.persistence.acquire_lock(session_id).await;
         let memory_session = read_cached_session(&self.cache, session_id);
@@ -199,6 +217,8 @@ impl SessionRepository {
 
         Ok(match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
+                let root_authority_preference =
+                    root_authority_storage_preference(&memory, &storage);
                 let prefer_storage = should_prefer_storage(&memory, &storage);
                 let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
                 let chosen_len = if prefer_storage {
@@ -231,10 +251,13 @@ impl SessionRepository {
                 // write back when we actually reconciled *to storage* (a memory
                 // win is already the cached copy; re-inserting it would needlessly
                 // replace a possibly-live Arc) AND the reconciled copy is not
-                // older than what memory already holds. This is what makes
-                // `load_merged` safe on hot read paths — it can never clobber a
-                // freshly-updated session with a stale storage copy.
-                if prefer_storage && chosen.updated_at >= memory_updated_at {
+                // older than what memory already holds, except when durable
+                // storage proved a new Root birth or higher mode epoch. Those
+                // authority changes must survive cross-process clock skew.
+                if prefer_storage
+                    && (root_authority_preference == Some(true)
+                        || chosen.updated_at >= memory_updated_at)
+                {
                     self.cache.insert(
                         session_id.to_string(),
                         Arc::new(crate::SessionSnapshot::new(chosen.clone())),
@@ -328,6 +351,10 @@ fn adopt_task_control_plane(target: &mut Session, durable: &Session) {
 }
 
 fn should_prefer_storage(memory_session: &Session, storage_session: &Session) -> bool {
+    if let Some(prefer_storage) = root_authority_storage_preference(memory_session, storage_session)
+    {
+        return prefer_storage;
+    }
     // Never reconcile *backwards* to a strictly-older storage copy: if memory is
     // newer it is authoritative (e.g. it just answered and cleared a pending
     // question while storage still holds the stale one). Respecting `updated_at`
@@ -340,6 +367,30 @@ fn should_prefer_storage(memory_session: &Session, storage_session: &Session) ->
     // a genuine clarification is never dropped.
     storage_session.updated_at > memory_session.updated_at
         || (memory_session.pending_question.is_none() && storage_session.pending_question.is_some())
+}
+
+/// `load_session` has already checked that the storage copy is live. Its Root
+/// birth therefore outranks any cached incarnation with the same ID, even if
+/// the new lifetime reset the mode epoch or a process clock moved backwards.
+/// Within one birth, only a higher durable epoch is an authority advance.
+fn root_authority_storage_preference(
+    memory_session: &Session,
+    storage_session: &Session,
+) -> Option<bool> {
+    use bamboo_domain::SessionKind;
+
+    if memory_session.kind != SessionKind::Root || storage_session.kind != SessionKind::Root {
+        return None;
+    }
+    if memory_session.created_at != storage_session.created_at
+        || memory_session.authority_identity != storage_session.authority_identity
+    {
+        return Some(true);
+    }
+    (memory_session.root_mode_transition_epoch != storage_session.root_mode_transition_epoch)
+        .then_some(
+            storage_session.root_mode_transition_epoch > memory_session.root_mode_transition_epoch,
+        )
 }
 
 /// `SessionRepository` is the canonical `RuntimeSessionPersistence`: the runtime
@@ -706,6 +757,10 @@ mod tests {
         persisted: Mutex<Option<Session>>,
     }
 
+    struct AmbiguousReplaySaveStorage {
+        persisted: Mutex<Option<Session>>,
+    }
+
     #[async_trait::async_trait]
     impl Storage for MapStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
@@ -794,6 +849,24 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Storage for AmbiguousReplaySaveStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.persisted.lock().unwrap() = Some(session.clone());
+            Err(std::io::Error::other(
+                "injected post-commit replay save error",
+            ))
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.persisted.lock().unwrap().clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
     fn test_repo(storage: Arc<dyn Storage>) -> SessionRepository {
         let cache: SessionCache = Arc::default();
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
@@ -805,6 +878,107 @@ mod tests {
             session.id.clone(),
             Arc::new(crate::SessionSnapshot::new(session.clone())),
         );
+    }
+
+    #[tokio::test]
+    async fn merged_root_prefers_live_recreated_birth_even_when_epoch_resets() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "root-recreated-same-id";
+        let mut stale = Session::new(id, "stale");
+        stale.root_mode_transition_epoch = 3;
+        stale.updated_at += chrono::Duration::hours(1);
+        cache_put(&repo, &stale);
+
+        let mut recreated = Session::new(id, "recreated");
+        recreated.created_at = stale.created_at + chrono::Duration::seconds(1);
+        recreated.updated_at = stale.created_at + chrono::Duration::seconds(1);
+        storage.save_session(&recreated).await.unwrap();
+
+        let loaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(loaded.model, "recreated");
+        assert_eq!(loaded.root_mode_transition_epoch, 0);
+        assert_eq!(
+            loaded.root_mode_birth_token(),
+            recreated.root_mode_birth_token()
+        );
+        let cached = read_cached_session(repo.cache(), id).expect("new birth cached");
+        assert_eq!(cached.model, "recreated");
+        assert_eq!(
+            cached.root_mode_birth_token(),
+            recreated.root_mode_birth_token()
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_root_caches_higher_durable_epoch_despite_clock_skew() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "root-mode-clock-skew";
+        let mut stale = Session::new(id, "model");
+        stale.updated_at += chrono::Duration::hours(1);
+        cache_put(&repo, &stale);
+
+        let mut durable = stale.clone();
+        durable.root_mode_transition_epoch = 1;
+        durable.root_orchestration_only = true;
+        durable.root_tool_authority_revision = 1;
+        durable.updated_at = durable.created_at;
+        storage.save_session(&durable).await.unwrap();
+
+        let loaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(loaded.root_mode_transition_epoch, 1);
+        assert!(loaded.root_orchestration_only);
+        let cached = read_cached_session(repo.cache(), id).expect("higher epoch cached");
+        assert_eq!(cached.root_mode_transition_epoch, 1);
+        assert!(cached.root_orchestration_only);
+    }
+
+    #[tokio::test]
+    async fn runtime_merge_save_adopts_root_mode_terminal_tuple_even_for_policy_neutral_fence() {
+        use bamboo_domain::{RootModeOperationAction, RootModeOperationRequest};
+
+        for action in [
+            RootModeOperationAction::Select,
+            RootModeOperationAction::Recover,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let concrete = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = concrete.clone();
+            let repo = test_repo(storage.clone());
+            let mut running = Session::new("runtime-root-mode-merge", "model");
+            storage.save_session(&running).await.unwrap();
+            cache_put(&repo, &running);
+            let request = RootModeOperationRequest {
+                session_id: running.id.clone(),
+                operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+                birth_token: running.root_mode_birth_token(),
+                expected_epoch: 0,
+                requested_enabled: true,
+                action,
+            };
+            storage.root_mode_operation(&request).await.unwrap();
+
+            // This save can race a host mode operation before the next runtime
+            // boundary. The production merge must preserve that durable tuple.
+            running.add_message(bamboo_agent_core::Message::assistant("run result", None));
+            repo.save(&mut running).await.unwrap();
+            assert_eq!(running.root_mode_transition_epoch, 1);
+            assert_eq!(running.root_mode_operations.len(), 1);
+            assert_eq!(
+                running.root_orchestration_only_enabled(),
+                action == RootModeOperationAction::Select
+            );
+            let durable = storage.load_session(&running.id).await.unwrap().unwrap();
+            assert_eq!(durable.root_mode_transition_epoch, 1);
+            assert_eq!(durable.root_mode_operations, running.root_mode_operations);
+            assert_eq!(durable.messages.last().unwrap().content, "run result");
+            concrete.flush_search_index().await;
+        }
     }
 
     fn task_list(session_id: &str, title: &str) -> bamboo_domain::TaskList {
@@ -1828,7 +2002,10 @@ mod tests {
         stale.updated_at = Utc::now() - chrono::Duration::seconds(10);
         storage.save_session(&stale).await.unwrap();
 
-        let mut fresh = Session::new(id.to_string(), "m");
+        // This is a fresher snapshot of the same Root birth, not a recreated
+        // Session with the same ID (whose live durable birth takes precedence).
+        let mut fresh = stale.clone();
+        fresh.clear_pending_question();
         fresh.updated_at = Utc::now();
         cache_put(&repo, &fresh);
 
@@ -2015,6 +2192,64 @@ mod tests {
                 .model,
             "previous",
             "fallible inherent save must publish only after a durable commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_ambiguous_save_evicts_same_age_stale_approval_cache() {
+        let id = "blocked-replay-ambiguous-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(AmbiguousReplaySaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert!(!reloaded
+            .metadata
+            .contains_key(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_precommit_save_error_reloads_retryable_approval() {
+        let id = "blocked-replay-precommit-save";
+        let mut approved = Session::new(id, "model");
+        approved.metadata.insert(
+            crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "call-1".into(),
+        );
+        let storage: Arc<dyn Storage> = Arc::new(FailingSaveStorage {
+            persisted: Mutex::new(Some(approved.clone())),
+        });
+        let repo = test_repo(storage);
+        cache_put(&repo, &approved);
+
+        let mut resolved = approved.clone();
+        resolved
+            .metadata
+            .remove(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY);
+        assert!(repo.save_replay_resolution(&mut resolved).await.is_err());
+        assert!(read_cached_session(repo.cache(), id).is_none());
+        let reloaded = repo.load_merged_checked(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.updated_at, approved.updated_at);
+        assert_eq!(
+            reloaded
+                .metadata
+                .get(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("call-1")
         );
     }
 

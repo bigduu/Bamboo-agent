@@ -215,6 +215,14 @@ impl ToolExecutor for OverlayToolExecutor {
             .await
     }
 
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        if name == self.overlay.name() {
+            Some(self)
+        } else {
+            self.base.exact_tool_owner(name)
+        }
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.base.list_tools();
 

@@ -12,15 +12,16 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use bamboo_domain::{
-    SessionActivationPolicy, SessionInboxBacklog, SessionInboxClaim, SessionInboxError,
-    SessionInboxLimits, SessionInboxPort, SessionInboxReceipt, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageSource,
+    SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxBacklog, SessionInboxClaim,
+    SessionInboxError, SessionInboxLimits, SessionInboxPort, SessionInboxReceipt,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageSource,
 };
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, Mailbox, MsgId};
 use base64::Engine;
 use chrono::{TimeZone, Utc};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::v2::atomic_write;
@@ -32,6 +33,28 @@ const ACTIVATION_GENERATION_FILE: &str = "activation-generation";
 const INTERRUPT_GENERATION_FILE: &str = "interrupt-generation";
 const ADMITTED_DIR: &str = "admitted";
 const OPERATION_LOCK_FILE: &str = ".session-inbox.lock";
+const ACTIVATION_INTENT_KEY: &str = "session_inbox_activation_intent";
+const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
+
+#[path = "session_inbox_owned.rs"]
+mod owned;
+pub(crate) use owned::OwnedFilesystem;
+use owned::{AckAuthority, InboxAuthority, StoredLease};
+
+struct StoredInboxReceipt {
+    delivery: SessionInboxReceipt,
+    intent: Option<SessionInboxActivationIntent>,
+    lease: Option<StoredLease>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedActivationWatermark {
+    version: u32,
+    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interrupt_snapshot: Option<u64>,
+}
 
 struct FileOperationLock(File);
 
@@ -53,6 +76,26 @@ pub struct FileSessionInbox {
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
     #[cfg(test)]
     followup_authority_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    admission_commit_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    activation_write_failure: bool,
+    #[cfg(test)]
+    intent_scan_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    owned_after_write_failure: bool,
+    #[cfg(test)]
+    owned_renew_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    owned_ack_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    owned_ack_after_receipt_failure: bool,
+    #[cfg(test)]
+    owned_after_header_failure: bool,
+    #[cfg(test)]
+    owned_fs_hook: Option<owned::FilesystemHook>,
+    #[cfg(test)]
+    owned_scope_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl FileSessionInbox {
@@ -63,11 +106,58 @@ impl FileSessionInbox {
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             followup_authority_pause: None,
+            #[cfg(test)]
+            admission_commit_pause: None,
+            #[cfg(test)]
+            activation_write_failure: false,
+            #[cfg(test)]
+            intent_scan_pause: None,
+            #[cfg(test)]
+            owned_after_write_failure: false,
+            #[cfg(test)]
+            owned_renew_pause: None,
+            #[cfg(test)]
+            owned_ack_pause: None,
+            #[cfg(test)]
+            owned_ack_after_receipt_failure: false,
+            #[cfg(test)]
+            owned_after_header_failure: false,
+            #[cfg(test)]
+            owned_fs_hook: None,
+            #[cfg(test)]
+            owned_scope_drop: None,
         }
+    }
+
+    /// Storage-only opt-in; this result is not provider or worker admission.
+    pub async fn checkpoint_actor_input(
+        &self,
+        request: crate::ActorInputCheckpoint,
+    ) -> Result<crate::ActorInputCheckpointResult, crate::ActorInputCheckpointError> {
+        self.sessions
+            .checkpoint_owned_input(self.clone(), request)
+            .await
+    }
+
+    pub(crate) async fn actor_input_filesystem(
+        &self,
+        target: &str,
+        guards: Arc<crate::v2::ActorInputGuards>,
+    ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        self.filesystem_with_authority(target, InboxAuthority::Actor { _guard: guards })
+            .await
     }
 
     pub fn limits(&self) -> SessionInboxLimits {
         self.limits
+    }
+
+    fn max_transport_bytes(&self) -> usize {
+        self.limits
+            .max_payload_bytes
+            .saturating_mul(8)
+            .saturating_add(4096)
+            .min(MAX_INTENT_TRANSPORT_BYTES)
     }
 
     async fn lock_process(&self, dir: &Path) -> OwnedMutexGuard<()> {
@@ -181,9 +271,13 @@ impl FileSessionInbox {
         }
     }
 
-    async fn next_generation(dir: &Path) -> Result<u64, SessionInboxError> {
+    async fn next_generation(
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<u64, SessionInboxError> {
         let next = Self::read_generation(dir).await?.saturating_add(1);
-        atomic_write(&dir.join(GENERATION_FILE), next.to_string().as_bytes())
+        filesystem
+            .write(&dir.join(GENERATION_FILE), next.to_string().as_bytes())
             .await
             .map_err(|error| {
                 SessionInboxError::Storage(format!("persist inbox generation: {error}"))
@@ -192,15 +286,35 @@ impl FileSessionInbox {
     }
 
     async fn read_activation_generation(dir: &Path) -> Result<u64, SessionInboxError> {
+        Self::read_activation_watermark(dir)
+            .await
+            .map(|(generation, _)| generation)
+    }
+
+    async fn read_activation_watermark(dir: &Path) -> Result<(u64, bool), SessionInboxError> {
         let path = dir.join(ACTIVATION_GENERATION_FILE);
         match tokio::fs::read_to_string(&path).await {
-            Ok(raw) => raw.trim().parse::<u64>().map_err(|error| {
-                SessionInboxError::Storage(format!(
-                    "decode inbox activation generation {}: {error}",
-                    path.display()
-                ))
-            }),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+            Ok(raw) => {
+                if let Ok(generation) = raw.trim().parse::<u64>() {
+                    return Ok((generation, false));
+                }
+                let watermark: VersionedActivationWatermark =
+                    serde_json::from_str(&raw).map_err(|_| {
+                        SessionInboxError::Storage("invalid inbox activation watermark".into())
+                    })?;
+                if !matches!(watermark.version, 2 | 3) {
+                    return Err(SessionInboxError::Storage(
+                        "unsupported inbox activation watermark version".into(),
+                    ));
+                }
+                if watermark.version == 3 && watermark.interrupt_snapshot.is_none() {
+                    return Err(SessionInboxError::Storage(
+                        "owned watermark lacks interrupt snapshot".into(),
+                    ));
+                }
+                Ok((watermark.generation, true))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok((0, false)),
             Err(error) => Err(SessionInboxError::Storage(format!(
                 "read inbox activation generation {}: {error}",
                 path.display()
@@ -208,16 +322,58 @@ impl FileSessionInbox {
         }
     }
 
+    async fn write_activation_watermark(
+        dir: &Path,
+        generation: u64,
+        versioned: bool,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
+        let owned = Self::owned_enabled(dir).await?;
+        let bytes = if versioned {
+            serde_json::to_vec(&VersionedActivationWatermark {
+                version: if owned { 3 } else { 2 },
+                generation,
+                interrupt_snapshot: if owned {
+                    Some(Self::read_interrupt_generation(dir).await?)
+                } else {
+                    None
+                },
+            })
+            .map_err(|_| SessionInboxError::Storage("encode inbox activation watermark".into()))?
+        } else {
+            generation.to_string().into_bytes()
+        };
+        filesystem
+            .write(&dir.join(ACTIVATION_GENERATION_FILE), &bytes)
+            .await
+            .map_err(|error| {
+                SessionInboxError::Storage(format!("persist inbox activation generation: {error}"))
+            })
+    }
+
     async fn read_interrupt_generation(dir: &Path) -> Result<u64, SessionInboxError> {
         let path = dir.join(INTERRUPT_GENERATION_FILE);
         match tokio::fs::read_to_string(&path).await {
-            Ok(raw) => raw.trim().parse::<u64>().map_err(|error| {
-                SessionInboxError::Storage(format!(
-                    "decode inbox interrupt generation {}: {error}",
-                    path.display()
-                ))
-            }),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+            Ok(raw) => {
+                if let Ok(generation) = raw.trim().parse::<u64>() {
+                    return Ok(Self::activation_interrupt_snapshot(dir)
+                        .await?
+                        .unwrap_or(generation));
+                }
+                let watermark: VersionedActivationWatermark =
+                    serde_json::from_str(&raw).map_err(|_| {
+                        SessionInboxError::Storage("invalid inbox interrupt watermark".into())
+                    })?;
+                if watermark.version != 3 {
+                    return Err(SessionInboxError::Storage(
+                        "unsupported inbox interrupt watermark version".into(),
+                    ));
+                }
+                Ok(watermark.generation)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Ok(Self::activation_interrupt_snapshot(dir).await?.unwrap_or(0))
+            }
             Err(error) => Err(SessionInboxError::Storage(format!(
                 "read inbox interrupt generation {}: {error}",
                 path.display()
@@ -225,17 +381,24 @@ impl FileSessionInbox {
         }
     }
 
-    async fn oldest_backlog_generation(dir: &Path) -> Result<Option<u64>, SessionInboxError> {
+    async fn oldest_backlog_generation(
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<Option<u64>, SessionInboxError> {
         let mut oldest = None;
         for queue in ["new", "cur"] {
-            for (generation, _, _) in Self::valid_queue_entries(dir, queue).await? {
+            for (generation, _, _) in Self::owned_queue_entries(dir, queue, filesystem).await? {
                 oldest = Some(oldest.map_or(generation, |current: u64| current.min(generation)));
             }
         }
         Ok(oldest)
     }
 
-    fn wrapper(envelope: &SessionMessageEnvelope, generation: u64) -> InboxMessage {
+    fn wrapper(
+        envelope: &SessionMessageEnvelope,
+        generation: u64,
+        intent: Option<SessionInboxActivationIntent>,
+    ) -> InboxMessage {
         let from = match &envelope.source {
             SessionMessageSource::User => AgentRef {
                 session_id: "user".to_string(),
@@ -253,6 +416,15 @@ impl FileSessionInbox {
         // The Maildir filename sorts on this transport timestamp. The original
         // sender timestamp remains intact inside the typed envelope body.
         let transport_time = Utc.timestamp_nanos(generation.min(i64::MAX as u64) as i64);
+        let mut body = serde_json::to_value(envelope).unwrap_or(serde_json::Value::Null);
+        if let (Some(intent), Some(fields)) = (intent, body.as_object_mut()) {
+            // Provider admission strips this transport-owned field. Maildir
+            // publishes permission with the message in the same rename.
+            fields.insert(
+                ACTIVATION_INTENT_KEY.into(),
+                serde_json::to_value(intent).expect("activation intent serialization"),
+            );
+        }
         InboxMessage {
             // Maildir filenames include MsgId. Hashing keeps the filename well
             // below NAME_MAX even when the accepted logical id is 256 bytes.
@@ -264,7 +436,7 @@ impl FileSessionInbox {
             )),
             from,
             kind: InboxKind::SessionEnvelope,
-            body: serde_json::to_value(envelope).unwrap_or(serde_json::Value::Null),
+            body,
             created_at: transport_time,
             correlation_id: envelope
                 .correlation_id
@@ -273,10 +445,118 @@ impl FileSessionInbox {
         }
     }
 
+    fn activation_intent(
+        body: &serde_json::Value,
+    ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
+        let Some(raw) = body.get(ACTIVATION_INTENT_KEY) else {
+            return Ok(None);
+        };
+        let intent: SessionInboxActivationIntent =
+            serde_json::from_value(raw.clone()).map_err(|_| {
+                SessionInboxError::InvalidClaim("invalid SessionInbox activation intent".into())
+            })?;
+        intent.policy()?;
+        Ok(Some(intent))
+    }
+
+    /// An immediate grant applies to one message, never an earlier sibling.
+    fn eligible(
+        generation: u64,
+        prefix: u64,
+        intent: Option<SessionInboxActivationIntent>,
+    ) -> bool {
+        generation > 0 && (generation <= prefix || intent.is_some())
+    }
+
+    fn effective_activation_policy(
+        generation: u64,
+        prefix: u64,
+        interrupt_prefix: u64,
+        intent: Option<SessionInboxActivationIntent>,
+    ) -> Result<SessionActivationPolicy, SessionInboxError> {
+        let own_interrupt = intent.map(|intent| intent.policy()).transpose()?
+            == Some(SessionActivationPolicy::InterruptSpecificWait);
+        Ok(
+            if own_interrupt || (generation <= prefix && generation <= interrupt_prefix) {
+                SessionActivationPolicy::InterruptSpecificWait
+            } else {
+                SessionActivationPolicy::RespectSpecificWait
+            },
+        )
+    }
+
+    async fn queue_intent(
+        &self,
+        path: &Path,
+        versioned: bool,
+    ) -> Result<Option<SessionInboxActivationIntent>, SessionInboxError> {
+        let file = tokio::fs::File::open(path).await.map_err(|error| {
+            SessionInboxError::Storage(format!("read inbox activation intent: {error}"))
+        })?;
+        let limit = self.max_transport_bytes();
+        let size = file
+            .metadata()
+            .await
+            .map_err(|error| {
+                SessionInboxError::Storage(format!("inspect inbox activation bytes: {error}"))
+            })?
+            .len();
+        if size > limit as u64 {
+            return Err(SessionInboxError::InvalidClaim(
+                "inbox activation scan exceeds byte limit".into(),
+            ));
+        }
+        #[cfg(test)]
+        if let Some((entered, release)) = &self.intent_scan_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        // Metadata is only a precheck: growth after stat must not bypass the
+        // bound, even when the transport subsequently fails JSON decoding.
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| {
+                SessionInboxError::Storage(format!("read inbox activation bytes: {error}"))
+            })?;
+        if bytes.len() > limit {
+            return Err(SessionInboxError::InvalidClaim(
+                "inbox activation scan exceeds byte limit".into(),
+            ));
+        }
+        // Corrupt legacy transports remain claim-time quarantine work. Their
+        // presence alone must never grant immediate execution permission.
+        let Ok((wrapper, lease)) = Self::decode_owned_wrapper(&bytes) else {
+            return Ok(None);
+        };
+        if lease.is_some()
+            && !Self::owned_enabled(path.parent().and_then(Path::parent).ok_or_else(|| {
+                SessionInboxError::InvalidClaim("invalid inbox queue path".into())
+            })?)
+            .await?
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "owned lease requires v3 watermarks".into(),
+            ));
+        }
+        if wrapper.kind != InboxKind::SessionEnvelope {
+            return Ok(None);
+        }
+        let intent = Self::activation_intent(&wrapper.body)?;
+        if intent.is_some() && !versioned {
+            return Err(SessionInboxError::InvalidClaim(
+                "activation intent requires its v2 watermark".into(),
+            ));
+        }
+        Ok(intent)
+    }
+
     fn claim_generation(claim_id: &str) -> Result<u64, SessionInboxError> {
         claim_id
             .split_once('-')
             .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
+            .filter(|generation| *generation > 0)
             .ok_or_else(|| {
                 SessionInboxError::InvalidClaim(format!(
                     "claim filename has no ordered generation: {claim_id}"
@@ -345,6 +625,22 @@ impl FileSessionInbox {
         dir: &Path,
         queue: &str,
     ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
+        Self::queue_entries(dir, queue, None).await
+    }
+
+    async fn owned_queue_entries(
+        dir: &Path,
+        queue: &str,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
+        Self::queue_entries(dir, queue, Some(filesystem)).await
+    }
+
+    async fn queue_entries(
+        dir: &Path,
+        queue: &str,
+        filesystem: Option<&OwnedFilesystem>,
+    ) -> Result<Vec<(u64, String, PathBuf)>, SessionInboxError> {
         let queue_dir = dir.join(queue);
         let mut reader = match tokio::fs::read_dir(&queue_dir).await {
             Ok(reader) => reader,
@@ -369,9 +665,14 @@ impl FileSessionInbox {
             }
             match Self::claim_generation(&name) {
                 Ok(generation) => valid.push((generation, name, entry.path())),
-                Err(error) => {
-                    Self::quarantine_claim(dir, &entry.path(), &error.to_string()).await?;
-                }
+                Err(error) => match filesystem {
+                    Some(filesystem) => {
+                        filesystem
+                            .quarantine(dir, &entry.path(), &error.to_string())
+                            .await?
+                    }
+                    None => Self::quarantine_claim(dir, &entry.path(), &error.to_string()).await?,
+                },
             }
         }
         Ok(valid)
@@ -410,7 +711,7 @@ impl FileSessionInbox {
     async fn admitted_receipt(
         dir: &Path,
         requested: &SessionMessageEnvelope,
-    ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
+    ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
         let admitted_path = Self::admitted_path(dir, id);
@@ -448,9 +749,13 @@ impl FileSessionInbox {
                         id
                     )));
                 }
-                return Ok(Some(SessionInboxReceipt {
-                    id: id.clone(),
-                    generation,
+                return Ok(Some(StoredInboxReceipt {
+                    delivery: SessionInboxReceipt {
+                        id: id.clone(),
+                        generation,
+                    },
+                    intent: Self::activation_intent(&receipt)?,
+                    lease: StoredLease::from_value(&receipt)?,
                 }));
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -467,29 +772,46 @@ impl FileSessionInbox {
     async fn existing_receipt(
         dir: &Path,
         requested: &SessionMessageEnvelope,
+        requested_intent: Option<SessionInboxActivationIntent>,
+        filesystem: &OwnedFilesystem,
     ) -> Result<Option<SessionInboxReceipt>, SessionInboxError> {
         if let Some(receipt) = Self::admitted_receipt(dir, requested).await? {
-            return Ok(Some(receipt));
+            if receipt.intent != requested_intent {
+                return Err(SessionInboxError::InvalidClaim(
+                    "message id was reused with different activation intent".into(),
+                ));
+            }
+            return Ok(Some(receipt.delivery));
         }
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
         for queue in ["new", "cur", "cancelled"] {
-            for (generation, _name, path) in Self::valid_queue_entries(dir, queue).await? {
+            for (generation, _name, path) in
+                Self::owned_queue_entries(dir, queue, filesystem).await?
+            {
                 let Ok(bytes) = tokio::fs::read(path).await else {
                     continue;
                 };
-                let Ok(wrapper) = serde_json::from_slice::<InboxMessage>(&bytes) else {
+                let Ok((wrapper, lease)) = Self::decode_owned_wrapper(&bytes) else {
                     continue;
                 };
+                if lease.is_some() && !Self::owned_enabled(dir).await? {
+                    return Err(SessionInboxError::InvalidClaim(
+                        "owned lease requires v3 watermarks".into(),
+                    ));
+                }
                 if wrapper.kind != InboxKind::SessionEnvelope {
                     continue;
                 }
+                let intent = Self::activation_intent(&wrapper.body)?;
                 let Ok(envelope) = serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
                 else {
                     continue;
                 };
                 if &envelope.id == id {
-                    if Self::semantic_digest(&envelope)? != requested_digest {
+                    if Self::semantic_digest(&envelope)? != requested_digest
+                        || intent != requested_intent
+                    {
                         return Err(SessionInboxError::InvalidClaim(format!(
                             "message id {} was reused with different delivery semantics",
                             id
@@ -508,8 +830,12 @@ impl FileSessionInbox {
     async fn deliver_with_lifecycle_held(
         &self,
         envelope: &SessionMessageEnvelope,
-        _lifecycle: &crate::v2::SessionLifecycleReadGuard,
+        authority: InboxAuthority,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        intent: Option<SessionInboxActivationIntent>,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
         envelope
             .validate()
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -522,18 +848,37 @@ impl FileSessionInbox {
             });
         }
 
-        let dir = self.inbox_dir(&envelope.target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        let (dir, filesystem) = self
+            .filesystem_with_authority(&envelope.target_session_id, authority)
+            .await?;
         // Enqueue idempotency is independent from consumer admission dedupe.
         // This closes the legacy-migration crash window (deliver succeeded,
         // source clear did not) without letting deterministic retries fill the
         // bounded backlog.
-        if let Some(receipt) = Self::existing_receipt(&dir, envelope).await? {
+        if let Some(receipt) = Self::existing_receipt(&dir, envelope, intent, &filesystem).await? {
+            if intent.is_some() && !Self::read_activation_watermark(&dir).await?.1 {
+                return Err(SessionInboxError::InvalidClaim(
+                    "activation intent requires its v2 watermark".into(),
+                ));
+            }
             return Ok(receipt);
         }
-        let mailbox = Mailbox::at(&dir);
-        let current = Self::valid_queue_entries(&dir, "new").await?.len()
-            + Self::valid_queue_entries(&dir, "cur").await?.len();
+        if let Some(gate) = gate {
+            if gate.is_cancelled() {
+                return Err(SessionInboxError::AdmissionCancelled);
+            }
+            if gate.is_committed() {
+                return Err(SessionInboxError::Storage(
+                    "committed inbox admission has no matching durable receipt".into(),
+                ));
+            }
+        }
+        let current = Self::owned_queue_entries(&dir, "new", &filesystem)
+            .await?
+            .len()
+            + Self::owned_queue_entries(&dir, "cur", &filesystem)
+                .await?
+                .len();
         if current >= self.limits.max_backlog {
             return Err(SessionInboxError::BacklogFull {
                 current,
@@ -541,15 +886,189 @@ impl FileSessionInbox {
             });
         }
 
-        let generation = Self::next_generation(&dir).await?;
-        mailbox
-            .deliver(&Self::wrapper(envelope, generation))
+        let generation = Self::next_generation(&dir, &filesystem).await?;
+        let wrapper = Self::wrapper(envelope, generation, intent);
+        if intent.is_some() {
+            let bytes = serde_json::to_vec_pretty(&wrapper).map_err(|_| {
+                SessionInboxError::Storage("encode immediate inbox transport".into())
+            })?;
+            if bytes.len() > self.max_transport_bytes() {
+                return Err(SessionInboxError::PayloadTooLarge {
+                    actual: bytes.len(),
+                    limit: self.max_transport_bytes(),
+                });
+            }
+            let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
+            if !versioned {
+                // Fence v1-only readers/writers before publishing any intent.
+                // This preserves the existing coordinator permission exactly;
+                // cancellation may leave this safe upgrade without a message.
+                Self::write_activation_watermark(&dir, prefix, true, &filesystem).await?;
+            }
+        }
+        #[cfg(test)]
+        if gate.is_some() {
+            if let Some((entered, release)) = &self.admission_commit_pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        match filesystem
+            .deliver(&dir, &wrapper, gate)
             .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+        {
+            bamboo_domain::AdmissionCommit::Committed(_) => {}
+            bamboo_domain::AdmissionCommit::Cancelled => {
+                return Err(SessionInboxError::AdmissionCancelled)
+            }
+            bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                return Err(SessionInboxError::Storage(
+                    "committed inbox admission has no matching durable receipt".into(),
+                ))
+            }
+        }
         Ok(SessionInboxReceipt {
             id: envelope.id.clone(),
             generation,
         })
+    }
+
+    async fn ack_unlocked(
+        &self,
+        dir: &Path,
+        target_session_id: &str,
+        claim: &SessionInboxClaim,
+        authority: AckAuthority<'_>,
+    ) -> Result<(), SessionInboxError> {
+        let expected_lease = authority.lease();
+        let cur_path = dir.join("cur").join(&claim.claim_id);
+        let bytes = match tokio::fs::read(&cur_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // Idempotent retry only when the exact permanent receipt is
+                // already present. A missing claim without that proof is stale.
+                return match Self::admitted_receipt(dir, &claim.envelope).await? {
+                    Some(receipt)
+                        if receipt.delivery.generation == claim.generation
+                            && StoredLease::same_optional_identity(
+                                receipt.lease.as_ref(),
+                                expected_lease,
+                            ) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(SessionInboxError::InvalidClaim(format!(
+                        "canonical claim no longer exists: {}",
+                        claim.claim_id
+                    ))),
+                };
+            }
+            Err(error) => {
+                return Err(SessionInboxError::Storage(format!(
+                    "read claimed message {}: {error}",
+                    cur_path.display()
+                )));
+            }
+        };
+        let (wrapper, stored_lease) = Self::decode_owned_wrapper(&bytes)?;
+        if !StoredLease::same_optional_identity(stored_lease.as_ref(), expected_lease) {
+            return Err(SessionInboxError::InvalidClaim(
+                "Inbox lease identity mismatch".into(),
+            ));
+        }
+        if wrapper.kind != InboxKind::SessionEnvelope {
+            return Err(SessionInboxError::InvalidClaim(format!(
+                "canonical claim {} has kind {:?}",
+                claim.claim_id, wrapper.kind
+            )));
+        }
+        let intent = Self::activation_intent(&wrapper.body)?;
+        let persisted: SessionMessageEnvelope =
+            serde_json::from_value(wrapper.body).map_err(|error| {
+                SessionInboxError::InvalidClaim(format!(
+                    "decode canonical envelope {}: {error}",
+                    claim.claim_id
+                ))
+            })?;
+        let filename_generation = Self::claim_generation(&claim.claim_id)?;
+        if filename_generation != claim.generation
+            || persisted.id != claim.envelope.id
+            || persisted.target_session_id != target_session_id
+            || persisted != claim.envelope
+        {
+            return Err(SessionInboxError::InvalidClaim(format!(
+                "canonical claim mismatch for {}",
+                claim.claim_id
+            )));
+        }
+
+        let admitted_path = Self::admitted_path(dir, &claim.envelope.id);
+        if let Some(existing) = Self::admitted_receipt(dir, &claim.envelope).await? {
+            if existing.delivery.generation != claim.generation
+                || existing.intent != intent
+                || !StoredLease::same_optional_identity(existing.lease.as_ref(), expected_lease)
+            {
+                return Err(SessionInboxError::InvalidClaim(format!(
+                    "admitted receipt generation mismatch for {}",
+                    claim.envelope.id
+                )));
+            }
+        }
+        let mut receipt = serde_json::json!({
+            "id": claim.envelope.id,
+            "generation": claim.generation,
+            "semantic_digest": Self::semantic_digest(&claim.envelope)?,
+            "admitted_at": Utc::now(),
+        });
+        if let Some(intent) = intent {
+            receipt.as_object_mut().expect("receipt object").insert(
+                ACTIVATION_INTENT_KEY.into(),
+                serde_json::to_value(intent).expect("activation intent serialization"),
+            );
+        }
+        if let Some(lease) = expected_lease {
+            receipt.as_object_mut().expect("receipt object").insert(
+                owned::LEASE_KEY.into(),
+                serde_json::to_value(lease).expect("lease serialization"),
+            );
+        }
+        let receipt = serde_json::to_vec_pretty(&receipt)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let admitted_dir = admitted_path.parent().ok_or_else(|| {
+            SessionInboxError::Storage(format!(
+                "admitted receipt has no parent: {}",
+                admitted_path.display()
+            ))
+        })?;
+        authority.create_dir(admitted_dir).await.map_err(|error| {
+            SessionInboxError::Storage(format!(
+                "create admitted receipt directory {}: {error}",
+                admitted_dir.display()
+            ))
+        })?;
+        authority
+            .write(&admitted_path, &receipt)
+            .await
+            .map_err(|error| {
+                SessionInboxError::Storage(format!("persist admitted receipt: {error}"))
+            })?;
+
+        #[cfg(test)]
+        if expected_lease.is_some() && self.owned_ack_after_receipt_failure {
+            return Err(SessionInboxError::Storage(
+                "injected post-receipt ACK failure".into(),
+            ));
+        }
+
+        match authority.remove(&cur_path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SessionInboxError::Storage(format!(
+                "remove claimed message {}: {error}",
+                cur_path.display()
+            ))),
+        }
     }
 
     fn validate_claim_name(claim_id: &str) -> Result<(), SessionInboxError> {
@@ -568,12 +1087,105 @@ impl FileSessionInbox {
 
 #[async_trait]
 impl SessionInboxPort for FileSessionInbox {
+    async fn claim_owned(
+        &self,
+        target: &str,
+        limit: usize,
+        run: Option<&str>,
+        request: &bamboo_domain::SessionInboxLeaseRequest,
+    ) -> Result<Vec<bamboo_domain::SessionInboxOwnedClaim>, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let run = run.map(str::to_owned);
+        let request = request.clone();
+        owned::complete_owned(async move {
+            inbox
+                .claim_owned_impl(&target, limit, run.as_deref(), &request)
+                .await
+        })
+        .await
+    }
+
+    async fn renew_owned(
+        &self,
+        target: &str,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+        request: &bamboo_domain::SessionInboxLeaseRequest,
+    ) -> Result<bamboo_domain::SessionInboxOwnedClaim, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let claim = claim.clone();
+        let request = request.clone();
+        owned::complete_owned(
+            async move { inbox.renew_owned_impl(&target, &claim, &request).await },
+        )
+        .await
+    }
+
+    async fn ack_owned(
+        &self,
+        target: &str,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let claim = claim.clone();
+        owned::complete_owned(async move { inbox.ack_owned_impl(&target, &claim, now).await }).await
+    }
+
+    async fn inspect_owned_leases(
+        &self,
+        target: &str,
+        limit: usize,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<bamboo_domain::SessionInboxLeaseInspection>, SessionInboxError> {
+        self.inspect_owned_impl(target, limit, now).await
+    }
+
     async fn deliver(
         &self,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let lifecycle = self.lock_lifecycle().await?;
-        self.deliver_with_lifecycle_held(envelope, &lifecycle).await
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn deliver_with_gate(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let lifecycle = self.lock_lifecycle().await?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            Some(gate),
+            None,
+        )
+        .await
+    }
+
+    async fn deliver_with_activation_intent(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        policy: SessionActivationPolicy,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let lifecycle = self.lock_lifecycle().await?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            gate,
+            Some(SessionInboxActivationIntent::new(policy)),
+        )
+        .await
     }
 
     async fn deliver_supervisor_followup(
@@ -604,8 +1216,15 @@ impl SessionInboxPort for FileSessionInbox {
         // Never call public deliver here: a queued lifecycle writer would make
         // that nested shared acquisition deadlock. This is the same adapter,
         // operation lock, semantic receipt and Maildir transaction as deliver.
-        self.deliver_with_lifecycle_held(envelope, authority.lifecycle())
-            .await
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Supervisor { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
     }
 
     async fn mark_activation_eligible(
@@ -614,9 +1233,9 @@ impl SessionInboxPort for FileSessionInbox {
         generation: u64,
         policy: SessionActivationPolicy,
     ) -> Result<(), SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
         let delivered_generation = Self::read_generation(&dir).await?;
         if generation == 0 || generation > delivered_generation {
             return Err(SessionInboxError::InvalidClaim(format!(
@@ -630,30 +1249,30 @@ impl SessionInboxPort for FileSessionInbox {
         if policy == SessionActivationPolicy::InterruptSpecificWait {
             let current_interrupt = Self::read_interrupt_generation(&dir).await?;
             if generation > current_interrupt {
-                atomic_write(
-                    &dir.join(INTERRUPT_GENERATION_FILE),
-                    generation.to_string().as_bytes(),
-                )
-                .await
-                .map_err(|error| {
-                    SessionInboxError::Storage(format!(
-                        "persist inbox interrupt generation: {error}"
-                    ))
-                })?;
+                Self::write_interrupt_watermark(&dir, generation, &filesystem).await?;
             }
         }
-        let current = Self::read_activation_generation(&dir).await?;
+        let (current, versioned) = Self::read_activation_watermark(&dir).await?;
         if generation > current {
-            atomic_write(
-                &dir.join(ACTIVATION_GENERATION_FILE),
-                generation.to_string().as_bytes(),
-            )
-            .await
-            .map_err(|error| {
-                SessionInboxError::Storage(format!("persist inbox activation generation: {error}"))
-            })?;
+            #[cfg(test)]
+            if self.activation_write_failure {
+                return Err(SessionInboxError::Storage(
+                    "injected activation watermark write failure".into(),
+                ));
+            }
+            Self::write_activation_watermark(&dir, generation, versioned, &filesystem).await?;
         }
         Ok(())
+    }
+
+    async fn coordinator_activation_generation(
+        &self,
+        target_session_id: &str,
+    ) -> Result<u64, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        Self::read_activation_generation(&dir).await
     }
 
     async fn claim(
@@ -673,25 +1292,30 @@ impl SessionInboxPort for FileSessionInbox {
         let _lifecycle = self.lock_lifecycle().await?;
         let dir = self.inbox_dir(target_session_id).await?;
         let _guard = self.lock_operation(&dir).await?;
+        if Self::owned_enabled(&dir).await? {
+            return Err(SessionInboxError::InvalidClaim(
+                "owned Inbox claim API required".into(),
+            ));
+        }
         let mailbox = Mailbox::at(&dir);
         mailbox
             .ensure_dirs()
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        let activation_generation = Self::read_activation_generation(&dir).await?;
+        let (activation_generation, versioned) = Self::read_activation_watermark(&dir).await?;
         let limit = limit.min(self.limits.max_claim_batch);
-        if activation_generation == 0 || limit == 0 {
+        if limit == 0 {
             return Ok(Vec::new());
         }
+        let interrupt_prefix = Self::read_interrupt_generation(&dir).await?;
 
-        // Claim only the prefix explicitly authorized by a durable producer
-        // watermark. In particular, recovering `cur/` after a crash must not
-        // let a newer, merely staged generation hitch a ride on an older
-        // activation. Unauthorized files stay exactly where they are.
+        // The coordinator grants a prefix; an immediate producer grants only
+        // its own message. Recovery cannot promote an earlier staged sibling.
         let mut eligible = Vec::new();
         for queue in ["cur", "new"] {
-            for (generation, name, _) in Self::valid_queue_entries(&dir, queue).await? {
-                if generation <= activation_generation {
+            for (generation, name, path) in Self::valid_queue_entries(&dir, queue).await? {
+                let intent = self.queue_intent(&path, versioned).await?;
+                if Self::eligible(generation, activation_generation, intent) {
                     if let Some(run_id) = active_run_id {
                         let path = dir.join(queue).join(&name);
                         let bytes = tokio::fs::read(&path)
@@ -707,7 +1331,17 @@ impl SessionInboxPort for FileSessionInbox {
                             }
                         }
                     }
-                    eligible.push((generation, name, queue == "cur"));
+                    eligible.push((
+                        generation,
+                        name,
+                        queue == "cur",
+                        Self::effective_activation_policy(
+                            generation,
+                            activation_generation,
+                            interrupt_prefix,
+                            intent,
+                        )?,
+                    ));
                 }
             }
         }
@@ -721,7 +1355,7 @@ impl SessionInboxPort for FileSessionInbox {
         });
 
         let mut claims = Vec::new();
-        for (_generation, claim_id, already_claimed) in eligible {
+        for (_generation, claim_id, already_claimed, activation_policy) in eligible {
             if claims.len() >= limit {
                 break;
             }
@@ -760,6 +1394,7 @@ impl SessionInboxPort for FileSessionInbox {
                 Ok(SessionInboxClaim {
                     envelope,
                     generation,
+                    activation_policy,
                     claim_id,
                 })
             })();
@@ -815,118 +1450,29 @@ impl SessionInboxPort for FileSessionInbox {
         Self::validate_claim_name(&claim.claim_id)?;
         if claim.envelope.target_session_id != target_session_id {
             return Err(SessionInboxError::InvalidClaim(
-                "claim target mismatch".to_string(),
+                "claim target mismatch".into(),
             ));
         }
         let _lifecycle = self.lock_lifecycle().await?;
         let dir = self.inbox_dir(target_session_id).await?;
         let _guard = self.lock_operation(&dir).await?;
-        let cur_path = dir.join("cur").join(&claim.claim_id);
-        let bytes = match tokio::fs::read(&cur_path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                // Idempotent retry only when the exact permanent receipt is
-                // already present. A missing claim without that proof is stale.
-                return match Self::admitted_receipt(&dir, &claim.envelope).await? {
-                    Some(receipt) if receipt.generation == claim.generation => Ok(()),
-                    _ => Err(SessionInboxError::InvalidClaim(format!(
-                        "canonical claim no longer exists: {}",
-                        claim.claim_id
-                    ))),
-                };
-            }
-            Err(error) => {
-                return Err(SessionInboxError::Storage(format!(
-                    "read claimed message {}: {error}",
-                    cur_path.display()
-                )));
-            }
-        };
-        let wrapper: InboxMessage = serde_json::from_slice(&bytes).map_err(|error| {
-            SessionInboxError::InvalidClaim(format!(
-                "decode canonical claim {}: {error}",
-                claim.claim_id
-            ))
-        })?;
-        if wrapper.kind != InboxKind::SessionEnvelope {
-            return Err(SessionInboxError::InvalidClaim(format!(
-                "canonical claim {} has kind {:?}",
-                claim.claim_id, wrapper.kind
-            )));
+        if Self::owned_enabled(&dir).await? {
+            return Err(SessionInboxError::InvalidClaim(
+                "owned Inbox ACK API required".into(),
+            ));
         }
-        let persisted: SessionMessageEnvelope =
-            serde_json::from_value(wrapper.body).map_err(|error| {
-                SessionInboxError::InvalidClaim(format!(
-                    "decode canonical envelope {}: {error}",
-                    claim.claim_id
-                ))
-            })?;
-        let filename_generation = Self::claim_generation(&claim.claim_id)?;
-        if filename_generation != claim.generation
-            || persisted.id != claim.envelope.id
-            || persisted.target_session_id != target_session_id
-            || persisted != claim.envelope
-        {
-            return Err(SessionInboxError::InvalidClaim(format!(
-                "canonical claim mismatch for {}",
-                claim.claim_id
-            )));
-        }
-
-        let admitted_path = Self::admitted_path(&dir, &claim.envelope.id);
-        if let Some(existing) = Self::admitted_receipt(&dir, &claim.envelope).await? {
-            if existing.generation != claim.generation {
-                return Err(SessionInboxError::InvalidClaim(format!(
-                    "admitted receipt generation mismatch for {}",
-                    claim.envelope.id
-                )));
-            }
-        }
-        let receipt = serde_json::to_vec_pretty(&serde_json::json!({
-            "id": claim.envelope.id,
-            "generation": claim.generation,
-            "semantic_digest": Self::semantic_digest(&claim.envelope)?,
-            "admitted_at": Utc::now(),
-        }))
-        .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        let admitted_dir = admitted_path.parent().ok_or_else(|| {
-            SessionInboxError::Storage(format!(
-                "admitted receipt has no parent: {}",
-                admitted_path.display()
-            ))
-        })?;
-        tokio::fs::create_dir_all(admitted_dir)
+        self.ack_unlocked(&dir, target_session_id, claim, AckAuthority::Legacy)
             .await
-            .map_err(|error| {
-                SessionInboxError::Storage(format!(
-                    "create admitted receipt directory {}: {error}",
-                    admitted_dir.display()
-                ))
-            })?;
-        atomic_write(&admitted_path, &receipt)
-            .await
-            .map_err(|error| {
-                SessionInboxError::Storage(format!("persist admitted receipt: {error}"))
-            })?;
-
-        match tokio::fs::remove_file(&cur_path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(SessionInboxError::Storage(format!(
-                "remove claimed message {}: {error}",
-                cur_path.display()
-            ))),
-        }
     }
 
     async fn pending_guidance(
         &self,
         target_session_id: &str,
     ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        let mut entries = Self::valid_queue_entries(&dir, "new").await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "new", &filesystem).await?;
         entries.sort_by_key(|entry| entry.0);
         let mut result = Vec::new();
         for (_, _, path) in entries {
@@ -949,12 +1495,12 @@ impl SessionInboxPort for FileSessionInbox {
         target_session_id: &str,
         id: &SessionMessageId,
     ) -> Result<bool, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
         // The same operation lock protects claim and withdrawal across adapters.
         // Retain the original envelope as a permanent deduplication tombstone.
-        for (_, name, path) in Self::valid_queue_entries(&dir, "new").await? {
+        for (_, name, path) in Self::owned_queue_entries(&dir, "new", &filesystem).await? {
             let bytes = tokio::fs::read(&path)
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -966,10 +1512,8 @@ impl SessionInboxPort for FileSessionInbox {
                 && envelope.is_guidance()
                 && envelope.target_session_id == target_session_id
             {
-                tokio::fs::create_dir_all(dir.join("cancelled"))
-                    .await
-                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-                tokio::fs::rename(path, dir.join("cancelled").join(name))
+                filesystem
+                    .cancel(&dir, &path, &name)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
                 return Ok(true);
@@ -982,18 +1526,45 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         target_session_id: &str,
     ) -> Result<SessionInboxBacklog, SessionInboxError> {
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        let pending = Self::valid_queue_entries(&dir, "new").await?.len();
-        let claimed = Self::valid_queue_entries(&dir, "cur").await?.len();
+        #[cfg(test)]
+        let _scope_drop = owned::ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target_session_id).await?;
+        let pending = Self::owned_queue_entries(&dir, "new", &filesystem)
+            .await?
+            .len();
+        let claimed = Self::owned_queue_entries(&dir, "cur", &filesystem)
+            .await?
+            .len();
+        let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
+        let interrupt_prefix = Self::read_interrupt_generation(&dir).await?;
+        let mut activation_generation = prefix;
+        let mut interrupt_generation = 0;
+        for queue in ["new", "cur"] {
+            for (generation, _, path) in Self::owned_queue_entries(&dir, queue, &filesystem).await?
+            {
+                let intent = self.queue_intent(&path, versioned).await?;
+                if Self::eligible(generation, prefix, intent) {
+                    activation_generation = activation_generation.max(generation);
+                    if Self::effective_activation_policy(
+                        generation,
+                        prefix,
+                        interrupt_prefix,
+                        intent,
+                    )? == SessionActivationPolicy::InterruptSpecificWait
+                    {
+                        interrupt_generation = interrupt_generation.max(generation);
+                    }
+                }
+            }
+        }
         Ok(SessionInboxBacklog {
             pending,
             claimed,
             generation: Self::read_generation(&dir).await?,
-            activation_generation: Self::read_activation_generation(&dir).await?,
-            interrupt_generation: Self::read_interrupt_generation(&dir).await?,
-            oldest_generation: Self::oldest_backlog_generation(&dir).await?,
+            activation_generation,
+            coordinator_generation: prefix,
+            interrupt_generation,
+            oldest_generation: Self::oldest_backlog_generation(&dir, &filesystem).await?,
         })
     }
 }
@@ -1001,6 +1572,14 @@ impl SessionInboxPort for FileSessionInbox {
 #[cfg(test)]
 #[path = "session_inbox_supervisor_tests.rs"]
 mod supervisor_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_activation_tests.rs"]
+mod activation_intent_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_owned_tests.rs"]
+mod owned_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1035,6 +1614,58 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_inbox_commit_publishes_no_message_after_restart() {
+        let (_temp, sessions, mut inbox) = fixture(SessionInboxLimits::default()).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        inbox.admission_commit_pause = Some((entered.clone(), release.clone()));
+        let inbox = Arc::new(inbox);
+        let envelope = SessionMessageEnvelope::user_input("session-1", "cancel me");
+        let gate = Arc::new(bamboo_domain::AdmissionGate::default());
+        let delivery = {
+            let inbox = inbox.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move { inbox.deliver_with_gate(&envelope, &gate).await })
+        };
+        entered.notified().await;
+        gate.cancel_if_pending();
+        release.notify_one();
+        assert!(matches!(
+            delivery.await.unwrap(),
+            Err(SessionInboxError::AdmissionCancelled)
+        ));
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        let backlog = reopened.inspect("session-1").await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert_eq!(backlog.activation_generation, 0);
+        let dir = reopened.inbox_dir("session-1").await.unwrap().join("new");
+        let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_gate_reuses_exact_receipt_after_retry_and_restart() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let envelope = SessionMessageEnvelope::user_input("session-1", "once");
+        let gate = bamboo_domain::AdmissionGate::default();
+        let first = inbox.deliver_with_gate(&envelope, &gate).await.unwrap();
+        gate.cancel_if_pending();
+        assert!(gate.is_committed());
+        assert_eq!(
+            inbox.deliver_with_gate(&envelope, &gate).await.unwrap(),
+            first
+        );
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        assert_eq!(
+            reopened.deliver_with_gate(&envelope, &gate).await.unwrap(),
+            first
+        );
+        let backlog = reopened.inspect("session-1").await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert_eq!(backlog.generation, first.generation);
     }
 
     #[tokio::test]
@@ -1594,6 +2225,7 @@ mod tests {
         let fabricated = SessionInboxClaim {
             envelope: envelope.clone(),
             generation: receipt.generation,
+            activation_policy: SessionActivationPolicy::RespectSpecificWait,
             claim_id,
         };
 
@@ -1743,3 +2375,11 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "session_inbox_owned_lifetime_tests.rs"]
+mod owned_lifetime_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_producer_lifetime_tests.rs"]
+mod producer_lifetime_tests;
