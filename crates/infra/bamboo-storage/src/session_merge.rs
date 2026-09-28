@@ -82,6 +82,109 @@ fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     })
 }
 
+/// A synchronous SubAgent tool has already persisted its tagged wait before
+/// launching the child. At runner finalization, the durable copy therefore
+/// owns later completion/rollback changes to that wait. Reconcile inside the
+/// same lock as the final save so completion cannot clear the wait between a
+/// read and a stale write. Untagged runner-created waits stay caller-owned:
+/// their first persistence attempt may have failed and this may be the retry.
+fn adopt_finalized_tool_child_wait(
+    session: &mut Session,
+    latest: &Session,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let incoming = session.agent_runtime_state.as_mut()?;
+    if session
+        .metadata
+        .get("runtime.suspend_reason")
+        .map(String::as_str)
+        != Some("waiting_for_children")
+        || !incoming
+            .waiting_for_children
+            .as_ref()
+            .is_some_and(|wait| wait.registered_by_tool_call_id.is_some())
+    {
+        return None;
+    }
+    let durable = latest.agent_runtime_state.as_ref()?;
+
+    let registered_at = incoming
+        .waiting_for_children
+        .as_ref()
+        .map(|wait| wait.registered_at);
+    incoming.waiting_for_children = durable.waiting_for_children.clone();
+    let cleared = incoming.waiting_for_children.is_none();
+    let cleared_without_other_suspension =
+        cleared && !latest.metadata.contains_key("runtime.suspend_reason");
+    if cleared {
+        incoming.status = durable.status;
+        incoming.suspension = durable.suspension.clone();
+        match latest.metadata.get("runtime.suspend_reason") {
+            Some(reason) => {
+                session
+                    .metadata
+                    .insert("runtime.suspend_reason".to_string(), reason.clone());
+            }
+            None => {
+                session.metadata.remove("runtime.suspend_reason");
+            }
+        }
+    }
+    // The child-session adapter still writes the legacy mirror when it arms
+    // a wait. Keep an existing mirror coherent with the reconciled typed
+    // state; do not create new mirrors for modern sessions.
+    if session.metadata.contains_key("agent.runtime.state") {
+        match serde_json::to_string(incoming) {
+            Ok(serialized) => {
+                session
+                    .metadata
+                    .insert("agent.runtime.state".to_string(), serialized);
+            }
+            Err(_) => {
+                session.metadata.remove("agent.runtime.state");
+            }
+        }
+    }
+    if cleared_without_other_suspension && session.last_run_status().as_deref() == Some("suspended")
+    {
+        session.set_last_run_status("completed");
+    }
+    if cleared {
+        registered_at
+    } else {
+        None
+    }
+}
+
+fn preserve_finalized_hidden_child_resumes(
+    session: &mut Session,
+    latest: &Session,
+    registered_at: chrono::DateTime<chrono::Utc>,
+) {
+    let existing: std::collections::HashSet<_> = session
+        .messages
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect();
+    let missing = latest
+        .messages
+        .iter()
+        .filter(|message| {
+            !existing.contains(message.id.as_str())
+                && message.created_at >= registered_at
+                && message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("runtime_kind"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|kind| {
+                        matches!(kind, "child_completion_resume" | "guardian_review_resume")
+                    })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    session.messages.extend(missing);
+}
+
 /// A pending response is an authoritative compare-and-consume transaction.
 /// When a stale runner still carries the consumed ask, its terminal save must
 /// adopt the durable response control plane instead of resurrecting the ask or
@@ -696,7 +799,28 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, false, publish)
+            .await
+    }
+
+    /// Final runner save with a lock-scoped check for a synchronous child
+    /// completion that raced the pipeline's earlier wait-state read.
+    pub async fn merge_save_finalized_runtime(&self, session: &mut Session) -> std::io::Result<()> {
+        self.merge_save_finalized_runtime_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Publish the reconciled final snapshot under the same serialization
+    /// lock, with the ordinary runtime save's cache-on-failure semantics.
+    pub async fn merge_save_finalized_runtime_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, true, publish)
             .await
     }
 
@@ -914,7 +1038,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner_and_publish(session, false, |_, _| {})
+        self.merge_save_runtime_inner_and_publish(session, false, false, |_, _| {})
             .await
     }
 
@@ -922,6 +1046,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
         adopt_bypass: bool,
+        finalize_child_wait: bool,
         publish: F,
     ) -> std::io::Result<()>
     where
@@ -964,6 +1089,11 @@ impl LockedSessionStore {
         }
 
         if let Some(latest) = latest.as_ref() {
+            if finalize_child_wait {
+                if let Some(registered_at) = adopt_finalized_tool_child_wait(session, latest) {
+                    preserve_finalized_hidden_child_resumes(session, latest, registered_at);
+                }
+            }
             adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
@@ -1340,6 +1470,10 @@ impl LockedSessionStore {
 impl RuntimeSessionPersistence for LockedSessionStore {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
+    }
+
+    async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.merge_save_finalized_runtime(session).await
     }
 
     async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
@@ -4948,6 +5082,147 @@ mod tests {
         assert_eq!(state.status, AgentStatusState::Idle);
         assert!(state.waiting_for_children.is_some());
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+    }
+
+    #[tokio::test]
+    async fn finalized_save_adopts_child_completion_after_pipeline_wait_read() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState,
+            WaitingForChildrenState,
+        };
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut parent = fresh("finalize-fast-child");
+        let mut runtime = AgentRuntimeState::new("parent-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".to_string(),
+            suspended_at: chrono::Utc::now(),
+            resumable: true,
+            hook_point: Some("AfterToolExecution".to_string()),
+        });
+        let mut wait = WaitingForChildrenState::for_children(
+            vec!["fast-child".to_string()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        );
+        wait.registered_by_tool_call_id = Some("spawn-call".to_string());
+        let registered_at = wait.registered_at;
+        runtime.waiting_for_children = Some(wait);
+        parent.agent_runtime_state = Some(runtime);
+        parent.metadata.insert(
+            "agent.runtime.state".to_string(),
+            serde_json::to_string(parent.agent_runtime_state.as_ref().unwrap()).unwrap(),
+        );
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        parent.set_last_run_status("suspended");
+        storage.save_session(&parent).await.unwrap();
+
+        // The pipeline already read this snapshot. Completion then commits
+        // before the runner's final merge-save reaches the per-session lock.
+        let mut stale_runner = parent.clone();
+        let mut completed = parent;
+        let completed_runtime = completed.agent_runtime_state.as_mut().unwrap();
+        completed_runtime.waiting_for_children = None;
+        completed_runtime.status = AgentStatusState::Idle;
+        completed_runtime.suspension = None;
+        completed.metadata.remove("runtime.suspend_reason");
+        let mut old_resume = Message::user("old consumed child outcome");
+        old_resume.created_at = registered_at - chrono::Duration::seconds(1);
+        old_resume.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(old_resume);
+        let mut outcome = Message::user("fast child outcome");
+        outcome.metadata = Some(serde_json::json!({
+            "runtime_kind": "child_completion_resume"
+        }));
+        completed.add_message(outcome);
+        storage.save_session(&completed).await.unwrap();
+
+        RuntimeSessionPersistence::save_finalized_runtime_session(&store, &mut stale_runner)
+            .await
+            .unwrap();
+        let saved = storage
+            .load_session("finalize-fast-child")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = saved.agent_runtime_state.as_ref().unwrap();
+        assert!(state.waiting_for_children.is_none());
+        assert!(state.suspension.is_none());
+        assert_eq!(state.status, AgentStatusState::Idle);
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+        let mirrored: AgentRuntimeState =
+            serde_json::from_str(saved.metadata.get("agent.runtime.state").unwrap()).unwrap();
+        assert!(mirrored.waiting_for_children.is_none());
+        assert_eq!(mirrored.status, AgentStatusState::Idle);
+        assert!(saved
+            .messages
+            .iter()
+            .any(|message| message.content == "fast child outcome"));
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|message| message.content == "old consumed child outcome"));
+    }
+
+    #[tokio::test]
+    async fn finalized_save_retains_unpersisted_untagged_safety_net_wait() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut parent = fresh("finalize-safety-net");
+        parent.agent_runtime_state = Some(AgentRuntimeState::new("parent-run"));
+        storage.save_session(&parent).await.unwrap();
+
+        // A runner-created safety-net wait may reach finalization after its
+        // first persistence attempt failed. There is no durable clear to adopt.
+        let mut runner = parent;
+        let runtime = runner.agent_runtime_state.as_mut().unwrap();
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["active-child".to_string()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        ));
+        runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        runner.set_last_run_status("suspended");
+
+        RuntimeSessionPersistence::save_finalized_runtime_session(&store, &mut runner)
+            .await
+            .unwrap();
+        let saved = storage
+            .load_session("finalize-safety-net")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children
+            .is_some());
+        assert_eq!(
+            saved
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
     }
 
     #[tokio::test]
