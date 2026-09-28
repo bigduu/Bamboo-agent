@@ -3660,6 +3660,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_worker_rejects_project_rebind_before_provider_execution() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, executor, store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        let session_id = "warm-project-identity";
+        let mut first = protocol_run(session_id, "activation-one", Vec::new());
+        first.project_id = Some(bamboo_domain::ProjectId::parse("project-a").unwrap());
+        let (first_outcome, _) = execute_protocol_run(&executor, first).await;
+        assert_eq!(
+            first_outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{first_outcome:?}"
+        );
+        let original = store.load_session(session_id).await.unwrap().unwrap();
+
+        let mut rebind = protocol_run(session_id, "activation-two", Vec::new());
+        rebind.project_id = Some(bamboo_domain::ProjectId::parse("project-b").unwrap());
+        let (outcome, confirmations) = execute_protocol_run(&executor, rebind).await;
+        assert_eq!(
+            outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Error
+        );
+        assert!(outcome.error.as_deref().is_some_and(|error| {
+            error.contains(
+                "warm Child activation disagrees with durable creation identity or Project",
+            )
+        }));
+        assert!(confirmations.is_empty());
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        let durable = store.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(durable.created_at, original.created_at);
+        assert_eq!(durable.project_id_meta(), original.project_id_meta());
+    }
+
+    #[tokio::test]
     async fn lost_confirmation_retry_on_independent_worker_store_keeps_one_context_entry() {
         let provider_a = Arc::new(RecordingWorkerProvider::default());
         let provider_b = Arc::new(RecordingWorkerProvider::default());
