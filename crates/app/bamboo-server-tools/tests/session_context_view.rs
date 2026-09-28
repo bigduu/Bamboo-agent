@@ -51,14 +51,26 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_projects(None, None).await
+    }
+
+    async fn new_with_projects(root_project: Option<&str>, child_project: Option<&str>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(
             SessionStoreV2::new(home.path().to_path_buf())
                 .await
                 .unwrap(),
         );
-        let root = Session::new("context-root", "test-model");
-        let child = Session::new_child_of("context-child", &root, "test-model", "Child preview");
+        let mut root = Session::new("context-root", "test-model");
+        let mut child =
+            Session::new_child_of("context-child", &root, "test-model", "Child preview");
+        if let Some(project) = root_project {
+            root.set_project_id_meta(project);
+            root.metadata_version = root.metadata_version.checked_add(1).unwrap();
+        }
+        if let Some(project) = child_project {
+            child.set_project_id_meta(project);
+        }
         for session in [&root, &child] {
             store.save_session(session).await.unwrap();
         }
@@ -400,17 +412,7 @@ async fn optional_project_identity_must_match_exactly_and_be_valid() {
         (Some("../invalid"), Some("../invalid"), false),
         (Some(""), Some(""), false),
     ] {
-        let mut f = Fixture::new().await;
-        if let Some(project) = root_project {
-            f.root.set_project_id_meta(project);
-            f.root.metadata_version = f.root.metadata_version.checked_add(1).unwrap();
-        }
-        if let Some(project) = child_project {
-            f.child.set_project_id_meta(project);
-        }
-        for session in [&f.root, &f.child] {
-            f.store.save_session(session).await.unwrap();
-        }
+        let f = Fixture::new_with_projects(root_project, child_project).await;
         let result = f
             .tool
             .invoke(
