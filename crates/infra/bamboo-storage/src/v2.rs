@@ -39,10 +39,11 @@ use uuid::Uuid;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
-    MessagePart, ProjectId, Role, RootModeOperationAction, RootModeOperationDecision,
-    RootModeOperationOutcome, RootModeOperationReceipt, RootModeOperationRequest,
-    RootToolAuthorityError, Session, SessionAuthorityIdentity, SessionKind,
-    SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
+    is_matching_session_message, Message, MessagePart, ParentRequest, ParentResolution, ProjectId,
+    Role, RootModeOperationAction, RootModeOperationDecision, RootModeOperationOutcome,
+    RootModeOperationReceipt, RootModeOperationRequest, RootToolAuthorityError, Session,
+    SessionAuthorityIdentity, SessionKind, SessionMessageEnvelope, SupervisorBootstrapReceipt,
+    TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
 mod actor_checkpoint_lineage;
@@ -116,6 +117,113 @@ use bamboo_domain::Storage;
 
 pub(crate) fn other_io_error(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
+}
+
+/// A full-save snapshot predates a durable direct-parent decision. Callers that
+/// checkpoint transcripts may reload and append the missing proof before retrying.
+#[derive(Debug, thiserror::Error)]
+#[error("durable direct-parent permission terminal changed while saving session")]
+pub(crate) struct DirectParentTerminalConflict;
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid direct-parent permission terminal proof")]
+pub(crate) struct DirectParentTerminalProofError;
+
+fn canonical_session_message(message: &Message, envelope: &SessionMessageEnvelope) -> bool {
+    is_matching_session_message(message, envelope)
+        && envelope.to_provider_message().ok().is_some_and(|expected| {
+            serde_json::to_value(message).ok() == serde_json::to_value(expected).ok()
+        })
+}
+
+fn reject_regressing_direct_parent_terminals(
+    incoming: &Session,
+    durable: &Session,
+) -> io::Result<()> {
+    const TERMINAL: &str = "direct_parent_forced_permission_terminal_v1";
+    for (terminal_index, terminal_message) in durable.messages.iter().enumerate() {
+        let Some(marker) = terminal_message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("session_message"))
+        else {
+            continue;
+        };
+        if marker
+            .pointer("/body/instruction")
+            .and_then(serde_json::Value::as_str)
+            != Some(TERMINAL)
+        {
+            continue;
+        }
+        let invalid_proof =
+            || io::Error::new(io::ErrorKind::InvalidData, DirectParentTerminalProofError);
+        let terminal: SessionMessageEnvelope =
+            serde_json::from_value(marker.clone()).map_err(|_| invalid_proof())?;
+        if !canonical_session_message(terminal_message, &terminal)
+            || durable
+                .messages
+                .iter()
+                .filter(|message| message.id == terminal_message.id)
+                .count()
+                != 1
+        {
+            return Err(invalid_proof());
+        }
+        let request_id = terminal.in_reply_to.as_ref().ok_or_else(invalid_proof)?;
+        let mut requests = durable.messages[..terminal_index]
+            .iter()
+            .filter(|message| message.id == request_id.as_str());
+        let request_message = requests.next().ok_or_else(invalid_proof)?;
+        if requests.next().is_some()
+            || durable.messages[terminal_index + 1..]
+                .iter()
+                .any(|message| {
+                    message.id == request_id.as_str() || message.id == terminal_message.id
+                })
+        {
+            return Err(invalid_proof());
+        }
+        let request_marker = request_message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("session_message"))
+            .ok_or_else(invalid_proof)?;
+        let request: SessionMessageEnvelope =
+            serde_json::from_value(request_marker.clone()).map_err(|_| invalid_proof())?;
+        let typed_request =
+            ParentRequest::from_forced_permission_envelope(&request).ok_or_else(invalid_proof)?;
+        if !canonical_session_message(request_message, &request)
+            || typed_request.parent.session_id != durable.id
+            || typed_request.parent.created_at != durable.created_at
+            || typed_request.root_session_id != durable.root_session_id
+            || ParentResolution::from_forced_permission_terminal(&request, &terminal).is_none()
+        {
+            return Err(invalid_proof());
+        }
+
+        for durable_message in [request_message, terminal_message] {
+            let mut matching = incoming
+                .messages
+                .iter()
+                .filter(|message| message.id == durable_message.id);
+            let Some(matched) = matching.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    DirectParentTerminalConflict,
+                ));
+            };
+            if matching.next().is_some()
+                || serde_json::to_value(matched).ok() != serde_json::to_value(durable_message).ok()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    DirectParentTerminalProofError,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Filename of the runtime control-plane sidecar, stored alongside
@@ -5344,6 +5452,24 @@ impl SessionStoreV2 {
         self.validate_child_project_for_write(session, true, None)
             .await?;
         self.reject_regressing_runtime_task(session).await?;
+        // The per-instance LockedSessionStore mutex cannot close another
+        // AppState's load→save window. Check the authoritative transcript while
+        // holding V2's cross-process session write lock, before either file is
+        // changed, so a stale checkpoint cannot erase a recorded decision.
+        // Read only Main: the sidecar is not transcript authority, and a full
+        // save must still be able to repair an interrupted creation whose Main
+        // is missing.
+        let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
+        match fs::read_to_string(current_main).await {
+            Ok(raw) => {
+                compact_main::validate_full_main(raw.as_bytes())?;
+                let durable: Session = serde_json::from_str(&raw)
+                    .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_regressing_direct_parent_terminals(session, &durable)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
 
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();

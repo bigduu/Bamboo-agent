@@ -76,10 +76,19 @@ const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id
 
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
-        error
-            .get_ref()
-            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        error.get_ref().is_some_and(|cause| {
+            cause.is::<bamboo_domain::SessionAuthorityConflict>()
+                || cause.is::<crate::v2::DirectParentTerminalConflict>()
+                || cause.is::<crate::v2::DirectParentTerminalProofError>()
+        })
     })
+}
+
+fn is_direct_parent_terminal_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        && error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<crate::v2::DirectParentTerminalConflict>())
 }
 
 /// Ordinary runner writes do not author tagged tool waits. Their first arm is
@@ -968,7 +977,31 @@ impl LockedSessionStore {
             let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
-        let result = self.save_session_rebasing_task_conflicts(session).await;
+        let mut result = self.save_session_rebasing_task_conflicts(session).await;
+        for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
+            if !result
+                .as_ref()
+                .err()
+                .is_some_and(is_direct_parent_terminal_conflict)
+            {
+                break;
+            }
+            // A second Store can commit the terminal after the first load but
+            // before V2 acquires its cross-process file lock. Rebase this
+            // checkpoint against that durable suffix, then let V2 validate the
+            // retry under the lock again.
+            let Some(durable) = self.storage.load_session(&session.id).await? else {
+                break;
+            };
+            ensure_model_context_checkpoint_is_current(session, &durable)?;
+            bamboo_domain::append_missing_runtime_messages(session, &durable);
+            bamboo_domain::merge_session_inbox_admission(session, &durable);
+            adopt_durable_consumed_clarification(session, &durable);
+            apply_authoritative_metadata(session, &durable);
+            adopt_fresher_disk_permission_posture(session, &durable);
+            let _ = adopt_durable_tagged_child_wait(session, &durable);
+            result = self.save_session_rebasing_task_conflicts(session).await;
+        }
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());
         }
@@ -4599,6 +4632,192 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    fn direct_parent_proof_pair(
+        parent: &Session,
+    ) -> (
+        bamboo_domain::SessionMessageEnvelope,
+        bamboo_domain::SessionMessageEnvelope,
+    ) {
+        use bamboo_domain::{
+            ParentRequest, ParentRequestActivation, ParentRequestActor, ParentRequestDelegation,
+            ParentRequestKind, ParentRequestOption, ParentResolution, SessionMessageBody,
+            SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+            SessionMessageSource, SessionProviderMessage, SessionRuntimeInstruction,
+            PARENT_REQUEST_VERSION,
+        };
+        use serde_json::json;
+
+        let generation = uuid::Uuid::new_v4().to_string();
+        let child_birth = parent.created_at + chrono::Duration::milliseconds(1);
+        let created_at = child_birth;
+        let deadline = created_at + chrono::Duration::seconds(120);
+        let activation = ParentRequestActivation {
+            host_scope: uuid::Uuid::new_v4().to_string(),
+            attempt: 1,
+            run: "run-1".into(),
+            epoch: 1,
+            reply: "reply-1".into(),
+        };
+        let request_id = SessionMessageId::stable(
+            "direct-parent-forced-approval-v1",
+            &json!({
+                "child": "approval-child",
+                "birth": child_birth,
+                "parent": parent.id,
+                "parent_birth": parent.created_at,
+                "generation": generation,
+            }),
+        );
+        let typed = ParentRequest {
+            version: PARENT_REQUEST_VERSION,
+            id: request_id.clone(),
+            generation: generation.clone(),
+            child: ParentRequestActor {
+                session_id: "approval-child".into(),
+                created_at: child_birth,
+            },
+            parent: ParentRequestActor {
+                session_id: parent.id.clone(),
+                created_at: parent.created_at,
+            },
+            root_session_id: parent.root_session_id.clone(),
+            project_id: parent.project_id_meta(),
+            activation: activation.clone(),
+            deadline,
+            kind: ParentRequestKind::ForcedPermission {
+                operation_digest: format!("stable-{}", "a".repeat(64)),
+                policy_revision: 1,
+                maximum_delegation: ParentRequestDelegation::ExactOperationOnce,
+                options: vec![ParentRequestOption::Deny, ParentRequestOption::ApproveOnce],
+            },
+        };
+        let live = json!({
+            "host_scope": activation.host_scope,
+            "attempt": activation.attempt,
+            "run": activation.run,
+            "epoch": activation.epoch,
+            "reply": activation.reply,
+            "deadline": deadline,
+        });
+        let request_text = "Parent permission request";
+        let request = SessionMessageEnvelope {
+            id: request_id.clone(),
+            source: SessionMessageSource::Runtime {
+                subsystem: "direct_parent_permission_review".into(),
+            },
+            target_session_id: parent.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+                instruction: "direct_parent_forced_permission_request_v1".into(),
+                content: Some(SessionMessageContent::text(request_text)),
+                data: Some(json!({
+                    "parent_request": typed,
+                    "parent_created_at": parent.created_at,
+                    "child_session_id": "approval-child",
+                    "child_created_at": child_birth,
+                    "root_session_id": parent.root_session_id,
+                    "project_id": parent.project_id_meta(),
+                    "request_generation": generation,
+                    "operation_digest": format!("stable-{}", "a".repeat(64)),
+                    "policy_revision": 1,
+                    "live": live,
+                })),
+                provider_message: Some(SessionProviderMessage {
+                    content: SessionMessageContent::text(request_text),
+                    metadata: Default::default(),
+                    never_compress: true,
+                }),
+            }),
+            created_at,
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        assert!(ParentRequest::from_forced_permission_envelope(&request).is_some());
+        let resolved_at = created_at + chrono::Duration::seconds(1);
+        let resolution = ParentResolution::for_forced_permission(&typed, resolved_at, false);
+        let terminal_text =
+            "Live parent permission review recorded Denied. This record is not a permission grant.";
+        let mut terminal = request.clone();
+        terminal.id = resolution.id.clone();
+        terminal.created_at = resolved_at;
+        terminal.in_reply_to = Some(request_id.clone());
+        terminal.body = SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: "direct_parent_forced_permission_terminal_v1".into(),
+            content: Some(SessionMessageContent::text(terminal_text)),
+            data: Some(json!({
+                "request": request_id,
+                "live": live,
+                "approved": false,
+                "parent_resolution": resolution,
+            })),
+            provider_message: Some(SessionProviderMessage {
+                content: SessionMessageContent::text(terminal_text),
+                metadata: Default::default(),
+                never_compress: true,
+            }),
+        });
+        assert!(ParentResolution::from_forced_permission_terminal(&request, &terminal).is_some());
+        (request, terminal)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rebases_direct_parent_terminal_committed_by_another_store() {
+        let home = tempfile::tempdir().unwrap();
+        let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let mut parent = fresh("direct-parent-terminal-race");
+        let (request, terminal) = direct_parent_proof_pair(&parent);
+        parent.add_message(request.to_provider_message().unwrap());
+        first.save_session(&parent).await.unwrap();
+        let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+
+        let paused = Arc::new(AuthoritySavePauseStorage {
+            inner: first.clone(),
+            calls: AtomicUsize::new(0),
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        let checkpoint_store = LockedSessionStore::new(paused.clone());
+        let mut stale = parent.clone();
+        stale.add_message(bamboo_domain::Message::assistant("runner output", None));
+        let checkpoint = tokio::spawn(async move {
+            checkpoint_store
+                .checkpoint_runtime_session(&mut stale)
+                .await?;
+            Ok::<_, std::io::Error>(stale)
+        });
+
+        // The first Store has already loaded the pending request and is now
+        // paused before its V2 file lock. Commit the decision through a second
+        // Store, whose in-memory session lock is independent.
+        paused.reached.wait().await;
+        let mut decided = second.load_session(&parent.id).await.unwrap().unwrap();
+        decided.add_message(terminal.to_provider_message().unwrap());
+        second.save_session(&decided).await.unwrap();
+
+        let stale_write = first.save_session(&parent).await.unwrap_err();
+        assert!(is_direct_parent_terminal_conflict(&stale_write));
+        assert!(!may_publish_runtime_result(&Err(stale_write)));
+        let mut forged = decided.clone();
+        forged.messages.last_mut().unwrap().content = "forged decision".into();
+        let forged_write = second.save_session(&forged).await.unwrap_err();
+        assert_eq!(forged_write.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!may_publish_runtime_result(&Err(forged_write)));
+
+        paused.release.wait().await;
+        paused.reached.wait().await;
+        paused.release.wait().await;
+        let reconciled = checkpoint.await.unwrap().unwrap();
+        let saved = second.load_session(&parent.id).await.unwrap().unwrap();
+        assert_eq!(paused.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(saved.messages.len(), 3);
+        assert_eq!(saved.messages[0].id, request.id.as_str());
+        assert_eq!(saved.messages[1].id, terminal.id.as_str());
+        assert_eq!(saved.messages[2].content, "runner output");
+        assert_eq!(reconciled.messages[1].id, terminal.id.as_str());
     }
 
     #[tokio::test]
