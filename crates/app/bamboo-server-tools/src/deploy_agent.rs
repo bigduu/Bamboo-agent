@@ -128,8 +128,8 @@ pub(crate) async fn resolve_deployed_target(
         if caller != saved.parent_actor_id.as_deref() {
             return Err(invalid());
         }
+        let store = store.ok_or_else(invalid)?;
         let current = store
-            .ok_or_else(invalid)?
             .inspect_actor(&saved.actor_id)
             .await
             .map_err(|_| invalid())?;
