@@ -885,7 +885,7 @@ impl AgentRuntime {
         let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
-        let result = run_agent_loop_with_config(
+        let result = Box::pin(run_agent_loop_with_config(
             session,
             initial_message,
             event_tx,
@@ -893,7 +893,7 @@ impl AgentRuntime {
             tools,
             cancel_token,
             loop_config,
-        )
+        ))
         .await;
 
         crate::runtime::hooks::run_session_end_hooks(

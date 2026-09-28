@@ -1043,6 +1043,129 @@ fn progressive_effective_set_intersects_final_session_eligible_catalog() {
 }
 
 #[test]
+fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "SubAgent",
+            "Plan",
+            "Task",
+            "session_history_current",
+            "Read",
+            "Grep",
+            "Glob",
+            "GetFileInfo",
+            "ViewImage",
+            "Bash",
+            "Edit",
+            "Write",
+            "load_skill",
+            "workflow_run",
+            "mcp__external__read",
+            "read_file",
+            "default::Read",
+            "execute_command",
+            "Workspace",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let mut root = Session::new("orchestration-root", "model");
+    root.set_root_orchestration_only(true).unwrap();
+
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &root);
+    let names = catalog
+        .iter()
+        .map(|entry| entry.execution_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+            .into_iter()
+            .collect()
+    );
+    let provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &root)
+        .into_iter()
+        .map(|entry| entry.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        provider_names,
+        names.iter().map(|name| (*name).to_string()).collect()
+    );
+    let discovery_names =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+            .into_iter()
+            .map(|entry| entry.canonical_name)
+            .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(discovery_names, provider_names);
+
+    let child = Session::new_child_of("worker", &root, "model", "worker");
+    let child_names = resolve_classified_tool_catalog_for_session(&config, &tools, &child)
+        .into_iter()
+        .map(|entry| entry.execution_name().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(child_names.contains("Bash"));
+    assert!(child_names.contains("Edit"));
+    assert!(child_names.contains("load_skill"));
+    assert!(child_names.contains("mcp__external__read"));
+}
+
+#[test]
+fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "Read",
+            "Bash",
+            "Edit",
+            "read_file",
+            "apply_patch",
+            "mcp__x__run",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let mut root = Session::new("progressive-root", "model");
+    root.set_root_orchestration_only(true).unwrap();
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &root);
+    let effective = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        [
+            "Bash",
+            "default::Bash",
+            "apply_patch",
+            "read_file",
+            "mcp__x__run",
+        ],
+    );
+
+    assert_eq!(
+        effective.execution_names().collect::<Vec<_>>(),
+        vec!["Read"]
+    );
+    for denied in [
+        "Bash",
+        "default::Bash",
+        "Edit",
+        "apply_patch",
+        "mcp__x__run",
+    ] {
+        assert_eq!(
+            effective.resolve_callable_reference(denied),
+            None,
+            "{denied}"
+        );
+    }
+    assert_eq!(
+        effective.resolve_callable_reference("default::Read"),
+        Some("Read".to_string())
+    );
+}
+
+#[test]
 fn browser_eval_is_independently_deferred_from_ordinary_browser_controls() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {

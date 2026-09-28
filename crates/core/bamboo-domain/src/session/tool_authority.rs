@@ -96,9 +96,23 @@ impl Session {
         &mut self,
         latest: &Session,
     ) -> Result<(), RootToolAuthorityError> {
+        // A tool policy revision is meaningful only within the same Session
+        // lifetime. A deleted Root ID can be recreated with a fresh birth, so
+        // matching the ID and revision alone would authorize an old SDK run.
+        fn root_id(session: &Session) -> &str {
+            if session.kind == SessionKind::Root && session.root_session_id.is_empty() {
+                session.id.as_str()
+            } else {
+                session.root_session_id.as_str()
+            }
+        }
         if self.id != latest.id
             || self.kind != latest.kind
+            || self.created_at != latest.created_at
+            || self.authority_identity != latest.authority_identity
             || self.parent_session_id != latest.parent_session_id
+            || root_id(self) != root_id(latest)
+            || self.spawn_depth != latest.spawn_depth
             || (self.root_orchestration_only && self.root_tool_authority_revision == 0)
             || (latest.root_orchestration_only && latest.root_tool_authority_revision == 0)
             || latest.root_tool_authority_revision < self.root_tool_authority_revision
@@ -181,6 +195,50 @@ mod tests {
         durable.set_root_orchestration_only(false).unwrap();
         running.adopt_root_tool_authority_from(&durable).unwrap();
         assert!(running.allows_model_tool_execution("Bash"));
+    }
+
+    #[test]
+    fn durable_refresh_rejects_a_different_birth_identity_or_lineage() {
+        let running = Session::new("root", "model");
+        let mut other_birth = running.clone();
+        other_birth.created_at += chrono::Duration::microseconds(1);
+        assert_eq!(
+            running.clone().adopt_root_tool_authority_from(&other_birth),
+            Err(RootToolAuthorityError::StaleSnapshot)
+        );
+
+        let mut other_identity = running.clone();
+        other_identity.authority_identity = super::super::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            running
+                .clone()
+                .adopt_root_tool_authority_from(&other_identity),
+            Err(RootToolAuthorityError::StaleSnapshot)
+        );
+
+        let mut other_lineage = running.clone();
+        other_lineage.root_session_id = "another-root".into();
+        assert_eq!(
+            running
+                .clone()
+                .adopt_root_tool_authority_from(&other_lineage),
+            Err(RootToolAuthorityError::StaleSnapshot)
+        );
+        other_lineage = running.clone();
+        other_lineage.spawn_depth = 1;
+        assert_eq!(
+            running
+                .clone()
+                .adopt_root_tool_authority_from(&other_lineage),
+            Err(RootToolAuthorityError::StaleSnapshot)
+        );
+
+        // Legacy Roots can omit this derived field without changing lineage.
+        let mut legacy = running.clone();
+        legacy.root_session_id.clear();
+        legacy.adopt_root_tool_authority_from(&running).unwrap();
     }
 
     #[test]

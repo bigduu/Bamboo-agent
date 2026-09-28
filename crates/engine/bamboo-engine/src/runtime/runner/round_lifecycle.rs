@@ -45,6 +45,22 @@ fn request_tool_schemas_for_loading_mode<'a>(
     mode: bamboo_domain::CapabilityLoadingMode,
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
+    if session.root_orchestration_only_enabled() {
+        // The full bounded catalog is already selected for this Root. A
+        // provider-specific discovery gateway must not reintroduce an
+        // unapproved tenth tool after that selection.
+        return Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| {
+                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
+                        |entry| session.allows_model_tool_execution(entry.execution_name()),
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+    }
     if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
         // Legacy providers keep every other Deferred function unchanged. Only
         // the shared browser is replaced with a small discovery gateway until
@@ -491,6 +507,50 @@ mod tests {
         assert!(request_tools.iter().all(|tool| {
             tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
         }));
+    }
+
+    #[tokio::test]
+    async fn selected_root_provider_never_receives_discovery_or_denied_tools() {
+        let provider = Arc::new(StickyCapturingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let mut session = Session::new("selected-root-tools", "chat-model");
+        session.set_root_orchestration_only(true).unwrap();
+        session.add_message(Message::user("coordinate this task"));
+        let config = AgentLoopConfig {
+            model_name: Some("chat-model".to_string()),
+            ..Default::default()
+        };
+        let tools = vec![
+            schema("Read"),
+            schema("SubAgent"),
+            schema("Plan"),
+            schema("Task"),
+            schema("Bash"),
+            schema("discover_capabilities"),
+        ];
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        execute_llm_round(
+            &mut session,
+            &config,
+            &llm,
+            &event_tx,
+            &CancellationToken::new(),
+            "selected-root-tools",
+            "chat-model",
+            &tools,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.requests.lock().unwrap()[0]
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "SubAgent", "Plan", "Task"]
+        );
     }
 
     #[tokio::test]

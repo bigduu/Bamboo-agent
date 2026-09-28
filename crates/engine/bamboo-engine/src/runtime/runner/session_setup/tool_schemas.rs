@@ -228,6 +228,10 @@ fn resolve_catalog_with_activation(
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     prefer_delegated_plan_tool(session, &mut by_execution_name);
+    // Apply the durable Root authority to exact registered execution names.
+    // This catalog feeds both provider schemas and capability discovery, so
+    // aliases and custom registrations cannot reintroduce a denied tool.
+    by_execution_name.retain(|name, _| session.allows_model_tool_execution(name));
 
     let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
     catalog.sort_by(|left, right| {
