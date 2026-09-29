@@ -1,9 +1,12 @@
 //! Real WSS frames and physical ACK effects; no Echo executor or mock core.
+use bamboo_broker::proto::FencedRunEnvelope;
 use bamboo_broker::{
-    client_config_trusting_cert, BrokerCore, BrokerFrame, BrokerLimits, BrokerServer, ClientFrame,
-    PeerPolicy,
+    client_config_trusting_cert, BrokerChildLink, BrokerCore, BrokerFrame, BrokerLimits,
+    BrokerServer, ClientFrame, PeerPolicy,
 };
-use bamboo_subagent::{ActorEventBatch, ActorEventQos, AgentRef, InboxKind, InboxMessage, MsgId};
+use bamboo_subagent::{
+    ActorEventBatch, ActorEventQos, AgentRef, ChildLink, InboxKind, InboxMessage, MsgId,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -246,6 +249,73 @@ fn bounded_closed_policy_rejects_ambiguity_without_echo() {
         .replacen("\"host\":", "\"host\":\"duplicate\",\"host\":", 1);
     assert!(PeerPolicy::from_json(raw.as_bytes()).is_err());
     assert!(PeerPolicy::from_json(&vec![b' '; 65537]).is_err());
+}
+
+#[tokio::test]
+async fn scoped_receipt_ack_does_not_replace_the_active_mailbox_subscriber() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert, key) = cert(tmp.path());
+    let core = Arc::new(BrokerCore::new_scoped(tmp.path()));
+    let (url, task) = listen(core.clone(), policy(), &cert, &key, BrokerLimits::default()).await;
+
+    let mut active = login(&url, &cert, "b", B).await;
+    send(&mut active, ClientFrame::Subscribe).await;
+    let mut sender = login(&url, &cert, "a", A).await;
+    let first = message();
+    let first_id = first.id.clone();
+    send(&mut sender, delivery("b", first)).await;
+    assert!(matches!(recv(&mut sender).await, BrokerFrame::Delivered { id } if id == first_id));
+    assert!(
+        matches!(recv(&mut active).await, BrokerFrame::Message { message } if message.id == first_id)
+    );
+
+    // The same ACK id under another authenticated mailbox cannot delete b's
+    // pending frame, even though ACK is idempotent for that other mailbox.
+    let wrong_request = MsgId::new();
+    send(
+        &mut sender,
+        ClientFrame::AckWithReceipt {
+            id: first_id.clone(),
+            request_id: wrong_request.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut sender).await, BrokerFrame::AckResult { id, request_id, accepted: true, .. }
+        if id == first_id && request_id == wrong_request)
+    );
+    let mailbox = bamboo_subagent::Mailbox::at(tmp.path().join("scoped-peers-v1/mailboxes/b"));
+    assert_eq!(mailbox.recover().await.unwrap().len(), 1);
+
+    let mut recovery = BrokerChildLink::connect_receipt_recovery_with_tls(
+        &url,
+        agent("b"),
+        B,
+        client_config_trusting_cert(&cert).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovery.parent_mailbox(), "b");
+    recovery
+        .acknowledge_recovered_durable_frames(
+            &core.broker_identity().await.unwrap(),
+            &[first_id.as_str().to_owned()],
+        )
+        .await
+        .unwrap();
+    assert!(core.is_subscribed("b").await);
+    assert!(mailbox.recover().await.unwrap().is_empty());
+    drop(recovery);
+    assert!(core.is_subscribed("b").await);
+
+    let second = message();
+    let second_id = second.id.clone();
+    send(&mut sender, delivery("b", second)).await;
+    assert!(matches!(recv(&mut sender).await, BrokerFrame::Delivered { id } if id == second_id));
+    assert!(
+        matches!(recv(&mut active).await, BrokerFrame::Message { message } if message.id == second_id)
+    );
+    task.abort();
 }
 
 #[tokio::test]
@@ -682,6 +752,178 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
         if reason == "scoped peer admission denied")
     );
     legacy_task.abort();
+}
+
+#[tokio::test]
+async fn scoped_wss_fences_canonical_run_to_one_authenticated_worker_connection() {
+    use bamboo_broker::{BrokerClient, BrokerError};
+    use bamboo_subagent::RunSpec;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = cert(dir.path());
+    let expiry = Utc::now() + ChronoDuration::minutes(5);
+    let policy = json!({"peers":[
+        {"credential":A,"host":"host-parent","mailbox":"a","role":"host",
+         "expires_at":expiry,"destinations":[{"mailbox":"b","kinds":["fenced_run","leased_run","run"]}],
+         "cancel":[],"presence":["worker"]},
+        {"credential":B,"host":"host-worker","mailbox":"b","role":"worker",
+         "expires_at":expiry,"destinations":[],"cancel":[],"presence":[]}
+    ]});
+    let core = Arc::new(BrokerCore::new_scoped(dir.path().join("broker")));
+    let (url, server) = listen(core.clone(), policy, &cert, &key, BrokerLimits::default()).await;
+    let tls = || Some(client_config_trusting_cert(&cert).unwrap());
+    let mut worker = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
+        .await
+        .unwrap();
+    worker.subscribe_environment_lease_v1().await.unwrap();
+    let mut parent = BrokerClient::connect_with_tls(
+        &url,
+        AgentRef {
+            session_id: "a".into(),
+            role: Some("host".into()),
+        },
+        A,
+        tls(),
+    )
+    .await
+    .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(first.environment_lease_v1);
+    assert_eq!(first.host_ref, "host-worker");
+
+    let run: RunSpec = serde_json::from_value(json!({
+        "assignment":"bounded work",
+        "logical_session":{
+            "session_id":"logical-child","parent_session_id":"logical-parent",
+            "root_session_id":"logical-root",
+            "creation":{"created_at":Utc::now(),"spawn_depth":1}
+        },
+        "activation_run_id":"activation-1","execution_epoch":1,
+        "permission_policy":{
+            "revision":1,"requested_mode":"default","effective_mode":"default",
+            "bypass_permissions":false,"session_id":"logical-child","policy":{},
+            "environment_lease":{
+                "version":1,"actor_id":"logical-child",
+                "activation_run_id":"activation-1","execution_epoch":1,
+                "admit_before":Utc::now()+ChronoDuration::minutes(2),
+                "git_commit":"a".repeat(40),"content_sha256":"b".repeat(64),
+                "workspace_relpath":"."
+            }
+        }
+    }))
+    .unwrap();
+    let first_envelope = FencedRunEnvelope::for_observation(run.clone(), &first).unwrap();
+    let make_run = |kind, body| InboxMessage {
+        id: MsgId::new(),
+        from: AgentRef {
+            session_id: "a".into(),
+            role: Some("host".into()),
+        },
+        kind,
+        body,
+        created_at: Utc::now(),
+        correlation_id: None,
+    };
+    let old_run = make_run(
+        InboxKind::FencedRun,
+        serde_json::to_value(&first_envelope).unwrap(),
+    );
+    parent.deliver("b", old_run.clone()).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(3), worker.next_message())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.id, old_run.id);
+    assert_eq!(received.kind, InboxKind::FencedRun);
+    // Leave the original Run unacked in Maildir. The same authenticated peer
+    // reconnects with the same host, role, mailbox, and checkout identity.
+    let mut successor = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
+        .await
+        .unwrap();
+    successor.subscribe_environment_lease_v1().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+                if current.connection_generation != first.connection_generation {
+                    break current;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(second.host_ref, first.host_ref);
+    assert_ne!(second.connection_generation, first.connection_generation);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), successor.next_message())
+            .await
+            .is_err(),
+        "old unacked Run was replayed to successor"
+    );
+
+    let stale_run = make_run(
+        InboxKind::FencedRun,
+        serde_json::to_value(&first_envelope).unwrap(),
+    );
+    assert!(matches!(
+        parent.deliver("b", stale_run).await,
+        Err(BrokerError::Rejected(reason)) if reason.contains("connection changed")
+    ));
+    let mut forged = FencedRunEnvelope::for_observation(run.clone(), &second).unwrap();
+    forged.recipient_role = "host".into();
+    assert!(matches!(
+        parent.deliver("b", make_run(InboxKind::FencedRun, serde_json::to_value(forged).unwrap())).await,
+        Err(BrokerError::Rejected(reason)) if reason.contains("connection changed")
+    ));
+    assert!(matches!(
+        parent.deliver("b", make_run(InboxKind::LeasedRun, serde_json::to_value(&run).unwrap())).await,
+        Err(BrokerError::Rejected(reason)) if reason.contains("lacks a WorkerHost connection fence")
+    ));
+    assert!(matches!(
+        parent.deliver("b", make_run(InboxKind::Run, serde_json::to_value(&run).unwrap())).await,
+        Err(BrokerError::Rejected(reason)) if reason.contains("requires a WorkerHost connection fence")
+    ));
+
+    let current_run = make_run(
+        InboxKind::FencedRun,
+        serde_json::to_value(FencedRunEnvelope::for_observation(run.clone(), &second).unwrap())
+            .unwrap(),
+    );
+    parent.deliver("b", current_run.clone()).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(3), successor.next_message())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.id, current_run.id);
+    successor.ack(received.id).await.unwrap();
+
+    let mut legacy_spec = run;
+    legacy_spec
+        .permission_policy
+        .as_mut()
+        .unwrap()
+        .environment_lease = None;
+    let legacy_run = make_run(InboxKind::Run, serde_json::to_value(legacy_spec).unwrap());
+    parent.deliver("b", legacy_run.clone()).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(3), successor.next_message())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.id, legacy_run.id);
+    successor.ack(received.id).await.unwrap();
+    worker.close().await.unwrap();
+    successor.close().await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]

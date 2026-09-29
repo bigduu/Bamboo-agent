@@ -71,9 +71,12 @@ pub enum InboxKind {
     /// bus instead of a direct WS connection). The unification target — a local
     /// child is driven over the bus exactly like a deployed one.
     Run,
-    /// Versioned fixed-remote Run. Old workers cannot decode this kind, so a
-    /// reconnect during placement cannot silently execute without a lease.
+    /// Legacy fixed-remote Run without a broker connection-generation fence.
+    /// New brokers and workers reject it; retained only for wire decoding.
     LeasedRun,
+    /// Canonical fixed-remote Run bound to one broker-authenticated WorkerHost
+    /// connection generation. Old brokers/workers cannot decode this kind.
+    FencedRun,
     /// Child→parent: a durable sequenced event batch during an
     /// [`InboxKind::Run`]. Snapshot/ephemeral batches use the broker's bounded
     /// live lane instead. `correlation_id` identifies the owning Run.
@@ -313,9 +316,17 @@ impl Mailbox {
     /// Acknowledge a processed message by its claimed location (O(1); preferred —
     /// [`Delivered::cur_path`] carries it). Idempotent (no-op if already gone).
     pub async fn ack_delivered(&self, delivered: &Delivered) -> Result<()> {
+        self.ack_delivered_if_present(delivered).await.map(|_| ())
+    }
+
+    /// Delete exactly this claimed Maildir entry, reporting whether this call
+    /// removed it. Callers maintaining a live pending count must decrement
+    /// only for `true`; matching a message id could remove a different entry
+    /// if two deliveries happened to reuse the same id.
+    pub async fn ack_delivered_if_present(&self, delivered: &Delivered) -> Result<bool> {
         match tokio::fs::remove_file(&delivered.cur_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
             Err(e) => Err(StoreError::io(&delivered.cur_path, e)),
         }
     }
@@ -677,9 +688,28 @@ mod tests {
         let (_d, mb) = mailbox();
         mb.deliver(&msg(1)).await.unwrap();
         let batch = mb.drain().await.unwrap();
-        mb.ack_delivered(&batch[0]).await.unwrap();
+        assert!(mb.ack_delivered_if_present(&batch[0]).await.unwrap());
         assert!(mb.recover().await.unwrap().is_empty()); // cur/ empty
-                                                         // idempotent
-        mb.ack_delivered(&batch[0]).await.unwrap();
+        assert!(!mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        mb.ack_delivered(&batch[0]).await.unwrap(); // old API remains idempotent
+    }
+
+    #[tokio::test]
+    async fn ack_delivered_if_present_does_not_remove_another_entry_with_same_id() {
+        let (_d, mb) = mailbox();
+        let first = msg(1);
+        let mut second = msg(2);
+        second.id = first.id.clone();
+        second.created_at = first.created_at + chrono::Duration::seconds(1);
+        mb.deliver(&first).await.unwrap();
+        mb.deliver(&second).await.unwrap();
+        let batch = mb.drain().await.unwrap();
+        assert_eq!(batch.len(), 2);
+
+        assert!(mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        assert!(!mb.ack_delivered_if_present(&batch[0]).await.unwrap());
+        let remaining = mb.recover().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].msg.body, second.body);
     }
 }

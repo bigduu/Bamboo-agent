@@ -99,6 +99,10 @@ jobs:
       - name: Test locked Rust workspace
         timeout-minutes: 30
         run: cargo test --locked
+        # Deep actor-runtime tests need the same thread stack on CI as the
+        # verified local workspace sweep; Rust's default is too small on Linux.
+        env:
+          RUST_MIN_STACK: "8388608"
 
       - name: Build examples
         if: github.event_name != 'pull_request' || github.base_ref == 'main'

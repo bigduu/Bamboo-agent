@@ -20,14 +20,17 @@ use tokio::fs;
 use uuid::Uuid;
 
 use super::{
-    durable_atomic_write_blocking, validate_session_id, RuntimeTaskTransactionReadGuard,
-    SessionLifecycleReadGuard, SessionStoreV2, SessionWriteGuard,
+    durable_atomic_write_blocking, validate_session_id, ActorTreeWriteGuard,
+    RuntimeTaskTransactionReadGuard, SessionLifecycleReadGuard, SessionStoreV2, SessionWriteGuard,
 };
 
 /// Every started filesystem job keeps the same physical and in-process locks
 /// alive, even when its async caller or Tokio runtime stops waiting. Field
 /// order releases the locks in reverse acquisition order.
 struct ActorAuthorityGuards {
+    _tree: std::sync::Mutex<Option<ActorTreeWriteGuard>>,
+    tree_root: std::sync::Mutex<Option<bamboo_domain::Session>>,
+    tree_bumped: std::sync::atomic::AtomicBool,
     _session: SessionWriteGuard,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: SessionLifecycleReadGuard,
@@ -433,6 +436,23 @@ impl SessionStoreV2 {
         bytes: Vec<u8>,
         guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
+        if !guards
+            .tree_bumped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let root = guards
+                .tree_root
+                .lock()
+                .expect("Actor tree Root")
+                .clone()
+                .ok_or(ActorDirectoryError::Corrupt)?;
+            self.bump_actor_tree_revision(&root)
+                .await
+                .map_err(storage)?;
+            guards
+                .tree_bumped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let path = path.to_path_buf();
         let guards = Arc::clone(guards);
         #[cfg(test)]
@@ -484,11 +504,25 @@ impl SessionStoreV2 {
             .await
             .map_err(storage)?;
         let guards = Arc::new(ActorAuthorityGuards {
+            _tree: std::sync::Mutex::new(None),
+            tree_root: std::sync::Mutex::new(None),
+            tree_bumped: std::sync::atomic::AtomicBool::new(false),
             _session: session,
             _task: task,
             _lifecycle: lifecycle,
         });
         let (rel, path) = self.actor_authority_location(actor_id).await?;
+        let (_, root_id) = Self::copy_source_identity_from_rel(actor_id, &rel).map_err(storage)?;
+        let tree = self
+            .acquire_actor_tree_write_guard(&root_id)
+            .await
+            .map_err(storage)?;
+        *guards._tree.lock().expect("Actor tree writer guard") = Some(tree);
+        let root = self
+            .canonical_actor_tree_root(&root_id)
+            .await
+            .map_err(storage)?;
+        *guards.tree_root.lock().expect("Actor tree Root") = Some(root);
         let mut entry = self
             .read_or_create_actor_entry(actor_id, &rel, &path, &guards)
             .await?;

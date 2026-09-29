@@ -1,13 +1,13 @@
 //! `ask_agent` — the in-loop "command another agent" tool.
 //!
-//! Lets a running (root) agent ask another agent — deployed as a local
-//! subprocess, in Docker, or on a remote host — a question over the central
-//! message broker, and judge the answer. The caller's session id is the asker
-//! (replies route back to it). The Host-wired tool resolves a returned ActorId,
-//! live deployment alias, or registered cluster node worker id before dispatch;
-//! standalone callers may still address a broker peer directly. Two modes mirror
+//! The Host-wired tool inspects a durable Child Session or steers it through
+//! SessionMessenger. Physical cluster workers still use the central broker.
+//! The caller's session id is the asker (physical replies route back to it).
+//! The tool resolves a returned ActorId, live deployment alias, or registered
+//! cluster node worker id before dispatch; standalone callers may still address
+//! a broker peer directly. Two modes mirror
 //! `AskMode`: `query` (read-only summarize/extract) and
-//! `steer` (insert into the target's conversation to redirect its work).
+//! `steer` (durably redirect a logical Child, or command a physical peer).
 //!
 //! Only registered on the Root surface when a broker is configured
 //! (`subagents.broker` in config).
@@ -21,7 +21,12 @@ use serde_json::json;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use bamboo_domain::{ActorDirectoryPort, ActorSession, Session, SessionKind};
+use bamboo_domain::{
+    ActorDirectoryPort, ActorSession, Session, SessionKind, SessionMessageBody,
+    SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource,
+};
+use bamboo_engine::{SessionMessenger, SessionMessengerError};
 use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{AgentRef, AskMode};
 
@@ -35,6 +40,7 @@ pub struct AskAgentTool {
     endpoint: String,
     token: String,
     deployments: Option<(DeployedRegistry, Arc<SessionStoreV2>)>,
+    messenger: Option<Arc<SessionMessenger>>,
 }
 
 impl AskAgentTool {
@@ -43,6 +49,7 @@ impl AskAgentTool {
             endpoint: endpoint.into(),
             token: token.into(),
             deployments: None,
+            messenger: None,
         }
     }
     pub fn with_deployments(
@@ -53,6 +60,100 @@ impl AskAgentTool {
         self.deployments = Some((registry, store));
         self
     }
+
+    /// Production routes a legacy Child steer through the same durable
+    /// logical inbox used by SubAgent, never through a worker's private chat.
+    pub fn with_messenger(mut self, messenger: Arc<SessionMessenger>) -> Self {
+        self.messenger = Some(messenger);
+        self
+    }
+}
+
+async fn canonical_steer(
+    messenger: &SessionMessenger,
+    caller: &str,
+    actor: &ActorSession,
+    tool_call_id: &str,
+    message: &str,
+) -> Result<serde_json::Value, ToolError> {
+    if message.trim().is_empty() || message.len() > 16 * 1024 {
+        return Err(ToolError::InvalidArguments(
+            "Child steer message must contain 1..=16384 UTF-8 bytes".into(),
+        ));
+    }
+    let envelope = SessionMessageEnvelope {
+        id: SessionMessageId::stable(
+            "legacy-ask-agent-steer-v1",
+            &json!({
+                "caller": caller,
+                "actor_id": actor.actor_id,
+                "actor_birth": actor.session_created_at,
+                "tool_call_id": tool_call_id,
+            }),
+        ),
+        source: SessionMessageSource::Session {
+            session_id: caller.to_string(),
+        },
+        target_session_id: actor.actor_id.clone(),
+        kind: SessionMessageKind::PeerMessage,
+        body: SessionMessageBody::Content(SessionMessageContent::text(message)),
+        created_at: chrono::Utc::now(),
+        thread_id: None,
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: None,
+    };
+    let result = messenger.send(envelope).await;
+    let (receipt, activation, activation_error) = match result {
+        Ok(receipt) => (
+            receipt.delivery,
+            match receipt.activation {
+                bamboo_domain::SessionActivationDisposition::ActiveNotified => "active_notified",
+                bamboo_domain::SessionActivationDisposition::ActivationReserved => {
+                    "activation_reserved"
+                }
+                bamboo_domain::SessionActivationDisposition::ActivationCoalesced => {
+                    "activation_coalesced"
+                }
+            },
+            None,
+        ),
+        Err(SessionMessengerError::Activation {
+            receipt, source, ..
+        }) => {
+            tracing::warn!(%source, actor_id = %actor.actor_id, "legacy Child steer activation pending");
+            (
+                receipt,
+                "activation_pending",
+                Some("receiver_activation_pending"),
+            )
+        }
+        Err(SessionMessengerError::ActivationEligibility {
+            receipt, source, ..
+        }) => {
+            tracing::warn!(%source, actor_id = %actor.actor_id, "legacy Child steer activation ineligible");
+            (
+                receipt,
+                "activation_retry_required",
+                Some("receiver_activation_ineligible"),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, actor_id = %actor.actor_id, "legacy Child steer admission failed");
+            return Err(ToolError::Execution(
+                "Child steer was not admitted; inspect Child diagnostics before retrying".into(),
+            ));
+        }
+    };
+    Ok(json!({
+        "from": actor.actor_id,
+        "mode": "steer",
+        "admitted": true,
+        "message_id": receipt.id.to_string(),
+        "inbox_generation": receipt.generation,
+        "activation": activation,
+        "activation_error": activation_error,
+    }))
 }
 
 /// A saved Session id is an authority-bearing logical address, not a broker
@@ -180,11 +281,12 @@ impl Tool for AskAgentTool {
          question=progress to receive a bounded canonical Session snapshot; no model answers a \
          free-form question on this path. For a physical cluster worker, the broker forwards your \
          question and returns that worker's answer.\n\
-         - mode=steer — WRITE. Existing Child ActorIds must use SubAgent target for canonical \
-         SessionInbox delivery. A physical cluster worker receives the question through the broker.\n\
+         - mode=steer — WRITE. Existing direct Child ActorIds receive a durable SessionInbox \
+         message and activation request. A physical cluster worker receives the question through the broker.\n\
          \n\
          EXAMPLES:\n\
          - ask_agent(target=\"actor-…\", question=\"status\", mode=query) reads saved Actor progress.\n\
+         - ask_agent(target=\"actor-…\", question=\"Focus on the assigned tests\", mode=steer) durably corrects a Child.\n\
          - ask_agent(target=<worker_id>, question=\"Summarize the auth flow\", mode=query) \
          asks a physical cluster worker.\n\
          \n\
@@ -201,7 +303,7 @@ impl Tool for AskAgentTool {
                 "mode": {
                     "type": "string",
                     "enum": ["query", "steer"],
-                    "description": "Host Child ActorId query = bounded canonical status/progress snapshot; use SubAgent target for Child steer. Physical worker query/steer uses broker replies."
+                    "description": "Host Child query = bounded canonical status/progress snapshot; Host Child steer = durable SessionInbox delivery. Physical worker query/steer uses broker replies."
                 },
                 "timeout_secs": { "type": "number", "description": "Max seconds to wait for the answer (default 60, max 300)." }
             },
@@ -233,6 +335,11 @@ impl Tool for AskAgentTool {
                 )))
             }
         };
+        if ctx.plan_read_only && matches!(mode, AskMode::Steer) {
+            return Err(ToolError::Execution(
+                "ask_agent steer is unavailable in Plan mode".into(),
+            ));
+        }
         let timeout = Duration::from_secs(
             parsed
                 .timeout_secs
@@ -268,10 +375,24 @@ impl Tool for AskAgentTool {
                                 .to_string(),
                         )))
                     }
-                    AskMode::Steer => Err(ToolError::Execution(
-                        "Host Child steer requires SubAgent target for canonical SessionInbox delivery"
-                            .into(),
-                    )),
+                    AskMode::Steer => {
+                        let messenger = self.messenger.as_ref().ok_or_else(|| {
+                            ToolError::Execution("logical SessionMessenger is unavailable".into())
+                        })?;
+                        let delivered = canonical_steer(
+                            messenger,
+                            caller,
+                            &actor,
+                            ctx.tool_call_id.as_ref(),
+                            &parsed.question,
+                        )
+                        .await?;
+                        let success = delivered["activation"] != "activation_retry_required";
+                        Ok(ToolOutcome::Completed(ToolResult::text(
+                            success,
+                            delivered.to_string(),
+                        )))
+                    }
                 };
             }
         }
@@ -302,14 +423,38 @@ impl Tool for AskAgentTool {
             .and_then(|target| target.actor.as_ref())
             .map(|actor| actor.actor_id.as_str())
             .unwrap_or(&parsed.target);
-        if matches!(mode, AskMode::Steer)
-            && resolved
-                .as_ref()
-                .is_some_and(|target| target.actor.is_some())
+        if let (AskMode::Steer, Some(bound), Some((_, store))) =
+            (mode, resolved.as_ref(), self.deployments.as_ref())
         {
-            return Err(ToolError::Execution(
-                "Host Actor steer requires SubAgent target for canonical SessionInbox delivery; no broker-private transcript mutation was made".into(),
-            ));
+            if let Some(actor) = bound.actor.as_ref() {
+                let child = store
+                    .load_session(&actor.actor_id)
+                    .await
+                    .map_err(|_| ToolError::Execution("canonical Child is unavailable".into()))?
+                    .ok_or_else(|| ToolError::Execution("canonical Child is unavailable".into()))?;
+                let current = authorize_direct_child(store, caller, &child).await?;
+                if current != *actor {
+                    return Err(ToolError::Execution(
+                        "deployment Actor identity changed before steer".into(),
+                    ));
+                }
+                let messenger = self.messenger.as_ref().ok_or_else(|| {
+                    ToolError::Execution("logical SessionMessenger is unavailable".into())
+                })?;
+                let delivered = canonical_steer(
+                    messenger,
+                    caller,
+                    actor,
+                    ctx.tool_call_id.as_ref(),
+                    &parsed.question,
+                )
+                .await?;
+                let success = delivered["activation"] != "activation_retry_required";
+                return Ok(ToolOutcome::Completed(ToolResult::text(
+                    success,
+                    delivered.to_string(),
+                )));
+            }
         }
         if let (AskMode::Query, Some(bound), Some((registry, store))) =
             (mode, resolved.as_ref(), self.deployments.as_ref())
@@ -375,5 +520,121 @@ impl Tool for AskAgentTool {
             display_preference: None,
             images: Vec::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_domain::{
+        SessionActivationDisposition, SessionActivationError, SessionActivationPort,
+        SessionInboxLimits, SessionInboxPort,
+    };
+    use bamboo_storage::FileSessionInbox;
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingActivation(Mutex<Vec<(String, u64)>>);
+
+    #[async_trait]
+    impl SessionActivationPort for RecordingActivation {
+        async fn request_activation(
+            &self,
+            target_session_id: &str,
+            inbox_generation: u64,
+        ) -> Result<SessionActivationDisposition, SessionActivationError> {
+            self.0
+                .lock()
+                .await
+                .push((target_session_id.to_string(), inbox_generation));
+            Ok(SessionActivationDisposition::ActivationReserved)
+        }
+    }
+
+    fn caller(root: &str, call: &str) -> ToolCtx {
+        let mut ctx = ToolCtx::none(call);
+        ctx.session_id = Some(Arc::from(root));
+        ctx
+    }
+
+    async fn steer(
+        tool: &AskAgentTool,
+        root: &str,
+        child: &str,
+        call: &str,
+        message: &str,
+    ) -> Result<serde_json::Value, ToolError> {
+        let result = tool
+            .invoke(
+                json!({"target":child,"question":message,"mode":"steer"}),
+                caller(root, call),
+            )
+            .await?;
+        let ToolOutcome::Completed(result) = result else {
+            panic!("legacy Child steer must complete with an admission receipt")
+        };
+        Ok(serde_json::from_str(&result.result).unwrap())
+    }
+
+    #[tokio::test]
+    async fn host_child_steer_is_durable_idempotent_and_direct_parent_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let root = Session::new("ask-root", "model");
+        let child = Session::new_child_of("ask-child", &root, "model", "task");
+        let other = Session::new("other-root", "model");
+        store.save_session(&root).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        store.save_session(&other).await.unwrap();
+
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let activation = Arc::new(RecordingActivation::default());
+        let messenger = Arc::new(SessionMessenger::new(
+            store.clone(),
+            inbox.clone(),
+            activation.clone(),
+        ));
+        let tool = AskAgentTool::new("ws://127.0.0.1:1", "unused")
+            .with_deployments(Arc::new(Mutex::new(Default::default())), store)
+            .with_messenger(messenger);
+
+        let first = steer(&tool, &root.id, &child.id, "call-1", "continue narrowly")
+            .await
+            .unwrap();
+        assert_eq!(first["from"], child.id);
+        assert_eq!(first["activation"], "activation_reserved");
+        assert_eq!(inbox.inspect(&child.id).await.unwrap().pending, 1);
+        assert_eq!(
+            activation.0.lock().await.as_slice(),
+            &[(child.id.clone(), 1)]
+        );
+
+        let retry = steer(&tool, &root.id, &child.id, "call-1", "continue narrowly")
+            .await
+            .unwrap();
+        assert_eq!(retry["message_id"], first["message_id"]);
+        assert_eq!(retry["inbox_generation"], first["inbox_generation"]);
+        assert_eq!(inbox.inspect(&child.id).await.unwrap().pending, 1);
+
+        assert!(steer(&tool, &root.id, &child.id, "call-1", "broaden scope")
+            .await
+            .is_err());
+        assert!(steer(&tool, &other.id, &child.id, "call-2", "take over")
+            .await
+            .is_err());
+        assert_eq!(inbox.inspect(&child.id).await.unwrap().pending, 1);
+
+        let mut plan = caller(&root.id, "call-plan");
+        plan.plan_read_only = true;
+        assert!(tool
+            .invoke(
+                json!({"target":child.id,"question":"mutate","mode":"steer"}),
+                plan,
+            )
+            .await
+            .is_err());
     }
 }

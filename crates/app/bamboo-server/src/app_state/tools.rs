@@ -412,20 +412,20 @@ pub(super) fn build_root_tools(
         Arc::new(crate::tools::OverlayToolExecutor::new(
             tools_with_inspector,
             Arc::new(bamboo_server_tools::SessionControlTool::new(
-                session_messenger,
+                session_messenger.clone(),
             )),
         ));
 
-    // When a broker is configured, root agents also get `ask_agent` (command
-    // broker-deployed agents, query/steer) and `deploy_agent` (spin up new
-    // workers themselves — local / Docker / SSH — wired to the same broker).
+    // Keep these exact-name compatibility calls registered. The per-session
+    // model catalog removes physical broker tools from Root/Child schemas.
     let tools: Arc<dyn ToolExecutor> = match broker {
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools_with_control,
                 Arc::new(
                     crate::tools::AskAgentTool::new(b.endpoint.clone(), b.token.clone())
-                        .with_deployments(fabric_deployer.registry(), session_store.clone()),
+                        .with_deployments(fabric_deployer.registry(), session_store.clone())
+                        .with_messenger(session_messenger),
                 ),
             ));
             // deploy_agent shares the fabric deployer's registry, so its

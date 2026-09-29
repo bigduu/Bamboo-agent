@@ -153,7 +153,9 @@ mod tests {
             .to_owned();
         let body: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
-        assert!(body["stream_cursor"].is_null());
+        assert!(body["stream_cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("at1-")));
         assert_eq!(body["nodes"][0]["actor_id"], child.id);
         assert_eq!(body["nodes"][0]["logical_state"], serde_json::Value::Null);
         assert_eq!(tokio::fs::read(source_path).await.unwrap(), source_before);

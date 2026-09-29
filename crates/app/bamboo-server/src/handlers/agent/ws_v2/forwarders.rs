@@ -34,6 +34,7 @@
 //! aborts exactly that forwarder AND drops its queue, leaving no orphaned
 //! broadcast reader and no stale queued frame.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 
 use bamboo_agent_core::AgentEvent;
+use bamboo_domain::ActorSnapshotError;
 use bamboo_engine::events::change_feed::ChangeEvent;
 use bamboo_engine::events::journal;
 use bamboo_engine::{
@@ -81,6 +83,129 @@ async fn send_env(out: &OutboundTx, encoding: Encoding, env: ServerEnvelope) -> 
         // A serialization failure is per-event; skip it but keep the forwarder
         // alive (matches the v1 SSE `serde_json::to_string(...).ok()` discipline).
         None => true,
+    }
+}
+
+/// Tree notifications are revision advances in the same durable per-Root
+/// domain as `PublicActorSubtreeSnapshot.stream_cursor`. There is no delta
+/// journal: every advance requires an authorized snapshot. Polling covers
+/// writers in other processes and does not rely on the process-local Actor Hub.
+pub(crate) fn spawn_actor_tree_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    state: web::Data<AppState>,
+    root_id: String,
+    since: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    let store = state.session_store.clone();
+    tokio::spawn(run_actor_tree_forwarder(
+        out,
+        encoding,
+        ch,
+        since,
+        Duration::from_secs(2),
+        move || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move { store.actor_tree_cursor(&root_id).await }
+        },
+    ))
+}
+
+async fn run_actor_tree_forwarder<F, Fut>(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    since: Option<String>,
+    poll_interval: Duration,
+    mut read_cursor: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<(String, u64)>, ActorSnapshotError>>,
+{
+    // An unavailable transaction is temporary. Keep the channel alive and
+    // retry the same durable cursor after bounded backoff; once the write
+    // finishes, a successful read resumes normal polling cadence.
+    let mut next_delay = Duration::ZERO;
+    let mut retry_delay = Duration::ZERO;
+    let mut observed: Option<(String, u64)> = None;
+    let mut first = true;
+    loop {
+        if !next_delay.is_zero() {
+            tokio::time::sleep(next_delay).await;
+        }
+        // A commit racing this read is either in the read or in a later
+        // poll. Polling does not depend on process-local notifications.
+        let latest = match read_cursor().await {
+            Ok(latest) => latest,
+            Err(ActorSnapshotError::NotFound) => {
+                let _ = send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(
+                            &ch,
+                            0,
+                            serde_json::json!({"type":"actor_snapshot_required","reason":"unavailable","cursor":null}),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            Err(error) => {
+                retry_delay = if retry_delay.is_zero() {
+                    poll_interval
+                } else {
+                    retry_delay.saturating_mul(2).min(Duration::from_secs(30))
+                };
+                next_delay = retry_delay;
+                tracing::debug!(%error, ?next_delay, "actor tree cursor poll will retry");
+                continue;
+            }
+        };
+        retry_delay = Duration::ZERO;
+        next_delay = poll_interval;
+        if !first && observed == latest {
+            continue;
+        }
+        let reason = if !first {
+            "changed"
+        } else if latest.is_none() {
+            "unavailable"
+        } else if since.is_none() {
+            "initial"
+        } else {
+            "gap"
+        };
+        let continuous = first
+            && latest
+                .as_ref()
+                .is_some_and(|(cursor, _)| since.as_deref() == Some(cursor.as_str()));
+        first = false;
+        observed = latest;
+        if continuous {
+            continue;
+        }
+        let (cursor, revision) = observed.as_ref().map_or((None, 0), |(cursor, revision)| {
+            (Some(cursor.as_str()), *revision)
+        });
+        if !send_env(
+            &out,
+            encoding,
+            ServerEnvelope::control(
+                &ch,
+                revision,
+                serde_json::json!({
+                    "type": "actor_snapshot_required",
+                    "reason": reason,
+                    "cursor": cursor,
+                }),
+            ),
+        )
+        .await
+        {
+            return;
+        }
     }
 }
 
@@ -1095,6 +1220,61 @@ fn is_terminal_event(event: &AgentEvent) -> bool {
 mod tests {
     use super::*;
     use crate::app_state::AgentRunner;
+    use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn actor_tree_retries_pending_transaction_then_sends_recovered_cursor() {
+        let (out, mut rx) = mpsc::channel(4);
+        let mut reads = VecDeque::from([
+            Err(ActorSnapshotError::PendingTransaction),
+            Ok(Some(("root:1".to_owned(), 1))),
+            Err(ActorSnapshotError::PendingTransaction),
+            Ok(Some(("root:2".to_owned(), 2))),
+        ]);
+        let handle = tokio::spawn(run_actor_tree_forwarder(
+            out,
+            Encoding::Json,
+            "tree.root".to_owned(),
+            Some("root:1".to_owned()),
+            Duration::from_millis(10),
+            move || {
+                let read = reads
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(Some(("root:2".to_owned(), 2))));
+                async move { read }
+            },
+        ));
+
+        let frame = next_json(&mut rx).await;
+        assert_eq!(frame["control"]["type"], "actor_snapshot_required");
+        assert_eq!(frame["control"]["reason"], "changed");
+        assert_eq!(frame["control"]["cursor"], "root:2");
+        assert_eq!(frame["seq"], 2);
+        assert!(
+            !handle.is_finished(),
+            "temporary errors keep the tree subscription open"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn actor_tree_not_found_sends_unavailable_and_ends_subscription() {
+        let (out, mut rx) = mpsc::channel(4);
+        let handle = tokio::spawn(run_actor_tree_forwarder(
+            out,
+            Encoding::Json,
+            "tree.root".to_owned(),
+            None,
+            Duration::from_millis(10),
+            || async { Err(ActorSnapshotError::NotFound) },
+        ));
+
+        let frame = next_json(&mut rx).await;
+        assert_eq!(frame["control"]["type"], "actor_snapshot_required");
+        assert_eq!(frame["control"]["reason"], "unavailable");
+        assert!(frame["control"]["cursor"].is_null());
+        handle.await.expect("not-found forwarder exits");
+    }
 
     #[test]
     fn agent_seq_is_monotonic_and_one_based() {

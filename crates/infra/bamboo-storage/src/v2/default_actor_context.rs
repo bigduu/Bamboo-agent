@@ -6,6 +6,9 @@ use bamboo_domain::{ActorDirectoryEntry, ActorLogicalState, SessionAuthorityConf
 
 // Field order releases Session, Task, lifecycle, reversing acquisition order.
 pub(super) struct DefaultWriterGuards {
+    // Keep this before Session/Task/lifecycle so it drops first. A cancelled
+    // async caller cannot release the Root lock while a spawned write remains.
+    tree: std::sync::Mutex<Option<ActorTreeWriteGuard>>,
     _session: SessionWriteGuard,
     _task: TaskGuard,
     _lifecycle: LifecycleGuard,
@@ -31,6 +34,7 @@ impl DefaultWriterGuards {
         session: SessionWriteGuard,
     ) -> Arc<Self> {
         Arc::new(Self {
+            tree: std::sync::Mutex::new(None),
             _session: session,
             _task: TaskGuard::Shared { _guard: task },
             _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
@@ -43,10 +47,15 @@ impl DefaultWriterGuards {
         session: SessionWriteGuard,
     ) -> Arc<Self> {
         Arc::new(Self {
+            tree: std::sync::Mutex::new(None),
             _session: session,
             _task: TaskGuard::Exclusive { _guard: task },
             _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
         })
+    }
+
+    pub(super) fn hold_tree(&self, tree: ActorTreeWriteGuard) {
+        *self.tree.lock().expect("Actor tree writer guard") = Some(tree);
     }
 }
 

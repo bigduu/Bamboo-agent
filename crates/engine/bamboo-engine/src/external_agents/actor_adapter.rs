@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::tool_start_arguments_for_display;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::poison::PoisonRecover;
@@ -498,6 +499,282 @@ pub struct ResolvedSchedulablePlacement {
     /// cluster node's `label`/host, surfaced on the UI placement badge. `None` ⇒
     /// fall back to the pool name.
     pub host_label: Option<String>,
+}
+
+/// Host-only receipt repair uses the same immutable boot configuration as the
+/// actor runner. It never infers a broker route from Child display metadata or
+/// a Worker claim. A role whose fixed remote route is ambiguous or incomplete
+/// stays blocked until an operator restores a provable route.
+pub struct BrokerTerminalReceiptReconciler {
+    store: Arc<bamboo_storage::SessionStoreV2>,
+    bus: Option<bamboo_subagent::BusEndpoint>,
+    remote: HashMap<String, Option<ReceiptRemoteRoute>>,
+}
+
+struct ReceiptRemoteRoute {
+    endpoint: String,
+    token: String,
+    ca_cert_file: PathBuf,
+    parent: bamboo_subagent::AgentRef,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerReceiptRepairReport {
+    pub candidates: usize,
+    pub repaired: usize,
+    pub blocked: usize,
+}
+
+impl BrokerTerminalReceiptReconciler {
+    pub fn new(store: Arc<bamboo_storage::SessionStoreV2>, config: &bamboo_config::Config) -> Self {
+        let subagents = config.subagents();
+        let mut counts = HashMap::<&str, usize>::new();
+        for placement in &subagents.remote_placements {
+            *counts.entry(placement.role.as_str()).or_default() += 1;
+        }
+        let mut remote = HashMap::new();
+        for placement in &subagents.remote_placements {
+            let route = (counts.get(placement.role.as_str()) == Some(&1))
+                .then(|| receipt_remote_route(placement))
+                .flatten();
+            remote.insert(placement.role.clone(), route);
+        }
+        Self {
+            store,
+            bus: subagents.broker.clone().and_then(|broker| {
+                (!broker.endpoint.trim().is_empty() && !broker.token.is_empty()).then_some(
+                    bamboo_subagent::BusEndpoint {
+                        endpoint: broker.endpoint,
+                        token: broker.token,
+                    },
+                )
+            }),
+            remote,
+        }
+    }
+
+    /// One physical-tree scan. Every Child is independent; a failed route,
+    /// broker, or ACK retains its Host receipt and never blocks another Child.
+    pub async fn reconcile_once(&self) -> BrokerReceiptRepairReport {
+        let candidates = match self
+            .store
+            .discover_unconfirmed_broker_terminal_children()
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(%error, "broker terminal receipt scan blocked; no ACK attempted");
+                return BrokerReceiptRepairReport {
+                    blocked: 1,
+                    ..BrokerReceiptRepairReport::default()
+                };
+            }
+        };
+        let mut report = BrokerReceiptRepairReport {
+            candidates: candidates.len(),
+            ..BrokerReceiptRepairReport::default()
+        };
+        for child in candidates {
+            let result =
+                tokio::time::timeout(Duration::from_secs(15), self.reconcile_child(&child)).await;
+            match result {
+                Ok(Ok(())) => report.repaired += 1,
+                Ok(Err(reason)) => {
+                    report.blocked += 1;
+                    tracing::warn!(child_id = %child.id, reason, "broker terminal receipt retained for retry");
+                }
+                Err(_) => {
+                    report.blocked += 1;
+                    tracing::warn!(child_id = %child.id, "broker terminal receipt repair timed out; retained for retry");
+                }
+            }
+        }
+        report
+    }
+
+    async fn reconcile_child(&self, child: &Session) -> Result<(), &'static str> {
+        if child.metadata.get("runtime.kind").map(String::as_str) != Some("external")
+            || child.metadata.get("external.protocol").map(String::as_str) != Some("actor")
+            || child.metadata.get("external.agent_id").map(String::as_str)
+                != Some(super::config::LOCAL_ACTOR_AGENT_ID)
+        {
+            return Err("Child has no trusted built-in actor recovery route");
+        }
+        let current = self
+            .store
+            .load_session(&child.id)
+            .await
+            .map_err(|_| "canonical Child reload failed")?
+            .ok_or("canonical Child disappeared")?;
+        if current.kind != bamboo_domain::SessionKind::Child
+            || current.id != child.id
+            || current.created_at != child.created_at
+            || current.parent_session_id != child.parent_session_id
+            || current.root_session_id != child.root_session_id
+            || current.project_id_meta() != child.project_id_meta()
+            || current.metadata.get("runtime.kind").map(String::as_str) != Some("external")
+            || current
+                .metadata
+                .get("external.protocol")
+                .map(String::as_str)
+                != Some("actor")
+            || current
+                .metadata
+                .get("external.agent_id")
+                .map(String::as_str)
+                != Some(super::config::LOCAL_ACTOR_AGENT_ID)
+            || bamboo_domain::ActorSession::from_session(&current).is_err()
+        {
+            return Err("canonical Child birth, Root, or Project changed");
+        }
+        let root = self
+            .store
+            .load_session(&child.root_session_id)
+            .await
+            .map_err(|_| "canonical Root reload failed")?
+            .ok_or("canonical Root disappeared")?;
+        if root.kind != bamboo_domain::SessionKind::Root
+            || root.id != child.root_session_id
+            || root.root_session_id != child.root_session_id
+            || root.project_id_meta() != child.project_id_meta()
+        {
+            return Err("canonical Root identity changed");
+        }
+        let parent_id = child
+            .parent_session_id
+            .as_deref()
+            .ok_or("Child parent identity missing")?;
+        let parent = self
+            .store
+            .load_session(parent_id)
+            .await
+            .map_err(|_| "canonical parent reload failed")?
+            .ok_or("canonical parent disappeared")?;
+        if parent.id != parent_id
+            || !matches!(
+                parent.kind,
+                bamboo_domain::SessionKind::Root | bamboo_domain::SessionKind::Child
+            )
+            || parent.root_session_id != child.root_session_id
+            || parent.project_id_meta() != child.project_id_meta()
+            || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
+        {
+            return Err("canonical parent lineage changed");
+        }
+
+        // Validate the Host checkpoint before opening a recovery connection.
+        // This rejects an uncommitted terminal, stale transcript, or changed
+        // Child identity before touching the broker.
+        let receipts = self
+            .store
+            .recover_broker_terminal_receipts(&current)
+            .await
+            .map_err(|_| "Host broker terminal checkpoint unverified")?;
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let role = current
+            .metadata
+            .get("subagent_type")
+            .map(String::as_str)
+            .unwrap_or("worker");
+        for receipt in receipts {
+            let local_mailbox = format!("p-{}", child.id);
+            // The committed receipt records the route used by this run. A
+            // later role configuration change must not redirect its ACK.
+            let mut link = if receipt.parent_mailbox == local_mailbox {
+                let bus = self
+                    .bus
+                    .as_ref()
+                    .ok_or("local broker receipt bus unavailable")?;
+                bamboo_broker::BrokerChildLink::connect_receipt_recovery(
+                    &bus.endpoint,
+                    bamboo_subagent::AgentRef {
+                        session_id: local_mailbox,
+                        role: None,
+                    },
+                    &bus.token,
+                )
+                .await
+                .map_err(|_| "local broker receipt connection unavailable")?
+            } else if let Some(remote) = self.remote.get(role) {
+                let route = remote
+                    .as_ref()
+                    .ok_or("fixed remote broker route is unavailable or ambiguous")?;
+                if receipt.parent_mailbox != route.parent.session_id {
+                    return Err("fixed remote parent mailbox changed since Host checkpoint");
+                }
+                let tls = bamboo_broker::client_config_trusting_cert(&route.ca_cert_file)
+                    .map_err(|_| "fixed remote broker TLS pin unavailable")?;
+                bamboo_broker::BrokerChildLink::connect_receipt_recovery_with_tls(
+                    &route.endpoint,
+                    route.parent.clone(),
+                    &route.token,
+                    tls,
+                )
+                .await
+                .map_err(|_| "fixed remote broker receipt connection unavailable")?
+            } else {
+                return Err("committed broker receipt route is unavailable");
+            };
+            if link.parent_mailbox() != receipt.parent_mailbox {
+                return Err("broker receipt link mailbox differs from Host checkpoint");
+            }
+            bamboo_subagent::ChildLink::acknowledge_recovered_durable_frames(
+                &mut link,
+                &receipt.broker_identity,
+                &receipt.message_ids,
+            )
+            .await
+            .map_err(|_| "broker identity changed or exact ACK unconfirmed")?;
+            self.store
+                .clear_acknowledged_broker_terminal_receipt(
+                    &receipt.session_id,
+                    receipt.created_at,
+                    &receipt.activation_run_id,
+                    &receipt.parent_mailbox,
+                )
+                .await
+                .map_err(|_| "broker ACK succeeded but Host receipt cleanup failed")?;
+        }
+        Ok(())
+    }
+}
+
+fn receipt_remote_route(
+    placement: &bamboo_config::RemoteActorPlacement,
+) -> Option<ReceiptRemoteRoute> {
+    let peer = placement.broker_peer.as_ref().filter(|peer| peer.valid())?;
+    let endpoint = url::Url::parse(&placement.endpoint).ok()?;
+    if placement.endpoint.len() > 2048
+        || endpoint.scheme() != "wss"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return None;
+    }
+    let token_env = placement
+        .token_env
+        .as_deref()
+        .filter(|name| !name.is_empty() && name.len() <= 256)?;
+    let token = std::env::var(token_env).ok()?;
+    if !(32..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    let ca_cert_file = PathBuf::from(placement.ca_cert_file.as_deref()?);
+    bamboo_broker::client_config_trusting_cert(&ca_cert_file).ok()?;
+    Some(ReceiptRemoteRoute {
+        endpoint: placement.endpoint.clone(),
+        token,
+        ca_cert_file,
+        parent: bamboo_subagent::AgentRef {
+            session_id: peer.parent_mailbox.clone(),
+            role: peer.parent_role.clone(),
+        },
+    })
 }
 
 /// How `execute_external_child` should obtain its worker connection, decided
@@ -1718,6 +1995,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 session,
                 activation_run_id,
                 &delivery.broker_identity,
+                &delivery.parent_mailbox,
                 &delivery.correlation_id,
                 &delivery.message_ids,
             )
@@ -1764,6 +2042,7 @@ impl ExternalChildRunner for ActorChildRunner {
             .await
             .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
         if committed.broker_identity != delivery.broker_identity
+            || committed.parent_mailbox != delivery.parent_mailbox
             || committed.broker_correlation_id != delivery.correlation_id
             || committed.message_ids != delivery.message_ids
             || committed.terminal_status != expected_status
@@ -1780,6 +2059,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 &session.id,
                 session.created_at,
                 activation_run_id,
+                &delivery.parent_mailbox,
             )
             .await
             .map_err(|error| {
@@ -2334,6 +2614,11 @@ impl ExternalChildRunner for ActorChildRunner {
                             format!("Host broker receipt recovery blocked: {error}")
                         })?;
                     for receipt in receipts {
+                        if client.broker_parent_mailbox() != Some(receipt.parent_mailbox.as_str()) {
+                            return Err(
+                                "old Child broker parent mailbox changed before ACK".to_string()
+                            );
+                        }
                         client
                             .acknowledge_recovered_durable_frames(
                                 &receipt.broker_identity,
@@ -2348,6 +2633,7 @@ impl ExternalChildRunner for ActorChildRunner {
                                 &receipt.session_id,
                                 receipt.created_at,
                                 &receipt.activation_run_id,
+                                &receipt.parent_mailbox,
                             )
                             .await
                             .map_err(|error| {
@@ -6922,6 +7208,7 @@ mod tests {
     struct DurableAckProbe {
         calls: Arc<AtomicUsize>,
         terminal_status: TerminalStatus,
+        parent_mailbox: String,
     }
 
     #[async_trait]
@@ -6941,6 +7228,7 @@ mod tests {
         fn durable_delivery_receipt(&self) -> Option<bamboo_subagent::DurableChildDeliveryReceipt> {
             Some(bamboo_subagent::DurableChildDeliveryReceipt {
                 broker_identity: "00000000-0000-4000-8000-000000000001".into(),
+                parent_mailbox: self.parent_mailbox.clone(),
                 correlation_id: "broker-run-1".into(),
                 message_ids: vec!["broker-outcome-1".into()],
                 terminal_status: self.terminal_status,
@@ -6975,9 +7263,222 @@ mod tests {
                 link: Box::new(DurableAckProbe {
                     calls: calls.clone(),
                     terminal_status,
+                    parent_mailbox: format!("p-{}", session.id),
                 }),
                 host_nested_wait_handoff,
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_receipt_reconciler_repairs_only_the_proven_local_mailbox() {
+        let (endpoint, broker_dir) = start_bus().await;
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let root = Session::new("receipt-root", "model");
+        store.save_session(&root).await.unwrap();
+        let mut sender = bamboo_broker::BrokerClient::connect(
+            &endpoint,
+            bamboo_subagent::AgentRef {
+                session_id: "receipt-worker".into(),
+                role: None,
+            },
+            "t",
+        )
+        .await
+        .unwrap();
+        let broker_identity = sender.durable_broker_identity().await.unwrap();
+        let wrong_broker_identity = if broker_identity == "00000000-0000-4000-8000-000000000001" {
+            "00000000-0000-4000-8000-000000000002"
+        } else {
+            "00000000-0000-4000-8000-000000000001"
+        };
+
+        for (id, receipt_mailbox, receipt_broker) in [
+            ("receipt-good", "p-receipt-good", broker_identity.as_str()),
+            (
+                "receipt-wrong-mailbox",
+                "p-another-child",
+                broker_identity.as_str(),
+            ),
+            (
+                "receipt-wrong-broker",
+                "p-receipt-wrong-broker",
+                wrong_broker_identity,
+            ),
+            (
+                "receipt-local-role-changed",
+                "p-receipt-local-role-changed",
+                broker_identity.as_str(),
+            ),
+            (
+                "receipt-remote-unproven",
+                "remote-parent-unproven",
+                broker_identity.as_str(),
+            ),
+        ] {
+            let mut child = Session::new_child_of(id, &root, "model", "task");
+            child
+                .metadata
+                .insert("runtime.kind".into(), "external".into());
+            child
+                .metadata
+                .insert("external.protocol".into(), "actor".into());
+            child.metadata.insert(
+                "external.agent_id".into(),
+                crate::external_agents::config::LOCAL_ACTOR_AGENT_ID.into(),
+            );
+            if id == "receipt-local-role-changed" || id == "receipt-remote-unproven" {
+                child
+                    .metadata
+                    .insert("subagent_type".into(), "remote-worker".into());
+            }
+            child.add_message(bamboo_agent_core::Message::user("work"));
+            store.save_session(&child).await.unwrap();
+            let message_id = bamboo_subagent::MsgId::new();
+            sender
+                .deliver(
+                    &format!("p-{id}"),
+                    bamboo_subagent::InboxMessage {
+                        id: message_id.clone(),
+                        from: bamboo_subagent::AgentRef {
+                            session_id: "receipt-worker".into(),
+                            role: None,
+                        },
+                        kind: bamboo_subagent::InboxKind::Outcome,
+                        body: serde_json::to_value(bamboo_subagent::ChildOutcome::completed(
+                            "done",
+                        ))
+                        .unwrap(),
+                        created_at: chrono::Utc::now(),
+                        correlation_id: Some(bamboo_subagent::MsgId::new()),
+                    },
+                )
+                .await
+                .unwrap();
+            // The Host can checkpoint only a frame already surfaced from the
+            // broker, which moves its Maildir file from new/ into cur/.
+            let mailbox =
+                bamboo_subagent::Mailbox::at(broker_dir.path().join(format!("mailboxes/p-{id}")));
+            assert_eq!(mailbox.drain().await.unwrap().len(), 1);
+            child.add_message(bamboo_agent_core::Message::assistant("done", None));
+            child.set_last_run_status("completed");
+            store
+                .prepare_broker_terminal_receipt(
+                    &child,
+                    "run-1",
+                    receipt_broker,
+                    receipt_mailbox,
+                    "correlation-1",
+                    &[message_id.as_str().to_owned()],
+                )
+                .await
+                .unwrap();
+            store.save_session(&child).await.unwrap();
+        }
+
+        let mut config = bamboo_config::Config::default();
+        config.subagents_mut().broker = Some(bamboo_config::BrokerClientConfig {
+            endpoint,
+            token: "t".into(),
+            ..Default::default()
+        });
+        config
+            .subagents_mut()
+            .remote_placements
+            .push(bamboo_config::RemoteActorPlacement {
+                role: "remote-worker".into(),
+                endpoint: "ws://unscoped.example.invalid".into(),
+                token_env: None,
+                ca_cert_file: None,
+                broker_peer: None,
+            });
+        let repair = BrokerTerminalReceiptReconciler::new(store.clone(), &config);
+        let report = repair.reconcile_once().await;
+        assert_eq!(report.candidates, 5);
+        assert_eq!(report.repaired, 2);
+        assert_eq!(report.blocked, 3);
+
+        let good = bamboo_subagent::Mailbox::at(broker_dir.path().join("mailboxes/p-receipt-good"));
+        let wrong = bamboo_subagent::Mailbox::at(
+            broker_dir.path().join("mailboxes/p-receipt-wrong-mailbox"),
+        );
+        let wrong_broker = bamboo_subagent::Mailbox::at(
+            broker_dir.path().join("mailboxes/p-receipt-wrong-broker"),
+        );
+        let local_role_changed = bamboo_subagent::Mailbox::at(
+            broker_dir
+                .path()
+                .join("mailboxes/p-receipt-local-role-changed"),
+        );
+        let remote_unproven = bamboo_subagent::Mailbox::at(
+            broker_dir
+                .path()
+                .join("mailboxes/p-receipt-remote-unproven"),
+        );
+        assert_eq!(good.pending_count().await.unwrap(), 0);
+        assert_eq!(wrong.pending_count().await.unwrap(), 1);
+        assert_eq!(wrong_broker.pending_count().await.unwrap(), 1);
+        assert_eq!(local_role_changed.pending_count().await.unwrap(), 0);
+        assert_eq!(remote_unproven.pending_count().await.unwrap(), 1);
+        let good_child = store.load_session("receipt-good").await.unwrap().unwrap();
+        let wrong_child = store
+            .load_session("receipt-wrong-mailbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let wrong_broker_child = store
+            .load_session("receipt-wrong-broker")
+            .await
+            .unwrap()
+            .unwrap();
+        let local_role_changed_child = store
+            .load_session("receipt-local-role-changed")
+            .await
+            .unwrap()
+            .unwrap();
+        let remote_unproven_child = store
+            .load_session("receipt-remote-unproven")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .recover_broker_terminal_receipts(&good_child)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .recover_broker_terminal_receipts(&wrong_child)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .recover_broker_terminal_receipts(&wrong_broker_child)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .recover_broker_terminal_receipts(&local_role_changed_child)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .recover_broker_terminal_receipts(&remote_unproven_child)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -7011,6 +7512,7 @@ mod tests {
                 &child,
                 "run-1",
                 "00000000-0000-4000-8000-000000000001",
+                "p-ack-child",
                 "broker-run-1",
                 &["broker-outcome-1".into()],
             )
@@ -7089,6 +7591,7 @@ mod tests {
                     &child,
                     "run-1",
                     "00000000-0000-4000-8000-000000000001",
+                    "p-failed-ack-child",
                     "broker-run-1",
                     &["broker-outcome-1".into()],
                 )
@@ -7142,6 +7645,7 @@ mod tests {
                 &child,
                 "run-1",
                 "00000000-0000-4000-8000-000000000001",
+                "p-nested-ack-child",
                 "broker-run-1",
                 &["broker-outcome-1".into()],
             )

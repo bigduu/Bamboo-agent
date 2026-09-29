@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::BrokerClient;
 use crate::error::{BrokerError, BrokerResult};
+use crate::proto::FencedRunEnvelope;
 
 /// Connection loss is not a graceful shutdown: the owner can no longer receive
 /// results, so cancel admitted work and give cancellation-aware handlers a short
@@ -1078,7 +1079,11 @@ where
             async move {
                 let _execution_slot = if matches!(
                     msg.kind,
-                    InboxKind::Run | InboxKind::LeasedRun | InboxKind::Ask | InboxKind::Task
+                    InboxKind::Run
+                        | InboxKind::LeasedRun
+                        | InboxKind::FencedRun
+                        | InboxKind::Ask
+                        | InboxKind::Task
                 ) {
                     Some(tokio::select! {
                         biased;
@@ -1095,7 +1100,7 @@ where
                 match msg.kind {
                     // A full child session over the bus (the actor-over-mailbox path):
                     // stream events back to the parent live, then the terminal outcome.
-                    InboxKind::Run | InboxKind::LeasedRun => {
+                    InboxKind::Run | InboxKind::LeasedRun | InboxKind::FencedRun => {
                         handle_run(
                             executor.as_ref(),
                             &me,
@@ -1380,18 +1385,44 @@ where
     if fatal_uplink.is_cancelled() {
         return Handled::Leave;
     }
-    let spec: RunSpec = match serde_json::from_value(msg.body.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("run {:?}: malformed RunSpec: {e}", msg.id);
-            if msg.kind == InboxKind::LeasedRun {
-                return reject_leased_run(me, &msg, uplink, "remote_environment_runspec_invalid")
-                    .await;
+    if msg.kind == InboxKind::LeasedRun {
+        return reject_leased_run(me, &msg, uplink, "remote_unfenced_run_rejected").await;
+    }
+    let spec: RunSpec = if msg.kind == InboxKind::FencedRun {
+        let envelope: FencedRunEnvelope = match serde_json::from_value(msg.body.clone()) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return reject_leased_run(me, &msg, uplink, "remote_fenced_runspec_invalid").await;
             }
-            return Handled::Ack;
+        };
+        if envelope.version != FencedRunEnvelope::VERSION
+            || envelope.recipient_host_ref.is_empty()
+            || envelope.recipient_mailbox != me.session_id
+            || envelope.recipient_connection_generation.is_empty()
+            || envelope.recipient_role != me.role.as_deref().unwrap_or_default()
+        {
+            return reject_leased_run(me, &msg, uplink, "remote_fenced_runspec_invalid").await;
+        }
+        envelope.run
+    } else {
+        match serde_json::from_value(msg.body.clone()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!("run {:?}: malformed RunSpec: {error}", msg.id);
+                return Handled::Ack;
+            }
         }
     };
-    if msg.kind == InboxKind::LeasedRun {
+    if msg.kind == InboxKind::Run
+        && spec
+            .permission_policy
+            .as_ref()
+            .and_then(|policy| policy.environment_lease.as_ref())
+            .is_some()
+    {
+        return reject_leased_run(me, &msg, uplink, "remote_unfenced_run_rejected").await;
+    }
+    if msg.kind == InboxKind::FencedRun {
         if !environment_lease_v1 {
             tracing::warn!(run_id = %msg.id.as_str(), "leased Run reached an unsupported executor; retaining it for a capable worker");
             return Handled::LeaveAndDisconnect;
