@@ -31,8 +31,12 @@ test("routine dev pull requests run locked Rust, formatting, and policy checks",
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
+  assert.match(testJob, /name: Test\n    runs-on: ubuntu-latest\n    timeout-minutes: 45\n/u)
   assert.match(testJob, /run: cargo build --locked\n/u)
-  assert.match(testJob, /run: cargo test --locked\n/u)
+  assert.match(
+    testJob,
+    /- name: Test locked Rust workspace\n        timeout-minutes: 30\n        run: cargo test --locked\n/u,
+  )
   assert.match(
     testJob,
     /- name: Test CI workflow policy\n        run: node --test scripts\/ci-policy\.test\.cjs\n/u,
