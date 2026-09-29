@@ -34,55 +34,24 @@ pub(super) fn state(
 }
 
 pub(super) async fn answer(
+    store: &bamboo_storage::SessionStoreV2,
     sessions: &bamboo_engine::SessionRepository,
     parent: &Session,
     question: &ParentQuestion,
     text: &str,
 ) -> Result<(State, bool), ()> {
     question.validate_answer(text).map_err(|_| ())?;
-    let wrote = AtomicBool::new(false);
-    let saved = sessions
-        .persistence()
-        .mutate_runtime_session_and_publish(
-            &question.child.session_id,
-            || None,
-            |child| {
-                match state(parent, child, question)? {
-                    State::Terminal(_) => return Ok::<_, ()>(()),
-                    State::Pending => {}
-                }
-                let now = chrono::Utc::now();
-                let resolution =
-                    ParentQuestionResolution::answered(question, now, text).ok_or(())?;
-                let paired = child
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == question.tool_result_message_id)
-                    .ok_or(())?;
-                paired.content = text.to_owned();
-                paired.tool_success = Some(true);
-                child.metadata.insert(
-                    PARENT_QUESTION_RESOLUTION_KEY.into(),
-                    serde_json::to_string(&resolution).map_err(|_| ())?,
-                );
-                wrote.store(true, Ordering::Relaxed);
-                Ok(())
-            },
-            |saved| {
-                sessions.cache().insert(
-                    saved.id.clone(),
-                    std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
-                );
-            },
-        )
+    let (saved, wrote) = store
+        .answer_parent_question(question, text, |saved| {
+            sessions.cache().insert(
+                saved.id.clone(),
+                std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+            );
+        })
         .await
         .map_err(|_| ())?
-        .map_err(|_| ())?
         .ok_or(())?;
-    Ok((
-        state(parent, &saved, question)?,
-        wrote.load(Ordering::Relaxed),
-    ))
+    Ok((state(parent, &saved, question)?, wrote))
 }
 
 pub(super) async fn expire(

@@ -51,4 +51,6 @@ pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,
     RootEntry, RootFields, SessionLoc, SubagentStore,
 };
-pub use transport::{ChildClient, ChildLink, TransportError, TransportResult, WsServer};
+pub use transport::{
+    ChildClient, ChildLink, DurableChildDeliveryReceipt, TransportError, TransportResult, WsServer,
+};

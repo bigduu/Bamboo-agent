@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_domain::{
     ActorActivation, ActorActivationClaim, ActorActivationFence, ActorActivationFinish,
-    ActorActivationStatus, ActorAncestorObservation, ActorDirectoryEntry, ActorDirectoryError,
-    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
+    ActorActivationStatus, ActorAncestorObservation, ActorControlPlaneBinding, ActorDirectoryEntry,
+    ActorDirectoryError, ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -549,6 +549,64 @@ impl ActorDirectoryPort for SessionStoreV2 {
         self.ensure_actor(actor_id).await
     }
 
+    async fn bind_control_plane(
+        &self,
+        actor_id: &str,
+        binding: ActorControlPlaneBinding,
+    ) -> Result<ActorDirectoryEntry, ActorDirectoryError> {
+        if binding
+            .placement_intent
+            .as_ref()
+            .is_some_and(|intent| !intent.is_valid())
+        {
+            return Err(ActorDirectoryError::InvalidTransition);
+        }
+        let ActorControlPlaneBinding {
+            policy_revision,
+            placement_intent,
+        } = binding;
+        self.actor_transaction(actor_id, |entry| {
+            let policy_changed = policy_revision
+                .is_some_and(|revision| entry.actor.policy_revision != Some(revision));
+            let placement_changed = placement_intent
+                .as_ref()
+                .is_some_and(|intent| entry.actor.placement_intent.as_ref() != Some(intent));
+            if !policy_changed && !placement_changed {
+                return Ok(Mutation::unchanged(entry.clone()));
+            }
+            if placement_changed && entry.actor.placement_intent.is_some() {
+                return Err(ActorDirectoryError::PlacementIntentConflict);
+            }
+            if policy_changed
+                && entry.actor.policy_revision.is_some_and(|previous| {
+                    policy_revision.is_none_or(|revision| revision <= previous)
+                })
+            {
+                return Err(ActorDirectoryError::PolicyTransitionBlocked);
+            }
+            if matches!(
+                entry.actor.state,
+                ActorLogicalState::Active | ActorLogicalState::Retired
+            ) {
+                return Err(if policy_changed {
+                    ActorDirectoryError::PolicyTransitionBlocked
+                } else {
+                    ActorDirectoryError::PlacementIntentConflict
+                });
+            }
+            if let Some(revision) = policy_revision {
+                entry.actor.policy_revision = Some(revision);
+            }
+            if let Some(intent) = placement_intent {
+                entry.actor.placement_intent = Some(intent);
+            }
+            let mut returned = entry.clone();
+            returned.revision = checked_next(entry.revision)?;
+            Ok(Mutation::changed(returned))
+        })
+        .await
+    }
+
     async fn claim_activation(
         &self,
         claim: &ActorActivationClaim,
@@ -752,7 +810,9 @@ mod tests {
     use std::sync::Arc;
 
     use bamboo_domain::{
-        ActorDirectoryPort, ActorPlacementClass, ActorPlacementRef, Session, Storage,
+        record_permission_audit, resolve_permission_mode, ActorControlPlaneBinding,
+        ActorDirectoryPort, ActorPlacementClass, ActorPlacementIntent, ActorPlacementRef,
+        PermissionAuditSeed, PermissionMode, Session, SessionPermissionMode, Storage,
     };
     use chrono::{Duration, Utc};
 
@@ -776,6 +836,202 @@ mod tests {
             }),
             now,
         }
+    }
+
+    fn stamp_policy(session: &mut Session, policy_revision: u64) {
+        record_permission_audit(
+            &mut session.metadata,
+            &PermissionAuditSeed::bamboo_runtime(
+                policy_revision,
+                resolve_permission_mode(SessionPermissionMode::Default, PermissionMode::Default),
+            ),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_policy_and_intent_survive_reassignment_and_physical_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("actor-control-plane", "model");
+        stamp_policy(&mut root, 7);
+        store.save_session(&root).await?;
+        let cold = store.ensure_actor(&root.id).await?;
+        // Even a complete saved audit is not by itself proof that its revision
+        // came from the Host's effective configuration.
+        assert_eq!(cold.actor.policy_revision, None);
+        assert_eq!(cold.actor.placement_intent, None);
+
+        let intent = ActorPlacementIntent::Pool {
+            pool_id: "workers".into(),
+        };
+        let binding = ActorControlPlaneBinding {
+            policy_revision: Some(7),
+            placement_intent: Some(intent.clone()),
+        };
+        let bound = store.bind_control_plane(&root.id, binding.clone()).await?;
+        assert_eq!(bound.actor.policy_revision, Some(7));
+        assert_eq!(bound.actor.placement_intent, Some(intent.clone()));
+        assert_eq!(
+            store.bind_control_plane(&root.id, binding).await?.revision,
+            bound.revision
+        );
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&root.id, "run-1", "host-a", now))
+            .await?;
+        assert_eq!(
+            activation.placement_ref.as_ref().unwrap().class,
+            ActorPlacementClass::Local
+        );
+        assert_eq!(
+            store.inspect_actor(&root.id).await?.actor.placement_intent,
+            Some(intent.clone())
+        );
+        store.start_activation(&activation.fence(), now).await?;
+        store
+            .finish_activation(
+                &activation.fence(),
+                now + Duration::seconds(1),
+                ActorActivationFinish::Succeeded,
+            )
+            .await?;
+
+        root.set_project_id_meta("another-project");
+        root.metadata_version += 1;
+        store.save_runtime_state(&root).await?;
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let after = reopened.inspect_actor(&root.id).await?;
+        assert_eq!(after.actor.project_id.as_deref(), Some("another-project"));
+        assert_eq!(after.actor.policy_revision, Some(7));
+        assert_eq!(after.actor.placement_intent, Some(intent));
+        let sidecar = home
+            .path()
+            .join("sessions/actor-control-plane/actor-authority.json");
+        let before_conflict = fs::read(&sidecar).await?;
+        assert_eq!(
+            reopened
+                .bind_control_plane(
+                    &root.id,
+                    ActorControlPlaneBinding {
+                        policy_revision: None,
+                        placement_intent: Some(ActorPlacementIntent::Local),
+                    }
+                )
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::PlacementIntentConflict
+        );
+        assert_eq!(fs::read(&sidecar).await?, before_conflict);
+        let advanced = reopened
+            .bind_control_plane(
+                &root.id,
+                ActorControlPlaneBinding {
+                    policy_revision: Some(8),
+                    placement_intent: None,
+                },
+            )
+            .await?;
+        assert_eq!(advanced.actor.policy_revision, Some(8));
+        assert_eq!(
+            advanced.actor.placement_intent,
+            after.actor.placement_intent
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_host_binding_sets_policy_and_live_or_regressive_changes_are_rejected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let mut root = Session::new("policy-refresh", "model");
+        stamp_policy(&mut root, 99);
+        root.metadata.insert(
+            "placement".into(),
+            r#"{"kind":"remote","host":"other"}"#.into(),
+        );
+        store.save_session(&root).await?;
+        assert_eq!(
+            store.ensure_actor(&root.id).await?.actor.policy_revision,
+            None
+        );
+        assert_eq!(
+            store.inspect_actor(&root.id).await?.actor.placement_intent,
+            None
+        );
+
+        let now = Utc::now();
+        let active = store
+            .claim_activation(&claim(&root.id, "run", "host", now))
+            .await?;
+        let sidecar = home
+            .path()
+            .join("sessions/policy-refresh/actor-authority.json");
+        let before_conflict = fs::read(&sidecar).await?;
+        assert_eq!(
+            store.inspect_actor(&root.id).await?.actor.policy_revision,
+            None
+        );
+        assert_eq!(
+            store
+                .bind_control_plane(
+                    &root.id,
+                    ActorControlPlaneBinding {
+                        policy_revision: Some(4),
+                        placement_intent: None,
+                    }
+                )
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::PolicyTransitionBlocked
+        );
+        assert_eq!(fs::read(&sidecar).await?, before_conflict);
+        store.validate_fence(&active.fence(), now).await?;
+        store.start_activation(&active.fence(), now).await?;
+        store
+            .finish_activation(
+                &active.fence(),
+                now + Duration::seconds(1),
+                ActorActivationFinish::Succeeded,
+            )
+            .await?;
+        let bound = store
+            .bind_control_plane(
+                &root.id,
+                ActorControlPlaneBinding {
+                    policy_revision: Some(4),
+                    placement_intent: None,
+                },
+            )
+            .await?;
+        assert_eq!(bound.actor.policy_revision, Some(4));
+        assert_eq!(bound.actor.placement_intent, None);
+
+        stamp_policy(&mut root, 1000);
+        store.save_runtime_state(&root).await?;
+        assert_eq!(
+            store.inspect_actor(&root.id).await?.actor.policy_revision,
+            Some(4)
+        );
+        let before_conflict = fs::read(&sidecar).await?;
+        assert_eq!(
+            store
+                .bind_control_plane(
+                    &root.id,
+                    ActorControlPlaneBinding {
+                        policy_revision: Some(3),
+                        placement_intent: None,
+                    }
+                )
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::PolicyTransitionBlocked
+        );
+        assert_eq!(fs::read(&sidecar).await?, before_conflict);
+        Ok(())
     }
 
     #[tokio::test]

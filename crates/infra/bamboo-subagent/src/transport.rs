@@ -32,6 +32,7 @@ use crate::executor::{
 use crate::poison::PoisonRecover;
 use crate::proto::{
     ActorEventBatch, ActorEventBatcher, ActorEventQos, ChildFrame, ParentFrame, RunSpec,
+    TerminalStatus,
 };
 
 /// Direct actor links use separate bounded data/control queues. A slow parent
@@ -967,12 +968,58 @@ impl ChildClient {
 /// ([`ChildClient`]) or over the mailbox bus
 /// (`bamboo_broker::BrokerChildLink`). This trait is the seam where the two
 /// sub-agent families (PULL direct / PUSH broker) collapse into one drive path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableChildDeliveryReceipt {
+    /// Stable identity of the broker Maildir that owns these MsgIds.
+    pub broker_identity: String,
+    /// Exact broker Run message id that correlated these frames.
+    pub correlation_id: String,
+    /// Exact Event and Outcome mailbox message ids, in delivery order.
+    pub message_ids: Vec<String>,
+    /// Worker terminal accepted by the Host frame pump, before SDK final save.
+    pub terminal_status: TerminalStatus,
+}
+
 #[async_trait::async_trait]
 pub trait ChildLink: Send {
     /// Send a parent→child frame (Run / Cancel / steer / approval reply).
     async fn send(&mut self, frame: ParentFrame) -> TransportResult<()>;
     /// Next child→parent frame, or `None` once the run is terminal / the link closes.
     async fn next_frame(&mut self) -> TransportResult<Option<ChildFrame>>;
+
+    /// Called only after the Host frame pump has validated and consumed the
+    /// terminal frame. A surfaced Outcome alone is not checkpoint authority.
+    fn accept_durable_terminal(&mut self, _status: TerminalStatus) {}
+
+    /// Whether this link holds a broker Outcome receipt for a fully processed
+    /// terminal frame. Direct WebSocket links have no mailbox receipt.
+    fn has_pending_durable_terminal(&self) -> bool {
+        false
+    }
+
+    fn durable_delivery_receipt(&self) -> Option<DurableChildDeliveryReceipt> {
+        None
+    }
+
+    /// Confirm the exact durable broker frames only after the Host has saved
+    /// the logical Child transcript and terminal status. A failed confirmation
+    /// leaves remaining mailbox receipts unconfirmed for replay.
+    async fn acknowledge_durable_frames(&mut self) -> TransportResult<()> {
+        Ok(())
+    }
+
+    /// Delete a previously Host-committed Run's frames on a newly connected
+    /// link. Unsupported transports must fail closed instead of claiming a
+    /// receipt was processed.
+    async fn acknowledge_recovered_durable_frames(
+        &mut self,
+        _broker_identity: &str,
+        _message_ids: &[String],
+    ) -> TransportResult<()> {
+        Err(TransportError::Protocol(
+            "recovered durable ACK is unavailable on this transport".into(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]

@@ -371,3 +371,131 @@ pub async fn inspect_owned_tree(
     }
     Ok(page)
 }
+
+/// Resolve one descendant for read-only inspection. Both lineages come from
+/// canonical Sessions; matching a candidate index entry or a root id alone is
+/// never enough to authorize transcript access.
+pub async fn load_owned_descendant(
+    port: &dyn OwnedTreePort,
+    caller_id: &str,
+    target_id: &str,
+) -> Result<Session, OwnedTreeError> {
+    let caller_chain = lineage(port, caller_id).await?;
+    let target_chain = lineage(port, target_id).await?;
+    if target_chain.len() <= caller_chain.len() {
+        return Err(OwnedTreeError::InvalidLineage);
+    }
+    let same_authority = |left: &Session, right: &Session| -> Result<bool, OwnedTreeError> {
+        let left = actor(left)?;
+        let right = actor(right)?;
+        Ok(left.actor_id == right.actor_id
+            && left.session_created_at == right.session_created_at
+            && left.parent_actor_id == right.parent_actor_id
+            && left.root_actor_id == right.root_actor_id
+            && left.project_id == right.project_id
+            && left.spawn_depth == right.spawn_depth)
+    };
+    for (caller, target_ancestor) in caller_chain.iter().zip(&target_chain) {
+        if !same_authority(caller, target_ancestor)? {
+            return Err(OwnedTreeError::InvalidLineage);
+        }
+    }
+    // Recheck authority after reading the target. If an ancestor is replaced
+    // or reparented during this read, do not return its transcript snapshot.
+    let current_chain = lineage(port, target_id).await?;
+    if current_chain.len() != target_chain.len() {
+        return Err(OwnedTreeError::InvalidLineage);
+    }
+    for (before, after) in target_chain.iter().zip(&current_chain) {
+        if !same_authority(before, after)? {
+            return Err(OwnedTreeError::InvalidLineage);
+        }
+    }
+    target_chain
+        .into_iter()
+        .last()
+        .ok_or(OwnedTreeError::InvalidLineage)
+}
+
+#[cfg(test)]
+mod descendant_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    struct Sessions(HashMap<String, Session>);
+
+    #[async_trait]
+    impl OwnedTreePort for Sessions {
+        async fn load(&self, id: &str) -> Result<Session, OwnedTreeError> {
+            self.0
+                .get(id)
+                .cloned()
+                .ok_or(OwnedTreeError::InvalidLineage)
+        }
+
+        async fn child_ids(&self, parent_id: &str) -> Result<Vec<String>, OwnedTreeError> {
+            Ok(self
+                .0
+                .values()
+                .filter(|session| session.parent_session_id.as_deref() == Some(parent_id))
+                .map(|session| session.id.clone())
+                .collect())
+        }
+    }
+
+    fn sessions() -> Sessions {
+        let now = Utc::now();
+        let mut root = Session::new("root", "model");
+        root.created_at = now;
+        let mut child = Session::new_child_of("child", &root, "model", "child");
+        child.created_at = now + Duration::seconds(1);
+        let mut grandchild = Session::new_child_of("grandchild", &child, "model", "grandchild");
+        grandchild.created_at = now + Duration::seconds(2);
+        let mut sibling = Session::new_child_of("sibling", &root, "model", "sibling");
+        sibling.created_at = now + Duration::seconds(1);
+        let mut outsider = Session::new("outsider", "model");
+        outsider.created_at = now;
+        Sessions(
+            [root, child, grandchild, sibling, outsider]
+                .into_iter()
+                .map(|session| (session.id.clone(), session))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn root_and_ancestor_can_inspect_descendant_but_sibling_and_other_root_cannot() {
+        let store = sessions();
+        assert_eq!(
+            load_owned_descendant(&store, "root", "grandchild")
+                .await
+                .unwrap()
+                .id,
+            "grandchild"
+        );
+        assert_eq!(
+            load_owned_descendant(&store, "child", "grandchild")
+                .await
+                .unwrap()
+                .id,
+            "grandchild"
+        );
+        for caller in ["sibling", "outsider", "grandchild"] {
+            assert!(matches!(
+                load_owned_descendant(&store, caller, "grandchild").await,
+                Err(OwnedTreeError::InvalidLineage)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn inconsistent_ancestor_birth_fails_closed() {
+        let mut store = sessions();
+        let invalid_birth = store.0.get("root").unwrap().created_at - Duration::seconds(1);
+        store.0.get_mut("grandchild").unwrap().created_at = invalid_birth;
+        assert!(matches!(
+            load_owned_descendant(&store, "root", "grandchild").await,
+            Err(OwnedTreeError::InvalidLineage)
+        ));
+    }
+}

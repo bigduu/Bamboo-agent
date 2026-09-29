@@ -41,6 +41,27 @@ pub enum ActorPlacementIntent {
     PinnedHost { host_ref: String },
 }
 
+/// Policy and placement selected by the Host control plane for a logical Actor.
+/// Missing fields leave an already-bound value unchanged. Neither field may
+/// be populated from a worker event, physical lease, or UI placement badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorControlPlaneBinding {
+    pub policy_revision: Option<u64>,
+    pub placement_intent: Option<ActorPlacementIntent>,
+}
+
+impl ActorPlacementIntent {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Local => true,
+            Self::Pool { pool_id } => !pool_id.trim().is_empty() && pool_id.trim() == pool_id,
+            Self::PinnedHost { host_ref } => {
+                !host_ref.trim().is_empty() && host_ref.trim() == host_ref
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorPlacementClass {
@@ -88,8 +109,10 @@ pub struct ActorSession {
     pub spawn_depth: u32,
     pub state: ActorLogicalState,
     pub current_attempt: u64,
-    /// Populated only after effective-policy authority is integrated.
+    /// Effective permission-policy revision bound from Host configuration.
     pub policy_revision: Option<u64>,
+    /// Host-resolved logical placement preference, independent of the current
+    /// physical activation's placement lease.
     pub placement_intent: Option<ActorPlacementIntent>,
 }
 
@@ -292,11 +315,7 @@ impl ActorDirectoryEntry {
                 .actor
                 .placement_intent
                 .as_ref()
-                .is_some_and(|intent| match intent {
-                    ActorPlacementIntent::Local => false,
-                    ActorPlacementIntent::Pool { pool_id } => pool_id.trim().is_empty(),
-                    ActorPlacementIntent::PinnedHost { host_ref } => host_ref.trim().is_empty(),
-                })
+                .is_some_and(|intent| !intent.is_valid())
         {
             return Err(ActorDirectoryError::Corrupt);
         }
@@ -395,6 +414,10 @@ pub enum ActorDirectoryError {
     InvalidIdentity,
     #[error("Root Project context changed or cannot be proven stable while an activation is live")]
     ProjectTransitionBlocked,
+    #[error("effective actor policy revision conflicts with the Host's previously bound revision")]
+    PolicyTransitionBlocked,
+    #[error("actor placement intent conflicts with the Host's previously bound intent")]
+    PlacementIntentConflict,
     #[error("actor authority record is malformed, unsupported, or inconsistent")]
     Corrupt,
     #[error("actor activation is already owned by another live attempt")]
@@ -420,6 +443,15 @@ pub trait ActorDirectoryPort: Send + Sync {
     async fn inspect_actor(
         &self,
         actor_id: &str,
+    ) -> Result<ActorDirectoryEntry, ActorDirectoryError>;
+    /// Bind the effective revision and logical placement selected by trusted
+    /// Host configuration before activation. Physical worker claims and
+    /// Session display metadata are never sources for this binding. Existing
+    /// values survive Project reassignment and physical replacement.
+    async fn bind_control_plane(
+        &self,
+        actor_id: &str,
+        binding: ActorControlPlaneBinding,
     ) -> Result<ActorDirectoryEntry, ActorDirectoryError>;
     async fn claim_activation(
         &self,

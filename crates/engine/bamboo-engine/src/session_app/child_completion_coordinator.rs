@@ -1011,11 +1011,45 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         parent.updated_at = Utc::now();
         write_runtime_state(&mut parent, &runtime_state);
-        if let Err(error) = self
-            .persistence
-            .checkpoint_runtime_session(&mut parent)
-            .await
-        {
+        // Canonical ChildOutcome admission owns the provider-visible message;
+        // this transaction only changes the parent's wait/control state. A
+        // concurrent Root turn may already have advanced its model-context
+        // ledger, so use the control-plane writer, which adopts that durable
+        // ledger under the session lock. The rolling-upgrade fallback above
+        // appends a message and still requires an append-safe checkpoint.
+        let save = if child_admission.is_some() {
+            self.persistence
+                .save_runtime_only_and_publish_on_success(&mut parent, |saved| {
+                    if let Some(cached) = self.sessions.get(&saved.id) {
+                        cached.update(|current| {
+                            let messages = current.messages.clone();
+                            let provider_transcript = current.provider_transcript.clone();
+                            let admission = current
+                                .runtime_metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.session_inbox_admission.clone());
+                            let mut refreshed = saved.clone();
+                            refreshed.messages = messages;
+                            refreshed.provider_transcript = provider_transcript;
+                            if let Some(admission) = admission {
+                                refreshed
+                                    .runtime_metadata
+                                    .get_or_insert_with(Default::default)
+                                    .session_inbox_admission = Some(admission);
+                            } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+                                metadata.session_inbox_admission = None;
+                            }
+                            *current = refreshed;
+                        });
+                    }
+                })
+                .await
+        } else {
+            self.persistence
+                .checkpoint_runtime_session(&mut parent)
+                .await
+        };
+        if let Err(error) = save {
             tracing::warn!(
                 parent_session_id = %completion.parent_session_id,
                 child_session_id = %completion.child_session_id,
@@ -1024,10 +1058,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             );
             return;
         }
-        self.sessions.insert(
-            parent.id.clone(),
-            Arc::new(crate::SessionSnapshot::new(parent.clone())),
-        );
+        if child_admission.is_none() {
+            self.sessions.insert(
+                parent.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(parent.clone())),
+            );
+        }
 
         // Capture before releasing the per-parent lock so the borrow checker
         // is satisfied; `resume_parent` has its own retry loop and should not
@@ -2997,6 +3033,33 @@ mod tests {
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct FailingRuntimeSaveStorage {
+        inner: Arc<bamboo_storage::SessionStoreV2>,
+    }
+
+    #[async_trait]
+    impl Storage for FailingRuntimeSaveStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+
+        async fn load_runtime_control_plane(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(id).await
+        }
+
+        async fn save_runtime_state(&self, _session: &Session) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected sidecar save failure"))
+        }
+    }
+
     struct EmptyTools;
 
     #[async_trait]
@@ -3509,6 +3572,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_child_wait_sidecar_save_keeps_cache_wait_and_transcript() {
+        let (_temp, store, inbox, mut coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "failed-sidecar-parent";
+        let child_id = "failed-sidecar-child";
+        let now = Utc::now();
+        let mut parent = Session::new(parent_id, "model");
+        parent.add_message(Message::user("durable root turn"));
+        let mut runtime = AgentRuntimeState::new("waiting-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec![child_id.to_string()],
+            ChildWaitPolicy::All,
+            now,
+        ));
+        write_runtime_state(&mut parent, &runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        store.save_session(&parent).await.unwrap();
+        let mut cached = parent.clone();
+        cached.add_message(Message::assistant("newer cached root turn", None));
+        coordinator.sessions.insert(
+            parent_id.to_string(),
+            Arc::new(crate::SessionSnapshot::new(cached)),
+        );
+
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child.set_last_run_status("completed");
+        store.save_session(&child).await.unwrap();
+        Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
+            Arc::new(FailingRuntimeSaveStorage {
+                inner: store.clone(),
+            }),
+        ));
+
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent_id.to_string(),
+                child_session_id: child_id.to_string(),
+                status: "completed".to_string(),
+                error: None,
+                completed_at: Utc::now(),
+            },
+        )
+        .await;
+
+        let durable = store.load_session(parent_id).await.unwrap().unwrap();
+        assert!(read_runtime_state(&durable).waiting_for_children.is_some());
+        assert_eq!(durable.messages.len(), 1);
+        assert_eq!(durable.messages[0].content, "durable root turn");
+        let cached = coordinator.sessions.get(parent_id).unwrap();
+        let cached = cached.value().read();
+        assert!(read_runtime_state(&cached).waiting_for_children.is_some());
+        assert!(cached
+            .messages
+            .iter()
+            .any(|message| message.content == "newer cached root turn"));
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn oversized_child_completion_clears_wait_and_activates_exactly_once() {
         let (_temp, store, inbox, coordinator, reservations, launches) =
             completion_inbox_fixture().await;
@@ -3535,6 +3665,15 @@ mod tests {
             "waiting_for_children".to_string(),
         );
         store.save_session(&parent).await.unwrap();
+        // The running Root can have a newer in-memory transcript while this
+        // coordinator reads the durable wait. Publishing the control-plane
+        // transition must not replace that transcript with the stale load.
+        let mut cached_parent = parent.clone();
+        cached_parent.add_message(Message::assistant("concurrent root turn", None));
+        coordinator.sessions.insert(
+            parent_id.to_string(),
+            Arc::new(crate::SessionSnapshot::new(cached_parent)),
+        );
 
         let mut child = Session::new_child(child_id, parent_id, "model", "Child");
         child.add_message(Message::assistant("z".repeat(300 * 1024), None));
@@ -3556,6 +3695,15 @@ mod tests {
         assert!(!durable_parent
             .metadata
             .contains_key("runtime.suspend_reason"));
+        let cached_parent = coordinator.sessions.get(parent_id).unwrap();
+        let cached_parent = cached_parent.value().read();
+        assert!(cached_parent
+            .messages
+            .iter()
+            .any(|message| message.content == "concurrent root turn"));
+        assert!(read_runtime_state(&cached_parent)
+            .waiting_for_children
+            .is_none());
         let backlog = inbox.inspect(parent_id).await.unwrap();
         assert_eq!(backlog.pending + backlog.claimed, 1);
         assert!(backlog.activation_pending());

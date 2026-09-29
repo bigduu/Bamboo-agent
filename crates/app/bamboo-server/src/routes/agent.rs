@@ -183,6 +183,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/sessions/{session_id}/guidance/{message_id}",
             web::delete().to(agent::guidance::cancel),
         )
+        .route(
+            "/sessions/{session_id}/dead-letters",
+            web::get().to(agent::dead_letters::inspect),
+        )
+        .route(
+            "/sessions/{session_id}/dead-letters/{message_id}/retry",
+            web::post().to(agent::dead_letters::retry),
+        )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
         .route(

@@ -26,7 +26,7 @@ use bamboo_subagent::{ActorEventBatch, AgentRef, InboxKind, InboxMessage, MsgId}
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
@@ -55,6 +55,7 @@ pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, M
 /// arrive promptly; 30s is a generous cap that still guarantees a caller can
 /// never hang indefinitely if the broker dies after receiving `Deliver`.
 const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+const ACK_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The reader never lets live event traffic block durable/control frames on
 /// the same WebSocket. Overflow is dropped and exposed by the batch sequence.
@@ -205,6 +206,8 @@ pub struct BrokerClient {
     actor_stream: mpsc::UnboundedReceiver<ActorStreamItem>,
     actor_stream_open: bool,
     delivered: mpsc::UnboundedReceiver<MsgId>,
+    ack_results: mpsc::UnboundedReceiver<(MsgId, MsgId, bool, Option<String>)>,
+    broker_identity: watch::Receiver<Option<String>>,
     /// Correlated rejections for an in-flight `Deliver` (e.g. `MailboxFull`),
     /// demuxed independently of `delivered` so `deliver()` can distinguish
     /// "the broker turned this down" from "no receipt arrived in time" — see
@@ -327,6 +330,8 @@ impl BrokerClient {
         let (actor_tx, actor_stream) = mpsc::unbounded_channel();
         let actor_capacity = Arc::new(Semaphore::new(CLIENT_EVENT_QUEUE_CAPACITY));
         let (del_tx, delivered) = mpsc::unbounded_channel();
+        let (ack_tx, ack_results) = mpsc::unbounded_channel();
+        let (broker_identity_tx, broker_identity) = watch::channel(None);
         let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
         let (conn_tx, connected) = mpsc::unbounded_channel();
@@ -388,6 +393,21 @@ impl BrokerClient {
                         }
                         Ok(BrokerFrame::Delivered { id }) => {
                             let _ = del_tx.send(id);
+                        }
+                        Ok(BrokerFrame::AckResult {
+                            id,
+                            request_id,
+                            accepted,
+                            reason,
+                        }) => {
+                            let _ = ack_tx.send((id, request_id, accepted, reason));
+                        }
+                        Ok(BrokerFrame::BrokerIdentity { id }) => {
+                            if uuid::Uuid::parse_str(&id).is_ok() {
+                                broker_identity_tx.send_replace(Some(id));
+                            } else {
+                                tracing::warn!("broker sent an invalid persistent identity");
+                            }
                         }
                         // Correlated to a specific `Deliver` (e.g.
                         // `MailboxFull`) — route it to `errors` so the waiting
@@ -457,6 +477,8 @@ impl BrokerClient {
             actor_stream,
             actor_stream_open: true,
             delivered,
+            ack_results,
+            broker_identity,
             errors,
             cancels,
             connected,
@@ -600,11 +622,31 @@ impl BrokerClient {
         mailbox: &str,
         role: &str,
     ) -> BrokerResult<Option<WorkerHostObservation>> {
+        self.observe_host_inner(mailbox, role, false).await
+    }
+
+    /// Request operator-policy capacity along with current scoped identity.
+    /// A legacy broker returns no capacity, so callers must fail closed.
+    pub async fn observe_host_capacity(
+        &mut self,
+        mailbox: &str,
+        role: &str,
+    ) -> BrokerResult<Option<WorkerHostObservation>> {
+        self.observe_host_inner(mailbox, role, true).await
+    }
+
+    async fn observe_host_inner(
+        &mut self,
+        mailbox: &str,
+        role: &str,
+        include_capacity: bool,
+    ) -> BrokerResult<Option<WorkerHostObservation>> {
         let request_id = MsgId::new();
         self.send(ClientFrame::ObserveHost {
             request_id: request_id.clone(),
             mailbox: mailbox.into(),
             role: role.into(),
+            include_capacity,
         })
         .await?;
         let deadline = tokio::time::Instant::now() + DELIVER_RECEIPT_TIMEOUT;
@@ -730,6 +772,24 @@ impl BrokerClient {
         self.reader_alive.load(Ordering::SeqCst)
     }
 
+    /// Wait for the server's stable Maildir identity. Legacy brokers do not
+    /// provide it and cannot participate in durable Child receipt recovery.
+    pub async fn durable_broker_identity(&mut self) -> BrokerResult<String> {
+        let wait = async {
+            loop {
+                if let Some(id) = self.broker_identity.borrow().clone() {
+                    return Ok(id);
+                }
+                self.broker_identity.changed().await.map_err(|_| {
+                    BrokerError::Transport("broker closed before identity receipt".into())
+                })?;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .map_err(|_| BrokerError::Transport("timed out waiting for broker identity".into()))?
+    }
+
     /// Acknowledge a processed message so the broker deletes it.
     pub async fn ack(&mut self, id: MsgId) -> BrokerResult<()> {
         #[cfg(test)]
@@ -737,6 +797,59 @@ impl BrokerClient {
             return Err(BrokerError::Transport("injected broker ack failure".into()));
         }
         self.send(ClientFrame::Ack { id }).await
+    }
+
+    /// Confirm that the broker processed this exact ACK. A timeout or lost
+    /// connection leaves the result uncertain, so callers must retain their
+    /// durable Host receipt and retry the same message id after reconnect.
+    pub async fn ack_confirmed(&mut self, id: MsgId) -> BrokerResult<()> {
+        self.ack_confirmed_with_timeout(id, ACK_RECEIPT_TIMEOUT)
+            .await
+    }
+
+    async fn ack_confirmed_with_timeout(
+        &mut self,
+        id: MsgId,
+        receipt_timeout: Duration,
+    ) -> BrokerResult<()> {
+        #[cfg(test)]
+        if self.fail_next_ack.swap(false, Ordering::SeqCst) {
+            return Err(BrokerError::Transport("injected broker ack failure".into()));
+        }
+        let request_id = MsgId::new();
+        self.send(ClientFrame::AckWithReceipt {
+            id: id.clone(),
+            request_id: request_id.clone(),
+        })
+        .await?;
+        let result = async {
+            loop {
+                match self.ack_results.recv().await {
+                    Some((received_id, received_request, accepted, reason))
+                        if received_id == id && received_request == request_id =>
+                    {
+                        return if accepted {
+                            Ok(())
+                        } else {
+                            Err(BrokerError::Rejected(
+                                reason.unwrap_or_else(|| "broker rejected durable ACK".into()),
+                            ))
+                        };
+                    }
+                    Some(_) => continue,
+                    None => {
+                        return Err(BrokerError::Transport(
+                            "connection closed before ACK receipt".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(receipt_timeout, result)
+            .await
+            .map_err(|_| {
+                BrokerError::Transport("timed out waiting for broker ACK receipt".into())
+            })?
     }
 
     /// Arm one synthetic ack failure without perturbing production behavior.

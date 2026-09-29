@@ -17,6 +17,16 @@ pub enum PublicActorEventClass {
     Ephemeral,
 }
 
+/// Host-admitted order within an activation. This is only for the process-local
+/// change hub; the browser receives an opaque event ID instead of these lease
+/// and execution coordinates.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ActorEventSourceOrder {
+    pub lease_epoch: u64,
+    pub execution_epoch: u64,
+    pub sequence: u64,
+}
+
 /// Safe metadata copied from the host-admitted envelope. The opaque event ID
 /// preserves duplicate identity without exposing internal lease/epoch fields.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -28,6 +38,8 @@ pub struct PublicActorEvent {
     pub attempt: u64,
     pub event_id: String,
     pub class: PublicActorEventClass,
+    #[serde(skip)]
+    pub source_order: ActorEventSourceOrder,
 }
 
 impl From<&ActorEventEnvelope> for PublicActorEvent {
@@ -52,6 +64,11 @@ impl From<&ActorEventEnvelope> for PublicActorEvent {
             attempt: envelope.attempt,
             event_id,
             class,
+            source_order: ActorEventSourceOrder {
+                lease_epoch: envelope.lease_epoch,
+                execution_epoch: envelope.execution_epoch,
+                sequence: envelope.sequence,
+            },
         }
     }
 }
@@ -88,6 +105,7 @@ mod tests {
         let public = PublicActorEvent::from(&envelope);
         assert_eq!(public.event_id.len(), 68);
         assert!(public.event_id.starts_with("ae1-"));
+        assert_eq!(public.source_order.sequence, 3);
         assert!(public.event_id[4..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
@@ -97,6 +115,7 @@ mod tests {
             "private-project",
             "lease_epoch",
             "execution_epoch",
+            "source_order",
         ] {
             assert!(!json.contains(private));
         }

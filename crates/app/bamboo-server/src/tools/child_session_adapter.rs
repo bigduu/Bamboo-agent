@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde_json::json;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -16,6 +17,10 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
+};
+use bamboo_domain::{
+    ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
+    SessionInboxAdministrationPrincipal, SessionInboxLimits, SessionInboxPort,
 };
 use bamboo_engine::execution::spawn::{SpawnJob, SpawnScheduler};
 use bamboo_engine::session_app::child_session::{
@@ -970,6 +975,180 @@ impl ChildSessionPort for ChildSessionAdapter {
         }
 
         Ok(child)
+    }
+
+    async fn load_child_for_inspection(
+        &self,
+        caller_id: &str,
+        child_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        bamboo_engine::session_app::child_session::owned_tree::load_owned_descendant(
+            self.session_store.as_ref(),
+            caller_id,
+            child_id,
+        )
+        .await
+        .map_err(|_| ChildSessionError::NotChildOfParent {
+            child_id: child_id.to_owned(),
+            parent_id: caller_id.to_owned(),
+        })
+    }
+
+    async fn inspect_child_diagnostics(
+        &self,
+        child: &Session,
+    ) -> Result<serde_json::Value, ChildSessionError> {
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            self.session_store.clone(),
+            SessionInboxLimits::default(),
+        );
+        let queue = match inbox.inspect(&child.id).await {
+            Ok(backlog) => json!({
+                "available": true,
+                "pending": backlog.pending,
+                "claimed": backlog.claimed,
+                "generation": backlog.generation,
+                "oldest_generation": backlog.oldest_generation,
+                "activation_pending": backlog.activation_pending(),
+                "interrupt_pending": backlog.interrupt_pending(),
+            }),
+            Err(_) => json!({"available": false, "reason": "storage_unavailable"}),
+        };
+        let now = Utc::now();
+        let leases = match inbox.inspect_owned_leases(&child.id, 8, now).await {
+            Ok(leases) => json!({
+                "available": true,
+                "items": leases.into_iter().map(|lease| json!({
+                    "generation": lease.generation,
+                    "epoch": lease.epoch,
+                    "expires_at": lease.expires_at,
+                    "expired": lease.expired,
+                    "reclaim_count": lease.reclaim_count,
+                    "manual_retry_count": lease.manual_retry_count,
+                    "failure_count": lease.failure_count,
+                    "last_error_code": lease.last_error_code,
+                    "retry_after": lease.retry_after,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(_) => json!({"available": false, "reason": "storage_unavailable"}),
+        };
+        let principal = SessionInboxAdministrationPrincipal::authenticated_host_owner_for(child);
+        let dead_letters = match inbox.inspect_dead_letters(&child.id, 8, &principal).await {
+            Ok(letters) => json!({
+                "available": true,
+                "items": letters.into_iter().map(|letter| json!({
+                    "id": letter.id,
+                    "generation": letter.generation,
+                    "failure_count": letter.failure_count,
+                    "last_error_code": letter.last_error_code,
+                    "dead_lettered_at": letter.dead_lettered_at,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(_) => json!({"available": false, "reason": "storage_unavailable"}),
+        };
+        let activation = match self
+            .session_store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &child.root_session_id,
+                &child.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+        {
+            Ok(snapshot) => match snapshot
+                .nodes
+                .into_iter()
+                .find(|node| node.actor_id == child.id)
+            {
+                Some(node) => json!({
+                    "available": true,
+                    "logical_state": node.logical_state,
+                    "placement_class": node.placement_class,
+                    "directory_revision": node.revision.actor_directory_revision,
+                    "attempt": node.activation.as_ref().map(|activation| activation.attempt),
+                    "status": node.activation.as_ref().map(|activation| activation.status),
+                }),
+                None => json!({"available": false, "reason": "inconsistent_authority"}),
+            },
+            Err(error) => json!({"available": false, "reason": error.to_string()}),
+        };
+        // Inspection is read-only, but queue and actor observations take separate
+        // locks. Suppress all evidence if the logical Session was replaced while
+        // those reads ran; a reused ID cannot inherit an older parent's view.
+        let current = self
+            .storage
+            .load_session(&child.id)
+            .await
+            .map_err(|_| ChildSessionError::Execution("diagnostic session unavailable".into()))?
+            .ok_or_else(|| ChildSessionError::NotFound(child.id.clone()))?;
+        if current.created_at != child.created_at
+            || current.parent_session_id != child.parent_session_id
+            || current.root_session_id != child.root_session_id
+        {
+            return Err(ChildSessionError::Execution(
+                "diagnostic session changed during inspection".into(),
+            ));
+        }
+        let wait = read_runtime_state(child).waiting_for_children.map(|wait| {
+            json!({
+                "child_count": wait.child_session_ids.len(),
+                "policy": wait.wait_for.as_str(),
+                "registered_at": wait.registered_at,
+                "timeout_at": wait.timeout_at,
+            })
+        });
+        let question = bamboo_domain::ParentQuestion::for_orphan_pending(child);
+        let question = if let Some(question) = question {
+            json!({"status": "pending", "id": question.id, "deadline": question.deadline})
+        } else if child.pending_question.is_some() {
+            json!({"status": "unverified"})
+        } else {
+            json!({"status": "none"})
+        };
+        let permission = match child.parent_session_id.as_deref() {
+            Some(parent_id) => match self.session_store.load_session(parent_id).await {
+                Ok(Some(parent)) => {
+                    match crate::app_state::pending_permissions_for_child(&parent, child) {
+                        Some(requests) => json!({
+                            "available": true,
+                            "status": if requests.is_empty() { "none" } else { "pending" },
+                            "pending_count_at_least": requests.len(),
+                            "truncated": requests.len() > 8,
+                            "requests": requests.into_iter().take(8).map(|request| json!({
+                                "id": request.id,
+                                "deadline": request.deadline,
+                                "deadline_passed": request.deadline <= now,
+                            })).collect::<Vec<_>>(),
+                        }),
+                        None => json!({"available": false, "reason": "inconsistent_authority"}),
+                    }
+                }
+                Ok(None) => json!({"available": false, "reason": "parent_missing"}),
+                Err(_) => json!({"available": false, "reason": "storage_unavailable"}),
+            },
+            None => json!({"available": false, "reason": "parent_missing"}),
+        };
+        let heartbeat = self.get_child_runner_info(&child.id).await;
+        Ok(json!({
+            "child_session_id": child.id,
+            "view": "diagnostics",
+            "available": true,
+            "observed_status": child.last_run_status(),
+            "queue": queue,
+            "leases": leases,
+            "dead_letters": dead_letters,
+            "activation": activation,
+            "wait": wait,
+            "question": question,
+            "permission": permission,
+            "heartbeat": {
+                "runner_observed": heartbeat.is_some(),
+                "last_event_at": heartbeat.as_ref().and_then(|info| info.last_event_at),
+                "round_count": heartbeat.as_ref().map(|info| info.round_count),
+            },
+            "error": {"present": child.last_run_error().is_some()},
+        }))
     }
 
     async fn validate_child_run_request(

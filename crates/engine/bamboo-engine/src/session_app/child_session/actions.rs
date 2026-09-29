@@ -577,7 +577,7 @@ pub async fn get_child_action(
     child_session_id: String,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let child = port
-        .load_child_for_parent(parent_id, &child_session_id)
+        .load_child_for_inspection(parent_id, &child_session_id)
         .await?;
 
     let status = child.last_run_status();

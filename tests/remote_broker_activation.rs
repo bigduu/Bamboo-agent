@@ -124,7 +124,10 @@ async fn response(body: web::Json<Value>, p: web::Data<Probe>) -> HttpResponse {
                 0 => json!({"message":"REMOTE_NATIVE_TASK: return one plain reply", "role":ROLE}),
                 1 => json!({"intent":"control","target":target.unwrap(),"message":"retry"}),
                 2 => json!({"intent":"control","target":target.unwrap(),"message":"cancel"}),
-                _ => json!({"intent":"inspect","target":target.unwrap(),"message":"result"}),
+                3 => json!({"intent":"inspect","target":target.unwrap(),"message":"result"}),
+                4 => json!({"intent":"chat","target":target.unwrap(),
+                    "message":"Repeat REMOTE_NATIVE_TASK: return one plain reply in this existing Actor session"}),
+                _ => panic!("unknown remote SubAgent operation {op}"),
             };
             (
                 json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"SubAgent","arguments":args.to_string()}}]}),
@@ -242,15 +245,24 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
         loop {
             let root = cold(&p.data, "remote-root").await;
             let call_id = format!("remote-op-{number}");
-            let result = matches!(op, 0 | 1 | 2)
+            let result = matches!(op, 0 | 1 | 2 | 4)
                 .then(|| {
                     root.messages
                         .iter()
                         .rev()
                         .find(|m| m.tool_call_id.as_deref() == Some(&call_id))
                         .map(|m| {
+                            assert_eq!(
+                                m.tool_success,
+                                Some(true),
+                                "durable SubAgent {call_id} failed: {}",
+                                m.content
+                            );
                             serde_json::from_str::<Value>(&m.content)
-                                .expect("actual durable SubAgent tool result")
+                                .unwrap_or_else(|error| panic!(
+                                    "durable SubAgent {call_id} returned non-JSON content: {error}; {}",
+                                    m.content
+                                ))
                         })
                 })
                 .flatten();
@@ -283,8 +295,9 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
                 {
                     break;
                 }
-                // Held spawn/retry may suspend with a merged, untagged sibling wait.
-                if matches!(op, 0 | 1)
+                // Held spawn/retry/continuation may suspend with a merged,
+                // untagged sibling wait.
+                if matches!(op, 0 | 1 | 4)
                     && p.hold.load(Ordering::SeqCst)
                     && root.last_run_status().as_deref() == Some("suspended")
                     && root
@@ -819,7 +832,10 @@ async fn fixture() {
     );
     turn(&client, &base, &p, 3, 0).await;
     p.hold.store(true, Ordering::SeqCst);
-    turn(&client, &base, &p, 1, 0).await;
+    // A completed answer is protected by the broker ACK transcript anchor.
+    // Continue this logical Actor with a new durable user turn; control retry
+    // below still covers failed/cancelled Runs without rewriting that answer.
+    turn(&client, &base, &p, 4, 0).await;
     wait_calls(&p, 2).await;
     turn(&client, &base, &p, 0, 0).await;
     let sibling = p.ids.lock().unwrap()[1].clone();
@@ -887,7 +903,7 @@ async fn fixture() {
     wait_calls(&p, 3).await;
     wait_child(&data, &child_id, "completed").await;
     p.hold.store(true, Ordering::SeqCst);
-    turn(&client, &base, &p, 1, 0).await;
+    turn(&client, &base, &p, 4, 0).await;
     wait_calls(&p, 4).await;
     h.stop();
     // Disconnection is not worker Run anti-replay. Settle the actual old Run

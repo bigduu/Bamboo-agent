@@ -94,40 +94,12 @@ fn role_name(role: &Role) -> &'static str {
 fn snapshot_sha256(messages: &[Message]) -> String {
     let mut digest = Sha256::new();
     for message in messages {
-        update_field(&mut digest, message.id.as_bytes());
-        update_field(&mut digest, role_name(&message.role).as_bytes());
-        update_field(&mut digest, message.content.as_bytes());
-        update_field(
-            &mut digest,
-            message.tool_call_id.as_deref().unwrap_or("").as_bytes(),
-        );
-        update_field(
-            &mut digest,
-            match message.tool_success {
-                Some(true) => b"true",
-                Some(false) => b"false",
-                None => b"",
-            },
-        );
-        for call in message.tool_calls.as_deref().unwrap_or(&[]) {
-            update_field(&mut digest, call.id.as_bytes());
-            update_field(&mut digest, call.function.name.as_bytes());
-            update_field(&mut digest, call.function.arguments.as_bytes());
-        }
-        update_field(
-            &mut digest,
-            &(message.content_parts.as_ref().map_or(0usize, Vec::len) as u64).to_be_bytes(),
-        );
-        update_field(&mut digest, message.created_at.to_rfc3339().as_bytes());
-        update_field(
-            &mut digest,
-            message
-                .phase
-                .as_ref()
-                .map(|phase| phase.as_str())
-                .unwrap_or("")
-                .as_bytes(),
-        );
+        // The cursor commits to the complete persisted message. Hashing only
+        // visible preview fields could accept a rewritten tool proof, image,
+        // reasoning signature, or metadata as the same transcript prefix.
+        let value = serde_json::to_value(message).expect("Message serializes");
+        let bytes = serde_json::to_vec(&value).expect("Message Value serializes");
+        update_field(&mut digest, &bytes);
     }
     hex::encode(digest.finalize())
 }
@@ -428,9 +400,17 @@ pub async fn inspect_child_action(
 ) -> Result<Value, ChildSessionError> {
     // Authorization precedes cursor parsing and every transcript/result read.
     let child = port
-        .load_child_for_parent(parent_id, child_session_id)
+        .load_child_for_inspection(parent_id, child_session_id)
         .await?;
     match view {
+        "diagnostics"
+            if cursor.is_none()
+                && message_id.is_none()
+                && limit.is_none()
+                && max_bytes.is_none() =>
+        {
+            port.inspect_child_diagnostics(&child).await
+        }
         "messages" if message_id.is_none() && max_bytes.is_none() => {
             message_page(&child, cursor, limit)
         }
@@ -441,11 +421,13 @@ pub async fn inspect_child_action(
         "error" if message_id.is_none() && limit.is_none() => {
             error_slice(&child, cursor, max_bytes)
         }
-        "messages" | "message" | "result" | "error" => Err(ChildSessionError::InvalidArguments(
-            "unsupported argument for the selected child-inspection view".to_string(),
-        )),
+        "diagnostics" | "messages" | "message" | "result" | "error" => {
+            Err(ChildSessionError::InvalidArguments(
+                "unsupported argument for the selected child-inspection view".to_string(),
+            ))
+        }
         _ => Err(ChildSessionError::InvalidArguments(
-            "view must be overview, messages, message, result, or error".to_string(),
+            "view must be overview, diagnostics, messages, message, result, or error".to_string(),
         )),
     }
 }
@@ -651,6 +633,21 @@ mod tests {
         child.messages[1].content = "rewritten".to_string();
         assert!(matches!(
             message_page(&child, Some(cursor), Some(3)),
+            Err(ChildSessionError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn message_cursor_rejects_rewritten_non_preview_fields() {
+        let mut child = child();
+        for index in 0..4 {
+            child.add_message(Message::user(format!("message {index}")));
+        }
+        let first = message_page(&child, None, Some(1)).unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap();
+        child.messages[0].reasoning = Some("changed private reasoning".into());
+        assert!(matches!(
+            message_page(&child, Some(cursor), Some(1)),
             Err(ChildSessionError::InvalidArguments(_))
         ));
     }

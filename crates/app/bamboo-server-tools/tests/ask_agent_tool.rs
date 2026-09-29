@@ -8,7 +8,8 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
 use bamboo_broker::{serve_executor, BrokerCore, BrokerServer, DeployedAgent};
 use bamboo_domain::{
-    ActorActivationClaim, ActorDirectoryPort, ActorPlacementClass, ActorPlacementRef, Session,
+    ActorActivationClaim, ActorDirectoryPort, ActorPlacementClass, ActorPlacementRef, Message,
+    Session,
 };
 use bamboo_server_tools::AskAgentTool;
 use bamboo_server_tools::{registry_keys, Deployed, DeployedRegistry};
@@ -101,6 +102,93 @@ fn root_ctx<'a>(session_id: &'a str, tool_call_id: &'a str) -> ToolExecutionCont
     }
 }
 
+#[tokio::test]
+async fn existing_direct_child_query_reads_durable_history_and_steer_requires_subagent() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let mut root = Session::new("canonical-root", "echo-model");
+    root.set_project_id_meta("project-a");
+    store.save_session(&root).await.unwrap();
+    let mut child = Session::new_child_of("canonical-child", &root, "echo-model", "resident");
+    child.set_project_id_meta("project-a");
+    child.add_message(Message::user("Existing canonical child history"));
+    store.save_session(&child).await.unwrap();
+    // No deployment registry entry or reachable broker: the query must read
+    // the same durable Child Session as SubAgent.
+    let tool = AskAgentTool::new("ws://127.0.0.1:1", "tok")
+        .with_deployments(Arc::default(), store.clone());
+    let query = tool
+        .invoke(
+            serde_json::json!({"target": child.id, "question":"status", "mode":"query"}),
+            root_ctx(&root.id, "query-child").to_tool_ctx(),
+        )
+        .await
+        .unwrap()
+        .into_tool_result();
+    let query: serde_json::Value = serde_json::from_str(&query.result).unwrap();
+    assert_eq!(query["from"], child.id);
+    assert_eq!(query["snapshot"]["message_count"], 1);
+    assert!(query.get("answer").is_none());
+
+    let error = tool
+        .invoke(
+            serde_json::json!({"target": child.id, "question":"Focus only on the assigned parser", "mode":"steer"}),
+            root_ctx(&root.id, "steer-child-1").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("SubAgent target"));
+    assert_eq!(
+        store
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn known_non_direct_or_wrong_project_actor_never_falls_back_to_broker() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let mut root = Session::new("root-a", "echo-model");
+    root.set_project_id_meta("project-a");
+    store.save_session(&root).await.unwrap();
+    let mut other = Session::new("root-b", "echo-model");
+    other.set_project_id_meta("project-b");
+    store.save_session(&other).await.unwrap();
+    let mut direct = Session::new_child_of("direct-child", &root, "echo-model", "resident");
+    direct.set_project_id_meta("project-a");
+    store.save_session(&direct).await.unwrap();
+    let mut grandchild = Session::new_child_of("nested-child", &direct, "echo-model", "resident");
+    grandchild.set_project_id_meta("project-a");
+    store.save_session(&grandchild).await.unwrap();
+    let mut foreign = Session::new_child_of("foreign-child", &other, "echo-model", "resident");
+    foreign.set_project_id_meta("project-b");
+    store.save_session(&foreign).await.unwrap();
+    let tool = AskAgentTool::new("ws://127.0.0.1:1", "tok").with_deployments(Arc::default(), store);
+    for target in [&root.id, &other.id, &grandchild.id, &foreign.id] {
+        for mode in ["query", "steer"] {
+            let error = tool
+                .invoke(
+                    serde_json::json!({"target":target, "question":"status", "mode":mode}),
+                    root_ctx(&root.id, "forbidden-child").to_tool_ctx(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not an existing direct Child Actor"),
+                "{target}: {error}"
+            );
+        }
+    }
+}
+
 async fn host_bound_deployment(store: &Arc<SessionStoreV2>, registry: &DeployedRegistry) -> String {
     let mut root = Session::new("owner-root", "echo-model");
     root.set_project_id_meta("project-a");
@@ -148,7 +236,7 @@ async fn host_bound_deployment(store: &Arc<SessionStoreV2>, registry: &DeployedR
 }
 
 #[tokio::test]
-async fn host_bound_ask_requires_owned_actor_or_live_alias_before_broker_send() {
+async fn host_bound_ask_uses_saved_child_or_live_alias_before_broker_send() {
     // A live broker peer named "worker" makes a raw-mailbox fallback observable.
     let (endpoint, _broker_dir) = broker_with_echo_worker().await;
     let home = tempfile::tempdir().unwrap();
@@ -218,7 +306,7 @@ async fn host_bound_ask_requires_owned_actor_or_live_alias_before_broker_send() 
     let before = store.load_session(&actor_id).await.unwrap().unwrap();
     for (question, mode, reason) in [
         ("tell me about your private transcript", "query", "status"),
-        ("inject this into the worker", "steer", "SessionInbox"),
+        ("inject this into the worker", "steer", "SubAgent target"),
     ] {
         let error = tool
             .invoke(
@@ -266,7 +354,10 @@ async fn host_bound_ask_requires_owned_actor_or_live_alias_before_broker_send() 
         .unwrap_err();
     assert!(invalid_caller.to_string().contains("saved Root"));
 
-    for target in [&actor_id, "friendly-alias"] {
+    for (target, reason) in [
+        (actor_id.as_str(), "not an existing direct Child Actor"),
+        ("friendly-alias", "identity or caller"),
+    ] {
         let error = tool
             .invoke(
                 serde_json::json!({"target": target, "question": "cross-project"}),
@@ -274,25 +365,33 @@ async fn host_bound_ask_requires_owned_actor_or_live_alias_before_broker_send() 
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("identity or caller"));
+        assert!(error.to_string().contains(reason));
     }
 
-    // Reopening the same durable store after a server restart does not make
-    // its former worker mailbox or alias an actor execution authority.
+    // Reopening the durable store retains exact Child query authority, but it
+    // does not restore the former worker mailbox or ephemeral deployment alias.
     let restarted_store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
     assert!(restarted_store.inspect_actor(&actor_id).await.is_ok());
     let restarted_tool = AskAgentTool::new("ws://127.0.0.1:1", "tok")
         .with_deployments(Arc::default(), restarted_store);
-    for target in [&actor_id, "friendly-alias"] {
-        let error = restarted_tool
-            .invoke(
-                serde_json::json!({"target": target, "question": "stale"}),
-                root_ctx("owner-root", "after-restart").to_tool_ctx(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("not a live deployment"));
-    }
+    let direct = restarted_tool
+        .invoke(
+            serde_json::json!({"target": actor_id, "question": "status"}),
+            root_ctx("owner-root", "after-restart").to_tool_ctx(),
+        )
+        .await
+        .unwrap()
+        .into_tool_result();
+    let direct: serde_json::Value = serde_json::from_str(&direct.result).unwrap();
+    assert_eq!(direct["snapshot"]["message_count"], 0);
+    let error = restarted_tool
+        .invoke(
+            serde_json::json!({"target": "friendly-alias", "question": "stale"}),
+            root_ctx("owner-root", "after-restart-alias").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a live deployment"));
 
     let fence = registry
         .lock()

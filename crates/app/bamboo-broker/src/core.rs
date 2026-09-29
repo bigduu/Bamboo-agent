@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bamboo_subagent::{ActorEventBatch, ActorEventQos, InboxMessage, Mailbox, MsgId};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::WorkerHostObservation;
@@ -98,6 +98,8 @@ struct Subscriber {
 pub(crate) struct AuthenticatedHost {
     pub host_ref: String,
     pub credential_expires_at: DateTime<Utc>,
+    pub host_capabilities: Option<bamboo_domain::WorkerHostCapabilities>,
+    pub max_slots: Option<u16>,
 }
 
 /// Opaque proof that one server connection installed the current subscriber.
@@ -115,6 +117,8 @@ pub(crate) struct SubscriptionStreams {
 /// In-process routing engine: owns the mailbox root and the live subscriber table.
 pub struct BrokerCore {
     root: PathBuf,
+    /// Exactly one durable identity publication/read per server process.
+    identity: OnceCell<String>,
     /// session_id -> live subscriber. Present only while a client is subscribed.
     subscribers: RwLock<HashMap<String, Subscriber>>,
     /// Per-mailbox pending-message cap (#53); see
@@ -138,12 +142,87 @@ impl BrokerCore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            identity: OnceCell::new(),
             subscribers: RwLock::new(HashMap::new()),
             max_pending_per_mailbox: DEFAULT_MAX_PENDING_PER_MAILBOX,
             pending_counts: Mutex::new(HashMap::new()),
             event_queue_capacity: DEFAULT_EVENT_QUEUE_CAPACITY,
             dropped_event_batches: AtomicU64::new(0),
         }
+    }
+
+    /// Stable identity of this Maildir namespace. Publish a fully synced
+    /// temporary file with a no-replace hard link: concurrent handshakes must
+    /// never observe an empty identity between create_new and write_all.
+    pub async fn broker_identity(&self) -> BrokerResult<String> {
+        self.identity
+            .get_or_try_init(|| async {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || -> BrokerResult<String> {
+                    use std::io::Write;
+                    std::fs::create_dir_all(&root).map_err(|error| {
+                        BrokerError::Transport(format!("broker identity directory: {error}"))
+                    })?;
+                    let path = root.join(".broker-maildir-identity-v1");
+                    if !path.exists() {
+                        let candidate = uuid::Uuid::new_v4().to_string();
+                        let temporary = root.join(format!(
+                            ".broker-maildir-identity-v1.{}.tmp",
+                            uuid::Uuid::new_v4()
+                        ));
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)
+                            .map_err(|error| {
+                                BrokerError::Transport(format!(
+                                    "broker identity temp create: {error}"
+                                ))
+                            })?;
+                        let write_result = file
+                            .write_all(candidate.as_bytes())
+                            .and_then(|_| file.sync_all());
+                        drop(file);
+                        if let Err(error) = write_result {
+                            let _ = std::fs::remove_file(&temporary);
+                            return Err(BrokerError::Transport(format!(
+                                "broker identity temp write: {error}"
+                            )));
+                        }
+                        let published = std::fs::hard_link(&temporary, &path);
+                        let _ = std::fs::remove_file(&temporary);
+                        match published {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => {
+                                return Err(BrokerError::Transport(format!(
+                                    "broker identity publish: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    // Also sync on the losing side of a concurrent publish. Neither
+                    // connection may advertise a root identity before its directory
+                    // entry is durable.
+                    #[cfg(unix)]
+                    std::fs::File::open(&root)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            BrokerError::Transport(format!("broker identity sync: {error}"))
+                        })?;
+                    let raw = std::fs::read_to_string(&path).map_err(|error| {
+                        BrokerError::Transport(format!("broker identity read: {error}"))
+                    })?;
+                    let parsed = uuid::Uuid::parse_str(&raw).map_err(|_| {
+                        BrokerError::Protocol("invalid persistent broker identity".into())
+                    })?;
+                    Ok(parsed.to_string())
+                })
+                .await
+                .map_err(|error| BrokerError::Transport(format!("broker identity task: {error}")))?
+            })
+            .await
+            .cloned()
     }
 
     /// Disjoint transport namespace; no legacy backlog adoption or migration.
@@ -326,6 +405,8 @@ impl BrokerCore {
                         role: role.map(str::to_string),
                         credential_expires_at: host.credential_expires_at,
                         connection_generation: MsgId::new().0,
+                        host_capabilities: host.host_capabilities,
+                        max_slots: host.max_slots,
                         environment_lease_v1,
                     });
                 }
@@ -639,6 +720,53 @@ impl BrokerCore {
 }
 
 #[cfg(test)]
+mod broker_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn identity_survives_core_restart_and_changes_with_maildir() {
+        let same_root = tempfile::tempdir().unwrap();
+        let first = BrokerCore::new(same_root.path());
+        let id = first.broker_identity().await.unwrap();
+        assert_eq!(
+            BrokerCore::new(same_root.path())
+                .broker_identity()
+                .await
+                .unwrap(),
+            id
+        );
+        let other_root = tempfile::tempdir().unwrap();
+        assert_ne!(
+            BrokerCore::new(other_root.path())
+                .broker_identity()
+                .await
+                .unwrap(),
+            id
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cores_publish_one_complete_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let path = root.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                BrokerCore::new(path).broker_identity().await.unwrap()
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), first);
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".broker-maildir-identity-v1")).unwrap(),
+            first
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_subagent::{AgentRef, InboxKind};
@@ -935,6 +1063,8 @@ mod tests {
         let host = |name: &str, expiry| AuthenticatedHost {
             host_ref: name.into(),
             credential_expires_at: expiry,
+            host_capabilities: None,
+            max_slots: None,
         };
         let (_first_streams, first_lease) = core
             .subscribe_scoped_with_lease("worker", Some("gpu"), host("host-a", deadline))

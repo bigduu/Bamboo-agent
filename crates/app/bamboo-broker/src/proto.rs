@@ -4,6 +4,7 @@
 //! [`AgentRef`] verbatim — the broker is a transport for those, it does not
 //! reinterpret them.
 
+use bamboo_domain::WorkerHostCapabilities;
 use bamboo_subagent::{ActorEventBatch, AgentRef, InboxMessage, MsgId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,12 @@ pub struct WorkerHostObservation {
     pub role: Option<String>,
     pub credential_expires_at: DateTime<Utc>,
     pub connection_generation: String,
+    /// Operator policy attestation captured by the broker for this exact
+    /// authenticated connection. Missing on legacy peers: no scheduling grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_capabilities: Option<WorkerHostCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_slots: Option<u16>,
     /// Claimed by this authenticated subscriber for the current connection.
     /// The Host still sends a versioned Run and the Worker validates its lease.
     #[serde(default)]
@@ -50,6 +57,9 @@ pub enum ClientFrame {
     /// Acknowledge a processed message so the broker deletes it (at-least-once;
     /// an unacked message is re-pushed on the next subscribe).
     Ack { id: MsgId },
+    /// ACK with a correlated deletion receipt. Used when the caller must
+    /// prove that the broker processed the ACK before releasing a Host receipt.
+    AckWithReceipt { id: MsgId, request_id: MsgId },
     /// Out-of-band cancel: ask the broker to signal session `to` to abort the
     /// in-flight run correlated to `correlation_id` (the timed-out ask's id).
     /// Ephemeral and fire-and-forget — NOT durable, never enters a mailbox, never
@@ -67,7 +77,15 @@ pub enum ClientFrame {
         request_id: MsgId,
         mailbox: String,
         role: String,
+        /// Opt in to the operator-policy capacity extension. Old peers omit
+        /// this field and receive the original observation shape.
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_capacity: bool,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Broker → client.
@@ -76,6 +94,9 @@ pub enum ClientFrame {
 pub enum BrokerFrame {
     /// Handshake accepted.
     Welcome,
+    /// Stable identity of the durable mailbox namespace behind this broker.
+    /// A Host receipt may only be replay-ACKed against this exact namespace.
+    BrokerIdentity { id: String },
     /// Handshake or request rejected; the broker closes the connection after
     /// an auth error.
     ///
@@ -101,6 +122,15 @@ pub enum BrokerFrame {
     },
     /// Receipt that a [`ClientFrame::Deliver`] was durably enqueued.
     Delivered { id: MsgId },
+    /// Result of an [`ClientFrame::AckWithReceipt`]. A retry with the same
+    /// message id remains safe after a lost response because ACK is idempotent.
+    AckResult {
+        id: MsgId,
+        request_id: MsgId,
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Out-of-band cancel pushed to a live subscriber: abort the in-flight run
     /// correlated to `correlation_id`. Ephemeral — never persisted/acked (#50).
     Cancel { correlation_id: MsgId },
@@ -178,6 +208,10 @@ mod tests {
             ClientFrame::Subscribe,
             ClientFrame::SubscribeEnvironmentLeaseV1,
             ClientFrame::Ack { id: MsgId::new() },
+            ClientFrame::AckWithReceipt {
+                id: MsgId::new(),
+                request_id: MsgId::new(),
+            },
             ClientFrame::Cancel {
                 to: "child".into(),
                 correlation_id: MsgId::new(),
@@ -189,6 +223,7 @@ mod tests {
                 request_id: MsgId::new(),
                 mailbox: "worker".into(),
                 role: "gpu-pool".into(),
+                include_capacity: false,
             },
         ];
         for f in frames {
@@ -209,9 +244,28 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_host_observation_request_keeps_legacy_wire_shape() {
+        let frame = ClientFrame::ObserveHost {
+            request_id: MsgId::new(),
+            mailbox: "worker".into(),
+            role: "worker".into(),
+            include_capacity: false,
+        };
+        let encoded = serde_json::to_value(&frame).unwrap();
+        assert!(encoded.get("include_capacity").is_none());
+        assert_eq!(
+            serde_json::from_value::<ClientFrame>(encoded).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
     fn broker_frames_round_trip() {
         let frames = [
             BrokerFrame::Welcome,
+            BrokerFrame::BrokerIdentity {
+                id: uuid::Uuid::new_v4().to_string(),
+            },
             BrokerFrame::Error {
                 reason: "bad token".into(),
                 id: None,
@@ -226,6 +280,12 @@ mod tests {
                 batch: event_batch(),
             },
             BrokerFrame::Delivered { id: MsgId::new() },
+            BrokerFrame::AckResult {
+                id: MsgId::new(),
+                request_id: MsgId::new(),
+                accepted: true,
+                reason: None,
+            },
             BrokerFrame::Cancel {
                 correlation_id: MsgId::new(),
             },
@@ -244,6 +304,8 @@ mod tests {
                     role: Some("gpu-pool".into()),
                     credential_expires_at: Utc::now(),
                     connection_generation: MsgId::new().0,
+                    host_capabilities: None,
+                    max_slots: None,
                     environment_lease_v1: true,
                 }),
             },
@@ -281,6 +343,8 @@ mod tests {
         });
         let observation: WorkerHostObservation = serde_json::from_value(legacy).unwrap();
         assert!(!observation.environment_lease_v1);
+        assert!(observation.host_capabilities.is_none());
+        assert!(observation.max_slots.is_none());
     }
 
     fn event_batch() -> ActorEventBatch {

@@ -56,6 +56,36 @@ fn pending_requests(parent: &Session) -> Vec<(ParentRequest, SessionMessageEnvel
         .collect()
 }
 
+/// Read-only diagnostic projection for one exact, directly owned Child. The
+/// canonical parent transcript is the source of truth; a live reviewer map is
+/// not sufficient after a restart. No request body or operation is exposed.
+pub(crate) fn pending_for_child(parent: &Session, child: &Session) -> Option<Vec<ParentRequest>> {
+    let parent_actor = ActorSession::from_session(parent).ok()?;
+    let child_actor = ActorSession::from_session(child).ok()?;
+    if child_actor.parent_actor_id.as_deref() != Some(parent.id.as_str())
+        || child_actor.root_actor_id != parent_actor.root_actor_id
+        || child_actor.project_id != parent_actor.project_id
+        || parent_actor.spawn_depth.checked_add(1) != Some(child_actor.spawn_depth)
+    {
+        return None;
+    }
+    Some(
+        pending_requests(parent)
+            .into_iter()
+            .filter_map(|(request, _)| {
+                (request.child.session_id == child.id
+                    && request.child.created_at == child.created_at
+                    && request.parent.session_id == parent.id
+                    && request.parent.created_at == parent.created_at
+                    && request.root_session_id == child_actor.root_actor_id
+                    && request.project_id == child_actor.project_id)
+                    .then_some(request)
+            })
+            .take(9)
+            .collect(),
+    )
+}
+
 /// Safe to repeat after a crash or concurrent review. `expire` rechecks the
 /// deadline and Pending state under the canonical parent mutation lock.
 async fn scan_startup(
@@ -332,6 +362,39 @@ mod tests {
             sessions,
             request,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_diagnostics_follow_exact_saved_child_birth_and_terminal() {
+        let seed = seed_request(chrono::Duration::seconds(-1), false).await;
+        let parent = seed
+            .store
+            .load_session("permission-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        let child = seed
+            .store
+            .load_session("permission-child")
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_for_child(&parent, &child).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, seed.request.id);
+
+        let mut replacement = child.clone();
+        replacement.created_at += chrono::Duration::seconds(1);
+        assert!(pending_for_child(&parent, &replacement).unwrap().is_empty());
+
+        assert_eq!(reconcile_once(&seed.store, &seed.sessions).await.denied, 1);
+        let resolved = seed
+            .store
+            .load_session("permission-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending_for_child(&resolved, &child).unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -66,12 +66,14 @@ pub use actor_input::{
 mod actor_input_tests;
 mod actor_model_context;
 mod actor_transcript;
+mod broker_receipt;
 pub use actor_model_context::{
     ActorModelContextCheckpoint, ActorModelContextError, ActorModelContextOutcome,
 };
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };
+pub use broker_receipt::BrokerTerminalReceipt;
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
@@ -86,8 +88,12 @@ mod compact_main;
 #[cfg(test)]
 mod compact_main_tests;
 mod default_actor_context;
+mod host_registry;
+pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
+#[cfg(test)]
+mod host_registry_tests;
 mod parent_question_checkpoint;
 #[cfg(test)]
 mod startup_sidecar_tests;
@@ -5423,7 +5429,10 @@ fn extension_to_mime(ext: &str) -> Option<&'static str> {
 }
 
 impl SessionStoreV2 {
-    async fn load_session_unlocked(&self, session_id: &str) -> io::Result<Option<Session>> {
+    pub(crate) async fn load_session_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
         let Some(path) = self.session_json_path(session_id).await? else {
             self.ensure_no_unindexed_root(session_id).await?;
@@ -5454,6 +5463,7 @@ impl SessionStoreV2 {
         session: &Session,
         total_started: Instant,
         guards: &Arc<DefaultWriterGuards>,
+        answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_actor_context(session, &self.abs_path_from_rel(&intended_rel), true)
@@ -5471,14 +5481,26 @@ impl SessionStoreV2 {
         // save must still be able to repair an interrupted creation whose Main
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
-        match fs::read_to_string(current_main).await {
+        match fs::read_to_string(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
                 reject_regressing_direct_parent_terminals(session, &durable)?;
+                self.reject_rewriting_broker_receipts(
+                    session,
+                    &durable,
+                    current_main.parent().expect("session.json has a parent"),
+                    answer_permit,
+                )
+                .await?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.reject_broker_receipts_without_main(
+                    current_main.parent().expect("session.json has a parent"),
+                )
+                .await?;
+            }
             Err(error) => return Err(error),
         }
 
@@ -5691,7 +5713,7 @@ impl Storage for SessionStoreV2 {
         session
             .record_root_mode_operation(receipt)
             .map_err(|error| other_io_error(error.to_string()))?;
-        self.save_session_after_lock(&session, total_started, &guards)
+        self.save_session_after_lock(&session, total_started, &guards, None)
             .await?;
         Ok(RootModeOperationDecision::Terminal(
             session
@@ -5753,7 +5775,7 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
         let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
-        self.save_session_after_lock(session, total_started, &guards)
+        self.save_session_after_lock(session, total_started, &guards, None)
             .await
     }
 

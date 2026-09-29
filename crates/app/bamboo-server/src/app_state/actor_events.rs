@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bamboo_engine::external_agents::actor_event_stream::{
-    ActorEventObserver, PublicActorEvent, PublicActorEventClass,
+    ActorEventObserver, ActorEventSourceOrder, PublicActorEvent, PublicActorEventClass,
 };
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -61,7 +61,32 @@ struct ChannelEntry {
     replay_floor: u64,
     replay_bytes: usize,
     replay: VecDeque<(SequencedActorChange, usize)>,
+    last_source: Option<AcceptedSource>,
     sender: broadcast::Sender<ActorHubMessage>,
+}
+
+struct AcceptedSource {
+    attempt: u64,
+    activation_id: String,
+    order: ActorEventSourceOrder,
+}
+
+impl AcceptedSource {
+    fn admits(&self, event: &PublicActorEvent) -> bool {
+        if event.attempt != self.attempt {
+            return event.attempt > self.attempt && event.class == PublicActorEventClass::Lifecycle;
+        }
+        if event.activation_id != self.activation_id
+            || event.source_order.lease_epoch != self.order.lease_epoch
+        {
+            return false;
+        }
+        if event.source_order.execution_epoch != self.order.execution_epoch {
+            return event.source_order.execution_epoch > self.order.execution_epoch
+                && event.class == PublicActorEventClass::Lifecycle;
+        }
+        event.source_order.sequence > self.order.sequence
+    }
 }
 
 impl ChannelEntry {
@@ -161,6 +186,7 @@ impl ActorEventHub {
                     replay_floor: generation << COUNTER_BITS,
                     replay_bytes: 0,
                     replay: VecDeque::new(),
+                    last_source: None,
                     sender,
                 },
             );
@@ -213,6 +239,18 @@ impl ActorEventObserver for ActorEventHub {
         let Some(entry) = state.channels.get(&event.actor_id) else {
             return;
         };
+        // Several activation pumps may finish their async publication paths
+        // out of order. Once this channel has observed an activation, a new
+        // attempt or execution epoch must publish its lifecycle first. A new
+        // channel may begin mid-activation: its required initial snapshot
+        // supplies that context, so its first event need not be lifecycle.
+        if entry
+            .last_source
+            .as_ref()
+            .is_some_and(|source| !source.admits(&event))
+        {
+            return;
+        }
         let rollover = entry.counter == u32::MAX;
         if rollover {
             // An extremely long-lived channel gets a new cursor epoch and a
@@ -232,6 +270,11 @@ impl ActorEventObserver for ActorEventHub {
         }
         let entry = state.channels.get_mut(&event.actor_id).expect("present");
         entry.counter += 1;
+        entry.last_source = Some(AcceptedSource {
+            attempt: event.attempt,
+            activation_id: event.activation_id.clone(),
+            order: event.source_order,
+        });
         let change = ActorChange::new(event);
         let bytes = serde_json::to_vec(&change).map_or(REPLAY_BYTES + 1, |value| value.len());
         let item = SequencedActorChange {
@@ -269,6 +312,11 @@ mod tests {
             attempt: 1,
             event_id: format!("ae1-{n:064x}"),
             class: PublicActorEventClass::Semantic,
+            source_order: ActorEventSourceOrder {
+                lease_epoch: 1,
+                execution_epoch: 1,
+                sequence: n as u64,
+            },
         }
     }
 
@@ -449,5 +497,63 @@ mod tests {
             live.receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn delayed_or_replayed_sources_cannot_rewind_a_live_actor_channel() {
+        let hub = Arc::new(ActorEventHub::default());
+        let live = hub.subscribe("child", None).unwrap();
+        let anchor = match live.initial {
+            ActorReplay::SnapshotRequired { cursor, .. } => cursor,
+            _ => unreachable!(),
+        };
+
+        let mut first = event("child", 1);
+        first.class = PublicActorEventClass::Lifecycle;
+        hub.publish(first.clone());
+        hub.publish(event("child", 2));
+        hub.publish(event("child", 2)); // exact replay
+        hub.publish(first); // older sequence
+        hub.publish(event("child", 4)); // source may skip an ephemeral event
+        hub.publish(event("child", 3)); // delayed event cannot rewind it
+
+        let mut early_epoch_content = event("child", 2);
+        early_epoch_content.source_order.execution_epoch = 2;
+        hub.publish(early_epoch_content); // cannot precede the new lifecycle
+        let mut next_epoch = event("child", 1);
+        next_epoch.source_order.execution_epoch = 2;
+        next_epoch.event_id = "ae1-next-epoch".into();
+        next_epoch.class = PublicActorEventClass::Lifecycle;
+        hub.publish(next_epoch);
+        hub.publish(event("child", 99)); // delayed prior execution epoch
+
+        let mut early_attempt_content = event("child", 2);
+        early_attempt_content.attempt = 2;
+        early_attempt_content.activation_id = "replacement-activation".into();
+        early_attempt_content.source_order.lease_epoch = 2;
+        hub.publish(early_attempt_content); // cannot precede the replacement lifecycle
+        let mut next_attempt = event("child", 1);
+        next_attempt.attempt = 2;
+        next_attempt.activation_id = "replacement-activation".into();
+        next_attempt.source_order.lease_epoch = 2;
+        next_attempt.event_id = "ae1-next-attempt".into();
+        next_attempt.class = PublicActorEventClass::Lifecycle;
+        hub.publish(next_attempt.clone());
+        let mut old_attempt = event("child", 100);
+        old_attempt.source_order.execution_epoch = 3;
+        hub.publish(old_attempt);
+        let mut conflicting = next_attempt;
+        conflicting.activation_id = "different-activation".into();
+        conflicting.source_order.sequence = 2;
+        hub.publish(conflicting);
+
+        let ActorReplay::Events(replay) = live.replay_after(anchor) else {
+            panic!("accepted source events must remain replayable");
+        };
+        assert_eq!(replay.len(), 5);
+        assert_eq!(replay.last().unwrap().cursor, anchor + 5);
+        assert_eq!(replay[3].change.event.event_id, "ae1-next-epoch");
+        assert_eq!(replay[4].change.event.event_id, "ae1-next-attempt");
+        assert_eq!(replay[4].change.event.attempt, 2);
     }
 }

@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -41,6 +42,7 @@ rustls-pemfile = "2"
 russh = { version = "0.62.4", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3.0"
 sha2 = "0.11"
+uuid = { workspace = true }
 # Per-connection message-rate limiting (#53). The broker is a plain
 # WebSocket/tokio server (no actix), so it drives `governor` directly rather
 # than through an actix middleware. Pinned to the same major/minor bamboo-server
@@ -49,6 +51,5 @@ sha2 = "0.11"
 governor = "0.10"
 
 [dev-dependencies]
-bamboo-domain = { path = "../../core/bamboo-domain" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 tempfile = "3"

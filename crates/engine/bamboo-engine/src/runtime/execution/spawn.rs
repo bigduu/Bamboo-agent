@@ -151,6 +151,29 @@ pub trait ExternalChildRunner: Send + Sync {
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()>;
 
+    /// Persist a Host-only broker receipt before the final Child checkpoint.
+    /// `Ok(true)` selects the append-safe final checkpoint. An unprepared
+    /// broker terminal must never be ACKed after a merely ordinary save.
+    async fn prepare_durable_child_delivery(
+        &self,
+        _session: &Session,
+        _activation_run_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Called only after the Host's final Child Session save returns. The
+    /// exact Child birth and activation run identify a pending broker terminal
+    /// receipt; a failed save leaves the mailbox unacknowledged.
+    async fn confirm_durable_child_delivery(
+        &self,
+        _session: &Session,
+        _activation_run_id: &str,
+        _save_succeeded: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Bind this runner's per-run escalation host bridge (#68). A nested worker's
     /// `run()` installs its OWN host bridge here so the runner can hand it to each
     /// grandchild's `drive()` AT SPAWN time (captured into the drive task, not read

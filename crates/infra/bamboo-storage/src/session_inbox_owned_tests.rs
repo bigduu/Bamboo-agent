@@ -22,6 +22,10 @@ async fn reopen(temp: &TempDir) -> FileSessionInbox {
         SessionInboxLimits::default(),
     )
 }
+async fn principal(store: &Arc<SessionStoreV2>) -> SessionInboxAdministrationPrincipal {
+    let session = store.load_session("target").await.unwrap().unwrap();
+    SessionInboxAdministrationPrincipal::authenticated_host_owner_for(&session)
+}
 fn request(now: DateTime<Utc>) -> SessionInboxLeaseRequest {
     SessionInboxLeaseRequest {
         consumer: SessionInboxConsumerId::new(),
@@ -40,6 +44,37 @@ async fn immediate(inbox: &FileSessionInbox, text: &str) -> SessionMessageEnvelo
         .await
         .unwrap();
     envelope
+}
+
+#[test]
+fn explicit_retry_delay_is_exponential_bounded_and_stable() {
+    let id = SessionMessageId::parse("retry-envelope").unwrap();
+    let generation = 17;
+    for (failure_count, lower, upper) in [
+        (1, 30_000, 37_500),
+        (2, 60_000, 75_000),
+        (3, 120_000, 150_000),
+        (4, 240_000, 300_000),
+        (5, 300_000, 300_000),
+    ] {
+        let delay = owned::retry_delay(&id, generation, failure_count).num_milliseconds();
+        assert!((lower..=upper).contains(&delay));
+        assert_eq!(
+            delay,
+            owned::retry_delay(&id, generation, failure_count).num_milliseconds()
+        );
+    }
+    let offsets = (0..16)
+        .map(|index| {
+            owned::retry_delay(
+                &SessionMessageId::parse(format!("retry-envelope-{index}")).unwrap(),
+                generation,
+                1,
+            )
+            .num_milliseconds()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert!(offsets.len() > 1, "jitter should spread distinct envelopes");
 }
 
 #[tokio::test]
@@ -192,7 +227,7 @@ async fn wake_readiness_waits_for_failure_retry_and_excludes_dead_letter() {
 
 #[tokio::test]
 async fn expiry_reclaims_do_not_count_as_poison_failures() {
-    let (temp, _, inbox) = fixture().await;
+    let (temp, store, inbox) = fixture().await;
     let envelope = immediate(&inbox, "slow but valid").await;
     let mut next = request(Utc::now());
     for epoch in 1..=5 {
@@ -215,11 +250,7 @@ async fn expiry_reclaims_do_not_count_as_poison_failures() {
         next = request(claim.lease.expires_at);
     }
     assert!(inbox
-        .inspect_dead_letters(
-            "target",
-            1,
-            &SessionInboxAdministrationPrincipal::authenticated_host_owner(),
-        )
+        .inspect_dead_letters("target", 1, &principal(&store).await,)
         .await
         .unwrap()
         .is_empty());
@@ -227,7 +258,7 @@ async fn expiry_reclaims_do_not_count_as_poison_failures() {
 
 #[tokio::test]
 async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_identity() {
-    let (temp, _, inbox) = fixture().await;
+    let (temp, store, inbox) = fixture().await;
     let envelope = immediate(&inbox, "poison candidate").await;
     let original = request(Utc::now());
     let first = inbox
@@ -254,6 +285,10 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
         }
         other => panic!("unexpected outcome: {other:?}"),
     };
+    assert_eq!(
+        retry_at - report.now,
+        owned::retry_delay(&envelope.id, first.claim.generation, 1)
+    );
     assert!(inbox.ack_owned("target", &first, report.now).await.is_err());
     let before = request(retry_at - Duration::seconds(1));
     assert!(inbox
@@ -275,6 +310,14 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
     assert_eq!(inspection[0].retry_after, Some(retry_at));
 
     let reopened = reopen(&temp).await;
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("target", retry_at - Duration::milliseconds(1))
+            .await
+            .unwrap()
+            .next_due_at,
+        Some(retry_at)
+    );
     let second_request = request(retry_at);
     let second = reopened
         .claim_owned("target", 1, None, &second_request)
@@ -300,6 +343,10 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
         }
         other => panic!("unexpected outcome: {other:?}"),
     };
+    assert_eq!(
+        retry_at - second_report.now,
+        owned::retry_delay(&envelope.id, second.claim.generation, 2)
+    );
     let third_request = request(retry_at);
     let third = reopened
         .claim_owned("target", 1, None, &third_request)
@@ -342,7 +389,7 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
     );
 
     let after_restart = reopen(&temp).await;
-    let principal = SessionInboxAdministrationPrincipal::authenticated_host_owner();
+    let principal = principal(&store).await;
     let dead = after_restart
         .inspect_dead_letters("target", 1, &principal)
         .await
@@ -352,6 +399,28 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
     assert_eq!(dead[0].generation, first.claim.generation);
     assert_eq!(dead[0].failure_count, 3);
     assert_eq!(dead[0].last_error_code, "consumer_rejected");
+    let mut wrong_birth = store.load_session("target").await.unwrap().unwrap();
+    wrong_birth.created_at += Duration::seconds(1);
+    let stale_principal =
+        SessionInboxAdministrationPrincipal::authenticated_host_owner_for(&wrong_birth);
+    assert!(after_restart
+        .retry_dead_letter(
+            "target",
+            &envelope.id,
+            first.claim.generation,
+            third_report.now + Duration::seconds(1),
+            &stale_principal,
+        )
+        .await
+        .is_err());
+    let mut wrong_target = store.load_session("target").await.unwrap().unwrap();
+    wrong_target.id = "other-target".into();
+    let wrong_principal =
+        SessionInboxAdministrationPrincipal::authenticated_host_owner_for(&wrong_target);
+    assert!(after_restart
+        .inspect_dead_letters("target", 1, &wrong_principal)
+        .await
+        .is_err());
     assert!(after_restart
         .retry_dead_letter(
             "target",
@@ -380,6 +449,7 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
         .await
         .unwrap()
         .remove(0);
+    assert_eq!(manual.claim.envelope, envelope);
     assert_eq!(manual.claim.envelope.id, envelope.id);
     assert_eq!(manual.claim.generation, first.claim.generation);
     assert_eq!(manual.lease.epoch, third.lease.epoch + 1);
@@ -403,7 +473,7 @@ async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_iden
 
 #[tokio::test]
 async fn interrupted_dead_letter_rotation_stays_inert_and_recovers_on_reopen() {
-    let (temp, _, inbox) = fixture().await;
+    let (temp, store, inbox) = fixture().await;
     immediate(&inbox, "rotation recovery").await;
     let mut now = Utc::now();
     for _ in 0..2 {
@@ -447,11 +517,7 @@ async fn interrupted_dead_letter_rotation_stays_inert_and_recovers_on_reopen() {
         .is_err());
     let recovered = reopen(&temp).await;
     let dead = recovered
-        .inspect_dead_letters(
-            "target",
-            1,
-            &SessionInboxAdministrationPrincipal::authenticated_host_owner(),
-        )
+        .inspect_dead_letters("target", 1, &principal(&store).await)
         .await
         .unwrap();
     assert_eq!(dead.len(), 1);

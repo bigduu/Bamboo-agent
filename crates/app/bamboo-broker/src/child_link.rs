@@ -9,10 +9,11 @@
 //! mailbox unification).
 
 use bamboo_subagent::{
-    AgentRef, ChildFrame, ChildLink, ChildOutcome, InboxKind, InboxMessage, MsgId, ParentFrame,
-    TransportError, TransportResult,
+    AgentRef, ChildFrame, ChildLink, ChildOutcome, DurableChildDeliveryReceipt, InboxKind,
+    InboxMessage, MsgId, ParentFrame, TerminalStatus, TransportError, TransportResult,
 };
 use chrono::Utc;
+use std::collections::VecDeque;
 
 use crate::client::{BrokerClient, BrokerStreamEvent};
 use crate::error::{BrokerError, BrokerResult};
@@ -24,6 +25,7 @@ pub struct BrokerChildLink {
     child: String,
     /// This parent's ref (the `from` on outbound messages; replies route here).
     me: AgentRef,
+    broker_identity: String,
     /// The current run's correlation id (the delivered `Run` message id). Set on
     /// `send(Run)`; `next_frame` only surfaces frames correlated to it.
     run_id: Option<MsgId>,
@@ -32,7 +34,15 @@ pub struct BrokerChildLink {
     selected_worker: Option<AgentRef>,
     expected_run: Option<bamboo_subagent::RunSpec>,
     require_environment_lease: bool,
+    /// Exact durable mailbox receipts accepted for this Run. The Host alone
+    /// decides when its logical Session checkpoint permits their ACK.
+    pending_durable: VecDeque<MsgId>,
+    pending_terminal: Option<MsgId>,
+    observed_terminal_status: Option<TerminalStatus>,
+    accepted_terminal_status: Option<TerminalStatus>,
 }
+
+const MAX_PENDING_DURABLE_FRAMES: usize = 4096;
 
 impl BrokerChildLink {
     /// Connect to the broker as `parent` and subscribe, ready to drive `child`.
@@ -44,15 +54,21 @@ impl BrokerChildLink {
     ) -> BrokerResult<Self> {
         let mut client = BrokerClient::connect_actor(endpoint, parent.clone(), token).await?;
         client.subscribe().await?;
+        let broker_identity = client.durable_broker_identity().await?;
         Ok(Self {
             client,
             child: child.into(),
             me: parent,
+            broker_identity,
             run_id: None,
             done: false,
             selected_worker: None,
             expected_run: None,
             require_environment_lease: false,
+            pending_durable: VecDeque::new(),
+            pending_terminal: None,
+            observed_terminal_status: None,
+            accepted_terminal_status: None,
         })
     }
 
@@ -68,6 +84,7 @@ impl BrokerChildLink {
             BrokerClient::connect_actor_with_tls(endpoint, parent.clone(), token, Some(tls))
                 .await?;
         client.subscribe().await?;
+        let broker_identity = client.durable_broker_identity().await?;
         // This connection's ordered control reply confirms subscription admission
         // and the selected role's current connection presence, not Host ownership.
         let role = worker.role.as_deref().ok_or_else(strict_link_error)?;
@@ -82,11 +99,16 @@ impl BrokerChildLink {
             client,
             child: worker.session_id.clone(),
             me: parent,
+            broker_identity,
             run_id: None,
             done: false,
             selected_worker: Some(worker),
             expected_run: None,
             require_environment_lease: false,
+            pending_durable: VecDeque::new(),
+            pending_terminal: None,
+            observed_terminal_status: None,
+            accepted_terminal_status: None,
         })
     }
 
@@ -145,6 +167,40 @@ impl BrokerChildLink {
             created_at: Utc::now(),
             correlation_id: correlation,
         }
+    }
+
+    fn hold_durable(&mut self, id: MsgId, terminal: bool) -> BrokerResult<()> {
+        if self.pending_durable.len() >= MAX_PENDING_DURABLE_FRAMES {
+            return Err(BrokerError::Protocol(
+                "too many unconfirmed child durable frames".into(),
+            ));
+        }
+        if terminal {
+            self.pending_terminal = Some(id.clone());
+        }
+        self.pending_durable.push_back(id);
+        Ok(())
+    }
+
+    /// ACK only after the Host has committed the Child's logical transcript
+    /// and final status. Exact MsgIds are retained across a failed send; a
+    /// reconnect may replay them and the Host must revalidate its checkpoint.
+    pub async fn acknowledge_durable_frames(&mut self) -> BrokerResult<()> {
+        if self.pending_terminal.is_none() || self.accepted_terminal_status.is_none() {
+            return Err(BrokerError::Protocol(
+                "child terminal receipt is not ready for durable ACK".into(),
+            ));
+        }
+        while let Some(id) = self.pending_durable.front().cloned() {
+            self.client.ack_confirmed(id.clone()).await?;
+            self.pending_durable.pop_front();
+            if self.pending_terminal.as_ref() == Some(&id) {
+                self.pending_terminal = None;
+                self.observed_terminal_status = None;
+                self.accepted_terminal_status = None;
+            }
+        }
+        Ok(())
     }
 
     /// Send a parent→child frame, mirroring `ChildClient::send`.
@@ -208,6 +264,8 @@ impl BrokerChildLink {
                 let m = self.msg(kind, body, None);
                 self.run_id = Some(m.id.clone());
                 self.done = false;
+                self.observed_terminal_status = None;
+                self.accepted_terminal_status = None;
                 self.client.deliver(&self.child, m).await?;
             }
             ParentFrame::Cancel => {
@@ -311,9 +369,9 @@ impl BrokerChildLink {
                 BrokerStreamEvent::Message(None) => return Ok(None),
             };
             let id = msg.id.clone();
-            // Only this run's frames; ack + skip anything else so the mailbox drains.
-            if self.run_id.is_some() && msg.correlation_id != self.run_id {
-                self.client.ack(id).await.ok();
+            // Never delete a different Run's durable message merely because it
+            // arrived on this subscription. Its Host checkpoint is unknown.
+            if self.run_id.is_none() || msg.correlation_id != self.run_id {
                 continue;
             }
             if self
@@ -455,6 +513,7 @@ impl BrokerChildLink {
                     let oc: ChildOutcome = serde_json::from_value(msg.body)
                         .map_err(|e| BrokerError::Transport(format!("decode ChildOutcome: {e}")))?;
                     self.done = true;
+                    self.observed_terminal_status = Some(oc.status);
                     Some(ChildFrame::Terminal {
                         status: oc.status,
                         result: oc.result,
@@ -464,7 +523,11 @@ impl BrokerChildLink {
                 }
                 _ => None,
             };
-            self.client.ack(id).await.ok();
+            if matches!(msg.kind, InboxKind::Event | InboxKind::Outcome) {
+                self.hold_durable(id, msg.kind == InboxKind::Outcome)?;
+            } else {
+                self.client.ack(id).await?;
+            }
             if let Some(f) = frame {
                 return Ok(Some(f));
             }
@@ -490,6 +553,68 @@ impl ChildLink for BrokerChildLink {
             .await
             .map_err(|e| TransportError::Protocol(format!("broker link recv: {e}")))
     }
+
+    fn accept_durable_terminal(&mut self, status: TerminalStatus) {
+        if self.pending_terminal.is_some() && self.observed_terminal_status == Some(status) {
+            self.accepted_terminal_status = Some(status);
+        }
+    }
+
+    fn has_pending_durable_terminal(&self) -> bool {
+        self.pending_terminal.is_some() && self.accepted_terminal_status.is_some()
+    }
+
+    fn durable_delivery_receipt(&self) -> Option<DurableChildDeliveryReceipt> {
+        self.pending_terminal.as_ref()?;
+        let terminal_status = self.accepted_terminal_status?;
+        Some(DurableChildDeliveryReceipt {
+            broker_identity: self.broker_identity.clone(),
+            correlation_id: self.run_id.as_ref()?.as_str().to_owned(),
+            message_ids: self
+                .pending_durable
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            terminal_status,
+        })
+    }
+
+    async fn acknowledge_durable_frames(&mut self) -> TransportResult<()> {
+        BrokerChildLink::acknowledge_durable_frames(self)
+            .await
+            .map_err(|e| TransportError::Protocol(format!("broker link ack: {e}")))
+    }
+
+    async fn acknowledge_recovered_durable_frames(
+        &mut self,
+        broker_identity: &str,
+        message_ids: &[String],
+    ) -> TransportResult<()> {
+        if broker_identity != self.broker_identity {
+            return Err(TransportError::Protocol(
+                "broker mailbox identity changed before recovered ACK".into(),
+            ));
+        }
+        if message_ids.is_empty() || message_ids.len() > MAX_PENDING_DURABLE_FRAMES {
+            return Err(TransportError::Protocol(
+                "invalid recovered durable ACK set".into(),
+            ));
+        }
+        for id in message_ids {
+            if id.is_empty() || id.len() > 128 {
+                return Err(TransportError::Protocol(
+                    "invalid recovered durable ACK id".into(),
+                ));
+            }
+            self.client
+                .ack_confirmed(MsgId(id.clone()))
+                .await
+                .map_err(|error| {
+                    TransportError::Protocol(format!("broker recovered ack: {error}"))
+                })?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -502,6 +627,230 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn durable_frames_replay_until_explicit_host_confirmation() {
+        let (endpoint, dir) = start_broker().await;
+        let mut link = connect_parent(&endpoint).await;
+        let run_id = MsgId::new();
+        link.run_id = Some(run_id.clone());
+        let worker_ref = AgentRef {
+            session_id: "child".into(),
+            role: None,
+        };
+        let mut worker = BrokerClient::connect(&endpoint, worker_ref.clone(), "t")
+            .await
+            .unwrap();
+        let event_id = MsgId::new();
+        let outcome_id = MsgId::new();
+        for (id, kind, body) in [
+            (
+                event_id,
+                InboxKind::Event,
+                serde_json::json!({"type":"ready"}),
+            ),
+            (
+                outcome_id,
+                InboxKind::Outcome,
+                serde_json::to_value(ChildOutcome::completed("done")).unwrap(),
+            ),
+        ] {
+            worker
+                .deliver(
+                    "parent",
+                    InboxMessage {
+                        id,
+                        from: worker_ref.clone(),
+                        kind,
+                        body,
+                        created_at: Utc::now(),
+                        correlation_id: Some(run_id.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            link.next_frame().await.unwrap(),
+            Some(ChildFrame::Event { .. })
+        ));
+        assert!(matches!(
+            link.next_frame().await.unwrap(),
+            Some(ChildFrame::Terminal { .. })
+        ));
+        let mailbox = bamboo_subagent::Mailbox::at(dir.path().join("mailboxes/parent"));
+        assert_eq!(mailbox.pending_count().await.unwrap(), 2);
+        drop(link);
+
+        // A successor's different correlation must not delete either old
+        // receipt. It may confirm only its own new Outcome after its own Host
+        // save; the previous Run still needs separate checkpoint proof.
+        let mut successor = connect_parent(&endpoint).await;
+        let successor_run = MsgId::new();
+        successor.run_id = Some(successor_run.clone());
+        worker
+            .deliver(
+                "parent",
+                InboxMessage {
+                    id: MsgId::new(),
+                    from: worker_ref.clone(),
+                    kind: InboxKind::Outcome,
+                    body: serde_json::to_value(ChildOutcome::completed("successor")).unwrap(),
+                    created_at: Utc::now(),
+                    correlation_id: Some(successor_run),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            successor.next_frame().await.unwrap(),
+            Some(ChildFrame::Terminal { .. })
+        ));
+        assert!(!successor.has_pending_durable_terminal());
+        successor.accept_durable_terminal(TerminalStatus::Completed);
+        successor.acknowledge_durable_frames().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mailbox.pending_count().await.unwrap() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(successor);
+
+        // The same Run's unconfirmed frames are re-pushed on reconnect. A
+        // failed ACK does not remove a token or turn a receipt into success.
+        let mut replay = connect_parent(&endpoint).await;
+        replay.run_id = Some(run_id);
+        assert!(matches!(
+            replay.next_frame().await.unwrap(),
+            Some(ChildFrame::Event { .. })
+        ));
+        assert!(matches!(
+            replay.next_frame().await.unwrap(),
+            Some(ChildFrame::Terminal { .. })
+        ));
+        replay.accept_durable_terminal(TerminalStatus::Completed);
+        let fail_ack = replay.client.fail_next_ack_handle();
+        fail_ack.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(replay.acknowledge_durable_frames().await.is_err());
+        assert_eq!(mailbox.pending_count().await.unwrap(), 2);
+        replay.acknowledge_durable_frames().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mailbox.pending_count().await.unwrap() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn successor_rehydrates_only_the_same_broker_maildir_receipt() {
+        let (endpoint, dir) = start_broker().await;
+        let mut first = connect_parent(&endpoint).await;
+        let old_run = MsgId::new();
+        first.run_id = Some(old_run.clone());
+        let worker_ref = AgentRef {
+            session_id: "child".into(),
+            role: None,
+        };
+        let mut worker = BrokerClient::connect(&endpoint, worker_ref.clone(), "t")
+            .await
+            .unwrap();
+        let outcome_id = MsgId::new();
+        worker
+            .deliver(
+                "parent",
+                InboxMessage {
+                    id: outcome_id.clone(),
+                    from: worker_ref,
+                    kind: InboxKind::Outcome,
+                    body: serde_json::to_value(ChildOutcome::completed("done")).unwrap(),
+                    created_at: Utc::now(),
+                    correlation_id: Some(old_run),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.next_frame().await.unwrap(),
+            Some(ChildFrame::Terminal { .. })
+        ));
+        first.accept_durable_terminal(TerminalStatus::Completed);
+        let receipt = first.durable_delivery_receipt().unwrap();
+        drop(first);
+
+        let mut successor = connect_parent(&endpoint).await;
+        successor.run_id = Some(MsgId::new());
+        let wrong_root = uuid::Uuid::new_v4().to_string();
+        assert!(successor
+            .acknowledge_recovered_durable_frames(&wrong_root, &receipt.message_ids)
+            .await
+            .is_err());
+        let mailbox = bamboo_subagent::Mailbox::at(dir.path().join("mailboxes/parent"));
+        assert_eq!(mailbox.pending_count().await.unwrap(), 1);
+        successor
+            .acknowledge_recovered_durable_frames(&receipt.broker_identity, &receipt.message_ids)
+            .await
+            .unwrap();
+        assert_eq!(mailbox.pending_count().await.unwrap(), 0);
+        // A lost Host cleanup response may retry the same exact MsgId.
+        successor
+            .acknowledge_recovered_durable_frames(&receipt.broker_identity, &receipt.message_ids)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_worker_terminals_wait_for_explicit_host_acceptance() {
+        for (outcome, status) in [
+            (ChildOutcome::error("worker failed"), TerminalStatus::Error),
+            (ChildOutcome::cancelled(), TerminalStatus::Cancelled),
+        ] {
+            let (endpoint, dir) = start_broker().await;
+            let mut link = connect_parent(&endpoint).await;
+            let run_id = MsgId::new();
+            link.run_id = Some(run_id.clone());
+            let worker_ref = AgentRef {
+                session_id: "child".into(),
+                role: None,
+            };
+            let mut worker = BrokerClient::connect(&endpoint, worker_ref.clone(), "t")
+                .await
+                .unwrap();
+            worker
+                .deliver(
+                    "parent",
+                    InboxMessage {
+                        id: MsgId::new(),
+                        from: worker_ref,
+                        kind: InboxKind::Outcome,
+                        body: serde_json::to_value(outcome).unwrap(),
+                        created_at: Utc::now(),
+                        correlation_id: Some(run_id),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                link.next_frame().await.unwrap(),
+                Some(ChildFrame::Terminal { status: received, .. }) if received == status
+            ));
+            let mailbox = bamboo_subagent::Mailbox::at(dir.path().join("mailboxes/parent"));
+            assert_eq!(mailbox.pending_count().await.unwrap(), 1);
+            assert!(link.durable_delivery_receipt().is_none());
+            link.accept_durable_terminal(TerminalStatus::Completed);
+            assert!(link.durable_delivery_receipt().is_none());
+            link.accept_durable_terminal(status);
+            assert_eq!(
+                link.durable_delivery_receipt().unwrap().terminal_status,
+                status
+            );
+            link.acknowledge_durable_frames().await.unwrap();
+            assert_eq!(mailbox.pending_count().await.unwrap(), 0);
+        }
+    }
 
     /// Full round trip: a parent drives a child over the bus via `BrokerChildLink`
     /// and the P1.3b worker streams `Event`s then a `Terminal` — proving local

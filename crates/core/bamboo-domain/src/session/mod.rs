@@ -8,6 +8,7 @@ pub mod budget_types;
 pub mod composition;
 pub mod context_block;
 pub mod hook_types;
+pub mod host_registry;
 pub mod inbox;
 pub mod message_part;
 pub mod model_context;
@@ -40,6 +41,7 @@ pub use budget_types::{
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;
+pub use host_registry::*;
 pub use inbox::*;
 pub use message_part::{ImageUrlRef, MessagePart};
 pub use model_context::*;

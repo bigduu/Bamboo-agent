@@ -136,6 +136,34 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         ))
     }
 
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+        save_succeeded: bool,
+    ) -> Result<(), String> {
+        for runner in &self.runners {
+            runner
+                .confirm_durable_child_delivery(session, activation_run_id, save_succeeded)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_durable_child_delivery(
+        &self,
+        session: &bamboo_agent_core::Session,
+        activation_run_id: &str,
+    ) -> Result<bool, String> {
+        let mut prepared = false;
+        for runner in &self.runners {
+            prepared |= runner
+                .prepare_durable_child_delivery(session, activation_run_id)
+                .await?;
+        }
+        Ok(prepared)
+    }
+
     /// #68: fan the per-run escalation bridge out to every inner runner. The
     /// composite is what `build_external_child_runner` returns and what the
     /// worker retains, so without this forward the bind would hit the trait's
