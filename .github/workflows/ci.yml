@@ -37,6 +37,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -96,6 +97,7 @@ jobs:
         run: cargo build --locked
 
       - name: Test locked Rust workspace
+        timeout-minutes: 30
         run: cargo test --locked
 
       - name: Build examples

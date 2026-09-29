@@ -10568,7 +10568,7 @@ for line in sys.stdin:
             2
         );
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let facade_revision = state
                     .config_facade
@@ -10585,20 +10585,29 @@ for line in sys.stdin:
                     .cluster_fabric
                     .node("race-node")
                     .map(|node| node.label.clone());
-                if facade_revision == 2 && runtime_label.as_deref() == Some("external-winner") {
-                    break;
+                let events = bamboo_engine::events::journal::read_since(
+                    state.account_sink.events_dir(),
+                    baseline_seq,
+                )
+                .unwrap();
+                let winner_event_is_durable = events.iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        AgentEvent::ConfigChanged { section, revision }
+                            if section == "cluster-fabric" && *revision == 2
+                    )
+                });
+                if facade_revision == 2
+                    && runtime_label.as_deref() == Some("external-winner")
+                    && winner_event_is_durable
+                {
+                    break events;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("watcher must apply the later external revision");
-
-        let events = bamboo_engine::events::journal::read_since(
-            state.account_sink.events_dir(),
-            baseline_seq,
-        )
-        .unwrap();
+        .expect("watcher must apply and publish the later external revision");
         let revisions = events
             .iter()
             .filter_map(|event| match &event.event {
