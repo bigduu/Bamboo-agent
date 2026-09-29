@@ -55,6 +55,39 @@ impl ActorSnapshotPort for SessionStoreV2 {
     }
 }
 
+impl SessionStoreV2 {
+    /// Cheap, read-only poll position for the host-authorized Root tree stream.
+    /// Callers first authorize the full subtree once. Each poll revalidates
+    /// canonical Root identity and reads the same marker as the full snapshot.
+    pub async fn actor_tree_cursor(&self, root_id: &str) -> Result<Option<(String, u64)>, Error> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            supported::selector(root_id)?;
+            let lifecycle = self
+                .lock_session_lifecycle_shared()
+                .await
+                .map_err(|_| Error::StorageUnavailable)?;
+            let transactions = self
+                .lock_runtime_task_transaction_exclusive()
+                .await
+                .map_err(|_| Error::StorageUnavailable)?;
+            let home = self.bamboo_home_dir.clone();
+            let root = root_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let _guards = (lifecycle, transactions);
+                supported::read_cursor(&home, &root)
+            })
+            .await
+            .map_err(|_| Error::StorageUnavailable)?
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = root_id;
+            Err(Error::UnsupportedAuthority)
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supported {
     use super::super::{
@@ -62,7 +95,8 @@ mod supported {
         root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
         supervisor,
         supervisor_proof::SUPERVISOR_PROOF_FILE,
-        RUNTIME_SIDECAR_FILE, RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR,
+        ActorTreeRevision, ACTOR_TREE_REVISION_FILE, RUNTIME_SIDECAR_FILE,
+        RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR,
     };
     use super::*;
     use bamboo_domain::{
@@ -94,6 +128,49 @@ mod supported {
 
     fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
         serde_json::from_slice(bytes).map_err(|_| Error::InconsistentAuthority)
+    }
+
+    fn cursor_for_root(
+        directory: &Directory,
+        root: &Session,
+        budget: &mut ReadBudget,
+    ) -> Result<Option<(String, u64)>, Error> {
+        Ok(directory
+            .read(ACTOR_TREE_REVISION_FILE, 4096, budget)?
+            .map(|bytes| decode::<ActorTreeRevision>(&bytes))
+            .transpose()?
+            .and_then(|marker| {
+                marker
+                    .matches_root(root)
+                    .then(|| (marker.cursor(), marker.revision))
+            }))
+    }
+
+    pub(super) fn read_cursor(home: &Path, root: &str) -> Result<Option<(String, u64)>, Error> {
+        let home = Directory::open_absolute(home)?;
+        let mut budget = ReadBudget::new(ActorSnapshotLimits::default());
+        for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+            if let Some(dir) = home.child(OsStr::new(name))? {
+                if !dir.entries(&mut budget)?.is_empty() {
+                    return Err(Error::PendingTransaction);
+                }
+            }
+        }
+        let sessions = home.child(OsStr::new("sessions"))?.ok_or(Error::NotFound)?;
+        let root_dir = sessions.child(OsStr::new(root))?.ok_or(Error::NotFound)?;
+        let source = read_source(&root_dir, root, root, true, &mut budget)?;
+        if let Some(revocations) = home.child(OsStr::new(".root-revocations"))? {
+            if let Some(bytes) = revocations.read(&format!("{root}.json"), 4096, &mut budget)? {
+                let evidence = decode::<Revocation>(&bytes)?;
+                if evidence.version != 1 || evidence.session_id != root {
+                    return Err(Error::InconsistentAuthority);
+                }
+                if source.session.created_at <= evidence.revoked_through {
+                    return Err(Error::NotFound);
+                }
+            }
+        }
+        cursor_for_root(&root_dir, &source.session, &mut budget)
     }
 
     #[derive(Default, Deserialize)]
@@ -495,24 +572,39 @@ mod supported {
             });
         }
         nodes.sort_by(|a, b| (a.depth, &a.actor_id).cmp(&(b.depth, &b.actor_id)));
+        // Read this within the same lifecycle/Task barrier as the projection.
+        // Legacy Roots lack the marker and cannot claim continuity. A marker
+        // prepared for a failed Project change also yields no cursor until a
+        // later successful publication restores matching canonical identity.
+        let stream_cursor = cursor_for_root(&root_dir, &sources[root].session, &mut budget)?
+            .map(|(cursor, _revision)| cursor);
         let mut snapshot = PublicActorSubtreeSnapshot {
             schema_version: ACTOR_SNAPSHOT_SCHEMA_VERSION,
             root_actor_id: root.to_owned(),
             subtree_actor_id: subtree.to_owned(),
             snapshot_id: String::new(),
-            stream_cursor: None,
+            stream_cursor,
             nodes,
         };
+        let stream_cursor = snapshot.stream_cursor.take();
+        let cursor_growth = stream_cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.len().saturating_sub(2));
         // Reserve the exact 68 ASCII bytes of the final identity while hashing
-        // the empty-identity view. Reject during serialization, before building
-        // an oversized JSON buffer. The final digest requires no JSON escaping.
+        // the empty-identity view. Cursor is excluded from the view identity:
+        // a private-only save can move the stream position without changing
+        // the public snapshot. Reserve its serialized growth over `null` too.
         let mut writer = BoundedDigest {
             digest: Sha256::new(),
             bytes: 0,
-            max: limits.response_bytes.saturating_sub(68),
+            max: limits
+                .response_bytes
+                .saturating_sub(68)
+                .saturating_sub(cursor_growth),
         };
         serde_json::to_writer(&mut writer, &snapshot).map_err(|_| Error::BudgetExceeded)?;
         snapshot.snapshot_id = format!("as1-{:x}", writer.digest.finalize());
+        snapshot.stream_cursor = stream_cursor;
         Ok(snapshot)
     }
 

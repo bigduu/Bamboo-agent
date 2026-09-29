@@ -972,6 +972,9 @@ impl ChildClient {
 pub struct DurableChildDeliveryReceipt {
     /// Stable identity of the broker Maildir that owns these MsgIds.
     pub broker_identity: String,
+    /// Host-owned mailbox where the broker stored these Event/Outcome MsgIds.
+    /// Recovery must reconnect to this exact mailbox before confirming ACKs.
+    pub parent_mailbox: String,
     /// Exact broker Run message id that correlated these frames.
     pub correlation_id: String,
     /// Exact Event and Outcome mailbox message ids, in delivery order.
@@ -998,6 +1001,12 @@ pub trait ChildLink: Send {
     }
 
     fn durable_delivery_receipt(&self) -> Option<DurableChildDeliveryReceipt> {
+        None
+    }
+
+    /// The authenticated parent mailbox subscribed by this broker link.
+    /// Recovery must match it to the Host checkpoint before ACKing frames.
+    fn broker_parent_mailbox(&self) -> Option<&str> {
         None
     }
 

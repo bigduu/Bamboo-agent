@@ -13,6 +13,9 @@ use bamboo_domain::{
 const RECEIPTS_FILE: &str = "broker-terminal-receipts.v1.json";
 const MAX_RECEIPTS: usize = 32;
 const MAX_IDS: usize = 4096;
+const MAX_RECEIPT_SCAN_ROOTS: usize = 4096;
+const MAX_RECEIPT_SCAN_CHILDREN: usize = 16384;
+const MAX_RECEIPT_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerTerminalReceipt {
@@ -23,6 +26,10 @@ pub struct BrokerTerminalReceipt {
     pub project_id: Option<String>,
     pub activation_run_id: String,
     pub broker_identity: String,
+    /// Exact parent mailbox that received this Run's Event/Outcome frames.
+    /// This is mandatory: an old receipt without a route cannot prove where
+    /// an idempotent broker ACK was applied.
+    pub parent_mailbox: String,
     pub broker_correlation_id: String,
     pub message_ids: Vec<String>,
     pub message_count: usize,
@@ -59,6 +66,16 @@ fn digest_messages(messages: &[Message]) -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes)))
 }
 
+fn valid_parent_mailbox(mailbox: &str) -> bool {
+    !mailbox.is_empty()
+        && mailbox.len() <= 256
+        && mailbox != "."
+        && mailbox != ".."
+        && mailbox
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+}
+
 fn identity_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> bool {
     session.kind == SessionKind::Child
         && receipt.session_id == session.id
@@ -66,6 +83,7 @@ fn identity_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> bool 
         && session.parent_session_id.as_deref() == Some(receipt.parent_session_id.as_str())
         && receipt.root_session_id == session.root_session_id
         && receipt.project_id == session.project_id_meta()
+        && valid_parent_mailbox(&receipt.parent_mailbox)
 }
 
 fn prefix_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> io::Result<bool> {
@@ -129,8 +147,19 @@ fn prefix_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> io::Res
 
 async fn read_ledger(dir: &Path) -> io::Result<ReceiptLedger> {
     match fs::read(dir.join(RECEIPTS_FILE)).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|_| invalid("invalid Host broker receipt ledger")),
+        Ok(bytes) => {
+            let ledger: ReceiptLedger = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("invalid Host broker receipt ledger"))?;
+            if ledger
+                .receipts
+                .iter()
+                .chain(ledger.acknowledged_anchor.iter())
+                .any(|receipt| !valid_parent_mailbox(&receipt.parent_mailbox))
+            {
+                return Err(invalid("invalid Host broker receipt parent mailbox"));
+            }
+            Ok(ledger)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ReceiptLedger::default()),
         Err(error) => Err(error),
     }
@@ -141,7 +170,203 @@ async fn write_ledger(dir: &Path, ledger: &ReceiptLedger) -> io::Result<()> {
     durable_atomic_write(&dir.join(RECEIPTS_FILE), &bytes).await
 }
 
+async fn real_receipt_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(invalid(
+            "broker receipt scan encountered a non-directory or symlink",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn real_receipt_file(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(invalid(
+            "broker receipt scan encountered a non-file or symlink",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 impl SessionStoreV2 {
+    /// Find every Child with a durable broker Outcome awaiting ACK, including
+    /// one whose successor Run was never started. The physical tree, not this
+    /// process's potentially stale `sessions.json` snapshot, is the source of
+    /// candidates. Malformed ledgers are isolated to their Child; a canonical
+    /// Session identity ambiguity still stops startup recovery rather than
+    /// allowing an ACK against the wrong Child.
+    ///
+    /// The discovered canonical entries repair the rebuildable index only
+    /// after the whole scan has passed, so the existing receipt recovery and
+    /// ACK APIs can address them on an independently reopened store.
+    pub async fn discover_unconfirmed_broker_terminal_children(&self) -> io::Result<Vec<Session>> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        if !real_receipt_directory(&self.sessions_dir).await? {
+            return Ok(Vec::new());
+        }
+
+        let mut seen_ids = HashSet::new();
+        let mut roots = 0usize;
+        let mut children = 0usize;
+        let mut candidates = Vec::new();
+        let mut root_entries = fs::read_dir(&self.sessions_dir).await?;
+        while let Some(root_entry) = root_entries.next_entry().await? {
+            let root_dir = root_entry.path();
+            let root_meta = fs::symlink_metadata(&root_dir).await?;
+            if root_meta.file_type().is_symlink() {
+                return Err(invalid("broker receipt scan encountered a symlinked Root"));
+            }
+            if root_meta.file_type().is_file() {
+                continue;
+            }
+            if !root_meta.file_type().is_dir() {
+                return Err(invalid(
+                    "broker receipt scan encountered an invalid Root entry",
+                ));
+            }
+            roots += 1;
+            if roots > MAX_RECEIPT_SCAN_ROOTS {
+                return Err(invalid("broker receipt Root scan limit exceeded"));
+            }
+            let root_id = root_entry
+                .file_name()
+                .into_string()
+                .map_err(|_| invalid("broker receipt Root ID is not UTF-8"))?;
+            validate_session_id(&root_id)?;
+            if !seen_ids.insert(root_id.clone()) {
+                return Err(invalid("ambiguous broker receipt Session ID"));
+            }
+            let children_dir = root_dir.join("children");
+            if !real_receipt_directory(&children_dir).await? {
+                continue;
+            }
+            let mut child_entries = fs::read_dir(&children_dir).await?;
+            while let Some(child_entry) = child_entries.next_entry().await? {
+                let child_dir = child_entry.path();
+                let child_meta = fs::symlink_metadata(&child_dir).await?;
+                if child_meta.file_type().is_symlink() {
+                    return Err(invalid("broker receipt scan encountered a symlinked Child"));
+                }
+                if child_meta.file_type().is_file() {
+                    continue;
+                }
+                if !child_meta.file_type().is_dir() {
+                    return Err(invalid(
+                        "broker receipt scan encountered an invalid Child entry",
+                    ));
+                }
+                children += 1;
+                if children > MAX_RECEIPT_SCAN_CHILDREN {
+                    return Err(invalid("broker receipt Child scan limit exceeded"));
+                }
+                let child_id = child_entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| invalid("broker receipt Child ID is not UTF-8"))?;
+                validate_session_id(&child_id)?;
+                if !seen_ids.insert(child_id.clone()) {
+                    return Err(invalid("ambiguous broker receipt Session ID"));
+                }
+                let receipt_path = child_dir.join(RECEIPTS_FILE);
+                if !real_receipt_file(&receipt_path).await? {
+                    continue;
+                }
+                if fs::symlink_metadata(&receipt_path).await?.len() > MAX_RECEIPT_LEDGER_BYTES {
+                    tracing::warn!(child_id = %child_id, "Broker receipt ledger exceeds scan limit; skipping Child recovery");
+                    continue;
+                }
+                let ledger = match read_ledger(&child_dir).await {
+                    Ok(ledger) => ledger,
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        tracing::warn!(child_id = %child_id, %error, "Invalid broker receipt ledger; skipping Child recovery");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if ledger.receipts.is_empty() {
+                    continue;
+                }
+                if ledger.receipts.len() > MAX_RECEIPTS {
+                    tracing::warn!(child_id = %child_id, "Broker receipt ledger has too many receipts; skipping Child recovery");
+                    continue;
+                }
+                if !real_receipt_file(&child_dir.join("session.json")).await? {
+                    return Err(invalid("broker receipt Child canonical files are invalid"));
+                }
+                // Absence is valid for a legacy Child; a present sidecar must
+                // be a regular file before the strict loader reads it.
+                real_receipt_file(&child_dir.join(RUNTIME_SIDECAR_FILE)).await?;
+                let session = self
+                    .load_session_from_dir_strict(
+                        &child_dir,
+                        &child_id,
+                        SessionKind::Child,
+                        &root_id,
+                    )
+                    .await?
+                    .ok_or_else(|| invalid("broker receipt Child is unavailable"))?;
+                bamboo_domain::ActorSession::from_session(&session)
+                    .map_err(|_| invalid("broker receipt Child lineage is invalid"))?;
+                real_receipt_file(&root_dir.join(RUNTIME_SIDECAR_FILE)).await?;
+                if !real_receipt_file(&root_dir.join("session.json")).await?
+                    || self
+                        .load_session_from_dir_strict(
+                            &root_dir,
+                            &root_id,
+                            SessionKind::Root,
+                            &root_id,
+                        )
+                        .await?
+                        .is_none()
+                {
+                    return Err(invalid("broker receipt Root is unavailable"));
+                }
+                if ledger
+                    .receipts
+                    .iter()
+                    .chain(ledger.acknowledged_anchor.iter())
+                    .any(|receipt| !identity_matches(receipt, &session))
+                {
+                    tracing::warn!(child_id = %child_id, "Broker receipt identity mismatch; skipping Child recovery");
+                    continue;
+                }
+                let attachments_dir = child_dir.join("attachments");
+                let has_attachments = if real_receipt_directory(&attachments_dir).await? {
+                    fs::read_dir(&attachments_dir)
+                        .await?
+                        .next_entry()
+                        .await?
+                        .is_some()
+                } else {
+                    false
+                };
+                candidates.push((
+                    session,
+                    Self::child_rel_path(&root_id, &child_id),
+                    has_attachments,
+                ));
+            }
+        }
+        for (session, rel_path, has_attachments) in &candidates {
+            self.upsert_index_from_session_inner(
+                session,
+                rel_path.clone(),
+                true,
+                Some(*has_attachments),
+            )
+            .await?;
+        }
+        Ok(candidates
+            .into_iter()
+            .map(|(session, _, _)| session)
+            .collect())
+    }
+
     async fn broker_receipt_dir(&self, session_id: &str) -> io::Result<PathBuf> {
         let path = self
             .session_json_path(session_id)
@@ -161,6 +386,7 @@ impl SessionStoreV2 {
         session: &Session,
         activation_run_id: &str,
         broker_identity: &str,
+        parent_mailbox: &str,
         broker_correlation_id: &str,
         message_ids: &[String],
     ) -> io::Result<()> {
@@ -169,6 +395,7 @@ impl SessionStoreV2 {
             || activation_run_id.is_empty()
             || activation_run_id.len() > 128
             || uuid::Uuid::parse_str(broker_identity).is_err()
+            || !valid_parent_mailbox(parent_mailbox)
             || broker_correlation_id.is_empty()
             || broker_correlation_id.len() > 128
             || message_ids.is_empty()
@@ -241,6 +468,7 @@ impl SessionStoreV2 {
             project_id: session.project_id_meta(),
             activation_run_id: activation_run_id.to_owned(),
             broker_identity: broker_identity.to_owned(),
+            parent_mailbox: parent_mailbox.to_owned(),
             broker_correlation_id: broker_correlation_id.to_owned(),
             message_ids: message_ids.to_vec(),
             message_count: session.messages.len(),
@@ -368,7 +596,11 @@ impl SessionStoreV2 {
         session_id: &str,
         created_at: DateTime<Utc>,
         activation_run_id: &str,
+        parent_mailbox: &str,
     ) -> io::Result<()> {
+        if !valid_parent_mailbox(parent_mailbox) {
+            return Err(invalid("invalid parent mailbox for broker receipt ACK"));
+        }
         let _guard = self
             .acquire_session_write_lock(session_id, SaveKind::Runtime)
             .await?;
@@ -382,6 +614,9 @@ impl SessionStoreV2 {
         }) else {
             return Ok(());
         };
+        if ledger.receipts[index].parent_mailbox != parent_mailbox {
+            return Err(invalid("broker receipt ACK parent mailbox changed"));
+        }
         let receipt = ledger.receipts.remove(index);
         if ledger
             .acknowledged_anchor
@@ -513,6 +748,8 @@ mod tests {
         FunctionCall, PendingQuestionSource, Storage, ToolCall, PARENT_QUESTION_RESOLUTION_KEY,
     };
 
+    const TEST_PARENT_MAILBOX: &str = "p-broker-receipt-child";
+
     async fn fixture() -> io::Result<(tempfile::TempDir, SessionStoreV2, Session)> {
         let home = tempfile::tempdir()?;
         let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
@@ -522,6 +759,275 @@ mod tests {
         child.add_message(Message::user("work"));
         store.save_session(&child).await?;
         Ok((home, store, child))
+    }
+
+    async fn completed_receipt(store: &SessionStoreV2, child: &Session) -> io::Result<Session> {
+        let mut completed = child.clone();
+        completed.add_message(Message::assistant("finished", None));
+        completed.set_last_run_status("completed");
+        store
+            .prepare_broker_terminal_receipt(
+                &completed,
+                "recovery-run",
+                &uuid::Uuid::new_v4().to_string(),
+                TEST_PARENT_MAILBOX,
+                "recovery-correlation",
+                &["recovery-outcome".into()],
+            )
+            .await?;
+        store.save_session(&completed).await?;
+        Ok(completed)
+    }
+
+    #[tokio::test]
+    async fn startup_scan_finds_unacked_child_without_successor_after_reopen() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let completed = completed_receipt(&store, &child).await?;
+        drop(store);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let found = reopened
+            .discover_unconfirmed_broker_terminal_children()
+            .await?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, completed.id);
+        assert_eq!(
+            digest_messages(&found[0].messages)?,
+            digest_messages(&completed.messages)?
+        );
+        let receipts = reopened.recover_broker_terminal_receipts(&found[0]).await?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].activation_run_id, "recovery-run");
+        reopened
+            .clear_acknowledged_broker_terminal_receipt(
+                &completed.id,
+                completed.created_at,
+                "recovery-run",
+                TEST_PARENT_MAILBOX,
+            )
+            .await?;
+        assert!(reopened
+            .discover_unconfirmed_broker_terminal_children()
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_scan_repairs_stale_index_from_canonical_child() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let completed = completed_receipt(&store, &child).await?;
+        let mut index: SessionsIndex =
+            serde_json::from_slice(&fs::read(store.index_path()).await?).unwrap();
+        index.sessions.remove(&completed.id);
+        fs::write(store.index_path(), serde_json::to_vec(&index).unwrap()).await?;
+        drop(store);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert!(reopened.get_index_entry(&completed.id).await.is_none());
+        let found = reopened
+            .discover_unconfirmed_broker_terminal_children()
+            .await?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, completed.id);
+        assert!(reopened.get_index_entry(&completed.id).await.is_some());
+        assert_eq!(
+            reopened
+                .recover_broker_terminal_receipts(&found[0])
+                .await?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_scan_rejects_ambiguous_child_and_isolates_forged_receipt_identity(
+    ) -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        completed_receipt(&store, &child).await?;
+        let duplicate = home
+            .path()
+            .join("sessions/another-root/children")
+            .join(&child.id);
+        fs::create_dir_all(&duplicate).await?;
+        assert!(store
+            .discover_unconfirmed_broker_terminal_children()
+            .await
+            .is_err());
+        fs::remove_dir_all(home.path().join("sessions/another-root")).await?;
+
+        let dir = home
+            .path()
+            .join("sessions")
+            .join(&child.root_session_id)
+            .join("children")
+            .join(&child.id);
+        let mut ledger = read_ledger(&dir).await?;
+        ledger.receipts[0].root_session_id = "forged-root".into();
+        write_ledger(&dir, &ledger).await?;
+        assert!(store
+            .discover_unconfirmed_broker_terminal_children()
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_scan_isolates_bad_ledgers_and_recovers_healthy_child() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        completed_receipt(&store, &child).await?;
+        let root = store.load_session(&child.root_session_id).await?.unwrap();
+
+        let mut legacy =
+            Session::new_child_of("broker-receipt-legacy-child", &root, "model", "task");
+        legacy.add_message(Message::user("legacy work"));
+        store.save_session(&legacy).await?;
+        completed_receipt(&store, &legacy).await?;
+        let legacy_path = home
+            .path()
+            .join("sessions")
+            .join(&root.id)
+            .join("children")
+            .join(&legacy.id)
+            .join(RECEIPTS_FILE);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(&legacy_path).await?).unwrap();
+        old["receipts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("parent_mailbox");
+        fs::write(&legacy_path, serde_json::to_vec(&old).unwrap()).await?;
+
+        let corrupt_path = home
+            .path()
+            .join("sessions")
+            .join(&root.id)
+            .join("children")
+            .join(&child.id)
+            .join(RECEIPTS_FILE);
+        fs::write(&corrupt_path, b"{invalid-ledger").await?;
+
+        let mut healthy =
+            Session::new_child_of("broker-receipt-healthy-child", &root, "model", "task");
+        healthy.add_message(Message::user("healthy work"));
+        store.save_session(&healthy).await?;
+        let completed = completed_receipt(&store, &healthy).await?;
+        drop(store);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let found = reopened
+            .discover_unconfirmed_broker_terminal_children()
+            .await?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, completed.id);
+        assert_eq!(
+            reopened
+                .recover_broker_terminal_receipts(&found[0])
+                .await?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_scan_rejects_symlinked_receipt_path() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (home, store, child) = fixture().await?;
+        completed_receipt(&store, &child).await?;
+        let dir = home
+            .path()
+            .join("sessions")
+            .join(&child.root_session_id)
+            .join("children")
+            .join(&child.id);
+        let receipt = dir.join(RECEIPTS_FILE);
+        let target = dir.join("moved-receipts.json");
+        fs::rename(&receipt, &target).await?;
+        symlink(&target, &receipt)?;
+        assert!(store
+            .discover_unconfirmed_broker_terminal_children()
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broker_receipt_ack_requires_the_original_parent_mailbox() -> io::Result<()> {
+        let (_home, store, child) = fixture().await?;
+        let completed = completed_receipt(&store, &child).await?;
+        let committed = store
+            .commit_broker_terminal_receipt(&completed, "recovery-run")
+            .await?;
+        assert_eq!(committed.parent_mailbox, TEST_PARENT_MAILBOX);
+        assert!(store
+            .clear_acknowledged_broker_terminal_receipt(
+                &completed.id,
+                completed.created_at,
+                "recovery-run",
+                "other-parent-mailbox",
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .recover_broker_terminal_receipts(&completed)
+                .await?
+                .len(),
+            1
+        );
+        store
+            .clear_acknowledged_broker_terminal_receipt(
+                &completed.id,
+                completed.created_at,
+                "recovery-run",
+                TEST_PARENT_MAILBOX,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_broker_receipt_without_parent_mailbox_fails_closed() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let completed = completed_receipt(&store, &child).await?;
+        let dir = home
+            .path()
+            .join("sessions")
+            .join(&child.root_session_id)
+            .join("children")
+            .join(&child.id);
+        let path = dir.join(RECEIPTS_FILE);
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).await?).unwrap();
+        old["receipts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("parent_mailbox");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).await?;
+        drop(store);
+
+        let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        assert!(reopened
+            .discover_unconfirmed_broker_terminal_children()
+            .await?
+            .is_empty());
+        assert!(reopened
+            .recover_broker_terminal_receipts(&completed)
+            .await
+            .is_err());
+        assert!(reopened
+            .clear_acknowledged_broker_terminal_receipt(
+                &completed.id,
+                completed.created_at,
+                "recovery-run",
+                TEST_PARENT_MAILBOX,
+            )
+            .await
+            .is_err());
+        Ok(())
     }
 
     #[tokio::test]
@@ -537,6 +1043,7 @@ mod tests {
                 &completed,
                 "host-run-1",
                 &broker_id,
+                TEST_PARENT_MAILBOX,
                 "broker-run-1",
                 &["event-1".into(), "outcome-1".into()],
             )
@@ -564,6 +1071,7 @@ mod tests {
                 &completed.id,
                 completed.created_at,
                 "host-run-1",
+                TEST_PARENT_MAILBOX,
             )
             .await?;
         assert!(reopened
@@ -592,6 +1100,7 @@ mod tests {
                 &completed,
                 "host-run-2",
                 &uuid::Uuid::new_v4().to_string(),
+                TEST_PARENT_MAILBOX,
                 "broker-run-2",
                 &["outcome-2".into()],
             )
@@ -655,6 +1164,7 @@ mod tests {
                 &child,
                 "question-run",
                 &uuid::Uuid::new_v4().to_string(),
+                TEST_PARENT_MAILBOX,
                 "question-correlation",
                 &["question-outcome".into()],
             )
@@ -664,7 +1174,12 @@ mod tests {
             .commit_broker_terminal_receipt(&child, "question-run")
             .await?;
         store
-            .clear_acknowledged_broker_terminal_receipt(&child.id, child.created_at, "question-run")
+            .clear_acknowledged_broker_terminal_receipt(
+                &child.id,
+                child.created_at,
+                "question-run",
+                TEST_PARENT_MAILBOX,
+            )
             .await?;
         assert!(store
             .answer_parent_question(&question, "A", |_| {})
@@ -749,6 +1264,7 @@ mod tests {
                     &terminal,
                     "host-run",
                     &broker_id,
+                    TEST_PARENT_MAILBOX,
                     "broker-run",
                     &["outcome".into()],
                 )

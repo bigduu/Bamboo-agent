@@ -79,8 +79,8 @@ use self::envelope::{
     Encoding, OutFrame,
 };
 use self::forwarders::{
-    spawn_actor_forwarder, spawn_agent_forwarder, spawn_agent_terminal_forwarder,
-    spawn_feed_forwarder, spawn_message_forwarder, OutboundTx,
+    spawn_actor_forwarder, spawn_actor_tree_forwarder, spawn_agent_forwarder,
+    spawn_agent_terminal_forwarder, spawn_feed_forwarder, spawn_message_forwarder, OutboundTx,
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::events::MAX_BATCH_MS;
@@ -727,6 +727,18 @@ async fn handle_client_frame(
             )
             .await;
         }
+        ClientFrame::SubscribeTree { ch, cursor } => {
+            subscribe_tree(
+                state,
+                forwarders,
+                queues,
+                encoding,
+                &ch,
+                cursor,
+                *actor_host_owner,
+            )
+            .await;
+        }
         ClientFrame::Unsubscribe { ch } => {
             if let Some(handle) = forwarders.remove(&ch) {
                 handle.abort();
@@ -911,6 +923,7 @@ async fn subscribe(
             };
             spawn_actor_forwarder(out_tx, encoding, ch.to_string(), subscription, since)
         }
+        Channel::Tree(_) => return, // opaque cursors use subscribe_tree
         Channel::Message(sid) => {
             if state.session_store.get_index_entry(&sid).await.is_none() {
                 tracing::debug!("ws_v2: ignoring message subscribe to unknown session {sid}");
@@ -937,6 +950,52 @@ async fn subscribe(
         }
     };
     finish_subscribe(forwarders, queues, ch, out_rx, handle, since);
+}
+
+async fn subscribe_tree(
+    state: &web::Data<AppState>,
+    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
+    encoding: Encoding,
+    ch: &str,
+    cursor: Option<String>,
+    actor_host_owner: bool,
+) {
+    let Some(Channel::Tree(root_id)) = Channel::parse(ch) else {
+        return;
+    };
+    if !actor_host_owner || cursor.as_ref().is_some_and(|cursor| cursor.len() > 128) {
+        return;
+    }
+    if let Some(old) = forwarders.remove(ch) {
+        old.abort();
+    }
+    queues.remove(ch);
+    // Full bounded Root proof is the authorization gate. The forwarder then
+    // polls only this Root's fd-bound durable cursor, including across hosts.
+    if state
+        .session_store
+        .actor_subtree_snapshot(
+            ActorSnapshotPrincipal::host_owner(),
+            &root_id,
+            &root_id,
+            ActorSnapshotLimits::default(),
+        )
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BUFFER);
+    let handle = spawn_actor_tree_forwarder(
+        out_tx,
+        encoding,
+        ch.to_string(),
+        state.clone(),
+        root_id,
+        cursor,
+    );
+    finish_subscribe(forwarders, queues, ch, out_rx, handle, None);
 }
 
 fn can_attempt_terminal_replay(
@@ -1448,6 +1507,96 @@ mod tests {
             !current_runner_allows_terminal_replay(&state, session_id, &rx).await,
             "the post-await re-read must observe the newly Running runner"
         );
+    }
+
+    #[actix_web::test]
+    async fn tree_channel_uses_durable_root_cursor_and_host_authority() {
+        use bamboo_agent_core::Storage;
+
+        let dir = tempdir().expect("temporary app data");
+        let home = dir.path().canonicalize().unwrap();
+        let state = web::Data::new(AppState::new(home).await.unwrap());
+        let root = bamboo_agent_core::Session::new("ws-tree-root", "test-model");
+        state.session_store.save_session(&root).await.unwrap();
+        let initial = state
+            .session_store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        let cursor = initial.stream_cursor.clone().expect("durable cursor");
+        let ch = format!("tree.{}", root.id);
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        subscribe_tree(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            Encoding::Json,
+            &ch,
+            Some(cursor.clone()),
+            false,
+        )
+        .await;
+        assert!(!queues.contains_key(&ch));
+        subscribe_tree(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            Encoding::Json,
+            &ch,
+            Some(cursor),
+            true,
+        )
+        .await;
+        assert!(queues.contains_key(&ch));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), queues.next())
+                .await
+                .is_err()
+        );
+
+        // A second Store stands in for a different process sharing the same
+        // durable Bamboo home. The WS process has no local Hub notification.
+        let other = bamboo_storage::SessionStoreV2::new(
+            state.session_store.bamboo_home_dir().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let mut changed = root.clone();
+        changed.title = "remote writer".into();
+        changed.metadata_version += 1;
+        other.save_session(&changed).await.unwrap();
+        let (received_ch, frame) = tokio::time::timeout(Duration::from_secs(5), queues.next())
+            .await
+            .expect("cross-process poll")
+            .expect("tree channel");
+        assert_eq!(received_ch, ch);
+        let OutFrame::Text(raw) = frame else {
+            panic!("expected JSON frame");
+        };
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["control"]["type"], "actor_snapshot_required");
+        assert_eq!(body["control"]["reason"], "changed");
+        let latest = state
+            .session_store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body["control"]["cursor"], latest.stream_cursor.unwrap());
+        assert_eq!(body["seq"], 2);
+        for (_, handle) in forwarders {
+            handle.abort();
+        }
     }
 
     #[actix_web::test]

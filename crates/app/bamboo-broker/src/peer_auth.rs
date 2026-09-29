@@ -210,7 +210,7 @@ impl CapturedPeer {
                     && identifier(role)
                     && self.peer.presence.contains(role)
                     && (self.destination(mailbox, InboxKind::Run)
-                        || self.destination(mailbox, InboxKind::LeasedRun))
+                        || self.destination(mailbox, InboxKind::FencedRun))
             }
             ClientFrame::Deliver { to, message } => {
                 self.destination(to, message.kind)

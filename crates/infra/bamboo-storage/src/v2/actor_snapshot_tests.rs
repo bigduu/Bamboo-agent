@@ -109,7 +109,7 @@ async fn complete_134_actor_tree_survives_restart_and_leaves_cold_authority_unkn
         .unwrap();
     assert_eq!(first.nodes.len(), 134);
     assert_eq!(first.schema_version, 1);
-    assert_eq!(first.stream_cursor, None);
+    assert!(first.stream_cursor.is_some());
     assert!(first.nodes.iter().all(|n| n.logical_state.is_none()
         && n.placement_class.is_none()
         && n.activation.is_none()
@@ -141,6 +141,14 @@ async fn complete_134_actor_tree_survives_restart_and_leaves_cold_authority_unkn
         .await
         .unwrap();
     assert_eq!(first, restarted);
+    assert_eq!(
+        reopened
+            .actor_tree_cursor(&f.root.id)
+            .await
+            .unwrap()
+            .map(|v| v.0),
+        first.stream_cursor
+    );
     let selected = f
         .snapshot(&parent.id, ActorSnapshotLimits::default())
         .await
@@ -163,16 +171,19 @@ async fn complete_134_actor_tree_survives_restart_and_leaves_cold_authority_unkn
         .snapshot(&f.root.id, ActorSnapshotLimits::default())
         .await
         .unwrap();
-    assert_eq!(first, large); // Same births, metadata and opaque public identity.
-    assert_eq!(
-        selected,
-        f.snapshot(&parent.id, ActorSnapshotLimits::default())
-            .await
-            .unwrap()
-    );
+    assert_eq!(first.snapshot_id, large.snapshot_id);
+    assert_eq!(first.nodes, large.nodes);
+    assert_eq!(first.stream_cursor, large.stream_cursor);
+    let selected_later = f
+        .snapshot(&parent.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(selected.snapshot_id, selected_later.snapshot_id);
+    assert_eq!(selected.nodes, selected_later.nodes);
+    assert_eq!(large.stream_cursor, selected_later.stream_cursor);
     let reopened = SessionStoreV2::new(f.home.clone()).await.unwrap();
     assert_eq!(
-        first,
+        large,
         reopened
             .actor_subtree_snapshot(
                 ActorSnapshotPrincipal::host_owner(),
@@ -504,7 +515,7 @@ async fn whitelist_never_serializes_private_payload_or_synthesizes_health_queue_
     ] {
         assert!(!wire.contains(key), "{key}");
     }
-    assert_eq!(json["stream_cursor"], serde_json::Value::Null);
+    assert!(json["stream_cursor"].as_str().is_some());
     assert_eq!(
         snapshot.nodes[0].logical_state,
         Some(ActorLogicalState::Active)
@@ -653,7 +664,128 @@ async fn opaque_identity_changes_with_view_without_becoming_global_revision() {
         next.nodes[0].revision.session_metadata_version,
         root.metadata_version
     );
-    assert_eq!(next.stream_cursor, None);
+    assert!(next.stream_cursor.is_some());
+    assert_ne!(first.stream_cursor, next.stream_cursor);
+}
+
+#[tokio::test]
+async fn legacy_missing_tree_marker_fails_closed_without_creating_one() {
+    let f = Fixture::new().await;
+    let marker = f.directory(&f.root.id).join(ACTOR_TREE_REVISION_FILE);
+    fs::remove_file(&marker).await.unwrap();
+    let snapshot = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.stream_cursor, None);
+    assert_eq!(f.store.actor_tree_cursor(&f.root.id).await.unwrap(), None);
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn private_session_saves_and_noop_actor_reads_do_not_advance_tree_cursor() {
+    let f = Fixture::new().await;
+    let initial = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    let mut root = f.root.clone();
+    add_private_history(&mut root);
+    f.store.save_session(&root).await.unwrap();
+    root.updated_at = Utc::now();
+    f.store.save_runtime_state(&root).await.unwrap();
+    let after_private = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(after_private.stream_cursor, initial.stream_cursor);
+    assert_eq!(after_private.snapshot_id, initial.snapshot_id);
+
+    f.store.inspect_actor(&f.root.id).await.unwrap();
+    let initialized = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_ne!(initialized.stream_cursor, initial.stream_cursor);
+    f.store.inspect_actor(&f.root.id).await.unwrap();
+    let no_op = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(no_op.stream_cursor, initialized.stream_cursor);
+}
+
+#[tokio::test]
+async fn cancelled_child_writer_retains_root_lock_until_physical_commit() {
+    use super::default_actor_context_tests::DefaultWriteHook;
+
+    struct Release(Arc<DefaultWriteHook>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let f = Fixture::new().await;
+    let mut first = f.child("tree-first", &f.root).await;
+    let mut second = f.child("tree-second", &f.root).await;
+    let before = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    first.title = "first committed".into();
+    first.metadata_version += 1;
+    second.title = "second committed".into();
+    second.metadata_version += 1;
+    let other = Arc::new(SessionStoreV2::new(f.home.clone()).await.unwrap());
+    let hook = DefaultWriteHook::install(
+        &f.store,
+        "session.json",
+        DurableWritePhase::BeforeReplace,
+        false,
+    );
+    let _release = Release(hook.clone());
+    let first_write = tokio::spawn({
+        let store = f.store.clone();
+        async move { store.save_session(&first).await }
+    });
+    tokio::task::spawn_blocking({
+        let hook = hook.clone();
+        move || hook.wait()
+    })
+    .await
+    .unwrap();
+    first_write.abort();
+    assert!(first_write.await.unwrap_err().is_cancelled());
+    let second_write = tokio::spawn(async move { other.save_session(&second).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !second_write.is_finished(),
+        "another Session under the same Root overtook an unfinished write"
+    );
+    hook.release();
+    second_write.await.unwrap().unwrap();
+    let after = f
+        .snapshot(&f.root.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert_ne!(before.stream_cursor, after.stream_cursor);
+    assert_eq!(after.nodes.len(), 3);
+    assert!(after
+        .nodes
+        .iter()
+        .any(|node| node.title == "first committed"));
+    assert!(after
+        .nodes
+        .iter()
+        .any(|node| node.title == "second committed"));
+    let marker: ActorTreeRevision = serde_json::from_slice(
+        &fs::read(f.directory(&f.root.id).join(ACTOR_TREE_REVISION_FILE))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker.revision, 5); // Root + two creates + two updates.
 }
 
 #[tokio::test]

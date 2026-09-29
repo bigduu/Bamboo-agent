@@ -368,6 +368,7 @@ impl SessionStoreV2 {
             fs::create_dir(staging.join("attachments")).await?;
             durable_atomic_write(&staging.join("session.json"), &main_bytes).await?;
             durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+            Self::stage_actor_tree_revision(&staging, &session).await?;
             Self::write_staged_root_tool_proof(&staging, &session).await?;
             Self::write_staged_supervisor_proof(&staging, &session).await?;
             sync_directory(&staging).await?;

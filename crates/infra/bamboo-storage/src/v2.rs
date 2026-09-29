@@ -268,6 +268,71 @@ const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
 const SESSION_LIFECYCLE_LOCK_FILE: &str = ".session-lifecycle.lock";
 const SESSION_INDEX_LOCK_FILE: &str = ".sessions-index.lock";
 const SESSION_WRITE_LOCK_DIR: &str = ".session-write-locks";
+const ACTOR_TREE_LOCK_DIR: &str = ".actor-tree-locks";
+const ACTOR_TREE_REVISION_FILE: &str = ".actor-tree-revision.json";
+const MAX_ACTOR_TREE_REVISION: u64 = (1_u64 << 53) - 1;
+
+/// The revision is published before a tree-visible write. A failed write can
+/// cause a harmless extra snapshot; a crash cannot leave changed public state
+/// behind an unchanged cursor. The epoch distinguishes Root ID reuse.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActorTreeRevision {
+    version: u32,
+    root_id: String,
+    root_created_at: DateTime<Utc>,
+    project_id: Option<String>,
+    epoch: Uuid,
+    revision: u64,
+}
+
+impl ActorTreeRevision {
+    fn new(root: &Session) -> Self {
+        Self {
+            version: 1,
+            root_id: root.id.clone(),
+            root_created_at: root.created_at,
+            project_id: normalized_project_id(root),
+            epoch: Uuid::new_v4(),
+            revision: 1,
+        }
+    }
+
+    fn matches_root(&self, root: &Session) -> bool {
+        self.version == 1
+            && self.root_id == root.id
+            && self.root_created_at == root.created_at
+            && self.revision > 0
+            && self.revision <= MAX_ACTOR_TREE_REVISION
+            && root.project_id_meta() == normalized_project_id(root)
+            && self.project_id == normalized_project_id(root)
+    }
+
+    fn cursor(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"actor-tree-cursor-v1\0");
+        hash.update(self.root_id.as_bytes());
+        hash.update(b"\0");
+        hash.update(self.root_created_at.to_rfc3339().as_bytes());
+        hash.update(b"\0");
+        hash.update(self.project_id.as_deref().unwrap_or("").as_bytes());
+        hash.update(b"\0");
+        hash.update(self.epoch.as_bytes());
+        format!("at1-{:x}-{}", hash.finalize(), self.revision)
+    }
+}
+
+/// Acquired after lifecycle, Task and exact Session locks. Its file lock spans
+/// all background filesystem jobs through the owning writer guard.
+struct ActorTreeWriteGuard {
+    file: std::fs::File,
+}
+
+impl Drop for ActorTreeWriteGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
 const SEARCH_INDEX_REVISION_FILE: &str = ".search-index-revision";
 const PERSISTENCE_METRIC_WINDOW: usize = 1024;
 const SEARCH_INDEX_MAX_ATTEMPTS: usize = 3;
@@ -526,6 +591,54 @@ fn normalized_project_id(session: &Session) -> Option<String> {
             None
         }
     }
+}
+
+/// Exactly the Session-owned inputs to PublicActorSnapshotNode, plus the
+/// authority scope that makes a cursor unsafe across Project/Root rebinding.
+/// Private transcript, model context and runtime heartbeats do not advance the
+/// tree stream.
+fn actor_tree_session_projection(session: &Session) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id,
+        "created_at": session.created_at,
+        "title": compact_main::public_title(&session.title),
+        "metadata_version": session.metadata_version,
+        "kind": session.kind,
+        "parent_session_id": session.parent_session_id,
+        "root_session_id": session.root_session_id,
+        "spawn_depth": session.spawn_depth,
+        "project_id": session.project_id_meta(),
+        "authority_identity": session.authority_identity,
+        "root_tool_authority_revision": session.root_tool_authority_revision,
+    })
+}
+
+async fn read_actor_tree_session_projection(
+    directory: &Path,
+    expected: &Session,
+) -> Option<serde_json::Value> {
+    let path = directory.join(RUNTIME_SIDECAR_FILE);
+    if !fs::symlink_metadata(&path)
+        .await
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    let bytes = fs::read(path).await.ok()?;
+    let side: Session = serde_json::from_slice(&bytes).ok()?;
+    if side.id != expected.id
+        || side.created_at != expected.created_at
+        || side.kind != expected.kind
+        || side.parent_session_id != expected.parent_session_id
+        || side.root_session_id != expected.root_session_id
+        || side.spawn_depth != expected.spawn_depth
+        || side.project_id_meta() != expected.project_id_meta()
+    {
+        return None;
+    }
+    Some(actor_tree_session_projection(&side))
 }
 
 /// Reject a session id that could escape the storage directory (empty, or
@@ -2070,6 +2183,145 @@ impl SessionStoreV2 {
         session_id: &str,
     ) -> io::Result<SessionWriteGuard> {
         self.acquire_session_lock(session_id, None).await
+    }
+
+    async fn acquire_actor_tree_write_guard(
+        &self,
+        root_id: &str,
+    ) -> io::Result<ActorTreeWriteGuard> {
+        validate_session_id(root_id)?;
+        let mut hash = Sha256::new();
+        hash.update(root_id.as_bytes());
+        let directory = self.bamboo_home_dir.join(ACTOR_TREE_LOCK_DIR);
+        fs::create_dir_all(&directory).await?;
+        let path = directory.join(format!("{:x}.lock", hash.finalize()));
+        let file = tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            FileExt::lock_exclusive(&file)?;
+            Ok::<_, io::Error>(file)
+        })
+        .await
+        .map_err(|error| other_io_error(format!("join Actor tree lock task: {error}")))??;
+        Ok(ActorTreeWriteGuard { file })
+    }
+
+    async fn canonical_actor_tree_root(&self, root_id: &str) -> io::Result<Session> {
+        let root = self
+            .load_session_from_dir_strict(
+                &self.sessions_dir.join(root_id),
+                root_id,
+                SessionKind::Root,
+                root_id,
+            )
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Actor tree Root is missing"))?;
+        if !self.session_lifetime_is_live(&root).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Actor tree Root was revoked",
+            ));
+        }
+        Ok(root)
+    }
+
+    /// An isolated worker cache stores the host's canonical Child without a
+    /// local Root. Such a cache has no public Actor tree or cursor to advance.
+    /// Only the bare `children/` layout qualifies: any Root file, index entry,
+    /// or revocation evidence means a Host Root is missing or damaged instead.
+    async fn actor_tree_root_for_child_write(&self, root_id: &str) -> io::Result<Option<Session>> {
+        match self.canonical_actor_tree_root(root_id).await {
+            Ok(root) => return Ok(Some(root)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if self.get_index_entry(root_id).await.is_some()
+            || self.root_revocation(root_id).await?.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Actor tree Root is missing",
+            ));
+        }
+        let directory = self.sessions_dir.join(root_id);
+        let metadata = fs::symlink_metadata(&directory).await?;
+        if !metadata.file_type().is_dir() {
+            return Err(other_io_error(
+                "Actor tree Root path is not a real directory",
+            ));
+        }
+        let mut entries = fs::read_dir(&directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name() != "children" || !entry.file_type().await?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Actor tree Root is missing",
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Caller holds lifecycle, Task, exact Session and Root tree locks, in that
+    /// order. This publication precedes every public tree write, so an
+    /// interrupted operation creates at most an unnecessary gap.
+    async fn bump_actor_tree_revision(&self, root: &Session) -> io::Result<()> {
+        if root.kind != SessionKind::Root
+            || (!root.root_session_id.is_empty() && root.id != root.root_session_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Actor tree revision requires canonical Root identity",
+            ));
+        }
+        let path = self
+            .sessions_dir
+            .join(&root.id)
+            .join(ACTOR_TREE_REVISION_FILE);
+        let mut marker = match fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let bytes = fs::read(&path).await?;
+                if bytes.len() > 4096 {
+                    return Err(other_io_error("Actor tree revision marker is oversized"));
+                }
+                let marker: ActorTreeRevision = serde_json::from_slice(&bytes)
+                    .map_err(|_| other_io_error("Actor tree revision marker is invalid"))?;
+                if marker.version != 1
+                    || marker.root_id != root.id
+                    || marker.root_created_at != root.created_at
+                    || marker.revision == 0
+                    || marker.revision > MAX_ACTOR_TREE_REVISION
+                {
+                    return Err(other_io_error("Actor tree revision identity mismatch"));
+                }
+                marker
+            }
+            Ok(_) => return Err(other_io_error("Actor tree revision marker is not regular")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ActorTreeRevision::new(root),
+            Err(error) => return Err(error),
+        };
+        if path.exists() {
+            marker.revision = marker
+                .revision
+                .checked_add(1)
+                .filter(|revision| *revision <= MAX_ACTOR_TREE_REVISION)
+                .ok_or_else(|| other_io_error("Actor tree revision exhausted"))?;
+        }
+        marker.project_id = normalized_project_id(root);
+        let bytes = serde_json::to_vec(&marker).map_err(io::Error::other)?;
+        durable_atomic_write(&path, &bytes).await
+    }
+
+    /// For a Root that is still invisible in a staging directory. The marker
+    /// and both Session files become visible together at directory rename.
+    async fn stage_actor_tree_revision(directory: &Path, root: &Session) -> io::Result<()> {
+        let marker = ActorTreeRevision::new(root);
+        let bytes = serde_json::to_vec(&marker).map_err(io::Error::other)?;
+        durable_atomic_write(&directory.join(ACTOR_TREE_REVISION_FILE), &bytes).await
     }
 
     async fn open_session_write_lock_file_at(path: PathBuf) -> io::Result<std::fs::File> {
@@ -4776,6 +5028,7 @@ impl SessionStoreV2 {
             .map_err(|error| other_io_error(error.to_string()))?;
         durable_atomic_write(&staging_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
         durable_atomic_write(&staging_dir.join("session.json"), main_bytes).await?;
+        Self::stage_actor_tree_revision(staging_dir, copied).await?;
         Self::write_staged_root_tool_proof(staging_dir, copied).await?;
         Self::write_staged_supervisor_proof(staging_dir, copied).await?;
         // Flush the staging directory after its children/attachments are all
@@ -5152,6 +5405,15 @@ impl SessionStoreV2 {
 
         match entry.kind {
             SessionKind::Child => {
+                let _tree = self
+                    .acquire_actor_tree_write_guard(&entry.root_session_id)
+                    .await?;
+                if let Some(root) = self
+                    .actor_tree_root_for_child_write(&entry.root_session_id)
+                    .await?
+                {
+                    self.bump_actor_tree_revision(&root).await?;
+                }
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = fs::remove_dir_all(&abs_dir).await;
                 self.update_index(|index| {
@@ -5481,7 +5743,7 @@ impl SessionStoreV2 {
         // save must still be able to repair an interrupted creation whose Main
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
-        match fs::read_to_string(&current_main).await {
+        let previous_main = match fs::read_to_string(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
@@ -5494,15 +5756,17 @@ impl SessionStoreV2 {
                     answer_permit,
                 )
                 .await?;
+                Some(durable)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.reject_broker_receipts_without_main(
                     current_main.parent().expect("session.json has a parent"),
                 )
                 .await?;
+                None
             }
             Err(error) => return Err(error),
-        }
+        };
 
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
@@ -5516,6 +5780,28 @@ impl SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(&rel_path);
         let path = abs_dir.join("session.json");
         stages.directory_preparation = directory_started.elapsed();
+
+        let previous_projection = match &previous_main {
+            Some(main) => read_actor_tree_session_projection(&abs_dir, main).await,
+            None => None,
+        };
+        let root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
+        guards.hold_tree(tree);
+        if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
+            let root = if session.kind == SessionKind::Root {
+                Some(session.clone())
+            } else {
+                self.actor_tree_root_for_child_write(root_id).await?
+            };
+            if let Some(root) = root.as_ref() {
+                self.bump_actor_tree_revision(root).await?;
+            }
+        }
 
         // Refresh the runtime sidecar BEFORE session.json. If the process
         // crashes between the two writes, the sidecar then carries a
@@ -5876,6 +6162,27 @@ impl Storage for SessionStoreV2 {
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
         let serialized_bytes = runtime_bytes.len();
+        let root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
+        guards.hold_tree(tree);
+        let tree_projection_changed = read_actor_tree_session_projection(&abs_dir, session)
+            .await
+            .as_ref()
+            != Some(&actor_tree_session_projection(session));
+        if tree_projection_changed {
+            let root = if session.kind == SessionKind::Root {
+                Some(session.clone())
+            } else {
+                self.actor_tree_root_for_child_write(root_id).await?
+            };
+            if let Some(root) = root.as_ref() {
+                self.bump_actor_tree_revision(root).await?;
+            }
+        }
         let filesystem_started = Instant::now();
         self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
             .await?;

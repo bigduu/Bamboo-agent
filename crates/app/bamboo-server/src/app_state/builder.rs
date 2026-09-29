@@ -800,6 +800,58 @@ impl AppState {
         ));
         external_runner.set_actor_directory_store(Some(session_store.clone()));
         external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
+        // Recover Host-checkpointed broker terminal receipts before launching
+        // pending children. The scan uses the physical canonical Child tree;
+        // each ACK is bound to the saved broker identity and parent mailbox.
+        // A bounded startup pass keeps an unavailable remote broker from
+        // delaying the HTTP server indefinitely. The periodic pass retries
+        // receipts left after that bound or a transient broker failure.
+        let broker_receipt_reconciler = Arc::new(
+            bamboo_engine::external_agents::actor_adapter::BrokerTerminalReceiptReconciler::new(
+                session_store.clone(),
+                &config_snapshot,
+            ),
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            broker_receipt_reconciler.reconcile_once(),
+        )
+        .await
+        {
+            Ok(report) if report.candidates > 0 || report.blocked > 0 => {
+                tracing::info!(
+                    candidates = report.candidates,
+                    repaired = report.repaired,
+                    blocked = report.blocked,
+                    "startup broker terminal receipt repair completed"
+                );
+            }
+            Err(_) => tracing::warn!(
+                "startup broker terminal receipt repair exceeded 15 seconds; pending receipts retained for periodic retry"
+            ),
+            _ => {}
+        }
+        {
+            let reconciler = broker_receipt_reconciler.clone();
+            let shutdown = mcp_proxy_shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    }
+                    let report = reconciler.reconcile_once().await;
+                    if report.candidates > 0 || report.blocked > 0 {
+                        tracing::info!(
+                            candidates = report.candidates,
+                            repaired = report.repaired,
+                            blocked = report.blocked,
+                            "periodic broker terminal receipt repair completed"
+                        );
+                    }
+                }
+            });
+        }
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,

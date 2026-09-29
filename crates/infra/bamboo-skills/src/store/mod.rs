@@ -4001,7 +4001,14 @@ mod tests {
         let expected_path = normalize_watcher_test_path(expected_path);
         let expected_event = format!("{expected_event} at {}", expected_path.display());
         let mut observed_batches = Vec::new();
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // macOS filesystem delivery and catalog reload can outlast five seconds
+        // while the parallel suite creates many workspace stores.
+        let timeout = if cfg!(target_os = "macos") {
+            std::time::Duration::from_secs(30)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+        let outcome = tokio::time::timeout(timeout, async {
             loop {
                 match batches.recv().await {
                     Ok(batch) => {

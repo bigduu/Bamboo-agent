@@ -103,7 +103,7 @@ fn root_ctx<'a>(session_id: &'a str, tool_call_id: &'a str) -> ToolExecutionCont
 }
 
 #[tokio::test]
-async fn existing_direct_child_query_reads_durable_history_and_steer_requires_subagent() {
+async fn existing_direct_child_query_reads_durable_history_and_steer_requires_messenger() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
     let mut root = Session::new("canonical-root", "echo-model");
@@ -137,7 +137,9 @@ async fn existing_direct_child_query_reads_durable_history_and_steer_requires_su
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("SubAgent target"));
+    assert!(error
+        .to_string()
+        .contains("SessionMessenger is unavailable"));
     assert_eq!(
         store
             .load_session(&child.id)
@@ -306,7 +308,11 @@ async fn host_bound_ask_uses_saved_child_or_live_alias_before_broker_send() {
     let before = store.load_session(&actor_id).await.unwrap().unwrap();
     for (question, mode, reason) in [
         ("tell me about your private transcript", "query", "status"),
-        ("inject this into the worker", "steer", "SubAgent target"),
+        (
+            "inject this into the worker",
+            "steer",
+            "SessionMessenger is unavailable",
+        ),
     ] {
         let error = tool
             .invoke(

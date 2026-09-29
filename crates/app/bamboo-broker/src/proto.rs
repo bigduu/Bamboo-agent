@@ -1,11 +1,12 @@
 //! Broker wire protocol: client ↔ broker frames, JSON over WebSocket text.
 //!
 //! Message payloads reuse `bamboo-subagent`'s [`InboxMessage`] / [`MsgId`] /
-//! [`AgentRef`] verbatim — the broker is a transport for those, it does not
-//! reinterpret them.
+//! [`AgentRef`] verbatim. The broker treats ordinary messages as opaque; the
+//! canonical remote [`FencedRunEnvelope`] is the exception because safe replay
+//! requires checking its destination against the current authenticated peer.
 
 use bamboo_domain::WorkerHostCapabilities;
-use bamboo_subagent::{ActorEventBatch, AgentRef, InboxMessage, MsgId};
+use bamboo_subagent::{ActorEventBatch, AgentRef, InboxMessage, MsgId, RunSpec};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,75 @@ pub struct WorkerHostObservation {
     /// The Host still sends a versioned Run and the Worker validates its lease.
     #[serde(default)]
     pub environment_lease_v1: bool,
+}
+
+/// Durable destination binding for a canonical remote Run. The broker creates
+/// the connection generation from an authenticated scoped subscription; the
+/// sender copies that observation here, and the broker checks it again both at
+/// enqueue and at every delivery/replay. An old Run can therefore remain in
+/// Maildir without being executed by a replacement subscriber at the same
+/// mailbox (even when its checkout is byte-for-byte identical).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FencedRunEnvelope {
+    pub version: u32,
+    pub recipient_host_ref: String,
+    pub recipient_mailbox: String,
+    pub recipient_connection_generation: String,
+    pub recipient_role: String,
+    pub run: RunSpec,
+}
+
+impl FencedRunEnvelope {
+    pub const VERSION: u32 = 1;
+
+    pub fn for_observation(run: RunSpec, observation: &WorkerHostObservation) -> Option<Self> {
+        let envelope = Self {
+            version: Self::VERSION,
+            recipient_host_ref: observation.host_ref.clone(),
+            recipient_mailbox: observation.mailbox.clone(),
+            recipient_connection_generation: observation.connection_generation.clone(),
+            recipient_role: observation.role.clone()?,
+            run,
+        };
+        envelope
+            .matches_observation(&observation.mailbox, observation)
+            .then_some(envelope)
+    }
+
+    pub fn matches_observation(&self, to: &str, observation: &WorkerHostObservation) -> bool {
+        let run_id = self.run.activation_run_id.as_deref().unwrap_or_default();
+        let actor_id = self
+            .run
+            .logical_session
+            .as_ref()
+            .filter(|identity| identity.creation.is_some())
+            .map(|identity| identity.session_id.as_str())
+            .unwrap_or_default();
+        self.version == Self::VERSION
+            && !self.recipient_host_ref.is_empty()
+            && !self.recipient_mailbox.is_empty()
+            && !self.recipient_connection_generation.is_empty()
+            && !self.recipient_role.is_empty()
+            && !run_id.is_empty()
+            && !actor_id.is_empty()
+            && self.run.execution_epoch != 0
+            && self.run.permission_policy.as_ref().is_some_and(|policy| {
+                policy.workspace_path.is_none()
+                    && policy.environment_lease.as_ref().is_some_and(|lease| {
+                        lease.actor_id == actor_id
+                            && lease.activation_run_id == run_id
+                            && lease.execution_epoch == self.run.execution_epoch
+                    })
+            })
+            && observation.mailbox == to
+            && observation.mailbox == self.recipient_mailbox
+            && observation.host_ref == self.recipient_host_ref
+            && observation.connection_generation == self.recipient_connection_generation
+            && observation.role.as_deref() == Some(self.recipient_role.as_str())
+            && observation.environment_lease_v1
+            && observation.credential_expires_at > Utc::now()
+    }
 }
 
 /// Client → broker.

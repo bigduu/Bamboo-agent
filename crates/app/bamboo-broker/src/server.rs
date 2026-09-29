@@ -448,7 +448,13 @@ impl BrokerServer {
                             let ack = if captured_peer.is_some() {
                                 match subscription.as_ref() {
                                     Some(lease) => self.core.ack_current(&session_id, &id, lease).await,
-                                    None => Err(scoped_error()),
+                                    // A Host may repair a checkpointed terminal
+                                    // after its old parent link has gone away.
+                                    // The captured scoped credential is already
+                                    // bound to this exact mailbox, and a
+                                    // receipt-only connection must not replace
+                                    // its live subscriber just to ACK.
+                                    None => self.core.ack(&session_id, &id).await,
                                 }
                             } else {
                                 self.core.ack(&session_id, &id).await

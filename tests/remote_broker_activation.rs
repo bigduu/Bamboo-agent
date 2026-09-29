@@ -439,6 +439,7 @@ async fn wait_runs_settled(data: &Path) {
                                 message.kind,
                                 bamboo_subagent::InboxKind::Run
                                     | bamboo_subagent::InboxKind::LeasedRun
+                                    | bamboo_subagent::InboxKind::FencedRun
                             ));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -541,7 +542,7 @@ async fn fixture() {
     let url = format!("wss://{bind}");
     let expiry = Utc::now() + ChronoDuration::minutes(15);
     let policy = json!({"peers":[{"credential":HOST,"mailbox":"remote-parent","role":"host","host":"host-node","expires_at":expiry,
-        "destinations":[{"mailbox":"remote-worker","kinds":["leased_run","steer"]}],"cancel":["remote-worker"],"presence":["worker"]},
+        "destinations":[{"mailbox":"remote-worker","kinds":["fenced_run","steer"]}],"cancel":["remote-worker"],"presence":["worker"]},
         {"credential":WORKER,"mailbox":"remote-worker","role":"worker","host":"worker-node","expires_at":expiry,
         "destinations":[{"mailbox":"remote-parent","kinds":["event","outcome","session_message_admitted","approval_request"]}]},
         {"credential":OBSERVER,"mailbox":"remote-observer","role":"observer","host":"observer-node","expires_at":expiry,

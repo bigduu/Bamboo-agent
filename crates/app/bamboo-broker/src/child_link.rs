@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 
 use crate::client::{BrokerClient, BrokerStreamEvent};
 use crate::error::{BrokerError, BrokerResult};
+use crate::proto::{FencedRunEnvelope, WorkerHostObservation};
 
 /// A parent→child link over the broker, addressing the child by its mailbox id.
 pub struct BrokerChildLink {
@@ -32,8 +33,11 @@ pub struct BrokerChildLink {
     /// True once a terminal frame has been surfaced for the current run.
     done: bool,
     selected_worker: Option<AgentRef>,
+    selected_host_observation: Option<WorkerHostObservation>,
     expected_run: Option<bamboo_subagent::RunSpec>,
     require_environment_lease: bool,
+    /// Recovery-only links may ACK Host-proven receipts but never dispatch Run.
+    recovery_only: bool,
     /// Exact durable mailbox receipts accepted for this Run. The Host alone
     /// decides when its logical Session checkpoint permits their ACK.
     pending_durable: VecDeque<MsgId>,
@@ -63,13 +67,81 @@ impl BrokerChildLink {
             run_id: None,
             done: false,
             selected_worker: None,
+            selected_host_observation: None,
             expected_run: None,
             require_environment_lease: false,
+            recovery_only: false,
             pending_durable: VecDeque::new(),
             pending_terminal: None,
             observed_terminal_status: None,
             accepted_terminal_status: None,
         })
+    }
+
+    /// Subscribe to the Host mailbox solely to replay-ACK its checkpointed
+    /// Event/Outcome receipts. This never requires the old worker to be online
+    /// and cannot be used to dispatch a new Run.
+    pub async fn connect_receipt_recovery(
+        endpoint: &str,
+        parent: AgentRef,
+        token: &str,
+    ) -> BrokerResult<Self> {
+        // The legacy broker accepts an authenticated ACK without a subscription.
+        // Avoid replacing an active parent subscription during periodic repair.
+        let mut client = BrokerClient::connect_actor(endpoint, parent.clone(), token).await?;
+        let broker_identity = client.durable_broker_identity().await?;
+        Ok(Self {
+            client,
+            child: String::new(),
+            me: parent,
+            broker_identity,
+            run_id: None,
+            done: false,
+            selected_worker: None,
+            selected_host_observation: None,
+            expected_run: None,
+            require_environment_lease: false,
+            recovery_only: true,
+            pending_durable: VecDeque::new(),
+            pending_terminal: None,
+            observed_terminal_status: None,
+            accepted_terminal_status: None,
+        })
+    }
+
+    /// Scoped TLS counterpart of [`Self::connect_receipt_recovery`]. The
+    /// authenticated peer policy, not a worker claim, binds the parent mailbox.
+    pub async fn connect_receipt_recovery_with_tls(
+        endpoint: &str,
+        parent: AgentRef,
+        token: &str,
+        tls: rustls::ClientConfig,
+    ) -> BrokerResult<Self> {
+        let mut client =
+            BrokerClient::connect_actor_with_tls(endpoint, parent.clone(), token, Some(tls))
+                .await?;
+        let broker_identity = client.durable_broker_identity().await?;
+        Ok(Self {
+            client,
+            child: String::new(),
+            me: parent,
+            broker_identity,
+            run_id: None,
+            done: false,
+            selected_worker: None,
+            selected_host_observation: None,
+            expected_run: None,
+            require_environment_lease: false,
+            recovery_only: true,
+            pending_durable: VecDeque::new(),
+            pending_terminal: None,
+            observed_terminal_status: None,
+            accepted_terminal_status: None,
+        })
+    }
+
+    pub fn parent_mailbox(&self) -> &str {
+        &self.me.session_id
     }
 
     /// Explicit scoped peer route; the credential belongs only to this client.
@@ -103,8 +175,10 @@ impl BrokerChildLink {
             run_id: None,
             done: false,
             selected_worker: Some(worker),
+            selected_host_observation: None,
             expected_run: None,
             require_environment_lease: false,
+            recovery_only: false,
             pending_durable: VecDeque::new(),
             pending_terminal: None,
             observed_terminal_status: None,
@@ -126,11 +200,16 @@ impl BrokerChildLink {
             Self::connect_strict_with_tls(endpoint, parent, token, worker.clone(), tls).await?;
         let role = worker.role.as_deref().ok_or_else(strict_link_error)?;
         let observation = link.client.observe_host(&worker.session_id, role).await?;
-        if !observation.is_some_and(|current| current.environment_lease_v1) {
+        let Some(observation) = observation.filter(|current| {
+            current.environment_lease_v1
+                && current.mailbox == worker.session_id
+                && current.role.as_deref() == Some(role)
+        }) else {
             return Err(BrokerError::Protocol(
                 "remote_environment_lease_unsupported".into(),
             ));
-        }
+        };
+        link.selected_host_observation = Some(observation);
         link.require_environment_lease = true;
         Ok(link)
     }
@@ -205,6 +284,11 @@ impl BrokerChildLink {
 
     /// Send a parent→child frame, mirroring `ChildClient::send`.
     pub async fn send(&mut self, frame: ParentFrame) -> BrokerResult<()> {
+        if self.recovery_only {
+            return Err(BrokerError::Protocol(
+                "broker receipt recovery link cannot dispatch work".into(),
+            ));
+        }
         match frame {
             ParentFrame::Run(spec) => {
                 if self.require_environment_lease
@@ -233,10 +317,7 @@ impl BrokerChildLink {
                         .as_ref()
                         .and_then(|id| id.creation.as_ref())
                         .is_none()
-                        || spec
-                            .activation_run_id
-                            .as_deref()
-                            .map_or(true, str::is_empty)
+                        || spec.activation_run_id.as_deref().is_none_or(str::is_empty)
                         || spec.execution_epoch == 0
                     {
                         return Err(strict_link_error());
@@ -254,10 +335,20 @@ impl BrokerChildLink {
                         secrets: Default::default(),
                     });
                 }
-                let body = serde_json::to_value(spec)
-                    .map_err(|e| BrokerError::Transport(format!("encode RunSpec: {e}")))?;
+                let body = if self.require_environment_lease {
+                    let observed = self
+                        .selected_host_observation
+                        .as_ref()
+                        .ok_or_else(strict_link_error)?;
+                    let envelope = FencedRunEnvelope::for_observation(spec, observed)
+                        .ok_or_else(strict_link_error)?;
+                    serde_json::to_value(envelope)
+                } else {
+                    serde_json::to_value(spec)
+                }
+                .map_err(|e| BrokerError::Transport(format!("encode RunSpec: {e}")))?;
                 let kind = if self.require_environment_lease {
-                    InboxKind::LeasedRun
+                    InboxKind::FencedRun
                 } else {
                     InboxKind::Run
                 };
@@ -569,6 +660,7 @@ impl ChildLink for BrokerChildLink {
         let terminal_status = self.accepted_terminal_status?;
         Some(DurableChildDeliveryReceipt {
             broker_identity: self.broker_identity.clone(),
+            parent_mailbox: self.me.session_id.clone(),
             correlation_id: self.run_id.as_ref()?.as_str().to_owned(),
             message_ids: self
                 .pending_durable
@@ -577,6 +669,10 @@ impl ChildLink for BrokerChildLink {
                 .collect(),
             terminal_status,
         })
+    }
+
+    fn broker_parent_mailbox(&self) -> Option<&str> {
+        Some(&self.me.session_id)
     }
 
     async fn acknowledge_durable_frames(&mut self) -> TransportResult<()> {
