@@ -228,7 +228,7 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
-        self.subscribe_streams(session_id, role, false, None)
+        self.subscribe_streams(session_id, role, false, None, false)
             .await
             .map(|(streams, _lease)| streams.control)
     }
@@ -241,7 +241,8 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
-        self.subscribe_streams(session_id, role, true, None).await
+        self.subscribe_streams(session_id, role, true, None, false)
+            .await
     }
 
     pub(crate) async fn subscribe_scoped_with_lease(
@@ -250,7 +251,17 @@ impl BrokerCore {
         role: Option<&str>,
         host: AuthenticatedHost,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
-        self.subscribe_streams(session_id, role, true, Some(host))
+        self.subscribe_streams(session_id, role, true, Some(host), false)
+            .await
+    }
+
+    pub(crate) async fn subscribe_scoped_environment_lease_v1(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        host: AuthenticatedHost,
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        self.subscribe_streams(session_id, role, true, Some(host), true)
             .await
     }
 
@@ -260,6 +271,7 @@ impl BrokerCore {
         role: Option<&str>,
         ordered_actor_events: bool,
         host: Option<AuthenticatedHost>,
+        environment_lease_v1: bool,
     ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -314,6 +326,7 @@ impl BrokerCore {
                         role: role.map(str::to_string),
                         credential_expires_at: host.credential_expires_at,
                         connection_generation: MsgId::new().0,
+                        environment_lease_v1,
                     });
                 }
             }
@@ -967,6 +980,22 @@ mod tests {
             .current_host_observation("worker", "gpu")
             .await
             .is_none());
+
+        let (_lease_streams, lease_owner) = core
+            .subscribe_scoped_environment_lease_v1(
+                "worker",
+                Some("gpu"),
+                host("lease-host", deadline),
+            )
+            .await
+            .unwrap();
+        assert!(
+            core.current_host_observation("worker", "gpu")
+                .await
+                .unwrap()
+                .environment_lease_v1
+        );
+        assert!(core.unsubscribe_if_owner("worker", &lease_owner).await);
 
         let (_legacy, legacy_lease) = core
             .subscribe_with_lease("worker", Some("gpu"))

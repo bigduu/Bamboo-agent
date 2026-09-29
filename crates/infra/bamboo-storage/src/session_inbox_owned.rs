@@ -1,14 +1,18 @@
 //! Explicit storage leases; no engine consumer opts in through this module.
 use super::*;
 use bamboo_domain::{
+    SessionInboxDeadLetterInspection, SessionInboxFailureOutcome, SessionInboxFailureReport,
     SessionInboxLeaseInspection, SessionInboxLeaseRequest, SessionInboxLeaseToken,
-    SessionInboxOwnedClaim,
+    SessionInboxOwnedClaim, SessionInboxReceipt, SessionInboxWakeCandidate,
+    SessionInboxWakeReadiness, SessionMessageId,
 };
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 pub(super) const LEASE_KEY: &str = "session_inbox_lease";
 const OWNED_KIND: &str = "session_envelope_owned_v3";
+const DEAD_LETTER_DIR: &str = "dead";
+const MAX_EXPLICIT_FAILURES: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,9 +20,29 @@ pub(super) struct StoredLease {
     version: u32,
     token: SessionInboxLeaseToken,
     policy: SessionActivationPolicy,
+    #[serde(default)]
+    failure_count: u32,
+    /// Missing on pre-dead-letter v3 transports; their epoch counted only
+    /// expiration reclaims, so the legacy value is epoch - 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reclaim_count: Option<u64>,
+    #[serde(default)]
+    manual_retry_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dead_lettered_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_requested_at: Option<DateTime<Utc>>,
 }
 
 impl StoredLease {
+    fn reclaim_count(&self) -> u64 {
+        self.reclaim_count.unwrap_or(self.token.epoch - 1)
+    }
+
     pub(super) fn from_value(value: &serde_json::Value) -> Result<Option<Self>, SessionInboxError> {
         let Some(raw) = value.get(LEASE_KEY) else {
             return Ok(None);
@@ -30,6 +54,23 @@ impl StoredLease {
             || lease.token.consumer.as_str().is_empty()
             || lease.token.consumer.as_str().len() > 128
             || uuid::Uuid::parse_str(&lease.token.incarnation).is_err()
+            || lease.failure_count > MAX_EXPLICIT_FAILURES
+            || lease
+                .reclaim_count
+                .is_some_and(|count| count >= lease.token.epoch)
+            || lease.manual_retry_count >= lease.token.epoch
+            || lease.last_error_code.as_ref().is_some_and(|code| {
+                code.is_empty()
+                    || code.len() > 64
+                    || !code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-' | b'.')
+                    })
+            })
+            || (lease.failure_count > 0 && lease.last_error_code.is_none())
+            || (lease.retry_after.is_some() && lease.dead_lettered_at.is_some())
+            || (lease.retry_requested_at.is_some() && lease.dead_lettered_at.is_none())
         {
             return Err(invalid("invalid Inbox lease"));
         }
@@ -299,6 +340,49 @@ pub(super) async fn complete_owned<T: Send + 'static>(
 }
 
 impl FileSessionInbox {
+    async fn recover_dead_letter_rotations(
+        &self,
+        dir: &Path,
+        target: &str,
+        filesystem: &OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
+        for (generation, name, path) in Self::owned_queue_entries(dir, "cur", filesystem).await? {
+            let (wrapper, stored) = self.read_owned_transport(&path).await?;
+            let Some(stored) = stored else {
+                continue;
+            };
+            if stored.dead_lettered_at.is_none() || stored.retry_requested_at.is_some() {
+                continue;
+            }
+            let claim = Self::owned_claim(wrapper, generation, name.clone(), stored, target)?;
+            if Self::admitted_receipt(dir, &claim.claim.envelope)
+                .await?
+                .is_some()
+            {
+                return Err(invalid(
+                    "dead-letter marker conflicts with terminal receipt",
+                ));
+            }
+            let dead_dir = dir.join(DEAD_LETTER_DIR);
+            filesystem
+                .create_dir(&dead_dir)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let destination = dead_dir.join(name);
+            if tokio::fs::try_exists(&destination)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            {
+                return Err(invalid("Inbox dead-letter incarnation already exists"));
+            }
+            filesystem
+                .rotate(&path, &destination)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn owned_filesystem(
         &self,
         target: &str,
@@ -598,13 +682,15 @@ impl FileSessionInbox {
         #[cfg(test)]
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
-        for queue in ["new", "cur", "corrupt"] {
+        for queue in ["new", "cur", "corrupt", DEAD_LETTER_DIR] {
             filesystem
                 .create_dir(&dir.join(queue))
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         }
         self.ensure_owned_format(&dir, &filesystem).await?;
+        self.recover_dead_letter_rotations(&dir, target, &filesystem)
+            .await?;
         let prefix = Self::read_activation_generation(&dir).await?;
         let interrupt = Self::read_interrupt_generation(&dir).await?;
         let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
@@ -643,11 +729,30 @@ impl FileSessionInbox {
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
                 continue;
             }
-            if run.is_some_and(|run| envelope.guidance_waits_for_run(run)) {
+            if let Some(lease) = stored.as_ref() {
+                if lease.dead_lettered_at.is_some() && lease.retry_requested_at.is_none() {
+                    return Err(invalid("dead-letter marker outside claimed queue"));
+                }
+                if lease.retry_requested_at.is_some()
+                    && path.parent() != Some(dir.join("new").as_path())
+                {
+                    return Err(invalid("Inbox manual retry outside pending queue"));
+                }
+                if lease
+                    .retry_after
+                    .is_some_and(|deadline| deadline > request.now)
+                {
+                    continue;
+                }
+            }
+            if run.is_some_and(|run| envelope.waits_for_successor_of_run(run)) {
                 continue;
             }
             let lease = match stored {
-                Some(lease) if lease.token.expires_at > request.now => {
+                Some(lease)
+                    if lease.retry_requested_at.is_none()
+                        && lease.token.expires_at > request.now =>
+                {
                     if lease.token.consumer != request.consumer {
                         continue;
                     }
@@ -670,6 +775,44 @@ impl FileSessionInbox {
                         expires_at,
                         incarnation: uuid::Uuid::new_v4().to_string(),
                     },
+                    failure_count: previous.as_ref().map_or(0, |lease| {
+                        if lease.retry_requested_at.is_some() {
+                            0
+                        } else {
+                            lease.failure_count
+                        }
+                    }),
+                    reclaim_count: Some(match previous.as_ref() {
+                        Some(lease)
+                            if lease.retry_requested_at.is_none()
+                                && lease.retry_after.is_none() =>
+                        {
+                            lease
+                                .reclaim_count()
+                                .checked_add(1)
+                                .ok_or_else(|| invalid("Inbox reclaim counter exhausted"))?
+                        }
+                        Some(lease) => lease.reclaim_count(),
+                        None => 0,
+                    }),
+                    manual_retry_count: match previous.as_ref() {
+                        Some(lease) if lease.retry_requested_at.is_some() => lease
+                            .manual_retry_count
+                            .checked_add(1)
+                            .ok_or_else(|| invalid("Inbox manual retry counter exhausted"))?,
+                        Some(lease) => lease.manual_retry_count,
+                        None => 0,
+                    },
+                    last_error_code: previous.as_ref().and_then(|lease| {
+                        if lease.retry_requested_at.is_some() {
+                            None
+                        } else {
+                            lease.last_error_code.clone()
+                        }
+                    }),
+                    retry_after: None,
+                    dead_lettered_at: None,
+                    retry_requested_at: None,
                 },
             };
             let name = Self::owned_name(generation, &lease.token);
@@ -899,6 +1042,188 @@ impl FileSessionInbox {
         .await
     }
 
+    pub(super) async fn fail_owned_impl(
+        &self,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        report: &SessionInboxFailureReport,
+    ) -> Result<SessionInboxFailureOutcome, SessionInboxError> {
+        report.validate()?;
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let (wrapper, mut stored) = self.current_owned(&dir, target, claim, report.now).await?;
+        if Self::admitted_receipt(&dir, &claim.claim.envelope)
+            .await?
+            .is_some()
+        {
+            return Err(invalid("Inbox claim is already terminal"));
+        }
+        stored.failure_count = stored
+            .failure_count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_EXPLICIT_FAILURES)
+            .ok_or_else(|| invalid("Inbox failure limit exhausted"))?;
+        stored.last_error_code = Some(report.error_code.clone());
+        // Writing a changed token first fences any ACK already holding this
+        // claim. The path stays in cur until a retry becomes eligible.
+        stored.token.expires_at = report.now;
+        let path = dir.join("cur").join(&claim.claim.claim_id);
+        let outcome = if stored.failure_count == MAX_EXPLICIT_FAILURES {
+            stored.retry_after = None;
+            stored.dead_lettered_at = Some(report.now);
+            stored.retry_requested_at = None;
+            SessionInboxFailureOutcome::DeadLettered {
+                failure_count: stored.failure_count,
+            }
+        } else {
+            let delay_seconds = if stored.failure_count == 1 { 30 } else { 120 };
+            let retry_after = report
+                .now
+                .checked_add_signed(chrono::Duration::seconds(delay_seconds))
+                .ok_or_else(|| invalid("Inbox retry deadline overflow"))?;
+            stored.retry_after = Some(retry_after);
+            SessionInboxFailureOutcome::RetryScheduled {
+                failure_count: stored.failure_count,
+                retry_after,
+            }
+        };
+        self.write_owned_transport(&path, &wrapper, &stored, &filesystem)
+            .await?;
+        if matches!(outcome, SessionInboxFailureOutcome::DeadLettered { .. }) {
+            let dead_dir = dir.join(DEAD_LETTER_DIR);
+            filesystem
+                .create_dir(&dead_dir)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let destination = dead_dir.join(&claim.claim.claim_id);
+            if tokio::fs::try_exists(&destination)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            {
+                return Err(invalid("Inbox dead-letter incarnation already exists"));
+            }
+            filesystem
+                .rotate(&path, &destination)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        }
+        Ok(outcome)
+    }
+
+    pub(super) async fn inspect_dead_letters_impl(
+        &self,
+        target: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionInboxDeadLetterInspection>, SessionInboxError> {
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        self.recover_dead_letter_rotations(&dir, target, &filesystem)
+            .await?;
+        let mut entries = Self::owned_queue_entries(&dir, DEAD_LETTER_DIR, &filesystem).await?;
+        entries.sort_by_key(|entry| entry.0);
+        let mut result = Vec::new();
+        for (generation, _, path) in entries {
+            if result.len() >= limit.min(self.limits.max_claim_batch) {
+                break;
+            }
+            let (wrapper, stored) = self.read_owned_transport(&path).await?;
+            let stored = stored.ok_or_else(|| invalid("dead letter has no owned lease"))?;
+            let claim = Self::owned_claim(
+                wrapper,
+                generation,
+                path.file_name()
+                    .ok_or_else(|| invalid("dead letter has no filename"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                stored.clone(),
+                target,
+            )?;
+            let dead_lettered_at = stored
+                .dead_lettered_at
+                .ok_or_else(|| invalid("dead letter has no terminal marker"))?;
+            result.push(SessionInboxDeadLetterInspection {
+                id: claim.claim.envelope.id,
+                generation,
+                failure_count: stored.failure_count,
+                last_error_code: stored
+                    .last_error_code
+                    .ok_or_else(|| invalid("dead letter has no error code"))?,
+                dead_lettered_at,
+            });
+        }
+        Ok(result)
+    }
+
+    pub(super) async fn retry_dead_letter_impl(
+        &self,
+        target: &str,
+        id: &SessionMessageId,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if generation == 0 {
+            return Err(invalid("invalid dead-letter generation"));
+        }
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        self.recover_dead_letter_rotations(&dir, target, &filesystem)
+            .await?;
+        let mut selected = None;
+        for (candidate_generation, name, path) in
+            Self::owned_queue_entries(&dir, DEAD_LETTER_DIR, &filesystem).await?
+        {
+            if candidate_generation != generation {
+                continue;
+            }
+            let (wrapper, stored) = self.read_owned_transport(&path).await?;
+            let stored = stored.ok_or_else(|| invalid("dead letter has no owned lease"))?;
+            let claim = Self::owned_claim(
+                wrapper.clone(),
+                generation,
+                name.clone(),
+                stored.clone(),
+                target,
+            )?;
+            if claim.claim.envelope.id != *id {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(invalid("duplicate dead-letter message id"));
+            }
+            selected = Some((name, path, wrapper, stored, claim.claim.envelope));
+        }
+        let (name, path, wrapper, mut stored, envelope) =
+            selected.ok_or_else(|| invalid("dead letter not found"))?;
+        if Self::admitted_receipt(&dir, &envelope).await?.is_some() {
+            return Err(invalid("dead letter is already terminal"));
+        }
+        let dead_at = stored
+            .dead_lettered_at
+            .ok_or_else(|| invalid("dead letter has no terminal marker"))?;
+        if now < dead_at || stored.failure_count != MAX_EXPLICIT_FAILURES {
+            return Err(invalid("dead letter retry has invalid history"));
+        }
+        if stored.retry_requested_at.is_none() {
+            stored.retry_requested_at = Some(now);
+            // Durable intent precedes the atomic move. A retry interrupted
+            // here may be repeated with the same exact selector.
+            self.write_owned_transport(&path, &wrapper, &stored, &filesystem)
+                .await?;
+        }
+        let destination = dir.join("new").join(name);
+        if tokio::fs::try_exists(&destination)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+        {
+            return Err(invalid("Inbox retry incarnation already exists"));
+        }
+        filesystem
+            .rotate(&path, &destination)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        Ok(SessionInboxReceipt {
+            id: id.clone(),
+            generation,
+        })
+    }
+
     pub(super) async fn inspect_owned_impl(
         &self,
         target: &str,
@@ -926,9 +1251,104 @@ impl FileSessionInbox {
                     epoch: lease.token.epoch,
                     expires_at: lease.token.expires_at,
                     expired: lease.token.expires_at <= now,
-                    reclaim_count: lease.token.epoch - 1,
+                    reclaim_count: lease.reclaim_count(),
+                    manual_retry_count: lease.manual_retry_count,
+                    failure_count: lease.failure_count,
+                    last_error_code: lease.last_error_code,
+                    retry_after: lease.retry_after,
                 });
             }
+        }
+        Ok(result)
+    }
+
+    /// Read the first item that a fresh consumer could claim now, or the
+    /// earliest eligible lease transition. This holds the same lifecycle,
+    /// process and cross-process Inbox locks as `claim_owned_impl` throughout
+    /// the scan. The result is only a wake hint; claim still performs its CAS.
+    pub(super) async fn inspect_wake_readiness_impl(
+        &self,
+        target: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SessionInboxWakeReadiness, SessionInboxError> {
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        for queue in ["new", "cur", "corrupt", DEAD_LETTER_DIR] {
+            filesystem
+                .create_dir(&dir.join(queue))
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        }
+        // Readiness is a scheduling hint, not a consumer. Upgrading a legacy
+        // queue here fences the ordinary Root turn's claim_for_turn before a
+        // consumer has opted in to owned claims. claim_owned performs the
+        // irreversible format upgrade when an owned consumer actually exists.
+        self.recover_dead_letter_rotations(&dir, target, &filesystem)
+            .await?;
+        let prefix = Self::read_activation_generation(&dir).await?;
+        let interrupt = Self::read_interrupt_generation(&dir).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut result = SessionInboxWakeReadiness::default();
+        for (generation, _, path) in entries {
+            let (wrapper, stored) = self.read_owned_transport(&path).await?;
+            let intent = Self::activation_intent(&wrapper.body)?;
+            if !Self::eligible(generation, prefix, intent) {
+                continue;
+            }
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+                .map_err(|_| invalid("invalid Inbox envelope"))?;
+            envelope
+                .validate()
+                .map_err(|_| invalid("invalid Inbox envelope"))?;
+            if envelope.target_session_id != target {
+                return Err(invalid("Inbox target mismatch"));
+            }
+            if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
+                if receipt.delivery.generation != generation
+                    || receipt.intent != intent
+                    || !StoredLease::same_optional_identity(receipt.lease.as_ref(), stored.as_ref())
+                {
+                    return Err(invalid("Inbox terminal lease mismatch"));
+                }
+                continue;
+            }
+            let (policy, lease_epoch, ready_after) = match stored.as_ref() {
+                Some(lease) => {
+                    if lease.dead_lettered_at.is_some() && lease.retry_requested_at.is_none() {
+                        return Err(invalid("dead-letter marker outside claimed queue"));
+                    }
+                    if lease.retry_requested_at.is_some()
+                        && path.parent() != Some(dir.join("new").as_path())
+                    {
+                        return Err(invalid("Inbox manual retry outside pending queue"));
+                    }
+                    let ready_after = lease.retry_requested_at.unwrap_or_else(|| {
+                        lease.retry_after.map_or(lease.token.expires_at, |retry| {
+                            retry.max(lease.token.expires_at)
+                        })
+                    });
+                    (lease.policy, Some(lease.token.epoch), Some(ready_after))
+                }
+                None => (
+                    Self::effective_activation_policy(generation, prefix, interrupt, intent)?,
+                    None,
+                    None,
+                ),
+            };
+            if let Some(due) = ready_after.filter(|due| *due > now) {
+                result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
+                continue;
+            }
+            result.ready = Some(SessionInboxWakeCandidate {
+                id: envelope.id,
+                generation,
+                activation_policy: policy,
+                coordinator_generation: prefix,
+                lease_epoch,
+                ready_after,
+            });
+            break;
         }
         Ok(result)
     }

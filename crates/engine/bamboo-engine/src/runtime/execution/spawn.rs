@@ -120,6 +120,9 @@ pub struct SessionInboxRuntimeBinding {
     pub inbox: Arc<dyn SessionInboxPort>,
     pub storage: Arc<dyn Storage>,
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    /// The production Host's exact SessionRepository write coordinator.
+    /// Canonical Worker checkpoints fail closed when this is absent.
+    pub parent_question_lock: Option<Arc<bamboo_storage::LockedSessionStore>>,
 }
 
 /// Trait for external child session runtimes (e.g. A2A, CLI adapters).
@@ -164,6 +167,10 @@ pub trait ExternalChildRunner: Send + Sync {
     /// Optional actual host Store for the local zero-tool named-profile route.
     /// This does not enable owned Inbox claims or grant authority to custom runners.
     fn set_actor_directory_store(&self, _store: Option<Arc<bamboo_storage::SessionStoreV2>>) {}
+
+    /// Bind the application-owned logical SubAgent tool after its canonical
+    /// scheduler/adapter exist. Actor runners use it only for fenced child RPCs.
+    fn set_canonical_subagent_tool(&self, _tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>) {}
 
     /// Optional host-owned, redacted canonical Actor event observer.
     fn set_actor_event_observer(

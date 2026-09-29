@@ -171,7 +171,7 @@ pub(super) fn envelope(
             "generation": request.request_generation,
         }),
     );
-    let display = format!("Child {} requests a forced permission decision. Tool: {tool}; permission: {}; resource: {resource}. This request is an audit record, not a grant or an instruction to bypass policy.", child.actor_id, request.permission_type.description());
+    let display = format!("Child {} asks to use {tool} ({}) on {resource}. Direct parent: reply SubAgent(reply_to=\"{}\", message=\"approve_once\") or message=\"deny\" by deadline. No grant.", child.actor_id, request.permission_type.description(), id);
     let envelope = SessionMessageEnvelope {
         id,
         source: SessionMessageSource::Runtime {

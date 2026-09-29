@@ -56,6 +56,9 @@ impl Drop for SynchronousLaunchGuard {
     }
 }
 
+use crate::parent_request_reply::{
+    ParentRequestMessageReceipt, ParentRequestReplyPort, ParentRequestReplyState,
+};
 use crate::sub_agent_facade::{self as facade, Projection};
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -301,7 +304,7 @@ async fn enqueue_waiting_child(
         .await
         .map_err(tool_error_from_child_session)?;
     let parent_before = sessions
-        .load_root_session(&parent.id)
+        .load_parent_session(&parent.id)
         .await
         .map_err(tool_error_from_child_session)?;
     let had_wait = parent_before
@@ -573,6 +576,10 @@ pub struct SubAgentTool {
     /// through launch/rollback. Two calls for the same child must not both
     /// observe an absent wait and later undo each other's registration.
     synchronous_launch_locks: SynchronousLaunchLocks,
+    /// Per-run, read-only canonical Host path for a logical Worker Child.
+    owned_tree_host: Option<(bamboo_subagent::executor::HostBridge, String)>,
+    /// Server-owned direct-parent resolver; absent in unbound tools.
+    parent_request_replies: Option<Arc<dyn ParentRequestReplyPort>>,
 }
 
 impl SubAgentTool {
@@ -585,6 +592,8 @@ impl SubAgentTool {
             resolver,
             catalog: None,
             synchronous_launch_locks: Arc::new(DashMap::new()),
+            owned_tree_host: None,
+            parent_request_replies: None,
         }
     }
 
@@ -592,6 +601,21 @@ impl SubAgentTool {
     /// resolution for `create.model`.
     pub fn with_model_catalog(mut self, catalog: Arc<dyn ModelCatalogPort>) -> Self {
         self.catalog = Some(catalog);
+        self
+    }
+
+    /// Bind only this run's active logical Child to the Host's canonical tree.
+    pub fn with_owned_tree_host(
+        mut self,
+        bridge: bamboo_subagent::executor::HostBridge,
+        actor_id: String,
+    ) -> Self {
+        self.owned_tree_host = Some((bridge, actor_id));
+        self
+    }
+
+    pub fn with_parent_request_replies(mut self, replies: Arc<dyn ParentRequestReplyPort>) -> Self {
+        self.parent_request_replies = Some(replies);
         self
     }
 }
@@ -676,6 +700,7 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        let host_args = args.clone();
         let normalized = facade::normalize(args)?;
         let args = normalized.args;
         let projection = normalized.projection;
@@ -683,7 +708,144 @@ impl Tool for SubAgentTool {
             let parent_id = ctx.session_id().ok_or_else(|| {
                 ToolError::Execution("SubAgent requires a current session".into())
             })?;
-            return facade::inspect_tree(self.sessions.as_ref(), parent_id).await;
+            let cursor = args.get("cursor").and_then(serde_json::Value::as_str);
+            if let Some((bridge, actor_id)) = &self.owned_tree_host {
+                if parent_id != actor_id {
+                    return Err(ToolError::Execution(
+                        "Owned tree caller differs from the active logical Child".into(),
+                    ));
+                }
+                let page = bridge
+                    .owned_tree_call(cursor)
+                    .await
+                    .map_err(ToolError::Execution)?;
+                return Ok(ToolOutcome::Completed(ToolResult::text(
+                    true,
+                    page.to_string(),
+                )));
+            }
+            return facade::inspect_tree(self.sessions.as_ref(), parent_id, cursor).await;
+        }
+        if let Some((bridge, actor_id)) = &self.owned_tree_host {
+            if ctx.session_id() != Some(actor_id.as_str()) {
+                return Err(ToolError::Execution(
+                    "SubAgent caller differs from the active logical Child".into(),
+                ));
+            }
+            let result = bridge
+                .subagent_call(host_args, ctx.tool_call_id.as_ref())
+                .await
+                .map_err(ToolError::Execution)?;
+            let result: ToolResult = serde_json::from_value(result).map_err(|_| {
+                ToolError::Execution("canonical SubAgent returned an invalid result".into())
+            })?;
+            return Ok(ToolOutcome::Completed(result));
+        }
+        if projection == Some(Projection::ParentQuestionAsk) {
+            // Only the canonical Host callback is allowed to produce an
+            // agentic clarification. A standalone/local Child tool without
+            // that bridge must not park itself on an unrouteable question.
+            if self.parent_request_replies.is_none() {
+                return Err(ToolError::Execution(
+                    "ask_parent requires a canonical Host-backed Child run".into(),
+                ));
+            }
+            let caller_id = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("ask_parent requires an active Child Session".into())
+            })?;
+            let child = self
+                .sessions
+                .load_tree_caller_session(caller_id)
+                .await
+                .map_err(tool_error_from_child_session)?;
+            let child_actor = bamboo_domain::ActorSession::from_session(&child)
+                .map_err(|_| ToolError::Execution("ask_parent Child identity is invalid".into()))?;
+            let parent_id = child.parent_session_id.as_deref().ok_or_else(|| {
+                ToolError::Execution("ask_parent requires a direct parent".into())
+            })?;
+            if child.id != caller_id
+                || child.kind != bamboo_domain::SessionKind::Child
+                || child.pending_question.is_some()
+                || ctx.plan_read_only
+                || child
+                    .subagent_type()
+                    .as_deref()
+                    .is_some_and(|role| matches!(role, "planner" | "guardian"))
+                || child
+                    .agent_runtime_state
+                    .as_ref()
+                    .is_some_and(|state| state.plan_mode.is_some())
+            {
+                return Err(ToolError::Execution(
+                    "ask_parent is unavailable for this Child run".into(),
+                ));
+            }
+            let parent = self
+                .sessions
+                .load_parent_session(parent_id)
+                .await
+                .map_err(tool_error_from_child_session)?;
+            let parent_actor = bamboo_domain::ActorSession::from_session(&parent)
+                .map_err(|_| ToolError::Execution("ask_parent direct parent is invalid".into()))?;
+            if child_actor.parent_actor_id.as_deref() != Some(parent.id.as_str())
+                || child_actor.root_actor_id != parent_actor.root_actor_id
+                || child_actor.project_id != parent_actor.project_id
+                || parent_actor.spawn_depth.checked_add(1) != Some(child_actor.spawn_depth)
+            {
+                return Err(ToolError::Execution(
+                    "ask_parent direct-parent lineage changed".into(),
+                ));
+            }
+            let question = args["question"]
+                .as_str()
+                .ok_or_else(|| ToolError::Execution("ask_parent question is missing".into()))?;
+            let result =
+                serde_json::to_string(&bamboo_agent_core::AgenticToolResult::NeedClarification {
+                    question: question.to_owned(),
+                    options: None,
+                })
+                .map_err(|_| {
+                    ToolError::Execution("ask_parent question cannot be encoded".into())
+                })?;
+            return Ok(ToolOutcome::Completed(ToolResult::text(true, result)));
+        }
+        if projection == Some(Projection::ParentRequestReply) {
+            let caller = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution("SubAgent requires a current parent Session".into())
+            })?;
+            let request_id = args["reply_to"].as_str().ok_or_else(|| {
+                ToolError::Execution("Canonical ParentRequest id is missing".into())
+            })?;
+            let resolver = self.parent_request_replies.as_ref().ok_or_else(|| {
+                ToolError::Execution("Direct-parent reply authority is unavailable".into())
+            })?;
+            let message = args["message"].as_str().ok_or_else(|| {
+                ToolError::Execution("Canonical ParentRequest reply message is missing".into())
+            })?;
+            let receipt = resolver
+                .resolve_message(caller, request_id, message)
+                .await
+                .map_err(ToolError::Execution)?;
+            let payload = match receipt {
+                ParentRequestMessageReceipt::Permission(receipt) => {
+                    let state = match receipt.state {
+                        ParentRequestReplyState::Recorded => "decision_recorded",
+                        ParentRequestReplyState::AlreadyResolved => "already_resolved",
+                    };
+                    json!({"request_id":request_id,"decision":receipt.decision,"state":state})
+                }
+                ParentRequestMessageReceipt::Clarification(receipt) => {
+                    let state = match receipt.state {
+                        ParentRequestReplyState::Recorded => "answer_recorded",
+                        ParentRequestReplyState::AlreadyResolved => "already_resolved",
+                    };
+                    json!({"request_id":request_id,"answer":receipt.answer,"state":state})
+                }
+            };
+            return Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                payload.to_string(),
+            )));
         }
         if projection == Some(Projection::ForcedPermissionAudit) {
             let caller_id = ctx.session_id().ok_or_else(|| {
@@ -832,7 +994,7 @@ impl SubAgentTool {
             let parent = self
                 .sessions
                 .as_ref()
-                .load_root_session(parent_session_id)
+                .load_parent_session(parent_session_id)
                 .await
                 .map_err(tool_error_from_child_session)?;
             let result = child_session::cancel_child_action(
@@ -954,7 +1116,7 @@ impl SubAgentTool {
         let parent = self
             .sessions
             .as_ref()
-            .load_root_session(parent_session_id)
+            .load_parent_session(parent_session_id)
             .await
             .map_err(tool_error_from_child_session)?;
 
@@ -1331,7 +1493,7 @@ impl SubAgentTool {
                                     Some("queued") => true,
                                     Some("message_queued") => self
                                         .sessions
-                                        .load_root_session(&parent.id)
+                                        .load_parent_session(&parent.id)
                                         .await
                                         .map_err(tool_error_from_child_session)?
                                         .agent_runtime_state
@@ -1727,7 +1889,7 @@ impl SubAgentTool {
                     // registration, so recheck durable terminality afterwards.
                     let parent_before = self
                         .sessions
-                        .load_root_session(&parent.id)
+                        .load_parent_session(&parent.id)
                         .await
                         .map_err(tool_error_from_child_session)?;
                     let had_wait = parent_before
@@ -1967,7 +2129,7 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["intent"]["enum"],
-            json!(["chat", "inspect", "control"])
+            json!(["chat", "inspect", "control", "ask_parent"])
         );
         let actual: std::collections::BTreeSet<_> = schema["properties"]
             .as_object()

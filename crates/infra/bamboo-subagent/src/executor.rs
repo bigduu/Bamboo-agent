@@ -5,7 +5,11 @@
 //! [`EchoExecutor`] is a dependency-free stand-in used by the demo worker and tests.
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::proto::{
@@ -24,6 +28,10 @@ pub enum ExecutorControl {
 pub enum HostRequestKind {
     /// Proxy a gated-tool approval to the host (→ `ChildFrame::ApprovalRequest`).
     Approval,
+    /// Read the active logical Child's owned tree from its canonical Host.
+    OwnedTree,
+    /// Invoke the canonical Host's logical SubAgent tool for this active Run.
+    SubAgent,
 }
 
 /// A single host-callback request: an executor proxies a gated-tool approval
@@ -40,13 +48,26 @@ pub struct HostRequest {
 #[derive(Clone)]
 pub struct HostBridge {
     req_tx: mpsc::UnboundedSender<HostRequest>,
+    tree_permits: Arc<Semaphore>,
+    tree_calls: Arc<AtomicUsize>,
+    subagent_permits: Arc<Semaphore>,
+    subagent_calls: Arc<AtomicUsize>,
 }
 
 impl HostBridge {
     /// Create a bridge + the receiver the transport pumps to the wire.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<HostRequest>) {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
-        (HostBridge { req_tx }, req_rx)
+        (
+            HostBridge {
+                req_tx,
+                tree_permits: Arc::new(Semaphore::new(1)),
+                tree_calls: Arc::new(AtomicUsize::new(0)),
+                subagent_permits: Arc::new(Semaphore::new(1)),
+                subagent_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            req_rx,
+        )
     }
 
     /// Proxy one gated-tool approval to the host and await the decision JSON
@@ -57,6 +78,87 @@ impl HostBridge {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         self.call(HostRequestKind::Approval, body).await
+    }
+
+    /// Request one bounded read from the canonical Host for the active logical
+    /// Child. Caller identity is never accepted from the Worker payload.
+    pub async fn owned_tree_call(&self, cursor: Option<&str>) -> Result<serde_json::Value, String> {
+        const MAX_CURSOR_BYTES: usize = 128;
+        const MAX_RESULT_BYTES: usize = 8192;
+        const MAX_CALLS_PER_RUN: usize = 16;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        if cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES) {
+            return Err("invalid owned tree cursor".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.tree_permits.acquire())
+            .await
+            .map_err(|_| "owned tree request timed out")?
+            .map_err(|_| "owned tree inspection unavailable")?;
+        if self.tree_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("owned tree request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::OwnedTree,
+                serde_json::json!({"cursor":cursor}),
+            ),
+        )
+        .await
+        .map_err(|_| "owned tree request timed out")??;
+        let page = reply
+            .get("page")
+            .filter(|page| !page.is_null())
+            .ok_or_else(|| "owned tree inspection rejected".to_string())?;
+        if serde_json::to_vec(page).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES) {
+            return Err("owned tree observation exceeds its limit".into());
+        }
+        Ok(page.clone())
+    }
+
+    /// Route a nested Child's logical operation to its canonical Host. The
+    /// Worker sends arguments and a transcript call id, never caller authority.
+    pub async fn subagent_call(
+        &self,
+        args: serde_json::Value,
+        tool_call_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        const MAX_ARGS_BYTES: usize = 64 * 1024;
+        const MAX_REPLY_BYTES: usize = 16 * 1024;
+        const MAX_CALLS_PER_RUN: usize = 64;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if tool_call_id.is_empty()
+            || tool_call_id.len() > 128
+            || serde_json::to_vec(&args).map_or(true, |bytes| bytes.len() > MAX_ARGS_BYTES)
+        {
+            return Err("invalid canonical SubAgent request".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.subagent_permits.acquire())
+            .await
+            .map_err(|_| "canonical SubAgent request timed out")?
+            .map_err(|_| "canonical SubAgent unavailable")?;
+        if self.subagent_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("canonical SubAgent request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::SubAgent,
+                serde_json::json!({"args":args,"tool_call_id":tool_call_id}),
+            ),
+        )
+        .await
+        .map_err(|_| "canonical SubAgent request timed out")??;
+        if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_REPLY_BYTES) {
+            return Err("canonical SubAgent result exceeds its limit".into());
+        }
+        if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
+            return Err(error.to_owned());
+        }
+        reply
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "canonical SubAgent operation rejected".into())
     }
 
     async fn call(
@@ -307,6 +409,12 @@ impl SteerInbox {
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
+    /// Advertise only when `run` validates EnvironmentLease before executing
+    /// provider or tools. The broker binds this claim to the authenticated
+    /// subscriber connection; an older worker defaults to unsupported.
+    fn supports_environment_lease_v1(&self) -> bool {
+        false
+    }
     /// Maximum number of independent Run/Ask/Task executions this instance may
     /// execute at once. The safe default is one: production executors often
     /// own mutable permission/provider/child-runner state that must not cross

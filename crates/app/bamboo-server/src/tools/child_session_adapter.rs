@@ -915,6 +915,29 @@ impl ChildSessionPort for ChildSessionAdapter {
         Ok(session)
     }
 
+    async fn load_parent_session(&self, parent_id: &str) -> Result<Session, ChildSessionError> {
+        let parent = self.load_tree_caller_session(parent_id).await?;
+        bamboo_domain::ActorSession::from_session(&parent).map_err(|_| {
+            ChildSessionError::InvalidArguments("invalid direct parent ActorSession".into())
+        })?;
+        Ok(parent)
+    }
+
+    async fn load_tree_caller_session(
+        &self,
+        caller_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.storage
+            .load_session(caller_id)
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!(
+                    "failed to load tree caller {caller_id}: {error}"
+                ))
+            })?
+            .ok_or_else(|| ChildSessionError::NotFound(caller_id.to_string()))
+    }
+
     async fn load_child_for_parent(
         &self,
         parent_session_id: &str,
@@ -1301,6 +1324,25 @@ impl ChildSessionPort for ChildSessionAdapter {
             })
             .map(|entry| map_index_entry_to_child_entry(&entry))
             .collect()
+    }
+
+    async fn tree_index_snapshot(
+        &self,
+    ) -> Result<Option<Vec<(String, String)>>, ChildSessionError> {
+        let entries = self.session_store.list_index_entries().await;
+        if entries.len() > bamboo_engine::session_app::child_session::owned_tree::INDEX_SNAPSHOT_CAP
+        {
+            return Err(ChildSessionError::Execution(
+                "tree candidate index exceeds its observation limit".into(),
+            ));
+        }
+        Ok(Some(
+            entries
+                .into_iter()
+                .filter(|entry| entry.kind == SessionKind::Child)
+                .filter_map(|entry| entry.parent_session_id.map(|parent| (parent, entry.id)))
+                .collect(),
+        ))
     }
 
     async fn find_resident_child(

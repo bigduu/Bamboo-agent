@@ -73,6 +73,101 @@ const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
 const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_rejections.v1";
 const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
 const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_handoff";
+
+/// A worker clarification was already checkpointed by the Host while this
+/// runner still held an older in-memory Child snapshot. The Host checkpoint,
+/// and a direct-parent answer that may have followed it, own the transcript
+/// and question control plane. Reconcile under the same lock as the final save
+/// so an old runner cannot erase the question or undo a fast answer.
+fn adopt_durable_actor_parent_question_handoff(
+    session: &mut Session,
+    durable: &Session,
+) -> std::io::Result<()> {
+    if session
+        .metadata
+        .get(ACTOR_PARENT_QUESTION_HANDOFF_KEY)
+        .map(String::as_str)
+        != Some("true")
+    {
+        return Ok(());
+    }
+    let request = durable
+        .metadata
+        .get(bamboo_domain::PARENT_QUESTION_REQUEST_KEY)
+        .and_then(|value| serde_json::from_str::<bamboo_domain::ParentQuestion>(value).ok());
+    let pending_question = request.as_ref().is_some_and(|question| {
+        durable.pending_question.as_ref().is_some_and(|pending| {
+            pending.source == bamboo_domain::PendingQuestionSource::DirectParent
+                && pending.tool_call_id == question.tool_call_id
+        }) && durable
+            .metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| reason == "awaiting_clarification")
+    });
+    let resolved_question = request.as_ref().is_some_and(|question| {
+        durable
+            .metadata
+            .get(bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY)
+            .and_then(|value| {
+                serde_json::from_str::<bamboo_domain::ParentQuestionResolution>(value).ok()
+            })
+            .is_some_and(|resolution| resolution.request == *question)
+    });
+    if session.kind != bamboo_domain::SessionKind::Child
+        || session.id != durable.id
+        || session.created_at != durable.created_at
+        || session.parent_session_id != durable.parent_session_id
+        || session.root_session_id != durable.root_session_id
+        || session.spawn_depth != durable.spawn_depth
+        || session.project_id_meta() != durable.project_id_meta()
+        || !request.as_ref().is_some_and(|question| {
+            question.child.session_id == durable.id
+                && question.child.created_at == durable.created_at
+                && question.root_session_id == durable.root_session_id
+                && question.project_id == durable.project_id_meta()
+        })
+        || !(pending_question || resolved_question)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "canonical direct-parent question handoff is missing or changed",
+        ));
+    }
+
+    // A suspended question has no legitimate runner-only messages after its
+    // Host checkpoint. In particular, a terminal Worker text is not a new
+    // assistant reply. Durable ordering also includes any fast parent answer.
+    session.messages.clone_from(&durable.messages);
+    session
+        .provider_transcript
+        .clone_from(&durable.provider_transcript);
+    session
+        .pending_question
+        .clone_from(&durable.pending_question);
+    for key in RESPONSE_CONTROL_METADATA_KEYS.iter().copied().chain([
+        bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+        bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+    ]) {
+        match durable.metadata.get(key) {
+            Some(value) => {
+                session.metadata.insert(key.to_string(), value.clone());
+            }
+            None => {
+                session.metadata.remove(key);
+            }
+        }
+    }
+    session.model.clone_from(&durable.model);
+    session.model_ref.clone_from(&durable.model_ref);
+    session.reasoning_effort = durable.reasoning_effort;
+    session
+        .agent_runtime_state
+        .clone_from(&durable.agent_runtime_state);
+    session.updated_at = session.updated_at.max(durable.updated_at);
+    session.metadata.remove(ACTOR_PARENT_QUESTION_HANDOFF_KEY);
+    Ok(())
+}
 
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
@@ -1216,6 +1311,7 @@ impl LockedSessionStore {
         }
 
         if let Some(latest) = latest.as_ref() {
+            adopt_durable_actor_parent_question_handoff(session, latest)?;
             if finalize_child_wait {
                 if let Some(registered_at) = adopt_finalized_tool_child_wait(session, latest) {
                     preserve_finalized_hidden_child_resumes(session, latest, registered_at);
@@ -4291,6 +4387,178 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].content, "Selected response: A");
+    }
+
+    #[tokio::test]
+    async fn actor_parent_question_handoff_adopts_canonical_question_and_discards_terminal_text() {
+        use bamboo_domain::{
+            FunctionCall, Message, ParentQuestion, PendingQuestionSource, ToolCall,
+            PARENT_QUESTION_REQUEST_KEY,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let parent = fresh("question-handoff-parent");
+        storage.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("question-handoff-child", &parent, "model", "child");
+        child.add_message(Message::user("assignment"));
+        storage.save_session(&child).await.unwrap();
+        let mut old_run = child.clone();
+        old_run
+            .metadata
+            .insert(ACTOR_PARENT_QUESTION_HANDOFF_KEY.into(), "true".into());
+        old_run.set_last_run_status("suspended");
+        old_run.add_message(Message::assistant("old terminal text", None));
+
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "ask-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AskUserQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "ask-call",
+            "Clarification needed: Choose?",
+            true,
+        ));
+        child.set_pending_question_with_source(
+            "ask-call".into(),
+            "AskUserQuestion".into(),
+            "Choose?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            PendingQuestionSource::DirectParent,
+        );
+        child.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let question = ParentQuestion::issue_at(&parent, &child, chrono::Utc::now()).unwrap();
+        child.metadata.insert(
+            PARENT_QUESTION_REQUEST_KEY.into(),
+            serde_json::to_string(&question).unwrap(),
+        );
+        storage.save_session(&child).await.unwrap();
+
+        store.merge_save_runtime(&mut old_run).await.unwrap();
+        let saved = storage.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved.messages).unwrap(),
+            serde_json::to_value(&child.messages).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.pending_question).unwrap(),
+            serde_json::to_value(&child.pending_question).unwrap()
+        );
+        assert_eq!(
+            saved.metadata.get(PARENT_QUESTION_REQUEST_KEY),
+            child.metadata.get(PARENT_QUESTION_REQUEST_KEY)
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+        assert!(!saved
+            .metadata
+            .contains_key(ACTOR_PARENT_QUESTION_HANDOFF_KEY));
+    }
+
+    #[tokio::test]
+    async fn actor_parent_question_handoff_cannot_undo_fast_parent_answer() {
+        use bamboo_domain::{
+            FunctionCall, Message, ParentQuestion, ParentQuestionResolution, PendingQuestionSource,
+            ToolCall, PARENT_QUESTION_REQUEST_KEY, PARENT_QUESTION_RESOLUTION_KEY,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let parent = fresh("answered-handoff-parent");
+        storage.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("answered-handoff-child", &parent, "model", "child");
+        child.add_message(Message::user("assignment"));
+        storage.save_session(&child).await.unwrap();
+        let mut old_run = child.clone();
+        old_run
+            .metadata
+            .insert(ACTOR_PARENT_QUESTION_HANDOFF_KEY.into(), "true".into());
+        old_run.set_last_run_status("suspended");
+
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "ask-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AskUserQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "ask-call",
+            "Clarification needed: Choose?",
+            true,
+        ));
+        child.set_pending_question_with_source(
+            "ask-call".into(),
+            "AskUserQuestion".into(),
+            "Choose?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            PendingQuestionSource::DirectParent,
+        );
+        child.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let issued_at = chrono::Utc::now();
+        let question = ParentQuestion::issue_at(&parent, &child, issued_at).unwrap();
+        child.metadata.insert(
+            PARENT_QUESTION_REQUEST_KEY.into(),
+            serde_json::to_string(&question).unwrap(),
+        );
+        storage.save_session(&child).await.unwrap();
+
+        let mut answered = child;
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        let paired = answered
+            .messages
+            .iter_mut()
+            .find(|message| message.id == question.tool_result_message_id)
+            .unwrap();
+        paired.content = "A".into();
+        paired.tool_success = Some(true);
+        let resolution = ParentQuestionResolution::answered(
+            &question,
+            issued_at + chrono::Duration::milliseconds(1),
+            "A",
+        )
+        .unwrap();
+        answered.metadata.insert(
+            PARENT_QUESTION_RESOLUTION_KEY.into(),
+            serde_json::to_string(&resolution).unwrap(),
+        );
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut old_run).await.unwrap();
+        let saved = storage.load_session(&answered.id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(
+            saved.metadata.get(PARENT_QUESTION_RESOLUTION_KEY),
+            answered.metadata.get(PARENT_QUESTION_RESOLUTION_KEY)
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.messages).unwrap(),
+            serde_json::to_value(&answered.messages).unwrap()
+        );
+        assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+        assert!(!saved
+            .metadata
+            .contains_key(ACTOR_PARENT_QUESTION_HANDOFF_KEY));
     }
 
     #[tokio::test]

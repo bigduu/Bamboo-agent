@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod memory;
 pub mod notify;
 pub mod overlay_executor;
+pub mod parent_request_reply;
 pub mod plan;
 pub mod project_tools;
 pub mod registry_keys;
@@ -36,6 +37,10 @@ pub use ledger::{LedgerScheduleBridge, LedgerTool};
 pub use memory::MemoryTool;
 pub use notify::{NotificationDispatcher, NotifyTool};
 pub use overlay_executor::OverlayToolExecutor;
+pub use parent_request_reply::{
+    validate_parent_answer_input, ParentQuestionReplyReceipt, ParentRequestMessageReceipt,
+    ParentRequestReplyPort, ParentRequestReplyReceipt, ParentRequestReplyState,
+};
 pub use plan::PlanTool;
 pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
 pub use session_control::SessionControlTool;

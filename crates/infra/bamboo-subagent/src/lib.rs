@@ -14,6 +14,7 @@
 
 pub mod codex_discovery;
 pub mod discovery;
+pub mod environment;
 pub mod error;
 pub mod executor;
 pub mod executor_util;

@@ -1706,6 +1706,7 @@ echo '{"type":"result","subtype":"success","result":"done"}'
             auto_approve_permissions: true,
             session_id: "auto-audit".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::to_value(
                 bamboo_tools::permission::SerializablePermissionConfig::default(),
@@ -1764,6 +1765,7 @@ exit 0
             auto_approve_permissions: true,
             session_id: "claude-explicit-deny".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::to_value(policy).unwrap(),
         });
@@ -1847,6 +1849,7 @@ echo '{"type":"result","subtype":"success","result":"done"}'
             auto_approve_permissions: false,
             session_id: "explicit-default".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::to_value(
                 bamboo_tools::permission::SerializablePermissionConfig::default(),

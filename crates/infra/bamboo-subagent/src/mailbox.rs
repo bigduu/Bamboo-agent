@@ -71,6 +71,9 @@ pub enum InboxKind {
     /// bus instead of a direct WS connection). The unification target — a local
     /// child is driven over the bus exactly like a deployed one.
     Run,
+    /// Versioned fixed-remote Run. Old workers cannot decode this kind, so a
+    /// reconnect during placement cannot silently execute without a lease.
+    LeasedRun,
     /// Child→parent: a durable sequenced event batch during an
     /// [`InboxKind::Run`]. Snapshot/ephemeral batches use the broker's bounded
     /// live lane instead. `correlation_id` identifies the owning Run.
@@ -97,6 +100,15 @@ pub enum InboxKind {
     /// `correlation_id` is the approval request `id`, so the worker routes it to
     /// the waiting tool call.
     ApprovalReply,
+    /// Child→parent: bounded, read-only tree page request for the active Run.
+    /// The body carries only a correlation id and optional cursor.
+    OwnedTreeRequest,
+    /// Parent→child: canonical Host page or a fail-closed null page.
+    OwnedTreeReply,
+    /// Worker→Host logical SubAgent invocation for the fenced active Run.
+    SubAgentRequest,
+    /// Host→Worker result or fail-closed denial for that invocation.
+    SubAgentReply,
     /// Typed logical-session envelope. This reuses the same Maildir
     /// claim/recover/ack protocol without making a worker mailbox id the
     /// durable address of a Bamboo Session.

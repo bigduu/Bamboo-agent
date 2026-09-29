@@ -531,12 +531,16 @@ pub(crate) use config_runtime::CredentialBackedResetCommit;
 pub mod init;
 pub mod parent_approval_reviewer;
 mod parent_permission_outcome;
+mod parent_permission_reconcile;
 mod parent_permission_request;
+mod parent_question_outcome;
+mod parent_question_reconcile;
 mod persistence;
 mod project_watcher;
 mod provider_api;
 pub mod resume_adapter;
 pub mod runner_lifecycle;
+mod wake_reconciler;
 // `pub` (not `pub(crate)`): `ScheduleContext::notification_relay` (a public
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a

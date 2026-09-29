@@ -23,10 +23,73 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session, SessionKind};
 use bamboo_domain::{
-    SessionInboxLimits, SessionInboxPort, SessionMessageBody, SessionMessageContent,
-    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
-    SessionRuntimeInstruction,
+    ParentQuestion, ParentQuestionCheckpointV1, PendingQuestionSource, SessionInboxLimits,
+    SessionInboxPort, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+    SessionMessageId, SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+    PARENT_QUESTION_CHECKPOINT_ACTION,
 };
+
+/// Built only from the worker's persisted execution snapshot after the engine
+/// has saved its clarification. The Host independently validates every field.
+fn persisted_parent_question_checkpoint(
+    durable: &Session,
+    prefix: &[Message],
+    event: &AgentEvent,
+) -> Result<ParentQuestionCheckpointV1, String> {
+    let AgentEvent::NeedClarification {
+        question,
+        tool_call_id: Some(tool_call_id),
+        tool_name: Some(tool_name),
+        source: Some(PendingQuestionSource::AgenticClarification),
+        ..
+    } = event
+    else {
+        return Err("Child question source is not supported for direct-parent checkpoint".into());
+    };
+    let pending = durable
+        .pending_question
+        .clone()
+        .ok_or("persisted Child question is missing")?;
+    if pending.source != PendingQuestionSource::AgenticClarification
+        || pending.question != *question
+        || pending.tool_call_id != *tool_call_id
+        || pending.tool_name != *tool_name
+        || durable
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            != Some("awaiting_clarification")
+        || durable.messages.len() < prefix.len()
+        || serde_json::to_value(&durable.messages[..prefix.len()]).ok()
+            != serde_json::to_value(prefix).ok()
+        || !durable.provider_transcript.groups().is_empty()
+    {
+        return Err("persisted Child question does not match this Run".into());
+    }
+    let suffix = durable.messages[prefix.len()..].to_vec();
+    let paired = suffix
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == Role::Tool
+                && message.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+        })
+        .ok_or("persisted Child question has no paired tool result")?;
+    let tool_result_message_id = paired.id.clone();
+    let request = ParentQuestionCheckpointV1 {
+        version: 1,
+        prefix_message_count: prefix.len(),
+        prefix_digest: ParentQuestion::prefix_digest(prefix)
+            .ok_or("Child question prefix cannot be encoded")?,
+        suffix,
+        pending: pending.clone(),
+        tool_call_id: tool_call_id.clone(),
+        tool_result_message_id: tool_result_message_id.clone(),
+        question_digest: ParentQuestion::question_digest(&pending, &tool_result_message_id),
+    };
+    request.validate_shape().map_err(str::to_string)?;
+    Ok(request)
+}
 use bamboo_llm::{create_provider_by_name, Config, LLMChunk, LLMProvider};
 use bamboo_memory::memory_store::{
     resolve_jiandu_data_root, MemoryStore, BAMBOO_JIANDU_DATA_DIR_ENV,
@@ -367,6 +430,8 @@ pub struct BambooRuntimeExecutor {
     /// supplied to each run via `ExecuteRequestBuilder.tools()` to break the
     /// agent→tools→adapter→scheduler→agent construction cycle.
     run_tools: Option<Arc<dyn bamboo_agent_core::tools::ToolExecutor>>,
+    /// Template for a per-run SubAgent overlay with a Host-bound tree reader.
+    run_sub_agent: Option<bamboo_server::tools::SubAgentTool>,
     /// This worker's nesting depth (from the actor spec). Stamped onto each run
     /// session's `spawn_depth` so the depth cap accumulates across the boundary.
     spawn_depth: u32,
@@ -795,10 +860,11 @@ impl BambooRuntimeExecutor {
         // auto-propagates down the tree and bottoms out at the cap.
         type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
         type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
-        let (run_tools, child_runner): (Option<RunTools>, Option<ChildRunner>) = if spec
-            .capabilities
-            .nested_spawn
-        {
+        let (run_tools, run_sub_agent, child_runner): (
+            Option<RunTools>,
+            Option<bamboo_server::tools::SubAgentTool>,
+            Option<ChildRunner>,
+        ) = if spec.capabilities.nested_spawn {
             // Point the worker's own actor runner at the shared fabric so
             // grandchildren are discoverable; the worker binary itself is
             // found via `current_exe()` inside build_local_actor_runner.
@@ -823,6 +889,7 @@ impl BambooRuntimeExecutor {
                     inbox: session_inbox.clone(),
                     storage: store_for_stack.clone(),
                     persistence: persistence.clone(),
+                    parent_question_lock: None,
                 },
             ));
             // #68: retain this exact runner so `run()` can bind its host
@@ -874,20 +941,18 @@ impl BambooRuntimeExecutor {
                 None,
                 config_for_stack.clone(),
             ));
-            let sub_agent = Arc::new(bamboo_server::tools::SubAgentTool::new(
-                adapter.clone(),
-                adapter,
-            ));
-            let run_tools = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                default_tools,
-                sub_agent,
-            )) as RunTools;
+            let sub_agent = bamboo_server::tools::SubAgentTool::new(adapter.clone(), adapter);
+            // The worker's private adapter is retained for compatibility with
+            // local activation bookkeeping, but it must never own nested
+            // ActorSession truth. The per-Run overlay below exposes SubAgent
+            // only when a canonical HostBridge is available.
+            let run_tools = default_tools as RunTools;
             child_completion_coordinator
                 .set_root_tools(run_tools.clone())
                 .await;
-            (Some(run_tools), Some(child_runner))
+            (Some(run_tools), Some(sub_agent), Some(child_runner))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // #73: when this run has NO interactive human approver, the per-run
@@ -910,6 +975,7 @@ impl BambooRuntimeExecutor {
                 .map(|v| v.iter().cloned().collect()),
             child_id: spec.identity.child_id.clone(),
             run_tools,
+            run_sub_agent,
             spawn_depth: spec.identity.depth,
             provisioned_permission,
             read_only_child: spec.capabilities.read_only_enforced(),
@@ -1216,6 +1282,10 @@ impl bamboo_engine::external_agents::ChildApprovalReviewer for ModelApprovalRevi
 
 #[async_trait]
 impl ChildExecutor for BambooRuntimeExecutor {
+    fn supports_environment_lease_v1(&self) -> bool {
+        true
+    }
+
     async fn run(
         &self,
         run: RunSpec,
@@ -1223,6 +1293,27 @@ impl ChildExecutor for BambooRuntimeExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        let remote_workspace = if let Some(context) = run.permission_policy.as_ref() {
+            if let Some(lease) = context.environment_lease.as_ref() {
+                if context.workspace_path.is_some()
+                    || context.inherit_session_grants
+                    || context.session_id != lease.actor_id
+                {
+                    return ChildOutcome::error("remote_environment_host_path_or_grants_rejected");
+                }
+                let Some(workspace) = self.workspace.as_deref() else {
+                    return ChildOutcome::error("remote_environment_worker_workspace_missing");
+                };
+                match lease.validate(workspace, &run).await {
+                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                    Err(error) => return ChildOutcome::error(error),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if self
             .native_tool_ceiling
             .as_ref()
@@ -1386,7 +1477,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
             .as_ref()
             .map(|config| config.policy_revision())
             .unwrap_or_default();
-        let mut effective_workspace = self.workspace.clone();
+        let mut effective_workspace = remote_workspace.clone().or_else(|| self.workspace.clone());
         if let Some(context) = run.permission_policy.as_ref() {
             permission_resolution = match context.resolved_modes() {
                 Ok((requested, effective)) => bamboo_domain::PermissionModeResolution {
@@ -1421,7 +1512,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 permission_resolution,
             ));
             policy_revision = context.revision;
-            effective_workspace = context.workspace_path.clone().or(effective_workspace);
+            if remote_workspace.is_none() {
+                effective_workspace = context.workspace_path.clone().or(effective_workspace);
+            }
             session.metadata.insert(
                 "permission.session_grants_inherited".to_string(),
                 context.inherit_session_grants.to_string(),
@@ -1987,6 +2080,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // parent over the WS protocol instead of failing closed in this headless
         // worker. Captured here BEFORE `events` moves into the forward task.
         let host = events.host().cloned();
+        let tree_host = host.clone();
         let approval_proxy: Option<Arc<dyn bamboo_tools::ApprovalProxy>> =
             if host.is_some() || self.no_human_review.is_some() {
                 Some(Arc::new(HostApprovalProxy {
@@ -2019,11 +2113,64 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 .as_ref()
                 .is_some_and(|ceiling| ceiling.tools == ["Glob"]);
         let tail_prefix_len = session.messages.len();
+        let question_prefix = session.messages.clone();
+        let question_agent = self.agent.clone();
+        let question_session_id = session.id.clone();
+        let question_host = tree_host.clone().filter(|_| {
+            logical_identity
+                .as_ref()
+                .is_some_and(|identity| identity.creation.is_some())
+        });
+        let question_checkpoint = Arc::new(std::sync::Mutex::new(None::<Result<String, String>>));
+        let question_checkpoint_task = question_checkpoint.clone();
         let tail_events = events.clone();
-        // AgentEvents stream to the parent verbatim (zero mapping).
+        // Ordinary AgentEvents stream to the parent. A canonical direct-parent
+        // question is represented by the Host's durable request projection.
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
         let forward = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
+                if matches!(&ev, AgentEvent::NeedClarification { .. }) {
+                    if let Some(host) = question_host.as_ref() {
+                        let checkpoint = async {
+                            let durable = question_agent
+                                .storage()
+                                .load_session(&question_session_id)
+                                .await
+                                .map_err(|_| {
+                                    "persisted Child question cannot be loaded".to_string()
+                                })?
+                                .ok_or("persisted Child question disappeared".to_string())?;
+                            let payload = persisted_parent_question_checkpoint(
+                                &durable,
+                                &question_prefix,
+                                &ev,
+                            )?;
+                            let tool_call_id = payload.tool_call_id.clone();
+                            let receipt = host.subagent_call(
+                                serde_json::json!({(PARENT_QUESTION_CHECKPOINT_ACTION): payload}),
+                                &tool_call_id,
+                            ).await?;
+                            let request_id = receipt
+                                .get("request_id")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or("Host question checkpoint omitted its receipt")?;
+                            bamboo_domain::SessionMessageId::parse(request_id.to_owned()).map_err(
+                                |_| "Host question checkpoint receipt is invalid".to_string(),
+                            )?;
+                            Ok::<_, String>(request_id.to_owned())
+                        }
+                        .await;
+                        if let Ok(mut state) = question_checkpoint_task.lock() {
+                            *state = Some(checkpoint.clone());
+                        }
+                        // The local pending question stays durable on failure.
+                        // Even after an ACK, the parent may already have
+                        // answered before a lost receipt is replayed. The
+                        // canonical request/terminal Inbox projection owns
+                        // presentation; never emit a stale UI question here.
+                        continue;
+                    }
+                }
                 if let Ok(value) = serde_json::to_value(&ev) {
                     events.emit(value).await;
                 }
@@ -2067,8 +2214,29 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6: when this worker self-orchestrates, run with the tool executor
         // that includes the REAL SubAgent tool (bound to the worker's own spawn
         // stack), so its LLM can create+wait on grandchildren directly.
-        if let Some(tools) = self.run_tools.clone() {
+        if let Some(mut tools) = self.run_tools.clone() {
+            if let (Some(sub_agent), Some(host), Some(identity)) = (
+                self.run_sub_agent.as_ref(),
+                tree_host.as_ref(),
+                logical_identity.as_ref(),
+            ) {
+                let scoped = sub_agent
+                    .clone()
+                    .with_owned_tree_host(host.clone(), identity.session_id.clone());
+                tools = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
+                    tools,
+                    Arc::new(scoped),
+                ));
+            }
             builder = builder.tools(tools);
+        }
+        if self.run_sub_agent.is_some() && tree_host.is_some() && logical_identity.is_some() {
+            // The worker store holds execution replicas for siblings and
+            // descendants. Only the Host's canonical Child index may decide
+            // whether this logical Child has an unfinished descendant.
+            session
+                .metadata
+                .insert("runtime.canonical_subagent_host".into(), "true".into());
         }
 
         // Scope the approval proxy to exactly this run (task-local), so gated
@@ -2085,6 +2253,22 @@ impl ChildExecutor for BambooRuntimeExecutor {
         steer_done.cancel();
         let _ = steer_task.await;
         let _ = forward.await; // flush remaining events before the terminal frame
+
+        if let Some(checkpoint) = question_checkpoint
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
+        {
+            match checkpoint {
+                Ok(_) if result.is_ok() => return ChildOutcome::suspended(Vec::new()),
+                Ok(_) => {}
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "direct-parent question checkpoint blocked: {error}"
+                    ))
+                }
+            }
+        }
 
         match result {
             Ok(()) => {
@@ -2241,6 +2425,7 @@ mod tests {
     use bamboo_subagent::executor::ExecutorControl;
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn local_completion_preserves_message_data_and_refuses_provider_state() {
@@ -2378,7 +2563,7 @@ mod tests {
     }
 
     async fn worker_executor_for_store(
-        provider: Arc<RecordingWorkerProvider>,
+        provider: Arc<dyn LLMProvider>,
         store: Arc<SessionStoreV2>,
         inbox: Arc<dyn SessionInboxPort>,
     ) -> BambooRuntimeExecutor {
@@ -2414,6 +2599,7 @@ mod tests {
             disabled_tools: None,
             child_id: "worker-transport".to_string(),
             run_tools: None,
+            run_sub_agent: None,
             spawn_depth: 1,
             provisioned_permission: bamboo_domain::resolve_permission_mode(
                 bamboo_domain::SessionPermissionMode::Default,
@@ -2429,6 +2615,188 @@ mod tests {
             no_human_review: None,
             child_runner: None,
         }
+    }
+
+    struct QuestionProvider(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl LLMProvider for QuestionProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            let chunks: Vec<bamboo_llm::provider::Result<LLMChunk>> =
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec![
+                        Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                            id: "question-call".into(),
+                            tool_type: "function".into(),
+                            function: bamboo_domain::FunctionCall {
+                                name: "SubAgent".into(),
+                                arguments: serde_json::json!({
+                                    "intent":"ask_parent",
+                                    "message":"Which option?"
+                                })
+                                .to_string(),
+                            },
+                        }])),
+                        Ok(LLMChunk::Done),
+                    ]
+                } else {
+                    vec![
+                        Ok(LLMChunk::Token("unexpected second round".into())),
+                        Ok(LLMChunk::Done),
+                    ]
+                };
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    struct QuestionTool(HostBridge);
+
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for QuestionTool {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            assert_eq!(call.function.name, "SubAgent");
+            let args = serde_json::from_str(&call.function.arguments).unwrap();
+            let result = self
+                .0
+                .subagent_call(args, &call.id)
+                .await
+                .map_err(ToolError::Execution)?;
+            serde_json::from_value(result)
+                .map_err(|_| ToolError::Execution("invalid Host SubAgent result".into()))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".into(),
+                function: bamboo_domain::FunctionSchema {
+                    name: "SubAgent".into(),
+                    description: "Ask the direct parent a bounded question".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn real_worker_tool_checkpoints_question_before_suspending() {
+        use bamboo_subagent::executor::HostRequestKind;
+        let temp = tempfile::tempdir().unwrap();
+        let host_store = Arc::new(SessionStoreV2::new(temp.path().join("host")).await.unwrap());
+        let mut parent = Session::new("parent", "test-model");
+        parent.created_at = "2026-09-25T00:00:00Z".parse().unwrap();
+        host_store.save_session(&parent).await.unwrap();
+        let run = protocol_run("question-child", "question-run", Vec::new());
+        let mut child = Session::new_child_of("question-child", &parent, "test-model", "Child");
+        child.created_at = run
+            .logical_session
+            .as_ref()
+            .unwrap()
+            .creation
+            .as_ref()
+            .unwrap()
+            .created_at;
+        child.messages = run
+            .messages
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        child.set_last_run_status("running");
+        host_store.save_session(&child).await.unwrap();
+        let worker_store = Arc::new(
+            SessionStoreV2::new(temp.path().join("worker"))
+                .await
+                .unwrap(),
+        );
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            worker_store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let mut executor = worker_executor_for_store(
+            Arc::new(QuestionProvider(AtomicUsize::new(0))),
+            worker_store,
+            inbox,
+        )
+        .await;
+        let (bridge, mut requests) = HostBridge::channel();
+        executor.run_tools = Some(Arc::new(QuestionTool(bridge.clone())));
+        let host_for_rpc = host_store.clone();
+        let parent_for_rpc = parent.clone();
+        let child_for_rpc = child.clone();
+        let responder = tokio::spawn(async move {
+            let ask = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ask.kind, HostRequestKind::SubAgent);
+            assert_eq!(ask.body["args"]["intent"], "ask_parent");
+            assert_eq!(ask.body["args"]["message"], "Which option?");
+            assert_eq!(ask.body["tool_call_id"], "question-call");
+            let agentic =
+                serde_json::to_string(&bamboo_agent_core::AgenticToolResult::NeedClarification {
+                    question: "Which option?".into(),
+                    options: None,
+                })
+                .unwrap();
+            ask.reply
+                .send(serde_json::json!({"result":ToolResult::text(true, agentic)}))
+                .unwrap();
+
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.kind, HostRequestKind::SubAgent);
+            let args = &request.body["args"];
+            let checkpoint: ParentQuestionCheckpointV1 =
+                serde_json::from_value(args[PARENT_QUESTION_CHECKPOINT_ACTION].clone()).unwrap();
+            assert_eq!(request.body["tool_call_id"], "question-call");
+            let (_, question) = host_for_rpc
+                .checkpoint_parent_question(&child_for_rpc, &parent_for_rpc, &checkpoint)
+                .await
+                .unwrap()
+                .expect("canonical Host accepted exact tool question");
+            request
+                .reply
+                .send(serde_json::json!({"result":{"request_id":question.id}}))
+                .unwrap();
+        });
+        let (events, mut receiver) = EventSink::channel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            executor.run(
+                run,
+                events.with_host_bridge(bridge),
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Suspended);
+        while let Ok(value) = receiver.try_recv() {
+            let event: AgentEvent = serde_json::from_value(value).unwrap();
+            assert!(
+                !matches!(event, AgentEvent::NeedClarification { .. }),
+                "the Host-owned durable request is the only question projection"
+            );
+        }
+        let reopened = SessionStoreV2::new(temp.path().join("host")).await.unwrap();
+        let durable = reopened.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            durable.pending_question.as_ref().unwrap().source,
+            PendingQuestionSource::DirectParent
+        );
+        assert!(ParentQuestion::for_pending(&parent, &durable).is_some());
+        assert_eq!(durable.messages.len(), child.messages.len() + 2);
     }
 
     #[derive(Default)]

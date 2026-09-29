@@ -1225,7 +1225,7 @@ enum SubagentWorkerProcessAction {
     HardExit(i32),
 }
 
-/// A dedicated subagent worker must not fall through `#[tokio::main]` runtime
+/// A dedicated subagent worker must not fall through Tokio runtime
 /// teardown after a fatal serve error: an async handler may still be inside
 /// synchronous, non-yielding code that `JoinHandle::abort` cannot interrupt.
 /// `process::exit` bypasses runtime Drop and is deliberately confined to this
@@ -1245,10 +1245,22 @@ fn main() {
     // opens any application sockets/files). The adjustment is best-effort and
     // reports failures directly to stderr because logging is not initialized yet.
     nofile_limit::raise_nofile_limit_best_effort();
-    run();
+    // Nested Actor activation can exceed Tokio's default worker-thread stack
+    // in debug builds. Keep a floor for Bamboo-owned runtime workers without
+    // reducing a larger stack requested by the process owner.
+    const MIN_WORKER_STACK: usize = 4 * 1024 * 1024;
+    let requested_stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(requested_stack.max(MIN_WORKER_STACK))
+        .enable_all()
+        .build()
+        .expect("build Bamboo Tokio runtime");
+    runtime.block_on(run());
 }
 
-#[tokio::main]
 async fn run() {
     let cli = Cli::parse();
 
@@ -1299,7 +1311,7 @@ async fn run() {
     {
         // SAFETY: consistent with the other env seeding in this file. We run
         // before any logging subscriber is installed and while the tokio
-        // worker threads (already spawned by `#[tokio::main]`) are parked and
+        // worker threads (already spawned by the runtime builder) are parked and
         // read no env, so this write races nothing in practice.
         unsafe {
             std::env::set_var("RUST_LOG", level);

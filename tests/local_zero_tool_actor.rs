@@ -2121,17 +2121,22 @@ async fn root_catalog_provider(
             ROOT_CATALOG_TASKS[ordinal],
             names.iter().take(32).collect::<Vec<_>>()
         );
-        let legacy_count = usize::from(ordinal == 0);
         assert_eq!(
             count("ask_agent"),
-            legacy_count,
-            "Standard broker positive or Ultra mask: {}",
+            0,
+            "Root model sees only the logical SubAgent facade: {}",
             ROOT_CATALOG_TASKS[ordinal]
         );
         assert_eq!(
             count("deploy_agent"),
-            legacy_count,
-            "Standard broker positive or Ultra mask: {}",
+            0,
+            "Root model sees only the logical SubAgent facade: {}",
+            ROOT_CATALOG_TASKS[ordinal]
+        );
+        assert_eq!(
+            count("cluster"),
+            0,
+            "Root model cannot deploy physical capacity directly: {}",
             ROOT_CATALOG_TASKS[ordinal]
         );
         ROOT_CATALOG_REPLIES[ordinal]
@@ -2449,16 +2454,17 @@ async fn root_catalog_fixture() {
             json!({
                 "SubAgent": count("SubAgent"),
                 "ask_agent": count("ask_agent"),
-                "deploy_agent": count("deploy_agent")
+                "deploy_agent": count("deploy_agent"),
+                "cluster": count("cluster")
             })
         })
         .collect();
     assert_eq!(
         observed_counts,
         [
-            json!({"SubAgent": 1, "ask_agent": 1, "deploy_agent": 1}),
-            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0}),
-            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0})
+            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0, "cluster": 0}),
+            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0, "cluster": 0}),
+            json!({"SubAgent": 1, "ask_agent": 0, "deploy_agent": 0, "cluster": 0})
         ]
     );
     // The Host created these Roots after `store` opened. Its in-memory index
@@ -2528,7 +2534,7 @@ async fn root_catalog_fixture() {
 }
 
 #[actix_web::test]
-async fn actual_root_catalog_masks_legacy_tools_and_preserves_ultra_continuation() {
+async fn actual_root_catalog_uses_single_subagent_facade_and_preserves_ultra_continuation() {
     Box::pin(root_catalog_fixture()).await;
 }
 

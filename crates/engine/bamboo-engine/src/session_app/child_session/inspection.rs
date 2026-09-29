@@ -512,7 +512,7 @@ async fn inspect_child_report_action_inner(
         }
         None
     };
-    let parent = port.load_root_session(parent_id).await?;
+    let parent = port.load_parent_session(parent_id).await?;
     let binding = match ChildContextBinding::from_session(&child) {
         Ok(Some(binding)) => binding,
         Ok(None) => return Ok(unavailable(view, "typed_result_unsupported")),

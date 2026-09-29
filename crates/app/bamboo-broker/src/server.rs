@@ -402,13 +402,14 @@ impl BrokerServer {
                                 .await;
                             }
                         }
-                        Ok(Some(ClientFrame::Subscribe)) => {
+                        Ok(Some(subscribe @ (ClientFrame::Subscribe | ClientFrame::SubscribeEnvironmentLeaseV1))) => {
+                            let lease_v1 = matches!(subscribe, ClientFrame::SubscribeEnvironmentLeaseV1);
                             let subscribed = if let Some(peer) = captured_peer.as_ref() {
-                                self.core.subscribe_scoped_with_lease(
-                                    &session_id,
-                                    role.as_deref(),
-                                    peer.authenticated_host(),
-                                ).await
+                                if lease_v1 {
+                                    self.core.subscribe_scoped_environment_lease_v1(&session_id, role.as_deref(), peer.authenticated_host()).await
+                                } else {
+                                    self.core.subscribe_scoped_with_lease(&session_id, role.as_deref(), peer.authenticated_host()).await
+                                }
                             } else {
                                 self.core.subscribe_with_lease(&session_id, role.as_deref()).await
                             };

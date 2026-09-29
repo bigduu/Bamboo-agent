@@ -268,6 +268,24 @@ impl SessionMessageEnvelope {
                 == Some(run_id)
     }
 
+    /// A child completion admitted while its parent Run still owns the turn
+    /// belongs to that Run's successor. The coordinator writes this fence in
+    /// the durable envelope before clearing the parent's wait.
+    pub fn child_outcome_waits_for_run(&self, run_id: &str) -> bool {
+        self.kind == SessionMessageKind::ChildOutcome
+            && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "child_completion_coordinator")
+            && self
+                .correlation_id
+                .as_deref()
+                .and_then(|value| value.strip_prefix("child_completion_after_run:"))
+                == Some(run_id)
+    }
+
+    pub fn waits_for_successor_of_run(&self, run_id: &str) -> bool {
+        self.guidance_waits_for_run(run_id) || self.child_outcome_waits_for_run(run_id)
+    }
+
     pub fn user_input(target_session_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             id: SessionMessageId::new(),
@@ -397,7 +415,17 @@ impl SessionMessageEnvelope {
                 "data": instruction.data,
             }),
         };
-        let correlation_id = if self.is_guidance()
+        let correlation_id = if self.kind == SessionMessageKind::ChildOutcome
+            && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "child_completion_coordinator")
+            && self.correlation_id.as_deref().is_some_and(|value| {
+                value.starts_with("child_completion_after_run:")
+                    || value.starts_with("child_completion:")
+            }) {
+            // The first admitted envelope owns the exact run fence across
+            // duplicate completion callbacks and restarts.
+            Some("child_completion")
+        } else if self.is_guidance()
             && self
                 .correlation_id
                 .as_deref()
@@ -799,6 +827,92 @@ pub struct SessionInboxLeaseInspection {
     pub expires_at: DateTime<Utc>,
     pub expired: bool,
     pub reclaim_count: u64,
+    pub manual_retry_count: u64,
+    /// Explicit consumer failures only; lease expiry is not a failure.
+    pub failure_count: u32,
+    pub last_error_code: Option<String>,
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+/// One exact, currently claimable Inbox item. This is a wake hint, never a
+/// claim or execution grant: the consumer must still pass the storage CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxWakeCandidate {
+    pub id: SessionMessageId,
+    pub generation: u64,
+    pub activation_policy: SessionActivationPolicy,
+    pub coordinator_generation: u64,
+    pub lease_epoch: Option<u64>,
+    /// Durable lease expiry, retry deadline, or manual retry time that made
+    /// this incarnation claimable. None means an unleased delivery.
+    pub ready_after: Option<DateTime<Utc>>,
+}
+
+/// Computed under the same queue lock as `claim_owned`. Staged and dead-letter
+/// items are omitted; `next_due_at` is the earliest eligible lease transition
+/// skipped during the ordered scan, including when a later item is ready now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInboxWakeReadiness {
+    pub ready: Option<SessionInboxWakeCandidate>,
+    pub next_due_at: Option<DateTime<Utc>>,
+}
+
+/// A bounded, non-sensitive diagnostic code supplied by the current owner.
+/// Free-form exception text, payloads and credentials must not be persisted.
+#[derive(Debug, Clone)]
+pub struct SessionInboxFailureReport {
+    pub now: DateTime<Utc>,
+    pub error_code: String,
+}
+
+impl SessionInboxFailureReport {
+    pub fn validate(&self) -> Result<(), SessionInboxError> {
+        if self.error_code.is_empty()
+            || self.error_code.len() > 64
+            || !self.error_code.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Inbox failure requires a bounded diagnostic code".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionInboxFailureOutcome {
+    RetryScheduled {
+        failure_count: u32,
+        retry_after: DateTime<Utc>,
+    },
+    DeadLettered {
+        failure_count: u32,
+    },
+}
+
+/// Host management identity. A gateway must prove local bypass or authenticated
+/// host credentials before constructing this principal from a request.
+pub struct SessionInboxAdministrationPrincipal(());
+
+impl SessionInboxAdministrationPrincipal {
+    pub fn authenticated_host_owner() -> Self {
+        Self(())
+    }
+}
+
+/// Bounded dead-letter evidence. It intentionally excludes message payloads
+/// and lease consumer identities, but retains exact retry selectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInboxDeadLetterInspection {
+    pub id: SessionMessageId,
+    pub generation: u64,
+    pub failure_count: u32,
+    pub last_error_code: String,
+    pub dead_lettered_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -926,6 +1040,57 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Read exact wake readiness from the canonical queue and lease state.
+    /// Backends without a joint lock and exact eligibility check fail closed.
+    async fn inspect_wake_readiness(
+        &self,
+        _target_session_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<SessionInboxWakeReadiness, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "exact Inbox wake inspection unsupported".into(),
+        ))
+    }
+
+    /// Only an exact, live owner may report a processing failure. An explicit
+    /// report is distinct from expiry/reclaim and can schedule bounded retry.
+    async fn fail_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+        _report: &SessionInboxFailureReport,
+    ) -> Result<SessionInboxFailureOutcome, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox failure reporting unsupported".into(),
+        ))
+    }
+
+    async fn inspect_dead_letters(
+        &self,
+        _target_session_id: &str,
+        _limit: usize,
+        _principal: &SessionInboxAdministrationPrincipal,
+    ) -> Result<Vec<SessionInboxDeadLetterInspection>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "Inbox dead-letter inspection unsupported".into(),
+        ))
+    }
+
+    /// The trusted host must authorize this exact target, message and
+    /// generation before requesting a manual retry.
+    async fn retry_dead_letter(
+        &self,
+        _target_session_id: &str,
+        _id: &SessionMessageId,
+        _generation: u64,
+        _now: DateTime<Utc>,
+        _principal: &SessionInboxAdministrationPrincipal,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "Inbox dead-letter retry unsupported".into(),
+        ))
+    }
+
     async fn deliver(
         &self,
         envelope: &SessionMessageEnvelope,
@@ -1013,7 +1178,8 @@ pub trait SessionInboxPort: Send + Sync {
         Ok(claims
             .into_iter()
             .filter(|claim| {
-                !active_run_id.is_some_and(|run_id| claim.envelope.guidance_waits_for_run(run_id))
+                !active_run_id
+                    .is_some_and(|run_id| claim.envelope.waits_for_successor_of_run(run_id))
             })
             .collect())
     }

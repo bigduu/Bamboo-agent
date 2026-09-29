@@ -553,19 +553,56 @@ async fn run_child_spawn_inner(
         // Reconcile the newest host control-plane state before terminal mapping
         // so a still-armed wait re-suspends, while a concurrent completion that
         // cleared it wins over this task's stale snapshot.
-        let durable_wait = match agent.storage().load_session(&session_id_clone).await {
-            Ok(Some(persisted)) => Some(host_wait_snapshot(&persisted)),
-            Ok(None) => None,
+        let durable_child = match agent.storage().load_session(&session_id_clone).await {
+            Ok(persisted) => persisted,
             Err(error) => {
                 tracing::warn!(
                     session_id = %session_id_clone,
                     %error,
-                    "could not reconcile host-persisted wait ownership after actor execution; preserving in-memory wait"
+                    "could not reconcile host-persisted Child control plane after actor execution; preserving in-memory state"
                 );
                 None
             }
         };
+        let durable_wait = durable_child.as_ref().map(host_wait_snapshot);
         reconcile_actor_host_wait(&mut session, durable_wait, &activation_run_id);
+        // The actor frame pump may have registered a nested Host wait just
+        // before its Worker completed. Keep this Run nonterminal even if a
+        // fast grandchild already cleared that durable wait and admitted a
+        // successor. This marker is never persisted: the Host wait snapshot
+        // above alone decides which wait, if any, survives final save.
+        let nested_wait_handoff = session
+            .metadata
+            .remove("runtime.actor_nested_wait_handoff")
+            .is_some_and(|value| value == "true");
+        // The Host ACKed a canonical direct-parent question while this Run
+        // held an older Child snapshot. Read the current durable question and
+        // suspend state for this boundary; the final LockedSessionStore save
+        // repeats the reconciliation under its session lock, including a fast
+        // answer that may commit after this read. Keep the handoff marker until
+        // that save consumes it, and never let this old Run publish a terminal
+        // ChildCompletion even if the answer already cleared the pending ask.
+        let parent_question_handoff = session
+            .metadata
+            .get("runtime.actor_parent_question_handoff")
+            .is_some_and(|value| value == "true");
+        if parent_question_handoff {
+            if let Some(durable) = durable_child.as_ref() {
+                session
+                    .pending_question
+                    .clone_from(&durable.pending_question);
+                match durable.metadata.get("runtime.suspend_reason") {
+                    Some(reason) => {
+                        session
+                            .metadata
+                            .insert("runtime.suspend_reason".into(), reason.clone());
+                    }
+                    None => {
+                        session.metadata.remove("runtime.suspend_reason");
+                    }
+                }
+            }
+        }
 
         let timeout_error = timeout_reason.read().await.clone();
         // Phase 2: a child that suspended awaiting the PARENT's approval of a
@@ -586,11 +623,13 @@ async fn run_child_spawn_inner(
         // mapping in `agent_spawn`), which the completion coordinator's
         // terminality guard leaves un-counted; the real terminal completion is
         // published when the child later resumes and finishes.
-        let suspended_non_terminal = result.is_ok()
-            && session
-                .metadata
-                .get("runtime.suspend_reason")
-                .is_some_and(|reason| !reason.trim().is_empty());
+        let suspended_non_terminal = parent_question_handoff
+            || (result.is_ok()
+                && (nested_wait_handoff
+                    || session
+                        .metadata
+                        .get("runtime.suspend_reason")
+                        .is_some_and(|reason| !reason.trim().is_empty())));
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
         } else if suspended_non_terminal {
@@ -734,10 +773,16 @@ async fn run_child_spawn_inner(
                 "failed to activate child successor for finalization-racing SessionInbox delivery"
             );
         }
-        sessions_cache.insert(
-            session_id_clone.clone(),
-            Arc::new(crate::SessionSnapshot::new(session)),
-        );
+        // A failed question handoff save means the canonical Child may already
+        // contain a newer answer. Never replace that cache entry with this old
+        // Run's uncommitted snapshot. Successful saves have already published
+        // the lock-reconciled `session` through SessionRepository.
+        if history_committed || !parent_question_handoff {
+            sessions_cache.insert(
+                session_id_clone.clone(),
+                Arc::new(crate::SessionSnapshot::new(session)),
+            );
+        }
 
         // Stop forwarding/heartbeats and emit terminal child status through the
         // same durable completion path used by success/error/cancel/timeout.

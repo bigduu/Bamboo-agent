@@ -135,6 +135,9 @@ impl ParentResolution {
             || terminal.source != request_envelope.source
             || terminal.target_session_id != request.parent.session_id
             || terminal.in_reply_to.as_ref() != Some(&request.id)
+            || terminal.thread_id.is_some()
+            || terminal.attempt.is_some()
+            || terminal.correlation_id.is_some()
             || serde_json::to_vec(terminal).ok()?.len() > PARENT_REQUEST_MAX_BYTES
         {
             return None;
@@ -178,6 +181,9 @@ impl ParentRequest {
                     subsystem: FORCED_PERMISSION_SUBSYSTEM.into(),
                 })
             || envelope.in_reply_to.is_some()
+            || envelope.thread_id.is_some()
+            || envelope.attempt.is_some()
+            || envelope.correlation_id.is_some()
             || serde_json::to_vec(envelope).ok()?.len() > PARENT_REQUEST_MAX_BYTES
         {
             return None;

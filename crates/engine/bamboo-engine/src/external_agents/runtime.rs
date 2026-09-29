@@ -158,6 +158,12 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         }
     }
 
+    fn set_canonical_subagent_tool(&self, tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>) {
+        for runner in &self.runners {
+            runner.set_canonical_subagent_tool(tool.clone());
+        }
+    }
+
     fn set_actor_event_observer(
         &self,
         observer: Option<Arc<dyn super::actor_event_stream::ActorEventObserver>>,

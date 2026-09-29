@@ -170,7 +170,7 @@ impl CapturedPeer {
         self.live()?;
         let allowed = match frame {
             ClientFrame::Hello { .. } => false,
-            ClientFrame::Subscribe => true,
+            ClientFrame::Subscribe | ClientFrame::SubscribeEnvironmentLeaseV1 => true,
             ClientFrame::Ack { id } => identifier(id.as_str()),
             ClientFrame::Cancel { to, correlation_id } => {
                 mailbox_identifier(to)
@@ -188,7 +188,8 @@ impl CapturedPeer {
                 identifier(request_id.as_str())
                     && identifier(role)
                     && self.peer.presence.contains(role)
-                    && self.destination(mailbox, InboxKind::Run)
+                    && (self.destination(mailbox, InboxKind::Run)
+                        || self.destination(mailbox, InboxKind::LeasedRun))
             }
             ClientFrame::Deliver { to, message } => {
                 self.destination(to, message.kind)

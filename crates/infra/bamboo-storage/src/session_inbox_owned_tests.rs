@@ -1,5 +1,8 @@
 use super::*;
-use bamboo_domain::{Session, SessionInboxConsumerId, SessionInboxLeaseRequest, Storage};
+use bamboo_domain::{
+    Session, SessionInboxAdministrationPrincipal, SessionInboxConsumerId,
+    SessionInboxFailureOutcome, SessionInboxFailureReport, SessionInboxLeaseRequest, Storage,
+};
 use chrono::{DateTime, Duration};
 use tempfile::TempDir;
 
@@ -37,6 +40,431 @@ async fn immediate(inbox: &FileSessionInbox, text: &str) -> SessionMessageEnvelo
         .await
         .unwrap();
     envelope
+}
+
+#[tokio::test]
+async fn wake_readiness_does_not_fence_legacy_root_turn_claim() {
+    let (_temp, _store, inbox) = fixture().await;
+    let envelope = immediate(&inbox, "root input").await;
+    let readiness = inbox
+        .inspect_wake_readiness("target", Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(readiness.ready.unwrap().id, envelope.id);
+    let dir = inbox.inbox_dir("target").await.unwrap();
+    assert!(!FileSessionInbox::owned_enabled(&dir).await.unwrap());
+    let claims = inbox
+        .claim_for_turn("target", 1, Some("root-run"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].envelope.id, envelope.id);
+}
+
+#[tokio::test]
+async fn wake_readiness_excludes_staged_and_tracks_exact_lease_expiry_after_restart() {
+    let (temp, _, inbox) = fixture().await;
+    let staged = SessionMessageEnvelope::user_input("target", "staged");
+    inbox.deliver(&staged).await.unwrap();
+    let immediate = immediate(&inbox, "immediate").await;
+    let now = Utc::now();
+    let first = inbox.inspect_wake_readiness("target", now).await.unwrap();
+    let ready = first.ready.unwrap();
+    assert_eq!(ready.id, immediate.id);
+    assert_eq!(ready.generation, 2);
+    assert_eq!(ready.lease_epoch, None);
+    assert_eq!(first.next_due_at, None);
+
+    let claimed = inbox
+        .claim_owned("target", 1, None, &request(now))
+        .await
+        .unwrap()
+        .remove(0);
+    let reopened = reopen(&temp).await;
+    let before = reopened
+        .inspect_wake_readiness("target", claimed.lease.expires_at - Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(before.ready, None);
+    assert_eq!(before.next_due_at, Some(claimed.lease.expires_at));
+    let due = reopened
+        .inspect_wake_readiness("target", claimed.lease.expires_at)
+        .await
+        .unwrap()
+        .ready
+        .unwrap();
+    assert_eq!(due.id, immediate.id);
+    assert_eq!(due.generation, claimed.claim.generation);
+    assert_eq!(due.lease_epoch, Some(claimed.lease.epoch));
+    assert_eq!(due.ready_after, Some(claimed.lease.expires_at));
+
+    let reclaimed = reopened
+        .claim_owned("target", 1, None, &request(claimed.lease.expires_at))
+        .await
+        .unwrap()
+        .remove(0);
+    reopened
+        .ack_owned("target", &reclaimed, claimed.lease.expires_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("target", claimed.lease.expires_at)
+            .await
+            .unwrap()
+            .ready,
+        None
+    );
+    reopened
+        .mark_activation_eligible("target", 1, SessionActivationPolicy::RespectSpecificWait)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .inspect_wake_readiness("target", claimed.lease.expires_at)
+            .await
+            .unwrap()
+            .ready
+            .unwrap()
+            .id,
+        staged.id
+    );
+}
+
+#[tokio::test]
+async fn wake_readiness_waits_for_failure_retry_and_excludes_dead_letter() {
+    let (_temp, _, inbox) = fixture().await;
+    let envelope = immediate(&inbox, "poison").await;
+    let mut now = Utc::now();
+    for failure_count in 1..=3 {
+        let claim = inbox
+            .claim_owned("target", 1, None, &request(now))
+            .await
+            .unwrap()
+            .remove(0);
+        let failed_at = now + Duration::seconds(1);
+        let outcome = inbox
+            .fail_owned(
+                "target",
+                &claim,
+                &SessionInboxFailureReport {
+                    now: failed_at,
+                    error_code: "consumer_rejected".into(),
+                },
+            )
+            .await
+            .unwrap();
+        if failure_count == 3 {
+            assert_eq!(
+                outcome,
+                SessionInboxFailureOutcome::DeadLettered { failure_count }
+            );
+            let after = inbox
+                .inspect_wake_readiness("target", failed_at + Duration::hours(1))
+                .await
+                .unwrap();
+            assert_eq!(after.ready, None);
+            assert_eq!(after.next_due_at, None);
+            break;
+        }
+        let SessionInboxFailureOutcome::RetryScheduled { retry_after, .. } = outcome else {
+            panic!("expected scheduled retry");
+        };
+        let before = inbox
+            .inspect_wake_readiness("target", retry_after - Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(before.ready, None);
+        assert_eq!(before.next_due_at, Some(retry_after));
+        let ready = inbox
+            .inspect_wake_readiness("target", retry_after)
+            .await
+            .unwrap()
+            .ready
+            .unwrap();
+        assert_eq!(ready.id, envelope.id);
+        assert_eq!(ready.generation, claim.claim.generation);
+        assert_eq!(ready.lease_epoch, Some(claim.lease.epoch));
+        assert_eq!(ready.ready_after, Some(retry_after));
+        now = retry_after;
+    }
+}
+
+#[tokio::test]
+async fn expiry_reclaims_do_not_count_as_poison_failures() {
+    let (temp, _, inbox) = fixture().await;
+    let envelope = immediate(&inbox, "slow but valid").await;
+    let mut next = request(Utc::now());
+    for epoch in 1..=5 {
+        let current = reopen(&temp).await;
+        let claim = current
+            .claim_owned("target", 1, None, &next)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(claim.claim.envelope.id, envelope.id);
+        assert_eq!(claim.lease.epoch, epoch);
+        let inspection = current
+            .inspect_owned_leases("target", 1, next.now)
+            .await
+            .unwrap();
+        assert_eq!(inspection[0].failure_count, 0);
+        assert_eq!(inspection[0].reclaim_count, epoch - 1);
+        assert_eq!(inspection[0].manual_retry_count, 0);
+        assert_eq!(inspection[0].last_error_code, None);
+        next = request(claim.lease.expires_at);
+    }
+    assert!(inbox
+        .inspect_dead_letters(
+            "target",
+            1,
+            &SessionInboxAdministrationPrincipal::authenticated_host_owner(),
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn explicit_failures_back_off_dead_letter_and_manual_retry_keep_exact_identity() {
+    let (temp, _, inbox) = fixture().await;
+    let envelope = immediate(&inbox, "poison candidate").await;
+    let original = request(Utc::now());
+    let first = inbox
+        .claim_owned("target", 1, None, &original)
+        .await
+        .unwrap()
+        .remove(0);
+    let invalid = SessionInboxFailureReport {
+        now: original.now + Duration::seconds(1),
+        error_code: "raw error: bearer secret".into(),
+    };
+    assert!(inbox.fail_owned("target", &first, &invalid).await.is_err());
+    let report = SessionInboxFailureReport {
+        now: invalid.now,
+        error_code: "consumer_rejected".into(),
+    };
+    let retry_at = match inbox.fail_owned("target", &first, &report).await.unwrap() {
+        SessionInboxFailureOutcome::RetryScheduled {
+            failure_count,
+            retry_after,
+        } => {
+            assert_eq!(failure_count, 1);
+            retry_after
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    assert!(inbox.ack_owned("target", &first, report.now).await.is_err());
+    let before = request(retry_at - Duration::seconds(1));
+    assert!(inbox
+        .claim_owned("target", 1, None, &before)
+        .await
+        .unwrap()
+        .is_empty());
+    let inspection = inbox
+        .inspect_owned_leases("target", 1, before.now)
+        .await
+        .unwrap();
+    assert_eq!(inspection[0].failure_count, 1);
+    assert_eq!(inspection[0].reclaim_count, 0);
+    assert_eq!(inspection[0].manual_retry_count, 0);
+    assert_eq!(
+        inspection[0].last_error_code.as_deref(),
+        Some("consumer_rejected")
+    );
+    assert_eq!(inspection[0].retry_after, Some(retry_at));
+
+    let reopened = reopen(&temp).await;
+    let second_request = request(retry_at);
+    let second = reopened
+        .claim_owned("target", 1, None, &second_request)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.lease.epoch, first.lease.epoch + 1);
+    let second_report = SessionInboxFailureReport {
+        now: retry_at + Duration::seconds(1),
+        error_code: "consumer_rejected".into(),
+    };
+    let retry_at = match reopened
+        .fail_owned("target", &second, &second_report)
+        .await
+        .unwrap()
+    {
+        SessionInboxFailureOutcome::RetryScheduled {
+            failure_count,
+            retry_after,
+        } => {
+            assert_eq!(failure_count, 2);
+            retry_after
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let third_request = request(retry_at);
+    let third = reopened
+        .claim_owned("target", 1, None, &third_request)
+        .await
+        .unwrap()
+        .remove(0);
+    let third_report = SessionInboxFailureReport {
+        now: retry_at + Duration::seconds(1),
+        error_code: "consumer_rejected".into(),
+    };
+    assert_eq!(
+        reopened
+            .fail_owned("target", &third, &third_report)
+            .await
+            .unwrap(),
+        SessionInboxFailureOutcome::DeadLettered { failure_count: 3 }
+    );
+    assert!(reopened
+        .claim_owned(
+            "target",
+            1,
+            None,
+            &request(third_report.now + Duration::hours(1))
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(reopened.inspect("target").await.unwrap().claimed, 0);
+    assert_eq!(
+        reopened
+            .deliver_with_activation_intent(
+                &envelope,
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap()
+            .generation,
+        first.claim.generation
+    );
+
+    let after_restart = reopen(&temp).await;
+    let principal = SessionInboxAdministrationPrincipal::authenticated_host_owner();
+    let dead = after_restart
+        .inspect_dead_letters("target", 1, &principal)
+        .await
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].id, envelope.id);
+    assert_eq!(dead[0].generation, first.claim.generation);
+    assert_eq!(dead[0].failure_count, 3);
+    assert_eq!(dead[0].last_error_code, "consumer_rejected");
+    assert!(after_restart
+        .retry_dead_letter(
+            "target",
+            &envelope.id,
+            first.claim.generation + 1,
+            third_report.now + Duration::seconds(1),
+            &principal,
+        )
+        .await
+        .is_err());
+    let retry = after_restart
+        .retry_dead_letter(
+            "target",
+            &envelope.id,
+            first.claim.generation,
+            third_report.now + Duration::seconds(1),
+            &principal,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.id, envelope.id);
+    assert_eq!(retry.generation, first.claim.generation);
+    let manual_request = request(third_report.now + Duration::seconds(2));
+    let manual = after_restart
+        .claim_owned("target", 1, None, &manual_request)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(manual.claim.envelope.id, envelope.id);
+    assert_eq!(manual.claim.generation, first.claim.generation);
+    assert_eq!(manual.lease.epoch, third.lease.epoch + 1);
+    assert!(after_restart
+        .ack_owned("target", &third, manual_request.now)
+        .await
+        .is_err());
+    let inspection = after_restart
+        .inspect_owned_leases("target", 1, manual_request.now)
+        .await
+        .unwrap();
+    assert_eq!(inspection[0].failure_count, 0);
+    assert_eq!(inspection[0].reclaim_count, 0);
+    assert_eq!(inspection[0].manual_retry_count, 1);
+    assert_eq!(inspection[0].last_error_code, None);
+    after_restart
+        .ack_owned("target", &manual, manual_request.now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_dead_letter_rotation_stays_inert_and_recovers_on_reopen() {
+    let (temp, _, inbox) = fixture().await;
+    immediate(&inbox, "rotation recovery").await;
+    let mut now = Utc::now();
+    for _ in 0..2 {
+        let request = request(now);
+        let claim = inbox
+            .claim_owned("target", 1, None, &request)
+            .await
+            .unwrap()
+            .remove(0);
+        let report = SessionInboxFailureReport {
+            now: request.now + Duration::seconds(1),
+            error_code: "consumer_rejected".into(),
+        };
+        let outcome = inbox.fail_owned("target", &claim, &report).await.unwrap();
+        let SessionInboxFailureOutcome::RetryScheduled { retry_after, .. } = outcome else {
+            panic!("expected scheduled retry");
+        };
+        now = retry_after;
+    }
+    let third_request = request(now);
+    let claim = inbox
+        .claim_owned("target", 1, None, &third_request)
+        .await
+        .unwrap()
+        .remove(0);
+    let report = SessionInboxFailureReport {
+        now: third_request.now + Duration::seconds(1),
+        error_code: "consumer_rejected".into(),
+    };
+    let mut interrupted = reopen(&temp).await;
+    interrupted.owned_fs_hook = Some(Arc::new(|event, _| {
+        if event == "rotate" {
+            Err(std::io::Error::other("injected dead-letter rotate failure"))
+        } else {
+            Ok(())
+        }
+    }));
+    assert!(interrupted
+        .fail_owned("target", &claim, &report)
+        .await
+        .is_err());
+    let recovered = reopen(&temp).await;
+    let dead = recovered
+        .inspect_dead_letters(
+            "target",
+            1,
+            &SessionInboxAdministrationPrincipal::authenticated_host_owner(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].generation, claim.claim.generation);
+    assert!(recovered
+        .claim_owned("target", 1, None, &request(report.now + Duration::hours(1)))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(recovered
+        .ack_owned("target", &claim, report.now)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

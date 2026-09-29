@@ -12,6 +12,8 @@ use bamboo_tools::permission::{PermissionReasonCode, PermissionType};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -20,7 +22,12 @@ use std::{
 use uuid::Uuid;
 
 const MAX_RESULT_BYTES: usize = child_session::MAX_CHILD_RESULT_BYTES;
+#[cfg(test)]
 const MAX_TREE_NODES: usize = 32;
+#[cfg(test)]
+const MAX_TREE_CURSOR_BYTES: usize = 128;
+#[cfg(test)]
+const MAX_TREE_DEPTH: u32 = 4;
 const MAX_AUDIT_ROWS: usize = 8;
 const AUDIT_SUBSYSTEM: &str = "direct_parent_permission_review";
 const AUDIT_REQUEST: &str = "direct_parent_forced_permission_request_v1";
@@ -35,6 +42,8 @@ pub(super) enum Projection {
     Error,
     Tree,
     ForcedPermissionAudit,
+    ParentRequestReply,
+    ParentQuestionAsk,
     Control,
 }
 
@@ -50,6 +59,7 @@ enum Intent {
     Chat,
     Inspect,
     Control,
+    AskParent,
 }
 
 #[derive(Deserialize)]
@@ -79,17 +89,17 @@ pub(super) fn parameters_schema() -> Value {
     json!({
         "type": "object", "additionalProperties": false,
         "properties": {
-            "intent": {"type":"string", "enum":["chat","inspect","control"], "description":"Defaults to chat. Runtime manages activation and waiting."},
-            "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to read the owned tree or Root-owned forced permission audit."},
+            "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
+            "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
             "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Unknown labels retain legacy behavior; invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
-            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, messages, result, error, or a JSON query with view/cursor/message_id for pagination. Control: cancel or retry. No host, worker, model, or mailbox parameters."},
-            "reply_to": {"type":"string", "description":"Reserved; ParentRequest resolution is not supported by this caller."}
+            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, messages, result, error, or a JSON query with view/cursor/message_id for pagination. Control: cancel or retry. No host, worker, model, or mailbox parameters."},
+            "reply_to": {"type":"string", "description":"Exact pending direct-parent ParentRequest id. For forced permission use message exactly approve_once or deny; for a clarification use message as a bounded answer. Omit target and role. The Host checks the canonical request kind and deadline."}
         }
     })
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate to durable child sessions with one logical identity. Use delegation when the user requests parallel work or a separate bounded task would crowd the current context; handle simple tasks directly. A child uses only the tools and permissions exposed to it by the runtime. Send a complete task in message (intent defaults to chat) to create a child; optionally select role=explorer, implementer, reviewer, or another catalog name. Omitted role keeps worker behavior. Include target to correct or continue that same child; role cannot rebind it. Use intent=inspect without target for a bounded owned tree, or message=forced_permission_audit for the current Root's read-only audit records. This audit is not approval or a ParentRequest. Use target for child overview, messages, result, or error. Paginate child inspection with a JSON message containing view/cursor/message_id. Use intent=control, target, and message=cancel or retry to control that same child. Runtime manages activation and waiting. This caller does not resolve ParentRequests or perform remote reassignment; do not pass physical worker or mailbox ids. Legacy action calls remain compatible but are not part of this compact interface."
+    "Delegate to durable child sessions with one logical identity. Use delegation when the user requests parallel work or a separate bounded task would crowd the current context; handle simple tasks directly. A child uses only the tools and permissions exposed to it by the runtime. Send a complete task in message (intent defaults to chat) to create a child; optionally select role=explorer, implementer, reviewer, or another catalog name. Omitted role keeps worker behavior. Include target to correct or continue that same child; role cannot rebind it. Use intent=inspect without target for the current Root's full tree. An active Child with a Host canonical tree route sees only its owned subtree. A Child can use intent=ask_parent with a bounded question in message to pause for its direct parent's answer; omit target, role, and reply_to. Use message=forced_permission_audit for Root's read-only audit records. To answer a pending direct-parent ParentRequest, set reply_to to its exact id, omit target and role, and put the reply in message. Forced permission requires exactly approve_once or deny; clarification accepts a bounded answer. The Host checks canonical kind, direct-parent lineage, Project, and deadline before recording one terminal result. Paginate the tree with message={\"view\":\"tree\",\"cursor\":\"...\"}; a changed tree rejects its old cursor. Use target for child overview, messages, result, or error. Paginate child inspection with a JSON message containing view/cursor/message_id. Use intent=control, target, and message=cancel or retry to control that same child. Runtime manages activation and waiting. Do not pass physical worker or mailbox ids. Legacy action calls remain compatible but are not part of this compact interface."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -117,10 +127,26 @@ pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
     let has_reply_to = args.get("reply_to").is_some();
     let parsed: FacadeArgs =
         serde_json::from_value(args).map_err(|_| invalid("Invalid compact SubAgent arguments"))?;
-    if has_reply_to || parsed.reply_to.is_some() {
-        return Err(invalid(
-            "ParentRequest replies are not supported by this caller",
-        ));
+    if has_reply_to {
+        if parsed.intent != Intent::Chat || has_target || has_role {
+            return Err(invalid(
+                "ParentRequest reply requires chat intent and omits target and role",
+            ));
+        }
+        let request = parsed
+            .reply_to
+            .as_deref()
+            .and_then(|id| SessionMessageId::parse(id).ok())
+            .ok_or_else(|| invalid("reply_to must be an exact ParentRequest id"))?;
+        let message = parsed
+            .message
+            .as_deref()
+            .ok_or_else(|| invalid("ParentRequest reply requires message"))?;
+        crate::parent_request_reply::validate_parent_answer_input(message).map_err(invalid)?;
+        return Ok(NormalizedCall {
+            args: json!({"reply_to":request.as_str(), "message":message}),
+            projection: Some(Projection::ParentRequestReply),
+        });
     }
     if has_role {
         if parsed.intent != Intent::Chat || parsed.target.is_some() {
@@ -142,6 +168,22 @@ pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
         return Err(invalid("target must be an exact logical Child ActorId"));
     }
     let (args, projection) = match parsed.intent {
+        Intent::AskParent => {
+            if has_target || has_role {
+                return Err(invalid("ask_parent requires omitted target and role"));
+            }
+            let question = parsed
+                .message
+                .as_deref()
+                .ok_or_else(|| invalid("ask_parent requires message"))?;
+            if question.trim().is_empty()
+                || question.len() > bamboo_domain::PARENT_QUESTION_TEXT_MAX_BYTES
+                || question.contains('\0')
+            {
+                return Err(invalid("ask_parent requires a bounded non-empty question"));
+            }
+            (json!({"question":question}), Projection::ParentQuestionAsk)
+        }
         Intent::Chat => {
             let message = parsed
                 .message
@@ -175,17 +217,31 @@ pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
                         projection: Some(Projection::ForcedPermissionAudit),
                     });
                 }
-                if parsed
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| !message.trim().is_empty() && message.trim() != "tree")
-                {
-                    return Err(invalid(
-                        "inspect without target accepts only tree or forced_permission_audit",
-                    ));
+                let cursor =
+                    match parsed.message.as_deref() {
+                        None | Some("tree") => None,
+                        Some(message) if message.trim().is_empty() => None,
+                        Some(message) if message.starts_with('{') && message.len() <= 4096 => {
+                            let query: InspectionQuery = serde_json::from_str(message)
+                                .map_err(|_| invalid("Invalid tree inspection query"))?;
+                            if query.view.as_deref() != Some("tree") || query.message_id.is_some() {
+                                return Err(invalid("Invalid tree inspection query"));
+                            }
+                            query.cursor
+                        }
+                        _ => return Err(invalid(
+                            "inspect without target accepts only tree or forced_permission_audit",
+                        )),
+                    };
+                if cursor.as_ref().is_some_and(|cursor| cursor.is_empty()) {
+                    return Err(invalid("Invalid tree inspection cursor"));
+                }
+                let mut args = json!({"action":"list"});
+                if let Some(cursor) = cursor {
+                    args["cursor"] = json!(cursor);
                 }
                 return Ok(NormalizedCall {
-                    args: json!({"action":"list"}),
+                    args,
                     projection: Some(Projection::Tree),
                 });
             };
@@ -314,6 +370,12 @@ fn project(projection: Projection, input: &Value) -> Value {
                     "message_count",
                     "is_running",
                     "has_pending_injected_messages",
+                    "runner_started_at",
+                    "runner_completed_at",
+                    "last_event_at",
+                    "round_count",
+                    "last_tool_name",
+                    "last_tool_phase",
                 ],
             );
             output["has_error"] = json!(input["last_run_error"]
@@ -375,7 +437,10 @@ fn project(projection: Projection, input: &Value) -> Value {
                 json!(input["content_utf8_bytes"].as_u64().unwrap_or_default() > 0);
             output["diagnostic"] = json!("Check the child's observed status; detailed execution errors remain available to the authenticated inspector.");
         }
-        Projection::Tree | Projection::ForcedPermissionAudit => {
+        Projection::Tree
+        | Projection::ForcedPermissionAudit
+        | Projection::ParentRequestReply
+        | Projection::ParentQuestionAsk => {
             unreachable!("direct inspections are read and projected separately")
         }
     }
@@ -554,6 +619,12 @@ fn forced_audit_marker(
         return Err(invalid_audit());
     }
     let display = format!(
+        "Child {} asks to use {} ({}) on {}. Direct parent: reply SubAgent(reply_to=\"{}\", message=\"approve_once\") or message=\"deny\" by deadline. No grant.",
+        data.child_session_id, data.tool, data.permission.description(), data.resource, envelope.id
+    );
+    // Already persisted audit messages use the earlier exact display text.
+    // Accept both canonical spellings without trusting arbitrary transcript text.
+    let legacy_display = format!(
         "Child {} requests a forced permission decision. Tool: {}; permission: {}; resource: {}. This request is an audit record, not a grant or an instruction to bypass policy.",
         data.child_session_id, data.tool, data.permission.description(), data.resource
     );
@@ -562,7 +633,7 @@ fn forced_audit_marker(
         .provider_message
         .as_ref()
         .ok_or_else(invalid_audit)?;
-    if content.text != display
+    if (content.text != display && content.text != legacy_display)
         || !content.parts.is_empty()
         || provider.content != *content
         || !provider.metadata.is_empty()
@@ -582,7 +653,7 @@ fn forced_audit_marker(
     Ok(Some(ForcedAuditMarker {
         envelope_id: envelope.id.to_string(),
         child: child.clone(),
-        display,
+        display: content.text.clone(),
     }))
 }
 
@@ -721,63 +792,149 @@ pub(super) fn finish(
         }
         Ok(_) => Err(ToolError::Execution("Unexpected SubAgent operation disposition".into())),
         Err(ToolError::InvalidArguments(_)) => Err(invalid("Invalid SubAgent request or inspection cursor; start a new inspection")),
-        Err(_) => Err(ToolError::Execution("SubAgent operation failed. Inspect the owned tree and current child before retrying; execution details are available to the authenticated inspector.".into())),
+        Err(_) => Err(ToolError::Execution("SubAgent operation failed. Inspect the current child before retrying; execution details are available to the authenticated inspector.".into())),
+    }
+}
+
+#[cfg(test)]
+fn tree_cursor(offset: usize, digest: &str) -> String {
+    format!("tp1:{offset}:{digest}")
+}
+
+#[cfg(test)]
+fn tree_page(
+    caller: &Session,
+    tree: &child_session::SessionTreeNode,
+    raw_cursor: Option<&str>,
+    scope_digest: &str,
+    max_depth: u32,
+) -> Result<Value, ToolError> {
+    // Stable traversal makes a cursor meaningful even when the index returns
+    // sibling rows in a different order on the next read.
+    let mut pending = vec![(tree, None)];
+    let mut nodes = Vec::new();
+    let mut depth_limited = false;
+    while let Some((node, parent)) = pending.pop() {
+        let title: String = node.title.chars().take(80).collect();
+        nodes.push(json!({"actor_id":node.session_id, "parent_actor_id":parent,
+            "title":title, "depth":node.depth,
+            "observed_status":observed_status(&json!(node.last_run_status))}));
+        depth_limited |= node.depth >= max_depth;
+        let mut children = node.children.iter().collect::<Vec<_>>();
+        children.sort_unstable_by(|a, b| a.session_id.cmp(&b.session_id));
+        for child in children.into_iter().rev() {
+            pending.push((child, Some(node.session_id.as_str())));
+        }
+    }
+    let fingerprint = json!({"caller":caller.id, "birth":caller.created_at,
+        "project":caller.project_id_meta(), "metadata_version":caller.metadata_version,
+        "canonical_scope":scope_digest, "nodes":nodes});
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&fingerprint)
+            .map_err(|_| invalid("Unable to encode the tree inspection"))?,
+    ));
+    let start = match raw_cursor {
+        None => 0,
+        Some(raw) => {
+            if raw.len() > MAX_TREE_CURSOR_BYTES {
+                return Err(invalid("Invalid or stale tree inspection cursor"));
+            }
+            let mut fields = raw.split(':');
+            let (Some("tp1"), Some(offset), Some(proof), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                return Err(invalid("Invalid or stale tree inspection cursor"));
+            };
+            if offset.starts_with('0') || proof != digest {
+                return Err(invalid("Invalid or stale tree inspection cursor"));
+            }
+            let offset = offset
+                .parse::<usize>()
+                .map_err(|_| invalid("Invalid or stale tree inspection cursor"))?;
+            if offset >= nodes.len() {
+                return Err(invalid("Invalid or stale tree inspection cursor"));
+            }
+            offset
+        }
+    };
+    let mut page = Vec::new();
+    for node in nodes.iter().skip(start).take(MAX_TREE_NODES) {
+        page.push(node.clone());
+        let end = start + page.len();
+        let next_cursor = (end < nodes.len()).then(|| tree_cursor(end, &digest));
+        let candidate = json!({"actor_id":caller.id, "nodes":page,
+            "truncated":depth_limited || next_cursor.is_some(), "next_cursor":next_cursor,
+            "observation":"Durable index tree; run statuses are observations, not activation leases."});
+        if serde_json::to_vec(&ToolResult::text(true, candidate.to_string()))
+            .map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES)
+        {
+            page.pop();
+            if page.is_empty() {
+                return Err(invalid("Tree node exceeds the SubAgent observation limit"));
+            }
+            break;
+        }
+    }
+    let end = start + page.len();
+    let next_cursor = (end < nodes.len()).then(|| tree_cursor(end, &digest));
+    Ok(json!({"actor_id":caller.id, "nodes":page,
+        "truncated":depth_limited || next_cursor.is_some(), "next_cursor":next_cursor,
+        "observation":"Durable index tree; run statuses are observations, not activation leases."}))
+}
+
+struct FacadeTreePort<'a>(&'a dyn ChildSessionPort);
+
+#[async_trait::async_trait]
+impl child_session::owned_tree::OwnedTreePort for FacadeTreePort<'_> {
+    async fn load(&self, id: &str) -> Result<Session, child_session::owned_tree::OwnedTreeError> {
+        self.0
+            .load_tree_caller_session(id)
+            .await
+            .map_err(|_| child_session::owned_tree::OwnedTreeError::InvalidLineage)
+    }
+
+    async fn child_ids(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<String>, child_session::owned_tree::OwnedTreeError> {
+        Ok(self
+            .0
+            .list_children(parent_id)
+            .await
+            .into_iter()
+            .map(|entry| entry.child_session_id)
+            .collect())
+    }
+
+    async fn child_index(
+        &self,
+    ) -> Result<Option<Vec<(String, String)>>, child_session::owned_tree::OwnedTreeError> {
+        self.0
+            .tree_index_snapshot()
+            .await
+            .map_err(|_| child_session::owned_tree::OwnedTreeError::InvalidLineage)
     }
 }
 
 pub(super) fn inspect_tree<'a>(
     port: &'a dyn ChildSessionPort,
-    parent_id: &'a str,
+    caller_id: &'a str,
+    raw_cursor: Option<&'a str>,
 ) -> Pin<Box<dyn Future<Output = Result<ToolOutcome, ToolError>> + Send + 'a>> {
     Box::pin(async move {
-        let root = port
-            .load_root_session(parent_id)
+        use child_session::owned_tree::{inspect_owned_tree, OwnedTreeError};
+        let page = inspect_owned_tree(&FacadeTreePort(port), caller_id, raw_cursor)
             .await
-            .map_err(|_| ToolError::Execution("The current Root session is unavailable".into()))?;
-        let tree = child_session::build_session_tree_action(port, parent_id, 4).await;
-        let mut pending = vec![(&tree, None)];
-        let mut nodes = Vec::new();
-        let mut truncated = false;
-        while let Some((node, parent)) = pending.pop() {
-            if nodes.len() >= MAX_TREE_NODES {
-                truncated = true;
-                break;
-            }
-            let title: String = node.title.chars().take(80).collect();
-            let candidate = json!({"actor_id":node.session_id, "parent_actor_id":parent,
-            "title":title, "depth":node.depth,
-            "observed_status":observed_status(&json!(node.last_run_status))});
-            nodes.push(candidate);
-            truncated |= node.depth >= 4;
-            let value = json!({"actor_id":parent_id, "nodes":nodes, "truncated":true,
-            "observation":"Durable index tree; run statuses are observations, not activation leases."});
-            if serde_json::to_vec(&ToolResult::text(true, value.to_string()))
-                .map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES)
-            {
-                nodes.pop();
-                truncated = true;
-                break;
-            }
-            for child in node.children.iter().rev() {
-                pending.push((child, Some(node.session_id.as_str())));
-            }
-        }
-        let current = port
-            .load_root_session(parent_id)
-            .await
-            .map_err(|_| ToolError::Execution("The current Root session is unavailable".into()))?;
-        if current.created_at != root.created_at {
-            return Err(ToolError::Execution(
-                "The current Root lifetime changed; start a new inspection".into(),
-            ));
-        }
-        bounded_result(
-            ToolResult::text(true, String::new()),
-            json!({
-                "actor_id":parent_id, "nodes":nodes, "truncated":truncated,
-                "observation":"Durable index tree; run statuses are observations, not activation leases."
-            }),
-        )
+            .map_err(|error| match error {
+                OwnedTreeError::InvalidCursor => invalid("Invalid or stale tree inspection cursor"),
+                OwnedTreeError::InvalidLineage => ToolError::Execution(
+                    "The owned tree has an invalid durable lineage or Project scope".into(),
+                ),
+                OwnedTreeError::ResultTooLarge => {
+                    invalid("Tree node exceeds the SubAgent observation limit")
+                }
+            })?;
+        bounded_result(ToolResult::text(true, String::new()), page)
     })
 }
 
@@ -822,7 +979,7 @@ mod tests {
         }
         for args in [
             json!({"message":"task", "model":"physical"}),
-            json!({"message":"task", "reply_to":"request"}),
+            json!({"message":"task", "reply_to":"unsafe/request"}),
             json!({"action":"create", "intent":"chat"}),
             json!({"target":" child ", "message":"task"}),
             json!({"intent":"control", "target":"child", "message":"retire"}),
@@ -834,6 +991,57 @@ mod tests {
             json!({"intent":"control", "role":"implementer", "target":"child", "message":"retry"}),
         ] {
             assert!(normalize(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parent_request_reply_keeps_bounded_message_for_canonical_kind_check() {
+        let request = SessionMessageId::new();
+        let approve =
+            normalize(json!({"reply_to":request.as_str(),"message":"approve_once"})).unwrap();
+        assert_eq!(approve.projection, Some(Projection::ParentRequestReply));
+        assert_eq!(approve.args["reply_to"], request.as_str());
+        assert_eq!(approve.args["message"], "approve_once");
+        let deny = normalize(json!({"reply_to":request.as_str(),"message":"deny"})).unwrap();
+        assert_eq!(deny.args["message"], "deny");
+        let answer =
+            normalize(json!({"reply_to":request.as_str(),"message":"Use option A"})).unwrap();
+        assert_eq!(answer.args["message"], "Use option A");
+        for bad in [
+            json!({"reply_to":null,"message":"deny"}),
+            json!({"reply_to":request.as_str(),"message":" "}),
+            json!({"reply_to":request.as_str(),"message":"x".repeat(bamboo_domain::PARENT_ANSWER_MAX_BYTES + 1)}),
+            json!({"reply_to":request.as_str(),"message":"deny ","target":"child"}),
+            json!({"reply_to":request.as_str(),"message":"deny","role":"reviewer"}),
+            json!({"intent":"inspect","reply_to":request.as_str(),"message":"deny"}),
+            json!({"action":"send_message","reply_to":request.as_str(),"message":"deny"}),
+        ] {
+            assert!(normalize(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ask_parent_keeps_existing_compact_fields_and_bounded_question() {
+        let call = normalize(json!({"intent":"ask_parent","message":"Which option?"})).unwrap();
+        assert_eq!(call.projection, Some(Projection::ParentQuestionAsk));
+        assert_eq!(call.args, json!({"question":"Which option?"}));
+        let maximum = "x".repeat(bamboo_domain::PARENT_QUESTION_TEXT_MAX_BYTES);
+        assert_eq!(
+            normalize(json!({"intent":"ask_parent","message":maximum.clone()}))
+                .unwrap()
+                .args["question"]
+                .as_str(),
+            Some(maximum.as_str())
+        );
+        for bad in [
+            json!({"intent":"ask_parent","message":" "}),
+            json!({"intent":"ask_parent","message":"x".repeat(bamboo_domain::PARENT_QUESTION_TEXT_MAX_BYTES + 1)}),
+            json!({"intent":"ask_parent","message":"a\0b"}),
+            json!({"intent":"ask_parent","message":"Question?","target":"child"}),
+            json!({"intent":"ask_parent","message":"Question?","role":"worker"}),
+            json!({"intent":"ask_parent","message":"Question?","reply_to":"request"}),
+        ] {
+            assert!(normalize(bad).is_err());
         }
     }
 
@@ -863,6 +1071,73 @@ mod tests {
         ] {
             assert!(normalize(args).is_err());
         }
+    }
+
+    #[test]
+    fn root_tree_pages_recover_every_descendant_and_reject_stale_cursors() {
+        let root = Session::new("tree-root", "model");
+        let mut tree = child_session::SessionTreeNode {
+            session_id: root.id.clone(),
+            title: "Root".into(),
+            last_run_status: None,
+            depth: 0,
+            children: (0..129)
+                .rev()
+                .map(|index| child_session::SessionTreeNode {
+                    session_id: format!("child-{index:03}"),
+                    title: format!("Child {index}"),
+                    last_run_status: Some("completed".into()),
+                    depth: 1,
+                    children: vec![],
+                })
+                .collect(),
+        };
+        let first = tree_page(&root, &tree, None, "", MAX_TREE_DEPTH).unwrap();
+        assert!(first["next_cursor"].is_string());
+        let stale = first["next_cursor"].as_str().unwrap().to_owned();
+        let normalized = normalize(json!({"intent":"inspect",
+            "message":json!({"view":"tree","cursor":stale}).to_string()}))
+        .unwrap();
+        assert_eq!(normalized.projection, Some(Projection::Tree));
+        assert_eq!(normalized.args["cursor"], stale);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = tree_page(&root, &tree, cursor.as_deref(), "", MAX_TREE_DEPTH).unwrap();
+            let nodes = page["nodes"].as_array().unwrap();
+            assert!(!nodes.is_empty() && nodes.len() <= MAX_TREE_NODES);
+            assert!(
+                serde_json::to_vec(&ToolResult::text(true, page.to_string()))
+                    .unwrap()
+                    .len()
+                    <= MAX_RESULT_BYTES
+            );
+            seen.extend(
+                nodes
+                    .iter()
+                    .map(|node| node["actor_id"].as_str().unwrap().to_owned()),
+            );
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                assert_eq!(page["truncated"], false);
+                break;
+            }
+            assert_eq!(page["truncated"], true);
+        }
+        assert_eq!(seen.len(), 130);
+        assert_eq!(seen.first().unwrap(), "tree-root");
+        assert_eq!(seen.last().unwrap(), "child-128");
+        assert!(tree_page(&root, &tree, Some("tp1:0:bad"), "", MAX_TREE_DEPTH).is_err());
+
+        tree.children.push(child_session::SessionTreeNode {
+            session_id: "child-new".into(),
+            title: "New child".into(),
+            last_run_status: None,
+            depth: 1,
+            children: vec![],
+        });
+        assert!(tree_page(&root, &tree, Some(&stale), "", MAX_TREE_DEPTH).is_err());
     }
 
     fn audit_fixture() -> (Session, Session, Message) {
@@ -924,6 +1199,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(owned_audit_child(&root, &root_actor, &marker, &child));
+        let mut modern: SessionMessageEnvelope =
+            serde_json::from_value(message.metadata.as_ref().unwrap()["session_message"].clone())
+                .unwrap();
+        let modern_display = format!(
+            "Child {} asks to use Write (Write files to disk) on file.txt. Direct parent: reply SubAgent(reply_to=\"{}\", message=\"approve_once\") or message=\"deny\" by deadline. No grant.",
+            child.id, modern.id
+        );
+        let SessionMessageBody::RuntimeInstruction(instruction) = &mut modern.body else {
+            panic!("audit instruction");
+        };
+        instruction.content = Some(bamboo_domain::SessionMessageContent::text(
+            modern_display.clone(),
+        ));
+        instruction.provider_message.as_mut().unwrap().content =
+            bamboo_domain::SessionMessageContent::text(modern_display.clone());
+        let modern_message = modern.to_provider_message().unwrap();
+        assert_eq!(
+            forced_audit_marker(&modern_message, &root, &root_actor)
+                .unwrap()
+                .unwrap()
+                .display,
+            modern_display
+        );
         let mut different_birth = child.clone();
         different_birth.created_at += chrono::Duration::seconds(1);
         assert!(!owned_audit_child(
@@ -995,6 +1293,27 @@ mod tests {
         );
         assert_eq!(error["has_error"], true);
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn overview_exposes_bounded_progress_without_physical_identity() {
+        let input = json!({"child_session_id":"logical", "last_run_status":"running",
+            "is_running":true, "round_count":7,
+            "runner_started_at":"2026-09-29T01:00:00Z",
+            "last_event_at":"2026-09-29T01:01:00Z",
+            "last_tool_name":"read_file", "last_tool_phase":"end",
+            "external_agent_id":"worker-secret", "endpoint":"wss://internal.invalid",
+            "last_run_error":"private diagnostic"});
+        let projected = project(Projection::Overview, &input);
+        assert_eq!(projected["actor_id"], "logical");
+        assert_eq!(projected["round_count"], 7);
+        assert_eq!(projected["last_tool_name"], "read_file");
+        assert_eq!(projected["last_event_at"], "2026-09-29T01:01:00Z");
+        assert_eq!(projected["has_error"], true);
+        let observation = projected.to_string();
+        for private in ["worker-secret", "internal.invalid", "private diagnostic"] {
+            assert!(!observation.contains(private));
+        }
     }
 
     #[test]

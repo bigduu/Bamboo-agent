@@ -755,6 +755,15 @@ impl AppState {
                 });
             }
         }
+        let parent_question_coordinator = Arc::new(
+            super::parent_question_reconcile::ParentQuestionCoordinator::new(
+                session_store.clone(),
+                session_repo.clone(),
+                session_messenger.clone(),
+                project_store.clone(),
+                mcp_proxy_shutdown.clone(),
+            ),
+        );
         let parent_approval_reviewer = Arc::new(
             crate::app_state::parent_approval_reviewer::ParentAgentApprovalReviewer::new(
                 session_repo.clone(),
@@ -765,7 +774,9 @@ impl AppState {
             .with_canonical_store(
                 session_store.clone(),
                 permission_checker.permission_config(),
-            ),
+            )
+            .with_shutdown_token(mcp_proxy_shutdown.clone())
+            .with_question_coordinator(parent_question_coordinator.clone()),
         );
         let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
         let external_runner =
@@ -773,7 +784,7 @@ impl AppState {
                 &config_snapshot,
                 config.clone(),
                 Some(approval_registry.clone()),
-                Some(parent_approval_reviewer),
+                Some(parent_approval_reviewer.clone()),
                 permission_checker.permission_config(),
                 Some(codex_run_tokens.clone()),
                 native_tool_ceiling,
@@ -784,6 +795,7 @@ impl AppState {
                 inbox: session_inbox.clone(),
                 storage: storage.clone(),
                 persistence: persistence.clone(),
+                parent_question_lock: Some(persistence.clone()),
             },
         ));
         external_runner.set_actor_directory_store(Some(session_store.clone()));
@@ -794,7 +806,7 @@ impl AppState {
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
-            external_runner,
+            external_runner.clone(),
             Some(provider_router.clone()),
             Some(child_completion_coordinator.clone()),
             Some(data_dir.clone()),
@@ -952,7 +964,7 @@ impl AppState {
             .await
             .map(HealthMonitor);
 
-        let tools = build_root_tools(
+        let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
             schedule_manager.clone(),
@@ -971,7 +983,9 @@ impl AppState {
             fabric_deployer.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            parent_approval_reviewer,
         );
+        external_runner.set_canonical_subagent_tool(Some(canonical_subagent_tool));
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
@@ -993,35 +1007,50 @@ impl AppState {
             .set_root_tools(tools.clone())
             .await;
 
-        // Restart recovers each immediate intent published with its message,
-        // even if no later wakeup/watermark write completed. The coordinator
-        // prefix remains separate: an immediate message never promotes an
-        // unauthorized staged child/Bash sibling. inspect and claim share the
-        // same durable eligibility rule.
-        for entry in session_store.list_index_entries().await {
-            match session_inbox.inspect(&entry.id).await {
-                Ok(backlog) if backlog.activation_pending() => {
-                    if let Err(error) = bamboo_domain::SessionActivationPort::request_activation(
-                        session_activation_router.as_ref(),
-                        &entry.id,
-                        backlog.activation_generation,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            session_id = %entry.id,
-                            %error,
-                            "failed to reactivate durable SessionInbox backlog during startup"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    session_id = %entry.id,
-                    %error,
-                    "failed to inspect SessionInbox during startup recovery"
-                ),
-            }
+        // Resolve expired, canonical direct-parent forced asks before any
+        // SessionInbox reactivation can admit an old parent request. A restart
+        // cannot restore the previous process's live approval scope, so this
+        // pass only records Deny terminals; it never sends a child grant.
+        let parent_permission_report = super::parent_permission_reconcile::reconcile_startup(
+            &session_store,
+            &session_repo,
+            &mcp_proxy_shutdown,
+        )
+        .await;
+        if parent_permission_report.denied > 0 || parent_permission_report.errors > 0 {
+            tracing::info!(
+                denied = parent_permission_report.denied,
+                errors = parent_permission_report.errors,
+                "reconciled direct-parent forced permission deadlines at startup"
+            );
+        }
+
+        // A Child checkpoint is the durable outbox. The first paced pass
+        // begins immediately and retries stable parent Inbox delivery and
+        // terminal fanout after process restart.
+        parent_question_coordinator.spawn();
+
+        // Reconcile exact Inbox wake readiness before serving, then pace
+        // runtime recovery for due leases and missed activation handoffs.
+        let wake_report = super::wake_reconciler::reconcile_startup(
+            session_store.clone(),
+            session_activation_router.clone(),
+            mcp_proxy_shutdown.clone(),
+        )
+        .await;
+        if wake_report.attempted > 0
+            || wake_report.retrying > 0
+            || wake_report.blocked > 0
+            || wake_report.queued > 0
+        {
+            tracing::info!(
+                checked = wake_report.checked,
+                queued = wake_report.queued,
+                attempted = wake_report.attempted,
+                retrying = wake_report.retrying,
+                blocked = wake_report.blocked,
+                "started durable SessionInbox wake reconciliation"
+            );
         }
 
         let tool_factory =

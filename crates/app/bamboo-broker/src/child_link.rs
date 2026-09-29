@@ -31,6 +31,7 @@ pub struct BrokerChildLink {
     done: bool,
     selected_worker: Option<AgentRef>,
     expected_run: Option<bamboo_subagent::RunSpec>,
+    require_environment_lease: bool,
 }
 
 impl BrokerChildLink {
@@ -51,6 +52,7 @@ impl BrokerChildLink {
             done: false,
             selected_worker: None,
             expected_run: None,
+            require_environment_lease: false,
         })
     }
 
@@ -84,7 +86,31 @@ impl BrokerChildLink {
             done: false,
             selected_worker: Some(worker),
             expected_run: None,
+            require_environment_lease: false,
         })
+    }
+
+    /// Fixed Remote only: require an authenticated, current Worker claim before
+    /// dispatch. A versioned inbox kind also rejects old Worker binaries if
+    /// the subscriber changes after this observation.
+    pub async fn connect_strict_with_tls_environment_lease(
+        endpoint: &str,
+        parent: AgentRef,
+        token: &str,
+        worker: AgentRef,
+        tls: rustls::ClientConfig,
+    ) -> BrokerResult<Self> {
+        let mut link =
+            Self::connect_strict_with_tls(endpoint, parent, token, worker.clone(), tls).await?;
+        let role = worker.role.as_deref().ok_or_else(strict_link_error)?;
+        let observation = link.client.observe_host(&worker.session_id, role).await?;
+        if !observation.is_some_and(|current| current.environment_lease_v1) {
+            return Err(BrokerError::Protocol(
+                "remote_environment_lease_unsupported".into(),
+            ));
+        }
+        link.require_environment_lease = true;
+        Ok(link)
     }
 
     fn validate_selected_batch(
@@ -125,6 +151,26 @@ impl BrokerChildLink {
     pub async fn send(&mut self, frame: ParentFrame) -> BrokerResult<()> {
         match frame {
             ParentFrame::Run(spec) => {
+                if self.require_environment_lease
+                    && !spec.permission_policy.as_ref().is_some_and(|policy| {
+                        policy.workspace_path.is_none()
+                            && policy.environment_lease.as_ref().is_some_and(|lease| {
+                                lease.actor_id
+                                    == spec
+                                        .logical_session
+                                        .as_ref()
+                                        .map(|id| id.session_id.as_str())
+                                        .unwrap_or("")
+                                    && lease.activation_run_id
+                                        == spec.activation_run_id.as_deref().unwrap_or("")
+                                    && lease.execution_epoch == spec.execution_epoch
+                            })
+                    })
+                {
+                    return Err(BrokerError::Protocol(
+                        "remote_environment_lease_missing".into(),
+                    ));
+                }
                 if self.selected_worker.is_some() {
                     if spec
                         .logical_session
@@ -154,7 +200,12 @@ impl BrokerChildLink {
                 }
                 let body = serde_json::to_value(spec)
                     .map_err(|e| BrokerError::Transport(format!("encode RunSpec: {e}")))?;
-                let m = self.msg(InboxKind::Run, body, None);
+                let kind = if self.require_environment_lease {
+                    InboxKind::LeasedRun
+                } else {
+                    InboxKind::Run
+                };
+                let m = self.msg(kind, body, None);
                 self.run_id = Some(m.id.clone());
                 self.done = false;
                 self.client.deliver(&self.child, m).await?;
@@ -196,6 +247,36 @@ impl BrokerChildLink {
                 let m = self.msg(
                     InboxKind::ApprovalReply,
                     serde_json::json!({ "id": id, "approved": approved }),
+                    self.run_id.clone(),
+                );
+                self.client.deliver(&self.child, m).await?;
+            }
+            ParentFrame::OwnedTreeReply { id, page } => {
+                if id.is_empty()
+                    || id.len() > 128
+                    || serde_json::to_vec(&page).map_or(true, |bytes| bytes.len() > 8192)
+                {
+                    return Err(BrokerError::Protocol("invalid owned tree reply".into()));
+                }
+                let m = self.msg(
+                    InboxKind::OwnedTreeReply,
+                    serde_json::json!({ "id": id, "page": page }),
+                    self.run_id.clone(),
+                );
+                self.client.deliver(&self.child, m).await?;
+            }
+            ParentFrame::SubAgentReply { id, result } => {
+                if id.is_empty()
+                    || id.len() > 128
+                    || serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024)
+                {
+                    return Err(BrokerError::Protocol(
+                        "invalid canonical SubAgent reply".into(),
+                    ));
+                }
+                let m = self.msg(
+                    InboxKind::SubAgentReply,
+                    serde_json::json!({ "id": id, "result": result }),
                     self.run_id.clone(),
                 );
                 self.client.deliver(&self.child, m).await?;
@@ -303,6 +384,72 @@ impl BrokerChildLink {
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({}));
                     Some(ChildFrame::ApprovalRequest { id, body })
+                }
+                InboxKind::OwnedTreeRequest => {
+                    let object = msg.body.as_object().ok_or_else(|| {
+                        BrokerError::Protocol("invalid owned tree request".into())
+                    })?;
+                    if object.keys().any(|key| key != "id" && key != "cursor") {
+                        return Err(BrokerError::Protocol("invalid owned tree request".into()));
+                    }
+                    let id = object
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .filter(|id| !id.is_empty() && id.len() <= 128)
+                        .ok_or_else(|| BrokerError::Protocol("invalid owned tree request".into()))?
+                        .to_owned();
+                    let cursor = match object.get("cursor") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(serde_json::Value::String(value))
+                            if !value.is_empty() && value.len() <= 128 =>
+                        {
+                            Some(value.clone())
+                        }
+                        _ => {
+                            return Err(BrokerError::Protocol("invalid owned tree request".into()))
+                        }
+                    };
+                    Some(ChildFrame::OwnedTreeRequest { id, cursor })
+                }
+                InboxKind::SubAgentRequest => {
+                    let object = msg.body.as_object().ok_or_else(|| {
+                        BrokerError::Protocol("invalid canonical SubAgent request".into())
+                    })?;
+                    if object
+                        .keys()
+                        .any(|key| key != "id" && key != "tool_call_id" && key != "args")
+                    {
+                        return Err(BrokerError::Protocol(
+                            "invalid canonical SubAgent request".into(),
+                        ));
+                    }
+                    let text = |key: &str| {
+                        object
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.is_empty() && value.len() <= 128)
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                BrokerError::Protocol("invalid canonical SubAgent request".into())
+                            })
+                    };
+                    let id = text("id")?;
+                    let tool_call_id = text("tool_call_id")?;
+                    let args = object
+                        .get("args")
+                        .filter(|value| value.is_object())
+                        .filter(|value| {
+                            serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            BrokerError::Protocol("invalid canonical SubAgent request".into())
+                        })?;
+                    Some(ChildFrame::SubAgentRequest {
+                        id,
+                        tool_call_id,
+                        args,
+                    })
                 }
                 InboxKind::Outcome => {
                     let oc: ChildOutcome = serde_json::from_value(msg.body)

@@ -375,6 +375,9 @@ pub enum PendingQuestionSource {
     AgenticClarification,
     ExternalAgent,
     Gold,
+    /// A local Child has durably routed this question to its direct parent.
+    /// Human response and permission replay must not infer authority from its text.
+    DirectParent,
 }
 
 /// A pending question waiting for user response.
