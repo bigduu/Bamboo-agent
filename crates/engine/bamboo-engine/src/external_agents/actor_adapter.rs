@@ -633,11 +633,29 @@ pub struct ActorChildRunner {
     /// A processed broker terminal still needs the Host's final Child Session
     /// save before its exact Event/Outcome mailbox receipts can be ACKed.
     pending_durable_links: tokio::sync::Mutex<
-        HashMap<
-            (String, chrono::DateTime<chrono::Utc>, String),
-            Box<dyn bamboo_subagent::ChildLink>,
-        >,
+        HashMap<(String, chrono::DateTime<chrono::Utc>, String), PendingDurableChildLink>,
     >,
+}
+
+struct PendingDurableChildLink {
+    link: Box<dyn bamboo_subagent::ChildLink>,
+    /// Captured from this Host frame pump after canonical nested-wait checks.
+    /// The map key binds it to the exact Child birth and activation Run.
+    host_nested_wait_handoff: bool,
+}
+
+fn effective_broker_terminal_status(
+    raw: TerminalStatus,
+    host_nested_wait_handoff: bool,
+) -> Result<&'static str, String> {
+    if host_nested_wait_handoff {
+        if raw != TerminalStatus::Completed {
+            return Err("nested wait cannot project a failed broker terminal".into());
+        }
+        Ok("suspended")
+    } else {
+        Ok(broker_terminal_status_label(raw))
+    }
 }
 
 fn broker_terminal_status_label(status: TerminalStatus) -> &'static str {
@@ -1658,17 +1676,22 @@ impl ExternalChildRunner for ActorChildRunner {
             session.created_at,
             activation_run_id.to_owned(),
         );
-        let delivery = {
+        let (delivery, host_nested_wait_handoff) = {
             let pending = self.pending_durable_links.lock().await;
-            let Some(link) = pending.get(&key) else {
+            let Some(pending) = pending.get(&key) else {
                 return Ok(false);
             };
-            link.durable_delivery_receipt()
-                .ok_or_else(|| "broker terminal has no exact durable receipt".to_string())?
+            (
+                pending
+                    .link
+                    .durable_delivery_receipt()
+                    .ok_or_else(|| "broker terminal has no exact durable receipt".to_string())?,
+                pending.host_nested_wait_handoff,
+            )
         };
-        if session.last_run_status().as_deref()
-            != Some(broker_terminal_status_label(delivery.terminal_status))
-        {
+        let expected_status =
+            effective_broker_terminal_status(delivery.terminal_status, host_nested_wait_handoff)?;
+        if session.last_run_status().as_deref() != Some(expected_status) {
             return Err("Host final status differs from accepted broker terminal".into());
         }
         let store = self
@@ -1714,18 +1737,20 @@ impl ExternalChildRunner for ActorChildRunner {
             session.created_at,
             activation_run_id.to_owned(),
         );
-        let Some(mut link) = self.pending_durable_links.lock().await.remove(&key) else {
+        let Some(mut pending) = self.pending_durable_links.lock().await.remove(&key) else {
             return Ok(());
         };
         // A later SDK timeout or Host postprocessing error cannot convert an
         // accepted Worker terminal into a different receipt status.
-        let delivery = link
+        let delivery = pending
+            .link
             .durable_delivery_receipt()
             .ok_or_else(|| "broker terminal lost its exact durable receipt".to_string())?;
-        if !save_succeeded
-            || session.last_run_status().as_deref()
-                != Some(broker_terminal_status_label(delivery.terminal_status))
-        {
+        let expected_status = effective_broker_terminal_status(
+            delivery.terminal_status,
+            pending.host_nested_wait_handoff,
+        )?;
+        if !save_succeeded || session.last_run_status().as_deref() != Some(expected_status) {
             return Ok(());
         }
         let store = self
@@ -1741,11 +1766,13 @@ impl ExternalChildRunner for ActorChildRunner {
         if committed.broker_identity != delivery.broker_identity
             || committed.broker_correlation_id != delivery.correlation_id
             || committed.message_ids != delivery.message_ids
-            || committed.terminal_status != broker_terminal_status_label(delivery.terminal_status)
+            || committed.terminal_status != expected_status
         {
             return Err("Host broker receipt changed before ACK".into());
         }
-        link.acknowledge_durable_frames()
+        pending
+            .link
+            .acknowledge_durable_frames()
             .await
             .map_err(|error| format!("child broker durable ACK unconfirmed: {error}"))?;
         store
@@ -2707,13 +2734,23 @@ impl ExternalChildRunner for ActorChildRunner {
             if client.has_pending_durable_terminal() {
                 if let Some(run_id) = bound_activation_run_id.as_deref() {
                     let key = (session.id.clone(), session.created_at, run_id.to_owned());
+                    let host_nested_wait_handoff = session
+                        .metadata
+                        .get("runtime.actor_nested_wait_handoff")
+                        .is_some_and(|value| value == "true");
                     let mut pending = self.pending_durable_links.lock().await;
                     if pending.contains_key(&key) {
                         return Err(AgentError::LLM(
                             "child broker terminal receipt already awaits Host checkpoint".into(),
                         ));
                     }
-                    pending.insert(key, client);
+                    pending.insert(
+                        key,
+                        PendingDurableChildLink {
+                            link: client,
+                            host_nested_wait_handoff,
+                        },
+                    );
                 } else {
                     // A Worker-local transcript is not Host checkpoint proof.
                     drop(client);
@@ -5878,6 +5915,13 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         plain_run,
     } = context;
 
+    // A projection belongs only to this Host-validated Run. A loaded Session
+    // or a prior attempt may carry a stale marker; only the canonical wait
+    // checks in the terminal branch below may set it again.
+    logical_session
+        .metadata
+        .remove("runtime.actor_nested_wait_handoff");
+
     // First-frame watchdog: a live worker emits its first frame (run-started /
     // first token) within seconds; total silence past the deadline means the
     // worker is dead (e.g. a pooled worker that exited right after checkout), so
@@ -6915,12 +6959,25 @@ mod tests {
         calls: &Arc<AtomicUsize>,
         terminal_status: TerminalStatus,
     ) {
+        insert_ack_probe_with_nested_wait(runner, session, calls, terminal_status, false).await;
+    }
+
+    async fn insert_ack_probe_with_nested_wait(
+        runner: &ActorChildRunner,
+        session: &Session,
+        calls: &Arc<AtomicUsize>,
+        terminal_status: TerminalStatus,
+        host_nested_wait_handoff: bool,
+    ) {
         runner.pending_durable_links.lock().await.insert(
             (session.id.clone(), session.created_at, "run-1".into()),
-            Box::new(DurableAckProbe {
-                calls: calls.clone(),
-                terminal_status,
-            }) as Box<dyn bamboo_subagent::ChildLink>,
+            PendingDurableChildLink {
+                link: Box::new(DurableAckProbe {
+                    calls: calls.clone(),
+                    terminal_status,
+                }),
+                host_nested_wait_handoff,
+            },
         );
     }
 
@@ -7047,6 +7104,82 @@ mod tests {
                 .unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn broker_completed_terminal_projects_only_host_verified_nested_wait() {
+        assert_eq!(
+            effective_broker_terminal_status(TerminalStatus::Completed, true).unwrap(),
+            "suspended"
+        );
+        for raw in [TerminalStatus::Error, TerminalStatus::Cancelled] {
+            assert!(effective_broker_terminal_status(raw, true).is_err());
+        }
+        let runner = ActorChildRunner::new(
+            "test".into(),
+            PathBuf::new(),
+            vec![],
+            PathBuf::new(),
+            ExecutorSpec::BambooRuntime,
+            vec![],
+            "test".into(),
+            1,
+        );
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let root = Session::new("nested-ack-parent", "model");
+        store.save_session(&root).await.unwrap();
+        let mut child = Session::new_child_of("nested-ack-child", &root, "model", "task");
+        child.add_message(bamboo_agent_core::Message::user("spawn a grandchild"));
+        store.save_session(&child).await.unwrap();
+        child.set_last_run_status("suspended");
+        store
+            .prepare_broker_terminal_receipt(
+                &child,
+                "run-1",
+                "00000000-0000-4000-8000-000000000001",
+                "broker-run-1",
+                &["broker-outcome-1".into()],
+            )
+            .await
+            .unwrap();
+        store.save_session(&child).await.unwrap();
+        runner.set_actor_directory_store(Some(store.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        insert_ack_probe(&runner, &child, &calls, TerminalStatus::Completed).await;
+        runner
+            .confirm_durable_child_delivery(&child, "run-1", true)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        insert_ack_probe_with_nested_wait(&runner, &child, &calls, TerminalStatus::Completed, true)
+            .await;
+        runner
+            .confirm_durable_child_delivery(&child, "run-1", true)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("suspended")
+        );
+        assert!(store
+            .recover_broker_terminal_receipts(&child)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     async fn bind_local_control_plane(
