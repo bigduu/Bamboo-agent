@@ -1587,6 +1587,34 @@ fn apply_system_prompt_contexts_persists_shared_prompt_snapshot() {
 }
 
 #[test]
+fn marker_free_system_bytes_survive_child_execution_prep() {
+    let original = "  Host guidance Host guidance  \n";
+    let mut session = Session::new("child-prompt-receipt", "old-model");
+    session.add_message(Message::system(original));
+    session.add_message(Message::user("bounded assignment"));
+
+    crate::session_app::execution_prep::prepare_session_for_execution(
+        &mut session,
+        None,
+        Some("new-model"),
+    );
+
+    assert_eq!(session.messages[0].content, original);
+    assert_eq!(session.model, "new-model");
+}
+
+#[test]
+fn incomplete_legacy_marker_does_not_rewrite_system_bytes() {
+    let original = "  Keep <!-- BAMBOO_PROJECT_CONTEXT_START --> as text  \n";
+    let mut session = Session::new("incomplete-legacy-marker", "model");
+    session.add_message(Message::system(original));
+
+    crate::session_app::execution_prep::prepare_session_for_execution(&mut session, None, None);
+
+    assert_eq!(session.messages[0].content, original);
+}
+
+#[test]
 fn legacy_workspace_prompt_migration_recovers_metadata_and_strips_derived_sections_once() {
     let legacy_project = format!(
         "{}\nProject ID: legacy-project\nProject path: /legacy/workspace\nProject home: /private/project-home\n{}",
