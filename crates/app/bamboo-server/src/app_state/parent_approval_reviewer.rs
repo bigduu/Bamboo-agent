@@ -6,15 +6,56 @@
 //! own provider/model reviews the action off-loop; failures and ambiguous
 //! verdicts deny without opening a human approval prompt.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use bamboo_agent_core::{Message, Role};
+use bamboo_agent_core::{storage::Storage, Message, Role};
+use bamboo_domain::{
+    ParentQuestion, ParentRequest, ParentRequestKind, ParentRequestOption, SessionMessageEnvelope,
+    SessionMessageId,
+};
 use bamboo_engine::external_agents::actor_adapter::{ChildApprovalReview, ChildApprovalScope};
 use bamboo_engine::external_agents::ChildApprovalReviewer;
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 use bamboo_llm::{LLMChunk, ProviderModelRouter};
 use futures::StreamExt;
+use tokio::sync::watch;
+
+const EXPLICIT_REPLY_WINDOW: Duration = Duration::from_secs(10);
+
+struct LiveParentReview {
+    request: SessionMessageEnvelope,
+    scope: ChildApprovalScope,
+    body: serde_json::Value,
+    observed: Vec<bamboo_domain::ActorSession>,
+    policy_revision: u64,
+    changed: watch::Sender<u64>,
+}
+
+struct LiveReviewGuard<'a> {
+    reviews: &'a Mutex<HashMap<String, Arc<LiveParentReview>>>,
+    id: String,
+    current: Arc<LiveParentReview>,
+}
+
+impl Drop for LiveReviewGuard<'_> {
+    fn drop(&mut self) {
+        let mut reviews = self
+            .reviews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reviews
+            .get(&self.id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.current))
+        {
+            reviews.remove(&self.id);
+        }
+    }
+}
 
 const MAX_CONTEXT_MESSAGES: usize = 6;
 const MAX_CONTEXT_CHARS: usize = 1_800;
@@ -28,6 +69,10 @@ pub struct ParentAgentApprovalReviewer {
         Arc<bamboo_storage::SessionStoreV2>,
         Arc<bamboo_tools::permission::PermissionConfig>,
     )>,
+    shutdown: tokio_util::sync::CancellationToken,
+    live_reviews: Mutex<HashMap<String, Arc<LiveParentReview>>>,
+    explicit_reply_window: Duration,
+    question_coordinator: Option<Arc<super::parent_question_reconcile::ParentQuestionCoordinator>>,
 }
 
 impl ParentAgentApprovalReviewer {
@@ -43,7 +88,24 @@ impl ParentAgentApprovalReviewer {
             messenger,
             projects,
             canonical: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            live_reviews: Mutex::new(HashMap::new()),
+            explicit_reply_window: EXPLICIT_REPLY_WINDOW,
+            question_coordinator: None,
         }
+    }
+
+    pub fn with_shutdown_token(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    pub(super) fn with_question_coordinator(
+        mut self,
+        coordinator: Arc<super::parent_question_reconcile::ParentQuestionCoordinator>,
+    ) -> Self {
+        self.question_coordinator = Some(coordinator);
+        self
     }
 
     pub fn with_canonical_store(
@@ -60,6 +122,12 @@ impl ParentAgentApprovalReviewer {
         {
             self.canonical = Some((store, policy));
         }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_explicit_reply_window(mut self, window: Duration) -> Self {
+        self.explicit_reply_window = window;
         self
     }
 
@@ -86,6 +154,307 @@ impl ParentAgentApprovalReviewer {
             )
             .await
             .is_some_and(|(_, _, current)| current == observed)
+    }
+
+    fn register_live(&self, review: Arc<LiveParentReview>) -> Option<LiveReviewGuard<'_>> {
+        let id = review.request.id.to_string();
+        let mut reviews = self
+            .live_reviews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reviews.contains_key(&id) {
+            return None;
+        }
+        reviews.insert(id.clone(), review.clone());
+        Some(LiveReviewGuard {
+            reviews: &self.live_reviews,
+            id,
+            current: review,
+        })
+    }
+
+    async fn canonical_state(
+        &self,
+        request: &SessionMessageEnvelope,
+    ) -> Result<super::parent_permission_outcome::State, ()> {
+        let (store, _) = self.canonical.as_ref().ok_or(())?;
+        let parent = store
+            .load_session(&request.target_session_id)
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+        super::parent_permission_outcome::state(&parent, request)
+    }
+
+    async fn observed_terminal(
+        &self,
+        review: &LiveParentReview,
+        parent: &str,
+        child: &str,
+    ) -> Option<ChildApprovalReview> {
+        use super::parent_permission_outcome::State;
+        match self.canonical_state(&review.request).await {
+            Ok(State::Pending) => None,
+            Ok(State::Terminal(approved)) => Some(ChildApprovalReview::Reply(
+                approved
+                    && chrono::Utc::now() < review.scope.deadline()
+                    && self
+                        .current(
+                            &review.scope,
+                            parent,
+                            child,
+                            &review.body,
+                            (&review.observed, review.policy_revision),
+                        )
+                        .await,
+            )),
+            Ok(State::Missing) | Err(()) => Some(ChildApprovalReview::Reply(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl bamboo_server_tools::ParentRequestReplyPort for ParentAgentApprovalReviewer {
+    async fn resolve_message(
+        &self,
+        caller_session_id: &str,
+        request_id: &str,
+        message: &str,
+    ) -> Result<bamboo_server_tools::ParentRequestMessageReceipt, String> {
+        use bamboo_server_tools::ParentRequestMessageReceipt;
+        let (store, _) = self
+            .canonical
+            .as_ref()
+            .ok_or("ParentRequest authority is unavailable")?;
+        let id = SessionMessageId::parse(request_id).map_err(|_| "Invalid ParentRequest id")?;
+        let parent = store
+            .load_session(caller_session_id)
+            .await
+            .map_err(|_| "Canonical parent Session is unavailable")?
+            .ok_or("Canonical parent Session is unavailable")?;
+        let envelope = parent
+            .messages
+            .iter()
+            .filter(|item| item.id == id.as_str())
+            .try_fold(None, |found, item| {
+                if found.is_some() {
+                    None
+                } else {
+                    item.metadata
+                        .as_ref()?
+                        .get("session_message")
+                        .and_then(|marker| {
+                            serde_json::from_value::<SessionMessageEnvelope>(marker.clone()).ok()
+                        })
+                        .map(Some)
+                }
+            })
+            .ok_or("ParentRequest canonical transcript is ambiguous")?
+            .ok_or("ParentRequest is not in the direct parent Session")?;
+        if ParentQuestion::from_envelope(&envelope).is_some() {
+            bamboo_server_tools::validate_parent_answer_input(message).map_err(str::to_string)?;
+            let coordinator = self
+                .question_coordinator
+                .as_ref()
+                .ok_or("Direct-parent clarification authority is unavailable")?;
+            return coordinator
+                .resolve_answer(caller_session_id, request_id, message)
+                .await
+                .map(ParentRequestMessageReceipt::Clarification);
+        }
+        if ParentRequest::from_forced_permission_envelope(&envelope).is_some() {
+            let decision = match message {
+                "approve_once" => ParentRequestOption::ApproveOnce,
+                "deny" => ParentRequestOption::Deny,
+                _ => return Err("Forced permission reply requires approve_once or deny".into()),
+            };
+            return self
+                .resolve(caller_session_id, request_id, decision)
+                .await
+                .map(ParentRequestMessageReceipt::Permission);
+        }
+        Err("ParentRequest canonical kind is unsupported".into())
+    }
+
+    async fn resolve(
+        &self,
+        caller_session_id: &str,
+        request_id: &str,
+        decision: ParentRequestOption,
+    ) -> Result<bamboo_server_tools::ParentRequestReplyReceipt, String> {
+        use super::parent_permission_outcome::{self as outcome, State};
+        use bamboo_server_tools::{ParentRequestReplyReceipt, ParentRequestReplyState};
+
+        let (store, policy) = self
+            .canonical
+            .as_ref()
+            .ok_or("ParentRequest authority is unavailable")?;
+        let id = SessionMessageId::parse(request_id).map_err(|_| "Invalid ParentRequest id")?;
+        let parent = store
+            .load_session(caller_session_id)
+            .await
+            .map_err(|_| "Canonical parent Session is unavailable")?
+            .ok_or("Canonical parent Session is unavailable")?;
+        let envelope = parent
+            .messages
+            .iter()
+            .find(|message| message.id == id.as_str())
+            .and_then(|message| message.metadata.as_ref()?.get("session_message"))
+            .and_then(|marker| {
+                serde_json::from_value::<SessionMessageEnvelope>(marker.clone()).ok()
+            })
+            .ok_or("ParentRequest is not in the direct parent Session")?;
+        let typed = ParentRequest::from_forced_permission_envelope(&envelope)
+            .ok_or("ParentRequest canonical proof is invalid")?;
+        let child = store
+            .load_session(&typed.child.session_id)
+            .await
+            .map_err(|_| "Canonical Child Session is unavailable")?
+            .ok_or("Canonical Child Session is unavailable")?;
+        if ParentRequest::inspect_direct_parent(&parent, &child, &id) != Some(typed.clone())
+            || typed.parent.session_id != caller_session_id
+        {
+            return Err("Only the canonical direct parent may answer this request".into());
+        }
+        let winner = match outcome::state(&parent, &envelope)
+            .map_err(|_| "ParentRequest canonical state is invalid")?
+        {
+            State::Terminal(approved) => Some(approved),
+            State::Pending => None,
+            State::Missing => return Err("ParentRequest is not pending".into()),
+        };
+        if let Some(approved) = winner {
+            return Ok(ParentRequestReplyReceipt {
+                decision: if approved {
+                    ParentRequestOption::ApproveOnce
+                } else {
+                    ParentRequestOption::Deny
+                },
+                state: ParentRequestReplyState::AlreadyResolved,
+            });
+        }
+        if chrono::Utc::now() >= typed.deadline {
+            let state = outcome::expire(&self.sessions, &envelope)
+                .await
+                .map_err(|_| "Expired ParentRequest denial is unconfirmed")?;
+            if let Some(live) = self
+                .live_reviews
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(request_id)
+                .cloned()
+            {
+                live.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+            }
+            return match state {
+                State::Terminal(approved) => Ok(ParentRequestReplyReceipt {
+                    decision: if approved {
+                        ParentRequestOption::ApproveOnce
+                    } else {
+                        ParentRequestOption::Deny
+                    },
+                    state: ParentRequestReplyState::AlreadyResolved,
+                }),
+                _ => Err("Expired ParentRequest denial is unconfirmed".into()),
+            };
+        }
+        let live = self
+            .live_reviews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request_id)
+            .cloned()
+            .ok_or("ParentRequest has no current live Child approval scope")?;
+        let ParentRequestKind::ForcedPermission {
+            operation_digest,
+            policy_revision,
+            ..
+        } = &typed.kind;
+        let stamp = live.scope.stamp();
+        let live_request = serde_json::to_value(&live.request)
+            .map_err(|_| "Live ParentRequest proof is invalid")?;
+        let canonical_request = serde_json::to_value(&envelope)
+            .map_err(|_| "Canonical ParentRequest proof is invalid")?;
+        if live_request != canonical_request
+            || live.scope.deadline() != typed.deadline
+            || stamp.get("host_scope").and_then(serde_json::Value::as_str)
+                != Some(typed.activation.host_scope.as_str())
+            || stamp.get("attempt").and_then(serde_json::Value::as_u64)
+                != Some(u64::from(typed.activation.attempt))
+            || stamp.get("run").and_then(serde_json::Value::as_str)
+                != Some(typed.activation.run.as_str())
+            || stamp.get("epoch").and_then(serde_json::Value::as_u64)
+                != Some(typed.activation.epoch)
+            || stamp.get("reply").and_then(serde_json::Value::as_str)
+                != Some(typed.activation.reply.as_str())
+            || live.policy_revision != *policy_revision
+            || policy.policy_revision() != *policy_revision
+        {
+            return Err("ParentRequest activation or policy fence changed".into());
+        }
+        let permission: bamboo_tools::permission::PermissionRequest = serde_json::from_value(
+            live.body
+                .get("permission_request")
+                .cloned()
+                .ok_or("Live permission request is unavailable")?,
+        )
+        .map_err(|_| "Live permission request is invalid")?;
+        let digest = SessionMessageId::stable(
+            "permission-operation",
+            &serde_json::to_value(&permission).map_err(|_| "Live permission request is invalid")?,
+        );
+        if permission.request_generation != typed.generation
+            || permission.policy_revision != *policy_revision
+            || digest.as_str() != operation_digest
+            || !self
+                .current(
+                    &live.scope,
+                    caller_session_id,
+                    &typed.child.session_id,
+                    &live.body,
+                    (&live.observed, *policy_revision),
+                )
+                .await
+        {
+            return Err("ParentRequest live operation is no longer current".into());
+        }
+        let (state, recorded) = outcome::resolve_with_receipt(
+            &self.sessions,
+            &envelope,
+            decision == ParentRequestOption::ApproveOnce,
+        )
+        .await
+        .map_err(|_| "ParentRequest terminal persistence is unconfirmed")?;
+        live.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        if !self
+            .current(
+                &live.scope,
+                caller_session_id,
+                &typed.child.session_id,
+                &live.body,
+                (&live.observed, *policy_revision),
+            )
+            .await
+        {
+            return Err("ParentRequest live operation changed before delivery".into());
+        }
+        match state {
+            State::Terminal(approved) => Ok(ParentRequestReplyReceipt {
+                decision: if approved {
+                    ParentRequestOption::ApproveOnce
+                } else {
+                    ParentRequestOption::Deny
+                },
+                state: if recorded {
+                    ParentRequestReplyState::Recorded
+                } else {
+                    ParentRequestReplyState::AlreadyResolved
+                },
+            }),
+            _ => Err("ParentRequest terminal persistence is unconfirmed".into()),
+        }
     }
 }
 
@@ -239,6 +608,29 @@ impl ChildApprovalReviewer for ParentAgentApprovalReviewer {
         if outcome::commit(&self.sessions, &envelope, None, true).await != Ok(State::Pending) {
             return deny;
         }
+        // This only schedules a future fail-closed terminal for the durable
+        // request. It carries no live ChildApprovalScope or approval authority.
+        // A crash in this narrow post-commit window is covered by boot census.
+        if let Some((store, _)) = &self.canonical {
+            super::parent_permission_reconcile::spawn_deadline(
+                store,
+                &self.sessions,
+                envelope.clone(),
+                self.shutdown.clone(),
+            );
+        }
+        let (changed, _initial_receiver) = watch::channel(0_u64);
+        let live = Arc::new(LiveParentReview {
+            request: envelope.clone(),
+            scope: scope.clone(),
+            body: request.clone(),
+            observed: observed.clone(),
+            policy_revision: permission.policy_revision,
+            changed,
+        });
+        let Some(_live_guard) = self.register_live(live.clone()) else {
+            return deny;
+        };
         if self.messenger.activate_prepared(&admission).await.is_err()
             || !self
                 .current(
@@ -294,6 +686,45 @@ impl ChildApprovalReviewer for ParentAgentApprovalReviewer {
         if chrono::Utc::now() >= scope.deadline() {
             return finalize(false).await;
         }
+        // The parent model gets a real, bounded window to answer the visible
+        // request through SubAgent. The watch edge only wakes this task; the
+        // canonical transcript remains the decision authority.
+        let mut changed = live.changed.subscribe();
+        if let Some(result) = self
+            .observed_terminal(&live, parent_session_id, child_session_id)
+            .await
+        {
+            return result;
+        }
+        let remaining = (scope.deadline() - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        let explicit_window = self.explicit_reply_window.min(remaining);
+        if !explicit_window.is_zero() {
+            let window = tokio::time::sleep(explicit_window);
+            tokio::pin!(window);
+            loop {
+                tokio::select! {
+                    _ = &mut window => break,
+                    changed_result = changed.changed() => {
+                        if changed_result.is_err() { return finalize(false).await; }
+                        if let Some(result) = self.observed_terminal(&live, parent_session_id, child_session_id).await {
+                            return result;
+                        }
+                    }
+                    _ = self.shutdown.cancelled() => return deny,
+                }
+            }
+        }
+        if let Some(result) = self
+            .observed_terminal(&live, parent_session_id, child_session_id)
+            .await
+        {
+            return result;
+        }
+        if chrono::Utc::now() >= scope.deadline() {
+            return finalize(false).await;
+        }
         let Some(action) = super::parent_permission_request::reviewer_action(&permission) else {
             tracing::warn!("parent approval action is private, incomplete or oversized; denying");
             return finalize(false).await;
@@ -305,7 +736,7 @@ impl ChildApprovalReviewer for ParentAgentApprovalReviewer {
                 child_session_id,
                 "parent approval reviewer found no parent model; denying"
             );
-            return deny;
+            return finalize(false).await;
         };
         let provider = match self.provider_router.route(&model_ref) {
             Ok(provider) => provider,
@@ -316,7 +747,7 @@ impl ChildApprovalReviewer for ParentAgentApprovalReviewer {
                     %error,
                     "parent approval reviewer could not route parent model; denying"
                 );
-                return deny;
+                return finalize(false).await;
             }
         };
 
@@ -371,13 +802,25 @@ impl ChildApprovalReviewer for ParentAgentApprovalReviewer {
             }
             Ok::<_, ()>(parse_review_verdict(&content))
         };
-        let remaining = (scope.deadline() - chrono::Utc::now())
-            .to_std()
-            .unwrap_or_default();
-        let approved = match tokio::time::timeout(remaining, review).await {
-            Ok(Ok(value)) => value,
-            Err(_) => false, // Fixed request deadline, never refreshed on retry.
-            Ok(Err(())) => return deny, // Failed relay/model is unconfirmed, not a durable Denied.
+        let mut review = Box::pin(review);
+        let approved = loop {
+            let remaining = (scope.deadline() - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            tokio::select! {
+                changed_result = changed.changed() => {
+                    if changed_result.is_err() { return finalize(false).await; }
+                    if let Some(result) = self.observed_terminal(&live, parent_session_id, child_session_id).await {
+                        return result;
+                    }
+                }
+                reviewed = &mut review => break match reviewed {
+                    Ok(value) => value,
+                    Err(()) => return finalize(false).await,
+                },
+                _ = tokio::time::sleep(remaining) => return finalize(false).await,
+                _ = self.shutdown.cancelled() => return deny,
+            }
         };
         tracing::info!(
             parent_session_id,
@@ -551,7 +994,8 @@ mod tests {
                 Some(Arc::new(
                     bamboo_tools::permission::PermissionConfig::default(),
                 )),
-            );
+            )
+            .with_explicit_reply_window(Duration::ZERO);
             let request = PermissionRequest {
                 request_id: "forced-call/1".into(),
                 request_generation: PermissionRequest::fresh_generation(),
@@ -627,6 +1071,339 @@ mod tests {
         }
     }
 
+    async fn await_live_request(f: &Fixture) -> SessionMessageEnvelope {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let parent = f
+                    .store
+                    .load_session("approval-parent")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let Some(envelope) = parent.messages.iter().find_map(|message| {
+                    let marker = message.metadata.as_ref()?.get("session_message")?;
+                    let envelope: SessionMessageEnvelope =
+                        serde_json::from_value(marker.clone()).ok()?;
+                    (ParentRequest::from_forced_permission_envelope(&envelope).is_some()
+                        && f.reviewer
+                            .live_reviews
+                            .lock()
+                            .unwrap()
+                            .contains_key(envelope.id.as_str()))
+                    .then_some(envelope)
+                }) {
+                    return envelope;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("live ParentRequest was not registered")
+    }
+
+    #[tokio::test]
+    async fn direct_parent_reply_records_one_terminal_and_wakes_scoped_review() {
+        use bamboo_server_tools::{ParentRequestReplyPort, ParentRequestReplyState};
+        for (decision, approved) in [
+            (ParentRequestOption::ApproveOnce, true),
+            (ParentRequestOption::Deny, false),
+        ] {
+            let mut f = Fixture::new().await;
+            f.reviewer.explicit_reply_window = Duration::from_secs(30);
+            let review = f.scoped(&f.body);
+            let reply = async {
+                let envelope = await_live_request(&f).await;
+                let receipt = f
+                    .reviewer
+                    .resolve("approval-parent", envelope.id.as_str(), decision)
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.state, ParentRequestReplyState::Recorded);
+                assert_eq!(receipt.decision, decision);
+                envelope
+            };
+            let (reviewed, envelope) = tokio::join!(review, reply);
+            assert_eq!(reviewed, ChildApprovalReview::Reply(approved));
+            assert_eq!(
+                f.probe.0.load(Ordering::SeqCst),
+                0,
+                "explicit parent reply must preempt the hidden fallback"
+            );
+            let parent = f
+                .store
+                .load_session("approval-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                super::super::parent_permission_outcome::state(&parent, &envelope),
+                Ok(super::super::parent_permission_outcome::State::Terminal(
+                    approved
+                ))
+            );
+            assert_eq!(parent.messages.len(), 2);
+            let again = f
+                .reviewer
+                .resolve(
+                    "approval-parent",
+                    envelope.id.as_str(),
+                    ParentRequestOption::ApproveOnce,
+                )
+                .await
+                .unwrap();
+            assert_eq!(again.state, ParentRequestReplyState::AlreadyResolved);
+            assert_eq!(
+                again.decision,
+                if approved {
+                    ParentRequestOption::ApproveOnce
+                } else {
+                    ParentRequestOption::Deny
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_message_dispatch_preserves_forced_permission_decision_vocabulary() {
+        use bamboo_server_tools::{ParentRequestMessageReceipt, ParentRequestReplyPort};
+        let mut f = Fixture::new().await;
+        f.reviewer.explicit_reply_window = Duration::from_secs(30);
+        let review = f.scoped(&f.body);
+        let reply = async {
+            let envelope = await_live_request(&f).await;
+            assert!(f
+                .reviewer
+                .resolve_message("approval-parent", envelope.id.as_str(), "approve",)
+                .await
+                .is_err());
+            let receipt = f
+                .reviewer
+                .resolve_message("approval-parent", envelope.id.as_str(), "deny")
+                .await
+                .unwrap();
+            assert!(matches!(receipt,
+                ParentRequestMessageReceipt::Permission(receipt)
+                    if receipt.decision == ParentRequestOption::Deny));
+        };
+        let (reviewed, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(review, reply)
+        })
+        .await
+        .expect("exact model message must wake the scoped review");
+        assert_eq!(reviewed, ChildApprovalReview::Reply(false));
+    }
+
+    #[tokio::test]
+    async fn short_explicit_window_precedes_bounded_hidden_fallback() {
+        let mut f = Fixture::new().await;
+        f.reviewer.explicit_reply_window = Duration::from_millis(100);
+        let review = f.scoped(&f.body);
+        let check_window = async {
+            let _ = await_live_request(&f).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(
+                f.probe.0.load(Ordering::SeqCst),
+                0,
+                "hidden reviewer started before the explicit reply window"
+            );
+        };
+        let (reviewed, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(review, check_window)
+        })
+        .await
+        .expect("short fallback window must not stall the Child");
+        assert_eq!(reviewed, ChildApprovalReview::Reply(false));
+        assert_eq!(f.probe.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_parent_reply_and_other_reviewer_share_one_cas_winner() {
+        use bamboo_server_tools::{ParentRequestReplyPort, ParentRequestReplyState};
+        let mut f = Fixture::new().await;
+        f.reviewer.explicit_reply_window = Duration::from_secs(30);
+        let mut review = Box::pin(f.scoped(&f.body));
+        let envelope = tokio::select! {
+            _ = &mut review => panic!("review finished before a parent reply"),
+            envelope = await_live_request(&f) => envelope,
+        };
+        let (reply, other) = tokio::join!(
+            f.reviewer.resolve(
+                "approval-parent",
+                envelope.id.as_str(),
+                ParentRequestOption::ApproveOnce
+            ),
+            super::super::parent_permission_outcome::resolve_with_receipt(
+                &f.reviewer.sessions,
+                &envelope,
+                false
+            ),
+        );
+        if let Some(live) = f
+            .reviewer
+            .live_reviews
+            .lock()
+            .unwrap()
+            .get(envelope.id.as_str())
+        {
+            live.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        let reply = reply.unwrap();
+        let (other_state, other_wrote) = other.unwrap();
+        assert_eq!(
+            reply.state == ParentRequestReplyState::Recorded,
+            !other_wrote
+        );
+        let winner = matches!(
+            other_state,
+            super::super::parent_permission_outcome::State::Terminal(true)
+        );
+        assert_eq!(
+            reply.decision,
+            if winner {
+                ParentRequestOption::ApproveOnce
+            } else {
+                ParentRequestOption::Deny
+            }
+        );
+        assert_eq!(review.await, ChildApprovalReview::Reply(winner));
+        let parent = f
+            .store
+            .load_session("approval-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lost_live_scope_rejects_reply_and_restart_expires_pending_request() {
+        use bamboo_server_tools::{ParentRequestReplyPort, ParentRequestReplyState};
+        let mut f = Fixture::new().await;
+        f.reviewer.explicit_reply_window = Duration::from_secs(30);
+        let generation = f.body["permission_request"]["request_generation"]
+            .as_str()
+            .unwrap();
+        let short_scope = ChildApprovalScope::new(
+            "approval-parent",
+            "approval-child",
+            (
+                0,
+                "fixture-run",
+                1,
+                "fixture-reply",
+                chrono::Utc::now() + chrono::Duration::seconds(1),
+            ),
+            f.router.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        );
+        f.scopes
+            .lock()
+            .unwrap()
+            .insert(generation.into(), short_scope);
+        let mut review = Box::pin(f.scoped(&f.body));
+        let envelope = tokio::select! {
+            _ = &mut review => panic!("review finished before scope loss"),
+            envelope = await_live_request(&f) => envelope,
+        };
+        drop(review);
+        f.reviewer.shutdown.cancel(); // Simulate process exit; its timer cannot settle the request.
+        assert!(f.reviewer.live_reviews.lock().unwrap().is_empty());
+        assert!(f
+            .reviewer
+            .resolve(
+                "approval-parent",
+                envelope.id.as_str(),
+                ParentRequestOption::ApproveOnce
+            )
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cold = Arc::new(
+            bamboo_storage::SessionStoreV2::new(f.home.path().into())
+                .await
+                .unwrap(),
+        );
+        let report = super::super::parent_permission_reconcile::reconcile_startup(
+            &cold,
+            &f.reviewer.sessions,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.denied, 1);
+        let parent = cold.load_session("approval-parent").await.unwrap().unwrap();
+        assert_eq!(
+            super::super::parent_permission_outcome::state(&parent, &envelope),
+            Ok(super::super::parent_permission_outcome::State::Terminal(
+                false
+            ))
+        );
+        let stale = f
+            .reviewer
+            .resolve(
+                "approval-parent",
+                envelope.id.as_str(),
+                ParentRequestOption::ApproveOnce,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.state, ParentRequestReplyState::AlreadyResolved);
+        assert_eq!(stale.decision, ParentRequestOption::Deny);
+    }
+
+    #[tokio::test]
+    async fn cancelled_activation_cannot_answer_pending_parent_request() {
+        use bamboo_server_tools::ParentRequestReplyPort;
+        let mut f = Fixture::new().await;
+        f.reviewer.explicit_reply_window = Duration::from_secs(30);
+        let generation = f.body["permission_request"]["request_generation"]
+            .as_str()
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let scope = ChildApprovalScope::new(
+            "approval-parent",
+            "approval-child",
+            (
+                0,
+                "fixture-run",
+                1,
+                "fixture-reply",
+                chrono::Utc::now() + chrono::Duration::seconds(240),
+            ),
+            f.router.clone(),
+            cancel.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        );
+        f.scopes.lock().unwrap().insert(generation.into(), scope);
+        let mut review = Box::pin(f.scoped(&f.body));
+        let envelope = tokio::select! {
+            _ = &mut review => panic!("review finished before activation cancellation"),
+            envelope = await_live_request(&f) => envelope,
+        };
+        cancel.cancel();
+        assert!(f
+            .reviewer
+            .resolve(
+                "approval-parent",
+                envelope.id.as_str(),
+                ParentRequestOption::ApproveOnce
+            )
+            .await
+            .is_err());
+        drop(review);
+        let parent = f
+            .store
+            .load_session("approval-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::super::parent_permission_outcome::state(&parent, &envelope),
+            Ok(super::super::parent_permission_outcome::State::Pending)
+        );
+    }
+
     #[tokio::test]
     async fn durable_request_retry_is_exact_and_cold_readable() {
         let f = Fixture::new().await;
@@ -686,6 +1463,18 @@ mod tests {
         assert_eq!(claims.len(), 1);
         let envelope = &claims[0].envelope;
         let typed = ParentRequest::inspect_direct_parent(&parent, &child, &envelope.id).unwrap();
+        for field in ["thread_id", "attempt", "correlation_id"] {
+            let mut altered = serde_json::to_value(envelope).unwrap();
+            altered[field] = match field {
+                "attempt" => json!(1),
+                _ => json!("untrusted-routing-metadata"),
+            };
+            let altered: SessionMessageEnvelope = serde_json::from_value(altered).unwrap();
+            assert!(
+                ParentRequest::from_forced_permission_envelope(&altered).is_none(),
+                "a ParentRequest must not carry {field}"
+            );
+        }
         assert_eq!(typed.id, envelope.id);
         assert_eq!(typed.parent.session_id, parent.id);
         assert_eq!(typed.child.session_id, child.id);
@@ -710,6 +1499,18 @@ mod tests {
             serde_json::from_value(terminal_marker.clone()).unwrap();
         let resolution =
             ParentResolution::from_forced_permission_terminal(envelope, &terminal).unwrap();
+        for field in ["thread_id", "attempt", "correlation_id"] {
+            let mut altered = serde_json::to_value(&terminal).unwrap();
+            altered[field] = match field {
+                "attempt" => json!(1),
+                _ => json!("untrusted-routing-metadata"),
+            };
+            let altered: SessionMessageEnvelope = serde_json::from_value(altered).unwrap();
+            assert!(
+                ParentResolution::from_forced_permission_terminal(envelope, &altered).is_none(),
+                "a ParentResolution must not carry {field}"
+            );
+        }
         assert_eq!(resolution.request_id, envelope.id);
         assert_eq!(resolution.decision, ParentRequestOption::Deny);
 

@@ -185,12 +185,18 @@ pub(super) async fn initialize_loop_state(
         runtime_state.checkpoints = previous.checkpoints.clone();
         runtime_state.hook_contexts = previous.hook_contexts.clone();
         runtime_state.stop_hook_forced_continuations = previous.stop_hook_forced_continuations;
-        // An interrupted tool-owned wait remains durable during this reasoning
-        // turn. Carry its identity, never the old suspended execution status.
+        // An interrupted wait remains durable during this reasoning turn.
+        // The inbox coordinator prepares an explicit interruption by clearing
+        // the suspension and setting Idle while retaining the existing wait.
+        // Preserve that exact lease, including an untagged safety-net wait;
+        // ordinary Suspended untagged waits still follow the startup cleanup.
+        let prepared_wait_interrupt = previous.status == AgentStatusState::Idle
+            && previous.suspension.is_none()
+            && session.last_run_status().as_deref() == Some("suspended");
         runtime_state.waiting_for_children = previous
             .waiting_for_children
             .as_ref()
-            .filter(|wait| wait.registered_by_tool_call_id.is_some())
+            .filter(|wait| wait.registered_by_tool_call_id.is_some() || prepared_wait_interrupt)
             .cloned();
     }
     runtime_state.llm.model_name = Some(model_name.clone());
@@ -450,11 +456,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_tagged_wait_survives_real_auto_catalog_publication_without_suspending() {
+    async fn startup_preserves_prepared_interrupt_wait_without_reviving_suspended_untagged_wait() {
         use bamboo_agent_core::storage::Storage;
         use bamboo_domain::{ChildWaitPolicy, WaitingForChildrenState};
 
-        for tagged in [true, false] {
+        for (tagged, prepared_interrupt) in [(true, false), (false, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let skills_dir = directory.path().join("skills");
             std::fs::create_dir_all(&skills_dir).unwrap();
@@ -489,8 +495,15 @@ mod tests {
             if tagged {
                 wait.registered_by_tool_call_id = Some("original-tool-call".into());
             }
+            if prepared_interrupt {
+                session.set_last_run_status("suspended");
+            }
             let runtime = session.agent_runtime_state.get_or_insert_default();
-            runtime.status = AgentStatusState::Suspended;
+            runtime.status = if prepared_interrupt {
+                AgentStatusState::Idle
+            } else {
+                AgentStatusState::Suspended
+            };
             runtime.waiting_for_children = Some(wait.clone());
             storage.save_session(&session).await.unwrap();
             let tools = SuccessfulLoadSkill::default();
@@ -512,7 +525,7 @@ mod tests {
                 Some("auto")
             );
             let saved = storage.load_session(&session.id).await.unwrap().unwrap();
-            let expected = tagged.then_some(&wait);
+            let expected = (tagged || prepared_interrupt).then_some(&wait);
             for runtime in [
                 &state.runtime_state,
                 session.agent_runtime_state.as_ref().unwrap(),

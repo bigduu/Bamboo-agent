@@ -2422,4 +2422,109 @@ mod tests {
             Some("keep")
         );
     }
+
+    #[tokio::test]
+    async fn repository_final_save_publishes_host_checkpointed_parent_question() {
+        use bamboo_domain::{
+            FunctionCall, ParentQuestion, ParentQuestionCheckpointV1, PendingQuestion,
+            PendingQuestionSource, ToolCall,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let repo = test_repo(storage);
+        let parent = Session::new("repository-question-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child =
+            Session::new_child_of("repository-question-child", &parent, "model", "assignment");
+        child.add_message(bamboo_agent_core::Message::user("assignment"));
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        cache_put(&repo, &child);
+
+        let assistant = bamboo_agent_core::Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "question-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AgenticQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        );
+        let result = bamboo_agent_core::Message::tool_result_with_status(
+            "question-call",
+            "Clarification needed: Which option?",
+            true,
+        );
+        let pending = PendingQuestion {
+            tool_call_id: "question-call".into(),
+            tool_name: "AgenticQuestion".into(),
+            question: "Which option?".into(),
+            options: vec!["A".into(), "B".into()],
+            allow_custom: true,
+            source: PendingQuestionSource::AgenticClarification,
+        };
+        let observation = ParentQuestionCheckpointV1 {
+            version: 1,
+            prefix_message_count: child.messages.len(),
+            prefix_digest: ParentQuestion::prefix_digest(&child.messages).unwrap(),
+            suffix: vec![assistant, result.clone()],
+            tool_call_id: pending.tool_call_id.clone(),
+            tool_result_message_id: result.id.clone(),
+            question_digest: ParentQuestion::question_digest(&pending, &result.id),
+            pending,
+        };
+        let (_, question) = store
+            .checkpoint_parent_question(&child, &parent, &observation)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut old_run = child.clone();
+        old_run.metadata.insert(
+            "runtime.actor_parent_question_handoff".into(),
+            "true".into(),
+        );
+        old_run.set_last_run_status("suspended");
+        old_run.add_message(bamboo_agent_core::Message::assistant(
+            "old terminal text",
+            None,
+        ));
+        cache_put(&repo, &old_run);
+        bamboo_domain::RuntimeSessionPersistence::save_runtime_session(&repo, &mut old_run)
+            .await
+            .unwrap();
+
+        let cached = repo.load(&child.id).await.unwrap();
+        let reopened = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .unwrap()
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for saved in [&cached, &reopened] {
+            assert_eq!(saved.last_run_status().as_deref(), Some("suspended"));
+            assert_eq!(saved.messages.len(), child.messages.len() + 2);
+            assert!(!saved
+                .messages
+                .iter()
+                .any(|message| message.content == "old terminal text"));
+            assert_eq!(
+                saved.pending_question.as_ref().unwrap().source,
+                PendingQuestionSource::DirectParent
+            );
+            assert_eq!(
+                ParentQuestion::for_pending(&parent, saved).unwrap().id,
+                question.id
+            );
+        }
+    }
 }

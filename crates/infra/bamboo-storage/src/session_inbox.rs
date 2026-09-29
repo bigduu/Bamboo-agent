@@ -785,7 +785,7 @@ impl FileSessionInbox {
         }
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
-        for queue in ["new", "cur", "cancelled"] {
+        for queue in ["new", "cur", "cancelled", "dead"] {
             for (generation, _name, path) in
                 Self::owned_queue_entries(dir, queue, filesystem).await?
             {
@@ -1143,6 +1143,59 @@ impl SessionInboxPort for FileSessionInbox {
         self.inspect_owned_impl(target, limit, now).await
     }
 
+    async fn inspect_wake_readiness(
+        &self,
+        target: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bamboo_domain::SessionInboxWakeReadiness, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        owned::complete_owned(async move { inbox.inspect_wake_readiness_impl(&target, now).await })
+            .await
+    }
+
+    async fn fail_owned(
+        &self,
+        target: &str,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+        report: &bamboo_domain::SessionInboxFailureReport,
+    ) -> Result<bamboo_domain::SessionInboxFailureOutcome, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let claim = claim.clone();
+        let report = report.clone();
+        owned::complete_owned(async move { inbox.fail_owned_impl(&target, &claim, &report).await })
+            .await
+    }
+
+    async fn inspect_dead_letters(
+        &self,
+        target: &str,
+        limit: usize,
+        _principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
+    ) -> Result<Vec<bamboo_domain::SessionInboxDeadLetterInspection>, SessionInboxError> {
+        self.inspect_dead_letters_impl(target, limit).await
+    }
+
+    async fn retry_dead_letter(
+        &self,
+        target: &str,
+        id: &SessionMessageId,
+        generation: u64,
+        now: chrono::DateTime<Utc>,
+        _principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let id = id.clone();
+        owned::complete_owned(async move {
+            inbox
+                .retry_dead_letter_impl(&target, &id, generation, now)
+                .await
+        })
+        .await
+    }
+
     async fn deliver(
         &self,
         envelope: &SessionMessageEnvelope,
@@ -1325,7 +1378,7 @@ impl SessionInboxPort for FileSessionInbox {
                             if let Ok(envelope) =
                                 serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
                             {
-                                if envelope.guidance_waits_for_run(run_id) {
+                                if envelope.waits_for_successor_of_run(run_id) {
                                     continue;
                                 }
                             }
@@ -1584,7 +1637,10 @@ mod owned_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{Session, Storage};
+    use bamboo_domain::{
+        Session, SessionChildOutcome, SessionMessageBody, SessionMessageKind, SessionMessageSource,
+        Storage,
+    };
     use tempfile::TempDir;
 
     async fn fixture(
@@ -1711,6 +1767,51 @@ mod tests {
             .await
             .unwrap()
             .activation_pending());
+    }
+
+    #[tokio::test]
+    async fn child_outcome_admitted_during_run_is_claimable_only_by_successor() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let mut outcome = SessionMessageEnvelope {
+            id: bamboo_domain::SessionMessageId::parse("grandchild-outcome").unwrap(),
+            source: SessionMessageSource::Runtime {
+                subsystem: "child_completion_coordinator".into(),
+            },
+            target_session_id: "session-1".into(),
+            kind: SessionMessageKind::ChildOutcome,
+            body: SessionMessageBody::ChildOutcome(SessionChildOutcome {
+                child_session_id: "grandchild".into(),
+                status: "completed".into(),
+                result: Some("done".into()),
+                error: None,
+                provider_message: None,
+            }),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: Some("child_completion_after_run:old-run".into()),
+        };
+        let first = inbox.deliver(&outcome).await.unwrap();
+        authorize_latest(&inbox).await;
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        assert!(reopened
+            .claim_for_turn("session-1", 1, Some("old-run"))
+            .await
+            .unwrap()
+            .is_empty());
+        outcome.correlation_id = Some("child_completion_after_run:new-run".into());
+        assert_eq!(reopened.deliver(&outcome).await.unwrap(), first);
+        let claims = reopened
+            .claim_for_turn("session-1", 1, Some("new-run"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id, outcome.id);
+        assert_eq!(
+            claims[0].envelope.correlation_id.as_deref(),
+            Some("child_completion_after_run:old-run")
+        );
     }
 
     #[tokio::test]

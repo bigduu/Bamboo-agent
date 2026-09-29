@@ -120,7 +120,7 @@ pub async fn create_child_action(
                 bamboo_domain::ChildContextPacketError::Budget.to_string(),
             ));
         }
-        let parent = port.load_root_session(&input.parent_session.id).await?;
+        let parent = port.load_parent_session(&input.parent_session.id).await?;
         if parent.created_at != input.parent_session.created_at {
             return Err(ChildSessionError::InvalidArguments(
                 "invalid_child_context_packet: parent lifetime changed".into(),
@@ -1058,7 +1058,7 @@ pub async fn send_message_to_child_action_with_gate(
         // Live messages intentionally retain their non-suspending semantics.
         let armed_wait = wait_if_queued && !is_running;
         let had_wait = if armed_wait {
-            port.load_root_session(&parent.id)
+            port.load_parent_session(&parent.id)
                 .await?
                 .agent_runtime_state
                 .as_ref()

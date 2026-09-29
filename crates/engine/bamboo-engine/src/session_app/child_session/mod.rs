@@ -14,6 +14,7 @@ mod actions;
 mod helpers;
 mod inspection;
 pub mod named_profile;
+pub mod owned_tree;
 mod result_projection;
 
 #[cfg(test)]
@@ -320,6 +321,21 @@ pub trait ChildSessionPort: Send + Sync {
     }
 
     async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError>;
+    /// Load a direct parent for child lifecycle operations. Server-backed
+    /// implementations may admit a canonical Child as the direct parent;
+    /// legacy embeddings remain Root-only until they opt in explicitly.
+    async fn load_parent_session(&self, parent_id: &str) -> Result<Session, ChildSessionError> {
+        self.load_root_session(parent_id).await
+    }
+    /// Load the current tree caller from durable Session storage. A default
+    /// embedding supports Root callers only; child inspection requires an
+    /// implementation that can reload arbitrary logical sessions by ID.
+    async fn load_tree_caller_session(
+        &self,
+        caller_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.load_root_session(caller_id).await
+    }
     async fn load_child_for_parent(
         &self,
         parent_id: &str,
@@ -469,6 +485,13 @@ pub trait ChildSessionPort: Send + Sync {
     }
     async fn is_child_running(&self, child_id: &str) -> bool;
     async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry>;
+    /// One bounded rebuildable candidate index for tree inspection. Every
+    /// returned ID is still reloaded from durable Session storage before display.
+    async fn tree_index_snapshot(
+        &self,
+    ) -> Result<Option<Vec<(String, String)>>, ChildSessionError> {
+        Ok(None)
+    }
     async fn enqueue_child_run(
         &self,
         parent: &Session,

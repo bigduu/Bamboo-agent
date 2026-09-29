@@ -18,6 +18,10 @@ pub struct WorkerHostObservation {
     pub role: Option<String>,
     pub credential_expires_at: DateTime<Utc>,
     pub connection_generation: String,
+    /// Claimed by this authenticated subscriber for the current connection.
+    /// The Host still sends a versioned Run and the Worker validates its lease.
+    #[serde(default)]
+    pub environment_lease_v1: bool,
 }
 
 /// Client → broker.
@@ -40,6 +44,9 @@ pub enum ClientFrame {
     /// Start receiving this client's own mailbox (push). Backlog (incl. crash
     /// leftovers) is delivered first, then new messages as they arrive.
     Subscribe,
+    /// Worker opts in to fixed-remote EnvironmentLease runs on this authenticated
+    /// subscription. Old brokers reject this unknown frame, failing closed.
+    SubscribeEnvironmentLeaseV1,
     /// Acknowledge a processed message so the broker deletes it (at-least-once;
     /// an unacked message is re-pushed on the next subscribe).
     Ack { id: MsgId },
@@ -169,6 +176,7 @@ mod tests {
                 batch: event_batch(),
             },
             ClientFrame::Subscribe,
+            ClientFrame::SubscribeEnvironmentLeaseV1,
             ClientFrame::Ack { id: MsgId::new() },
             ClientFrame::Cancel {
                 to: "child".into(),
@@ -236,6 +244,7 @@ mod tests {
                     role: Some("gpu-pool".into()),
                     credential_expires_at: Utc::now(),
                     connection_generation: MsgId::new().0,
+                    environment_lease_v1: true,
                 }),
             },
         ];
@@ -259,6 +268,19 @@ mod tests {
                 id: None,
             }
         );
+    }
+
+    #[test]
+    fn old_host_observation_does_not_claim_environment_lease() {
+        let legacy = serde_json::json!({
+            "host_ref": "old-worker",
+            "mailbox": "worker",
+            "role": "gpu",
+            "credential_expires_at": Utc::now(),
+            "connection_generation": "old-generation"
+        });
+        let observation: WorkerHostObservation = serde_json::from_value(legacy).unwrap();
+        assert!(!observation.environment_lease_v1);
     }
 
     fn event_batch() -> ActorEventBatch {

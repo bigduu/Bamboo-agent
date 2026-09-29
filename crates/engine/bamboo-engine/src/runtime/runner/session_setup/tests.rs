@@ -1111,6 +1111,93 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_names.contains("mcp__external__read"));
 }
 
+#[tokio::test]
+async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_tools() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "SubAgent",
+            "ask_agent",
+            "deploy_agent",
+            "cluster",
+            "default::ask_agent",
+            "default::deploy_agent",
+            "default::cluster",
+            "Plan",
+            "Bash",
+            "load_skill",
+            "mcp__external__read",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let root = Session::new("standard-root", "model");
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &root);
+    let names = catalog
+        .iter()
+        .map(|entry| entry.execution_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(names.contains("SubAgent"));
+    for hidden in [
+        "ask_agent",
+        "deploy_agent",
+        "cluster",
+        "default::ask_agent",
+        "default::deploy_agent",
+        "default::cluster",
+    ] {
+        assert!(!names.contains(hidden), "{hidden}");
+    }
+    for ordinary in ["Plan", "Bash", "load_skill", "mcp__external__read"] {
+        assert!(names.contains(ordinary), "{ordinary}");
+    }
+    assert_eq!(
+        resolve_available_tool_schemas_for_session(&config, &tools, &root)
+            .into_iter()
+            .map(|entry| entry.function.name)
+            .collect::<std::collections::BTreeSet<_>>(),
+        names.into_iter().map(str::to_owned).collect()
+    );
+
+    let child = Session::new_child_of("child", &root, "model", "child");
+    let child_catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &child);
+    let child_names = child_catalog
+        .iter()
+        .map(|entry| entry.execution_name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(child_names.contains("SubAgent"));
+    for hidden in [
+        "ask_agent",
+        "deploy_agent",
+        "cluster",
+        "default::ask_agent",
+        "default::deploy_agent",
+        "default::cluster",
+    ] {
+        assert!(!child_names.contains(hidden), "{hidden}");
+    }
+    let child_provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &child)
+        .into_iter()
+        .map(|entry| entry.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(child_provider_names, child_names);
+    let child_discovery_names =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&child_catalog)
+            .into_iter()
+            .map(|entry| entry.canonical_name)
+            .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(child_discovery_names, child_names);
+
+    // Presentation filtering must leave legacy direct invocation registered.
+    let call: ToolCall = serde_json::from_value(serde_json::json!({
+        "id": "legacy-call", "type": "function",
+        "function": {"name": "ask_agent", "arguments": "{}"}
+    }))
+    .unwrap();
+    assert_eq!(tools.execute(&call).await.unwrap().result, "ok");
+}
+
 #[test]
 fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
     let config = crate::runtime::config::AgentLoopConfig::default();

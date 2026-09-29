@@ -400,6 +400,12 @@ async fn verify_reused_worker(home: &std::path::Path, base_url: &str, probe: &Pr
                     ChildFrame::ApprovalRequest { .. } => {
                         panic!("ordinary effort cannot request authority")
                     }
+                    ChildFrame::OwnedTreeRequest { .. } => {
+                        panic!("ordinary effort cannot request a Host tree")
+                    }
+                    ChildFrame::SubAgentRequest { .. } => {
+                        panic!("ordinary effort cannot request a Host SubAgent operation")
+                    }
                     ChildFrame::SessionMessageAdmitted { .. } => panic!("no initial deliveries"),
                     ChildFrame::Event { .. } => {}
                 }

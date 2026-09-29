@@ -656,9 +656,10 @@ async fn fixture(case: Case) {
     if case.forced() {
         let cold = SessionStoreV2::new(data.clone()).await.unwrap();
         let parent = cold.load_session("native-root").await.unwrap().unwrap();
-        assert!(parent.messages.iter().any(|message| message
-            .content
-            .contains("requests a forced permission decision")));
+        assert!(parent
+            .messages
+            .iter()
+            .any(|message| message.content.contains("SubAgent(reply_to=")));
         let records: Vec<_> = parent
             .messages
             .iter()

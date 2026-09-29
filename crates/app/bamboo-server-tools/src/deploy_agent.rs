@@ -1,10 +1,10 @@
 //! `deploy_agent` — the AI-callable "spin up a worker myself" tool.
 //!
-//! Lets a running (root) agent deploy a new broker-agent worker on demand — as a
-//! local subprocess, in a Docker container, or on a remote host over SSH — wired
-//! to the configured broker. The agent then commands it with `ask_agent` by the
-//! returned id. Deployed handles are kept alive in a registry (they are
-//! kill-on-drop) and torn down via `action=stop` (or when the server exits).
+//! Standalone callers can deploy a broker worker on demand — as a local
+//! subprocess, in Docker, or over SSH — and command it with `ask_agent`.
+//! Host-bound deployment fails closed until a launcher can bind the worker to
+//! its canonical Child Session. Existing handles remain manageable via
+//! `action=stop` and are killed when the server exits.
 //!
 //! Only registered on the Root surface when a broker is configured.
 
@@ -90,22 +90,61 @@ pub(crate) struct ResolvedDeployment {
 }
 
 /// Resolve a live physical handle only after checking its saved Host identity
-/// and exact running activation. This does not grant transcript authority.
+/// and exact running activation. A configured Host store makes an unbound
+/// broker peer, physical worker id, or stale alias invalid. This does not grant
+/// transcript authority.
 pub(crate) async fn resolve_deployed_target(
     registry: &DeployedRegistry,
     store: Option<&Arc<SessionStoreV2>>,
     caller: Option<&str>,
     target: &str,
 ) -> Result<Option<ResolvedDeployment>, ToolError> {
+    resolve_target(registry, store, caller, target, false).await
+}
+
+/// Preserve the direct cluster/fabric compatibility route for a currently
+/// registered node worker. A configured node is capacity, not an ActorSession;
+/// this must not be used as a logical actor lookup or a general broker fallback.
+pub(crate) async fn resolve_ask_target(
+    registry: &DeployedRegistry,
+    store: Option<&Arc<SessionStoreV2>>,
+    caller: Option<&str>,
+    target: &str,
+) -> Result<Option<ResolvedDeployment>, ToolError> {
+    resolve_target(registry, store, caller, target, true).await
+}
+
+async fn resolve_target(
+    registry: &DeployedRegistry,
+    store: Option<&Arc<SessionStoreV2>>,
+    caller: Option<&str>,
+    target: &str,
+    allow_fabric_worker: bool,
+) -> Result<Option<ResolvedDeployment>, ToolError> {
     let resolved = {
         let reg = registry.lock().await;
-        reg.iter()
-            .find(|(key, d)| {
-                *key == &crate::registry_keys::agent_key(target)
-                    || d.actor
-                        .as_ref()
-                        .is_some_and(|actor| actor.actor_id == target || d.handle.id == target)
+        let alias = crate::registry_keys::agent_key(target);
+        let owned = reg
+            .get_key_value(&alias)
+            .filter(|(_, deployment)| store.is_none() || deployment.actor.is_some())
+            .or_else(|| {
+                reg.iter().find(|(_, deployment)| {
+                    deployment.actor.as_ref().is_some_and(|actor| {
+                        actor.actor_id == target
+                            || (!allow_fabric_worker && deployment.handle.id == target)
+                    })
+                })
+            });
+        let fabric = (allow_fabric_worker && store.is_some()).then(|| {
+            reg.iter().find(|(key, deployment)| {
+                crate::registry_keys::split(key).0 == "node"
+                    && deployment.actor.is_none()
+                    && deployment.activation.is_none()
+                    && deployment.handle.id == target
             })
+        });
+        owned
+            .or_else(|| fabric.flatten())
             .map(|(key, d)| ResolvedDeployment {
                 key: key.clone(),
                 worker_id: d.handle.id.clone(),
@@ -114,9 +153,9 @@ pub(crate) async fn resolve_deployed_target(
             })
     };
     let Some(resolved) = resolved else {
-        if target.starts_with("actor-") {
+        if store.is_some() || target.starts_with("actor-") {
             return Err(ToolError::Execution(
-                "logical Actor is not a live deployment".into(),
+                "target is not a live deployment owned by the caller".into(),
             ));
         }
         return Ok(None);
@@ -129,10 +168,27 @@ pub(crate) async fn resolve_deployed_target(
             return Err(invalid());
         }
         let store = store.ok_or_else(invalid)?;
+        let parent = store
+            .load_session(caller.ok_or_else(invalid)?)
+            .await
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
         let current = store
             .inspect_actor(&saved.actor_id)
             .await
             .map_err(|_| invalid())?;
+        let parent_birth = current
+            .actor
+            .ancestor_observations
+            .first()
+            .filter(|ancestor| ancestor.actor_id == parent.id)
+            .map(|ancestor| ancestor.session_created_at);
+        if parent_birth != Some(parent.created_at)
+            || parent.project_id_meta() != saved.project_id
+            || parent.id != saved.parent_actor_id.as_deref().unwrap_or_default()
+        {
+            return Err(invalid());
+        }
         if current.actor.state != ActorLogicalState::Active
             || current.actor.session_created_at != saved.session_created_at
             || current.actor.parent_actor_id != saved.parent_actor_id
@@ -155,6 +211,23 @@ pub(crate) async fn resolve_deployed_target(
                 resolved.activation.as_ref().ok_or_else(invalid)?,
                 chrono::Utc::now(),
             )
+            .await
+            .map_err(|_| invalid())?;
+    } else if store.is_some() {
+        // Cluster nodes remain a bounded physical compatibility route. Require
+        // a real saved Root caller, never an arbitrary broker-provided identity.
+        let invalid = || ToolError::Execution("cluster caller is not a saved Root".into());
+        let caller = caller.ok_or_else(invalid)?;
+        let root = store
+            .ok_or_else(invalid)?
+            .load_session(caller)
+            .await
+            .map_err(|_| invalid())?
+            .filter(|session| session.id == caller && session.kind == SessionKind::Root)
+            .ok_or_else(invalid)?;
+        store
+            .ok_or_else(invalid)?
+            .inspect_actor(&root.id)
             .await
             .map_err(|_| invalid())?;
     }
@@ -273,6 +346,15 @@ impl DeployAgentTool {
         params: DeployParams,
         caller: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
+        // A broker worker owns a private conversation, while a Host Actor must
+        // execute its canonical Session. The legacy launcher below cannot
+        // bind those two identities; reject before creating a Child or an
+        // activation that would falsely appear Running.
+        if self.actor_store.is_some() {
+            return Err(ToolError::Execution(
+                "Host-bound deploy_agent cannot start a canonical Actor; use SubAgent for a local Child or a registered cluster worker".into(),
+            ));
+        }
         let DeployParams {
             id,
             role,
@@ -669,6 +751,12 @@ impl Tool for DeployAgentTool {
     }
 
     fn description(&self) -> &str {
+        if self.actor_store.is_some() {
+            return "Manage existing broker deployments with action=list or action=stop. \
+                    Host-bound action=deploy is unavailable until a worker can execute the \
+                    canonical Child Session; use SubAgent for local delegation. Registered \
+                    cluster node workers remain available through ask_agent.";
+        }
         "Spin up a NEW worker agent on demand, anywhere, and manage its lifecycle. This is how you \
          scale yourself out: you deploy a fresh broker-agent, then drive it with ask_agent. The \
          worker connects back to the same message broker you are on, and inherits your MCP servers \
@@ -707,10 +795,15 @@ impl Tool for DeployAgentTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let actions = if self.actor_store.is_some() {
+            json!(["stop", "list"])
+        } else {
+            json!(["deploy", "stop", "list"])
+        };
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["deploy", "stop", "list"] },
+                "action": { "type": "string", "enum": actions },
                 "id": { "type": "string", "description": "deploy: optional live alias (auto if omitted). stop: returned logical ActorId or its live alias." },
                 "role": { "type": "string", "description": "deploy: role/profile label." },
                 "model": { "type": "string", "description": "deploy: provider:model for the worker." },
@@ -747,7 +840,6 @@ impl Tool for DeployAgentTool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn empty_registry() -> DeployedRegistry {
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
@@ -835,9 +927,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_identity_failure_does_not_launch_and_failed_launcher_leaves_retired_actor() {
+    async fn host_bound_deploy_rejects_before_creating_child_or_activation() {
+        use bamboo_agent_core::storage::Storage;
+
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SessionStoreV2::new(dir.path().into()).await.unwrap());
+        let root = Session::new("saved-root", "echo-model");
+        store.save_session(&root).await.unwrap();
         let registry = empty_registry();
         let tool = DeployAgentTool::new(
             "ws://127.0.0.1:1",
@@ -847,102 +943,18 @@ mod tests {
             Arc::new(RwLock::new(Config::default())),
         )
         .with_actor_store(store.clone());
-        let params = || serde_json::from_value(serde_json::json!({"echo":true})).unwrap();
-        let error = tool
-            .deploy(params(), Some("missing-root"))
-            .await
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("saved calling Root"));
-        assert!(registry.lock().await.is_empty());
-        assert!(!store.sessions_root_dir().join("missing-root").exists());
-        let root = Session::new("saved-root", "echo-model");
-        store.save_session(&root).await.unwrap();
-        let error = tool.deploy(params(), Some(&root.id)).await.err().unwrap();
-        assert!(error.to_string().contains("launcher failed"));
+        assert_eq!(
+            tool.parameters_schema()["properties"]["action"]["enum"],
+            json!(["stop", "list"])
+        );
+        for env in ["local", "docker", "ssh"] {
+            let params = serde_json::from_value(json!({"env":env,"echo":true})).unwrap();
+            let error = tool.deploy(params, Some(&root.id)).await.unwrap_err();
+            assert!(error.to_string().contains("cannot start a canonical Actor"));
+        }
         assert!(registry.lock().await.is_empty());
         let children = store.sessions_root_dir().join(&root.id).join("children");
-        let actors: Vec<_> = std::fs::read_dir(children)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_dir())
-            .collect();
-        assert_eq!(actors.len(), 1);
-        let actor_id = actors[0].file_name().into_string().unwrap();
-        let child = store.load_session(&actor_id).await.unwrap().unwrap();
-        assert_eq!(child.parent_session_id.as_deref(), Some(root.id.as_str()));
-        let entry = store.inspect_actor(&actor_id).await.unwrap();
-        assert_eq!(entry.actor.state, ActorLogicalState::Retired);
-        assert_eq!(entry.actor.current_attempt, 1);
-        assert_eq!(
-            entry.activation.unwrap().status,
-            ActorActivationStatus::Cancelled
-        );
-    }
-
-    #[tokio::test]
-    async fn resident_worker_is_bound_to_host_activation_until_stop() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("resident-worker");
-        std::fs::write(&bin, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = Arc::new(
-            SessionStoreV2::new(dir.path().join("sessions"))
-                .await
-                .unwrap(),
-        );
-        let root = Session::new("resident-root", "echo-model");
-        store.save_session(&root).await.unwrap();
-        let registry = empty_registry();
-        let tool = DeployAgentTool::new(
-            "ws://127.0.0.1:1",
-            "test-token",
-            bin,
-            registry.clone(),
-            Arc::new(RwLock::new(Config::default())),
-        )
-        .with_actor_store(store.clone());
-        let params = serde_json::from_value(serde_json::json!({
-            "id": "resident-alias",
-            "echo": true
-        }))
-        .unwrap();
-        let actor_id = parse(tool.deploy(params, Some(&root.id)).await.unwrap())["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let bound =
-            resolve_deployed_target(&registry, Some(&store), Some(&root.id), "resident-alias")
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(bound.actor.as_ref().unwrap().actor_id, actor_id);
-        let entry = store.inspect_actor(&actor_id).await.unwrap();
-        assert_eq!(entry.actor.state, ActorLogicalState::Active);
-        let activation = entry.activation.unwrap();
-        assert_eq!(activation.status, ActorActivationStatus::Running);
-        assert_eq!(bound.activation, Some(activation.fence()));
-        assert_eq!(
-            activation.placement_ref.unwrap(),
-            ActorPlacementRef {
-                class: ActorPlacementClass::Local,
-                lease_id: bound.worker_id,
-            }
-        );
-
-        let stopped = parse(tool.stop(actor_id.clone(), Some(&root.id)).await.unwrap());
-        assert_eq!(stopped["status"], "stopped");
-        let entry = store.inspect_actor(&actor_id).await.unwrap();
-        assert_eq!(entry.actor.state, ActorLogicalState::Retired);
-        assert_eq!(
-            entry.activation.unwrap().status,
-            ActorActivationStatus::Cancelled
-        );
-        assert!(
-            resolve_deployed_target(&registry, Some(&store), Some(&root.id), &actor_id)
-                .await
-                .is_err()
-        );
+        assert!(!children.exists() || std::fs::read_dir(children).unwrap().next().is_none());
     }
 
     #[tokio::test]

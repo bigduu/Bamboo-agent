@@ -2,8 +2,8 @@
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
-use bamboo_domain::{Role, Session};
-use bamboo_storage::SessionStoreV2;
+use bamboo_domain::{Role, Session, SessionInboxLimits, SessionInboxPort};
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -21,8 +21,10 @@ struct Probe {
     data: PathBuf,
     workspace: PathBuf,
     role: Option<&'static str>,
+    fast_grandchild: bool,
     root_calls: AtomicUsize,
     child_calls: AtomicUsize,
+    grandchild_parent: Mutex<Option<String>>,
     requests: Mutex<Vec<Value>>,
 }
 fn call(id: &str, name: &str, args: Value) -> (Value, &'static str) {
@@ -50,17 +52,253 @@ fn logical_child(body: &Value) -> String {
     });
     result["actor_id"].as_str().unwrap().into()
 }
+fn logical_grandchild(body: &Value) -> String {
+    let content = tool_content(body, "grandchild-create");
+    let result: Value = serde_json::from_str(&content).unwrap_or_else(|error| {
+        panic!("grandchild create did not return JSON: {error}; {content}")
+    });
+    result["child_session_id"].as_str().unwrap().into()
+}
 async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
-    let (delta, finish) = if body["model"] == "compact-child" {
-        match probe.child_calls.fetch_add(1, Ordering::SeqCst) {
-            0 => call(
+    let is_grandchild = body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("Sub-session title: Nested running Grandchild")
+                })
+        })
+    });
+    let (delta, finish) = if probe.role.is_none() && is_grandchild {
+        let parent_id = probe.grandchild_parent.lock().unwrap().clone().unwrap();
+        let suspended = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+                let parent = disk.load_session(&parent_id).await.unwrap().unwrap();
+                let wait_registered = parent
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| state.waiting_for_children.as_ref())
+                    .is_some();
+                if (probe.fast_grandchild && wait_registered)
+                    || (!probe.fast_grandchild
+                        && parent.last_run_status().as_deref() == Some("suspended"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if suspended.is_err() {
+            let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+            let parent = disk.load_session(&parent_id).await.unwrap().unwrap();
+            let grandchildren = disk
+                .list_index_entries()
+                .await
+                .into_iter()
+                .filter(|entry| entry.parent_session_id.as_deref() == Some(parent_id.as_str()))
+                .map(|entry| (entry.id, entry.last_run_status))
+                .collect::<Vec<_>>();
+            let log = std::fs::read_to_string(probe.data.join("host.log")).unwrap_or_default();
+            panic!("canonical Child did not suspend: status={:?}, error={:?}, wait={:?}, reason={:?}, grandchildren={:?}, log_tail={}",
+                parent.last_run_status(), parent.last_run_error(),
+                parent.agent_runtime_state.as_ref().and_then(|state| state.waiting_for_children.as_ref()),
+                parent.metadata.get("runtime.suspend_reason"),
+                grandchildren,
+                log.chars().rev().take(3500).collect::<String>().chars().rev().collect::<String>());
+        }
+        (json!({"content":"GRANDCHILD_DONE"}), "stop")
+    } else if body["model"] == "compact-child" {
+        let tool_names = body["tools"]
+            .as_array()
+            .expect("actual Child provider tools array")
+            .iter()
+            .map(|tool| {
+                tool["function"]["name"]
+                    .as_str()
+                    .expect("registered Child provider execution name")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if probe.role.is_none() {
+            assert!(
+                tool_names.contains("SubAgent"),
+                "ordinary Child can delegate"
+            );
+        }
+        for physical in ["ask_agent", "deploy_agent", "cluster"] {
+            assert!(!tool_names.contains(physical), "Child model saw {physical}");
+        }
+        match (probe.role, probe.child_calls.fetch_add(1, Ordering::SeqCst)) {
+            (None, 0) => {
+                // The isolated Worker has no Root ancestor, so a successful
+                // lineage-checked tree page must come from canonical Host storage.
+                call("compact-tree", "SubAgent", json!({"intent":"inspect"}))
+            }
+            (None, 1) => {
+                let tree_result = tool_content(&body, "compact-tree");
+                let page: Value = serde_json::from_str(&tree_result)
+                    .unwrap_or_else(|error| {
+                        let log = std::fs::read_to_string(probe.data.join("host.log"))
+                            .unwrap_or_default();
+                        panic!("Child tree should return canonical Host JSON: {error}; actual={tree_result}; host_log={}",
+                            log.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>())
+                    });
+                let actor_id = page["actor_id"].as_str().unwrap();
+                *probe.grandchild_parent.lock().unwrap() = Some(actor_id.to_string());
+                let nodes = page["nodes"].as_array().unwrap();
+                assert!(nodes.iter().any(|node| node["actor_id"] == actor_id));
+                assert!(!nodes.iter().any(|node| node["actor_id"] == "foreign-child"));
+                let canonical = SessionStoreV2::new(probe.data.clone())
+                    .await
+                    .unwrap()
+                    .load_session(actor_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(canonical.parent_session_id.as_deref(), Some("compact-root"));
+                call(
+                    "grandchild-create",
+                    "SubAgent",
+                    json!({
+                        "action":"create", "title":"Nested canonical draft",
+                        "responsibility":"Keep a bounded draft under the active Child",
+                        "prompt":"Nested draft from the real Child",
+                        "auto_run":false
+                    }),
+                )
+            }
+            (None, 2) => {
+                let grandchild_id = logical_grandchild(&body);
+                let page: Value =
+                    serde_json::from_str(&tool_content(&body, "compact-tree")).unwrap();
+                let parent_id = page["actor_id"].as_str().unwrap();
+                let canonical = SessionStoreV2::new(probe.data.clone())
+                    .await
+                    .unwrap()
+                    .load_session(&grandchild_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(canonical.parent_session_id.as_deref(), Some(parent_id));
+                assert_eq!(canonical.root_session_id, "compact-root");
+                call(
+                    "grandchild-message",
+                    "SubAgent",
+                    json!({
+                        "action":"send_message", "child_session_id":grandchild_id,
+                        "message":"Correct this bounded draft in place", "auto_run":false
+                    }),
+                )
+            }
+            (None, 3) => {
+                let grandchild_id = logical_grandchild(&body);
+                let canonical = SessionStoreV2::new(probe.data.clone())
+                    .await
+                    .unwrap()
+                    .load_session(&grandchild_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(canonical.messages.iter().any(|message| message
+                    .content
+                    .contains("Correct this bounded draft in place")));
+                call(
+                    "grandchild-get",
+                    "SubAgent",
+                    json!({
+                        "action":"get", "child_session_id":grandchild_id,
+                    }),
+                )
+            }
+            (None, 4) => {
+                let grandchild_id = logical_grandchild(&body);
+                let overview: Value =
+                    serde_json::from_str(&tool_content(&body, "grandchild-get")).unwrap();
+                assert_eq!(overview["child_session_id"], grandchild_id);
+                call(
+                    "grandchild-cancel",
+                    "SubAgent",
+                    json!({
+                        "action":"cancel", "child_session_id":grandchild_id,
+                    }),
+                )
+            }
+            (None, 5) => {
+                let grandchild_id = logical_grandchild(&body);
+                let canonical = SessionStoreV2::new(probe.data.clone())
+                    .await
+                    .unwrap()
+                    .load_session(&grandchild_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(canonical.last_run_status().as_deref(), Some("cancelled"));
+                call(
+                    "compact-glob",
+                    "Glob",
+                    json!({"pattern":"compact-marker.txt","limit":1}),
+                )
+            }
+            (Some(_), 0) => call(
                 "compact-glob",
                 "Glob",
                 json!({"pattern":"compact-marker.txt","limit":1}),
             ),
-            1 => {
+            (None, 6) => {
+                assert!(tool_content(&body, "compact-glob")
+                    .contains(probe.workspace.join("compact-marker.txt").to_str().unwrap()));
+                call(
+                    "grandchild-auto-create",
+                    "SubAgent",
+                    json!({
+                        "action":"create", "title":"Nested running Grandchild",
+                        "responsibility":"Return one bounded result to the direct Child",
+                        "prompt":"Nested running Grandchild", "auto_run":true
+                    }),
+                )
+            }
+            (None, 7) => {
+                let created: Value =
+                    serde_json::from_str(&tool_content(&body, "grandchild-auto-create")).unwrap();
+                assert!(created["child_session_id"].as_str().is_some());
+                if probe.fast_grandchild {
+                    call(
+                        "grandchild-fast-wait",
+                        "SubAgent",
+                        json!({
+                            "action":"wait", "child_session_ids":[created["child_session_id"]]
+                        }),
+                    )
+                } else {
+                    (json!({"content":"CHILD_AWAITING_GRANDCHILD"}), "stop")
+                }
+            }
+            (None, 8) => {
+                assert!(
+                    body.to_string().contains("GRANDCHILD_DONE"),
+                    "resumed Child must receive canonical Grandchild outcome; messages={:?}",
+                    body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|message| {
+                            (
+                                message["role"].as_str().unwrap_or(""),
+                                message["content"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(300)
+                                    .collect::<String>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                );
+                (json!({"content":"COMPACT_CHILD_EVIDENCE"}), "stop")
+            }
+            (Some(_), 1) => {
                 assert!(tool_content(&body, "compact-glob")
                     .contains(probe.workspace.join("compact-marker.txt").to_str().unwrap()));
                 (json!({"content":"COMPACT_CHILD_EVIDENCE"}), "stop")
@@ -94,7 +332,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             }
             1 => {
                 let child_id = logical_child(&body);
-                tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::time::timeout(Duration::from_secs(60), async {
                     loop {
                         let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
                         let child = disk.load_session(&child_id).await.unwrap().unwrap();
@@ -115,6 +353,42 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             2 => {
                 let result: Value =
                     serde_json::from_str(&tool_content(&body, "compact-result")).unwrap();
+                if result["text"] != "COMPACT_CHILD_EVIDENCE" {
+                    let child_id = logical_child(&body);
+                    let child = SessionStoreV2::new(probe.data.clone())
+                        .await
+                        .unwrap()
+                        .load_session(&child_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    eprintln!(
+                        "root inspect mismatch: status={:?}, messages={:?}",
+                        child.last_run_status(),
+                        child
+                            .messages
+                            .iter()
+                            .rev()
+                            .take(6)
+                            .map(|message| (
+                                format!("{:?}", message.role),
+                                message.content.chars().take(150).collect::<String>()
+                            ))
+                            .collect::<Vec<_>>()
+                    );
+                    let log =
+                        std::fs::read_to_string(probe.data.join("host.log")).unwrap_or_default();
+                    eprintln!(
+                        "fixture host log tail: {}",
+                        log.chars()
+                            .rev()
+                            .take(3500)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>()
+                    );
+                }
                 assert_eq!(result["text"], "COMPACT_CHILD_EVIDENCE");
                 call(
                     "compact-correct",
@@ -184,8 +458,10 @@ fn compact_root_creates_inspects_and_corrects_one_actual_child() {
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             actix_web::rt::System::new().block_on(async {
-                for role in [None, Some("explorer")] {
-                    fixture(role).await;
+                for (role, fast_grandchild) in
+                    [(None, false), (None, true), (Some("explorer"), false)]
+                {
+                    fixture(role, fast_grandchild).await;
                 }
             })
         })
@@ -193,8 +469,7 @@ fn compact_root_creates_inspects_and_corrects_one_actual_child() {
         .join()
         .unwrap();
 }
-async fn fixture(role: Option<&'static str>) {
-    eprintln!("actual compact facade role {role:?}");
+async fn fixture(role: Option<&'static str>, fast_grandchild: bool) {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().canonicalize().unwrap();
     let workspace = data.join("workspace");
@@ -214,8 +489,10 @@ async fn fixture(role: Option<&'static str>) {
         data: data.clone(),
         workspace: workspace.clone(),
         role,
+        fast_grandchild,
         root_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
+        grandchild_parent: Mutex::new(None),
         requests: Mutex::new(vec![]),
     });
     let provider_probe = probe.clone();
@@ -299,7 +576,7 @@ async fn fixture(role: Option<&'static str>) {
         .unwrap()
         .status()
         .is_success());
-    let parent = tokio::time::timeout(Duration::from_secs(60), async {
+    let parent = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             assert!(
                 host.0.try_wait().unwrap().is_none(),
@@ -334,7 +611,34 @@ async fn fixture(role: Option<&'static str>) {
         .filter(|e| e.parent_session_id.as_deref() == Some("compact-root"))
         .collect();
     assert_eq!(entries.len(), 1);
-    let child = cold.load_session(&entries[0].id).await.unwrap().unwrap();
+    let corrected = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let child = cold.load_session(&entries[0].id).await.unwrap().unwrap();
+            if child.messages.iter().any(|message| {
+                message.role == Role::Assistant && message.content == "COMPACT_CORRECTION_DONE"
+            }) {
+                break child;
+            }
+            assert_ne!(
+                child.last_run_status().as_deref(),
+                Some("error"),
+                "Child correction failed: {:?}",
+                child.last_run_error()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let child = if let Ok(child) = corrected {
+        child
+    } else {
+        let child = cold.load_session(&entries[0].id).await.unwrap().unwrap();
+        panic!("Child correction did not finish: role={role:?}, fast={fast_grandchild}, status={:?}, error={:?}, messages={:?}",
+            child.last_run_status(), child.last_run_error(),
+            child.messages.iter().rev().take(5).map(|message|
+                (format!("{:?}", message.role), message.content.chars().take(180).collect::<String>())
+            ).collect::<Vec<_>>());
+    };
     assert_eq!(child.metadata["assignment_prompt"], TASK);
     if let Some(role) = role {
         let binding: Value =
@@ -356,6 +660,13 @@ async fn fixture(role: Option<&'static str>) {
         .messages
         .iter()
         .any(|m| m.role == Role::Assistant && m.content == "COMPACT_CORRECTION_DONE"));
+    assert_eq!(child.last_run_status().as_deref(), Some("completed"));
+    let inbox = FileSessionInbox::new(
+        std::sync::Arc::new(SessionStoreV2::new(data.clone()).await.unwrap()),
+        SessionInboxLimits::default(),
+    );
+    let inbox_state = inbox.inspect(&child.id).await.unwrap();
+    assert_eq!((inbox_state.pending, inbox_state.claimed), (0, 0));
     assert!(probe.child_calls.load(Ordering::SeqCst) >= 3);
     let requests = probe.requests.lock().unwrap().clone();
     let matched = requests

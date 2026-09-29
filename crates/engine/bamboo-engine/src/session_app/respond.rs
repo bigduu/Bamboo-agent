@@ -415,6 +415,13 @@ fn apply_pending_response(
         .take()
         .ok_or(RespondError::NoPendingQuestion)?;
 
+    if pending.source == bamboo_agent_core::PendingQuestionSource::DirectParent {
+        session.pending_question = Some(pending);
+        return Err(RespondError::InvalidResponse(
+            "Direct-parent clarification requires a canonical ParentRequest reply".into(),
+        ));
+    }
+
     if session
         .messages
         .iter()
@@ -1418,6 +1425,32 @@ mod tests {
                 }),
             Some(receipt)
         );
+    }
+
+    #[test]
+    fn direct_parent_pending_cannot_be_answered_by_human_respond_text() {
+        let mut session = Session::new("direct-parent-child", "test-model");
+        session.set_pending_question_with_source(
+            "question-call".into(),
+            "AskUserQuestion".into(),
+            "Which option?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            bamboo_agent_core::PendingQuestionSource::DirectParent,
+        );
+        let input = RespondInput {
+            session_id: session.id.clone(),
+            user_response: "A".into(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        };
+        assert!(matches!(
+            apply_pending_response(&mut session, &input, Some("question-call"), ResponseSource::Human, None),
+            Err(RespondError::InvalidResponse(message)) if message.contains("Direct-parent")
+        ));
+        assert!(session.pending_question.is_some());
     }
 
     #[test]

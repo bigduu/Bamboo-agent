@@ -585,6 +585,16 @@ where
                         let _ = reply.send(serde_json::json!({ "approved": approved }));
                     }
                 }
+                Ok(ParentFrame::OwnedTreeReply { id, page }) => {
+                    if let Some(reply) = pending.lock().recover_poison().remove(&id) {
+                        let _ = reply.send(serde_json::json!({ "page": page }));
+                    }
+                }
+                Ok(ParentFrame::SubAgentReply { id, result }) => {
+                    if let Some(reply) = pending.lock().recover_poison().remove(&id) {
+                        let _ = reply.send(result);
+                    }
+                }
                 Ok(ParentFrame::Run(spec)) => {
                     // A new run supersedes any active run: cancel the previous
                     // task *before* starting the new one so the old run stops
@@ -791,6 +801,24 @@ fn start_run<E: ChildExecutor + ?Sized>(
             registrations.ids.push(id.clone());
             let frame = match req.kind {
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
+                HostRequestKind::OwnedTree => ChildFrame::OwnedTreeRequest {
+                    id,
+                    cursor: req
+                        .body
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                },
+                HostRequestKind::SubAgent => ChildFrame::SubAgentRequest {
+                    id,
+                    tool_call_id: req
+                        .body
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    args: req.body.get("args").cloned().unwrap_or_default(),
+                },
             };
             if out_req.send(frame).await.is_err() {
                 break;
@@ -1203,7 +1231,9 @@ mod tests {
                     saw_batch = true;
                     events.extend(batch.events);
                 }
-                ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. }
+                | ChildFrame::OwnedTreeRequest { .. }
+                | ChildFrame::SubAgentRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
                         "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"
@@ -1758,7 +1788,9 @@ mod tests {
                             .filter_map(|event| event["content"].as_str().map(ToString::to_string)),
                     );
                 }
-                ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::ApprovalRequest { .. }
+                | ChildFrame::OwnedTreeRequest { .. }
+                | ChildFrame::SubAgentRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
                         "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"

@@ -23,8 +23,9 @@ use bamboo_domain::poison::PoisonRecover;
 use bamboo_domain::{
     ActorActivationClaim, ActorActivationFence, ActorActivationFinish, ActorDirectoryPort,
     ActorLogicalState, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal, HookResult,
-    SessionInboxClaim, SessionInboxConsumerId, SessionInboxLeaseRequest, SessionInboxOwnedClaim,
-    SessionInboxPort,
+    ParentQuestion, ParentQuestionCheckpointV1, SessionInboxClaim, SessionInboxConsumerId,
+    SessionInboxFailureReport, SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
+    PARENT_QUESTION_CHECKPOINT_ACTION,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -627,6 +628,7 @@ pub struct ActorChildRunner {
     /// runtime. Kept per runner/runtime; never process-global.
     session_inbox_runtime: Arc<std::sync::Mutex<Option<SessionInboxRuntimeBinding>>>,
     actor_directory_store: std::sync::Mutex<Option<Arc<bamboo_storage::SessionStoreV2>>>,
+    canonical_subagent_tool: std::sync::Mutex<Option<Arc<dyn bamboo_agent_core::tools::Tool>>>,
     actor_event_observer: std::sync::Mutex<Option<Arc<dyn ActorEventObserver>>>,
 }
 
@@ -831,6 +833,7 @@ impl ActorChildRunner {
             codex_run_tokens: None,
             session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
             actor_directory_store: std::sync::Mutex::new(None),
+            canonical_subagent_tool: std::sync::Mutex::new(None),
             actor_event_observer: std::sync::Mutex::new(None),
         }
     }
@@ -1619,6 +1622,10 @@ impl ExternalChildRunner for ActorChildRunner {
         *self.actor_directory_store.lock().recover_poison() = store;
     }
 
+    fn set_canonical_subagent_tool(&self, tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>) {
+        *self.canonical_subagent_tool.lock().recover_poison() = tool;
+    }
+
     fn set_actor_event_observer(&self, observer: Option<Arc<dyn ActorEventObserver>>) {
         *self.actor_event_observer.lock().recover_poison() = observer;
     }
@@ -1643,6 +1650,7 @@ impl ExternalChildRunner for ActorChildRunner {
         let escalation = self.escalation_bridge.lock().recover_poison().clone();
         let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let actor_directory_store = self.actor_directory_store.lock().recover_poison().clone();
+        let canonical_subagent_tool = self.canonical_subagent_tool.lock().recover_poison().clone();
         let actor_event_observer = self.actor_event_observer.lock().recover_poison().clone();
         let required_context = bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
@@ -1736,7 +1744,7 @@ impl ExternalChildRunner for ActorChildRunner {
         }
         // Eligibility uses the actual Host callable ceiling, after the strict
         // built-in route and birth capability checks. A role label is not a grant.
-        let first_reply_store = actor_directory_store.filter(|_| {
+        let first_reply_store = actor_directory_store.clone().filter(|_| {
             required_context.is_some()
                 && crate::session_app::child_session::named_profile::has_named_profile(session)
                 && matches!(spec.placement, Placement::Local)
@@ -1888,6 +1896,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 auto_approve_permissions: resolution.suppress_approval_prompts(),
                 session_id: session.id.clone(),
                 workspace_path: session.workspace.clone(),
+                environment_lease: None,
                 inherit_session_grants: false,
                 policy,
             })
@@ -2026,7 +2035,7 @@ impl ExternalChildRunner for ActorChildRunner {
                                 .ok_or_else(remote_broker_unavailable)?,
                         )
                         .map_err(|_| remote_broker_unavailable())?;
-                        let connect = bamboo_broker::BrokerChildLink::connect_strict_with_tls(
+                        let connect = bamboo_broker::BrokerChildLink::connect_strict_with_tls_environment_lease(
                             &placement.endpoint,
                             bamboo_subagent::AgentRef {
                                 session_id: peer.parent_mailbox.clone(),
@@ -2312,6 +2321,48 @@ impl ExternalChildRunner for ActorChildRunner {
             }
             let mut logical_identity = logical_identity_for_actor_run(session, job);
             logical_identity.creation = creation.clone();
+            let run_permission_policy = if strict_remote.is_some() {
+                let prepared = async {
+                    let mut policy = permission_policy.clone().ok_or_else(|| {
+                        AgentError::LLM("remote_environment_permission_policy_missing".into())
+                    })?;
+                    let workspace = session.workspace.as_deref().ok_or_else(|| {
+                        AgentError::LLM("remote_environment_workspace_missing".into())
+                    })?;
+                    let run_id = bound_activation_run_id.as_deref().ok_or_else(|| {
+                        AgentError::LLM("remote_environment_activation_missing".into())
+                    })?;
+                    let lease = bamboo_subagent::environment::EnvironmentLease::capture(
+                        workspace,
+                        &session.id,
+                        run_id,
+                        execution_epoch,
+                    )
+                    .await
+                    .map_err(|error| AgentError::LLM(error.into()))?;
+                    policy.workspace_path = None;
+                    policy.environment_lease = Some(lease);
+                    Ok::<_, AgentError>(Some(policy))
+                }
+                .await;
+                match prepared {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        if let (Some(binding), Some(run_id)) = (
+                            session_inbox_runtime.as_ref(),
+                            bound_activation_run_id.as_deref(),
+                        ) {
+                            binding
+                                .router
+                                .detach_delivery_sink(&job.child_session_id, run_id)
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                permission_policy.clone()
+            };
             let run_spec = RunSpec {
                 // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                 assignment: assignment.clone(),
@@ -2328,7 +2379,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 } else {
                     None
                 },
-                permission_policy: permission_policy.clone(),
+                permission_policy: run_permission_policy,
                 messages,
                 activation_run_id: bound_activation_run_id.clone(),
                 execution_epoch,
@@ -2399,6 +2450,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 expected_permission_posture: expected_permission_posture.clone(),
                 expected_creation: creation.as_ref(),
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
+                actor_directory_store: actor_directory_store.as_deref(),
+                canonical_subagent_tool: canonical_subagent_tool.clone(),
                 activation_run_id: bound_activation_run_id.as_deref(),
                 execution_epoch,
                 expected_source_actor_id: &actor.mailbox_id,
@@ -2410,6 +2463,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
                 // on a fixed remote endpoint).
                 plain_actor: plain_activation.is_some(),
+                remote_environment_lease: strict_remote.is_some(),
                 readonly_output: if readonly_actor {
                     Some(&mut readonly_messages)
                 } else {
@@ -2483,12 +2537,12 @@ impl ExternalChildRunner for ActorChildRunner {
         };
 
         let result = if strict_remote.is_some() {
-            result.map_err(|error| {
-                if matches!(error, AgentError::Cancelled) {
-                    error
-                } else {
-                    remote_broker_unavailable()
-                }
+            result.map_err(|error| match &error {
+                AgentError::Cancelled => error,
+                AgentError::LLM(message) => remote_environment_error_code(message)
+                    .map(|code| AgentError::LLM(code.to_owned()))
+                    .unwrap_or_else(remote_broker_unavailable),
+                _ => remote_broker_unavailable(),
             })
         } else {
             result
@@ -3039,6 +3093,22 @@ impl PlainActorActivation {
                 if !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
                     if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
                 {
+                    self.input_inbox
+                        .fail_owned(
+                            &session.id,
+                            claim,
+                            &SessionInboxFailureReport {
+                                now: chrono::Utc::now(),
+                                error_code: "unsupported_actor_input".into(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(%error, "Actor correction failure report unconfirmed");
+                            AgentError::LLM(
+                                "Actor correction failure report unconfirmed; durable input is preserved".into(),
+                            )
+                        })?;
                     return Err(plain_actor_unsupported());
                 }
             }
@@ -4337,11 +4407,14 @@ struct ActorDriveContext<'a> {
     expected_permission_posture: Option<ExpectedPermissionPosture>,
     expected_creation: Option<&'a bamboo_subagent::proto::ChildCreationIdentity>,
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
+    actor_directory_store: Option<&'a bamboo_storage::SessionStoreV2>,
+    canonical_subagent_tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>,
     activation_run_id: Option<&'a str>,
     execution_epoch: u64,
     expected_source_actor_id: &'a str,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     plain_actor: bool,
+    remote_environment_lease: bool,
     readonly_output: Option<&'a mut Vec<bamboo_agent_core::Message>>,
     local_history_tools: Option<&'a [String]>,
     local_history_read_only: bool,
@@ -4522,6 +4595,385 @@ async fn validate_directory_actor_event(
         return Err(AgentError::LLM("actor event authority changed".into()));
     }
     Ok(entry)
+}
+
+/// The Worker supplies only a cursor. All identity and scope inputs come from
+/// this Host's active drive and its canonical durable Session store.
+async fn inspect_active_owned_tree(
+    store: &bamboo_storage::SessionStoreV2,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    child_id: &str,
+    parent_id: &str,
+    logical_session: &Session,
+    creation: &bamboo_subagent::proto::ChildCreationIdentity,
+    plain_input: Option<&PlainActorActivation>,
+    cursor: Option<&str>,
+) -> Option<serde_json::Value> {
+    use bamboo_agent_core::storage::Storage;
+    let current = match store.load_session(child_id).await {
+        Ok(Some(current)) => current,
+        _ => {
+            tracing::warn!("owned tree denied: canonical caller unavailable");
+            return None;
+        }
+    };
+    let current_project = match project_id_for_actor_run(&current) {
+        Ok(project) => project,
+        Err(_) => {
+            tracing::warn!("owned tree denied: invalid canonical Project");
+            return None;
+        }
+    };
+    let logical_project = match project_id_for_actor_run(logical_session) {
+        Ok(project) => project,
+        Err(_) => {
+            tracing::warn!("owned tree denied: invalid logical Project");
+            return None;
+        }
+    };
+    if current.id != child_id
+        || current.kind != bamboo_domain::SessionKind::Child
+        || current.parent_session_id.as_deref() != Some(parent_id)
+        || current.parent_session_id != logical_session.parent_session_id
+        || current.root_session_id != logical_session.root_session_id
+        || current.created_at != creation.created_at
+        || current.created_at != logical_session.created_at
+        || current.spawn_depth != creation.spawn_depth
+        || current.spawn_depth != logical_session.spawn_depth
+        || current_project != logical_project
+    {
+        tracing::warn!("owned tree denied: caller lifetime or Project changed");
+        return None;
+    }
+    if let Some(activation) = plain_input {
+        validate_directory_actor_event(
+            activation.store.as_ref(),
+            &activation.fence,
+            &current,
+            Some(run_id),
+        )
+        .await
+        .ok()?;
+    } else if !binding.router.owns_run(child_id, run_id).await {
+        tracing::warn!("owned tree denied: activation owner changed");
+        return None;
+    }
+    let page = match crate::session_app::child_session::owned_tree::inspect_owned_tree(
+        store, child_id, cursor,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(?error, "owned tree denied: canonical tree read failed");
+            return None;
+        }
+    };
+    let again = match store.load_session(child_id).await {
+        Ok(Some(again)) => again,
+        _ => {
+            tracing::warn!("owned tree denied: canonical caller disappeared");
+            return None;
+        }
+    };
+    if again.created_at != current.created_at
+        || again.parent_session_id != current.parent_session_id
+        || again.root_session_id != current.root_session_id
+        || again.spawn_depth != current.spawn_depth
+        || project_id_for_actor_run(&again).ok()? != current_project
+    {
+        tracing::warn!("owned tree denied: caller changed during inspection");
+        return None;
+    }
+    if let Some(activation) = plain_input {
+        validate_directory_actor_event(
+            activation.store.as_ref(),
+            &activation.fence,
+            &again,
+            Some(run_id),
+        )
+        .await
+        .ok()?;
+    } else if !binding.router.owns_run(child_id, run_id).await {
+        tracing::warn!("owned tree denied: activation owner changed after inspection");
+        return None;
+    }
+    serde_json::to_vec(&page)
+        .ok()
+        .filter(|bytes| bytes.len() <= 8192)?;
+    Some(page)
+}
+
+/// Resolve the caller of a mutating nested SubAgent RPC entirely from the
+/// Host's active drive and canonical store. The frame never supplies identity,
+/// Project, ancestry, or a run fence.
+async fn load_active_subagent_caller(
+    store: &bamboo_storage::SessionStoreV2,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    child_id: &str,
+    parent_id: &str,
+    logical_session: &Session,
+    creation: &bamboo_subagent::proto::ChildCreationIdentity,
+    plain_input: Option<&PlainActorActivation>,
+) -> Option<Session> {
+    use bamboo_agent_core::storage::Storage;
+    let current = store.load_session(child_id).await.ok().flatten()?;
+    let current_project = project_id_for_actor_run(&current).ok()?;
+    let logical_project = project_id_for_actor_run(logical_session).ok()?;
+    if current.id != child_id
+        || current.kind != bamboo_domain::SessionKind::Child
+        || current.parent_session_id.as_deref() != Some(parent_id)
+        || current.parent_session_id != logical_session.parent_session_id
+        || current.root_session_id != logical_session.root_session_id
+        || current.created_at != creation.created_at
+        || current.created_at != logical_session.created_at
+        || current.spawn_depth != creation.spawn_depth
+        || current.spawn_depth != logical_session.spawn_depth
+        || current_project != logical_project
+        || bamboo_domain::ActorSession::from_session(&current).is_err()
+    {
+        return None;
+    }
+    if let Some(activation) = plain_input {
+        validate_directory_actor_event(
+            activation.store.as_ref(),
+            &activation.fence,
+            &current,
+            Some(run_id),
+        )
+        .await
+        .ok()?;
+    } else if !binding.router.owns_run(child_id, run_id).await {
+        return None;
+    }
+    Some(current)
+}
+
+async fn invoke_active_subagent(
+    tool: &dyn bamboo_agent_core::tools::Tool,
+    caller: &Session,
+    args: serde_json::Value,
+    tool_call_id: &str,
+) -> serde_json::Value {
+    use bamboo_agent_core::tools::{ToolCtx, ToolOutcome};
+    let mut ctx = ToolCtx::none(tool_call_id.to_owned());
+    ctx.session_id = Some(Arc::from(caller.id.as_str()));
+    match tool.invoke(args, ctx).await {
+        Ok(ToolOutcome::Completed(result))
+            if result.images.is_empty()
+                && serde_json::to_vec(&result).is_ok_and(|bytes| bytes.len() <= 16 * 1024) =>
+        {
+            serde_json::json!({"result":result})
+        }
+        _ => serde_json::json!({
+            "error":"SubAgent operation failed or its result exceeded the limit; inspect logical child state before retrying"
+        }),
+    }
+}
+
+/// Commit one already-persisted Worker clarification under the Host's current
+/// Child birth and Run fence. Only the Host supplies caller/parent identity.
+#[allow(clippy::too_many_arguments)]
+async fn checkpoint_active_parent_question(
+    store: &bamboo_storage::SessionStoreV2,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    child_id: &str,
+    parent_id: &str,
+    logical_session: &mut Session,
+    creation: &bamboo_subagent::proto::ChildCreationIdentity,
+    plain_input: Option<&PlainActorActivation>,
+    observation: ParentQuestionCheckpointV1,
+) -> Option<String> {
+    use bamboo_agent_core::storage::Storage;
+    if plain_input.is_some() || observation.validate_shape().is_err() {
+        return None;
+    }
+    // SessionRepository's final save and the direct-parent answer resolver
+    // use this same Host-owned lock. Hold it across the V2 read/CAS/save so
+    // neither can read an older Child and overwrite the checkpoint afterward.
+    let _session_guard = binding
+        .parent_question_lock
+        .as_ref()?
+        .acquire_lock(child_id)
+        .await;
+    let caller = load_active_subagent_caller(
+        store,
+        binding,
+        run_id,
+        child_id,
+        parent_id,
+        logical_session,
+        creation,
+        plain_input,
+    )
+    .await?;
+    let parent = store.load_session(parent_id).await.ok().flatten()?;
+    if parent.created_at > caller.created_at || !binding.router.owns_run(child_id, run_id).await {
+        return None;
+    }
+    let (saved, question) = store
+        .checkpoint_parent_question(&caller, &parent, &observation)
+        .await
+        .ok()
+        .flatten()?;
+    // The current Run's local snapshot must carry the committed canonical
+    // prefix into finalization; sdk/spawn rechecks disk before its last save.
+    logical_session.messages = saved.messages;
+    logical_session.pending_question = saved.pending_question;
+    if let Some(reason) = saved.metadata.get("runtime.suspend_reason") {
+        logical_session
+            .metadata
+            .insert("runtime.suspend_reason".into(), reason.clone());
+    }
+    if let Some(request) = saved
+        .metadata
+        .get(bamboo_domain::PARENT_QUESTION_REQUEST_KEY)
+    {
+        logical_session.metadata.insert(
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY.into(),
+            request.clone(),
+        );
+    }
+    logical_session.metadata.insert(
+        "runtime.actor_parent_question_handoff".into(),
+        "true".into(),
+    );
+    Some(question.id.as_str().to_owned())
+}
+
+/// An actor Worker cannot see the Host's canonical descendants. At the end of
+/// an otherwise completed Child turn, apply the same orphan-child safety net
+/// used by the in-process root loop before publishing this Child as terminal.
+/// The existing Host wait, including an explicit `any` policy, always wins.
+async fn ensure_active_nested_wait(
+    tool: &dyn bamboo_agent_core::tools::Tool,
+    store: &bamboo_storage::SessionStoreV2,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    child_id: &str,
+    parent_id: &str,
+    logical_session: &Session,
+    creation: &bamboo_subagent::proto::ChildCreationIdentity,
+    plain_input: Option<&PlainActorActivation>,
+) -> Result<bool, AgentError> {
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{ToolCtx, ToolOutcome};
+
+    let caller = load_active_subagent_caller(
+        store,
+        binding,
+        run_id,
+        child_id,
+        parent_id,
+        logical_session,
+        creation,
+        plain_input,
+    )
+    .await
+    .ok_or_else(|| AgentError::LLM("nested wait caller is no longer active".into()))?;
+    if caller
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    let active = store
+        .list_child_run_statuses(child_id)
+        .await
+        .map_err(|error| AgentError::LLM(format!("nested child status scan failed: {error}")))?
+        .into_iter()
+        .filter(|(_, status)| {
+            !status.as_deref().is_some_and(|status| {
+                matches!(
+                    status,
+                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
+                )
+            })
+        })
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(false);
+    }
+
+    let mut ctx = ToolCtx::none(format!("host-nested-orphan-wait:{run_id}"));
+    ctx.session_id = Some(Arc::from(caller.id.as_str()));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        tool.invoke(
+            serde_json::json!({"action":"wait", "child_session_ids":active}),
+            ctx,
+        ),
+    )
+    .await
+    .map_err(|_| AgentError::LLM("nested wait registration timed out".into()))?
+    .map_err(|error| AgentError::LLM(format!("nested wait registration failed: {error}")))?;
+    let wait_registered = match outcome {
+        ToolOutcome::Completed(result) if result.success => {
+            let payload: serde_json::Value = serde_json::from_str(&result.result)
+                .map_err(|_| AgentError::LLM("nested wait result is invalid".into()))?;
+            payload["status"] == "waiting"
+        }
+        _ => {
+            return Err(AgentError::LLM(
+                "nested wait registration was not completed".into(),
+            ))
+        }
+    };
+
+    // A grandchild may finish while the wait is being registered and clear it.
+    // A clear wait is safe only when no canonical descendants remain active.
+    let latest = load_active_subagent_caller(
+        store,
+        binding,
+        run_id,
+        child_id,
+        parent_id,
+        logical_session,
+        creation,
+        plain_input,
+    )
+    .await
+    .ok_or_else(|| AgentError::LLM("nested wait caller changed during registration".into()))?;
+    if latest
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.as_ref())
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let still_active = store
+        .list_child_run_statuses(child_id)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!("nested child wait verification failed: {error}"))
+        })?
+        .into_iter()
+        .any(|(_, status)| {
+            !status.as_deref().is_some_and(|status| {
+                matches!(
+                    status,
+                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
+                )
+            })
+        });
+    if still_active {
+        return Err(AgentError::LLM(
+            "nested child remains active without a durable parent wait".into(),
+        ));
+    }
+    // Keep the current Run's suspend intent even if the last grandchild
+    // finished and cleared the Host wait before SDK finalization. Its outcome
+    // has already admitted a successor; publishing this Run as completed
+    // would release the grandparent on the Child's interim response.
+    Ok(wait_registered)
 }
 
 fn actor_event_route_error(error: ActorEventRouteError) -> AgentError {
@@ -5180,12 +5632,15 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         mut expected_permission_posture,
         expected_creation,
         session_inbox_runtime,
+        actor_directory_store,
+        canonical_subagent_tool,
         activation_run_id,
         execution_epoch,
         expected_source_actor_id,
         initial_inflight_claims,
         first_frame_timeout,
         plain_actor,
+        remote_environment_lease,
         mut readonly_output,
         local_history_tools,
         local_history_read_only,
@@ -5218,6 +5673,13 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let _approval_lifetime = approval_cancel.clone().drop_guard();
     let mut approval_scopes: HashMap<String, (serde_json::Value, ChildApprovalScope)> =
         HashMap::new();
+    let mut owned_tree_requests = 0usize;
+    let mut canonical_subagent_requests = 0usize;
+    // Once this Run registers a canonical Child wait, a fast completion may
+    // clear it before the Worker sends Terminal. Keep the current Run
+    // nonterminal so its already admitted outcome belongs to the successor.
+    let mut nested_wait_registered_this_run = false;
+    let mut parent_question_checkpoint_id: Option<String> = None;
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
@@ -5473,6 +5935,124 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             next_actor_event_seq = seq.saturating_add(1);
                         }
                     }
+                    Ok(Some(ChildFrame::OwnedTreeRequest { id, cursor })) => {
+                        owned_tree_requests += 1;
+                        if owned_tree_requests > 16 {
+                            return Err(AgentError::LLM("owned tree request limit exceeded".into()));
+                        }
+                        let page = if id.len() <= 128
+                            && cursor.as_ref().is_none_or(|value| !value.is_empty() && value.len() <= 128)
+                            && !cancel_token.is_cancelled()
+                        {
+                            match (actor_directory_store, session_inbox_runtime,
+                                activation_run_id, expected_creation) {
+                                (Some(store), Some(binding), Some(run_id), Some(creation)) => {
+                                    tokio::time::timeout(
+                                        Duration::from_secs(8),
+                                        inspect_active_owned_tree(
+                                            store, binding, run_id, child_session_id,
+                                            parent_session_id, logical_session, creation,
+                                            plain_input, cursor.as_deref(),
+                                        ),
+                                    ).await.ok().flatten()
+                                }
+                                _ => {
+                                    tracing::warn!("owned tree denied: canonical Host scope unavailable");
+                                    None
+                                },
+                            }
+                        } else {
+                            tracing::warn!("owned tree denied: request bounds or cancellation");
+                            None
+                        };
+                        if cancel_token.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
+                        client.send(ParentFrame::OwnedTreeReply { id, page }).await
+                            .map_err(|_| AgentError::LLM("owned tree reply transport closed".into()))?;
+                    }
+                    Ok(Some(ChildFrame::SubAgentRequest { id, tool_call_id, args })) => {
+                        canonical_subagent_requests += 1;
+                        if canonical_subagent_requests > 64 {
+                            return Err(AgentError::LLM("canonical SubAgent request limit exceeded".into()));
+                        }
+                        let valid_shape = !id.is_empty() && id.len() <= 128
+                            && !tool_call_id.is_empty() && tool_call_id.len() <= 128
+                            && args.is_object()
+                            && serde_json::to_vec(&args)
+                                .is_ok_and(|bytes| bytes.len() <= 64 * 1024);
+                        let registers_wait = matches!(args.get("action").and_then(|value| value.as_str()),
+                            Some("wait"))
+                            || (args.get("action").and_then(|value| value.as_str()) == Some("create")
+                                && args.get("wait").and_then(|value| value.as_bool()) == Some(true));
+                        let checkpoint_payload = args.get(PARENT_QUESTION_CHECKPOINT_ACTION).cloned();
+                        let result = if valid_shape
+                            && !cancel_token.is_cancelled()
+                            && !permission_handshake.is_awaiting()
+                        {
+                            if let Some(payload) = checkpoint_payload {
+                                let parsed = (args.as_object().is_some_and(|object| object.len() == 1))
+                                    .then(|| serde_json::from_value::<ParentQuestionCheckpointV1>(payload).ok())
+                                    .flatten()
+                                    .filter(|observation| observation.tool_call_id == tool_call_id);
+                                match (parsed, actor_directory_store, session_inbox_runtime,
+                                    activation_run_id, expected_creation) {
+                                    (Some(observation), Some(store), Some(binding), Some(run_id), Some(creation)) => {
+                                        let receipt = tokio::time::timeout(Duration::from_secs(25),
+                                            checkpoint_active_parent_question(
+                                                store, binding, run_id, child_session_id,
+                                                parent_session_id, logical_session, creation,
+                                                plain_input, observation,
+                                            )).await.ok().flatten();
+                                        if let Some(request_id) = receipt {
+                                            parent_question_checkpoint_id = Some(request_id.clone());
+                                            serde_json::json!({"result":{"request_id":request_id}})
+                                        } else {
+                                            serde_json::json!({"error":"canonical Child question checkpoint rejected; persisted worker question is preserved"})
+                                        }
+                                    }
+                                    _ => serde_json::json!({"error":"canonical Child question checkpoint unavailable"}),
+                                }
+                            } else {
+                            match (canonical_subagent_tool.as_deref(), actor_directory_store,
+                                session_inbox_runtime, activation_run_id, expected_creation) {
+                                (Some(tool), Some(store), Some(binding), Some(run_id), Some(creation)) => {
+                                    if let Some(caller) = load_active_subagent_caller(
+                                        store, binding, run_id, child_session_id,
+                                        parent_session_id, logical_session, creation,
+                                        plain_input,
+                                    ).await {
+                                        tokio::time::timeout(
+                                            Duration::from_secs(30),
+                                            invoke_active_subagent(tool, &caller, args, &tool_call_id),
+                                        ).await.unwrap_or_else(|_| serde_json::json!({
+                                            "error":"canonical SubAgent operation timed out; inspect logical child state before retrying"
+                                        }))
+                                    } else {
+                                        serde_json::json!({"error":"canonical SubAgent caller is no longer active"})
+                                    }
+                                }
+                                _ => serde_json::json!({"error":"canonical SubAgent Host authority unavailable"}),
+                            }
+                            }
+                        } else {
+                            serde_json::json!({"error":"canonical SubAgent request rejected"})
+                        };
+                        if registers_wait
+                            && result["result"]["success"] == true
+                            && result["result"]["result"]
+                                .as_str()
+                                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                                .is_some_and(|value| value["status"] == "waiting")
+                        {
+                            nested_wait_registered_this_run = true;
+                        }
+                        if cancel_token.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
+                        client.send(ParentFrame::SubAgentReply { id, result }).await
+                            .map_err(|_| AgentError::LLM("canonical SubAgent reply transport closed".into()))?;
+                    }
                     Ok(Some(ChildFrame::ApprovalRequest { id, body })) => {
                         if plain_actor { return Err(plain_actor_unsupported()); }
                         if permission_handshake.is_awaiting() {
@@ -5693,7 +6273,19 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         }
                     }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
+                        if parent_question_checkpoint_id.is_some()
+                            && status != TerminalStatus::Suspended
+                        {
+                            return Err(AgentError::LLM(
+                                "Child question checkpoint must end in a suspended Run".into(),
+                            ));
+                        }
                         if permission_handshake.is_awaiting() {
+                            if remote_environment_lease && status == TerminalStatus::Error {
+                                if let Some(code) = error.as_deref().and_then(remote_environment_error_code) {
+                                    return Err(AgentError::LLM(code.to_owned()));
+                                }
+                            }
                             return Err(AgentError::LLM(
                                 "actor terminated before permission posture confirmation"
                                     .to_string(),
@@ -5768,20 +6360,82 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 }
                             }
                         }
+                        if status == TerminalStatus::Completed {
+                            // Only an activation with a canonical Child creation
+                            // identity can invoke the Host SubAgent route. Legacy
+                            // Echo and other executors may share this runner's
+                            // installed tool but have no nested wait to fence.
+                            if let (Some(tool), Some(creation)) =
+                                (canonical_subagent_tool.as_deref(), expected_creation)
+                            {
+                                let (Some(store), Some(binding), Some(run_id)) =
+                                    (actor_directory_store, session_inbox_runtime,
+                                        activation_run_id)
+                                else {
+                                    return Err(AgentError::LLM(
+                                        "nested SubAgent Host authority unavailable at Child terminal"
+                                            .into(),
+                                    ));
+                                };
+                                let must_suspend = ensure_active_nested_wait(
+                                    tool, store, binding, run_id, child_session_id,
+                                    parent_session_id, logical_session, creation, plain_input,
+                                ).await?;
+                                if must_suspend || nested_wait_registered_this_run {
+                                    // This is only a current-Run handoff fence.
+                                    // sdk/spawn re-reads the durable Host wait;
+                                    // copying a stale wait into this Session
+                                    // would re-arm it after a fast grandchild
+                                    // completion, while copying no wait would
+                                    // erase an active registration on final save.
+                                    logical_session.metadata.insert(
+                                        "runtime.actor_nested_wait_handoff".into(),
+                                        "true".into(),
+                                    );
+                                }
+                            }
+                        }
                         return match status {
                             TerminalStatus::Completed => Ok(result),
                             TerminalStatus::Cancelled => Err(AgentError::Cancelled),
                             TerminalStatus::Error => Err(AgentError::LLM(
                                 error.unwrap_or_else(|| "actor child errored".to_string()),
                             )),
-                            // The suspend/resume round-trip (host re-dispatch of a
-                            // nested parent) is not wired here yet; a worker in
-                            // this build never emits Suspended, so this is
-                            // unreachable in practice.
-                            TerminalStatus::Suspended => Err(AgentError::LLM(
-                                "nested sub-agent suspend received but resume transport is not wired"
-                                    .to_string(),
-                            )),
+                            TerminalStatus::Suspended => {
+                                use bamboo_agent_core::storage::Storage;
+                                let (Some(request_id), Some(store), Some(binding), Some(run_id), Some(creation)) =
+                                    (parent_question_checkpoint_id.as_ref(), actor_directory_store,
+                                        session_inbox_runtime, activation_run_id, expected_creation)
+                                else {
+                                    return Err(AgentError::LLM("uncheckpointed Child suspension rejected".into()));
+                                };
+                                if load_active_subagent_caller(
+                                    store, binding, run_id, child_session_id,
+                                    parent_session_id, logical_session, creation, plain_input,
+                                ).await.is_none() {
+                                    return Err(AgentError::LLM("stale Child question suspension rejected".into()));
+                                }
+                                let id = bamboo_domain::SessionMessageId::parse(request_id.clone())
+                                    .map_err(|_| AgentError::LLM("invalid Child question receipt".into()))?;
+                                let child = store.load_session(child_session_id).await
+                                    .map_err(|_| AgentError::LLM("canonical Child question unavailable".into()))?
+                                    .ok_or_else(|| AgentError::LLM("canonical Child question missing".into()))?;
+                                let parent = store.load_session(parent_session_id).await
+                                    .map_err(|_| AgentError::LLM("canonical direct parent unavailable".into()))?
+                                    .ok_or_else(|| AgentError::LLM("canonical direct parent missing".into()))?;
+                                let pending = ParentQuestion::for_pending(&parent, &child)
+                                    .is_some_and(|question| question.id == id);
+                                let answered = bamboo_domain::ParentQuestionResolution::from_child(
+                                    &parent, &child, &id,
+                                ).is_some();
+                                if !pending && !answered {
+                                    return Err(AgentError::LLM("canonical Child question proof changed".into()));
+                                }
+                                logical_session.metadata.insert(
+                                    "runtime.actor_parent_question_handoff".into(), "true".into(),
+                                );
+                                Ok(None)
+                            }
                         };
                     }
                     Ok(None) => {
@@ -5821,6 +6475,34 @@ fn project_id_for_actor_run(
 
 fn remote_broker_unavailable() -> AgentError {
     AgentError::LLM("remote_broker_activation_unavailable".into())
+}
+
+/// Only these bounded worker admission errors may cross the fixed Remote
+/// diagnostic boundary before permission posture confirmation. Transport and
+/// arbitrary worker text retain the generic remote error.
+fn remote_environment_error_code(value: &str) -> Option<&'static str> {
+    const CODES: &[&str] = &[
+        "remote_environment_lease_invalid",
+        "remote_environment_snapshot_mismatch",
+        "remote_environment_checkout_not_clean",
+        "remote_environment_checkout_unsupported",
+        "remote_environment_workspace_unavailable",
+        "remote_environment_workspace_outside_git_root",
+        "remote_environment_path_unsupported",
+        "remote_environment_git_unavailable",
+        "remote_environment_git_inspection_failed",
+        "remote_environment_git_inspection_timed_out",
+        "remote_environment_git_output_too_large",
+        "remote_environment_snapshot_too_large",
+        "remote_environment_snapshot_changed",
+        "remote_environment_index_invalid",
+        "remote_environment_index_unsupported",
+        "remote_environment_host_path_or_grants_rejected",
+        "remote_environment_worker_workspace_missing",
+        "remote_environment_runspec_invalid",
+        "remote_environment_lease_missing_or_host_path_present",
+    ];
+    CODES.iter().copied().find(|code| *code == value)
 }
 
 // Read only: no ensure/repair/Actor initialization or subtree budget. Capture
@@ -6465,11 +7147,14 @@ mod tests {
                 expected_permission_posture: None,
                 expected_creation: Some(&creation),
                 session_inbox_runtime: None,
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
                 activation_run_id: Some("current"),
                 execution_epoch: 7,
                 expected_source_actor_id: "selected",
                 initial_inflight_claims: vec![].into(),
                 plain_actor: false,
+                remote_environment_lease: false,
                 readonly_output: None,
                 local_history_tools: Some(&tools),
                 local_history_read_only: true,
@@ -6777,6 +7462,7 @@ mod tests {
             inbox,
             storage,
             persistence,
+            parent_question_lock: None,
         }
     }
 
@@ -7346,6 +8032,39 @@ mod tests {
                             .status,
                         bamboo_domain::ActorActivationStatus::Failed
                     );
+                }
+                if case == "oversize" {
+                    let reopened = Arc::new(
+                        bamboo_storage::SessionStoreV2::new(temp.path().into())
+                            .await
+                            .unwrap(),
+                    );
+                    let cold_inbox = bamboo_storage::FileSessionInbox::new(
+                        reopened,
+                        bamboo_domain::SessionInboxLimits::default(),
+                    );
+                    let now = chrono::Utc::now();
+                    let leases = cold_inbox
+                        .inspect_owned_leases(&before.id, 2, now)
+                        .await
+                        .unwrap();
+                    assert_eq!(leases.len(), 1);
+                    assert_eq!(leases[0].failure_count, 1);
+                    assert_eq!(
+                        leases[0].last_error_code.as_deref(),
+                        Some("unsupported_actor_input")
+                    );
+                    let retry_after = leases[0].retry_after.unwrap();
+                    assert!(retry_after > now);
+                    let readiness = cold_inbox
+                        .inspect_wake_readiness(&before.id, now)
+                        .await
+                        .unwrap();
+                    assert!(
+                        readiness.ready.is_none(),
+                        "failed correction must not hot-loop"
+                    );
+                    assert_eq!(readiness.next_due_at, Some(retry_after));
                 }
                 continue;
             }
@@ -8053,6 +8772,7 @@ mod tests {
                 auto_approve_permissions: false,
                 session_id: child.id.clone(),
                 workspace_path: child.workspace.clone(),
+                environment_lease: None,
                 inherit_session_grants: false,
                 policy: serde_json::to_value(policy.to_serializable()).unwrap(),
             }),
@@ -9006,11 +9726,14 @@ mod tests {
             logical_session: &mut session,
             expected_permission_posture: Some(expected),
             session_inbox_runtime: None,
+            actor_directory_store: None,
+            canonical_subagent_tool: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: session_id,
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            remote_environment_lease: false,
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
@@ -10118,6 +10841,7 @@ mod tests {
             inbox: inbox.clone(),
             storage,
             persistence: locked,
+            parent_question_lock: None,
         };
         let pairs = claim_canonical_deliveries(&binding, &mut session, run_id, usize::MAX)
             .await
@@ -10212,11 +10936,14 @@ mod tests {
             logical_session: &mut session,
             expected_permission_posture: None,
             session_inbox_runtime: Some(&binding),
+            actor_directory_store: None,
+            canonical_subagent_tool: None,
             activation_run_id: Some(run_id),
             execution_epoch: 0,
             expected_source_actor_id: session_id,
             initial_inflight_claims: claims,
             plain_actor: false,
+            remote_environment_lease: false,
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
@@ -11227,11 +11954,14 @@ mod tests {
                 logical_session: &mut logical_session,
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
                 activation_run_id: None,
                 execution_epoch: 0,
                 expected_source_actor_id: "child-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                remote_environment_lease: false,
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
@@ -11299,11 +12029,14 @@ mod tests {
                 logical_session: &mut logical_session,
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
                 activation_run_id: None,
                 execution_epoch: 0,
                 expected_source_actor_id: "child-no-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 plain_actor: false,
+                remote_environment_lease: false,
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
@@ -11368,11 +12101,14 @@ mod tests {
             logical_session: &mut logical_session,
             expected_permission_posture: None,
             session_inbox_runtime: None,
+            actor_directory_store: None,
+            canonical_subagent_tool: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: "child-x",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            remote_environment_lease: false,
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
@@ -11415,11 +12151,14 @@ mod tests {
             logical_session: &mut logical_session,
             expected_permission_posture: None,
             session_inbox_runtime: None,
+            actor_directory_store: None,
+            canonical_subagent_tool: None,
             activation_run_id: None,
             execution_epoch: 0,
             expected_source_actor_id: "child-y",
             initial_inflight_claims: VecDeque::new(),
             plain_actor: false,
+            remote_environment_lease: false,
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,

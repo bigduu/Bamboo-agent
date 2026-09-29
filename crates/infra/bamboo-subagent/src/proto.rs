@@ -691,6 +691,10 @@ pub struct PermissionPolicyContext {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// A portable, admission-time Git snapshot for a fixed remote worker.
+    /// Remote runs carry no host-absolute workspace path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_lease: Option<crate::environment::EnvironmentLease>,
     /// Session grants are deliberately not inherited across an actor boundary;
     /// a future opt-in protocol can set this and carry explicit scoped grants.
     #[serde(default)]
@@ -802,6 +806,18 @@ pub enum ParentFrame {
         id: String,
         approved: bool,
     },
+    /// Bounded Host-owned tree page for the active logical Child. A missing
+    /// page is a fail-closed denial; no Session authority travels to Worker.
+    OwnedTreeReply {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<serde_json::Value>,
+    },
+    /// Canonical Host result for a logical SubAgent operation in this Run.
+    SubAgentReply {
+        id: String,
+        result: serde_json::Value,
+    },
 }
 
 /// Child → parent event/terminal frames.
@@ -819,6 +835,20 @@ pub enum ChildFrame {
     /// host answers with [`ParentFrame::ApprovalReply`] carrying the same `id`.
     /// `body` carries `{tool_name, permission_type, resource, question}`.
     ApprovalRequest { id: String, body: serde_json::Value },
+    /// The Worker supplies only a page cursor. The Host binds this frame to
+    /// the currently fenced logical Child; it never accepts a caller ID here.
+    OwnedTreeRequest {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// The Worker supplies only logical arguments and a transcript call id.
+    /// Caller identity is bound to the active Host drive, not this frame.
+    SubAgentRequest {
+        id: String,
+        tool_call_id: String,
+        args: serde_json::Value,
+    },
     /// Emitted only after the worker's local SessionInbox transcript + cursor
     /// checkpoint and admitted receipt are durable.
     SessionMessageAdmitted {
@@ -1165,6 +1195,7 @@ mod tests {
             auto_approve_permissions: false,
             session_id: "child-1".into(),
             workspace_path: Some("/workspace/project".into()),
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::json!({"enabled":true,"durable_rules":[]}),
         };
@@ -1219,6 +1250,7 @@ mod tests {
             auto_approve_permissions: true,
             session_id: "partial-policy".to_string(),
             workspace_path: None,
+            environment_lease: None,
             inherit_session_grants: false,
             policy: serde_json::json!({}),
         };

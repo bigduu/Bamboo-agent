@@ -411,6 +411,8 @@ async fn one_cluster_worker_multiplexes_200_concurrent_runs_end_to_end() {
                         break;
                     }
                     ChildFrame::ApprovalRequest { .. }
+                    | ChildFrame::OwnedTreeRequest { .. }
+                    | ChildFrame::SubAgentRequest { .. }
                     | ChildFrame::SessionMessageAdmitted { .. } => {
                         panic!("echo run {run} emitted an unexpected control frame")
                     }

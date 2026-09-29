@@ -2,6 +2,8 @@
 
 > 本文是 sub-agent 体系的**设计**(非实施步骤)。取代旧的 `subagent-subprocess-refactor-plan.md`——子进程只是本设计的一种 runtime 实现,不再是主题。
 
+> #791 当前交付范围与现成 Actor 库评估见 [actor-library-evaluation.md](actor-library-evaluation.md)。
+
 ---
 
 ## 1. 目标与核心理念

@@ -336,7 +336,11 @@ pub(super) fn build_root_tools(
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
-) -> Arc<dyn ToolExecutor> {
+    parent_request_replies: Arc<dyn bamboo_server_tools::ParentRequestReplyPort>,
+) -> (
+    Arc<dyn ToolExecutor>,
+    Arc<dyn bamboo_agent_core::tools::Tool>,
+) {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
         session_store: session_store.clone(),
@@ -360,12 +364,14 @@ pub(super) fn build_root_tools(
     // for session lifecycle, `SubagentResolutionPort` for subagent_type config).
     // The model catalog enables `action=list_models` + explicit `create.model`.
     let sub_agent_tool = Arc::new(
-        crate::tools::SubAgentTool::new(adapter.clone(), adapter.clone()).with_model_catalog(
-            Arc::new(crate::tools::RegistryModelCatalog::new(provider_registry)),
-        ),
+        crate::tools::SubAgentTool::new(adapter.clone(), adapter.clone())
+            .with_model_catalog(Arc::new(crate::tools::RegistryModelCatalog::new(
+                provider_registry,
+            )))
+            .with_parent_request_replies(parent_request_replies),
     );
     let tools_with_sub_agent: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool),
+        crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool.clone()),
     );
 
     // Planning is delegated to one runtime-enforced read-only child. This keeps
@@ -413,7 +419,7 @@ pub(super) fn build_root_tools(
     // When a broker is configured, root agents also get `ask_agent` (command
     // broker-deployed agents, query/steer) and `deploy_agent` (spin up new
     // workers themselves — local / Docker / SSH — wired to the same broker).
-    match broker {
+    let tools: Arc<dyn ToolExecutor> = match broker {
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools_with_control,
@@ -448,7 +454,8 @@ pub(super) fn build_root_tools(
             ))
         }
         _ => tools_with_control,
-    }
+    };
+    (tools, sub_agent_tool)
 }
 
 #[cfg(test)]

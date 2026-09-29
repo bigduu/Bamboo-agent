@@ -24,6 +24,7 @@ use std::{
 };
 const HOST: &str = "remote-host-opaque-credential-000000001";
 const WORKER: &str = "remote-worker-opaque-credential-0000001";
+const OBSERVER: &str = "remote-observer-opaque-credential-00001";
 const ROLE: &str = "legacy-remote-native";
 struct Process(Child);
 impl Process {
@@ -223,7 +224,7 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
     p.step.store(0, Ordering::SeqCst);
     let reply=client.post(format!("{base}/chat")).json(&json!({"session_id":"remote-root","message":format!("Perform remote operation {number}"),
         "model":"remote-root","provider":"openai","model_ref":{"provider":"openai","model":"remote-root"},
-        "permission_mode":"bypass","workspace_path":p.data.join("workspace")})).send().await.unwrap();
+        "permission_mode":"bypass","workspace_path":p.data.join("host-workspace")})).send().await.unwrap();
     assert!(
         reply.status().is_success(),
         "{}",
@@ -421,7 +422,11 @@ async fn wait_runs_settled(data: &Path) {
                         Ok(bytes) => {
                             let message: bamboo_subagent::InboxMessage =
                                 serde_json::from_slice(&bytes).unwrap();
-                            runs += usize::from(message.kind == bamboo_subagent::InboxKind::Run);
+                            runs += usize::from(matches!(
+                                message.kind,
+                                bamboo_subagent::InboxKind::Run
+                                    | bamboo_subagent::InboxKind::LeasedRun
+                            ));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => panic!("physical Run observation: {error}"),
@@ -445,7 +450,54 @@ async fn fixture() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.keep().canonicalize().unwrap();
     eprintln!("remote broker native evidence: {}", data.display());
-    std::fs::create_dir(data.join("workspace")).unwrap();
+    let host_workspace = data.join("host-workspace");
+    let worker_workspace = data.join("worker-workspace");
+    let replacement_workspace = data.join("replacement-worker-workspace");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(&host_workspace)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(host_workspace.join("README.md"), "same portable bytes\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&host_workspace)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&host_workspace)
+        .args([
+            "-c",
+            "user.name=Remote Test",
+            "-c",
+            "user.email=remote@test.invalid",
+            "commit",
+            "-qm",
+            "snapshot"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["clone", "-q", "--local"])
+        .arg(&host_workspace)
+        .arg(&worker_workspace)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["clone", "-q", "--local"])
+        .arg(&host_workspace)
+        .arg(&replacement_workspace)
+        .status()
+        .unwrap()
+        .success());
+    assert_ne!(host_workspace, worker_workspace);
+    assert_ne!(worker_workspace, replacement_workspace);
     std::fs::create_dir(data.join("home")).unwrap();
     let (cert, key) = (data.join("cert.pem"), data.join("key.pem"));
     assert!(Command::new("openssl")
@@ -476,9 +528,11 @@ async fn fixture() {
     let url = format!("wss://{bind}");
     let expiry = Utc::now() + ChronoDuration::minutes(15);
     let policy = json!({"peers":[{"credential":HOST,"mailbox":"remote-parent","role":"host","host":"host-node","expires_at":expiry,
-        "destinations":[{"mailbox":"remote-worker","kinds":["run","steer"]}],"cancel":["remote-worker"],"presence":["worker"]},
+        "destinations":[{"mailbox":"remote-worker","kinds":["leased_run","steer"]}],"cancel":["remote-worker"],"presence":["worker"]},
         {"credential":WORKER,"mailbox":"remote-worker","role":"worker","host":"worker-node","expires_at":expiry,
-        "destinations":[{"mailbox":"remote-parent","kinds":["event","outcome","session_message_admitted","approval_request"]}]}]});
+        "destinations":[{"mailbox":"remote-parent","kinds":["event","outcome","session_message_admitted","approval_request"]}]},
+        {"credential":OBSERVER,"mailbox":"remote-observer","role":"observer","host":"observer-node","expires_at":expiry,
+        "destinations":[],"presence":["worker"]}]});
     let mut c = command(&data);
     c.args(["broker", "serve", "--bind"])
         .arg(&bind)
@@ -532,7 +586,7 @@ async fn fixture() {
         data.join("fabric").to_string_lossy().into_owned(),
     );
     spec.storage_dir = Some(data.join("worker-cache").to_string_lossy().into_owned());
-    spec.workspace = Some(data.join("workspace").to_string_lossy().into_owned());
+    spec.workspace = Some(worker_workspace.to_string_lossy().into_owned());
     spec.model = Some(ModelRefSpec {
         provider: "openai".into(),
         model: "remote-child".into(),
@@ -551,6 +605,16 @@ async fn fixture() {
         endpoint: url.clone(),
         token: WORKER.into(),
     });
+    // A replacement resident has its own checkout and private cache. The
+    // broker mailbox and Host-owned Child identity remain stable across the
+    // explicit handoff after the old Run has ACKed.
+    let mut replacement_spec = spec.clone();
+    replacement_spec.storage_dir = Some(
+        data.join("replacement-worker-cache")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    replacement_spec.workspace = Some(replacement_workspace.to_string_lossy().into_owned());
     let mut observer = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(c) = BrokerClient::connect_with_tls(
@@ -571,9 +635,64 @@ async fn fixture() {
     })
     .await
     .unwrap();
+    // A scoped old Worker can subscribe but has no lease capability. The Host
+    // rejects it at placement, before it can receive a Run or call a provider.
+    let mut legacy_worker = BrokerClient::connect_with_tls(
+        &url,
+        AgentRef {
+            session_id: "remote-worker".into(),
+            role: Some("worker".into()),
+        },
+        WORKER,
+        Some(client_config_trusting_cert(&cert).unwrap()),
+    )
+    .await
+    .unwrap();
+    legacy_worker.subscribe().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if observer
+                .observe_host("remote-worker", "worker")
+                .await
+                .unwrap()
+                .is_some_and(|host| !host.environment_lease_v1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let unsupported = bamboo_broker::BrokerChildLink::connect_strict_with_tls_environment_lease(
+        &url,
+        AgentRef {
+            session_id: "remote-parent".into(),
+            role: Some("host".into()),
+        },
+        HOST,
+        AgentRef {
+            session_id: "remote-worker".into(),
+            role: Some("worker".into()),
+        },
+        client_config_trusting_cert(&cert).unwrap(),
+    )
+    .await
+    .err()
+    .expect("old Worker must be refused before Run");
+    assert!(unsupported
+        .to_string()
+        .contains("remote_environment_lease_unsupported"));
+    assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+    drop(legacy_worker);
     let mut resident = worker(&data, &spec, &url, &cert, "first");
     tokio::time::timeout(Duration::from_secs(30), async {
-        while observer.list_connected("worker").await.unwrap() != vec!["remote-worker"] {
+        while !observer
+            .observe_host("remote-worker", "worker")
+            .await
+            .unwrap()
+            .is_some_and(|host| host.environment_lease_v1)
+        {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     })
@@ -630,6 +749,16 @@ async fn fixture() {
     }
     let original = cold(&data, &child_id).await;
     let (mut h, base) = host(&data, &config, "valid").await;
+    std::fs::write(worker_workspace.join("README.md"), "dirty worker bytes\n").unwrap();
+    let dirty_requested_at = SystemTime::now();
+    turn(&client, &base, &p, 1, 0).await;
+    let dirty = wait_child_after(&data, &child_id, "error", dirty_requested_at).await;
+    assert!(dirty
+        .last_run_error()
+        .unwrap_or_default()
+        .contains("remote_environment_checkout_not_clean"));
+    assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+    std::fs::write(worker_workspace.join("README.md"), "same portable bytes\n").unwrap();
     let public: Value = client
         .get(format!("{base}/bamboo/config"))
         .send()
@@ -707,7 +836,53 @@ async fn fixture() {
     wait_runs_settled(&data).await;
     resident.stop();
     assert!(resident.0.try_wait().unwrap().is_some());
-    resident = worker(&data, &spec, &url, &cert, "replacement");
+    std::fs::write(
+        replacement_workspace.join("README.md"),
+        "different replacement bytes\n",
+    )
+    .unwrap();
+    resident = worker(&data, &replacement_spec, &url, &cert, "replacement");
+    let mut replacement_observer = BrokerClient::connect_with_tls(
+        &url,
+        AgentRef {
+            session_id: "remote-observer".into(),
+            role: Some("observer".into()),
+        },
+        OBSERVER,
+        Some(client_config_trusting_cert(&cert).unwrap()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !replacement_observer
+            .list_connected("worker")
+            .await
+            .unwrap()
+            .contains(&"remote-worker".to_string())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(replacement_observer);
+    let mismatched_requested_at = SystemTime::now();
+    turn(&client, &base, &p, 1, 0).await;
+    let mismatched = wait_child_after(&data, &child_id, "error", mismatched_requested_at).await;
+    assert!(mismatched
+        .last_run_error()
+        .unwrap_or_default()
+        .contains("remote_environment_checkout_not_clean"));
+    assert_eq!(
+        p.calls.load(Ordering::SeqCst),
+        2,
+        "a replacement with a different checkout must not call the provider"
+    );
+    std::fs::write(
+        replacement_workspace.join("README.md"),
+        "same portable bytes\n",
+    )
+    .unwrap();
     turn(&client, &base, &p, 1, 0).await;
     wait_calls(&p, 3).await;
     wait_child(&data, &child_id, "completed").await;
@@ -721,14 +896,17 @@ async fn fixture() {
     wait_runs_settled(&data).await;
     resident.stop();
     assert!(h.0.try_wait().unwrap().is_some() && resident.0.try_wait().unwrap().is_some());
-    resident = worker(&data, &spec, &url, &cert, "cold");
+    resident = worker(&data, &replacement_spec, &url, &cert, "cold");
     let (mut h, base) = host(&data, &config, "cold").await;
     turn(&client, &base, &p, 1, 0).await;
     wait_calls(&p, 5).await;
     let final_child = wait_child(&data, &child_id, "completed").await;
     h.stop();
     resident.stop();
-    let cached = cold(&data.join("worker-cache"), &child_id).await;
+    let cached = cold(&data.join("replacement-worker-cache"), &child_id).await;
+    assert_eq!(cached.workspace.as_deref(), replacement_workspace.to_str());
+    assert_ne!(cached.workspace.as_deref(), worker_workspace.to_str());
+    assert_ne!(cached.workspace.as_deref(), host_workspace.to_str());
     for session in [&final_child, &cached] {
         assert_eq!(session.id, child_id);
         assert_eq!(session.created_at, original.created_at);
@@ -743,4 +921,6 @@ async fn fixture() {
     }
     assert_eq!(p.calls.load(Ordering::SeqCst), 5);
     handle.stop(true).await;
+    drop(_broker);
+    std::fs::remove_dir_all(&data).unwrap();
 }

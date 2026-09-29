@@ -154,6 +154,7 @@ where
         tls_config,
         idle_timeout,
         CancellationToken::new(),
+        false,
     )
     .await
 }
@@ -168,6 +169,7 @@ async fn serve_mailbox_full_with_lifecycle_and_owner_loss<H, Fut>(
     tls_config: Option<Arc<rustls::ClientConfig>>,
     idle_timeout: Option<Duration>,
     owner_loss: CancellationToken,
+    environment_lease_v1: bool,
 ) -> BrokerResult<ServeExitReason>
 where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
@@ -176,7 +178,11 @@ where
     let mut client =
         BrokerClient::connect_with_tls(endpoint, me.clone(), token, clone_tls_config(&tls_config))
             .await?;
-    client.subscribe().await?;
+    if environment_lease_v1 {
+        client.subscribe_environment_lease_v1().await?;
+    } else {
+        client.subscribe().await?;
+    }
     serve_loop_with_timeouts_and_owner_loss(
         &mut client,
         &me,
@@ -1045,12 +1051,14 @@ where
     // arrive as independent messages handled by independent tasks).
     let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let tree_waiters: TreeWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let me_owned = me.clone();
     let approval_timeout = DEFAULT_APPROVAL_TIMEOUT;
     let readiness = shutdown.clone();
     let fatal_uplink = CancellationToken::new();
     let owner_loss = CancellationToken::new();
     let handler_owner_loss = owner_loss.clone();
+    let environment_lease_v1 = executor.supports_environment_lease_v1();
     serve_mailbox_full_with_lifecycle_and_owner_loss(
         endpoint,
         me,
@@ -1060,6 +1068,7 @@ where
             let context = Arc::clone(&context);
             let coords = Arc::clone(&coords);
             let waiters = Arc::clone(&waiters);
+            let tree_waiters = Arc::clone(&tree_waiters);
             let execution_slots = Arc::clone(&execution_slots);
             let me = me_owned.clone();
             let uplink = uplink.clone();
@@ -1067,24 +1076,26 @@ where
             let fatal_uplink = fatal_uplink.clone();
             let owner_loss = handler_owner_loss.clone();
             async move {
-                let _execution_slot =
-                    if matches!(msg.kind, InboxKind::Run | InboxKind::Ask | InboxKind::Task) {
-                        Some(tokio::select! {
-                            biased;
-                            _ = fatal_uplink.cancelled() => return Handled::Leave,
-                            slot = execution_slots.acquire_owned() => slot
-                                .expect("executor execution-slot semaphore is never closed"),
-                        })
-                    } else {
-                        None
-                    };
+                let _execution_slot = if matches!(
+                    msg.kind,
+                    InboxKind::Run | InboxKind::LeasedRun | InboxKind::Ask | InboxKind::Task
+                ) {
+                    Some(tokio::select! {
+                        biased;
+                        _ = fatal_uplink.cancelled() => return Handled::Leave,
+                        slot = execution_slots.acquire_owned() => slot
+                            .expect("executor execution-slot semaphore is never closed"),
+                    })
+                } else {
+                    None
+                };
                 if fatal_uplink.is_cancelled() {
                     return Handled::Leave;
                 }
                 match msg.kind {
                     // A full child session over the bus (the actor-over-mailbox path):
                     // stream events back to the parent live, then the terminal outcome.
-                    InboxKind::Run => {
+                    InboxKind::Run | InboxKind::LeasedRun => {
                         handle_run(
                             executor.as_ref(),
                             &me,
@@ -1092,11 +1103,13 @@ where
                             cancel,
                             &coords,
                             &waiters,
+                            &tree_waiters,
                             &uplink,
                             approval_timeout,
                             readiness,
                             fatal_uplink,
                             owner_loss,
+                            environment_lease_v1,
                         )
                         .await
                     }
@@ -1133,6 +1146,56 @@ where
                         }
                         Handled::Ack
                     }
+                    InboxKind::OwnedTreeReply => {
+                        let id = msg
+                            .body
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let mut pending = tree_waiters_lock(&tree_waiters);
+                        if pending.get(id).is_some_and(|waiter| {
+                            waiter.parent == msg.from
+                                && msg.correlation_id.as_ref() == Some(&waiter.run_id)
+                        }) {
+                            if let Some(waiter) = pending.remove(id) {
+                                let page = msg
+                                    .body
+                                    .get("page")
+                                    .filter(|page| {
+                                        serde_json::to_vec(page)
+                                            .is_ok_and(|bytes| bytes.len() <= 8192)
+                                    })
+                                    .cloned();
+                                let _ = waiter.reply.send(page);
+                            }
+                        }
+                        Handled::Ack
+                    }
+                    InboxKind::SubAgentReply => {
+                        let id = msg
+                            .body
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let mut pending = tree_waiters_lock(&tree_waiters);
+                        if pending.get(id).is_some_and(|waiter| {
+                            waiter.parent == msg.from
+                                && msg.correlation_id.as_ref() == Some(&waiter.run_id)
+                        }) {
+                            if let Some(waiter) = pending.remove(id) {
+                                let result = msg
+                                    .body
+                                    .get("result")
+                                    .filter(|value| {
+                                        serde_json::to_vec(value)
+                                            .is_ok_and(|bytes| bytes.len() <= 16 * 1024)
+                                    })
+                                    .cloned();
+                                let _ = waiter.reply.send(result);
+                            }
+                        }
+                        Handled::Ack
+                    }
                     // Ask/Task: the conversational query/steer path (unchanged).
                     _ => handle_with_executor(executor.as_ref(), &context, msg, cancel).await,
                 }
@@ -1142,6 +1205,7 @@ where
         tls_config,
         idle_timeout,
         owner_loss,
+        environment_lease_v1,
     )
     .await
 }
@@ -1169,6 +1233,32 @@ impl Drop for RunCoordRegistration {
 /// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
 /// an [`InboxKind::ApprovalReply`] fulfils the matching one.
 type ApprovalWaiters = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+
+struct TreeReplyWaiter {
+    parent: AgentRef,
+    run_id: MsgId,
+    reply: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+}
+type TreeWaiters = Arc<std::sync::Mutex<HashMap<String, TreeReplyWaiter>>>;
+
+fn tree_waiters_lock(
+    waiters: &TreeWaiters,
+) -> std::sync::MutexGuard<'_, HashMap<String, TreeReplyWaiter>> {
+    waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct TreeWaiterRegistration {
+    waiters: TreeWaiters,
+    id: String,
+}
+
+impl Drop for TreeWaiterRegistration {
+    fn drop(&mut self) {
+        tree_waiters_lock(&self.waiters).remove(&self.id);
+    }
+}
 
 fn approval_waiters_lock(
     waiters: &ApprovalWaiters,
@@ -1271,15 +1361,18 @@ async fn handle_run<E>(
     cancel: CancellationToken,
     coords: &RunCoords,
     waiters: &ApprovalWaiters,
+    tree_waiters: &TreeWaiters,
     uplink: &ActorBrokerUplink,
     approval_timeout: Duration,
     readiness: CancellationToken,
     fatal_uplink: CancellationToken,
     owner_loss: CancellationToken,
+    environment_lease_v1: bool,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
+    use bamboo_subagent::executor::HostRequestKind;
     use bamboo_subagent::{
         ActorEventBatcher, EventSink, ExecutorControl, HostBridge, RunSpec, SteerInbox,
     };
@@ -1287,14 +1380,35 @@ where
     if fatal_uplink.is_cancelled() {
         return Handled::Leave;
     }
-    let spec: RunSpec = match serde_json::from_value(msg.body) {
+    let spec: RunSpec = match serde_json::from_value(msg.body.clone()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("run {:?}: malformed RunSpec, dropping: {e}", msg.id);
+            tracing::warn!("run {:?}: malformed RunSpec: {e}", msg.id);
+            if msg.kind == InboxKind::LeasedRun {
+                return reject_leased_run(me, &msg, uplink, "remote_environment_runspec_invalid")
+                    .await;
+            }
             return Handled::Ack;
         }
     };
+    if msg.kind == InboxKind::LeasedRun {
+        if !environment_lease_v1 {
+            tracing::warn!(run_id = %msg.id.as_str(), "leased Run reached an unsupported executor; retaining it for a capable worker");
+            return Handled::LeaveAndDisconnect;
+        }
+        let error = if !spec.permission_policy.as_ref().is_some_and(|policy| {
+            policy.workspace_path.is_none() && policy.environment_lease.is_some()
+        }) {
+            Some("remote_environment_lease_missing_or_host_path_present")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return reject_leased_run(me, &msg, uplink, error).await;
+        }
+    }
     let run_id = msg.id.clone();
+    let parent_actor = msg.from.clone();
     let parent = msg.from.session_id.clone();
     let legacy_event_wire = spec.execution_epoch == 0;
     let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()));
@@ -1477,7 +1591,9 @@ where
     // ApprovalReply wakes the registered waiter, whose decision answers the tool.
     // Ends when the run drops the sink ⇒ the host bridge ⇒ `host_rx` closes.
     let waiters_drain = Arc::clone(waiters);
+    let tree_waiters_drain = Arc::clone(tree_waiters);
     let run_id_appr = run_id.clone();
+    let parent_actor_appr = parent_actor.clone();
     let uplink_appr = uplink.clone();
     let failure_appr = critical_uplink_failed.clone();
     let readiness_appr = readiness.clone();
@@ -1492,6 +1608,78 @@ where
                     None => break,
                 },
             };
+            if matches!(
+                req.kind,
+                HostRequestKind::OwnedTree | HostRequestKind::SubAgent
+            ) {
+                let request_id = MsgId::new();
+                let request_id_str = format!("{request_id:?}");
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tree_waiters_lock(&tree_waiters_drain).insert(
+                    request_id_str.clone(),
+                    TreeReplyWaiter {
+                        parent: parent_actor_appr.clone(),
+                        run_id: run_id_appr.clone(),
+                        reply: tx,
+                    },
+                );
+                let _registration = TreeWaiterRegistration {
+                    waiters: tree_waiters_drain.clone(),
+                    id: request_id_str.clone(),
+                };
+                let (kind, body, timeout) = match req.kind {
+                    HostRequestKind::OwnedTree => (
+                        InboxKind::OwnedTreeRequest,
+                        serde_json::json!({
+                            "id": request_id_str,
+                            "cursor": req.body.get("cursor").cloned().unwrap_or_default(),
+                        }),
+                        Duration::from_secs(8),
+                    ),
+                    HostRequestKind::SubAgent => (
+                        InboxKind::SubAgentRequest,
+                        serde_json::json!({
+                            "id": request_id_str,
+                            "tool_call_id": req.body.get("tool_call_id"),
+                            "args": req.body.get("args"),
+                        }),
+                        Duration::from_secs(30),
+                    ),
+                    HostRequestKind::Approval => unreachable!(),
+                };
+                let message = InboxMessage {
+                    id: MsgId::new(),
+                    from: me.clone(),
+                    kind,
+                    body,
+                    created_at: Utc::now(),
+                    correlation_id: Some(run_id_appr.clone()),
+                };
+                let delivered = tokio::select! {
+                    _ = approval_cancel.cancelled() => false,
+                    result = tokio::time::timeout(timeout,
+                        uplink_appr.deliver_control(&parent, message)) => result.is_ok_and(|result| result.is_ok()),
+                };
+                let result = if delivered {
+                    tokio::select! {
+                        _ = approval_cancel.cancelled() => None,
+                        result = tokio::time::timeout(timeout, rx) => result.ok().and_then(Result::ok).flatten(),
+                    }
+                } else {
+                    None
+                };
+                let reply = if req.kind == HostRequestKind::OwnedTree {
+                    serde_json::json!({ "page": result })
+                } else {
+                    result.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "error": "canonical SubAgent operation unavailable"
+                        })
+                    })
+                };
+                let _ = req.reply.send(reply);
+                continue;
+            }
             let approval_id = MsgId::new();
             let approval_id_str = format!("{approval_id:?}");
             let (atx, arx) = tokio::sync::oneshot::channel::<bool>();
@@ -1561,6 +1749,43 @@ where
     // Once Outcome is durable, a subsequently observed control failure retires
     // this worker but must not replay the same successful terminal result.
     if critical_uplink_ok {
+        Handled::Ack
+    } else {
+        Handled::LeaveAndDisconnect
+    }
+}
+
+async fn reject_leased_run(
+    me: &AgentRef,
+    msg: &InboxMessage,
+    uplink: &ActorBrokerUplink,
+    reason: &'static str,
+) -> Handled {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let outcome = bamboo_subagent::ChildOutcome::error(reason);
+    let body = serde_json::to_value(outcome).expect("ChildOutcome is serializable");
+    // Maildir names include both created_at and MsgId. Keep both stable across
+    // a Run replay so a lost Run ACK cannot create a fresh terminal identity.
+    let mut stable_id = String::from("lease-reject-");
+    for byte in Sha256::digest(format!("{}:{}", me.session_id, msg.id.as_str()).as_bytes()) {
+        write!(&mut stable_id, "{byte:02x}").expect("write to String");
+    }
+    let outcome_id = MsgId(stable_id);
+    let terminal = InboxMessage {
+        id: outcome_id,
+        from: me.clone(),
+        kind: InboxKind::Outcome,
+        body,
+        created_at: msg.created_at,
+        correlation_id: Some(msg.id.clone()),
+    };
+    if uplink
+        .deliver_ordered(&msg.from.session_id, terminal)
+        .await
+        .is_ok()
+    {
         Handled::Ack
     } else {
         Handled::LeaveAndDisconnect
@@ -2190,6 +2415,7 @@ mod tests {
         client.subscribe().await?;
         let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let tree_waiters: TreeWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let readiness = CancellationToken::new();
         let loop_readiness = readiness.clone();
         let fatal = CancellationToken::new();
@@ -2203,6 +2429,7 @@ mod tests {
                 let executor = Arc::clone(&executor);
                 let coords = Arc::clone(&coords);
                 let waiters = Arc::clone(&waiters);
+                let tree_waiters = Arc::clone(&tree_waiters);
                 let uplink = uplink.clone();
                 let worker = handler_worker.clone();
                 let readiness = readiness.clone();
@@ -2216,11 +2443,13 @@ mod tests {
                         cancel,
                         &coords,
                         &waiters,
+                        &tree_waiters,
                         &uplink,
                         Duration::from_secs(1),
                         readiness,
                         fatal,
                         owner_loss,
+                        false,
                     )
                     .await
                 }
@@ -3080,6 +3309,143 @@ mod tests {
         assert!(events >= 1, "expected streamed events, got {events}");
         let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
         assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
+    }
+
+    #[tokio::test]
+    async fn canonical_subagent_rpc_rejects_wrong_run_reply_over_real_broker() {
+        struct NestedCall;
+
+        #[async_trait::async_trait]
+        impl bamboo_subagent::ChildExecutor for NestedCall {
+            async fn run(
+                &self,
+                _spec: bamboo_subagent::RunSpec,
+                events: bamboo_subagent::EventSink,
+                _steer: bamboo_subagent::SteerInbox,
+                _cancel: CancellationToken,
+            ) -> bamboo_subagent::ChildOutcome {
+                let result = events
+                    .host()
+                    .expect("active Run bridge")
+                    .subagent_call(
+                        serde_json::json!({"intent":"inspect","target":"owned-child"}),
+                        "nested-call",
+                    )
+                    .await
+                    .expect("canonical Host reply");
+                bamboo_subagent::ChildOutcome::completed(
+                    result["result"].as_str().expect("canonical result text"),
+                )
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let worker_endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor(
+                &worker_endpoint,
+                AgentRef {
+                    session_id: "nested-worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(NestedCall),
+            )
+            .await;
+        });
+        let mut parent = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        parent.subscribe().await.unwrap();
+        let run = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::Run,
+            body: serde_json::to_value(bamboo_subagent::RunSpec {
+                assignment: "inspect owned child".into(),
+                logical_session: None,
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![],
+                activation_run_id: Some("nested-activation".into()),
+                execution_epoch: 1,
+                initial_session_messages: Vec::new(),
+                secrets: Default::default(),
+            })
+            .unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let run_id = run.id.clone();
+        parent.deliver("nested-worker", run).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent.next_message().await.unwrap();
+                if message.kind == InboxKind::SubAgentRequest {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("worker SubAgent RPC");
+        assert_eq!(request.correlation_id.as_ref(), Some(&run_id));
+        assert_eq!(request.body["tool_call_id"], "nested-call");
+        assert_eq!(request.body["args"]["target"], "owned-child");
+        parent.ack(request.id.clone()).await.ok();
+        let id = request.body["id"].as_str().unwrap();
+        let result = serde_json::json!({"result":{
+            "success":true,"result":"canonical-result","display_preference":null
+        }});
+        let reply = |correlation_id| InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "nested-parent".into(),
+                role: None,
+            },
+            kind: InboxKind::SubAgentReply,
+            body: serde_json::json!({"id":id,"result":result.clone()}),
+            created_at: Utc::now(),
+            correlation_id: Some(correlation_id),
+        };
+        parent
+            .deliver("nested-worker", reply(MsgId::new()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), parent.next_message())
+                .await
+                .is_err(),
+            "wrong Run reply must not wake the caller"
+        );
+        parent
+            .deliver("nested-worker", reply(run_id.clone()))
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent.next_message().await.unwrap();
+                if message.kind == InboxKind::Outcome {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("correlated canonical reply completes Run");
+        assert_eq!(terminal.correlation_id.as_ref(), Some(&run_id));
+        let outcome: bamboo_subagent::ChildOutcome = serde_json::from_value(terminal.body).unwrap();
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(outcome.result.as_deref(), Some("canonical-result"));
     }
 
     #[tokio::test]

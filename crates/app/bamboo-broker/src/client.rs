@@ -570,6 +570,10 @@ impl BrokerClient {
         self.send(ClientFrame::Subscribe).await
     }
 
+    pub async fn subscribe_environment_lease_v1(&mut self) -> BrokerResult<()> {
+        self.send(ClientFrame::SubscribeEnvironmentLeaseV1).await
+    }
+
     /// Ask the broker which actors are currently connected serving `role` — the
     /// bus-native live-actor registry (Phase 3). `&mut self` serializes requests,
     /// so the single `connected` reply is unambiguously ours. Bounded by

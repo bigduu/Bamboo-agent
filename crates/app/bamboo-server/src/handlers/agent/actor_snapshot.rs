@@ -126,6 +126,9 @@ mod tests {
         let child = Session::new_child_of("public-child", &root, "model", "Child");
         state.session_store.save_session(&root).await.unwrap();
         state.session_store.save_session(&child).await.unwrap();
+        // A live WS replay window is not a durable coordinate for this
+        // independent REST snapshot, including when both are in one process.
+        let _live_actor = state.actor_event_hub.subscribe(&child.id, None).unwrap();
         let source_path = home.join("sessions/public-root/session.json");
         let source_before = tokio::fs::read(&source_path).await.unwrap();
         let app = test::init_service(
@@ -150,6 +153,7 @@ mod tests {
             .to_owned();
         let body: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+        assert!(body["stream_cursor"].is_null());
         assert_eq!(body["nodes"][0]["actor_id"], child.id);
         assert_eq!(body["nodes"][0]["logical_state"], serde_json::Value::Null);
         assert_eq!(tokio::fs::read(source_path).await.unwrap(), source_before);

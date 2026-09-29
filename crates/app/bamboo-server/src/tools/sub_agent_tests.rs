@@ -60,6 +60,118 @@ async fn invoke_plan_completed(
     }
 }
 
+struct QuestionHostBound;
+
+#[async_trait::async_trait]
+impl bamboo_server_tools::ParentRequestReplyPort for QuestionHostBound {
+    async fn resolve(
+        &self,
+        _: &str,
+        _: &str,
+        _: bamboo_domain::ParentRequestOption,
+    ) -> Result<bamboo_server_tools::ParentRequestReplyReceipt, String> {
+        Err("test question binding never grants permission".into())
+    }
+}
+
+#[tokio::test]
+async fn ask_parent_requires_host_bound_child_and_returns_agentic_clarification() {
+    let harness = build_test_harness().await;
+    let ask = json!({"intent":"ask_parent","message":"Which option?"});
+    assert!(
+        invoke_completed(
+            &harness.tool,
+            ask.clone(),
+            subagent_test_ctx(&harness.child_session_id, "ask-parent-local"),
+        )
+        .await
+        .is_err(),
+        "unbound local tool cannot park a Child"
+    );
+    let tool = SubAgentTool::new(harness.adapter.clone(), harness.adapter.clone())
+        .with_parent_request_replies(Arc::new(QuestionHostBound));
+    assert!(
+        invoke_completed(
+            &tool,
+            ask.clone(),
+            subagent_test_ctx(&harness.parent_session_id, "ask-parent-root"),
+        )
+        .await
+        .is_err(),
+        "Root cannot ask itself"
+    );
+    let result = invoke_completed(
+        &tool,
+        ask.clone(),
+        subagent_test_ctx(&harness.child_session_id, "ask-parent-child"),
+    )
+    .await
+    .expect("Host-bound direct Child can ask");
+    assert!(matches!(
+        bamboo_agent_core::tools::try_parse_agentic_result(&result),
+        Some(bamboo_agent_core::AgenticToolResult::NeedClarification { question, options })
+            if question == "Which option?" && options.is_none()
+    ));
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.set_subagent_type("planner");
+    harness.storage.save_session(&child).await.unwrap();
+    assert!(
+        invoke_completed(
+            &tool,
+            ask.clone(),
+            subagent_test_ctx(&harness.child_session_id, "ask-parent-planner"),
+        )
+        .await
+        .is_err(),
+        "planner Child cannot bypass its role through ask_parent"
+    );
+    child.set_subagent_type("guardian");
+    harness.storage.save_session(&child).await.unwrap();
+    assert!(
+        invoke_completed(
+            &tool,
+            ask.clone(),
+            subagent_test_ctx(&harness.child_session_id, "ask-parent-guardian"),
+        )
+        .await
+        .is_err(),
+        "guardian Child cannot bypass its role through ask_parent"
+    );
+    child.set_subagent_type("general");
+    child.set_project_id_meta(bamboo_domain::ProjectId::new().to_string());
+    harness.storage.save_session(&child).await.unwrap();
+    assert!(
+        invoke_completed(
+            &tool,
+            ask.clone(),
+            subagent_test_ctx(&harness.child_session_id, "ask-parent-project-changed"),
+        )
+        .await
+        .is_err(),
+        "Child cannot ask after its Project diverges from the direct parent"
+    );
+    child.clear_project_id_meta();
+    let other_parent = Session::new("different-root", "gpt-5");
+    harness.storage.save_session(&other_parent).await.unwrap();
+    child.parent_session_id = Some(other_parent.id.clone());
+    harness.storage.save_session(&child).await.unwrap();
+    assert!(
+        invoke_completed(
+            &tool,
+            ask,
+            subagent_test_ctx(&harness.child_session_id, "ask-parent-lineage-changed"),
+        )
+        .await
+        .is_err(),
+        "Child cannot ask after its direct-parent identity diverges from its Root"
+    );
+}
+
 fn subagent_test_ctx(session_id: &str, tool_call_id: &str) -> ToolCtx {
     ToolExecutionContext {
         executing_supervisor: None,
@@ -2674,21 +2786,15 @@ async fn create_without_subagent_type_defaults_to_worker_label() {
 #[tokio::test]
 async fn create_refused_at_max_spawn_depth() {
     // Phase 6: an agent at the depth cap cannot create more sub-agents (bounds
-    // worker→worker→… recursion). Put the parent run session at the cap.
-    let harness = build_test_harness().await;
-    let mut parent = harness
-        .storage
-        .load_session(&harness.parent_session_id)
-        .await
-        .unwrap()
-        .unwrap();
-    parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH;
-    harness.storage.save_session(&parent).await.unwrap();
+    // worker→worker→… recursion). Use a real nested Child at the cap.
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let parent =
+        nested_parent_at_depth(&harness, bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH).await;
 
     let err = invoke_completed(
         &harness.tool,
             json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":harness.workspace_path.to_string_lossy()}),
-            ctx_for(&harness.parent_session_id, "tc_depth_cap").to_tool_ctx(),
+            ctx_for(&parent.id, "tc_depth_cap").to_tool_ctx(),
         )
         .await
         .expect_err("create at the depth cap must be refused");
@@ -2701,26 +2807,40 @@ async fn create_refused_at_max_spawn_depth() {
 #[tokio::test]
 async fn create_allowed_just_below_max_spawn_depth() {
     // One level below the cap, create proceeds (depth gate does not fire).
-    let harness = build_test_harness().await;
-    let mut parent = harness
-        .storage
-        .load_session(&harness.parent_session_id)
-        .await
-        .unwrap()
-        .unwrap();
-    parent.spawn_depth = bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH - 1;
-    harness.storage.save_session(&parent).await.unwrap();
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let parent =
+        nested_parent_at_depth(&harness, bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH - 1).await;
 
     let result = invoke_completed(
         &harness.tool,
             json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":harness.workspace_path.to_string_lossy()}),
-            ctx_for(&harness.parent_session_id, "tc_depth_ok").to_tool_ctx(),
+            ctx_for(&parent.id, "tc_depth_ok").to_tool_ctx(),
         )
         .await;
     assert!(
         result.is_ok(),
         "create just below the cap should proceed, got {result:?}"
     );
+}
+
+async fn nested_parent_at_depth(harness: &TestHarness, depth: u32) -> Session {
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for level in 1..=depth {
+        let child = Session::new_child_of(
+            format!("depth-{level}"),
+            &parent,
+            "gpt-5",
+            format!("Depth {level}"),
+        );
+        harness.storage.save_session(&child).await.unwrap();
+        parent = child;
+    }
+    parent
 }
 
 #[tokio::test]
@@ -6948,6 +7068,178 @@ async fn compact_tree_bounds_owned_observations_without_physical_identity() {
         .all(|node| node.get("parent_actor_id").is_some()));
     assert!(!result.result.contains("foreign-child"));
     assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+}
+
+#[tokio::test]
+async fn compact_child_tree_reads_only_its_durable_owned_subtree() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let sibling = Session::new_child("tree-sibling", &h.parent_session_id, "gpt-5", "Sibling");
+    let grandchild = Session::new_child_of("tree-grandchild", &child, "gpt-5", "Grandchild");
+    let great_grandchild = Session::new_child_of(
+        "tree-great-grandchild",
+        &grandchild,
+        "gpt-5",
+        "Great grandchild",
+    );
+    for session in [&sibling, &grandchild, &great_grandchild] {
+        h.storage.save_session(session).await.unwrap();
+    }
+
+    let result = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect"}),
+        subagent_test_ctx(&child.id, "child-owned-tree"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["actor_id"], child.id);
+    let nodes = payload["nodes"].as_array().unwrap();
+    let actor_ids = nodes
+        .iter()
+        .map(|node| node["actor_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actor_ids,
+        ["child-session", "tree-grandchild", "tree-great-grandchild"]
+    );
+    assert_eq!(nodes[0]["parent_actor_id"], serde_json::Value::Null);
+    assert_eq!(nodes[1]["parent_actor_id"], child.id);
+    assert_eq!(nodes[2]["depth"], 2);
+    assert!(!result.result.contains("tree-sibling"));
+    assert!(!result.result.contains(&h.parent_session_id));
+
+    let root_result = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect"}),
+        subagent_test_ctx(&h.parent_session_id, "root-full-tree"),
+    )
+    .await
+    .unwrap();
+    let root_payload: serde_json::Value = serde_json::from_str(&root_result.result).unwrap();
+    let root_ids = root_payload["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["actor_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(root_ids.contains(&"tree-sibling"));
+    assert!(root_ids.contains(&"tree-great-grandchild"));
+}
+
+async fn write_tree_runtime_fixture(h: &TestHarness, session: &Session) {
+    // A forged or stale index/runtime pair cannot be produced by a normal
+    // save: Storage rejects immutable Child lineage and Project changes. Put
+    // the bad durable runtime snapshot on disk to exercise the read boundary.
+    let entry = h
+        .adapter
+        .session_store
+        .get_index_entry(&session.id)
+        .await
+        .unwrap();
+    let path = h
+        .adapter
+        .session_store
+        .bamboo_home_dir()
+        .join(entry.rel_path)
+        .join("runtime.json");
+    tokio::fs::write(path, serde_json::to_vec(session).unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn compact_child_tree_rejects_project_and_root_spoofing() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut root = Session::new("tree-project-root", "gpt-5");
+    root.set_project_id_meta("project-a");
+    h.storage.save_session(&root).await.unwrap();
+    let mut child = Session::new_child_of("tree-project-parent", &root, "gpt-5", "Scoped");
+    child.set_project_id_meta("project-a");
+    h.storage.save_session(&child).await.unwrap();
+    let mut grandchild = Session::new_child_of("tree-project-child", &child, "gpt-5", "Scoped");
+    grandchild.set_project_id_meta("project-a");
+    h.storage.save_session(&grandchild).await.unwrap();
+    let child_id = child.id.clone();
+    let inspect = || {
+        invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect"}),
+            subagent_test_ctx(&child_id, "child-tree-scope"),
+        )
+    };
+    assert!(inspect().await.is_ok());
+
+    grandchild.set_project_id_meta("project-b");
+    write_tree_runtime_fixture(&h, &grandchild).await;
+    assert!(inspect().await.is_err());
+    grandchild.set_project_id_meta("project-a");
+    grandchild.root_session_id = "foreign-root".into();
+    write_tree_runtime_fixture(&h, &grandchild).await;
+    assert!(inspect().await.is_err());
+    grandchild.root_session_id = root.id.clone();
+    write_tree_runtime_fixture(&h, &grandchild).await;
+
+    child.set_project_id_meta("project-b");
+    write_tree_runtime_fixture(&h, &child).await;
+    assert!(inspect().await.is_err());
+    child.set_project_id_meta("project-a");
+    write_tree_runtime_fixture(&h, &child).await;
+    child
+        .metadata
+        .insert("project_id".into(), "project-b".into());
+    write_tree_runtime_fixture(&h, &child).await;
+    assert!(inspect().await.is_err());
+}
+
+#[tokio::test]
+async fn compact_child_tree_cursor_rejects_recreated_descendant() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut descendants = Vec::new();
+    for index in 0..35 {
+        let grandchild = Session::new_child_of(
+            format!("tree-page-{index:02}"),
+            &child,
+            "gpt-5",
+            "Same title",
+        );
+        h.storage.save_session(&grandchild).await.unwrap();
+        descendants.push(grandchild);
+    }
+    let first = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect"}),
+        subagent_test_ctx(&child.id, "child-tree-first-page"),
+    )
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+    assert!(payload["nodes"].as_array().unwrap().len() <= 32);
+    let cursor = payload["next_cursor"].as_str().unwrap().to_owned();
+    let page = |cursor: &str| {
+        invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect", "message":json!({"view":"tree", "cursor":cursor}).to_string()}),
+            subagent_test_ctx(&child.id, "child-tree-next-page"),
+        )
+    };
+    assert!(page(&cursor).await.is_ok());
+
+    descendants[0].created_at += chrono::Duration::seconds(1);
+    write_tree_runtime_fixture(&h, &descendants[0]).await;
+    assert!(page(&cursor).await.is_err());
 }
 
 async fn required_result_harness() -> (

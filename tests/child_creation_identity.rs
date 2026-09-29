@@ -167,6 +167,12 @@ async fn dispatch(endpoint: &str, run: RunSpec, expect_success: bool) {
                 ChildFrame::ApprovalRequest { .. } => {
                     panic!("identity test cannot request new authority")
                 }
+                ChildFrame::OwnedTreeRequest { .. } => {
+                    panic!("identity test cannot request a Host tree")
+                }
+                ChildFrame::SubAgentRequest { .. } => {
+                    panic!("identity test cannot request a Host SubAgent operation")
+                }
                 ChildFrame::Event { .. } => panic!("typed activation must retain event identity"),
             }
         }

@@ -39,11 +39,12 @@ use uuid::Uuid;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
-    is_matching_session_message, Message, MessagePart, ParentRequest, ParentResolution, ProjectId,
-    Role, RootModeOperationAction, RootModeOperationDecision, RootModeOperationOutcome,
-    RootModeOperationReceipt, RootModeOperationRequest, RootToolAuthorityError, Session,
-    SessionAuthorityIdentity, SessionKind, SessionMessageEnvelope, SupervisorBootstrapReceipt,
-    TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
+    is_matching_session_message, Message, MessagePart, ParentQuestion, ParentQuestionResolution,
+    ParentRequest, ParentResolution, ProjectId, Role, RootModeOperationAction,
+    RootModeOperationDecision, RootModeOperationOutcome, RootModeOperationReceipt,
+    RootModeOperationRequest, RootToolAuthorityError, Session, SessionAuthorityIdentity,
+    SessionKind, SessionMessageEnvelope, SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage,
+    DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
 mod actor_checkpoint_lineage;
@@ -87,6 +88,7 @@ mod compact_main_tests;
 mod default_actor_context;
 #[cfg(test)]
 mod default_actor_context_tests;
+mod parent_question_checkpoint;
 #[cfg(test)]
 mod startup_sidecar_tests;
 #[cfg(test)]
@@ -122,11 +124,11 @@ pub(crate) fn other_io_error(message: impl Into<String>) -> io::Error {
 /// A full-save snapshot predates a durable direct-parent decision. Callers that
 /// checkpoint transcripts may reload and append the missing proof before retrying.
 #[derive(Debug, thiserror::Error)]
-#[error("durable direct-parent permission terminal changed while saving session")]
+#[error("durable direct-parent terminal changed while saving session")]
 pub(crate) struct DirectParentTerminalConflict;
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid direct-parent permission terminal proof")]
+#[error("invalid direct-parent terminal proof")]
 pub(crate) struct DirectParentTerminalProofError;
 
 fn canonical_session_message(message: &Message, envelope: &SessionMessageEnvelope) -> bool {
@@ -140,7 +142,8 @@ fn reject_regressing_direct_parent_terminals(
     incoming: &Session,
     durable: &Session,
 ) -> io::Result<()> {
-    const TERMINAL: &str = "direct_parent_forced_permission_terminal_v1";
+    const PERMISSION_TERMINAL: &str = "direct_parent_forced_permission_terminal_v1";
+    const CLARIFICATION_TERMINAL: &str = "direct_parent_clarification_terminal_v1";
     for (terminal_index, terminal_message) in durable.messages.iter().enumerate() {
         let Some(marker) = terminal_message
             .metadata
@@ -149,11 +152,10 @@ fn reject_regressing_direct_parent_terminals(
         else {
             continue;
         };
-        if marker
+        let instruction = marker
             .pointer("/body/instruction")
-            .and_then(serde_json::Value::as_str)
-            != Some(TERMINAL)
-        {
+            .and_then(serde_json::Value::as_str);
+        if instruction != Some(PERMISSION_TERMINAL) && instruction != Some(CLARIFICATION_TERMINAL) {
             continue;
         }
         let invalid_proof =
@@ -191,14 +193,23 @@ fn reject_regressing_direct_parent_terminals(
             .ok_or_else(invalid_proof)?;
         let request: SessionMessageEnvelope =
             serde_json::from_value(request_marker.clone()).map_err(|_| invalid_proof())?;
-        let typed_request =
-            ParentRequest::from_forced_permission_envelope(&request).ok_or_else(invalid_proof)?;
-        if !canonical_session_message(request_message, &request)
-            || typed_request.parent.session_id != durable.id
-            || typed_request.parent.created_at != durable.created_at
-            || typed_request.root_session_id != durable.root_session_id
-            || ParentResolution::from_forced_permission_terminal(&request, &terminal).is_none()
-        {
+        let typed_proof = if instruction == Some(PERMISSION_TERMINAL) {
+            ParentRequest::from_forced_permission_envelope(&request).is_some_and(|typed_request| {
+                typed_request.parent.session_id == durable.id
+                    && typed_request.parent.created_at == durable.created_at
+                    && typed_request.root_session_id == durable.root_session_id
+                    && ParentResolution::from_forced_permission_terminal(&request, &terminal)
+                        .is_some()
+            })
+        } else {
+            ParentQuestion::from_envelope(&request).is_some_and(|typed_request| {
+                typed_request.parent.session_id == durable.id
+                    && typed_request.parent.created_at == durable.created_at
+                    && typed_request.root_session_id == durable.root_session_id
+                    && ParentQuestionResolution::from_terminal(&request, &terminal).is_some()
+            })
+        };
+        if !canonical_session_message(request_message, &request) || !typed_proof {
             return Err(invalid_proof());
         }
 
@@ -6071,6 +6082,75 @@ mod tests {
         let bamboo_home = temp_dir.path().to_path_buf();
         let storage = SessionStoreV2::new(bamboo_home).await?;
         Ok((storage, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn stale_second_store_cannot_erase_clarification_terminal() -> io::Result<()> {
+        use bamboo_domain::{FunctionCall, PendingQuestionSource, ToolCall};
+
+        let (first, home) = create_temp_storage().await?;
+        let mut parent = Session::new("clarification-terminal-parent", "model");
+        let mut child =
+            Session::new_child_of("clarification-terminal-child", &parent, "model", "Child");
+        child.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "clarification-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "AskUserQuestion".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        child.add_message(Message::tool_result_with_status(
+            "clarification-call",
+            "Clarification needed: Which option?",
+            true,
+        ));
+        child.set_pending_question_with_source(
+            "clarification-call".into(),
+            "AskUserQuestion".into(),
+            "Which option?".into(),
+            vec!["A".into(), "B".into()],
+            true,
+            PendingQuestionSource::DirectParent,
+        );
+        child.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let question = ParentQuestion::issue_at(&parent, &child, Utc::now()).unwrap();
+        parent.add_message(question.envelope().to_provider_message().unwrap());
+        first.save_session(&parent).await?;
+
+        let second = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let stale = second.load_session(&parent.id).await?.unwrap();
+        let resolution = ParentQuestionResolution::answered(
+            &question,
+            question.issued_at + chrono::Duration::milliseconds(1),
+            "A",
+        )
+        .unwrap();
+        let terminal = resolution.terminal_envelope().unwrap();
+        assert_eq!(
+            ParentQuestionResolution::from_terminal(&question.envelope(), &terminal),
+            Some(resolution)
+        );
+        parent.add_message(terminal.to_provider_message().unwrap());
+        first.save_session(&parent).await?;
+
+        let error = second.save_session(&stale).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<DirectParentTerminalConflict>()));
+        let retained = first.load_session(&parent.id).await?.unwrap();
+        assert_eq!(
+            serde_json::to_value(retained.messages).unwrap(),
+            serde_json::to_value(parent.messages).unwrap()
+        );
+        Ok(())
     }
 
     pub(super) fn transaction_task_list(root_id: &str, title: &str) -> TaskList {

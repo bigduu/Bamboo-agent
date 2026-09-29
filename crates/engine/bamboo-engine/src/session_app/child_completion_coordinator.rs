@@ -937,29 +937,39 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         // inspectable envelope; only a durably committed policy transition
         // below is allowed to activate it.
         let messenger = self.agent.session_messenger().cloned();
-        let child_admission =
-            if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
-                let envelope = child_completion_envelope(
-                    &completion,
-                    wait.registered_at,
-                    child_final_response,
-                    &resume_message,
-                );
-                match messenger.admit(envelope).await {
-                    Ok(admission) => Some(admission),
-                    Err(error) => {
-                        tracing::warn!(
-                            parent_session_id = %completion.parent_session_id,
-                            child_session_id = %completion.child_session_id,
-                            %error,
-                            "child outcome SessionInbox admission failed; leaving parent wait armed"
-                        );
-                        return;
-                    }
+        let child_admission = if let (Some(wait), Some(messenger)) =
+            (active_wait.as_ref(), messenger.as_ref())
+        {
+            let mut envelope = child_completion_envelope(
+                &completion,
+                wait.registered_at,
+                child_final_response,
+                &resume_message,
+            );
+            if let Some(run_id) = self
+                .agent
+                .activation_router()
+                .map(|router| router.current_run_id(&completion.parent_session_id))
+            {
+                if let Some(run_id) = run_id.await {
+                    envelope.correlation_id = Some(format!("child_completion_after_run:{run_id}"));
                 }
-            } else {
-                None
-            };
+            }
+            match messenger.admit(envelope).await {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    tracing::warn!(
+                        parent_session_id = %completion.parent_session_id,
+                        child_session_id = %completion.child_session_id,
+                        %error,
+                        "child outcome SessionInbox admission failed; leaving parent wait armed"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         if should_resume {
             if let (Some(messenger), Some(admission)) =

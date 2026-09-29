@@ -3,7 +3,7 @@ use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
-    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet,
+    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
 };
 use bamboo_skills::runtime_metadata::{
     LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
@@ -13,6 +13,7 @@ use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
+const PHYSICAL_SUBAGENT_TOOLS: [&str; 3] = ["ask_agent", "deploy_agent", "cluster"];
 
 pub(crate) fn effective_guide_activation(
     config: &AgentLoopConfig,
@@ -228,6 +229,14 @@ fn resolve_catalog_with_activation(
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     prefer_delegated_plan_tool(session, &mut by_execution_name);
+    // Root and Child models delegate through the logical SubAgent facade. Keep the
+    // physical broker/deployment tools registered for existing direct callers,
+    // but omit their schemas (including namespaced aliases) from every Root/Child
+    // model catalog and capability-discovery projection.
+    if matches!(session.kind, SessionKind::Root | SessionKind::Child) {
+        by_execution_name
+            .retain(|_, entry| !PHYSICAL_SUBAGENT_TOOLS.contains(&entry.alias_fallback_name()));
+    }
     // Apply the durable Root authority to exact registered execution names.
     // This catalog feeds both provider schemas and capability discovery, so
     // aliases and custom registrations cannot reintroduce a denied tool.

@@ -1114,6 +1114,17 @@ async fn maybe_suspend_for_orphaned_children(
     config: &AgentLoopConfig,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<Option<TurnOutcome>, AgentError> {
+    if session
+        .metadata
+        .get("runtime.canonical_subagent_host")
+        .is_some_and(|value| value == "true")
+    {
+        // Actor Workers share a physical cache of execution replicas. Its
+        // child index is not the logical Child's descendant authority; the
+        // Host actor terminal gate scans the canonical index and persists the
+        // wait before this Run can be reported terminal.
+        return Ok(None);
+    }
     let inherited_tool_wait = runtime_state
         .waiting_for_children
         .as_ref()

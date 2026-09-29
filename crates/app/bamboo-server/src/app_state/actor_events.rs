@@ -15,7 +15,8 @@ const REPLAY_BYTES: usize = 64 * 1024;
 const RING_EVENTS: usize = 64;
 const MAX_CHANNELS: usize = 256;
 // The outer WS seq is a JavaScript-safe integer. Its high bits distinguish a
-// new channel after all observers leave, so an old `since` cannot look current.
+// new channel after all observers leave within one process. The generation
+// restarts with the process and is not a cross-process resume credential.
 const COUNTER_BITS: u32 = 32;
 const MAX_GENERATION: u64 = (1 << 21) - 1;
 
@@ -168,7 +169,19 @@ impl ActorEventHub {
         entry.refs += 1;
         // Receiver creation and replay planning are serialized with publish.
         let receiver = entry.sender.subscribe();
-        let initial = entry.replay_after(since);
+        // A numeric client cursor has no boot identity. Even if a replay window
+        // is active, a previous process can have issued the same generation and
+        // counter. Never claim a reconnect is continuous from `since`; require
+        // an authorized snapshot. This subscription's own replay_after remains
+        // valid for live lag recovery because it cannot outlive this hub.
+        let initial = if since.is_some() {
+            ActorReplay::SnapshotRequired {
+                cursor: entry.cursor(),
+                reason: "gap",
+            }
+        } else {
+            entry.replay_after(since)
+        };
         Some(ActorSubscription {
             hub: self.clone(),
             actor_id: actor_id.to_owned(),
@@ -289,6 +302,73 @@ mod tests {
     }
 
     #[test]
+    fn process_restart_cannot_accept_a_colliding_old_cursor() {
+        let before_restart = Arc::new(ActorEventHub::default());
+        let old = before_restart.subscribe("child", None).unwrap();
+        let base = match &old.initial {
+            ActorReplay::SnapshotRequired { cursor, .. } => *cursor,
+            _ => panic!("first subscription needs a snapshot"),
+        };
+        before_restart.publish(event("child", 1));
+        before_restart.publish(event("child", 2));
+        let old_cursor = base + 2;
+        drop(old);
+
+        // A fresh process has the same initial generation. Another subscriber
+        // can open its channel and advance to the same numeric cursor before
+        // this client reconnects, so merely checking for a new channel fails.
+        let after_restart = Arc::new(ActorEventHub::default());
+        let current = after_restart.subscribe("child", None).unwrap();
+        after_restart.publish(event("child", 3));
+        after_restart.publish(event("child", 4));
+        let resumed = after_restart.subscribe("child", Some(old_cursor)).unwrap();
+        assert!(matches!(
+            &resumed.initial,
+            ActorReplay::SnapshotRequired {
+                cursor,
+                reason: "gap"
+            } if *cursor == old_cursor
+        ));
+
+        // After a fresh snapshot, this live channel can still replay events
+        // published while the client fetched that snapshot.
+        after_restart.publish(event("child", 5));
+        let ActorReplay::Events(events) = resumed.replay_after(old_cursor) else {
+            panic!("the current channel must retain its live tail");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cursor, old_cursor + 1);
+        drop(current);
+    }
+
+    #[test]
+    fn event_between_snapshot_read_and_subscription_requires_a_new_snapshot() {
+        let hub = Arc::new(ActorEventHub::default());
+        // The independent REST snapshot can finish before WS subscribes. With
+        // no listener, this change has no replay window and must not be silently
+        // treated as covered by that earlier snapshot.
+        hub.publish(event("child", 1));
+        let mut subscribed = hub.subscribe("child", None).unwrap();
+        let anchor = match &subscribed.initial {
+            ActorReplay::SnapshotRequired {
+                cursor,
+                reason: "initial",
+            } => *cursor,
+            _ => panic!("subscribe must require a post-subscription snapshot"),
+        };
+        hub.publish(event("child", 2));
+        let ActorReplay::Events(events) = subscribed.replay_after(anchor) else {
+            panic!("events after subscription must remain recoverable");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change.event.event_id, event("child", 2).event_id);
+        assert!(matches!(
+            subscribed.receiver.try_recv(),
+            Ok(ActorHubMessage::Change(item)) if item.cursor == anchor + 1
+        ));
+    }
+
+    #[test]
     fn replay_is_bounded_and_redacted() {
         let hub = Arc::new(ActorEventHub::default());
         let mut first = hub.subscribe("child", None).unwrap();
@@ -299,14 +379,13 @@ mod tests {
         for n in 0..80 {
             hub.publish(event("child", n));
         }
-        let recent = hub.subscribe("child", Some(cursor + 75)).unwrap();
-        let ActorReplay::Events(replay) = &recent.initial else {
+        let ActorReplay::Events(replay) = first.replay_after(cursor + 75) else {
             panic!("recent cursor must replay");
         };
         assert_eq!(replay.len(), 5);
         assert_eq!(replay[0].cursor, cursor + 76);
         assert!(matches!(
-            &hub.subscribe("child", Some(cursor)).unwrap().initial,
+            first.replay_after(cursor),
             ActorReplay::SnapshotRequired { reason: "gap", .. }
         ));
         let wire = serde_json::to_value(&replay[0].change).unwrap();
@@ -344,8 +423,7 @@ mod tests {
         snapshot.class = PublicActorEventClass::Snapshot;
         hub.publish(snapshot);
 
-        let resumed = hub.subscribe("child", Some(anchor)).unwrap();
-        let ActorReplay::Events(replay) = &resumed.initial else {
+        let ActorReplay::Events(replay) = live.replay_after(anchor) else {
             panic!("critical events must remain replayable");
         };
         assert_eq!(replay.len(), 2);

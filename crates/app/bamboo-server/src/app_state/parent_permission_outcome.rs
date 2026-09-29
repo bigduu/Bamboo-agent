@@ -7,12 +7,20 @@ use bamboo_domain::{
     SessionProviderMessage, PARENT_REQUEST_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum State {
     Missing,
     Pending,
     Terminal(bool),
+}
+
+#[derive(Clone, Copy)]
+enum CommitMode {
+    Initialize,
+    Resolve(bool),
+    Expire,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -232,6 +240,45 @@ pub(super) async fn commit(
     decision: Option<bool>,
     initialize: bool,
 ) -> Result<State, ()> {
+    let mode = match (decision, initialize) {
+        (None, true) => CommitMode::Initialize,
+        (Some(value), false) => CommitMode::Resolve(value),
+        _ => return Err(()),
+    };
+    commit_mode(sessions, request, mode)
+        .await
+        .map(|(state, _)| state)
+}
+
+/// Return whether this exact caller appended the terminal under the parent
+/// Session lock. A competing reviewer or deadline may have won before us.
+pub(super) async fn resolve_with_receipt(
+    sessions: &bamboo_engine::SessionRepository,
+    request: &SessionMessageEnvelope,
+    approved: bool,
+) -> Result<(State, bool), ()> {
+    commit_mode(sessions, request, CommitMode::Resolve(approved)).await
+}
+
+/// Reconcile only a request whose fixed deadline has elapsed. The deadline is
+/// checked again while holding the canonical parent-session mutation lock;
+/// a stale scan cannot create an early terminal or replace an existing winner.
+pub(super) async fn expire(
+    sessions: &bamboo_engine::SessionRepository,
+    request: &SessionMessageEnvelope,
+) -> Result<State, ()> {
+    commit_mode(sessions, request, CommitMode::Expire)
+        .await
+        .map(|(state, _)| state)
+}
+
+async fn commit_mode(
+    sessions: &bamboo_engine::SessionRepository,
+    request: &SessionMessageEnvelope,
+    mode: CommitMode,
+) -> Result<(State, bool), ()> {
+    let typed = ParentRequest::from_forced_permission_envelope(request).ok_or(())?;
+    let wrote = AtomicBool::new(false);
     let result = sessions
         .persistence()
         .mutate_runtime_session_and_publish(
@@ -239,16 +286,30 @@ pub(super) async fn commit(
             || None,
             |parent| {
                 let current = state(parent, request)?;
-                match (current, decision) {
-                    (State::Missing, None) if initialize => {
+                match (current, mode) {
+                    (State::Missing, CommitMode::Initialize) => {
                         parent.add_message(request.to_provider_message().map_err(|_| ())?)
                     }
-                    (State::Pending, Some(value)) => parent.add_message(
-                        terminal(request, value, chrono::Utc::now())
-                            .ok_or(())?
-                            .to_provider_message()
-                            .map_err(|_| ())?,
-                    ),
+                    (State::Pending, CommitMode::Resolve(value)) => {
+                        let resolved_at = chrono::Utc::now();
+                        parent.add_message(
+                            terminal(request, value, resolved_at)
+                                .ok_or(())?
+                                .to_provider_message()
+                                .map_err(|_| ())?,
+                        );
+                        wrote.store(resolved_at < typed.deadline, Ordering::Relaxed);
+                    }
+                    (State::Pending, CommitMode::Expire)
+                        if chrono::Utc::now() >= typed.deadline =>
+                    {
+                        parent.add_message(
+                            terminal(request, false, chrono::Utc::now())
+                                .ok_or(())?
+                                .to_provider_message()
+                                .map_err(|_| ())?,
+                        )
+                    }
                     (State::Missing, _) => return Err(()),
                     _ => {}
                 }
@@ -265,5 +326,5 @@ pub(super) async fn commit(
         .map_err(|_| ())?
         .map_err(|_| ())?
         .ok_or(())?;
-    state(&result, request)
+    Ok((state(&result, request)?, wrote.load(Ordering::Relaxed)))
 }
