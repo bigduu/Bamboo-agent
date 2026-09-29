@@ -506,29 +506,19 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "SubAgent" => Some(guide(
             "SubAgent",
             ToolCategory::TaskManagement,
-            "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. Use action=create to spawn a new child; use list/get to inspect existing children before creating duplicates; use update/run/send_message/cancel/delete to manage existing children.",
+            "Delegate a bounded task with message and optional role. Omit target to create a durable child; include its logical ActorId as target to correct or continue that child. Use intent=inspect to view the child or current tree, and intent=control with message=cancel or retry to manage it. A child may use intent=ask_parent for a bounded clarification.",
             "Do not use proactively for simple one-step tasks; from a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
-                    "Create a read-only research child",
-                    json!({"action":"create","title":"Inspect parser module","responsibility":"Find parser entrypoints and summarize data flow","prompt":"Read parser-related files and report key functions. Do not modify files.","subagent_type":"researcher"}),
-                    "Use for isolated investigation that would otherwise fill the main context.",
+                    "Delegate read-only exploration",
+                    json!({"role":"explorer","message":"Inspect parser entrypoints and report the data flow. Do not modify files."}),
+                    "Give the child a complete, narrow task and choose its read-only role.",
                 ),
                 example(
-                    "List existing children",
-                    json!({"action":"list"}),
-                    "Use before creating a new child when you might already have a relevant one.",
-                ),
-                example(
-                    "Send follow-up to existing child",
-                    json!({"action":"send_message","child_session_id":"child_123","message":"Focus on error handling paths and summarize risks.","auto_run":true}),
-                    "Use follow-up instead of creating a duplicate child session.",
-                ),
-                example(
-                    "Cancel a running child",
-                    json!({"action":"cancel","child_session_id":"child_123"}),
-                    "Use when a child session is no longer needed or has gone off track.",
+                    "Correct an existing child",
+                    json!({"target":"child_123","message":"Focus on error handling only and report the specific risks."}),
+                    "Reuse the returned logical ActorId to keep the correction in the same child.",
                 ),
             ],
         )),
@@ -734,6 +724,20 @@ mod tests {
         assert!(!guide
             .when_not_to_use
             .contains("do not spawn children from child sessions"));
+        assert!(guide.when_to_use.contains("intent=inspect"));
+        assert!(guide.when_to_use.contains("intent=control"));
+        assert!(guide.when_to_use.contains("intent=ask_parent"));
+        assert!(!guide.when_to_use.contains("action="));
+        for example in &guide.examples {
+            let fields = example
+                .parameters
+                .as_object()
+                .expect("SubAgent example parameters should be an object");
+            assert!(fields
+                .keys()
+                .all(|field| ["intent", "target", "role", "message", "reply_to"]
+                    .contains(&field.as_str())));
+        }
     }
 
     #[test]

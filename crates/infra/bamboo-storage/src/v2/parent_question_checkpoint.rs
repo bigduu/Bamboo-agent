@@ -4,9 +4,34 @@
 
 use super::*;
 use bamboo_domain::{
-    ParentQuestion, ParentQuestionCheckpointV1, PendingQuestionSource, PARENT_QUESTION_REQUEST_KEY,
-    PARENT_QUESTION_RESOLUTION_KEY,
+    ParentQuestion, ParentQuestionCheckpointV1, ParentQuestionResolution, PendingQuestionSource,
+    PARENT_QUESTION_REQUEST_KEY, PARENT_QUESTION_RESOLUTION_KEY,
 };
+
+fn parent_request_is_durable(parent: &Session, question: &ParentQuestion) -> bool {
+    let expected = question.envelope();
+    let mut matches = parent
+        .messages
+        .iter()
+        .filter(|message| message.id == expected.id.as_str());
+    let Some(message) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("session_message"))
+            .and_then(|marker| {
+                serde_json::from_value::<SessionMessageEnvelope>(marker.clone()).ok()
+            })
+            .as_ref()
+            == Some(&expected)
+        && is_matching_session_message(message, &expected)
+        && expected.to_provider_message().is_ok_and(|provider| {
+            serde_json::to_value(message).ok() == serde_json::to_value(provider).ok()
+        })
+}
 
 impl SessionStoreV2 {
     pub async fn checkpoint_parent_question(
@@ -126,9 +151,92 @@ impl SessionStoreV2 {
             PARENT_QUESTION_REQUEST_KEY.into(),
             serde_json::to_string(&question).map_err(|error| other_io_error(error.to_string()))?,
         );
-        self.save_session_after_lock(&child, started, &guards)
+        self.save_session_after_lock(&child, started, &guards, None)
             .await?;
         Ok(Some((child, question)))
+    }
+
+    /// The only writer allowed to replace an ACKed suspended Tool result with
+    /// a parent's answer. The parent request, Child pending state, answer and
+    /// transcript all receive fresh canonical checks under the Child V2 lock.
+    /// Generic Session save/mutate paths never receive this one-use permit.
+    pub async fn answer_parent_question<F>(
+        &self,
+        question: &ParentQuestion,
+        text: &str,
+        publish: F,
+    ) -> io::Result<Option<(Session, bool)>>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        if question.validate_answer(text).is_err()
+            || validate_session_id(&question.child.session_id).is_err()
+            || validate_session_id(&question.parent.session_id).is_err()
+        {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let writer = self
+            .acquire_session_write_lock(&question.child.session_id, SaveKind::Full)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, task, writer);
+        let Some(parent) = self
+            .load_session_unlocked(&question.parent.session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(mut child) = self
+            .load_session_unlocked(&question.child.session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if parent.id != question.parent.session_id
+            || parent.created_at != question.parent.created_at
+            || child.id != question.child.session_id
+            || child.created_at != question.child.created_at
+            || !parent_request_is_durable(&parent, question)
+        {
+            return Ok(None);
+        }
+        if let Some(terminal) = ParentQuestionResolution::from_child(&parent, &child, &question.id)
+        {
+            if terminal.request == *question {
+                publish(&child);
+                return Ok(Some((child, false)));
+            }
+            return Ok(None);
+        }
+        if Utc::now() >= question.deadline
+            || ParentQuestion::for_pending(&parent, &child).as_ref() != Some(question)
+        {
+            return Ok(None);
+        }
+        let Some(paired) = child
+            .messages
+            .iter_mut()
+            .find(|message| message.id == question.tool_result_message_id)
+        else {
+            return Ok(None);
+        };
+        paired.content = text.to_owned();
+        paired.tool_success = Some(true);
+        let Some(resolution) = ParentQuestionResolution::answered(question, Utc::now(), text)
+        else {
+            return Ok(None);
+        };
+        child.metadata.insert(
+            PARENT_QUESTION_RESOLUTION_KEY.into(),
+            serde_json::to_string(&resolution)
+                .map_err(|error| other_io_error(error.to_string()))?,
+        );
+        self.save_session_after_lock(&child, started, &guards, Some(question))
+            .await?;
+        publish(&child);
+        Ok(Some((child, true)))
     }
 }
 
@@ -256,5 +364,56 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn choice_only_child_question_checkpoints_with_exact_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let parent = Session::new("choice-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("choice-child", &parent, "model", "Child");
+        child.add_message(Message::user("assignment"));
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+
+        let mut observed =
+            observation(&child.messages, PendingQuestionSource::AgenticClarification);
+        observed.pending.allow_custom = false;
+        observed.pending.options.clear();
+        observed.question_digest =
+            ParentQuestion::question_digest(&observed.pending, &observed.tool_result_message_id);
+        assert!(store
+            .checkpoint_parent_question(&child, &parent, &observed)
+            .await
+            .unwrap()
+            .is_none());
+
+        observed.pending.options = vec!["A".into(), "B".into()];
+        observed.question_digest =
+            ParentQuestion::question_digest(&observed.pending, &observed.tool_result_message_id);
+        let (saved, question) = store
+            .checkpoint_parent_question(&child, &parent, &observed)
+            .await
+            .unwrap()
+            .expect("Host must accept a choice-only Child question with offered options");
+        assert!(!question.allow_custom);
+        assert_eq!(
+            ParentQuestion::for_pending(&parent, &saved),
+            Some(question.clone())
+        );
+        assert!(question.validate_answer("A").is_ok());
+        assert!(question.validate_answer("C").is_err());
+        assert_eq!(
+            store
+                .checkpoint_parent_question(&child, &parent, &observed)
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            question
+        );
     }
 }

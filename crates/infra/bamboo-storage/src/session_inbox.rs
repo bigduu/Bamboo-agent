@@ -1172,9 +1172,10 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         target: &str,
         limit: usize,
-        _principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
+        principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
     ) -> Result<Vec<bamboo_domain::SessionInboxDeadLetterInspection>, SessionInboxError> {
-        self.inspect_dead_letters_impl(target, limit).await
+        self.inspect_dead_letters_impl(target, limit, principal)
+            .await
     }
 
     async fn retry_dead_letter(
@@ -1183,14 +1184,15 @@ impl SessionInboxPort for FileSessionInbox {
         id: &SessionMessageId,
         generation: u64,
         now: chrono::DateTime<Utc>,
-        _principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
+        principal: &bamboo_domain::SessionInboxAdministrationPrincipal,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         let inbox = self.clone();
         let target = target.to_owned();
         let id = id.clone();
+        let principal = principal.clone();
         owned::complete_owned(async move {
             inbox
-                .retry_dead_letter_impl(&target, &id, generation, now)
+                .retry_dead_letter_impl(&target, &id, generation, now, &principal)
                 .await
         })
         .await

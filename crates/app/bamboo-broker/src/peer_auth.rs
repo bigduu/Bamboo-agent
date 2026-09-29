@@ -1,4 +1,5 @@
 //! Explicit startup policy for the opt-in scoped broker listener.
+use bamboo_domain::{WorkerHostCapabilities, MAX_WORKER_HOST_SLOTS};
 use bamboo_subagent::{ActorEventBatch, ActorEventQos, AgentRef, InboxKind};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -29,6 +30,12 @@ struct Peer {
     #[serde(default)]
     role: Option<String>,
     expires_at: DateTime<Utc>,
+    /// Static, operator-owned capacity policy. Worker Subscribe frames cannot
+    /// supply or widen these fields.
+    #[serde(default)]
+    host_capabilities: Option<WorkerHostCapabilities>,
+    #[serde(default)]
+    max_slots: Option<u16>,
     destinations: Vec<Destination>,
     #[serde(default)]
     cancel: Vec<String>,
@@ -83,6 +90,14 @@ impl PeerPolicy {
                 || !identifier(&peer.host)
                 || !mailbox_identifier(&peer.mailbox)
                 || peer.role.as_deref().is_some_and(|s| !identifier(s))
+                || peer.host_capabilities.is_some() != peer.max_slots.is_some()
+                || peer
+                    .host_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.validate().is_err())
+                || peer
+                    .max_slots
+                    .is_some_and(|slots| slots == 0 || slots > MAX_WORKER_HOST_SLOTS)
                 || !identifiers(&peer.cancel)
                 || !peer.cancel.iter().all(|s| mailbox_identifier(s))
                 || !identifiers(&peer.presence)
@@ -134,6 +149,8 @@ impl CapturedPeer {
         AuthenticatedHost {
             host_ref: self.peer.host.clone(),
             credential_expires_at: self.peer.expires_at.to_owned(),
+            host_capabilities: self.peer.host_capabilities.clone(),
+            max_slots: self.peer.max_slots,
         }
     }
 
@@ -172,6 +189,9 @@ impl CapturedPeer {
             ClientFrame::Hello { .. } => false,
             ClientFrame::Subscribe | ClientFrame::SubscribeEnvironmentLeaseV1 => true,
             ClientFrame::Ack { id } => identifier(id.as_str()),
+            ClientFrame::AckWithReceipt { id, request_id } => {
+                identifier(id.as_str()) && identifier(request_id.as_str())
+            }
             ClientFrame::Cancel { to, correlation_id } => {
                 mailbox_identifier(to)
                     && identifier(correlation_id.as_str())
@@ -184,6 +204,7 @@ impl CapturedPeer {
                 request_id,
                 mailbox,
                 role,
+                ..
             } => {
                 identifier(request_id.as_str())
                     && identifier(role)
@@ -252,6 +273,7 @@ mod tests {
             request_id: MsgId::new(),
             mailbox: "worker".into(),
             role: "worker".into(),
+            include_capacity: false,
         };
         let allowed = policy(&["run"], &["worker"])
             .capture(&agent, token)
@@ -263,16 +285,19 @@ mod tests {
                 request_id: MsgId::new(),
                 mailbox: "other".into(),
                 role: "worker".into(),
+                include_capacity: false,
             },
             ClientFrame::ObserveHost {
                 request_id: MsgId::new(),
                 mailbox: "worker".into(),
                 role: "other".into(),
+                include_capacity: false,
             },
             ClientFrame::ObserveHost {
                 request_id: MsgId::new(),
                 mailbox: "WORKER".into(),
                 role: "worker".into(),
+                include_capacity: false,
             },
         ] {
             assert!(allowed.admit(&denied).is_err());
@@ -287,5 +312,32 @@ mod tests {
             .unwrap()
             .admit(&frame)
             .is_err());
+    }
+
+    #[test]
+    fn capacity_attestation_requires_complete_valid_operator_policy() {
+        let base = json!({"peers":[{
+            "credential":"worker-fixture-credential-000000001",
+            "host":"trusted-host","mailbox":"worker","role":"worker",
+            "expires_at":Utc::now()+chrono::Duration::minutes(5),
+            "destinations":[],"cancel":[],"presence":[]
+        }]});
+        let parsed =
+            |value: serde_json::Value| PeerPolicy::from_json(&serde_json::to_vec(&value).unwrap());
+        let mut only_slots = base.clone();
+        only_slots["peers"][0]["max_slots"] = json!(2);
+        assert!(parsed(only_slots).is_err());
+        let mut only_capabilities = base.clone();
+        only_capabilities["peers"][0]["host_capabilities"] = json!({
+            "placement_class":"remote","project_ids":["project-a"],
+            "allow_unscoped_project":false,"trust_zone":"trusted",
+            "workspace_labels":["clean-git"],"executors":["bamboo-runtime"],
+            "tools":[],"network_zones":[],"network_isolation":true
+        });
+        assert!(parsed(only_capabilities.clone()).is_err());
+        only_capabilities["peers"][0]["max_slots"] = json!(0);
+        assert!(parsed(only_capabilities.clone()).is_err());
+        only_capabilities["peers"][0]["max_slots"] = json!(1);
+        assert!(parsed(only_capabilities).is_ok());
     }
 }

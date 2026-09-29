@@ -107,9 +107,10 @@ impl ParentQuestionCoordinator {
             let _ = self.reconcile_after_reply(&child.id).await;
             return Err("ParentQuestion deadline elapsed".into());
         }
-        let (state, recorded) = outcome::answer(&self.sessions, &parent, &question, answer)
-            .await
-            .map_err(|_| "ParentQuestion answer CAS is unconfirmed")?;
+        let (state, recorded) =
+            outcome::answer(&self.store, &self.sessions, &parent, &question, answer)
+                .await
+                .map_err(|_| "ParentQuestion answer CAS is unconfirmed")?;
         self.reconcile_after_reply(&child.id).await?;
         match state {
             State::Terminal(ParentQuestionResolution {
@@ -699,6 +700,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let (state, recorded) = outcome::answer(
+            &fixture.store,
             &fixture.coordinator.sessions,
             &parent,
             &fixture.question,

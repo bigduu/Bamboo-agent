@@ -116,7 +116,7 @@ impl ParentQuestion {
             || paired.metadata.is_some()
             || paired.content_parts.is_some()
             || paired.tool_calls.is_some()
-            || !pending.allow_custom
+            || (!pending.allow_custom && pending.options.is_empty())
             || pending.tool_name.is_empty()
             || pending.tool_name.len() > 256
             || !child.messages[..paired_index].iter().rev().any(|message| {
@@ -409,6 +409,11 @@ impl ParentQuestion {
             && self.deadline - self.issued_at
                 == chrono::Duration::seconds(PARENT_QUESTION_DEADLINE_SECONDS)
             && self.options.len() <= 16
+            && (self.allow_custom
+                || (!self.options.is_empty()
+                    && self.options.iter().all(|option| {
+                        option.len() <= PARENT_ANSWER_MAX_BYTES && !option.contains('\0')
+                    })))
             && self.options.iter().all(|option| !option.trim().is_empty())
             && serde_json::to_vec(self)
                 .is_ok_and(|bytes| bytes.len() <= PARENT_QUESTION_MAX_BYTES / 2)
@@ -741,6 +746,39 @@ mod tests {
             .messages
             .push(Message::tool_result_with_status("tool-call", "new", true));
         assert_ne!(ParentQuestion::for_pending(&parent, &child), Some(question));
+    }
+
+    #[test]
+    fn choice_only_question_requires_offered_options_and_exact_answer() {
+        let (parent, mut child, _) = fixture();
+        child.pending_question.as_mut().unwrap().allow_custom = false;
+        let question = ParentQuestion::issue_at(&parent, &child, Utc::now()).unwrap();
+        child.metadata.insert(
+            PARENT_QUESTION_REQUEST_KEY.into(),
+            serde_json::to_string(&question).unwrap(),
+        );
+        assert_eq!(
+            ParentQuestion::for_pending(&parent, &child),
+            Some(question.clone())
+        );
+        assert_eq!(
+            ParentQuestion::from_envelope(&question.envelope()),
+            Some(question.clone())
+        );
+        assert!(question.validate_answer("A").is_ok());
+        assert!(question.validate_answer("C").is_err());
+
+        child.pending_question.as_mut().unwrap().options.clear();
+        assert!(ParentQuestion::issue_at(&parent, &child, Utc::now()).is_none());
+        child.pending_question.as_mut().unwrap().options =
+            vec!["x".repeat(PARENT_ANSWER_MAX_BYTES + 1)];
+        assert!(ParentQuestion::issue_at(&parent, &child, Utc::now()).is_none());
+        child.pending_question.as_mut().unwrap().options = vec!["A\0".into()];
+        assert!(ParentQuestion::issue_at(&parent, &child, Utc::now()).is_none());
+        let mut invalid = question;
+        invalid.options.clear();
+        invalid.id = invalid.stable_id();
+        assert!(ParentQuestion::from_envelope(&invalid.envelope()).is_none());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! Explicit storage leases; no engine consumer opts in through this module.
 use super::*;
 use bamboo_domain::{
-    SessionInboxDeadLetterInspection, SessionInboxFailureOutcome, SessionInboxFailureReport,
-    SessionInboxLeaseInspection, SessionInboxLeaseRequest, SessionInboxLeaseToken,
-    SessionInboxOwnedClaim, SessionInboxReceipt, SessionInboxWakeCandidate,
-    SessionInboxWakeReadiness, SessionMessageId,
+    SessionInboxAdministrationPrincipal, SessionInboxDeadLetterInspection,
+    SessionInboxFailureOutcome, SessionInboxFailureReport, SessionInboxLeaseInspection,
+    SessionInboxLeaseRequest, SessionInboxLeaseToken, SessionInboxOwnedClaim, SessionInboxReceipt,
+    SessionInboxWakeCandidate, SessionInboxWakeReadiness, SessionMessageId,
 };
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,31 @@ pub(super) const LEASE_KEY: &str = "session_inbox_lease";
 const OWNED_KIND: &str = "session_envelope_owned_v3";
 const DEAD_LETTER_DIR: &str = "dead";
 const MAX_EXPLICIT_FAILURES: u32 = 3;
+const RETRY_BASE_MILLIS: u64 = 30_000;
+const RETRY_MAX_MILLIS: u64 = 300_000;
+
+/// Stable per-envelope jitter spreads retries without depending on process
+/// hash seeds or changing the deadline when a failed claim is inspected again.
+pub(super) fn retry_delay(
+    id: &SessionMessageId,
+    generation: u64,
+    failure_count: u32,
+) -> chrono::Duration {
+    let power = failure_count.saturating_sub(1).min(16);
+    let exponential = RETRY_BASE_MILLIS
+        .saturating_mul(1_u64 << power)
+        .min(RETRY_MAX_MILLIS);
+    let jitter_limit = (exponential / 4).min(RETRY_MAX_MILLIS - exponential);
+    let mut digest = Sha256::new();
+    digest.update(b"session-inbox-owned-retry-v1");
+    digest.update(id.as_str().as_bytes());
+    digest.update(generation.to_be_bytes());
+    digest.update(failure_count.to_be_bytes());
+    let bytes = digest.finalize();
+    let jitter =
+        u64::from_be_bytes(bytes[..8].try_into().expect("SHA-256 prefix")) % (jitter_limit + 1);
+    chrono::Duration::milliseconds((exponential + jitter) as i64)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,6 +365,27 @@ pub(super) async fn complete_owned<T: Send + 'static>(
 }
 
 impl FileSessionInbox {
+    /// Called after acquiring the lifecycle and Inbox guards. A deleted and
+    /// recreated Session with the same id must not inherit an old retry grant.
+    async fn authorize_administration(
+        &self,
+        target: &str,
+        principal: &SessionInboxAdministrationPrincipal,
+    ) -> Result<(), SessionInboxError> {
+        let current = self
+            .sessions
+            .load_session_unlocked(target)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            .ok_or_else(|| SessionInboxError::TargetNotFound(target.to_owned()))?;
+        if current.id != target || !principal.authorizes(&current) {
+            return Err(invalid(
+                "Inbox administration target or Session lifetime mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     async fn recover_dead_letter_rotations(
         &self,
         dir: &Path,
@@ -1075,10 +1121,14 @@ impl FileSessionInbox {
                 failure_count: stored.failure_count,
             }
         } else {
-            let delay_seconds = if stored.failure_count == 1 { 30 } else { 120 };
+            let delay = retry_delay(
+                &claim.claim.envelope.id,
+                claim.claim.generation,
+                stored.failure_count,
+            );
             let retry_after = report
                 .now
-                .checked_add_signed(chrono::Duration::seconds(delay_seconds))
+                .checked_add_signed(delay)
                 .ok_or_else(|| invalid("Inbox retry deadline overflow"))?;
             stored.retry_after = Some(retry_after);
             SessionInboxFailureOutcome::RetryScheduled {
@@ -1113,8 +1163,10 @@ impl FileSessionInbox {
         &self,
         target: &str,
         limit: usize,
+        principal: &SessionInboxAdministrationPrincipal,
     ) -> Result<Vec<SessionInboxDeadLetterInspection>, SessionInboxError> {
         let (dir, filesystem) = self.owned_filesystem(target).await?;
+        self.authorize_administration(target, principal).await?;
         self.recover_dead_letter_rotations(&dir, target, &filesystem)
             .await?;
         let mut entries = Self::owned_queue_entries(&dir, DEAD_LETTER_DIR, &filesystem).await?;
@@ -1158,11 +1210,13 @@ impl FileSessionInbox {
         id: &SessionMessageId,
         generation: u64,
         now: DateTime<Utc>,
+        principal: &SessionInboxAdministrationPrincipal,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         if generation == 0 {
             return Err(invalid("invalid dead-letter generation"));
         }
         let (dir, filesystem) = self.owned_filesystem(target).await?;
+        self.authorize_administration(target, principal).await?;
         self.recover_dead_letter_rotations(&dir, target, &filesystem)
             .await?;
         let mut selected = None;

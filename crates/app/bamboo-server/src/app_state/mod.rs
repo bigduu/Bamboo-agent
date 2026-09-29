@@ -532,6 +532,7 @@ pub mod init;
 pub mod parent_approval_reviewer;
 mod parent_permission_outcome;
 mod parent_permission_reconcile;
+pub(crate) use parent_permission_reconcile::pending_for_child as pending_permissions_for_child;
 mod parent_permission_request;
 mod parent_question_outcome;
 mod parent_question_reconcile;

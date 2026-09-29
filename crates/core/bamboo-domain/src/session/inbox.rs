@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Message, MessagePart, Role};
+use super::{Message, MessagePart, Role, Session};
 
 /// Serialize JSON with every object key sorted recursively.
 ///
@@ -894,13 +894,25 @@ pub enum SessionInboxFailureOutcome {
     },
 }
 
-/// Host management identity. A gateway must prove local bypass or authenticated
-/// host credentials before constructing this principal from a request.
-pub struct SessionInboxAdministrationPrincipal(());
+/// Host management identity for one exact Session lifetime. A gateway must
+/// prove local bypass or authenticated host credentials and authorization for
+/// this Session before constructing the principal from a request.
+#[derive(Clone)]
+pub struct SessionInboxAdministrationPrincipal {
+    target_session_id: String,
+    target_created_at: DateTime<Utc>,
+}
 
 impl SessionInboxAdministrationPrincipal {
-    pub fn authenticated_host_owner() -> Self {
-        Self(())
+    pub fn authenticated_host_owner_for(session: &Session) -> Self {
+        Self {
+            target_session_id: session.id.clone(),
+            target_created_at: session.created_at,
+        }
+    }
+
+    pub fn authorizes(&self, session: &Session) -> bool {
+        self.target_session_id == session.id && self.target_created_at == session.created_at
     }
 }
 

@@ -743,6 +743,34 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
+        self.save_runtime_only_and_publish_inner(session, publish, true)
+            .await
+    }
+
+    /// Save a control-plane transition and publish it only after a successful
+    /// durable sidecar write. Callers that use the callback to release an Inbox
+    /// wait must not expose an uncommitted transition after a save error.
+    pub async fn save_runtime_only_and_publish_on_success<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        self.save_runtime_only_and_publish_inner(session, publish, false)
+            .await
+    }
+
+    async fn save_runtime_only_and_publish_inner<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+        publish_on_failure: bool,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
             apply_authoritative_metadata(session, &latest);
@@ -758,7 +786,7 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        if may_publish_runtime_result(&result) {
+        if result.is_ok() || (publish_on_failure && may_publish_runtime_result(&result)) {
             publish(session);
         }
         result

@@ -341,6 +341,28 @@ pub trait ChildSessionPort: Send + Sync {
         parent_id: &str,
         child_id: &str,
     ) -> Result<Session, ChildSessionError>;
+    /// Read-only history/diagnostics may address a verified descendant. A
+    /// runtime that cannot prove lineage retains direct-parent inspection.
+    async fn load_child_for_inspection(
+        &self,
+        caller_id: &str,
+        child_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.load_child_for_parent(caller_id, child_id).await
+    }
+    /// Read bounded operational evidence for an already authorized direct child.
+    /// Implementations without a durable diagnostic source must say so.
+    async fn inspect_child_diagnostics(
+        &self,
+        child: &Session,
+    ) -> Result<serde_json::Value, ChildSessionError> {
+        Ok(serde_json::json!({
+            "child_session_id": child.id,
+            "view": "diagnostics",
+            "available": false,
+            "reason": "unsupported_runtime",
+        }))
+    }
     /// Validate a run request before resetting transcript or changing control state.
     /// Default embeddings retain their existing behavior; this never grants an activation.
     async fn validate_child_run_request(

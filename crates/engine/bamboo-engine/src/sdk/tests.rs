@@ -270,6 +270,7 @@ impl ExternalChildRunner for InProcessTestRunner {
 struct TerminalBarrierRunner {
     inner: InProcessTestRunner,
     completed_runs: AtomicUsize,
+    durable_confirmations: Arc<AtomicUsize>,
     first_execute_returned: Arc<Notify>,
     release_first_terminal: Arc<Notify>,
 }
@@ -299,6 +300,34 @@ impl ExternalChildRunner for TerminalBarrierRunner {
             self.release_first_terminal.notified().await;
         }
         result
+    }
+
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &Session,
+        _activation_run_id: &str,
+        save_succeeded: bool,
+    ) -> Result<(), String> {
+        if !save_succeeded {
+            return Ok(());
+        }
+        let saved = self
+            .inner
+            .agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "terminal Child snapshot missing before ACK callback".to_string())?;
+        if saved.created_at != session.created_at
+            || saved.last_run_status() != session.last_run_status()
+            || saved.messages.last().map(|message| &message.content)
+                != session.messages.last().map(|message| &message.content)
+        {
+            return Err("terminal Child snapshot was not durable before ACK callback".into());
+        }
+        self.durable_confirmations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -423,6 +452,7 @@ struct DeliveryHarness {
     reservation_entered: Arc<Notify>,
     allow_reservation: Arc<Notify>,
     reservations: Arc<AtomicUsize>,
+    durable_confirmations: Arc<AtomicUsize>,
     _spawn_scheduler: Arc<crate::runtime::execution::spawn::SpawnScheduler>,
 }
 
@@ -635,12 +665,14 @@ async fn build_terminal_delivery_harness(
 
     let first_execute_returned = Arc::new(Notify::new());
     let release_first_terminal = Arc::new(Notify::new());
+    let durable_confirmations = Arc::new(AtomicUsize::new(0));
     let external_child_runner: Arc<dyn ExternalChildRunner> = Arc::new(TerminalBarrierRunner {
         inner: InProcessTestRunner {
             agent: agent.clone(),
             tools: tools.clone(),
         },
         completed_runs: AtomicUsize::new(0),
+        durable_confirmations: durable_confirmations.clone(),
         first_execute_returned: first_execute_returned.clone(),
         release_first_terminal: release_first_terminal.clone(),
     });
@@ -703,6 +735,7 @@ async fn build_terminal_delivery_harness(
         reservation_entered,
         allow_reservation,
         reservations,
+        durable_confirmations,
         _spawn_scheduler: spawn_scheduler,
     }
 }
@@ -2316,6 +2349,11 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
     )
     .await
     .expect("terminal finalization must request a successor");
+    assert_eq!(
+        harness.durable_confirmations.load(Ordering::SeqCst),
+        1,
+        "the external ACK callback must follow the first durable terminal save"
+    );
     let backlog = harness
         .inbox
         .inspect(&harness.child_session_id)

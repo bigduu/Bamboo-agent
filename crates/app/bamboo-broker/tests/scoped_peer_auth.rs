@@ -71,6 +71,13 @@ async fn recv(ws: &mut Ws) -> BrokerFrame {
     .await
     .unwrap()
 }
+async fn expect_welcome_identity(ws: &mut Ws) {
+    assert!(matches!(recv(ws).await, BrokerFrame::Welcome));
+    assert!(matches!(
+        recv(ws).await,
+        BrokerFrame::BrokerIdentity { id } if uuid::Uuid::parse_str(&id).is_ok()
+    ));
+}
 fn agent(id: &str) -> AgentRef {
     AgentRef {
         session_id: id.into(),
@@ -87,7 +94,7 @@ async fn login(url: &str, cert: &Path, id: &str, token: &str) -> Ws {
         },
     )
     .await;
-    assert!(matches!(recv(&mut ws).await, BrokerFrame::Welcome));
+    expect_welcome_identity(&mut ws).await;
     ws
 }
 fn message() -> InboxMessage {
@@ -487,7 +494,13 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
          "expires_at":expiry,"destinations":[{"mailbox":"b","kinds":["run"]}],
          "cancel":[],"presence":["worker"]},
         {"credential":B,"host":"host-worker","mailbox":"b","role":"worker",
-         "expires_at":expiry,"destinations":[],"cancel":[],"presence":[]},
+         "expires_at":expiry,"destinations":[],"cancel":[],"presence":[],
+         "max_slots":2,"host_capabilities":{
+             "placement_class":"remote","project_ids":["project-a"],
+             "allow_unscoped_project":false,"trust_zone":"trusted",
+             "workspace_labels":["clean-git"],"executors":["bamboo-runtime"],
+             "tools":["Glob"],"network_zones":["internal"],
+             "network_isolation":true}},
         {"credential":"ask-only-fixture-credential-00000001","host":"host-ask",
          "mailbox":"c","role":"host","expires_at":expiry,
          "destinations":[{"mailbox":"b","kinds":["ask"]}],
@@ -499,7 +512,7 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     let mut worker = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
         .await
         .unwrap();
-    worker.subscribe().await.unwrap();
+    worker.subscribe_environment_lease_v1().await.unwrap();
     let mut parent = BrokerClient::connect_with_tls(
         &url,
         AgentRef {
@@ -513,7 +526,7 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+            if let Some(current) = parent.observe_host_capacity("b", "worker").await.unwrap() {
                 break current;
             }
             tokio::task::yield_now().await;
@@ -526,6 +539,14 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     assert_eq!(first.role.as_deref(), Some("worker"));
     assert_eq!(first.credential_expires_at, expiry);
     assert!(!first.connection_generation.is_empty());
+    assert!(first.environment_lease_v1);
+    assert_eq!(first.max_slots, Some(2));
+    let capabilities = first.host_capabilities.as_ref().unwrap();
+    assert_eq!(capabilities.trust_zone, "trusted");
+    assert!(capabilities
+        .project_ids
+        .contains(&"project-a".parse().unwrap()));
+    assert!(capabilities.tools.contains("Glob"));
     assert_eq!(
         parent.list_connected("worker").await.unwrap(),
         vec!["b".to_string()]
@@ -557,13 +578,14 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
             },
         )
         .await;
-        assert!(matches!(recv(&mut ws).await, BrokerFrame::Welcome));
+        expect_welcome_identity(&mut ws).await;
         send(
             &mut ws,
             ClientFrame::ObserveHost {
                 request_id: MsgId::new(),
                 mailbox: target.into(),
                 role: requested_role.into(),
+                include_capacity: true,
             },
         )
         .await;
@@ -576,10 +598,10 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     let mut replacement = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
         .await
         .unwrap();
-    replacement.subscribe().await.unwrap();
+    replacement.subscribe_environment_lease_v1().await.unwrap();
     let second = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(current) = parent.observe_host("b", "worker").await.unwrap() {
+            if let Some(current) = parent.observe_host_capacity("b", "worker").await.unwrap() {
                 if current.connection_generation != first.connection_generation {
                     break current;
                 }
@@ -593,8 +615,15 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
     assert_ne!(second.connection_generation, first.connection_generation);
     worker.close().await.unwrap();
     assert!(core.is_subscribed("b").await);
+    let legacy_shape = parent.observe_host("b", "worker").await.unwrap().unwrap();
     assert_eq!(
-        parent.observe_host("b", "worker").await.unwrap(),
+        legacy_shape.connection_generation,
+        second.connection_generation
+    );
+    assert!(legacy_shape.host_capabilities.is_none());
+    assert!(legacy_shape.max_slots.is_none());
+    assert_eq!(
+        parent.observe_host_capacity("b", "worker").await.unwrap(),
         Some(second)
     );
     replacement.close().await.unwrap();
@@ -626,7 +655,7 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
         },
     )
     .await;
-    assert!(matches!(recv(&mut legacy).await, BrokerFrame::Welcome));
+    expect_welcome_identity(&mut legacy).await;
     send(&mut legacy, ClientFrame::Subscribe).await;
     send(
         &mut legacy,
@@ -644,6 +673,7 @@ async fn scoped_wss_observes_only_authorized_current_worker_host() {
             request_id: MsgId::new(),
             mailbox: "b".into(),
             role: "worker".into(),
+            include_capacity: true,
         },
     )
     .await;

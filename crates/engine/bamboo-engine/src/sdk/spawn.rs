@@ -719,6 +719,15 @@ async fn run_child_spawn_inner(
         } else {
             session.clear_last_run_error();
         }
+        let broker_receipt_prepared = match tokio::time::timeout(
+            Duration::from_secs(5),
+            external_runner.prepare_durable_child_delivery(&session, &activation_run_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err("Host broker receipt preparation timed out".into()),
+        };
         if let Some(registration) = activation_registration.as_mut() {
             registration.begin_finalization().await;
         } else if let Some(router) = agent.activation_router() {
@@ -726,7 +735,23 @@ async fn run_child_spawn_inner(
                 .begin_finalization(&session_id_clone, &activation_run_id)
                 .await;
         }
-        let saved = agent.persistence().save_runtime_session(&mut session).await;
+        let saved = match broker_receipt_prepared {
+            Ok(true) => {
+                agent
+                    .persistence()
+                    .checkpoint_runtime_session(&mut session)
+                    .await
+            }
+            Ok(false) => agent.persistence().save_runtime_session(&mut session).await,
+            Err(error) => {
+                tracing::error!(
+                    session_id = %session_id_clone,
+                    %error,
+                    "Host broker receipt was not prepared; final Child save is blocked"
+                );
+                Err(std::io::Error::other(error))
+            }
+        };
         let history_committed = saved.is_ok();
         if let Err(error) = saved {
             tracing::warn!(
@@ -734,6 +759,31 @@ async fn run_child_spawn_inner(
                 %error,
                 "failed to save final child session snapshot"
             );
+        }
+        // A broker Outcome is only a transport receipt. The external runner
+        // may ACK its exact Event/Outcome MsgIds now that the Host's canonical
+        // Child transcript and terminal status have been durably saved. Failed
+        // saves and failed ACKs leave broker messages unconfirmed for replay.
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            external_runner.confirm_durable_child_delivery(
+                &session,
+                &activation_run_id,
+                history_committed,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(
+                session_id = %session_id_clone,
+                %error,
+                "child broker durable ACK remains unconfirmed"
+            ),
+            Err(_) => tracing::error!(
+                session_id = %session_id_clone,
+                "child broker durable ACK timed out and remains unconfirmed"
+            ),
         }
         if history_committed
             && !history_commit_barrier

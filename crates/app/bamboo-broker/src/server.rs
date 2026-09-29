@@ -315,7 +315,14 @@ impl BrokerServer {
             }
             None => return Ok(()), // closed before handshake
         };
+        let broker_id = self.core.broker_identity().await?;
         send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Welcome).await?;
+        send_scoped(
+            &mut sink,
+            captured_peer.as_ref(),
+            BrokerFrame::BrokerIdentity { id: broker_id },
+        )
+        .await?;
 
         // 2. Serve: client frames in, subscription stream out.
         let mut control_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
@@ -437,6 +444,33 @@ impl BrokerServer {
                                 let _ = send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::Error { reason: e.to_string(), id: None }).await;
                             }
                         }
+                        Ok(Some(ClientFrame::AckWithReceipt { id, request_id })) => {
+                            let ack = if captured_peer.is_some() {
+                                match subscription.as_ref() {
+                                    Some(lease) => self.core.ack_current(&session_id, &id, lease).await,
+                                    None => Err(scoped_error()),
+                                }
+                            } else {
+                                self.core.ack(&session_id, &id).await
+                            };
+                            let frame = match ack {
+                                Ok(()) => BrokerFrame::AckResult {
+                                    id,
+                                    request_id,
+                                    accepted: true,
+                                    reason: None,
+                                },
+                                Err(error) => BrokerFrame::AckResult {
+                                    id,
+                                    request_id,
+                                    accepted: false,
+                                    reason: Some(error.to_string()),
+                                },
+                            };
+                            if send_scoped(&mut sink, captured_peer.as_ref(), frame).await.is_err() {
+                                break Ok(());
+                            }
+                        }
                         // A second Hello is meaningless mid-session; ignore.
                         Ok(Some(ClientFrame::Hello { .. })) => {}
                         // Out-of-band, fire-and-forget cancel: signal the target's
@@ -453,7 +487,7 @@ impl BrokerServer {
                                 break Ok(());
                             }
                         }
-                        Ok(Some(ClientFrame::ObserveHost { request_id, mailbox, role })) => {
+                        Ok(Some(ClientFrame::ObserveHost { request_id, mailbox, role, include_capacity })) => {
                             if captured_peer.is_none() {
                                 let _ = send(&mut sink, BrokerFrame::Error {
                                     reason: "scoped peer admission denied".into(),
@@ -461,7 +495,13 @@ impl BrokerServer {
                                 }).await;
                                 break Err(scoped_error());
                             }
-                            let observation = self.core.current_host_observation(&mailbox, &role).await;
+                            let mut observation = self.core.current_host_observation(&mailbox, &role).await;
+                            if !include_capacity {
+                                if let Some(current) = observation.as_mut() {
+                                    current.host_capabilities = None;
+                                    current.max_slots = None;
+                                }
+                            }
                             if send_scoped(&mut sink, captured_peer.as_ref(), BrokerFrame::HostObservation { request_id, observation }).await.is_err() {
                                 break Ok(());
                             }

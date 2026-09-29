@@ -6244,7 +6244,7 @@ async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
 }
 
 #[tokio::test]
-async fn child_inspection_only_allows_the_direct_parent() {
+async fn child_inspection_allows_verified_ancestors_but_not_other_roots() {
     let harness = build_test_harness_with_storage(None, None, true).await;
     let root = harness
         .storage
@@ -6258,14 +6258,25 @@ async fn child_inspection_only_allows_the_direct_parent() {
     harness.storage.save_session(&nested_parent).await.unwrap();
     harness.storage.save_session(&grandchild).await.unwrap();
 
-    let root_error = invoke_completed(
+    let root_result = invoke_completed(
         &harness.tool,
         json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
         child_inspection_ctx(&harness.parent_session_id),
     )
     .await
-    .unwrap_err();
-    assert!(root_error.to_string().contains("does not belong to parent"));
+    .unwrap();
+    let root_result: serde_json::Value = serde_json::from_str(&root_result.result).unwrap();
+    assert_eq!(root_result["text"], "nested answer");
+
+    let outsider = Session::new("unrelated-root", "gpt-5");
+    harness.storage.save_session(&outsider).await.unwrap();
+    assert!(invoke_completed(
+        &harness.tool,
+        json!({"action": "get", "child_session_id": grandchild.id, "view": "result"}),
+        child_inspection_ctx(&outsider.id),
+    )
+    .await
+    .is_err());
 
     let nested = inspect_child(
         &harness.tool,
@@ -6887,6 +6898,7 @@ async fn compact_owned_inspection_correction_and_control_keep_one_logical_child(
     h.storage.save_session(&child).await.unwrap();
     for query in [
         "overview".to_string(),
+        "diagnostics".to_string(),
         "messages".to_string(),
         "result".to_string(),
         "error".to_string(),
@@ -6903,6 +6915,10 @@ async fn compact_owned_inspection_correction_and_control_keep_one_logical_child(
         assert!(!result.result.contains("physical-worker-sentinel"));
         assert!(!result.result.contains("physical-endpoint-sentinel"));
         assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        if query == "diagnostics" {
+            assert_eq!(payload["permission"]["available"], true);
+            assert_eq!(payload["permission"]["status"], "none");
+        }
         if query == "messages" {
             assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
             let cursor = payload["next_cursor"].as_str().unwrap();

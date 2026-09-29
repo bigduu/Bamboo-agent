@@ -37,6 +37,7 @@ const AUDIT_TERMINAL: &str = "direct_parent_forced_permission_terminal_v1";
 pub(super) enum Projection {
     Chat,
     Overview,
+    Diagnostics,
     Messages,
     Content,
     Error,
@@ -91,15 +92,15 @@ pub(super) fn parameters_schema() -> Value {
         "properties": {
             "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
             "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
-            "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Unknown labels retain legacy behavior; invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
-            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, messages, result, error, or a JSON query with view/cursor/message_id for pagination. Control: cancel or retry. No host, worker, model, or mailbox parameters."},
+            "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
+            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, result, error, or a JSON query with view/cursor/message_id for pagination. Control: cancel or retry. No host, worker, model, or mailbox parameters."},
             "reply_to": {"type":"string", "description":"Exact pending direct-parent ParentRequest id. For forced permission use message exactly approve_once or deny; for a clarification use message as a bounded answer. Omit target and role. The Host checks the canonical request kind and deadline."}
         }
     })
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate to durable child sessions with one logical identity. Use delegation when the user requests parallel work or a separate bounded task would crowd the current context; handle simple tasks directly. A child uses only the tools and permissions exposed to it by the runtime. Send a complete task in message (intent defaults to chat) to create a child; optionally select role=explorer, implementer, reviewer, or another catalog name. Omitted role keeps worker behavior. Include target to correct or continue that same child; role cannot rebind it. Use intent=inspect without target for the current Root's full tree. An active Child with a Host canonical tree route sees only its owned subtree. A Child can use intent=ask_parent with a bounded question in message to pause for its direct parent's answer; omit target, role, and reply_to. Use message=forced_permission_audit for Root's read-only audit records. To answer a pending direct-parent ParentRequest, set reply_to to its exact id, omit target and role, and put the reply in message. Forced permission requires exactly approve_once or deny; clarification accepts a bounded answer. The Host checks canonical kind, direct-parent lineage, Project, and deadline before recording one terminal result. Paginate the tree with message={\"view\":\"tree\",\"cursor\":\"...\"}; a changed tree rejects its old cursor. Use target for child overview, messages, result, or error. Paginate child inspection with a JSON message containing view/cursor/message_id. Use intent=control, target, and message=cancel or retry to control that same child. Runtime manages activation and waiting. Do not pass physical worker or mailbox ids. Legacy action calls remain compatible but are not part of this compact interface."
+    "Delegate bounded work to a durable child ActorId. Use for parallel or context-heavy tasks; handle simple tasks directly. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, result, or error. Paginate with a JSON message containing view/cursor/message_id; changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -261,15 +262,21 @@ pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
             let view = query.view.as_deref().unwrap_or("overview");
             let projection = match view {
                 "overview" => Projection::Overview,
+                "diagnostics" => Projection::Diagnostics,
                 "messages" => Projection::Messages,
                 "message" | "result" => Projection::Content,
                 "error" => Projection::Error,
-                _ => {
-                    return Err(invalid(
-                        "inspect supports overview, messages, message, result, or error",
-                    ))
-                }
+                _ => return Err(invalid(
+                    "inspect supports overview, diagnostics, messages, message, result, or error",
+                )),
             };
+            if projection == Projection::Diagnostics
+                && (query.cursor.is_some() || query.message_id.is_some())
+            {
+                return Err(invalid(
+                    "diagnostics does not accept a cursor or message_id",
+                ));
+            }
             let mut args = json!({"action":"get", "child_session_id":target, "view":view});
             if let Some(cursor) = query.cursor {
                 args["cursor"] = json!(cursor);
@@ -381,6 +388,27 @@ fn project(projection: Projection, input: &Value) -> Value {
             output["has_error"] = json!(input["last_run_error"]
                 .as_str()
                 .is_some_and(|error| !error.is_empty()));
+        }
+        Projection::Diagnostics => {
+            copy_fields(
+                &mut output,
+                input,
+                &[
+                    "view",
+                    "available",
+                    "observed_status",
+                    "queue",
+                    "leases",
+                    "dead_letters",
+                    "activation",
+                    "wait",
+                    "question",
+                    "permission",
+                    "heartbeat",
+                    "error",
+                    "reason",
+                ],
+            );
         }
         Projection::Messages => {
             copy_fields(
@@ -1314,6 +1342,40 @@ mod tests {
         for private in ["worker-secret", "internal.invalid", "private diagnostic"] {
             assert!(!observation.contains(private));
         }
+    }
+
+    #[test]
+    fn diagnostics_is_read_only_and_keeps_physical_topology_out_of_model_output() {
+        let call = normalize(json!({
+            "intent": "inspect",
+            "target": "logical-child",
+            "message": "diagnostics",
+        }))
+        .unwrap();
+        assert_eq!(call.args["action"], "get");
+        assert_eq!(call.args["view"], "diagnostics");
+        assert_eq!(call.projection, Some(Projection::Diagnostics));
+        let projected = project(
+            Projection::Diagnostics,
+            &json!({
+                "child_session_id": "logical-child",
+                "view": "diagnostics",
+                "available": true,
+                "queue": {"available": true, "pending": 2},
+                "activation": {"available": true, "attempt": 3},
+                "endpoint": "wss://secret.invalid",
+                "worker_id": "private-worker",
+            }),
+        );
+        assert_eq!(projected["queue"]["pending"], 2);
+        assert_eq!(projected["activation"]["attempt"], 3);
+        assert!(!projected.to_string().contains("secret.invalid"));
+        assert!(!projected.to_string().contains("private-worker"));
+        assert!(
+            normalize(json!({"intent":"inspect","target":"logical-child",
+            "message":"{\"view\":\"diagnostics\",\"cursor\":\"older\"}"}))
+            .is_err()
+        );
     }
 
     #[test]
