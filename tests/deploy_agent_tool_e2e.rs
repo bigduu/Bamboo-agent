@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_agent_core::tools::{Tool, ToolExecutionContext};
+use bamboo_agent_core::tools::{Tool, ToolError, ToolExecutionContext};
 use bamboo_broker::{ask_agent, BrokerCore, BrokerServer};
 use bamboo_server_tools::DeployAgentTool;
 use bamboo_subagent::{AgentRef, AskMode};
@@ -114,8 +114,8 @@ async fn agent_deploys_a_worker_then_asks_lists_and_stops_it() {
     assert_eq!(v["status"], "stopped");
 }
 
-/// Production binding must not report a broker-private worker as a Running
-/// canonical Actor or leave a Child after the rejected launch.
+/// A host-bound deploy without a canonical Child port must not publish a
+/// broker-private worker or leave a Child after the rejected launch.
 #[tokio::test]
 async fn host_bound_deploy_fails_before_publishing_actor_or_worker() {
     use bamboo_agent_core::storage::Storage;
@@ -146,7 +146,13 @@ async fn host_bound_deploy_fails_before_publishing_actor_or_worker() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("cannot start a canonical Actor"));
+    assert!(
+        matches!(
+            &error,
+            ToolError::Execution(message) if message == "canonical Child creation is unavailable"
+        ),
+        "unexpected deploy error: {error}"
+    );
     assert!(registry.lock().await.is_empty());
     let children = store.sessions_root_dir().join("root").join("children");
     assert!(!children.exists() || std::fs::read_dir(children).unwrap().next().is_none());

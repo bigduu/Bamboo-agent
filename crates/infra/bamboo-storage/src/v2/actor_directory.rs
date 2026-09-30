@@ -867,6 +867,7 @@ mod tests {
             placement_ref: Some(ActorPlacementRef {
                 class: ActorPlacementClass::Local,
                 lease_id: "local-lease".into(),
+                slot_epoch: None,
             }),
             now,
         }

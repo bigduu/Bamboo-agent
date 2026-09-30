@@ -22,7 +22,7 @@ use serde_json::json;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{
-    ActorDirectoryPort, ActorSession, Session, SessionKind, SessionMessageBody,
+    ActorDirectoryPort, ActorLogicalState, ActorSession, Session, SessionKind, SessionMessageBody,
     SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
     SessionMessageSource,
 };
@@ -191,18 +191,20 @@ async fn authorize_direct_child(
         .await
         .map_err(|_| unauthorized())?
         .actor;
-    let child_actor = store
+    let child_entry = store
         .inspect_actor(&child.id)
         .await
-        .map_err(|_| unauthorized())?
-        .actor;
+        .map_err(|_| unauthorized())?;
+    let child_actor = child_entry.actor;
     let direct_parent = child_actor.ancestor_observations.first();
     if !parent_actor.matches_session(&parent)
         || parent_actor.project_id.as_deref() != parent.project_id_meta().as_deref()
+        || parent_actor.state == ActorLogicalState::Retired
         || !child_actor.matches_session(child)
         || child_actor.project_id.as_deref() != child.project_id_meta().as_deref()
         || child_actor.parent_actor_id.as_deref() != Some(caller)
         || child_actor.root_actor_id != parent_actor.actor_id
+        || child_actor.state == ActorLogicalState::Retired
         || direct_parent.is_none_or(|ancestor| {
             ancestor.actor_id != parent_actor.actor_id
                 || ancestor.session_created_at != parent_actor.session_created_at
@@ -376,6 +378,7 @@ impl Tool for AskAgentTool {
                         )))
                     }
                     AskMode::Steer => {
+                        authorize_direct_child(store, caller, &child).await?;
                         let messenger = self.messenger.as_ref().ok_or_else(|| {
                             ToolError::Execution("logical SessionMessenger is unavailable".into())
                         })?;

@@ -127,7 +127,7 @@ impl SessionStoreV2 {
         Self::validate_supervisor_proof_value(side, proof)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub(super) fn validate_snapshot_supervisor_proof(
         side: &Session,
         bytes: &[u8],

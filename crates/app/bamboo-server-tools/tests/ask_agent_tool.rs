@@ -213,6 +213,7 @@ async fn host_bound_deployment(store: &Arc<SessionStoreV2>, registry: &DeployedR
             placement_ref: Some(ActorPlacementRef {
                 class: ActorPlacementClass::Local,
                 lease_id: "worker".into(),
+                slot_epoch: None,
             }),
             now,
         })

@@ -107,7 +107,7 @@ pub async fn handler(
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
     use super::*;
     use crate::handlers::settings::issue_device_token;

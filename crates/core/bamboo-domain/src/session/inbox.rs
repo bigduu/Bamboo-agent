@@ -1003,6 +1003,12 @@ pub enum SessionInboxError {
 /// but every address is a stable logical session id.
 #[async_trait]
 pub trait SessionInboxPort: Send + Sync {
+    /// Host-only access to the concrete durable Inbox when an Actor-fenced
+    /// transcript seed must hold the same process lock as claim and ACK.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Irreversibly opt this queue into owned claims. Legacy claim/ACK APIs
     /// must fail closed afterwards. This does not enable production expiry.
     async fn claim_owned(

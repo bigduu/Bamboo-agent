@@ -59,6 +59,7 @@ impl Fixture {
                 placement_ref: Some(ActorPlacementRef {
                     class: ActorPlacementClass::Docker,
                     lease_id: "PRIVATE-ENDPOINT-LEASE".into(),
+                    slot_epoch: None,
                 }),
                 now,
             })

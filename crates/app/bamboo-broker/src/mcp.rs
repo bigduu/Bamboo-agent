@@ -1607,39 +1607,64 @@ mod tests {
                         }
                     }
 
-                    // 2. Serve Deliver frames. The first connection closes right
-                    //    after it has answered the connect Manifest + one Call
-                    //    (the simulated blip). Reconnects stay open.
+                    // 2. Serve Deliver and durable ACK frames. The first
+                    //    connection closes after the connect Manifest + one
+                    //    Call have both been answered and ACKed. Reconnects
+                    //    stay open.
                     let mut delivered = 0u32;
+                    let mut unacked_replies = HashSet::new();
+                    let mut close_after_ack = None;
                     while let Some(Ok(msg)) = source.next().await {
-                        let message = match msg {
+                        let frame = match msg {
                             Message::Text(t) => match ClientFrame::from_text(&t) {
-                                Ok(ClientFrame::Deliver { message, .. }) => message,
+                                Ok(frame) => frame,
                                 _ => continue,
                             },
                             _ => continue,
                         };
-                        let _ = sink
-                            .send(Message::text(
-                                BrokerFrame::Delivered {
-                                    id: message.id.clone(),
+                        match frame {
+                            ClientFrame::Deliver { message, .. } => {
+                                let _ = sink
+                                    .send(Message::text(
+                                        BrokerFrame::Delivered {
+                                            id: message.id.clone(),
+                                        }
+                                        .to_text(),
+                                    ))
+                                    .await;
+                                let reply = answer_mcp_request(message, &orch);
+                                unacked_replies.insert(reply.id.clone());
+                                if is_first {
+                                    delivered += 1;
+                                    if delivered == 2 {
+                                        close_after_ack = Some(reply.id.clone());
+                                    }
                                 }
-                                .to_text(),
-                            ))
-                            .await;
-                        let reply = answer_mcp_request(message, &orch);
-                        let _ = sink
-                            .send(Message::text(
-                                BrokerFrame::Message { message: reply }.to_text(),
-                            ))
-                            .await;
-                        if is_first {
-                            delivered += 1;
-                            if delivered == 2 {
-                                // manifest + call served → drop the connection
-                                let _ = sink.send(Message::Close(None)).await;
-                                break;
+                                let _ = sink
+                                    .send(Message::text(
+                                        BrokerFrame::Message { message: reply }.to_text(),
+                                    ))
+                                    .await;
                             }
+                            ClientFrame::AckWithReceipt { id, request_id } => {
+                                let accepted = unacked_replies.remove(&id);
+                                let _ = sink
+                                    .send(Message::text(
+                                        BrokerFrame::AckResult {
+                                            id: id.clone(),
+                                            request_id,
+                                            accepted,
+                                            reason: (!accepted).then(|| "unknown reply".into()),
+                                        }
+                                        .to_text(),
+                                    ))
+                                    .await;
+                                if accepted && close_after_ack.as_ref() == Some(&id) {
+                                    let _ = sink.send(Message::Close(None)).await;
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 });

@@ -78,6 +78,10 @@ pub enum ActorPlacementClass {
 pub struct ActorPlacementRef {
     pub class: ActorPlacementClass,
     pub lease_id: String,
+    /// Slot incarnation within one WorkerHost generation. Older local and
+    /// deployment records deserialize without it; remote admission requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_epoch: Option<u64>,
 }
 
 /// One saved ancestor identity and revision in a Child's authority chain.
@@ -340,10 +344,14 @@ impl ActorDirectoryEntry {
                         .is_some_and(|id| id.parse::<ProjectId>().is_err())
                     || (activation.status.is_live()
                         && activation.project_id != self.actor.project_id)
-                    || activation
-                        .placement_ref
-                        .as_ref()
-                        .is_some_and(|placement| placement.lease_id.trim().is_empty())
+                    || activation.placement_ref.as_ref().is_some_and(|placement| {
+                        placement.lease_id.trim().is_empty()
+                            || (matches!(
+                                placement.class,
+                                ActorPlacementClass::Remote | ActorPlacementClass::Schedulable
+                            ) && activation.status.is_live()
+                                && !matches!(placement.slot_epoch, Some(epoch) if epoch > 0))
+                    })
                 {
                     return Err(ActorDirectoryError::Corrupt);
                 }
@@ -539,5 +547,52 @@ mod tests {
             ActorSession::from_session(&malformed_child),
             Err(ActorDirectoryError::InvalidIdentity)
         );
+    }
+
+    #[test]
+    fn terminal_legacy_remote_placement_without_slot_epoch_remains_readable() {
+        for class in [
+            ActorPlacementClass::Remote,
+            ActorPlacementClass::Schedulable,
+        ] {
+            let root = Session::new("legacy-remote-root", "model");
+            let now = chrono::Utc::now();
+            let mut entry = ActorDirectoryEntry::new(ActorSession::from_session(&root).unwrap());
+            entry.actor.current_attempt = 1;
+            entry.actor.state = ActorLogicalState::Failed;
+            entry.activation = Some(ActorActivation {
+                schema_version: ACTOR_DIRECTORY_SCHEMA_VERSION,
+                actor_id: root.id.clone(),
+                activation_id: "legacy-activation".into(),
+                attempt: 1,
+                run_id: "legacy-run".into(),
+                lease_owner: "legacy-host".into(),
+                lease_epoch: 1,
+                lease_expires_at: now + chrono::Duration::minutes(1),
+                project_id: None,
+                inbox_generation: 0,
+                placement_ref: Some(ActorPlacementRef {
+                    class,
+                    lease_id: "legacy-placement".into(),
+                    slot_epoch: None,
+                }),
+                status: ActorActivationStatus::Failed,
+                checkpoint_revision: 0,
+                started_at: Some(now),
+                finished_at: Some(now),
+            });
+            let saved = serde_json::to_value(&entry).unwrap();
+            assert!(saved["activation"]["placement_ref"]
+                .get("slot_epoch")
+                .is_none());
+            let mut restored: ActorDirectoryEntry = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.validate(), Ok(()));
+
+            restored.actor.state = ActorLogicalState::Active;
+            let activation = restored.activation.as_mut().unwrap();
+            activation.status = ActorActivationStatus::Running;
+            activation.finished_at = None;
+            assert_eq!(restored.validate(), Err(ActorDirectoryError::Corrupt));
+        }
     }
 }

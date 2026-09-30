@@ -613,34 +613,95 @@ fn subagent_executor_spec(
     })
 }
 
-/// Resolve config `schedulable_placements` into runner-ready handles (#181, P2b),
-/// keyed by role. Mirrors `resolve_remote_placements`: the bearer is read from
-/// `token_env` HERE (the raw token never rides the config) and is used for BOTH
-/// the registry query and the chosen worker's connect. If `token_env` is `Some`
-/// but the env var is UNSET, log an error and SKIP that placement so a misconfig
-/// fails SAFE to the local path rather than querying/connecting with no bearer. A
-/// placement with no `token_env` is tokenless (trusted/loopback link only).
-/// Duplicate roles: last one wins.
+fn valid_placement_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_placement_requirements(value: &bamboo_config::OperatorPlacementRequirements) -> bool {
+    valid_placement_identifier(&value.trust_zone)
+        && value
+            .workspace_label
+            .as_deref()
+            .is_none_or(valid_placement_identifier)
+        && value
+            .network_zone
+            .as_deref()
+            .is_none_or(valid_placement_identifier)
+        && value.required_tools.len() <= 256
+        && value
+            .required_tools
+            .iter()
+            .all(|tool| valid_placement_identifier(tool))
+}
+
+fn valid_scoped_broker_endpoint(value: &str) -> bool {
+    value.len() <= 2048
+        && url::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "wss"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn resolved_broker_token(name: Option<&str>) -> Option<String> {
+    name.filter(|name| !name.is_empty() && name.len() <= 256)
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|token| {
+            (32..=256).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+}
+
+/// Resolve every configured role, including invalid legacy entries. An explicit
+/// scheduled role must never silently fall through to Local.
 fn resolve_schedulable_placements(
     placements: &[bamboo_config::SchedulablePlacement],
     nodes: &[bamboo_config::cluster_fabric::Node],
 ) -> std::collections::HashMap<String, super::actor_adapter::ResolvedSchedulablePlacement> {
-    // Phase 3: a pool is just a bus role. The runner picks a live connected worker
-    // of that role via the bus presence query — no registry url / token / cert.
-    placements
-        .iter()
-        .map(|p| {
-            (
-                p.role.clone(),
-                super::actor_adapter::ResolvedSchedulablePlacement {
-                    pool: p.pool.clone(),
-                    // The badge shows the cluster node's own metadata: a node
-                    // deployed to serve this pool (its `deploy.default_role`).
-                    host_label: node_label_for_role(nodes, &p.pool),
-                },
-            )
-        })
-        .collect()
+    let mut out = std::collections::HashMap::new();
+    for p in placements {
+        let token = resolved_broker_token(p.token_env.as_deref());
+        let valid = valid_placement_identifier(&p.pool)
+            && valid_scoped_broker_endpoint(&p.registry_url)
+            && p.token_env.is_some()
+            && token.is_some()
+            && p.ca_cert_file.as_ref().is_some_and(|path| {
+                bamboo_broker::client_config_trusting_cert(std::path::Path::new(path)).is_ok()
+            })
+            && p.broker_parent.as_ref().is_some_and(|parent| {
+                valid_placement_identifier(&parent.parent_mailbox)
+                    && valid_placement_identifier(&parent.parent_role)
+            })
+            && p.placement_requirements
+                .as_ref()
+                .is_some_and(valid_placement_requirements);
+        let resolved = super::actor_adapter::ResolvedSchedulablePlacement {
+            pool: p.pool.clone(),
+            host_label: node_label_for_role(nodes, &p.pool),
+            endpoint: p.registry_url.clone(),
+            token: if valid { token } else { None },
+            ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
+            broker_parent: if valid { p.broker_parent.clone() } else { None },
+            requirements: if valid {
+                p.placement_requirements.clone()
+            } else {
+                None
+            },
+        };
+        if out.insert(p.role.clone(), resolved).is_some() {
+            // Ambiguous authority is unavailable, regardless of entry order.
+            if let Some(route) = out.get_mut(&p.role) {
+                route.broker_parent = None;
+            }
+        }
+    }
+    out
 }
 
 /// Friendly display name for a cluster node whose worker serves `role`
@@ -718,34 +779,23 @@ fn resolve_remote_placements(
                     ca_cert_file: None,
                     host_label: Some("remote".into()),
                     broker_peer: Some(Err(())),
+                    requirements: None,
                 },
             );
             continue;
         }
         if let Some(peer) = &p.broker_peer {
-            let token = p
-                .token_env
-                .as_deref()
-                .and_then(|name| std::env::var(name).ok());
+            let token = resolved_broker_token(p.token_env.as_deref());
             let valid = peer.valid()
-                && p.endpoint.len() <= 2048
-                && p.token_env
-                    .as_ref()
-                    .is_some_and(|name| !name.is_empty() && name.len() <= 256)
-                && url::Url::parse(&p.endpoint).is_ok_and(|url| {
-                    url.scheme() == "wss"
-                        && url.host_str().is_some()
-                        && url.username().is_empty()
-                        && url.password().is_none()
-                        && url.query().is_none()
-                        && url.fragment().is_none()
-                })
-                && token.as_ref().is_some_and(|s| {
-                    (32..=256).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic())
-                })
+                && valid_scoped_broker_endpoint(&p.endpoint)
+                && p.token_env.is_some()
+                && token.is_some()
                 && p.ca_cert_file.as_ref().is_some_and(|path| {
                     bamboo_broker::client_config_trusting_cert(std::path::Path::new(path)).is_ok()
-                });
+                })
+                && p.placement_requirements
+                    .as_ref()
+                    .is_some_and(valid_placement_requirements);
             out.insert(
                 p.role.clone(),
                 super::actor_adapter::ResolvedRemotePlacement {
@@ -754,6 +804,11 @@ fn resolve_remote_placements(
                     ca_cert_file: p.ca_cert_file.as_ref().map(std::path::PathBuf::from),
                     host_label: Some("remote".into()),
                     broker_peer: Some(if valid { Ok(peer.clone()) } else { Err(()) }),
+                    requirements: if valid {
+                        p.placement_requirements.clone()
+                    } else {
+                        None
+                    },
                 },
             );
             continue; // Invalid explicit routes remain selected, never Local fallback.
@@ -768,6 +823,7 @@ fn resolve_remote_placements(
                 // a known cluster node; else the endpoint host is used downstream.
                 host_label: node_label_for_endpoint(nodes, &p.endpoint),
                 broker_peer: Some(Err(())),
+                requirements: None,
             },
         );
     }
@@ -1253,6 +1309,7 @@ mod placement_resolver_tests {
             token_env: Some("BAMBOO_1431_MISSING_FIXTURE_TOKEN".into()),
             ca_cert_file: None,
             broker_peer: Some(route),
+            placement_requirements: None,
         };
         let parsed: RemoteActorPlacement =
             serde_json::from_value(serde_json::to_value(&placement).unwrap()).unwrap();

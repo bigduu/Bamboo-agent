@@ -256,14 +256,14 @@ impl SessionStoreV2 {
         Self::validate_root_tool_proof_value(side, proof)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub(super) fn validate_snapshot_root_pair(main: &Session, side: &Session) -> io::Result<()> {
         Self::validate_root_tool_authority_pair(&RootToolAuthorityMain::from(main), side)
     }
 
     /// Pure validation for callers that already read the proof under their own
     /// bounded capability/transaction boundary. This never opens or repairs files.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub(super) fn validate_snapshot_root_proof(side: &Session, bytes: &[u8]) -> io::Result<()> {
         let proof = serde_json::from_slice(bytes).map_err(|_| conflict("invalid proof"))?;
         Self::validate_root_tool_proof_value(side, proof)

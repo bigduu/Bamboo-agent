@@ -799,6 +799,15 @@ async fn scoped_wss_fences_canonical_run_to_one_authenticated_worker_connection(
     .unwrap();
     assert!(first.environment_lease_v1);
     assert_eq!(first.host_ref, "host-worker");
+    assert_eq!(
+        worker
+            .observe_host("b", "worker")
+            .await
+            .unwrap()
+            .unwrap()
+            .connection_generation,
+        first.connection_generation
+    );
 
     let run: RunSpec = serde_json::from_value(json!({
         "assignment":"bounded work",
@@ -844,6 +853,13 @@ async fn scoped_wss_fences_canonical_run_to_one_authenticated_worker_connection(
         .unwrap();
     assert_eq!(received.id, old_run.id);
     assert_eq!(received.kind, InboxKind::FencedRun);
+    // Leave another frame in the old connection's reader queue while its
+    // subscription is replaced. Broker replay cleanup cannot retract it.
+    let queued_run = make_run(
+        InboxKind::FencedRun,
+        serde_json::to_value(&first_envelope).unwrap(),
+    );
+    parent.deliver("b", queued_run.clone()).await.unwrap();
     // Leave the original Run unacked in Maildir. The same authenticated peer
     // reconnects with the same host, role, mailbox, and checkout identity.
     let mut successor = BrokerClient::connect_with_tls(&url, agent("b"), B, tls())
@@ -864,6 +880,16 @@ async fn scoped_wss_fences_canonical_run_to_one_authenticated_worker_connection(
     .unwrap();
     assert_eq!(second.host_ref, first.host_ref);
     assert_ne!(second.connection_generation, first.connection_generation);
+    let queued = tokio::time::timeout(Duration::from_secs(3), worker.next_message())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.id, queued_run.id);
+    // The old connection can still have a Run in its reader queue. Admission
+    // must query current broker ownership, which now reports the successor.
+    let current = worker.observe_host("b", "worker").await.unwrap().unwrap();
+    assert_eq!(current.connection_generation, second.connection_generation);
+    assert!(!first_envelope.matches_observation("b", &current));
     assert!(
         tokio::time::timeout(Duration::from_millis(200), successor.next_message())
             .await

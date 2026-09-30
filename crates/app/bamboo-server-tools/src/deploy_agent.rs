@@ -2,9 +2,9 @@
 //!
 //! Standalone callers can deploy a broker worker on demand — as a local
 //! subprocess, in Docker, or over SSH — and command it with `ask_agent`.
-//! Host-bound deployment fails closed until a launcher can bind the worker to
-//! its canonical Child Session. Existing handles remain manageable via
-//! `action=stop` and are killed when the server exits.
+//! Host-bound local deployment creates a durable, cold Child ActorSession.
+//! Its first task enters the canonical SessionInbox through `ask_agent`.
+//! Docker/SSH still require an executor that can bind the canonical Session.
 //!
 //! Only registered on the Root surface when a broker is configured.
 
@@ -29,6 +29,7 @@ use bamboo_domain::{
     ActorLogicalState, ActorPlacementClass, ActorPlacementRef, ActorSession, ProjectId, Session,
     SessionKind,
 };
+use bamboo_engine::session_app::child_session::{self, ChildSessionPort, CreateChildInput};
 use bamboo_storage::SessionStoreV2;
 
 /// Keeps deployed workers alive (the handles are kill-on-drop) and lets `stop`
@@ -56,6 +57,7 @@ pub struct DeployAgentTool {
     /// the whole config or the master encryption key (#46).
     config: Arc<RwLock<Config>>,
     actor_store: Option<Arc<SessionStoreV2>>,
+    child_port: Option<Arc<dyn ChildSessionPort>>,
 }
 
 impl DeployAgentTool {
@@ -73,11 +75,19 @@ impl DeployAgentTool {
             registry,
             config,
             actor_store: None,
+            child_port: None,
         }
     }
     /// Production uses the actual Host store, never a worker-local Session.
     pub fn with_actor_store(mut self, store: Arc<SessionStoreV2>) -> Self {
         self.actor_store = Some(store);
+        self
+    }
+
+    /// Use the same Host child-creation boundary as SubAgent. A deployed
+    /// logical Child is cold until its first canonical SessionInbox message.
+    pub fn with_child_port(mut self, port: Arc<dyn ChildSessionPort>) -> Self {
+        self.child_port = Some(port);
         self
     }
 }
@@ -112,6 +122,71 @@ pub(crate) async fn resolve_ask_target(
     target: &str,
 ) -> Result<Option<ResolvedDeployment>, ToolError> {
     resolve_target(registry, store, caller, target, true).await
+}
+
+/// A Host-created compatibility deployment is a normal direct Child, not a
+/// broker mailbox. Reload both Sessions and Directory entries on every call;
+/// no process-local registry entry is needed to address it after restart.
+async fn host_logical_deployment(
+    store: &SessionStoreV2,
+    caller: &str,
+    target: &str,
+) -> Result<Option<(Session, ActorSession, ActorLogicalState)>, ToolError> {
+    let parent = store
+        .load_session(caller)
+        .await
+        .map_err(|_| ToolError::Execution("canonical deployment parent is unavailable".into()))?
+        .ok_or_else(|| ToolError::Execution("canonical deployment parent is unavailable".into()))?;
+    if parent.kind != SessionKind::Root || parent.id != caller {
+        return Err(ToolError::Execution(
+            "deployment caller is not a saved Root".into(),
+        ));
+    }
+    let parent_actor = store
+        .inspect_actor(caller)
+        .await
+        .map_err(|_| ToolError::Execution("canonical deployment parent is unavailable".into()))?
+        .actor;
+    if !parent_actor.matches_session(&parent) || parent_actor.state == ActorLogicalState::Retired {
+        return Err(ToolError::Execution(
+            "deployment parent Actor identity changed".into(),
+        ));
+    }
+    let Some(child) = store
+        .load_session(target)
+        .await
+        .map_err(|_| ToolError::Execution("canonical deployment target is unavailable".into()))?
+    else {
+        return Ok(None);
+    };
+    if child.kind != SessionKind::Child
+        || child.parent_session_id.as_deref() != Some(caller)
+        || child.root_session_id != caller
+        || child.project_id_meta() != parent.project_id_meta()
+        || child.metadata.get("deployment_kind").map(String::as_str) != Some("legacy_logical")
+    {
+        return Err(ToolError::Execution(
+            "deployment target is not owned by the caller".into(),
+        ));
+    }
+    let entry = store
+        .inspect_actor(target)
+        .await
+        .map_err(|_| ToolError::Execution("canonical deployment Actor is unavailable".into()))?;
+    let ancestor = entry.actor.ancestor_observations.first();
+    if !entry.actor.matches_session(&child)
+        || entry.actor.parent_actor_id.as_deref() != Some(caller)
+        || entry.actor.root_actor_id != parent_actor.actor_id
+        || ancestor.is_none_or(|ancestor| {
+            ancestor.actor_id != caller || ancestor.session_created_at != parent.created_at
+        })
+    {
+        return Err(ToolError::Execution(
+            "deployment Actor identity or caller changed".into(),
+        ));
+    }
+    let state = entry.actor.state;
+    Ok(Some((child, entry.actor, state)))
 }
 
 async fn resolve_target(
@@ -341,19 +416,169 @@ enum DeployArgs {
 }
 
 impl DeployAgentTool {
+    async fn deploy_host_local(
+        &self,
+        params: DeployParams,
+        caller: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        let store = self
+            .actor_store
+            .as_ref()
+            .ok_or_else(|| ToolError::Execution("canonical Actor store is unavailable".into()))?;
+        let port = self.child_port.as_ref().ok_or_else(|| {
+            ToolError::Execution("canonical Child creation is unavailable".into())
+        })?;
+        if params.env.as_deref().is_some_and(|env| env != "local")
+            || params.image.is_some()
+            || params.host.is_some()
+        {
+            return Err(ToolError::InvalidArguments(
+                "Host-bound deploy currently supports local ActorSessions only".into(),
+            ));
+        }
+        if params.echo {
+            return Err(ToolError::InvalidArguments(
+                "echo workers have no canonical Child Session executor".into(),
+            ));
+        }
+        if params.id.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "physical deployment aliases are unavailable for canonical Child creation; use the returned ActorId"
+                    .into(),
+            ));
+        }
+        let caller = caller
+            .ok_or_else(|| ToolError::Execution("deploy requires a saved calling Root".into()))?;
+        let parent = port
+            .load_root_session(caller)
+            .await
+            .map_err(|_| ToolError::Execution("deployment parent could not be loaded".into()))?;
+        if parent.id != caller || parent.kind != SessionKind::Root {
+            return Err(ToolError::Execution(
+                "deploy requires a saved calling Root".into(),
+            ));
+        }
+        let parent_actor = store.ensure_actor(caller).await.map_err(|_| {
+            ToolError::Execution("deployment parent Actor authority is unavailable".into())
+        })?;
+        if !parent_actor.actor.matches_session(&parent)
+            || parent_actor.actor.state == ActorLogicalState::Retired
+        {
+            return Err(ToolError::Execution(
+                "deployment parent Actor identity changed".into(),
+            ));
+        }
+        let role = params.role.unwrap_or_else(|| "worker".into());
+        if role.is_empty()
+            || role.len() > 128
+            || !role.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(ToolError::InvalidArguments(
+                "role must be a bounded ASCII name using letters, digits, '_' or '-'".into(),
+            ));
+        }
+        let model_ref_override = match params.model.as_deref() {
+            None => None,
+            Some(model) => {
+                let model = model.trim();
+                if model.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "model must be non-empty".into(),
+                    ));
+                }
+                let (provider, model) = if let Some((provider, model)) = model.split_once(':') {
+                    if provider.trim().is_empty() || model.trim().is_empty() {
+                        return Err(ToolError::InvalidArguments(
+                            "model must be provider:model with both parts non-empty".into(),
+                        ));
+                    }
+                    (provider.trim().to_owned(), model.trim().to_owned())
+                } else {
+                    let provider = parent.provider_name().ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "bare model needs a parent provider; use provider:model".into(),
+                        )
+                    })?;
+                    (provider, model.to_owned())
+                };
+                Some(bamboo_domain::ProviderModelRef::new(provider, model))
+            }
+        };
+        let (workspace, workspace_source) = port
+            .resolve_child_workspace(&parent, params.workspace.as_deref())
+            .await
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let child_id = format!("actor-{}", uuid::Uuid::new_v4());
+        let result = child_session::create_child_action(
+            port.as_ref(),
+            CreateChildInput {
+                parent_session: parent,
+                child_id,
+                title: format!("Deployed {role}"),
+                responsibility: "Handle tasks sent by the direct parent through the logical SessionInbox."
+                    .into(),
+                assignment_prompt: "Wait for the direct parent's first concrete task. Do not infer additional scope from this deployment."
+                    .into(),
+                subagent_type: role,
+                workspace,
+                workspace_source,
+                model_override: model_ref_override.as_ref().map(|model| model.model.clone()),
+                model_ref_override,
+                runtime_metadata: std::collections::HashMap::from([(
+                    "deployment_kind".into(),
+                    "legacy_logical".into(),
+                )]),
+                read_only: false,
+                auto_run: false,
+                reasoning_effort: None,
+                lifecycle: Some("resident".into()),
+                resident_name: None,
+                resident_context: Some("accumulate".into()),
+                disabled_tools: None,
+                context_fork: None,
+            },
+        )
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let child = store
+            .load_session(&result.child_session_id)
+            .await
+            .map_err(|_| ToolError::Execution("created Child persistence is unavailable".into()))?
+            .ok_or_else(|| {
+                ToolError::Execution("created Child persistence is unavailable".into())
+            })?;
+        let actor = store
+            .ensure_actor(&child.id)
+            .await
+            .map_err(|_| {
+                ToolError::Execution("created Child Actor authority is unavailable".into())
+            })?
+            .actor;
+        if !actor.matches_session(&child)
+            || actor.parent_actor_id.as_deref() != Some(caller)
+            || child.metadata.get("deployment_kind").map(String::as_str) != Some("legacy_logical")
+        {
+            return Err(ToolError::Execution(
+                "created Child Actor authority is inconsistent".into(),
+            ));
+        }
+        Ok(tool_json(json!({
+            "id": actor.actor_id,
+            "env": "local",
+            "status": "cold",
+            "note": "ActorSession is durable and awaits its first ask_agent(target=<ActorId>, mode=steer) task",
+        })))
+    }
+
     async fn deploy(
         &self,
         params: DeployParams,
         caller: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
-        // A broker worker owns a private conversation, while a Host Actor must
-        // execute its canonical Session. The legacy launcher below cannot
-        // bind those two identities; reject before creating a Child or an
-        // activation that would falsely appear Running.
         if self.actor_store.is_some() {
-            return Err(ToolError::Execution(
-                "Host-bound deploy_agent cannot start a canonical Actor; use SubAgent for a local Child or a registered cluster worker".into(),
-            ));
+            return self.deploy_host_local(params, caller).await;
         }
         let DeployParams {
             id,
@@ -532,6 +757,7 @@ impl DeployAgentTool {
                     placement_ref: Some(ActorPlacementRef {
                         class: placement_class,
                         lease_id: id.clone(),
+                        slot_epoch: None,
                     }),
                     now,
                 })
@@ -641,6 +867,29 @@ impl DeployAgentTool {
     }
 
     async fn stop(&self, id: String, caller: Option<&str>) -> Result<ToolResult, ToolError> {
+        if let Some(store) = &self.actor_store {
+            let caller = caller
+                .ok_or_else(|| ToolError::Execution("stop requires a saved calling Root".into()))?;
+            let Some((child, actor, _state)) = host_logical_deployment(store, caller, &id).await?
+            else {
+                return Ok(tool_json(json!({ "id": id, "status": "not_found" })));
+            };
+            let port = self.child_port.as_ref().ok_or_else(|| {
+                ToolError::Execution("canonical Child control is unavailable".into())
+            })?;
+            // Fence any new inbox activation before waiting for a running
+            // worker. A retry still attempts cancellation if a prior wait failed.
+            store
+                .retire_actor(&child.id, chrono::Utc::now())
+                .await
+                .map_err(|_| ToolError::Execution("Actor retirement is unconfirmed".into()))?;
+            port.cancel_child_run_and_wait(&child.id)
+                .await
+                .map_err(|_| ToolError::Execution("Child cancellation is unconfirmed".into()))?;
+            return Ok(tool_json(
+                json!({ "id": actor.actor_id, "status": "stopped" }),
+            ));
+        }
         // Take the entry out FIRST, then shut down without holding the registry
         // lock: shutdown is now graceful (SIGTERM + drain grace window, #49), so
         // it can take seconds — other deploy/stop/list calls must not serialize
@@ -693,6 +942,50 @@ impl DeployAgentTool {
     }
 
     async fn list(&self, caller: Option<&str>) -> Result<ToolResult, ToolError> {
+        if let Some(store) = &self.actor_store {
+            let caller = caller
+                .ok_or_else(|| ToolError::Execution("list requires a saved calling Root".into()))?;
+            let mut agents = Vec::new();
+            for entry in store.list_index_entries().await {
+                if entry.kind != SessionKind::Child
+                    || entry.parent_session_id.as_deref() != Some(caller)
+                {
+                    continue;
+                }
+                let child = store
+                    .load_session(&entry.id)
+                    .await
+                    .map_err(|_| {
+                        ToolError::Execution("canonical deployment list is unavailable".into())
+                    })?
+                    .ok_or_else(|| {
+                        ToolError::Execution("canonical deployment list is inconsistent".into())
+                    })?;
+                if child.metadata.get("deployment_kind").map(String::as_str)
+                    != Some("legacy_logical")
+                {
+                    continue;
+                }
+                if let Some((_, actor, state)) =
+                    host_logical_deployment(store, caller, &entry.id).await?
+                {
+                    if state != ActorLogicalState::Retired {
+                        agents.push(json!({
+                            "id": actor.actor_id,
+                            "source": "logical",
+                            "env": "local",
+                            "status": state,
+                        }));
+                    }
+                }
+                if agents.len() > 256 {
+                    return Err(ToolError::Execution(
+                        "logical deployment list exceeds its bound".into(),
+                    ));
+                }
+            }
+            return Ok(tool_json(json!({ "agents": agents })));
+        }
         let entries: Vec<_> = {
             let registry = self.registry.lock().await;
             registry
@@ -752,10 +1045,12 @@ impl Tool for DeployAgentTool {
 
     fn description(&self) -> &str {
         if self.actor_store.is_some() {
-            return "Manage existing broker deployments with action=list or action=stop. \
-                    Host-bound action=deploy is unavailable until a worker can execute the \
-                    canonical Child Session; use SubAgent for local delegation. Registered \
-                    cluster node workers remain available through ask_agent.";
+            return "Create and manage a durable local Child ActorSession. \
+                    action=deploy returns a stable ActorId in cold state; give it a concrete \
+                    task with ask_agent(target=<ActorId>, mode=steer). action=list shows direct \
+                    deployments, and action=stop cancels and retires one. Host-bound Docker, SSH, \
+                    echo, and custom deployment aliases are unavailable. Registered cluster node \
+                    workers remain available through ask_agent.";
         }
         "Spin up a NEW worker agent on demand, anywhere, and manage its lifecycle. This is how you \
          scale yourself out: you deploy a fresh broker-agent, then drive it with ask_agent. The \
@@ -795,11 +1090,7 @@ impl Tool for DeployAgentTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let actions = if self.actor_store.is_some() {
-            json!(["stop", "list"])
-        } else {
-            json!(["deploy", "stop", "list"])
-        };
+        let actions = json!(["deploy", "stop", "list"]);
         json!({
             "type": "object",
             "properties": {
@@ -828,6 +1119,11 @@ impl Tool for DeployAgentTool {
     ) -> Result<ToolOutcome, ToolError> {
         let parsed: DeployArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid deploy_agent args: {e}")))?;
+        if ctx.plan_read_only && !matches!(&parsed, DeployArgs::List) {
+            return Err(ToolError::Execution(
+                "deploy_agent mutations are unavailable in Plan mode".into(),
+            ));
+        }
         match parsed {
             DeployArgs::Deploy(params) => self.deploy(params, ctx.session_id()).await,
             DeployArgs::Stop { id } => self.stop(id, ctx.session_id()).await,
@@ -927,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_bound_deploy_rejects_before_creating_child_or_activation() {
+    async fn host_bound_deploy_without_canonical_child_port_fails_before_persistence() {
         use bamboo_agent_core::storage::Storage;
 
         let dir = tempfile::tempdir().unwrap();
@@ -945,12 +1241,14 @@ mod tests {
         .with_actor_store(store.clone());
         assert_eq!(
             tool.parameters_schema()["properties"]["action"]["enum"],
-            json!(["stop", "list"])
+            json!(["deploy", "stop", "list"])
         );
         for env in ["local", "docker", "ssh"] {
             let params = serde_json::from_value(json!({"env":env,"echo":true})).unwrap();
             let error = tool.deploy(params, Some(&root.id)).await.unwrap_err();
-            assert!(error.to_string().contains("cannot start a canonical Actor"));
+            assert!(error
+                .to_string()
+                .contains("canonical Child creation is unavailable"));
         }
         assert!(registry.lock().await.is_empty());
         let children = store.sessions_root_dir().join(&root.id).join("children");

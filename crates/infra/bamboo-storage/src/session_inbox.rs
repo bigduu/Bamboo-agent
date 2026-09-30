@@ -64,6 +64,75 @@ impl Drop for FileOperationLock {
     }
 }
 
+/// Holds the same cross-process Inbox lock as claim/ACK while an Actor-fenced
+/// pre-dispatch context seed verifies the physical `cur/` entries and writes
+/// main. It does not admit or acknowledge those entries.
+pub(crate) struct UnownedActorClaimGuard {
+    _process: OwnedMutexGuard<()>,
+    _file: FileOperationLock,
+    dir: PathBuf,
+    target: String,
+    max_transport_bytes: usize,
+}
+
+impl UnownedActorClaimGuard {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn verify(&self, claim: &SessionInboxClaim) -> Result<(), SessionInboxError> {
+        use std::io::Read;
+
+        FileSessionInbox::validate_claim_name(&claim.claim_id)?;
+        if FileSessionInbox::claim_generation(&claim.claim_id)? != claim.generation
+            || claim.envelope.target_session_id != self.target
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim identity changed before dispatch".into(),
+            ));
+        }
+        let path = self.dir.join("cur").join(&claim.claim_id);
+        let file = File::open(path)
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor claim disappeared".into()))?;
+        if !file
+            .metadata()
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor claim unreadable".into()))?
+            .is_file()
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim is not a regular file".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(self.max_transport_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor claim unreadable".into()))?;
+        if bytes.len() > self.max_transport_bytes {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim exceeds transport limit".into(),
+            ));
+        }
+        let wrapper: InboxMessage = serde_json::from_slice(&bytes)
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor claim is invalid".into()))?;
+        if wrapper.kind != InboxKind::SessionEnvelope {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim kind changed".into(),
+            ));
+        }
+        let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor envelope is invalid".into()))?;
+        envelope
+            .validate()
+            .map_err(|_| SessionInboxError::InvalidClaim("Actor envelope is invalid".into()))?;
+        if envelope != claim.envelope {
+            return Err(SessionInboxError::InvalidClaim(
+                "Actor claim envelope changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Filesystem SessionInbox implementation. Clone/share one instance per
 /// runtime so concurrent senders serialize only the small generation/backlog
 /// transaction for their target session.
@@ -146,6 +215,26 @@ impl FileSessionInbox {
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
         self.filesystem_with_authority(target, InboxAuthority::Actor { _guard: guards })
             .await
+    }
+
+    pub(crate) async fn lock_unowned_actor_claims(
+        &self,
+        target: &str,
+    ) -> Result<UnownedActorClaimGuard, SessionInboxError> {
+        let dir = self.inbox_dir(target).await?;
+        let (process, file) = self.lock_operation(&dir).await?;
+        if Self::owned_enabled(&dir).await? {
+            return Err(SessionInboxError::InvalidClaim(
+                "unowned Actor claim required".into(),
+            ));
+        }
+        Ok(UnownedActorClaimGuard {
+            _process: process,
+            _file: file,
+            dir,
+            target: target.to_owned(),
+            max_transport_bytes: self.max_transport_bytes(),
+        })
     }
 
     pub fn limits(&self) -> SessionInboxLimits {
@@ -1087,6 +1176,10 @@ impl FileSessionInbox {
 
 #[async_trait]
 impl SessionInboxPort for FileSessionInbox {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn claim_owned(
         &self,
         target: &str,

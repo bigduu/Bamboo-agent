@@ -13,7 +13,8 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
 use bamboo_domain::{
-    SessionActivationDisposition, SessionActivationError, SessionActivationPort, SessionInboxPort,
+    ActorDirectoryPort, ActorLogicalState, SessionActivationDisposition, SessionActivationError,
+    SessionActivationPort, SessionInboxPort,
 };
 use bamboo_engine::session_app::child_session;
 use bamboo_engine::session_app::child_session::{
@@ -58,6 +59,201 @@ async fn invoke_plan_completed(
         Ok(_) => panic!("expected a Completed outcome"),
         Err(error) => Err(error),
     }
+}
+
+#[tokio::test]
+async fn host_local_deploy_uses_durable_child_actor_and_canonical_inbox() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let store = harness.adapter.session_store.clone();
+    let registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let deploy = crate::tools::DeployAgentTool::new(
+        "ws://127.0.0.1:1",
+        "unused",
+        "/absent-bamboo",
+        registry.clone(),
+        Arc::new(RwLock::new(bamboo_config::Config::default())),
+    )
+    .with_actor_store(store.clone())
+    .with_child_port(harness.adapter.clone());
+    let ToolOutcome::Completed(created) = deploy
+        .invoke(
+            json!({
+                "action": "deploy",
+                "env": "local",
+                "role": "worker",
+                "workspace": harness.workspace_path,
+            }),
+            subagent_test_ctx(&harness.parent_session_id, "deploy-local-actor"),
+        )
+        .await
+        .expect("local deploy creates a logical Child")
+    else {
+        panic!("deploy must complete synchronously");
+    };
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let actor_id = created["id"].as_str().unwrap();
+    assert!(actor_id.starts_with("actor-"));
+    assert_eq!(created["status"], "cold");
+    let child = store.load_session(actor_id).await.unwrap().unwrap();
+    let actor = store.inspect_actor(actor_id).await.unwrap().actor;
+    assert_eq!(actor.actor_id, child.id);
+    assert_eq!(
+        actor.parent_actor_id.as_deref(),
+        Some(harness.parent_session_id.as_str())
+    );
+    assert_eq!(actor.state, ActorLogicalState::Cold);
+    assert_eq!(
+        child.metadata.get("deployment_kind").map(String::as_str),
+        Some("legacy_logical")
+    );
+    assert!(
+        registry.lock().await.is_empty(),
+        "no private broker worker was launched"
+    );
+
+    let ToolOutcome::Completed(listed) = deploy
+        .invoke(
+            json!({"action": "list"}),
+            subagent_test_ctx(&harness.parent_session_id, "list-local-actor"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("list must complete synchronously");
+    };
+    let listed: serde_json::Value = serde_json::from_str(&listed.result).unwrap();
+    assert_eq!(
+        listed["agents"].as_array().unwrap().len(),
+        1,
+        "ordinary SubAgent Child must stay out of deploy list"
+    );
+    assert_eq!(listed["agents"][0]["id"], actor_id);
+
+    // Use a recording activation port so this verifies durable admission
+    // without launching the test harness's NoopProvider worker.
+    let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+        harness.storage.clone(),
+        harness.session_inbox.clone(),
+        Arc::new(RecordingActivation::default()),
+    ));
+    let ask = crate::tools::AskAgentTool::new("ws://127.0.0.1:1", "unused")
+        .with_deployments(registry, store.clone())
+        .with_messenger(messenger);
+    let ToolOutcome::Completed(steered) = ask
+        .invoke(
+            json!({"target": actor_id, "mode": "steer", "question": "Handle only the assigned file"}),
+            subagent_test_ctx(&harness.parent_session_id, "steer-local-actor"),
+        )
+        .await
+        .expect("Root can steer its durable Child")
+    else {
+        panic!("steer must complete synchronously");
+    };
+    let steered: serde_json::Value = serde_json::from_str(&steered.result).unwrap();
+    assert_eq!(steered["admitted"], true);
+    assert_eq!(
+        harness
+            .session_inbox
+            .inspect(actor_id)
+            .await
+            .unwrap()
+            .pending,
+        1
+    );
+
+    let ToolOutcome::Completed(stopped) = deploy
+        .invoke(
+            json!({"action": "stop", "id": actor_id}),
+            subagent_test_ctx(&harness.parent_session_id, "stop-local-actor"),
+        )
+        .await
+        .expect("Root can retire its Child")
+    else {
+        panic!("stop must complete synchronously");
+    };
+    let stopped: serde_json::Value = serde_json::from_str(&stopped.result).unwrap();
+    assert_eq!(stopped["status"], "stopped");
+    assert_eq!(
+        store.inspect_actor(actor_id).await.unwrap().actor.state,
+        ActorLogicalState::Retired
+    );
+    assert!(ask
+        .invoke(
+            json!({"target": actor_id, "mode": "steer", "question": "Another task"}),
+            subagent_test_ctx(&harness.parent_session_id, "steer-retired-actor"),
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn retired_root_cannot_deploy_or_steer_durable_child() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let store = harness.adapter.session_store.clone();
+    let registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let deploy = crate::tools::DeployAgentTool::new(
+        "ws://127.0.0.1:1",
+        "unused",
+        "/absent-bamboo",
+        registry.clone(),
+        Arc::new(RwLock::new(bamboo_config::Config::default())),
+    )
+    .with_actor_store(store.clone())
+    .with_child_port(harness.adapter.clone());
+    let ToolOutcome::Completed(created) = deploy
+        .invoke(
+            json!({
+                "action": "deploy",
+                "env": "local",
+                "role": "worker",
+                "workspace": harness.workspace_path,
+            }),
+            subagent_test_ctx(&harness.parent_session_id, "deploy-before-root-retire"),
+        )
+        .await
+        .expect("live Root creates a Child")
+    else {
+        panic!("deploy must complete synchronously");
+    };
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let actor_id = created["id"].as_str().unwrap();
+    store
+        .retire_actor(&harness.parent_session_id, chrono::Utc::now())
+        .await
+        .expect("Root retirement persists");
+
+    let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+        harness.storage.clone(),
+        harness.session_inbox.clone(),
+        Arc::new(RecordingActivation::default()),
+    ));
+    let ask = crate::tools::AskAgentTool::new("ws://127.0.0.1:1", "unused")
+        .with_deployments(registry, store.clone())
+        .with_messenger(messenger);
+    assert!(ask
+        .invoke(
+            json!({"target": actor_id, "mode": "steer", "question": "Work after retirement"}),
+            subagent_test_ctx(&harness.parent_session_id, "steer-after-root-retire"),
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        harness
+            .session_inbox
+            .inspect(actor_id)
+            .await
+            .unwrap()
+            .pending,
+        0,
+        "retired Root must not enqueue a Child message"
+    );
+    assert!(deploy
+        .invoke(
+            json!({"action": "deploy", "env": "local", "role": "worker", "workspace": harness.workspace_path}),
+            subagent_test_ctx(&harness.parent_session_id, "deploy-after-root-retire"),
+        )
+        .await
+        .is_err());
 }
 
 struct QuestionHostBound;

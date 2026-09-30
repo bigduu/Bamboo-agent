@@ -1136,6 +1136,14 @@ async fn maybe_suspend_for_orphaned_children(
         return Ok(None);
     };
 
+    // Completion and orphan-wait registration must observe one another in a
+    // single order. A fast child can finish after the index scan but before
+    // the wait is saved; its completion handler would then see no wait and
+    // never send another wake. The handler uses this same per-parent lock.
+    let parent_lock =
+        crate::session_app::child_completion_coordinator::session_resume_lock(&session.id);
+    let _parent_guard = parent_lock.lock().await;
+
     let mut active: Vec<String> = storage
         .list_child_run_statuses(&session.id)
         .await
@@ -9391,6 +9399,81 @@ mod tests {
             "no active children → must not suspend"
         );
         assert!(runtime_state.waiting_for_children.is_none());
+    }
+
+    struct FinishingChildIndexStorage {
+        inner: Arc<TestStorage>,
+        terminal: AtomicBool,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FinishingChildIndexStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+
+        async fn list_child_run_statuses(
+            &self,
+            _parent: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![(
+                "fast-child".into(),
+                Some(
+                    if self.terminal.load(Ordering::SeqCst) {
+                        "completed"
+                    } else {
+                        "running"
+                    }
+                    .into(),
+                ),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_wait_does_not_rearm_after_completion_wins_parent_lock() {
+        let storage = Arc::new(FinishingChildIndexStorage {
+            inner: Arc::new(TestStorage::default()),
+            terminal: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+        });
+        let config = config_with_storage(storage.clone());
+        let parent_lock =
+            crate::session_app::child_completion_coordinator::session_resume_lock("fast-parent");
+        let parent_guard = parent_lock.lock().await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+
+        let candidate = tokio::spawn(async move {
+            let mut session = Session::new("fast-parent", "model");
+            let mut runtime = AgentRuntimeState::new("fast-parent");
+            let _ = started.send(());
+            let outcome = maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime)
+                .await
+                .expect("orphan gate observation succeeds");
+            (outcome, runtime)
+        });
+        ready.await.expect("orphan gate task started");
+        tokio::task::yield_now().await;
+        assert_eq!(storage.reads.load(Ordering::SeqCst), 0);
+
+        // The completion handler holds this lock until the terminal child
+        // status and any parent wait transition are durable.
+        storage.terminal.store(true, Ordering::SeqCst);
+        drop(parent_guard);
+        let (outcome, runtime) = candidate.await.expect("orphan gate task joins");
+        assert!(outcome.is_none(), "completed child must not arm a new wait");
+        assert!(runtime.waiting_for_children.is_none());
+        assert_eq!(storage.reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
