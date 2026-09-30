@@ -1241,20 +1241,25 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
-    // Do this before Tokio constructs its runtime (and therefore before Bamboo
-    // opens any application sockets/files). The adjustment is best-effort and
-    // reports failures directly to stderr because logging is not initialized yet.
-    nofile_limit::raise_nofile_limit_best_effort();
-    // Nested Actor activation can exceed Tokio's default worker-thread stack
-    // in debug builds. Keep a floor for Bamboo-owned runtime workers without
-    // reducing a larger stack requested by the process owner.
-    const MIN_WORKER_STACK: usize = 4 * 1024 * 1024;
+    // Session deserialization can run on Actix's own Rust worker threads as
+    // well as Tokio workers. Establish one process-wide thread-stack floor
+    // before either runtime can spawn threads, preserving a larger operator
+    // setting. The Tokio builder's explicit size alone does not cover Actix.
+    const MIN_PROCESS_THREAD_STACK: usize = 8 * 1024 * 1024;
     let requested_stack = std::env::var("RUST_MIN_STACK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let thread_stack = requested_stack.max(MIN_PROCESS_THREAD_STACK);
+    if requested_stack < MIN_PROCESS_THREAD_STACK {
+        std::env::set_var("RUST_MIN_STACK", thread_stack.to_string());
+    }
+    // Do this before Tokio constructs its runtime (and therefore before Bamboo
+    // opens any application sockets/files). The adjustment is best-effort and
+    // reports failures directly to stderr because logging is not initialized yet.
+    nofile_limit::raise_nofile_limit_best_effort();
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(requested_stack.max(MIN_WORKER_STACK))
+        .thread_stack_size(thread_stack)
         .enable_all()
         .build()
         .expect("build Bamboo Tokio runtime");

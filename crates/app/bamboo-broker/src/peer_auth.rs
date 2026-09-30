@@ -204,13 +204,19 @@ impl CapturedPeer {
                 request_id,
                 mailbox,
                 role,
-                ..
+                include_capacity,
             } => {
                 identifier(request_id.as_str())
                     && identifier(role)
-                    && self.peer.presence.contains(role)
-                    && (self.destination(mailbox, InboxKind::Run)
-                        || self.destination(mailbox, InboxKind::FencedRun))
+                    && ((self.peer.presence.contains(role)
+                        && (self.destination(mailbox, InboxKind::Run)
+                            || self.destination(mailbox, InboxKind::FencedRun)))
+                        // A worker may verify that its own subscribed generation
+                        // still owns a queued FencedRun before admitting it.
+                        // This grants no visibility into another mailbox.
+                        || (!include_capacity
+                            && mailbox == &self.peer.mailbox
+                            && self.peer.role.as_deref() == Some(role.as_str())))
             }
             ClientFrame::Deliver { to, message } => {
                 self.destination(to, message.kind)
@@ -312,6 +318,39 @@ mod tests {
             .unwrap()
             .admit(&frame)
             .is_err());
+    }
+
+    #[test]
+    fn worker_can_observe_only_its_own_generation_without_capacity() {
+        let token = "worker-fixture-credential-000000000001";
+        let policy = PeerPolicy::from_json(
+            &serde_json::to_vec(&json!({"peers":[{
+                "credential":token,"host":"worker-host","mailbox":"worker",
+                "role":"worker","expires_at":Utc::now()+chrono::Duration::minutes(5),
+                "destinations":[],"cancel":[],"presence":[]
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let captured = policy
+            .capture(
+                &AgentRef {
+                    session_id: "worker".into(),
+                    role: Some("worker".into()),
+                },
+                token,
+            )
+            .unwrap();
+        let observe = |mailbox: &str, role: &str, include_capacity| ClientFrame::ObserveHost {
+            request_id: MsgId::new(),
+            mailbox: mailbox.into(),
+            role: role.into(),
+            include_capacity,
+        };
+        assert!(captured.admit(&observe("worker", "worker", false)).is_ok());
+        assert!(captured.admit(&observe("other", "worker", false)).is_err());
+        assert!(captured.admit(&observe("worker", "other", false)).is_err());
+        assert!(captured.admit(&observe("worker", "worker", true)).is_err());
     }
 
     #[test]

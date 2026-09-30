@@ -872,6 +872,8 @@ impl BrokerClient {
             self.sink,
             self.messages,
             self.delivered,
+            self.errors,
+            self.ack_results,
             self.reader_alive,
             me,
         )

@@ -59,8 +59,8 @@ mod canonical_birth_census;
 mod canonical_birth_census_tests;
 pub(crate) use actor_input::ActorInputGuards;
 pub use actor_input::{
-    ActorInputCheckpoint, ActorInputCheckpointError, ActorInputCheckpointResult,
-    ActorInputCheckpointStatus,
+    ActorClaimContextSeed, ActorInputCheckpoint, ActorInputCheckpointError,
+    ActorInputCheckpointResult, ActorInputCheckpointStatus,
 };
 #[cfg(test)]
 mod actor_input_tests;
@@ -79,8 +79,13 @@ mod actor_directory_lifetime_tests;
 mod actor_snapshot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod actor_snapshot_reader;
+#[cfg(windows)]
+#[path = "v2/actor_snapshot_reader_windows.rs"]
+mod actor_snapshot_reader;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod actor_snapshot_tests;
+#[cfg(all(test, windows))]
+mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
 mod child_project;

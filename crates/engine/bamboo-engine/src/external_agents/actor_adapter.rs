@@ -10,12 +10,13 @@
 //! every sub-agent (the in-process runtime was removed). The expert `externalAgents`
 //! tables can additionally route specific roles to other actor/a2a agents.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::placement_scheduler::PlacementScheduler;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::tool_start_arguments_for_display;
@@ -28,6 +29,7 @@ use bamboo_domain::{
     SessionInboxFailureReport, SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
     PARENT_QUESTION_CHECKPOINT_ACTION,
 };
+use bamboo_domain::{HostPlacementIntent, HostPlacementRequest, WorkerSlotLease};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -466,7 +468,7 @@ async fn reap_worker_pool_once(pool: &Arc<tokio::sync::Mutex<WorkerPool>>) -> us
 /// #193), resolved at runner-build time from `SubagentsConfig.remote_placements`:
 /// the env-named broker bearer is already READ into `token` here (the raw token
 /// never rides the config), and `ca_cert_file` pins the broker's TLS cert.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ResolvedRemotePlacement {
     pub endpoint: String,
     pub token: Option<String>,
@@ -477,6 +479,7 @@ pub struct ResolvedRemotePlacement {
     pub host_label: Option<String>,
     /// Some(Err) preserves explicit unavailable selection; never falls back.
     pub broker_peer: Option<Result<bamboo_config::RemoteBrokerPeer, ()>>,
+    pub requirements: Option<bamboo_config::OperatorPlacementRequirements>,
 }
 impl std::fmt::Debug for ResolvedRemotePlacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -492,13 +495,526 @@ impl std::fmt::Debug for ResolvedRemotePlacement {
 /// scheduling candidates — the runner picks one via the bus presence query
 /// (`BrokerClient::list_connected`). Phase 3 retired the old HTTP registry, so a
 /// pool is now just a role on the bus.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedSchedulablePlacement {
     pub pool: String,
     /// Display name for the machine this pool's workers run on — the matching
     /// cluster node's `label`/host, surfaced on the UI placement badge. `None` ⇒
     /// fall back to the pool name.
     pub host_label: Option<String>,
+    pub endpoint: String,
+    pub token: Option<String>,
+    pub ca_cert_file: Option<PathBuf>,
+    pub broker_parent: Option<bamboo_config::SchedulableBrokerParent>,
+    pub requirements: Option<bamboo_config::OperatorPlacementRequirements>,
+}
+
+#[derive(Clone)]
+struct ScopedPlacementRoute {
+    endpoint: String,
+    token: String,
+    ca_cert_file: PathBuf,
+    parent: bamboo_subagent::AgentRef,
+    worker_role: String,
+    pinned_mailbox: Option<String>,
+    requirements: bamboo_config::OperatorPlacementRequirements,
+}
+
+impl ScopedPlacementRoute {
+    async fn query(&self) -> Result<bamboo_broker::BrokerClient, AgentError> {
+        let tls = bamboo_broker::client_config_trusting_cert(&self.ca_cert_file)
+            .map_err(|_| remote_broker_unavailable())?;
+        bamboo_broker::BrokerClient::connect_with_tls(
+            &self.endpoint,
+            self.parent.clone(),
+            &self.token,
+            Some(tls),
+        )
+        .await
+        .map_err(|_| remote_broker_unavailable())
+    }
+}
+
+/// Holds one atomic HostRegistry slot for the entire remote Run. A fresh
+/// authenticated broker observation extends the Host lease before the slot is
+/// renewed. Losing either identity cancels the Run; Drop releases the exact
+/// generation/epoch and cannot free a replacement worker's slot.
+struct ActivePlacementLease {
+    registry: bamboo_storage::v2::FileHostRegistry,
+    actor_store: Arc<bamboo_storage::SessionStoreV2>,
+    route: ScopedPlacementRoute,
+    mailbox: String,
+    host_ref: String,
+    fence: ActorActivationFence,
+    placement_ref: bamboo_domain::ActorPlacementRef,
+    lease: Arc<tokio::sync::Mutex<WorkerSlotLease>>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    run_cancel: CancellationToken,
+    lost: Arc<AtomicBool>,
+    release_on_drop: AtomicBool,
+}
+
+/// No Run has reached a worker yet, so a failed placement preflight may end
+/// only the activation it claimed. A replacement activation has a different
+/// fence and must remain untouched.
+async fn fail_pre_dispatch_activation(
+    actor_store: &bamboo_storage::SessionStoreV2,
+    fence: &ActorActivationFence,
+) -> Result<(), bamboo_domain::ActorDirectoryError> {
+    actor_store
+        .finish_activation(fence, chrono::Utc::now(), ActorActivationFinish::Failed)
+        .await
+        .map(|_| ())
+}
+
+/// Once the Run send is invoked, an error may mean that the broker persisted
+/// the FencedRun but its delivery receipt was lost. Only errors before this
+/// call can safely roll back the Actor activation and its reserved slot.
+async fn send_actor_run(
+    client: &mut dyn bamboo_subagent::ChildLink,
+    spec: RunSpec,
+    send_invoked: &mut bool,
+) -> Result<(), AgentError> {
+    *send_invoked = true;
+    client
+        .send(ParentFrame::Run(spec))
+        .await
+        .map_err(|error| AgentError::LLM(format!("actor run dispatch failed: {error}")))
+}
+
+fn remote_activation_finish(
+    result: &Result<Option<String>, AgentError>,
+    accepted_terminal: Option<TerminalStatus>,
+) -> ActorActivationFinish {
+    if result.is_ok() {
+        ActorActivationFinish::Succeeded
+    } else if matches!(result, Err(AgentError::Cancelled))
+        && accepted_terminal == Some(TerminalStatus::Cancelled)
+    {
+        ActorActivationFinish::Cancelled
+    } else {
+        ActorActivationFinish::Failed
+    }
+}
+
+/// Commit a remote reply through the current Actor fence before marking the
+/// activation terminal. The SDK's later status save may then carry exactly
+/// the canonical main transcript instead of trying an unfenced append.
+async fn append_fenced_remote_reply(
+    actor_store: &bamboo_storage::SessionStoreV2,
+    fence: &ActorActivationFence,
+    session: &mut Session,
+    text: &str,
+) -> Result<(), AgentError> {
+    let message = bamboo_agent_core::Message::assistant(text, None);
+    let committed = actor_store
+        .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
+            fence: fence.clone(),
+            expected_created_at: session.created_at,
+            expected_messages: session.messages.clone(),
+            expected_provider_transcript: session.provider_transcript.clone(),
+            messages: vec![message],
+            native_groups: Vec::new(),
+        })
+        .await
+        .map_err(|error| AgentError::LLM(format!("remote actor reply commit failed: {error}")))?;
+    session.messages = committed.messages;
+    session.provider_transcript = committed.provider_transcript;
+    session.updated_at = committed.updated_at;
+    Ok(())
+}
+
+impl ActivePlacementLease {
+    async fn reserve(
+        registry: bamboo_storage::v2::FileHostRegistry,
+        actor_store: Arc<bamboo_storage::SessionStoreV2>,
+        route: ScopedPlacementRoute,
+        mailbox: String,
+        actor_id: String,
+        run_id: String,
+        project_id: Option<bamboo_domain::ProjectId>,
+        required_tools: BTreeSet<String>,
+        parent_cancel: &CancellationToken,
+    ) -> Result<Self, AgentError> {
+        let scheduler = PlacementScheduler::new(registry.clone());
+        let mut query = route.query().await?;
+        let observed = query
+            .observe_host_capacity(&mailbox, &route.worker_role)
+            .await
+            .map_err(|_| remote_broker_unavailable())?
+            .ok_or_else(remote_broker_unavailable)?;
+        let host = scheduler
+            .observe_scoped_host(
+                &mut query,
+                &observed.host_ref,
+                &mailbox,
+                &route.worker_role,
+                chrono::Duration::seconds(110),
+            )
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        if host.capabilities.placement_class != bamboo_domain::ActorPlacementClass::Remote
+            || host.connection_generation != observed.connection_generation
+            || route
+                .pinned_mailbox
+                .as_deref()
+                .is_some_and(|pinned| pinned != mailbox)
+        {
+            return Err(remote_broker_unavailable());
+        }
+        let now = chrono::Utc::now();
+        let request = HostPlacementRequest {
+            intent: HostPlacementIntent::PinnedHost {
+                host_ref: host.host_ref.clone(),
+            },
+            actor_id,
+            run_id,
+            project_id: project_id.clone(),
+            trust_zone: route.requirements.trust_zone.clone(),
+            workspace_label: route.requirements.workspace_label.clone(),
+            executor: "bamboo-runtime".into(),
+            required_tools,
+            network_zone: route.requirements.network_zone.clone(),
+            require_network_isolation: route.requirements.require_network_isolation,
+            preferred_host_ref: None,
+            now,
+            lease_expires_at: now + chrono::Duration::seconds(80),
+        };
+        if !request.eligible(&host) {
+            return Err(remote_broker_unavailable());
+        }
+        let lease = scheduler
+            .reserve(request)
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        let placement_ref = bamboo_domain::ActorPlacementRef {
+            class: bamboo_domain::ActorPlacementClass::Remote,
+            lease_id: lease.lease_id.clone(),
+            slot_epoch: Some(lease.epoch),
+        };
+        let mut claimed_fence = None;
+        let actor_binding = async {
+            let actor = actor_store
+                .ensure_actor(&lease.actor_id)
+                .await
+                .map_err(|_| remote_broker_unavailable())?;
+            if actor.actor.project_id != project_id.as_ref().map(|id| id.to_string()) {
+                return Err(remote_broker_unavailable());
+            }
+            let placement_intent = if route.pinned_mailbox.is_some() {
+                bamboo_domain::ActorPlacementIntent::PinnedHost {
+                    host_ref: host.host_ref.clone(),
+                }
+            } else {
+                bamboo_domain::ActorPlacementIntent::Pool {
+                    pool_id: route.worker_role.clone(),
+                }
+            };
+            actor_store
+                .bind_control_plane(
+                    &lease.actor_id,
+                    bamboo_domain::ActorControlPlaneBinding {
+                        policy_revision: None,
+                        placement_intent: Some(placement_intent),
+                    },
+                )
+                .await
+                .map_err(|_| {
+                    tracing::warn!(stage = "actor_bind", "remote placement admission failed");
+                    remote_broker_unavailable()
+                })?;
+            let activation = actor_store
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: lease.actor_id.clone(),
+                    run_id: lease.run_id.clone(),
+                    lease_owner: format!("worker-host-{}", uuid::Uuid::new_v4()),
+                    lease_expires_at: lease.expires_at,
+                    inbox_generation: 0,
+                    placement_ref: Some(placement_ref.clone()),
+                    now: chrono::Utc::now(),
+                })
+                .await
+                .map_err(|_| {
+                    tracing::warn!(stage = "actor_claim", "remote placement admission failed");
+                    remote_broker_unavailable()
+                })?;
+            let fence = activation.fence();
+            claimed_fence = Some(fence.clone());
+            actor_store
+                .start_activation(&fence, chrono::Utc::now())
+                .await
+                .map_err(|_| {
+                    tracing::warn!(stage = "actor_start", "remote placement admission failed");
+                    remote_broker_unavailable()
+                })?;
+            let reservation = registry
+                .validate_run_reservation(bamboo_domain::WorkerRunReservationCheck {
+                    placement_ref: placement_ref.clone(),
+                    actor_id: lease.actor_id.clone(),
+                    run_id: lease.run_id.clone(),
+                    observed_host_ref: host.host_ref.clone(),
+                    observed_connection_generation: host.connection_generation.clone(),
+                    now: chrono::Utc::now(),
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(stage = "slot_preflight", reason = %error, "remote placement admission failed");
+                    remote_broker_unavailable()
+                })?;
+            if reservation.mailbox != mailbox || reservation.lease != lease {
+                tracing::warn!(stage = "slot_binding", "remote placement admission failed");
+                return Err(remote_broker_unavailable());
+            }
+            Ok::<_, AgentError>(fence)
+        }
+        .await;
+        let fence = match actor_binding {
+            Ok(fence) => fence,
+            Err(error) => {
+                if let Some(fence) = claimed_fence.as_ref() {
+                    if let Err(rollback_error) =
+                        fail_pre_dispatch_activation(actor_store.as_ref(), fence).await
+                    {
+                        tracing::warn!(
+                            stage = "actor_pre_dispatch_rollback",
+                            reason = %rollback_error,
+                            "remote placement activation rollback failed"
+                        );
+                    }
+                }
+                let _ = registry.release_slot(&lease).await;
+                return Err(error);
+            }
+        };
+        let lease = Arc::new(tokio::sync::Mutex::new(lease));
+        let host_ref = host.host_ref.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let run_cancel = parent_cancel.child_token();
+        let heartbeat = {
+            let registry = registry.clone();
+            let actor_store = actor_store.clone();
+            let route = route.clone();
+            let host_ref = host_ref.clone();
+            let mailbox = mailbox.clone();
+            let fence = fence.clone();
+            let placement_ref = placement_ref.clone();
+            let lease = lease.clone();
+            let lost = lost.clone();
+            let run_cancel = run_cancel.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = run_cancel.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    let refreshed = async {
+                        let mut query = route.query().await?;
+                        let host = PlacementScheduler::new(registry.clone())
+                            .observe_scoped_host(
+                                &mut query,
+                                &host_ref,
+                                &mailbox,
+                                &route.worker_role,
+                                chrono::Duration::seconds(110),
+                            )
+                            .await
+                            .map_err(|_| remote_broker_unavailable())?;
+                        let current = lease.lock().await.clone();
+                        if host.connection_generation != current.connection_generation {
+                            return Err(remote_broker_unavailable());
+                        }
+                        let entry = actor_store
+                            .inspect_actor(&current.actor_id)
+                            .await
+                            .map_err(|_| remote_broker_unavailable())?;
+                        if entry.activation.as_ref().is_none_or(|activation| {
+                            activation.fence() != fence
+                                || activation.placement_ref.as_ref() != Some(&placement_ref)
+                        }) {
+                            return Err(remote_broker_unavailable());
+                        }
+                        let now = chrono::Utc::now();
+                        registry
+                            .validate_run_reservation(bamboo_domain::WorkerRunReservationCheck {
+                                placement_ref: placement_ref.clone(),
+                                actor_id: current.actor_id.clone(),
+                                run_id: current.run_id.clone(),
+                                observed_host_ref: host.host_ref.clone(),
+                                observed_connection_generation: host.connection_generation.clone(),
+                                now,
+                            })
+                            .await
+                            .map_err(|_| remote_broker_unavailable())?;
+                        let renewed = registry
+                            .renew_slot(&current, now, now + chrono::Duration::seconds(80))
+                            .await
+                            .map_err(|_| remote_broker_unavailable())?;
+                        *lease.lock().await = renewed;
+                        let expiry = lease.lock().await.expires_at;
+                        actor_store
+                            .renew_activation(&fence, now, expiry)
+                            .await
+                            .map_err(|_| remote_broker_unavailable())?;
+                        Ok::<(), AgentError>(())
+                    }
+                    .await;
+                    if refreshed.is_err() {
+                        lost.store(true, Ordering::SeqCst);
+                        run_cancel.cancel();
+                        break;
+                    }
+                }
+            })
+        };
+        Ok(Self {
+            registry,
+            actor_store,
+            route,
+            mailbox,
+            host_ref,
+            fence,
+            placement_ref,
+            lease,
+            heartbeat,
+            run_cancel,
+            lost,
+            release_on_drop: AtomicBool::new(false),
+        })
+    }
+
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    async fn abort_if_run_unsent(&mut self, send_invoked: bool) -> Result<bool, AgentError> {
+        if send_invoked {
+            return Ok(false);
+        }
+        self.abort_before_dispatch().await?;
+        Ok(true)
+    }
+
+    async fn abort_before_dispatch(&mut self) -> Result<(), AgentError> {
+        self.heartbeat.abort();
+        let _ = (&mut self.heartbeat).await;
+        let current = self.lease.lock().await.clone();
+        let failed = fail_pre_dispatch_activation(self.actor_store.as_ref(), &self.fence).await;
+        let released = self.registry.release_slot(&current).await;
+        if let Err(error) = failed {
+            tracing::warn!(stage = "actor_pre_dispatch_rollback", reason = %error, "remote activation failure could not be recorded");
+            return Err(remote_broker_unavailable());
+        }
+        if let Err(error) = released {
+            if !matches!(error, bamboo_domain::HostRegistryError::StaleLease) {
+                tracing::warn!(stage = "slot_pre_dispatch_rollback", reason = %error, "remote slot release failed");
+                return Err(remote_broker_unavailable());
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete(
+        &mut self,
+        outcome: ActorActivationFinish,
+        terminal_proven: bool,
+    ) -> Result<(), AgentError> {
+        if !terminal_proven {
+            // Keep the activation live until its lease expires. A silent Worker
+            // may still be executing; this blocks an immediate ActorId retry.
+            return if outcome == ActorActivationFinish::Succeeded {
+                Err(remote_broker_unavailable())
+            } else {
+                Ok(())
+            };
+        }
+        // Wait for the heartbeat to stop before reading the exact lease. It
+        // must not renew the slot after terminal verification or release.
+        self.heartbeat.abort();
+        let _ = (&mut self.heartbeat).await;
+        let current = self.lease.lock().await.clone();
+        // A correlated Outcome from the selected mailbox alone cannot release
+        // a new generation's slot. Reobserve the scoped broker identity at
+        // terminal time, including fast reconnects between heartbeat ticks.
+        let mut query = self.route.query().await?;
+        let observed = query
+            .observe_host_capacity(&self.mailbox, &self.route.worker_role)
+            .await
+            .map_err(|_| remote_broker_unavailable())?
+            .ok_or_else(remote_broker_unavailable)?;
+        if observed.host_ref != self.host_ref
+            || observed.connection_generation != current.connection_generation
+            || observed.mailbox != self.mailbox
+            || observed.role.as_deref() != Some(self.route.worker_role.as_str())
+        {
+            return Err(remote_broker_unavailable());
+        }
+        let entry = self
+            .actor_store
+            .inspect_actor(&current.actor_id)
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        if entry.activation.as_ref().is_none_or(|activation| {
+            activation.fence() != self.fence
+                || activation.placement_ref.as_ref() != Some(&self.placement_ref)
+        }) {
+            return Err(remote_broker_unavailable());
+        }
+        self.registry
+            .validate_slot(&current, chrono::Utc::now())
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        self.actor_store
+            .finish_activation(&self.fence, chrono::Utc::now(), outcome)
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        // A terminal ActorDirectory record permits an immediate retry. Free
+        // its exact slot before returning rather than racing a Drop task.
+        self.release_on_drop.store(true, Ordering::SeqCst);
+        match self.registry.release_slot(&current).await {
+            Ok(()) | Err(bamboo_domain::HostRegistryError::StaleLease) => {
+                self.release_on_drop.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(stage = "slot_terminal_release", reason = %error, "remote slot release failed");
+                Err(remote_broker_unavailable())
+            }
+        }
+    }
+}
+
+impl Drop for ActivePlacementLease {
+    fn drop(&mut self) {
+        self.run_cancel.cancel();
+        self.heartbeat.abort();
+        if !self.release_on_drop.load(Ordering::SeqCst) {
+            return;
+        }
+        let registry = self.registry.clone();
+        let actor_store = self.actor_store.clone();
+        let fence = self.fence.clone();
+        let placement_ref = self.placement_ref.clone();
+        let lease = self.lease.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let current = lease.lock().await.clone();
+                if actor_store
+                    .inspect_actor(&current.actor_id)
+                    .await
+                    .ok()
+                    .and_then(|entry| entry.activation)
+                    .is_some_and(|activation| {
+                        activation.fence() == fence
+                            && activation.placement_ref.as_ref() == Some(&placement_ref)
+                    })
+                {
+                    let _ = registry.release_slot(&current).await;
+                }
+            });
+        }
+    }
 }
 
 /// Host-only receipt repair uses the same immutable boot configuration as the
@@ -898,7 +1414,6 @@ pub struct ActorChildRunner {
     /// once per pick so successive sibling spawns SPREAD across a pool's live
     /// workers instead of all landing on the first candidate. Best-effort spread,
     /// not a load balancer — the registry's live set can change between picks.
-    schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     /// Optional server authority used only by `Codex` in `bamboo` auth mode.
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
     /// Canonical logical-session inbox resources, late-bound by each owning
@@ -1141,7 +1656,6 @@ impl ActorChildRunner {
             remote_placements: HashMap::new(),
             strict_remote_subscription: tokio::sync::Mutex::new(()),
             schedulable_placements: HashMap::new(),
-            schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
             codex_run_tokens: None,
             session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
             actor_directory_store: std::sync::Mutex::new(None),
@@ -1792,73 +2306,153 @@ impl ActorChildRunner {
         placement_metadata(&spec.placement, host_label)
     }
 
-    /// Pick a live worker for a SCHEDULABLE role from the BUS (#181, Phase 3):
-    /// ask the broker which actors are connected serving the pool role (presence
-    /// is connection-truth — no HTTP registry, no leases, no connect-fail
-    /// failover), then round-robin one per resolve for spread. Returns the chosen
-    /// worker's mailbox id. An empty pool ⇒ a terminal `AgentError` — NEVER a
-    /// local-subprocess fallback (that would silently defeat the placement).
-    async fn resolve_schedulable_worker(
+    fn scoped_placement_route(
         &self,
-        role: &str,
-    ) -> std::result::Result<String, AgentError> {
-        let pool = self
-            .schedulable_placements
-            .get(role)
-            .ok_or_else(|| {
-                AgentError::LLM(format!(
-                    "schedulable placement for role '{role}' vanished before scheduling"
-                ))
-            })?
-            .pool
-            .clone();
-        let bus = self.bus.as_ref().ok_or_else(|| {
-            AgentError::LLM(format!(
-                "schedulable role '{role}': no mailbox bus configured (subagents.broker)"
-            ))
-        })?;
-
-        // Ask the BUS who is connected serving the pool role — presence is
-        // connection-truth (no HTTP registry, no leases, no stale-record failover).
-        let mut q = bamboo_broker::BrokerClient::connect(
-            &bus.endpoint,
-            bamboo_subagent::AgentRef {
-                session_id: format!("sched-q-{role}"),
-                role: None,
-            },
-            &bus.token,
-        )
-        .await
-        .map_err(|e| {
-            AgentError::LLM(format!(
-                "schedulable role '{role}': bus connect failed: {e}"
-            ))
-        })?;
-        let candidates = q.list_connected(&pool).await.map_err(|e| {
-            AgentError::LLM(format!(
-                "schedulable role '{role}': bus presence query failed: {e}"
-            ))
-        })?;
-
-        if candidates.is_empty() {
-            return Err(AgentError::LLM(format!(
-                "schedulable role '{role}': no live worker in pool '{pool}' on the bus \
-                 (NOT spawning a local subprocess — a schedulable role has no local fallback)"
-            )));
+        spec: &ProvisionSpec,
+    ) -> Result<Option<ScopedPlacementRoute>, AgentError> {
+        match &spec.placement {
+            Placement::Local => Ok(None),
+            Placement::Remote { .. } => {
+                let placement = self
+                    .remote_placements
+                    .get(&spec.identity.role)
+                    .ok_or_else(remote_broker_unavailable)?;
+                let peer = placement
+                    .broker_peer
+                    .as_ref()
+                    .and_then(|peer| peer.as_ref().ok())
+                    .ok_or_else(remote_broker_unavailable)?;
+                let worker_role = peer
+                    .worker_role
+                    .clone()
+                    .ok_or_else(remote_broker_unavailable)?;
+                Ok(Some(ScopedPlacementRoute {
+                    endpoint: placement.endpoint.clone(),
+                    token: placement
+                        .token
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    ca_cert_file: placement
+                        .ca_cert_file
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    parent: bamboo_subagent::AgentRef {
+                        session_id: peer.parent_mailbox.clone(),
+                        role: peer.parent_role.clone(),
+                    },
+                    worker_role,
+                    pinned_mailbox: Some(peer.worker_mailbox.clone()),
+                    requirements: placement
+                        .requirements
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                }))
+            }
+            Placement::Schedulable { .. } => {
+                let placement = self
+                    .schedulable_placements
+                    .get(&spec.identity.role)
+                    .ok_or_else(remote_broker_unavailable)?;
+                let parent = placement
+                    .broker_parent
+                    .as_ref()
+                    .ok_or_else(remote_broker_unavailable)?;
+                Ok(Some(ScopedPlacementRoute {
+                    endpoint: placement.endpoint.clone(),
+                    token: placement
+                        .token
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    ca_cert_file: placement
+                        .ca_cert_file
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    parent: bamboo_subagent::AgentRef {
+                        session_id: parent.parent_mailbox.clone(),
+                        role: Some(parent.parent_role.clone()),
+                    },
+                    worker_role: placement.pool.clone(),
+                    pinned_mailbox: None,
+                    requirements: placement
+                        .requirements
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                }))
+            }
         }
+    }
 
-        // Round-robin: advance a per-pool cursor once per resolve so successive
-        // sibling spawns spread across the connected pool workers. No failover
-        // needed — a listed worker is connected NOW (the bus only lists live
-        // subscribers), so there is no stale-but-leased candidate to skip.
-        let idx = {
-            let mut cursors = self.schedule_cursor.lock().recover_poison();
-            let cursor = cursors.entry(pool.clone()).or_insert(0);
-            let i = *cursor % candidates.len();
-            *cursor = cursor.wrapping_add(1);
-            i
-        };
-        Ok(candidates[idx].clone())
+    async fn select_scoped_worker(
+        &self,
+        route: &ScopedPlacementRoute,
+        registry: &bamboo_storage::v2::FileHostRegistry,
+        actor_id: &str,
+        project_id: Option<bamboo_domain::ProjectId>,
+        required_tools: &BTreeSet<String>,
+    ) -> Result<String, AgentError> {
+        if let Some(mailbox) = &route.pinned_mailbox {
+            return Ok(mailbox.clone());
+        }
+        let mut query = route.query().await?;
+        let candidates = query
+            .list_connected(&route.worker_role)
+            .await
+            .map_err(|_| remote_broker_unavailable())?;
+        let scheduler = PlacementScheduler::new(registry.clone());
+        let mut selected: Option<(String, usize, u16)> = None;
+        for mailbox in candidates {
+            let Some(observed) = query
+                .observe_host_capacity(&mailbox, &route.worker_role)
+                .await
+                .map_err(|_| remote_broker_unavailable())?
+            else {
+                continue;
+            };
+            let Ok(host) = scheduler
+                .observe_scoped_host(
+                    &mut query,
+                    &observed.host_ref,
+                    &mailbox,
+                    &route.worker_role,
+                    chrono::Duration::seconds(110),
+                )
+                .await
+            else {
+                continue;
+            };
+            let now = chrono::Utc::now();
+            let request = HostPlacementRequest {
+                intent: HostPlacementIntent::Pool {
+                    pool_id: route.worker_role.clone(),
+                },
+                actor_id: actor_id.to_owned(),
+                run_id: "selection".into(),
+                project_id: project_id.clone(),
+                trust_zone: route.requirements.trust_zone.clone(),
+                workspace_label: route.requirements.workspace_label.clone(),
+                executor: "bamboo-runtime".into(),
+                required_tools: required_tools.clone(),
+                network_zone: route.requirements.network_zone.clone(),
+                require_network_isolation: route.requirements.require_network_isolation,
+                preferred_host_ref: None,
+                now,
+                lease_expires_at: now + chrono::Duration::seconds(80),
+            };
+            if host.capabilities.placement_class != bamboo_domain::ActorPlacementClass::Remote
+                || !request.eligible(&host)
+            {
+                continue;
+            }
+            let load = host.active_slots(now);
+            if selected.as_ref().is_none_or(|(_, old_load, old_slots)| {
+                load * usize::from(*old_slots) < *old_load * usize::from(host.max_slots)
+            }) {
+                selected = Some((mailbox, load, host.max_slots));
+            }
+        }
+        selected
+            .map(|(mailbox, _, _)| mailbox)
+            .ok_or_else(remote_broker_unavailable)
     }
 }
 
@@ -2103,14 +2697,9 @@ impl ExternalChildRunner for ActorChildRunner {
             .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
-        let strict_remote = self
-            .remote_placements
-            .get(spec.identity.role.as_str())
-            .and_then(|p| p.broker_peer.as_ref());
-        if (matches!(spec.placement, Placement::Remote { .. }) && strict_remote.is_none())
-            || strict_remote.is_some_and(|route| route.is_err())
-            || strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime)
-        {
+        let scoped_route = self.scoped_placement_route(&spec)?;
+        let strict_remote = scoped_route.as_ref();
+        if strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime) {
             return Err(remote_broker_unavailable());
         }
         let lineage = if strict_remote.is_some() {
@@ -2429,6 +3018,25 @@ impl ExternalChildRunner for ActorChildRunner {
             Placement::Local => PlacementKind::Local,
         };
         let remote = !matches!(kind, PlacementKind::Local);
+        let scoped_registry = if remote {
+            let store = actor_directory_store
+                .as_ref()
+                .ok_or_else(remote_broker_unavailable)?;
+            Some(
+                bamboo_storage::v2::FileHostRegistry::new(store.bamboo_home_dir().to_path_buf())
+                    .await
+                    .map_err(|_| remote_broker_unavailable())?,
+            )
+        } else {
+            None
+        };
+        let scoped_tools = scoped_route.as_ref().map(|route| {
+            let mut tools = route.requirements.required_tools.clone();
+            if let Some(ceiling) = &spec.capabilities.native_tool_ceiling {
+                tools.extend(ceiling.tools.iter().cloned());
+            }
+            tools
+        });
 
         // Stamp WHICH machine this child runs on onto its session metadata, so the
         // UI can show it (mirrored into the session index → SessionSummary.placement).
@@ -2452,109 +3060,92 @@ impl ExternalChildRunner for ActorChildRunner {
             let execution_epoch = self.next_execution_epoch.fetch_add(1, Ordering::Relaxed) + 1;
             let (actor, mut client) = match kind {
                 PlacementKind::Remote => {
-                    // REMOTE branch: connect to a broker-selected resident worker. No spawn, no pool
-                    // touch, no drain. We do not own the worker, so a connect failure
-                    // has NO respawn fallback — it is a clear, terminal error.
-                    let placement = self
-                        .remote_placements
-                        .get(spec.identity.role.as_str())
-                        .ok_or_else(|| {
-                            AgentError::LLM(format!(
-                                "remote placement for role '{}' vanished before connect",
-                                spec.identity.role
-                            ))
-                        })?;
-                    if let Some(Ok(peer)) = &placement.broker_peer {
-                        let tls = bamboo_broker::client_config_trusting_cert(
-                            placement
-                                .ca_cert_file
-                                .as_deref()
-                                .ok_or_else(remote_broker_unavailable)?,
-                        )
+                    let route = scoped_route
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?;
+                    let mailbox_id = route
+                        .pinned_mailbox
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?;
+                    let tls = bamboo_broker::client_config_trusting_cert(&route.ca_cert_file)
                         .map_err(|_| remote_broker_unavailable())?;
-                        let connect = bamboo_broker::BrokerChildLink::connect_strict_with_tls_environment_lease(
-                            &placement.endpoint,
+                    let connect =
+                        bamboo_broker::BrokerChildLink::connect_strict_with_tls_environment_lease(
+                            &route.endpoint,
+                            route.parent.clone(),
+                            &route.token,
                             bamboo_subagent::AgentRef {
-                                session_id: peer.parent_mailbox.clone(),
-                                role: peer.parent_role.clone(),
-                            },
-                            placement
-                                .token
-                                .as_deref()
-                                .ok_or_else(remote_broker_unavailable)?,
-                            bamboo_subagent::AgentRef {
-                                session_id: peer.worker_mailbox.clone(),
-                                role: peer.worker_role.clone(),
+                                session_id: mailbox_id.clone(),
+                                role: Some(route.worker_role.clone()),
                             },
                             tls,
                         );
-                        let link = tokio::select! { biased;
-                            _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
-                            result = tokio::time::timeout(Duration::from_secs(30), connect) =>
-                                result.map_err(|_| remote_broker_unavailable())?.map_err(|_| remote_broker_unavailable())?,
-                        };
-                        let record = AgentRecord {
-                            agent_id: job.child_session_id.clone(),
-                            role: spec.identity.role.clone(),
-                            labels: Vec::new(),
-                            endpoint: String::new(),
-                            pid: 0,
-                            version: String::new(),
-                            started_at: chrono::Utc::now(),
-                            lease_expires_at: chrono::Utc::now(),
-                        };
-                        (
-                            PooledWorker {
-                                worker: SpawnedChild::remote(record),
-                                mailbox_id: peer.worker_mailbox.clone(),
-                                parked_at: None,
-                            },
-                            Box::new(link) as Box<dyn bamboo_subagent::ChildLink>,
-                        )
-                    } else {
-                        return Err(remote_broker_unavailable());
-                    }
+                    let link = tokio::select! { biased;
+                        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                        result = tokio::time::timeout(Duration::from_secs(30), connect) =>
+                            result.map_err(|_| remote_broker_unavailable())?.map_err(|_| remote_broker_unavailable())?,
+                    };
+                    let record = AgentRecord {
+                        agent_id: job.child_session_id.clone(),
+                        role: spec.identity.role.clone(),
+                        labels: Vec::new(),
+                        endpoint: String::new(),
+                        pid: 0,
+                        version: String::new(),
+                        started_at: chrono::Utc::now(),
+                        lease_expires_at: chrono::Utc::now(),
+                    };
+                    (
+                        PooledWorker {
+                            worker: SpawnedChild::remote(record),
+                            mailbox_id,
+                            parked_at: None,
+                        },
+                        Box::new(link) as Box<dyn bamboo_subagent::ChildLink>,
+                    )
                 }
                 PlacementKind::Schedulable => {
-                    // SCHEDULABLE branch (#181): pick a LIVE worker of the pool role
-                    // from the BUS (presence = connection-truth; no HTTP registry, no
-                    // leases, no failover) and drive it by mailbox id. The pool worker
-                    // stays connected and is reused next time. No spawn, no kill, NO
-                    // local fallback — an empty pool is a terminal error (raised in
-                    // resolve_schedulable_worker).
-                    let bus = self.bus.as_ref().ok_or_else(|| {
-                        AgentError::LLM(
-                            "schedulable sub-agents require a mailbox bus (subagents.broker)"
-                                .to_string(),
-                        )
-                    })?;
+                    let route = scoped_route
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?;
+                    let registry = scoped_registry
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?;
                     let mailbox_id = self
-                        .resolve_schedulable_worker(spec.identity.role.as_str())
+                        .select_scoped_worker(
+                            route,
+                            registry,
+                            &session.id,
+                            project_id.clone(),
+                            scoped_tools
+                                .as_ref()
+                                .ok_or_else(remote_broker_unavailable)?,
+                        )
                         .await?;
-                    let parent = bamboo_subagent::AgentRef {
-                        session_id: format!("p-{}", job.child_session_id),
-                        role: None,
+                    let tls = bamboo_broker::client_config_trusting_cert(&route.ca_cert_file)
+                        .map_err(|_| remote_broker_unavailable())?;
+                    let connect =
+                        bamboo_broker::BrokerChildLink::connect_strict_with_tls_environment_lease(
+                            &route.endpoint,
+                            route.parent.clone(),
+                            &route.token,
+                            bamboo_subagent::AgentRef {
+                                session_id: mailbox_id.clone(),
+                                role: Some(route.worker_role.clone()),
+                            },
+                            tls,
+                        );
+                    let link = tokio::select! { biased;
+                        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                        result = tokio::time::timeout(Duration::from_secs(30), connect) =>
+                            result.map_err(|_| remote_broker_unavailable())?.map_err(|_| remote_broker_unavailable())?,
                     };
-                    let link = bamboo_broker::BrokerChildLink::connect(
-                        &bus.endpoint,
-                        parent,
-                        &bus.token,
-                        mailbox_id.clone(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        AgentError::LLM(format!(
-                            "schedulable link connect to '{mailbox_id}' failed: {e}"
-                        ))
-                    })?;
-                    // Process-less handle — a bus-resident pool worker is never ours to
-                    // kill (remote ⇒ dropped, not pooled, after the run).
                     let actor = PooledWorker {
                         worker: SpawnedChild::remote(AgentRecord {
                             agent_id: mailbox_id.clone(),
                             role: spec.identity.role.clone(),
                             labels: Vec::new(),
-                            endpoint: bus.endpoint.clone(),
+                            endpoint: route.endpoint.clone(),
                             pid: 0,
                             version: String::new(),
                             started_at: chrono::Utc::now(),
@@ -2677,8 +3268,10 @@ impl ExternalChildRunner for ActorChildRunner {
                 session_inbox_runtime.as_ref(),
                 bound_activation_run_id.as_deref(),
             ) {
-                (Some(binding), Some(run_id)) if plain_actor_store.is_none() => {
-                    match claim_canonical_deliveries(binding, session, run_id, usize::MAX).await {
+                (Some(binding), Some(run_id)) if plain_actor_store.is_none() && !remote => {
+                    match claim_canonical_deliveries(binding, session, run_id, usize::MAX, None)
+                        .await
+                    {
                         Ok(deliveries) => deliveries,
                         Err(error) => {
                             binding
@@ -2698,7 +3291,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 .iter()
                 .map(|(_, delivery)| delivery.clone())
                 .collect::<Vec<_>>();
-            let initial_inflight_claims = initial_pairs
+            let mut initial_inflight_claims = initial_pairs
                 .into_iter()
                 .map(|(claim, _)| claim)
                 .collect::<VecDeque<_>>();
@@ -2880,7 +3473,7 @@ impl ExternalChildRunner for ActorChildRunner {
             } else {
                 permission_policy.clone()
             };
-            let run_spec = RunSpec {
+            let mut run_spec = RunSpec {
                 // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                 assignment: assignment.clone(),
                 logical_session: Some(logical_identity),
@@ -2903,6 +3496,101 @@ impl ExternalChildRunner for ActorChildRunner {
                 initial_session_messages,
                 secrets: run_secrets.clone(),
             };
+            let mut active_lease = if remote {
+                let reserve = ActivePlacementLease::reserve(
+                    scoped_registry
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?
+                        .clone(),
+                    actor_directory_store
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?
+                        .clone(),
+                    scoped_route
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?
+                        .clone(),
+                    actor.mailbox_id.clone(),
+                    session.id.clone(),
+                    bound_activation_run_id
+                        .clone()
+                        .ok_or_else(remote_broker_unavailable)?,
+                    project_id.clone(),
+                    scoped_tools.clone().ok_or_else(remote_broker_unavailable)?,
+                    &cancel_token,
+                )
+                .await;
+                match reserve {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        if let (Some(binding), Some(run_id)) = (
+                            session_inbox_runtime.as_ref(),
+                            bound_activation_run_id.as_deref(),
+                        ) {
+                            binding
+                                .router
+                                .detach_delivery_sink(&job.child_session_id, run_id)
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(lease) = active_lease.as_mut() {
+                let seeded = async {
+                    let binding = session_inbox_runtime
+                        .as_ref()
+                        .ok_or_else(remote_broker_unavailable)?;
+                    let run_id = bound_activation_run_id
+                        .as_deref()
+                        .ok_or_else(remote_broker_unavailable)?;
+                    let pairs = claim_canonical_deliveries(
+                        binding,
+                        session,
+                        run_id,
+                        usize::MAX,
+                        Some((lease.actor_store.as_ref(), &lease.fence)),
+                    )
+                    .await?;
+                    if let Some(binding) = &required_context {
+                        binding
+                            .validate_messages(&session.id, &session.messages)
+                            .map_err(|error| AgentError::Budget(error.to_string()))?;
+                    }
+                    run_spec.messages = session
+                        .messages
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|_| remote_broker_unavailable())?;
+                    run_spec.initial_session_messages =
+                        pairs.iter().map(|(_, delivery)| delivery.clone()).collect();
+                    initial_inflight_claims = pairs
+                        .into_iter()
+                        .map(|(claim, _)| claim)
+                        .collect::<VecDeque<_>>();
+                    Ok::<(), AgentError>(())
+                }
+                .await;
+                if let Err(error) = seeded {
+                    if let Err(rollback_error) = lease.abort_before_dispatch().await {
+                        tracing::warn!(stage = "claim_pre_dispatch_rollback", reason = %rollback_error, "remote claim rollback failed");
+                    }
+                    if let (Some(binding), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        binding
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
+            let mut run_send_invoked = false;
             let dispatch = async {
                 if let Some(activation) = plain_activation
                     .as_ref()
@@ -2914,13 +3602,13 @@ impl ExternalChildRunner for ActorChildRunner {
                         &mut expected_permission_posture,
                     )?;
                 }
-                client
-                    .send(ParentFrame::Run(run_spec.clone()))
-                    .await
-                    .map_err(|e| AgentError::LLM(format!("actor run dispatch failed: {e}")))
+                send_actor_run(&mut *client, run_spec.clone(), &mut run_send_invoked).await
             }
             .await;
             if let Err(e) = dispatch {
+                if remote {
+                    tracing::warn!(stage = "run_dispatch", "remote placement admission failed");
+                }
                 if let (Some(binding), Some(run_id)) = (
                     session_inbox_runtime.as_ref(),
                     bound_activation_run_id.as_deref(),
@@ -2935,6 +3623,17 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
                 if let Some(activation) = &plain_activation {
                     activation.finish(ActorActivationFinish::Failed).await?;
+                }
+                if let Some(lease) = active_lease.as_mut() {
+                    match lease.abort_if_run_unsent(run_send_invoked).await {
+                        Ok(false) => {
+                            tracing::warn!(stage = "run_dispatch_unconfirmed", "remote Run send failed after publication became possible; retaining Actor activation and slot until terminal proof or expiry");
+                        }
+                        Ok(true) => {}
+                        Err(rollback_error) => {
+                            tracing::warn!(stage = "run_pre_dispatch_rollback", reason = %rollback_error, "remote Run rollback failed");
+                        }
+                    }
                 }
                 return Err(e);
             }
@@ -2960,7 +3659,9 @@ impl ExternalChildRunner for ActorChildRunner {
                 approval_reviewer: self.approval_reviewer.as_ref(),
                 escalation_bridge: escalation.clone(),
                 event_tx: &event_tx,
-                cancel_token: &cancel_token,
+                cancel_token: active_lease
+                    .as_ref()
+                    .map_or(&cancel_token, |lease| &lease.run_cancel),
                 live_rx: &mut live_rx,
                 delivery_rx: &mut delivery_rx,
                 logical_session: session,
@@ -2989,6 +3690,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 local_history_tools: local_history_tools.as_deref(),
                 local_history_read_only: spec.capabilities.read_only_enforced(),
                 plain_input: plain_activation.as_ref(),
+                canonical_activation: active_lease.as_ref().map(|lease| &lease.fence),
+                canonical_placement_ref: active_lease.as_ref().map(|lease| &lease.placement_ref),
                 actor_event_observer: actor_event_observer.as_deref(),
                 // BrokerChildLink replaces the actual correlation for each Run;
                 // direct legacy WS Terminal frames carry no such identity.
@@ -2999,6 +3702,99 @@ impl ExternalChildRunner for ActorChildRunner {
                 first_frame_timeout: Some(WORKER_FIRST_FRAME_TIMEOUT),
             })
             .await;
+            let mut result = if active_lease
+                .as_ref()
+                .is_some_and(ActivePlacementLease::lost)
+            {
+                Err(remote_broker_unavailable())
+            } else {
+                result
+            };
+            if local_history_tools.is_none() {
+                let reply = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|reply| reply.as_deref())
+                    .filter(|reply| !reply.is_empty())
+                    .map(str::to_owned);
+                if let (Some(lease), Some(reply)) = (active_lease.as_ref(), reply) {
+                    if let Err(error) = append_fenced_remote_reply(
+                        lease.actor_store.as_ref(),
+                        &lease.fence,
+                        session,
+                        &reply,
+                    )
+                    .await
+                    {
+                        result = Err(error);
+                    }
+                }
+            }
+            if remote {
+                if let Err(error) = &result {
+                    let code = match error {
+                        AgentError::LLM(message) if message.starts_with("actor event") => {
+                            "actor_event"
+                        }
+                        AgentError::LLM(message) if message.starts_with("remote_actor") => {
+                            "remote_actor"
+                        }
+                        AgentError::LLM(message) if message.starts_with("remote_environment") => {
+                            if message.len() <= 128
+                                && message.bytes().all(|byte| {
+                                    byte.is_ascii_lowercase()
+                                        || byte.is_ascii_digit()
+                                        || byte == b'_'
+                                })
+                            {
+                                message.as_str()
+                            } else {
+                                "environment"
+                            }
+                        }
+                        AgentError::LLM(message) if message.contains("permission posture") => {
+                            "permission_posture"
+                        }
+                        AgentError::LLM(message) if message.contains("broker") => "broker",
+                        AgentError::LLM(_) => "other_llm",
+                        AgentError::WorkerUnresponsive(_) => "unresponsive",
+                        AgentError::Cancelled => "cancelled",
+                        _ => "other",
+                    };
+                    tracing::warn!(stage = "actor_drive", code, "remote actor run failed");
+                }
+            }
+            if let Some(lease) = active_lease.as_mut() {
+                let accepted_terminal = client
+                    .durable_delivery_receipt()
+                    .map(|receipt| receipt.terminal_status);
+                if let Err(error) = lease
+                    .complete(
+                        remote_activation_finish(&result, accepted_terminal),
+                        client.has_pending_durable_terminal(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        stage = "actor_complete",
+                        "remote placement admission failed"
+                    );
+                    if let (Some(binding), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        binding
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    drop(live_guard);
+                    drop(client); // No Host checkpoint proof means no broker ACK.
+                    drop(active_lease);
+                    return Err(error);
+                }
+            }
+            drop(active_lease);
             if let (Some(binding), Some(run_id)) = (
                 session_inbox_runtime.as_ref(),
                 bound_activation_run_id.as_deref(),
@@ -3045,37 +3841,21 @@ impl ExternalChildRunner for ActorChildRunner {
                 drop(client);
             }
 
-            // No first frame ⇒ the worker is wedged. Recover ONCE before giving up:
-            //   - Local: reap the dead pooled worker + respawn.
-            //   - Schedulable: not ours to kill — drop it and re-select a live pool
-            //     member (a wedged worker must not fail the run when the pool has others).
-            //   - Remote: a FIXED endpoint has no alternative — fall through to a bounded
-            //     WorkerUnresponsive error (far better than the previous infinite hang).
+            // Retry only a local worker that we can kill. A silent remote
+            // Worker may still be executing its first Run; starting the same
+            // Actor on another Host before a terminal fence would duplicate it.
             if required_context.is_none()
                 && attempt == 0
+                && matches!(kind, PlacementKind::Local)
                 && matches!(result, Err(AgentError::WorkerUnresponsive(_)))
             {
-                match kind {
-                    PlacementKind::Local => {
-                        tracing::warn!(
-                        "actor child {} got no first frame; reaping the worker and respawning once",
-                        job.child_session_id
-                    );
-                        actor.worker.kill().await;
-                        attempt += 1;
-                        continue;
-                    }
-                    PlacementKind::Schedulable => {
-                        tracing::warn!(
-                        "scheduled actor child {} got no first frame; re-selecting a pool worker",
-                        job.child_session_id
-                    );
-                        drop(actor);
-                        attempt += 1;
-                        continue;
-                    }
-                    PlacementKind::Remote => {}
-                }
+                tracing::warn!(
+                    "actor child {} got no first frame; reaping the worker and respawning once",
+                    job.child_session_id
+                );
+                actor.worker.kill().await;
+                attempt += 1;
+                continue;
             }
             break (result, actor);
         };
@@ -3179,7 +3959,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // (run_child_spawn saves the session right after we return.)
         match result {
             Ok(Some(text)) => {
-                if local_history_tools.is_none() && !text.is_empty() {
+                if !remote && local_history_tools.is_none() && !text.is_empty() {
                     session.add_message(bamboo_agent_core::Message::assistant(text, None));
                 }
                 Ok(())
@@ -3493,6 +4273,7 @@ impl PlainActorActivation {
                         // Written only after the real worker capability probe
                         // and spawn. Opaque provenance, never a live-owner grant.
                         lease_id: format!("owned-initial-release-v1:{worker}"),
+                        slot_epoch: None,
                     }),
                     now,
                 })
@@ -4656,6 +5437,7 @@ async fn checkpoint_and_ack_canonical_claim(
     binding: &SessionInboxRuntimeBinding,
     session: &mut Session,
     claim: &SessionInboxClaim,
+    fenced: Option<(&bamboo_storage::SessionStoreV2, &ActorActivationFence)>,
 ) -> crate::runtime::runner::Result<()> {
     if claim.envelope.target_session_id != session.id {
         return Err(AgentError::LLM(format!(
@@ -4675,6 +5457,60 @@ async fn checkpoint_and_ack_canonical_claim(
         })?
     {
         return reconcile_already_admitted_claim(binding, session, claim).await;
+    }
+
+    if let Some((store, fence)) = fenced {
+        let committed = store
+            .confirm_actor_claim_context(
+                concrete_file_inbox(binding)?,
+                bamboo_storage::ActorClaimContextSeed {
+                    fence: fence.clone(),
+                    expected_created_at: session.created_at,
+                    expected_messages: session.messages.clone(),
+                    expected_provider_transcript: session.provider_transcript.clone(),
+                    expected_admission: session.session_inbox_admission().cloned(),
+                    claims: vec![claim.clone()],
+                },
+            )
+            .await;
+        let committed = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                // An error after atomic replacement may still have advanced
+                // Main. Keep the claim unacked and use that canonical context
+                // for the SDK's terminal status save.
+                adopt_latest_actor_context(store, session).await;
+                return Err(AgentError::LLM(format!(
+                    "confirm fenced Actor claim context unconfirmed: {error}"
+                )));
+            }
+        };
+        bamboo_domain::merge_session_inbox_admission(session, &committed);
+        session.messages = committed.messages;
+        session.provider_transcript = committed.provider_transcript;
+        session.updated_at = committed.updated_at;
+        if !session
+            .messages
+            .iter()
+            .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope))
+            || !session
+                .session_inbox_admission()
+                .is_some_and(|cursor| cursor.contains(&claim.envelope.id))
+        {
+            return Err(AgentError::LLM(
+                "fenced Actor claim confirmation lost durable proof".into(),
+            ));
+        }
+        return binding
+            .inbox
+            .ack(&session.id, claim)
+            .await
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "ack fenced Actor claim {} after confirmation: {error}",
+                    claim.envelope.id
+                ))
+            });
     }
 
     let transcript_has_id = session
@@ -4750,6 +5586,28 @@ async fn checkpoint_and_ack_canonical_claim(
         })
 }
 
+fn concrete_file_inbox(
+    binding: &SessionInboxRuntimeBinding,
+) -> Result<bamboo_storage::FileSessionInbox, AgentError> {
+    binding
+        .inbox
+        .as_any()
+        .and_then(|inbox| inbox.downcast_ref::<bamboo_storage::FileSessionInbox>())
+        .cloned()
+        .ok_or_else(|| AgentError::LLM("remote Actor requires canonical FileSessionInbox".into()))
+}
+
+async fn adopt_latest_actor_context(store: &bamboo_storage::SessionStoreV2, session: &mut Session) {
+    if let Ok(Some(latest)) = store.load_session(&session.id).await {
+        if latest.created_at == session.created_at {
+            bamboo_domain::merge_session_inbox_admission(session, &latest);
+            session.messages = latest.messages;
+            session.provider_transcript = latest.provider_transcript;
+            session.updated_at = latest.updated_at;
+        }
+    }
+}
+
 /// Durably seed claimed typed messages into the canonical host transcript
 /// before dispatching them to any actor worker, while deliberately leaving the
 /// admission cursor and `cur/` claims untouched.
@@ -4764,11 +5622,13 @@ async fn checkpoint_claim_context_before_dispatch(
     binding: &SessionInboxRuntimeBinding,
     session: &mut Session,
     claims: &[SessionInboxClaim],
+    fenced: Option<(&bamboo_storage::SessionStoreV2, &ActorActivationFence)>,
 ) -> crate::runtime::runner::Result<()> {
     if claims.is_empty() {
         return Ok(());
     }
     let before = session.clone();
+    let mut additions = Vec::new();
     for claim in claims {
         if claim.envelope.target_session_id != session.id {
             return Err(AgentError::LLM(format!(
@@ -4808,19 +5668,55 @@ async fn checkpoint_claim_context_before_dispatch(
                     claim.envelope.id
                 ))
             })?;
-            session.add_message(message);
+            additions.push(message);
         }
     }
-    session.updated_at = chrono::Utc::now();
-    if let Err(error) = binding
-        .persistence
-        .checkpoint_runtime_session(session)
-        .await
-    {
-        *session = before;
-        return Err(AgentError::LLM(format!(
-            "checkpoint canonical SessionInbox actor context: {error}"
-        )));
+    let fenced_seed = fenced.is_some();
+    if let Some((store, fence)) = fenced {
+        let committed = store
+            .seed_actor_claim_context(
+                concrete_file_inbox(binding)?,
+                bamboo_storage::ActorClaimContextSeed {
+                    fence: fence.clone(),
+                    expected_created_at: session.created_at,
+                    expected_messages: session.messages.clone(),
+                    expected_provider_transcript: session.provider_transcript.clone(),
+                    expected_admission: session.session_inbox_admission().cloned(),
+                    claims: claims.to_vec(),
+                },
+            )
+            .await;
+        let committed = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                // Publication may have occurred before an unconfirmed
+                // readback. Do not dispatch or ACK; adopt only the current
+                // canonical context so SDK can still save an error status.
+                adopt_latest_actor_context(store, session).await;
+                return Err(AgentError::LLM(format!(
+                    "seed fenced Actor claim context unconfirmed: {error}"
+                )));
+            }
+        };
+        bamboo_domain::merge_session_inbox_admission(session, &committed);
+        session.messages = committed.messages;
+        session.provider_transcript = committed.provider_transcript;
+        session.updated_at = committed.updated_at;
+    } else {
+        for message in additions {
+            session.add_message(message);
+        }
+        session.updated_at = chrono::Utc::now();
+        if let Err(error) = binding
+            .persistence
+            .checkpoint_runtime_session(session)
+            .await
+        {
+            *session = before;
+            return Err(AgentError::LLM(format!(
+                "checkpoint canonical SessionInbox actor context: {error}"
+            )));
+        }
     }
     for claim in claims {
         if !session
@@ -4828,7 +5724,9 @@ async fn checkpoint_claim_context_before_dispatch(
             .iter()
             .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope))
         {
-            *session = before;
+            if !fenced_seed {
+                *session = before;
+            }
             return Err(AgentError::LLM(format!(
                 "actor context checkpoint lost typed transcript proof for {}",
                 claim.envelope.id
@@ -4843,6 +5741,7 @@ async fn claim_canonical_deliveries(
     session: &mut Session,
     activation_run_id: &str,
     limit: usize,
+    fenced: Option<(&bamboo_storage::SessionStoreV2, &ActorActivationFence)>,
 ) -> crate::runtime::runner::Result<Vec<(SessionInboxClaim, SessionMessageDelivery)>> {
     let claims = binding
         .inbox
@@ -4875,7 +5774,7 @@ async fn claim_canonical_deliveries(
         }
         unconfirmed.push(claim);
     }
-    checkpoint_claim_context_before_dispatch(binding, session, &unconfirmed).await?;
+    checkpoint_claim_context_before_dispatch(binding, session, &unconfirmed, fenced).await?;
 
     let mut deliveries = Vec::with_capacity(unconfirmed.len());
     for claim in unconfirmed {
@@ -4917,12 +5816,13 @@ async fn forward_next_canonical_claim(
     session: &mut Session,
     activation_run_id: &str,
     inflight: &mut VecDeque<SessionInboxClaim>,
+    fenced: Option<(&bamboo_storage::SessionStoreV2, &ActorActivationFence)>,
 ) -> crate::runtime::runner::Result<()> {
     if !inflight.is_empty() {
         return Ok(());
     }
     let Some((claim, delivery)) =
-        claim_canonical_deliveries(binding, session, activation_run_id, 1)
+        claim_canonical_deliveries(binding, session, activation_run_id, 1, fenced)
             .await?
             .pop()
     else {
@@ -4971,6 +5871,8 @@ struct ActorDriveContext<'a> {
     local_history_tools: Option<&'a [String]>,
     local_history_read_only: bool,
     plain_input: Option<&'a PlainActorActivation>,
+    canonical_activation: Option<&'a ActorActivationFence>,
+    canonical_placement_ref: Option<&'a bamboo_domain::ActorPlacementRef>,
     actor_event_observer: Option<&'a dyn ActorEventObserver>,
     plain_run: Option<(&'a RunSpec, &'a AtomicU64)>,
     first_frame_timeout: Option<Duration>,
@@ -6197,6 +7099,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         local_history_tools,
         local_history_read_only,
         plain_input,
+        canonical_activation,
+        canonical_placement_ref,
         actor_event_observer,
         plain_run,
     } = context;
@@ -6244,6 +7148,15 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
     let mut next_actor_event_seq = 1u64;
     let mut canonical_router: Option<ActorEventRouter> = None;
+    let canonical_fence = plain_input
+        .map(|activation| &activation.fence)
+        .or(canonical_activation);
+    let canonical_store = plain_input
+        .map(|activation| activation.store.as_ref())
+        .or(actor_directory_store);
+    let remote_claim_fence =
+        canonical_activation.and_then(|fence| actor_directory_store.map(|store| (store, fence)));
+    let mut remote_cancel_deadline: Option<tokio::time::Instant> = None;
     let mut display = ActorEventDisplay::default();
     let mut readonly = readonly_output
         .as_ref()
@@ -6251,9 +7164,30 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut local_history = local_history_tools.map(|_| LocalToolCollector::default());
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
-                // fall through to the cancel handling below
+            _ = cancel_token.cancelled(), if remote_cancel_deadline.is_none() => {
+                if remote_claim_fence.is_some() {
+                    // A remote Worker may finish after its subscriber cancels.
+                    // Keep the same correlated frame pump alive briefly so an
+                    // exact Cancelled Outcome can terminalize the Actor fence.
+                    // Without that proof the activation stays live until its
+                    // lease expires and a retry must remain blocked.
+                    let _ = client.send(ParentFrame::Cancel).await;
+                    remote_cancel_deadline = Some(
+                        tokio::time::Instant::now() + Duration::from_secs(10)
+                    );
+                    continue;
+                }
+                // Direct/local links retain their existing cancel behavior.
                 break;
+            }
+            _ = async {
+                if let Some(deadline) = remote_cancel_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err(AgentError::Cancelled);
             }
             _ = async {
                 match first_frame_watch.as_mut() {
@@ -6280,6 +7214,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                     logical_session,
                     activation_run_id.expect("guarded"),
                     &mut inflight_claims,
+                    remote_claim_fence,
                 )
                 .await?;
             }
@@ -6297,6 +7232,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
+                        if canonical_activation.is_some() {
+                            return Err(AgentError::LLM("remote_actor_event_batch_required".into()));
+                        }
                         if local_history.is_some() {
                             return Err(local_tool_history_unsupported());
                         }
@@ -6361,23 +7299,23 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             expected_source_actor_id,
                             expected_creation,
                         )?;
-                        let directory_entry = if let Some(activation) = plain_input {
-                            Some(validate_directory_actor_event(
-                                activation.store.as_ref(),
-                                &activation.fence,
-                                logical_session,
-                                batch.activation_id.as_deref(),
-                            )
-                            .await?)
-                        } else {
-                            None
-                        };
-                        if let (Some(entry), Some(activation)) = (&directory_entry, plain_input) {
+                        let directory_entry = if let (Some(store), Some(fence)) = (canonical_store, canonical_fence) {
+                            let entry = validate_directory_actor_event(
+                                store, fence, logical_session, batch.activation_id.as_deref(),
+                            ).await?;
+                            if canonical_placement_ref.is_some_and(|expected| {
+                                entry.activation.as_ref().and_then(|activation| activation.placement_ref.as_ref()) != Some(expected)
+                            }) {
+                                return Err(AgentError::LLM("remote_actor_placement_ref_changed".into()));
+                            }
+                            Some(entry)
+                        } else { None };
+                        if let (Some(entry), Some(fence)) = (&directory_entry, canonical_fence) {
                             if canonical_router.is_none() {
                                 canonical_router = Some(
                                     ActorEventRouter::new(
                                         entry,
-                                        &activation.fence,
+                                        fence,
                                         current_epoch,
                                         strict_permission_events && permission_handshake.is_awaiting(),
                                     )
@@ -6434,8 +7372,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 false // A worker cache observation is not a legacy Host commit.
                             } else if plain_actor { plain_actor_event(&event)? } else { true };
                             }
-                            if let (Some(router), Some(entry), Some(activation)) =
-                                (canonical_router.as_mut(), directory_entry.as_ref(), plain_input)
+                            if let (Some(router), Some(entry), Some(fence)) =
+                                (canonical_router.as_mut(), directory_entry.as_ref(), canonical_fence)
                             {
                                 let typed = if publish {
                                     Some(serde_json::from_value::<AgentEvent>(event.clone())
@@ -6443,7 +7381,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 } else {
                                     None
                                 };
-                                match router.route(entry, &activation.fence, current_epoch, seq, typed)
+                                match router.route(entry, fence, current_epoch, seq, typed)
                                     .map_err(actor_event_route_error)?
                                 {
                                     ActorEventRoute::Publish(envelope) => {
@@ -6815,7 +7753,12 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .expect("validated in-flight canonical claim");
                         // On failure the durable canonical cur file remains
                         // recoverable for the next owner.
-                        checkpoint_and_ack_canonical_claim(binding, logical_session, &claim)
+                        checkpoint_and_ack_canonical_claim(
+                            binding,
+                            logical_session,
+                            &claim,
+                            remote_claim_fence,
+                        )
                             .await?;
                         // Ordered single-consumer: only after the exact prior
                         // claim is checkpointed+acked may the driver claim and
@@ -6827,11 +7770,21 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 logical_session,
                                 bound_run_id,
                                 &mut inflight_claims,
+                                remote_claim_fence,
                             )
                             .await?;
                         }
                     }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
+                        if remote_cancel_deadline.is_some() && status == TerminalStatus::Cancelled {
+                            // A selected Worker terminal proves that its Run
+                            // ended even if permission posture or an Inbox
+                            // correction was still pending. Claims remain
+                            // unacked for retry; only the placement fence can
+                            // now be released after SDK saves Cancelled.
+                            client.accept_durable_terminal(status);
+                            return Err(AgentError::Cancelled);
+                        }
                         if parent_question_checkpoint_id.is_some()
                             && status != TerminalStatus::Suspended
                         {
@@ -6842,6 +7795,13 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         if permission_handshake.is_awaiting() {
                             if remote_environment_lease && status == TerminalStatus::Error {
                                 if let Some(code) = error.as_deref().and_then(remote_environment_error_code) {
+                                    // The Worker rejected the EnvironmentLease before it
+                                    // could confirm its permission posture. This exact
+                                    // correlated Outcome still proves the Run ended, so
+                                    // retain its durable receipt and release the slot after
+                                    // the Host records the failure. Other early terminals
+                                    // remain unproven and keep their placement fence.
+                                    client.accept_durable_terminal(status);
                                     return Err(AgentError::LLM(code.to_owned()));
                                 }
                             }
@@ -7205,6 +8165,301 @@ mod tests {
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
 
+    #[tokio::test]
+    async fn pre_dispatch_placement_failure_fails_only_claimed_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let parent = Session::new("placement-parent", "model");
+        let child = Session::new_child_of("placement-child", &parent, "model", "task");
+        store.save_session(&parent).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        store.ensure_actor(&child.id).await.unwrap();
+        store
+            .bind_control_plane(
+                &child.id,
+                bamboo_domain::ActorControlPlaneBinding {
+                    policy_revision: None,
+                    placement_intent: Some(bamboo_domain::ActorPlacementIntent::Pool {
+                        pool_id: "remote-worker".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let claim = |run_id: &str| ActorActivationClaim {
+            actor_id: child.id.clone(),
+            run_id: run_id.into(),
+            lease_owner: format!("host-{run_id}"),
+            lease_expires_at: chrono::Utc::now() + chrono::Duration::seconds(80),
+            inbox_generation: 0,
+            placement_ref: Some(bamboo_domain::ActorPlacementRef {
+                class: bamboo_domain::ActorPlacementClass::Remote,
+                lease_id: format!("slot-{run_id}"),
+                slot_epoch: Some(1),
+            }),
+            now: chrono::Utc::now(),
+        };
+        let first = store.claim_activation(&claim("first")).await.unwrap();
+        store
+            .start_activation(&first.fence(), chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(store.claim_activation(&claim("retry")).await.is_err());
+
+        // This is the post-claim placement preflight failure path. No Run has
+        // been dispatched, so the same ActorId can retry before lease expiry.
+        fail_pre_dispatch_activation(&store, &first.fence())
+            .await
+            .unwrap();
+        let failed = store.inspect_actor(&child.id).await.unwrap();
+        assert_eq!(
+            failed.activation.unwrap().status,
+            bamboo_domain::ActorActivationStatus::Failed
+        );
+        let retry = store.claim_activation(&claim("retry")).await.unwrap();
+        assert_eq!(retry.attempt, first.attempt + 1);
+        assert!(fail_pre_dispatch_activation(&store, &first.fence())
+            .await
+            .is_err());
+        assert_eq!(
+            store.inspect_actor(&child.id).await.unwrap().activation,
+            Some(retry)
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_run_delivery_receipt_keeps_actor_activation_live() {
+        struct AcceptedWithoutReceipt {
+            published: bool,
+        }
+
+        #[async_trait]
+        impl bamboo_subagent::ChildLink for AcceptedWithoutReceipt {
+            async fn send(&mut self, frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+                assert!(matches!(frame, ParentFrame::Run(_)));
+                self.published = true;
+                Err(bamboo_subagent::TransportError::Protocol(
+                    "broker delivery receipt lost after publication".into(),
+                ))
+            }
+
+            async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+                std::future::pending().await
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().into())
+                .await
+                .unwrap(),
+        );
+        let parent = Session::new("dispatch-parent", "model");
+        let child = Session::new_child_of("dispatch-child", &parent, "model", "task");
+        store.save_session(&parent).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        store.ensure_actor(&child.id).await.unwrap();
+        let now = chrono::Utc::now();
+        let claim = ActorActivationClaim {
+            actor_id: child.id.clone(),
+            run_id: "dispatch-run".into(),
+            lease_owner: "dispatch-host".into(),
+            lease_expires_at: now + chrono::Duration::seconds(80),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        };
+        let activation = store.claim_activation(&claim).await.unwrap();
+        store
+            .start_activation(&activation.fence(), chrono::Utc::now())
+            .await
+            .unwrap();
+        let mut link = AcceptedWithoutReceipt { published: false };
+        let mut send_invoked = false;
+        let run = RunSpec {
+            assignment: "task".into(),
+            logical_session: None,
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: Vec::new(),
+            activation_run_id: Some(claim.run_id.clone()),
+            execution_epoch: 1,
+            initial_session_messages: Vec::new(),
+            secrets: Default::default(),
+        };
+        assert!(send_actor_run(&mut link, run, &mut send_invoked)
+            .await
+            .is_err());
+        assert!(send_invoked && link.published);
+        let slot = WorkerSlotLease {
+            lease_id: "dispatch-slot".into(),
+            host_ref: "dispatch-worker".into(),
+            connection_generation: "dispatch-generation".into(),
+            slot: 0,
+            epoch: 1,
+            actor_id: child.id.clone(),
+            run_id: claim.run_id.clone(),
+            expires_at: claim.lease_expires_at,
+        };
+        let mut lease = ActivePlacementLease {
+            registry: bamboo_storage::v2::FileHostRegistry::new(temp.path().into())
+                .await
+                .unwrap(),
+            actor_store: store.clone(),
+            route: ScopedPlacementRoute {
+                endpoint: String::new(),
+                token: String::new(),
+                ca_cert_file: PathBuf::new(),
+                parent: bamboo_subagent::AgentRef {
+                    session_id: "dispatch-parent".into(),
+                    role: Some("host".into()),
+                },
+                worker_role: "worker".into(),
+                pinned_mailbox: None,
+                requirements: Default::default(),
+            },
+            mailbox: "dispatch-worker".into(),
+            host_ref: "dispatch-worker".into(),
+            fence: activation.fence(),
+            placement_ref: bamboo_domain::ActorPlacementRef {
+                class: bamboo_domain::ActorPlacementClass::Remote,
+                lease_id: slot.lease_id.clone(),
+                slot_epoch: Some(slot.epoch),
+            },
+            lease: Arc::new(tokio::sync::Mutex::new(slot)),
+            heartbeat: tokio::spawn(std::future::pending()),
+            run_cancel: CancellationToken::new(),
+            lost: Arc::new(AtomicBool::new(false)),
+            release_on_drop: AtomicBool::new(false),
+        };
+        assert!(!lease.abort_if_run_unsent(send_invoked).await.unwrap());
+        assert_eq!(
+            store
+                .inspect_actor(&child.id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap()
+                .status,
+            bamboo_domain::ActorActivationStatus::Running
+        );
+        let mut retry = claim.clone();
+        retry.run_id = "dispatch-retry".into();
+        retry.now = chrono::Utc::now();
+        retry.lease_expires_at = retry.now + chrono::Duration::seconds(80);
+        assert!(matches!(
+            store.claim_activation(&retry).await,
+            Err(bamboo_domain::ActorDirectoryError::Busy)
+        ));
+    }
+
+    #[test]
+    fn accepted_cancelled_terminal_maps_to_cancelled_actor_activation() {
+        let cancelled: Result<Option<String>, AgentError> = Err(AgentError::Cancelled);
+        assert_eq!(
+            remote_activation_finish(&cancelled, Some(TerminalStatus::Cancelled)),
+            ActorActivationFinish::Cancelled
+        );
+        assert_eq!(
+            remote_activation_finish(&cancelled, None),
+            ActorActivationFinish::Failed
+        );
+        assert_eq!(
+            remote_activation_finish(&cancelled, Some(TerminalStatus::Completed)),
+            ActorActivationFinish::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_reply_is_fenced_before_terminal_status_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let parent = Session::new("remote-reply-parent", "model");
+        let mut child = Session::new_child_of("remote-reply-child", &parent, "model", "task");
+        child.add_message(bamboo_agent_core::Message::user("task"));
+        store.save_session(&parent).await.unwrap();
+        store.save_session(&child).await.unwrap();
+        store.ensure_actor(&child.id).await.unwrap();
+        store
+            .bind_control_plane(
+                &child.id,
+                bamboo_domain::ActorControlPlaneBinding {
+                    policy_revision: None,
+                    placement_intent: Some(bamboo_domain::ActorPlacementIntent::Pool {
+                        pool_id: "remote-worker".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let activation = store
+            .claim_activation(&ActorActivationClaim {
+                actor_id: child.id.clone(),
+                run_id: "remote-reply-run".into(),
+                lease_owner: "remote-worker".into(),
+                lease_expires_at: now + chrono::Duration::seconds(80),
+                inbox_generation: 0,
+                placement_ref: Some(bamboo_domain::ActorPlacementRef {
+                    class: bamboo_domain::ActorPlacementClass::Remote,
+                    lease_id: "remote-slot".into(),
+                    slot_epoch: Some(1),
+                }),
+                now,
+            })
+            .await
+            .unwrap();
+        let fence = activation.fence();
+        store.start_activation(&fence, now).await.unwrap();
+
+        append_fenced_remote_reply(&store, &fence, &mut child, "done")
+            .await
+            .unwrap();
+        store
+            .finish_activation(&fence, chrono::Utc::now(), ActorActivationFinish::Succeeded)
+            .await
+            .unwrap();
+        child.set_last_run_status("completed");
+        store.save_session(&child).await.unwrap();
+        let saved = store.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
+        assert_eq!(saved.messages.len(), 2);
+        assert_eq!(saved.messages.last().unwrap().content, "done");
+        assert!(
+            append_fenced_remote_reply(&store, &fence, &mut child, "duplicate")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+    }
+
+    async fn start_bus() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{addr}"), dir)
+    }
+
     struct DurableAckProbe {
         calls: Arc<AtomicUsize>,
         terminal_status: TerminalStatus,
@@ -7396,6 +8651,7 @@ mod tests {
                 token_env: None,
                 ca_cert_file: None,
                 broker_peer: None,
+                placement_requirements: None,
             });
         let repair = BrokerTerminalReceiptReconciler::new(store.clone(), &config);
         let report = repair.reconcile_once().await;
@@ -7913,7 +9169,7 @@ mod tests {
             // A real canonical admission wins after validation, before the
             // final append-safe checkpoint acquires its serialization lock.
             let mut latest = self.real.storage.load_session(&session.id).await?.unwrap();
-            checkpoint_and_ack_canonical_claim(&self.real, &mut latest, &self.claim)
+            checkpoint_and_ack_canonical_claim(&self.real, &mut latest, &self.claim, None)
                 .await
                 .map_err(|_| std::io::Error::other("concurrent admission failed"))?;
             self.real
@@ -7979,7 +9235,7 @@ mod tests {
                 .await
                 .unwrap();
             let claim = inbox.claim(&child.id, 1).await.unwrap().remove(0);
-            checkpoint_and_ack_canonical_claim(&binding, &mut child, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut child, &claim, None)
                 .await
                 .unwrap();
             assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
@@ -8224,6 +9480,8 @@ mod tests {
                 local_history_tools: Some(&tools),
                 local_history_read_only: true,
                 plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
                 actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: Some(Duration::from_secs(1)),
@@ -8532,6 +9790,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_claim_seed_rejects_unsupported_inbox_before_dispatch() {
+        let (_temp, store, locked, inbox, mut session, claim) =
+            actor_inbox_fixture("unsupported-remote-inbox").await;
+        let wrapped: Arc<dyn SessionInboxPort> = Arc::new(ActorFailBeforeAckInbox {
+            inner: inbox.clone(),
+            fail_once: std::sync::atomic::AtomicBool::new(false),
+        });
+        let binding = actor_binding(store.clone(), wrapped, locked);
+        let fence = ActorActivationFence {
+            schema_version: 1,
+            actor_id: session.id.clone(),
+            activation_id: "unsupported-inbox-activation".into(),
+            attempt: 1,
+            run_id: "unsupported-inbox-run".into(),
+            lease_owner: "unsupported-inbox-host".into(),
+            lease_epoch: 1,
+        };
+        let before = session.clone();
+
+        let error = checkpoint_claim_context_before_dispatch(
+            &binding,
+            &mut session,
+            &[claim],
+            Some((store.as_ref(), &fence)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires canonical FileSessionInbox"));
+        assert_eq!(
+            serde_json::to_value(&session.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &store
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .messages
+            )
+            .unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 1);
+    }
+
+    #[tokio::test]
     async fn remote_broker_lineage_rejects_missing_parent_and_project_drift() {
         let (_temp, store, locked, inbox, parent, _claim) =
             actor_inbox_fixture("remote-parent").await;
@@ -8654,16 +9962,17 @@ mod tests {
                 Arc::new(bamboo_storage::LockedSessionStore::new(restarted.clone())),
             );
             let mut session = restarted.load_session(session_id).await.unwrap().unwrap();
-            let pairs = claim_canonical_deliveries(&binding, &mut session, "run-1", usize::MAX)
-                .await
-                .unwrap();
+            let pairs =
+                claim_canonical_deliveries(&binding, &mut session, "run-1", usize::MAX, None)
+                    .await
+                    .unwrap();
             assert_eq!(pairs.len(), 2, "the staged sibling has no permission");
             for ((claim, delivery), (envelope, policy, receipt)) in pairs.iter().zip(&sent) {
                 assert_eq!(claim.envelope.id, envelope.id);
                 assert_eq!(claim.generation, receipt.generation);
                 assert_eq!(claim.activation_policy, *policy);
                 assert_eq!(delivery.activation_policy, *policy);
-                checkpoint_and_ack_canonical_claim(&binding, &mut session, claim)
+                checkpoint_and_ack_canonical_claim(&binding, &mut session, claim, None)
                     .await
                     .unwrap();
             }
@@ -8692,7 +10001,7 @@ mod tests {
                 );
             }
             assert!(
-                claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX)
+                claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX, None)
                     .await
                     .unwrap()
                     .is_empty()
@@ -8705,9 +10014,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let pairs = claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX)
-                .await
-                .unwrap();
+            let pairs =
+                claim_canonical_deliveries(&binding, &mut session, "run-2", usize::MAX, None)
+                    .await
+                    .unwrap();
             assert_eq!(pairs.len(), 1);
             assert_eq!(pairs[0].0.envelope.id, staged.id);
             assert_eq!(
@@ -8733,7 +10043,7 @@ mod tests {
         let binding = actor_binding(store, inbox.clone(), persistence);
 
         assert!(
-            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim, None)
                 .await
                 .is_err()
         );
@@ -8757,7 +10067,7 @@ mod tests {
         let binding = actor_binding(store.clone(), inbox.clone(), persistence);
 
         assert!(
-            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim, None)
                 .await
                 .is_err()
         );
@@ -8787,7 +10097,7 @@ mod tests {
         let binding = actor_binding(store.clone(), inbox.clone(), persistence);
 
         assert!(
-            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim, None)
                 .await
                 .is_err()
         );
@@ -8815,7 +10125,7 @@ mod tests {
         let binding = actor_binding(store.clone(), inbox.clone(), fault);
 
         assert!(
-            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim, None)
                 .await
                 .is_err()
         );
@@ -8834,7 +10144,7 @@ mod tests {
         let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
         let binding = actor_binding(store.clone(), reopened.clone(), persistence);
         let mut restarted = store.load_session(&session.id).await.unwrap().unwrap();
-        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered)
+        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered, None)
             .await
             .unwrap();
         assert_eq!(
@@ -8866,7 +10176,7 @@ mod tests {
         let binding = actor_binding(store.clone(), faulted, persistence);
 
         assert!(
-            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim, None)
                 .await
                 .is_err()
         );
@@ -8893,7 +10203,7 @@ mod tests {
         let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
         let binding = actor_binding(store.clone(), reopened.clone(), persistence);
         let mut restarted = durable;
-        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered)
+        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered, None)
             .await
             .unwrap();
         assert_eq!(
@@ -9284,6 +10594,7 @@ mod tests {
                         Some(bamboo_domain::ActorPlacementRef {
                             class: bamboo_domain::ActorPlacementClass::Local,
                             lease_id: "owned-initial-release-v1:actual-old-worker".into(),
+                            slot_epoch: None,
                         })
                     },
                     now,
@@ -10867,6 +12178,8 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            canonical_activation: None,
+            canonical_placement_ref: None,
             actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
@@ -10892,6 +12205,215 @@ mod tests {
             .contains("terminated before permission posture confirmation"));
         assert!(events.is_empty());
         assert!(bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata).is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_environment_rejection_accepts_only_allowlisted_durable_terminal() {
+        struct TerminalProofProbe {
+            frame: Option<ChildFrame>,
+            accepted: bool,
+        }
+
+        #[async_trait]
+        impl bamboo_subagent::ChildLink for TerminalProofProbe {
+            async fn send(&mut self, _frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+                Ok(())
+            }
+
+            async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+                Ok(self.frame.take())
+            }
+
+            fn accept_durable_terminal(&mut self, status: TerminalStatus) {
+                self.accepted = status == TerminalStatus::Error;
+            }
+
+            fn has_pending_durable_terminal(&self) -> bool {
+                self.accepted
+            }
+        }
+
+        for (status, error, expected_proof) in [
+            (
+                TerminalStatus::Error,
+                Some("remote_environment_checkout_not_clean"),
+                true,
+            ),
+            (TerminalStatus::Error, Some("untrusted worker error"), false),
+            (
+                TerminalStatus::Cancelled,
+                Some("remote_environment_checkout_not_clean"),
+                false,
+            ),
+        ] {
+            let mut link = TerminalProofProbe {
+                frame: Some(ChildFrame::Terminal {
+                    status,
+                    result: None,
+                    error: error.map(str::to_owned),
+                    transcript: Vec::new(),
+                }),
+                accepted: false,
+            };
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+            let mut session = Session::new("remote-terminal-proof", "model");
+            let result = drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: "proof-parent",
+                child_session_id: "remote-terminal-proof",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut session,
+                expected_permission_posture: Some(expected_default_permission_posture(7)),
+                expected_creation: None,
+                session_inbox_runtime: None,
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
+                activation_run_id: None,
+                execution_epoch: 0,
+                expected_source_actor_id: "remote-terminal-proof",
+                initial_inflight_claims: VecDeque::new(),
+                plain_actor: false,
+                remote_environment_lease: true,
+                readonly_output: None,
+                local_history_tools: None,
+                local_history_read_only: false,
+                plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
+                actor_event_observer: None,
+                plain_run: None,
+                first_frame_timeout: Some(Duration::from_secs(1)),
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                bamboo_subagent::ChildLink::has_pending_durable_terminal(&link),
+                expected_proof
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_cancel_requires_selected_worker_terminal_for_release_proof() {
+        struct CancelOutcomeLink {
+            cancel_sent: bool,
+            settle: bool,
+            accepted: bool,
+        }
+
+        #[async_trait]
+        impl bamboo_subagent::ChildLink for CancelOutcomeLink {
+            async fn send(&mut self, frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+                self.cancel_sent = matches!(frame, ParentFrame::Cancel);
+                Ok(())
+            }
+
+            async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+                if !self.cancel_sent || !self.settle {
+                    std::future::pending::<bamboo_subagent::TransportResult<Option<ChildFrame>>>()
+                        .await
+                } else {
+                    self.cancel_sent = false;
+                    Ok(Some(ChildFrame::Terminal {
+                        status: TerminalStatus::Cancelled,
+                        result: None,
+                        error: None,
+                        transcript: Vec::new(),
+                    }))
+                }
+            }
+
+            fn accept_durable_terminal(&mut self, status: TerminalStatus) {
+                self.accepted = status == TerminalStatus::Cancelled;
+            }
+
+            fn has_pending_durable_terminal(&self) -> bool {
+                self.accepted
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let fence = ActorActivationFence {
+            schema_version: 2,
+            actor_id: "cancelled-remote-child".into(),
+            activation_id: "cancelled-remote-activation".into(),
+            attempt: 1,
+            run_id: "cancelled-remote-run".into(),
+            lease_owner: "cancelled-remote-host".into(),
+            lease_epoch: 1,
+        };
+        for settle in [true, false] {
+            let mut link = CancelOutcomeLink {
+                cancel_sent: false,
+                settle,
+                accepted: false,
+            };
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+            let mut session = Session::new("cancelled-remote-child", "model");
+            let result = drive(ActorDriveContext {
+                expected_creation: None,
+                client: &mut link,
+                parent_session_id: "cancelled-remote-parent",
+                child_session_id: "cancelled-remote-child",
+                child_attempt: 1,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut session,
+                expected_permission_posture: Some(expected_default_permission_posture(7)),
+                session_inbox_runtime: None,
+                actor_directory_store: Some(&store),
+                canonical_subagent_tool: None,
+                activation_run_id: Some("cancelled-remote-run"),
+                execution_epoch: 0,
+                expected_source_actor_id: "cancelled-remote-worker",
+                initial_inflight_claims: VecDeque::new(),
+                plain_actor: false,
+                remote_environment_lease: true,
+                readonly_output: None,
+                local_history_tools: None,
+                local_history_read_only: false,
+                plain_input: None,
+                canonical_activation: Some(&fence),
+                canonical_placement_ref: None,
+                actor_event_observer: None,
+                plain_run: None,
+                first_frame_timeout: None,
+            })
+            .await;
+            assert!(matches!(result, Err(AgentError::Cancelled)));
+            assert_eq!(
+                link.accepted, settle,
+                "only a consumed exact terminal can release the remote fence"
+            );
+            assert_eq!(
+                bamboo_subagent::ChildLink::has_pending_durable_terminal(&link),
+                settle
+            );
+        }
     }
 
     #[tokio::test]
@@ -11972,7 +13494,7 @@ mod tests {
             persistence: locked,
             parent_question_lock: None,
         };
-        let pairs = claim_canonical_deliveries(&binding, &mut session, run_id, usize::MAX)
+        let pairs = claim_canonical_deliveries(&binding, &mut session, run_id, usize::MAX, None)
             .await
             .unwrap();
         assert_eq!(
@@ -12077,6 +13599,8 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            canonical_activation: None,
+            canonical_placement_ref: None,
             actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_secs(1)),
@@ -13095,6 +14619,8 @@ mod tests {
                 local_history_tools: None,
                 local_history_read_only: false,
                 plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
                 actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: None,
@@ -13170,6 +14696,8 @@ mod tests {
                 local_history_tools: None,
                 local_history_read_only: false,
                 plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
                 actor_event_observer: None,
                 plain_run: None,
                 first_frame_timeout: None,
@@ -13242,6 +14770,8 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            canonical_activation: None,
+            canonical_placement_ref: None,
             actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(100)),
@@ -13292,6 +14822,8 @@ mod tests {
             local_history_tools: None,
             local_history_read_only: false,
             plain_input: None,
+            canonical_activation: None,
+            canonical_placement_ref: None,
             actor_event_observer: None,
             plain_run: None,
             first_frame_timeout: Some(Duration::from_millis(50)),
@@ -13492,6 +15024,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: None,
                 broker_peer: None,
+                requirements: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -13517,6 +15050,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: None,
                 broker_peer: None,
+                requirements: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -14077,6 +15611,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: Some("mini-e2e".into()),
                 broker_peer: None,
+                requirements: None,
             },
         );
         let runner = bogus_runner(placements);
@@ -14127,6 +15662,8 @@ mod tests {
         ResolvedSchedulablePlacement {
             pool: pool.into(),
             host_label: None,
+            requirements: None,
+            ..Default::default()
         }
     }
 
@@ -14162,6 +15699,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: None,
                 broker_peer: None,
+                requirements: None,
             },
         );
         let mut sched = HashMap::new();
@@ -14210,6 +15748,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: Some("mini".into()),
                 broker_peer: None,
+                requirements: None,
             },
         );
         let runner = bogus_runner(remote);
@@ -14230,6 +15769,7 @@ mod tests {
                 ca_cert_file: None,
                 host_label: None,
                 broker_peer: None,
+                requirements: None,
             },
         );
         let r2 = bogus_runner(remote_nolabel);
@@ -14246,6 +15786,8 @@ mod tests {
             ResolvedSchedulablePlacement {
                 pool: "mac-mini-monitor".into(),
                 host_label: Some("mini".into()),
+                requirements: None,
+                ..Default::default()
             },
         );
         let sr = bogus_sched_runner(HashMap::new(), sched);
@@ -14262,191 +15804,27 @@ mod tests {
         assert_eq!(local.placement_stamp_for(&spec4), None);
     }
 
-    // ---- #181: schedulable selection over the BUS (Phase 3 cutover) ----------
-
-    async fn start_bus() -> (String, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let core = std::sync::Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
-        let server = std::sync::Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = server.serve(listener).await;
-        });
-        (format!("ws://{addr}"), dir)
-    }
-
-    async fn join_pool(endpoint: &str, id: &str, pool: &str) -> bamboo_broker::BrokerClient {
-        let mut c = bamboo_broker::BrokerClient::connect(
-            endpoint,
-            bamboo_subagent::AgentRef {
-                session_id: id.into(),
-                role: Some(pool.into()),
-            },
-            "t",
-        )
-        .await
-        .unwrap();
-        c.subscribe().await.unwrap();
-        c
-    }
-
-    fn sched_runner_on_bus(endpoint: &str, child_role: &str, pool: &str) -> ActorChildRunner {
-        let mut sched = HashMap::new();
-        sched.insert(child_role.to_string(), sched_placement(pool, "unused"));
-        bogus_sched_runner(HashMap::new(), sched).with_bus(Some(bamboo_subagent::BusEndpoint {
-            endpoint: endpoint.into(),
-            token: "t".into(),
-        }))
-    }
-
     #[tokio::test]
-    async fn resolve_schedulable_picks_a_live_bus_worker() {
-        let (endpoint, _dir) = start_bus().await;
-        let _w = join_pool(&endpoint, "w-gpu", "gpu-pool").await;
-        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
-
-        let mailbox = runner
-            .resolve_schedulable_worker("explorer")
-            .await
-            .expect("a live pool worker is found on the bus");
-        assert_eq!(mailbox, "w-gpu");
-    }
-
-    #[tokio::test]
-    async fn resolve_schedulable_round_robins_over_pool_workers() {
-        let (endpoint, _dir) = start_bus().await;
-        let _a = join_pool(&endpoint, "w-a", "gpu-pool").await;
-        let _b = join_pool(&endpoint, "w-b", "gpu-pool").await;
-        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
-
-        // Successive resolves spread across both connected workers.
-        let mut picked = std::collections::HashSet::new();
-        for _ in 0..6 {
-            picked.insert(runner.resolve_schedulable_worker("explorer").await.unwrap());
-        }
-        assert_eq!(
-            picked,
-            ["w-a".to_string(), "w-b".to_string()].into_iter().collect(),
-            "round-robin must cover every connected pool worker"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_schedulable_errors_on_empty_pool() {
-        let (endpoint, _dir) = start_bus().await;
-        // No worker subscribes to "gpu-pool".
-        let runner = sched_runner_on_bus(&endpoint, "explorer", "gpu-pool");
-
-        let err = runner
-            .resolve_schedulable_worker("explorer")
-            .await
-            .expect_err("an empty pool is terminal — no local fallback")
-            .to_string();
-        assert!(err.contains("no live worker in pool"), "got: {err}");
-        assert!(err.contains("NOT spawning"), "got: {err}");
-    }
-
-    /// FULL schedulable run over the bus: a worker SERVING `EchoExecutor` joins the
-    /// pool by role; `execute_external_child` with a Schedulable placement resolves
-    /// it from the bus (no local subprocess — the worker_bin is `/bin/false`),
-    /// drives the run, gets the echo back, AND stamps the child session with the
-    /// pool's cluster-node label — `{kind:remote, host:"mini"}`. The end-to-end
-    /// analogue of the live `mac-mini-monitor`→mini run.
-    #[tokio::test]
-    async fn execute_external_child_runs_schedulable_over_bus_and_stamps_node_label() {
-        let (endpoint, _dir) = start_bus().await;
-
-        // A bus worker SERVING runs (not just presence), joined to the pool by role.
-        let ep = endpoint.clone();
-        let worker = tokio::spawn(async move {
-            let _ = bamboo_broker::serve_executor(
-                &ep,
-                bamboo_subagent::AgentRef {
-                    session_id: "mmm-worker".into(),
-                    role: Some("mac-mini-monitor".into()),
-                },
-                "t",
-                std::sync::Arc::new(bamboo_subagent::executor::EchoExecutor),
-            )
-            .await;
-        });
-
-        // Wait until the worker is visible on the bus so the pool is non-empty
-        // when execute_external_child resolves it (serve_executor connects async).
-        let mut probe = bamboo_broker::BrokerClient::connect(
-            &endpoint,
-            bamboo_subagent::AgentRef {
-                session_id: "probe".into(),
-                role: None,
-            },
-            "t",
-        )
-        .await
-        .unwrap();
-        let mut ready = false;
-        for _ in 0..100 {
-            if probe
-                .list_connected("mac-mini-monitor")
-                .await
-                .unwrap()
-                .iter()
-                .any(|id| id == "mmm-worker")
-            {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        assert!(ready, "worker never joined the pool");
-
-        // Runner: child role → schedulable pool "mac-mini-monitor" carrying the
-        // cluster node's label "mini"; bogus worker_bin so any local spawn fails.
+    async fn legacy_schedulable_route_fails_closed_without_local_fallback() {
         let mut sched = HashMap::new();
         sched.insert(
-            "mac-mini-monitor".to_string(),
-            ResolvedSchedulablePlacement {
-                pool: "mac-mini-monitor".into(),
-                host_label: Some("mini".into()),
-            },
+            "explorer".to_string(),
+            sched_placement("gpu-pool", "unused"),
         );
-        let runner = bogus_sched_runner(HashMap::new(), sched).with_bus(Some(
-            bamboo_subagent::BusEndpoint {
-                endpoint: endpoint.clone(),
-                token: "t".into(),
-            },
-        ));
-
-        let mut session = session_of_role("mac-mini-monitor", "hello scheduled");
-        let job = job_for("child-1");
-        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(64);
-        let cancel = CancellationToken::new();
-
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            runner.execute_external_child(&mut session, &job, event_tx, cancel),
-        )
-        .await
-        .expect("run did not hang")
-        .expect("schedulable run succeeded over the bus (no local spawn)");
-
-        // Echo reply flowed back — proves it routed to the bus worker, not local.
-        let last = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::Assistant))
-            .expect("an assistant reply was written back");
-        assert!(last.content.contains("echo:"), "got {:?}", last.content);
-
-        // ...and the child is stamped with the pool's cluster-node label.
-        let placement = session
-            .metadata
-            .get("placement")
-            .expect("scheduled child session stamped with a placement");
-        assert!(placement.contains(r#""kind":"remote""#), "{placement}");
-        assert!(placement.contains(r#""host":"mini""#), "{placement}");
-
-        worker.abort();
+        let runner = bogus_sched_runner(HashMap::new(), sched);
+        let mut session = session_of_role("explorer", "do the thing");
+        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let error = runner
+            .execute_external_child(
+                &mut session,
+                &job_for("child-1"),
+                event_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("legacy bus presence cannot grant placement");
+        assert!(error
+            .to_string()
+            .contains("remote_broker_activation_unavailable"));
     }
 }

@@ -76,6 +76,7 @@ fn run_check(lease: &WorkerSlotLease, now: DateTime<Utc>) -> WorkerRunReservatio
         placement_ref: ActorPlacementRef {
             class: ActorPlacementClass::Remote,
             lease_id: lease.lease_id.clone(),
+            slot_epoch: Some(lease.epoch),
         },
         actor_id: lease.actor_id.clone(),
         run_id: lease.run_id.clone(),
@@ -110,7 +111,7 @@ async fn independent_stores_atomically_reserve_one_slot() {
     assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1);
     assert!(matches!(
         a.err().or_else(|| b.err()),
-        Some(HostRegistryError::NoEligibleHost)
+        Some(HostRegistryError::Busy)
     ));
 }
 
@@ -338,6 +339,11 @@ async fn auto_selection_is_deterministic_and_respects_capacity() {
     assert_eq!(first.host_ref, "host-a");
     let mut second_request = request(now);
     second_request.run_id = "run-b".into();
+    assert!(matches!(
+        registry.reserve_slot(second_request.clone()).await,
+        Err(HostRegistryError::Busy)
+    ));
+    second_request.actor_id = "child-b".into();
     let second = registry.reserve_slot(second_request).await.unwrap();
     assert_eq!(second.host_ref, "host-b");
 }
@@ -410,6 +416,19 @@ async fn run_preflight_requires_exact_live_placement_and_observed_connection() {
     assert_eq!(preflight.lease, lease);
     assert_eq!(preflight.mailbox, "mailbox-host-a");
     assert_eq!(preflight.role.as_deref(), Some("worker-pool"));
+
+    let mut missing_epoch = check.clone();
+    missing_epoch.placement_ref.slot_epoch = None;
+    assert!(matches!(
+        registry.validate_run_reservation(missing_epoch).await,
+        Err(HostRegistryError::Invalid)
+    ));
+    let mut wrong_epoch = check.clone();
+    wrong_epoch.placement_ref.slot_epoch = Some(lease.epoch + 1);
+    assert!(matches!(
+        registry.validate_run_reservation(wrong_epoch).await,
+        Err(HostRegistryError::StaleLease)
+    ));
 
     let mut wrong = check.clone();
     wrong.actor_id = "other-actor".into();

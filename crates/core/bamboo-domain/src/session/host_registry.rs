@@ -131,6 +131,7 @@ pub struct WorkerRunReservationCheck {
 impl WorkerRunReservationCheck {
     pub fn validate(&self) -> Result<(), HostRegistryError> {
         if !identifier(&self.placement_ref.lease_id)
+            || !matches!(self.placement_ref.slot_epoch, Some(epoch) if epoch > 0)
             || !identifier(&self.actor_id)
             || !identifier(&self.run_id)
             || !identifier(&self.observed_host_ref)

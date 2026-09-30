@@ -415,7 +415,7 @@ fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::
 /// ([`BashCompletionSink::on_bash_completed`]), and the bash **backstop** poll
 /// ([`ChildCompletionCoordinator::bash_self_resume`]) — can never double-resume.
 /// The inner sync `Mutex` guards only the brief map lookup (no await inside).
-fn session_resume_lock(session_id: &str) -> SessionResumeLock {
+pub(crate) fn session_resume_lock(session_id: &str) -> SessionResumeLock {
     let mut map = parent_locks().lock().recover_poison();
     let lock = map
         .entry(session_id.to_string())
@@ -430,7 +430,7 @@ fn session_resume_lock(session_id: &str) -> SessionResumeLock {
 /// The lease is constructed before awaiting the mutex, so cancelled waiters
 /// also reclaim their registration. Lookup and last-owner removal use the same
 /// brief registry lock; two live mutexes can never exist for the same ID.
-struct SessionResumeLock {
+pub(crate) struct SessionResumeLock {
     session_id: String,
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
@@ -789,6 +789,16 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         let mut should_resume = false;
         let mut remaining_children = 0usize;
         let active_wait = runtime_state.waiting_for_children.clone();
+        if active_wait.is_none() {
+            // A fast Child can finish while its parent is still completing a
+            // normal reasoning round, before that parent registers a wait.
+            // There is no parent control-plane transition to save here. In
+            // particular, a stale parent snapshot must not attempt a full
+            // transcript checkpoint against an advancing model-context ledger.
+            // Orphan-wait registration uses this same lock and will observe the
+            // terminal Child index after this completion returns.
+            return;
+        }
         if let Some(wait) = active_wait.as_ref() {
             remaining_children = wait
                 .child_session_ids
@@ -3721,6 +3731,44 @@ mod tests {
         assert_eq!(reservations.load(Ordering::SeqCst), 1);
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(inbox.inspect(parent_id).await.unwrap().claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn completion_before_parent_wait_does_not_checkpoint_stale_root() {
+        let (_temp, store, inbox, coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "parent-without-wait";
+        let child_id = "already-finished-child";
+        let mut parent = Session::new(parent_id, "model");
+        parent.add_message(Message::assistant("root is still reasoning", None));
+        store.save_session(&parent).await.unwrap();
+        let before = store.load_session(parent_id).await.unwrap().unwrap();
+
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child.set_last_run_status("completed");
+        store.save_session(&child).await.unwrap();
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent_id.to_string(),
+                child_session_id: child_id.to_string(),
+                status: "completed".to_string(),
+                error: None,
+                completed_at: Utc::now(),
+            },
+        )
+        .await;
+
+        let after = store.load_session(parent_id).await.unwrap().unwrap();
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert!(read_runtime_state(&after).waiting_for_children.is_none());
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

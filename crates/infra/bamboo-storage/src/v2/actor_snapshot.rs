@@ -20,7 +20,7 @@ impl ActorSnapshotPort for SessionStoreV2 {
         if !limits.is_bounded() {
             return Err(Error::BudgetExceeded);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             supported::selector(root_id)?;
             supported::selector(subtree_id)?;
@@ -47,7 +47,7 @@ impl ActorSnapshotPort for SessionStoreV2 {
             .await
             .map_err(|_| Error::StorageUnavailable)?
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = (principal, root_id, subtree_id);
             Err(Error::UnsupportedAuthority)
@@ -60,7 +60,7 @@ impl SessionStoreV2 {
     /// Callers first authorize the full subtree once. Each poll revalidates
     /// canonical Root identity and reads the same marker as the full snapshot.
     pub async fn actor_tree_cursor(&self, root_id: &str) -> Result<Option<(String, u64)>, Error> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             supported::selector(root_id)?;
             let lifecycle = self
@@ -80,7 +80,7 @@ impl SessionStoreV2 {
             .await
             .map_err(|_| Error::StorageUnavailable)?
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = root_id;
             Err(Error::UnsupportedAuthority)
@@ -88,7 +88,7 @@ impl SessionStoreV2 {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod supported {
     use super::super::{
         actor_snapshot_reader::{Directory, ReadBudget},

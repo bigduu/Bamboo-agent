@@ -140,11 +140,18 @@ impl ParentAgentApprovalReviewer {
         expected: (&[bamboo_domain::ActorSession], u64),
     ) -> bool {
         let (observed, revision) = expected;
-        let Some((_, policy)) = &self.canonical else {
+        let Some((store, policy)) = &self.canonical else {
             return false;
         };
-        scope.is_current(parent, child).await
-            && policy.policy_revision() == revision
+        if !scope.is_current(parent, child).await || policy.policy_revision() != revision {
+            return false;
+        }
+        let super::parent_permission_request::LiveActorLineage::Live(live) =
+            super::parent_permission_request::live_actor_lineage(store, child).await
+        else {
+            return false;
+        };
+        live == observed
             && super::parent_permission_request::lineage(
                 self.sessions.storage().as_ref(),
                 self.projects.as_ref(),
@@ -1099,6 +1106,33 @@ mod tests {
         })
         .await
         .expect("live ParentRequest was not registered")
+    }
+
+    #[tokio::test]
+    async fn retired_root_cannot_review_grandchild_permission() {
+        use bamboo_domain::ActorDirectoryPort;
+
+        let fixture = Fixture::new_with_nested_parent(true).await;
+        fixture
+            .store
+            .retire_actor("approval-root", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.scoped(&fixture.body).await,
+            ChildApprovalReview::Reply(false)
+        );
+        let parent = fixture
+            .store
+            .load_session("approval-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            parent.messages.is_empty(),
+            "retired lineage must not receive a request"
+        );
+        assert_eq!(fixture.probe.0.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

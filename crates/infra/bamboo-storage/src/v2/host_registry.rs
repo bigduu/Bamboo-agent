@@ -225,6 +225,17 @@ impl FileHostRegistry {
     ) -> Result<WorkerSlotLease, HostRegistryError> {
         request.validate()?;
         self.transact(move |state| {
+            // ActorSession identity may not occupy two WorkerHosts or slots at
+            // once, including a retry with a different Run ID. This check and
+            // slot selection share the same cross-process file lock.
+            if state.hosts.values().any(|host| {
+                host.is_live(request.now)
+                    && host.slots.values().any(|lease| {
+                        lease.actor_id == request.actor_id && lease.expires_at > request.now
+                    })
+            }) {
+                return Err(HostRegistryError::Busy);
+            }
             let selected = select_worker_host(&state.hosts, &request)?;
             let host_ref = selected.host_ref.clone();
             let slot = selected
@@ -315,6 +326,7 @@ impl FileHostRegistry {
             }
             if lease.actor_id != check.actor_id
                 || lease.run_id != check.run_id
+                || Some(lease.epoch) != check.placement_ref.slot_epoch
                 || lease.connection_generation != check.observed_connection_generation
                 || lease.expires_at <= check.now
             {

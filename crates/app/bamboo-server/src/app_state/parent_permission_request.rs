@@ -2,9 +2,9 @@
 //! a ParentRequest resolution/wait-cycle protocol.
 use bamboo_agent_core::{storage::Storage, Session};
 use bamboo_domain::{
-    ActorSession, SessionKind, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageKind, SessionMessageSource, SessionProviderMessage,
-    SessionRuntimeInstruction,
+    ActorDirectoryPort, ActorLogicalState, ActorSession, SessionKind, SessionMessageBody,
+    SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource, SessionProviderMessage, SessionRuntimeInstruction,
 };
 use bamboo_subagent::proto::LogicalSessionIdentity;
 use bamboo_tools::permission::{PermissionReasonCode, PermissionRequest, PermissionType};
@@ -12,6 +12,74 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
+const MAX_PARENT_LINEAGE_ACTORS: usize = 16;
+
+/// Session ancestry describes the requested relationship; ActorDirectory is
+/// the durable lifecycle authority. A retained Session must not make a
+/// retired ancestor available for another child decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LiveActorLineage {
+    Live(Vec<ActorSession>),
+    Retired,
+    Unavailable,
+}
+
+pub(super) async fn live_actor_lineage(
+    store: &bamboo_storage::SessionStoreV2,
+    child_id: &str,
+) -> LiveActorLineage {
+    let mut current_id = child_id.to_owned();
+    let mut previous: Option<ActorSession> = None;
+    let mut observed = Vec::new();
+    loop {
+        if observed.len() >= MAX_PARENT_LINEAGE_ACTORS {
+            return LiveActorLineage::Unavailable;
+        }
+        let session = match store.load_session(&current_id).await {
+            Ok(Some(session)) => session,
+            _ => return LiveActorLineage::Unavailable,
+        };
+        let projected = match ActorSession::from_session(&session) {
+            Ok(actor) => actor,
+            Err(_) => return LiveActorLineage::Unavailable,
+        };
+        let saved = match store.inspect_actor(&current_id).await {
+            Ok(entry) => entry.actor,
+            Err(_) => return LiveActorLineage::Unavailable,
+        };
+        if saved.state == ActorLogicalState::Retired {
+            return LiveActorLineage::Retired;
+        }
+        if !saved.matches_session(&session)
+            || saved.project_id != projected.project_id
+            || previous.as_ref().is_some_and(|child| {
+                child.parent_actor_id.as_deref() != Some(projected.actor_id.as_str())
+                    || child.root_actor_id != projected.root_actor_id
+                    || child.project_id != projected.project_id
+                    || projected.spawn_depth.checked_add(1) != Some(child.spawn_depth)
+                    || projected.session_created_at > child.session_created_at
+            })
+        {
+            return LiveActorLineage::Unavailable;
+        }
+        let parent_id = projected.parent_actor_id.clone();
+        previous = Some(projected.clone());
+        observed.push(projected);
+        match parent_id {
+            Some(parent_id) => current_id = parent_id,
+            None => {
+                return if observed
+                    .last()
+                    .is_some_and(|root| root.actor_id == root.root_actor_id)
+                {
+                    LiveActorLineage::Live(observed)
+                } else {
+                    LiveActorLineage::Unavailable
+                }
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +167,9 @@ pub(super) fn lineage<'a>(
         let mut observations = vec![current.clone()];
         let mut direct_parent = None;
         while let Some(id) = current.parent_actor_id.as_deref() {
+            if observations.len() >= MAX_PARENT_LINEAGE_ACTORS {
+                return None;
+            }
             let session = storage.load_session(id).await.ok()??;
             let parent = ActorSession::from_session(&session).ok()?;
             if parent.root_actor_id != current.root_actor_id

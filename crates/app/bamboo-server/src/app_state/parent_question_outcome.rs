@@ -103,6 +103,37 @@ pub(super) async fn block_unavailable_at_deadline(
     sessions: &bamboo_engine::SessionRepository,
     question: &ParentQuestion,
 ) -> Result<(), ()> {
+    block_at_deadline(
+        sessions,
+        question,
+        false,
+        "runtime.parent_question.unavailable_at_deadline_v1",
+    )
+    .await
+}
+
+/// A Retired ancestor cannot recover. Once the business deadline passes,
+/// close even a previously accepted answer's pending fanout without waking a
+/// Child under a revoked lineage. Keep its typed answer in the Child audit.
+pub(super) async fn block_retired_at_deadline(
+    sessions: &bamboo_engine::SessionRepository,
+    question: &ParentQuestion,
+) -> Result<(), ()> {
+    block_at_deadline(
+        sessions,
+        question,
+        true,
+        "runtime.parent_question.retired_at_deadline_v1",
+    )
+    .await
+}
+
+async fn block_at_deadline(
+    sessions: &bamboo_engine::SessionRepository,
+    question: &ParentQuestion,
+    preserve_answer: bool,
+    marker_key: &str,
+) -> Result<(), ()> {
     sessions
         .persistence()
         .mutate_runtime_session_and_publish(
@@ -124,9 +155,11 @@ pub(super) async fn block_unavailable_at_deadline(
                 // Another process may have won the answer CAS after the
                 // reconciler's read. Its pending flag is still the outbox
                 // obligation for parent terminal and Child wake delivery.
-                if terminal.as_ref().is_some_and(|resolution| {
-                    matches!(resolution.outcome, ParentQuestionOutcome::Answer { .. })
-                }) {
+                if !preserve_answer
+                    && terminal.as_ref().is_some_and(|resolution| {
+                        matches!(resolution.outcome, ParentQuestionOutcome::Answer { .. })
+                    })
+                {
                     return Err(());
                 }
                 let pending = child.pending_question.as_ref().ok_or(())?;
@@ -149,10 +182,9 @@ pub(super) async fn block_unavailable_at_deadline(
                     "runtime.suspend_reason".into(),
                     "blocked_needs_input".into(),
                 );
-                child.metadata.insert(
-                    "runtime.parent_question.unavailable_at_deadline_v1".into(),
-                    question.id.to_string(),
-                );
+                child
+                    .metadata
+                    .insert(marker_key.into(), question.id.to_string());
                 Ok::<_, ()>(())
             },
             |saved| {

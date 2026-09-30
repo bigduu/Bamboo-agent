@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+use super::parent_permission_request::LiveActorLineage;
 use super::parent_question_outcome::{self as outcome, State};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
@@ -72,6 +73,12 @@ impl ParentQuestionCoordinator {
             .await
             .map_err(|_| "Canonical Child Session is unavailable")?
             .ok_or("Canonical Child Session is unavailable")?;
+        if !matches!(
+            self.question_lineage(&question).await,
+            LiveActorLineage::Live(_)
+        ) {
+            return Err("ParentQuestion Actor lineage is unavailable or retired".into());
+        }
         if child
             .metadata
             .get("runtime.parent_question.unavailable_at_deadline_v1")
@@ -156,6 +163,31 @@ impl ParentQuestionCoordinator {
         }
     }
 
+    async fn question_lineage(&self, question: &ParentQuestion) -> LiveActorLineage {
+        match super::parent_permission_request::live_actor_lineage(
+            &self.store,
+            &question.child.session_id,
+        )
+        .await
+        {
+            LiveActorLineage::Live(lineage)
+                if lineage.first().is_some_and(|child| {
+                    child.actor_id == question.child.session_id
+                        && child.session_created_at == question.child.created_at
+                        && child.root_actor_id == question.root_session_id
+                        && child.project_id == question.project_id
+                }) && lineage.get(1).is_some_and(|parent| {
+                    parent.actor_id == question.parent.session_id
+                        && parent.session_created_at == question.parent.created_at
+                }) =>
+            {
+                LiveActorLineage::Live(lineage)
+            }
+            LiveActorLineage::Retired => LiveActorLineage::Retired,
+            _ => LiveActorLineage::Unavailable,
+        }
+    }
+
     /// One exact Child is loaded from canonical storage. The index and a
     /// callback, if added later, are scheduling hints only.
     pub async fn reconcile_child(&self, child_id: &str) -> Result<ReconcileDisposition, String> {
@@ -190,16 +222,20 @@ impl ParentQuestionCoordinator {
             Ok(Some(parent)) => Some(parent),
             Ok(None) | Err(_) => None,
         };
-        if parent.is_none() || !self.project_active(&question) {
-            // The Child CAS can have accepted an answer before the deadline,
-            // even if its parent fanout failed and authority disappeared later.
-            // Keep that durable outbox pending until authority returns.
+        let lineage = self.question_lineage(&question).await;
+        if parent.is_none()
+            || !self.project_active(&question)
+            || !matches!(lineage, LiveActorLineage::Live(_))
+        {
+            // A committed answer survives temporary storage/Project loss, but
+            // a Retired ancestor cannot recover and cannot wake this Child.
             if ParentQuestionResolution::from_orphan_child(&child, &question.id).is_some_and(
                 |resolution| {
                     resolution.request == question
                         && matches!(resolution.outcome, ParentQuestionOutcome::Answer { .. })
                 },
-            ) {
+            ) && lineage != LiveActorLineage::Retired
+            {
                 return Ok(ReconcileDisposition::RetryAt(now + RETRY_INTERVAL));
             }
             if now < question.deadline {
@@ -207,9 +243,15 @@ impl ParentQuestionCoordinator {
                     (now + RETRY_INTERVAL).min(question.deadline),
                 ));
             }
-            outcome::block_unavailable_at_deadline(&self.sessions, &question)
-                .await
-                .map_err(|_| "ParentQuestion unavailable authority block is unconfirmed")?;
+            if lineage == LiveActorLineage::Retired {
+                outcome::block_retired_at_deadline(&self.sessions, &question)
+                    .await
+                    .map_err(|_| "ParentQuestion retired authority block is unconfirmed")?;
+            } else {
+                outcome::block_unavailable_at_deadline(&self.sessions, &question)
+                    .await
+                    .map_err(|_| "ParentQuestion unavailable authority block is unconfirmed")?;
+            }
             return Ok(ReconcileDisposition::Done);
         }
         let parent = parent.expect("checked above");
@@ -414,8 +456,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use bamboo_domain::{
-        FunctionCall, Message, PendingQuestionSource, SessionActivationDisposition,
-        SessionActivationError, SessionActivationPort, SessionInboxPort, ToolCall,
+        ActorDirectoryPort, FunctionCall, Message, PendingQuestionSource,
+        SessionActivationDisposition, SessionActivationError, SessionActivationPort,
+        SessionInboxPort, ToolCall,
     };
 
     struct Active;
@@ -441,17 +484,35 @@ mod tests {
 
     impl Fixture {
         async fn new(issued_at: DateTime<Utc>) -> Self {
-            Self::with_missing_project(issued_at, false).await
+            Self::with_options(issued_at, false, false).await
         }
 
         async fn with_missing_project(issued_at: DateTime<Utc>, missing_project: bool) -> Self {
+            Self::with_options(issued_at, missing_project, false).await
+        }
+
+        async fn with_nested_parent(issued_at: DateTime<Utc>) -> Self {
+            Self::with_options(issued_at, false, true).await
+        }
+
+        async fn with_options(
+            issued_at: DateTime<Utc>,
+            missing_project: bool,
+            nested_parent: bool,
+        ) -> Self {
             let home = tempfile::tempdir().unwrap();
             let store = Arc::new(
                 bamboo_storage::SessionStoreV2::new(home.path().into())
                     .await
                     .unwrap(),
             );
-            let mut parent = Session::new("direct-parent", "test-model");
+            let mut parent = if nested_parent {
+                let root = Session::new("ancestor-root", "test-model");
+                store.save_session(&root).await.unwrap();
+                Session::new_child_of("direct-parent", &root, "test-model", "Parent")
+            } else {
+                Session::new("direct-parent", "test-model")
+            };
             if missing_project {
                 parent.set_project_id_meta(ProjectId::new().to_string());
             }
@@ -662,6 +723,130 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn retired_direct_parent_cannot_answer_delivered_child_question() {
+        let fixture = Fixture::new(Utc::now()).await;
+        fixture.deliver_parent_request().await;
+        fixture
+            .store
+            .retire_actor("direct-parent", Utc::now())
+            .await
+            .unwrap();
+        assert!(fixture
+            .coordinator
+            .resolve_answer("direct-parent", fixture.question.id.as_str(), "A")
+            .await
+            .is_err());
+        let child = fixture
+            .store
+            .load_session("direct-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child.pending_question.is_some());
+        assert!(
+            ParentQuestionResolution::from_orphan_child(&child, &fixture.question.id).is_none(),
+            "retired parent must not commit an answer behind an error response"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_root_blocks_grandchild_question_at_deadline_after_restart() {
+        let fixture =
+            Fixture::with_nested_parent(Utc::now() - chrono::Duration::seconds(241)).await;
+        fixture
+            .store
+            .retire_actor("ancestor-root", Utc::now())
+            .await
+            .unwrap();
+        let restarted_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(fixture.home.path().into())
+                .await
+                .unwrap(),
+        );
+        let (restarted_inbox, restarted) = Fixture::runtime(&fixture.home, restarted_store.clone());
+        assert_eq!(
+            restarted.reconcile_child("direct-child").await.unwrap(),
+            ReconcileDisposition::Done
+        );
+        let grandchild = restarted_store
+            .load_session("direct-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(grandchild.pending_question.is_none());
+        assert_eq!(
+            grandchild
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("blocked_needs_input")
+        );
+        let parent = restarted_store
+            .load_session("direct-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request_envelope(&parent, &fixture.question.id).is_none());
+        assert!(restarted_inbox
+            .claim("direct-parent", 1)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_root_closes_committed_grandchild_answer_without_wake_after_restart() {
+        let fixture =
+            Fixture::with_nested_parent(Utc::now() - chrono::Duration::seconds(241)).await;
+        fixture.commit_answer_before_expired_deadline().await;
+        fixture
+            .store
+            .retire_actor("ancestor-root", Utc::now())
+            .await
+            .unwrap();
+        let restarted_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(fixture.home.path().into())
+                .await
+                .unwrap(),
+        );
+        let (restarted_inbox, restarted) = Fixture::runtime(&fixture.home, restarted_store.clone());
+        assert_eq!(
+            restarted.reconcile_child("direct-child").await.unwrap(),
+            ReconcileDisposition::Done
+        );
+        let grandchild = restarted_store
+            .load_session("direct-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(grandchild.pending_question.is_none());
+        assert_eq!(
+            grandchild
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("blocked_needs_input")
+        );
+        assert_eq!(
+            grandchild
+                .metadata
+                .get("runtime.parent_question.retired_at_deadline_v1")
+                .map(String::as_str),
+            Some(fixture.question.id.as_str())
+        );
+        assert!(matches!(
+            ParentQuestionResolution::from_orphan_child(&grandchild, &fixture.question.id)
+                .map(|resolution| resolution.outcome),
+            Some(ParentQuestionOutcome::Answer { .. })
+        ));
+        assert!(restarted_inbox
+            .claim("direct-child", 1)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

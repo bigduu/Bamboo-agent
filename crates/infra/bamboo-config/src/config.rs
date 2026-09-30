@@ -873,21 +873,39 @@ pub struct McpRoleAllowlistEntry {
     pub tools: Vec<String>,
 }
 
-/// Routes a single sub-agent role to a registry-scheduled worker (remote-actor-
-/// plan §3.4 / P2b, #181). A child whose `subagent_type` matches `role` is run on
-/// a LIVE worker chosen from the agent registry: the engine builds a
-/// `RegistryFabric` at `registry_url`, lists live workers (the registry already
-/// excludes expired leases), filters to those whose `role` == `pool`, picks one
-/// (round-robin), and connects over `wss://` (Bearer-authenticated). If no live
-/// worker exists the run ERRORS — a schedulable role NEVER falls back to a local
-/// subprocess (that would silently defeat the placement).
-///
-/// The bearer token is NEVER stored here in the clear: `token_env` names the
-/// environment variable that holds it (mirroring `RemoteActorPlacement` /
-/// the A2A `auth_ref` pattern), read once at runner-build time and used for BOTH
-/// the registry query AND the worker connect. A `token_env` that is set-but-unset
-/// at build time fails SAFE — the placement is skipped and the role falls back to
-/// Local rather than querying/connecting unauthenticated.
+/// Operator-owned hard constraints for a remote WorkerHost. The broker's
+/// authenticated peer policy advertises capacity; it does not choose the
+/// trust/data boundary for a Child. Missing requirements leave an explicitly
+/// selected remote placement unavailable rather than inferring authority from
+/// the worker's own capabilities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPlacementRequirements {
+    pub trust_zone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_zone: Option<String>,
+    #[serde(default)]
+    pub require_network_isolation: bool,
+    /// Operator-declared tools the selected Host must support. The runner adds
+    /// a native tool ceiling when one is bound to the Child.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub required_tools: std::collections::BTreeSet<String>,
+}
+
+/// The fixed parent identity used by a scoped broker pool. Every candidate
+/// WorkerHost is separately selected by its authenticated observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulableBrokerParent {
+    pub parent_mailbox: String,
+    pub parent_role: String,
+}
+
+/// Route a role to a capacity-managed WorkerHost pool through a scoped WSS
+/// broker. The operator supplies the parent identity and hard constraints;
+/// legacy entries remain readable but unavailable until migrated.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulablePlacement {
     /// Sub-agent role this targets (matches the child session's
@@ -895,9 +913,7 @@ pub struct SchedulablePlacement {
     pub role: String,
     /// Logical pool name — the registry `role` to query for live workers.
     pub pool: String,
-    /// VESTIGIAL (Phase 3 retired the HTTP agent registry — pools are now bus
-    /// roles resolved via broker presence). Kept for config back-compat; ignored
-    /// by the resolver. Optional so a placement is just `{role, pool}`.
+    /// Scoped WSS broker endpoint. The old HTTP registry was retired.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub registry_url: String,
     /// Env var holding the bearer token (NOT the raw token — mirrors A2A
@@ -905,10 +921,16 @@ pub struct SchedulablePlacement {
     /// `None` ⇒ query/connect without a bearer (trusted link only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
-    /// PEM file pinning a self-signed worker/registry cert. `None` ⇒ default
-    /// webpki roots.
+    /// PEM file pinning the scoped broker certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_file: Option<String>,
+    /// Required for authority-backed scheduling. `registry_url` is the scoped
+    /// WSS broker URL for this route; legacy entries remain readable but cannot
+    /// dispatch a Run without a trusted parent identity and requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_parent: Option<SchedulableBrokerParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_requirements: Option<OperatorPlacementRequirements>,
 }
 
 /// Pins a single sub-agent role to a remote resident worker (remote-actor-plan
@@ -941,6 +963,8 @@ pub struct RemoteActorPlacement {
     /// unavailable, never a direct parent-to-worker connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_peer: Option<RemoteBrokerPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_requirements: Option<OperatorPlacementRequirements>,
 }
 
 /// Operator-pinned transport identities; these do not grant Actor ownership.

@@ -255,10 +255,18 @@ impl<T> Drop for AbortOnDropTask<T> {
     }
 }
 
-struct ActorControlCommand {
-    to: String,
-    message: InboxMessage,
-    result: tokio::sync::oneshot::Sender<BrokerResult<MsgId>>,
+enum ActorControlCommand {
+    Deliver {
+        to: String,
+        message: InboxMessage,
+        result: tokio::sync::oneshot::Sender<BrokerResult<MsgId>>,
+    },
+    ObserveSelf {
+        mailbox: String,
+        role: String,
+        result:
+            tokio::sync::oneshot::Sender<BrokerResult<Option<crate::proto::WorkerHostObservation>>>,
+    },
 }
 
 enum ActorEventCommand {
@@ -338,7 +346,7 @@ impl ActorBrokerUplink {
     async fn deliver_control(&self, to: &str, message: InboxMessage) -> BrokerResult<MsgId> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.control
-            .send(ActorControlCommand {
+            .send(ActorControlCommand::Deliver {
                 to: to.to_string(),
                 message,
                 result: result_tx,
@@ -348,6 +356,34 @@ impl ActorBrokerUplink {
         result_rx
             .await
             .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))?
+    }
+
+    /// Check a queued Run again after its execution slot opens. The inbound
+    /// connection may have lost ownership while the handler waited in memory.
+    async fn fenced_run_is_current(
+        &self,
+        me: &AgentRef,
+        envelope: &FencedRunEnvelope,
+    ) -> BrokerResult<bool> {
+        let role = me
+            .role
+            .as_deref()
+            .ok_or_else(|| BrokerError::Protocol("FencedRun worker role missing".into()))?;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.control
+            .send(ActorControlCommand::ObserveSelf {
+                mailbox: me.session_id.clone(),
+                role: role.to_owned(),
+                result: result_tx,
+            })
+            .await
+            .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))?;
+        let observation = result_rx
+            .await
+            .map_err(|_| BrokerError::Transport("actor control uplink closed".into()))??;
+        Ok(observation
+            .as_ref()
+            .is_some_and(|current| envelope.matches_observation(&me.session_id, current)))
     }
 
     /// Send an ordered durable boundary on the actor-event connection. Outcome
@@ -436,9 +472,28 @@ async fn actor_control_uplink_loop(
     mut commands: tokio::sync::mpsc::Receiver<ActorControlCommand>,
 ) {
     while let Some(command) = commands.recv().await {
-        let result = client.deliver(&command.to, command.message).await;
-        let transport_failed = result.is_err() && !client.reader_alive();
-        let _ = command.result.send(result);
+        let transport_failed = match command {
+            ActorControlCommand::Deliver {
+                to,
+                message,
+                result,
+            } => {
+                let delivery = client.deliver(&to, message).await;
+                let failed = delivery.is_err() && !client.reader_alive();
+                let _ = result.send(delivery);
+                failed
+            }
+            ActorControlCommand::ObserveSelf {
+                mailbox,
+                role,
+                result,
+            } => {
+                let observation = client.observe_host(&mailbox, &role).await;
+                let failed = observation.is_err() && !client.reader_alive();
+                let _ = result.send(observation);
+                failed
+            }
+        };
         if transport_failed {
             break;
         }
@@ -702,11 +757,12 @@ where
                         tokio::time::Instant::now() + connection_drain_timeout,
                     );
                 } else if retire && !connection_lost {
-                    tracing::warn!(message_id = %id.as_str(), "critical actor uplink failed; retiring worker without Run ACK");
+                    tracing::warn!(message_id = %id.as_str(), "worker lost Run ownership or critical uplink; retiring without ACK");
                     messages_open = false;
                     connection_lost = true;
+                    owner_loss.cancel();
                     connection_failure = Some(BrokerError::Transport(
-                        "critical actor uplink failed; Run remains retryable".into(),
+                        "worker lost Run ownership or critical uplink; Run remains retryable".into(),
                     ));
                     for handler in inflight.values() {
                         handler.cancel.cancel();
@@ -773,6 +829,41 @@ where
                         idle_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + timeout);
+                    }
+                    // A Run may have reached this connection's reader queue
+                    // before another subscriber replaced it. The broker's
+                    // enqueue/replay fence alone cannot retract such a frame.
+                    // Ask the broker for the current authenticated generation
+                    // on this same connection immediately before admission.
+                    if msg.kind == InboxKind::FencedRun {
+                        let current = match (
+                            me.role.as_deref(),
+                            serde_json::from_value::<FencedRunEnvelope>(msg.body.clone()),
+                        ) {
+                            (Some(role), Ok(envelope)) => client
+                                .observe_host(&me.session_id, role)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|observation| {
+                                    envelope.matches_observation(&me.session_id, &observation)
+                                }),
+                            _ => false,
+                        };
+                        if !current {
+                            tracing::warn!(run_id = %msg.id.as_str(), "queued FencedRun no longer owns this WorkerHost connection; retaining it for broker recovery");
+                            messages_open = false;
+                            exit_reason = ServeExitReason::ConnectionClosed;
+                            connection_lost = true;
+                            owner_loss.cancel();
+                            for handler in inflight.values() {
+                                handler.cancel.cancel();
+                            }
+                            connection_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + connection_drain_timeout,
+                            );
+                            continue;
+                        }
                     }
                     let id = msg.id.clone();
                     if completed_admissions.contains(&id) {
@@ -1402,6 +1493,17 @@ where
             || envelope.recipient_role != me.role.as_deref().unwrap_or_default()
         {
             return reject_leased_run(me, &msg, uplink, "remote_fenced_runspec_invalid").await;
+        }
+        // The message can wait for an executor slot after the inbound reader
+        // checked it. A replacement during that wait invalidates the old
+        // connection even though its reader already queued this Run.
+        if !uplink
+            .fenced_run_is_current(me, &envelope)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::warn!(run_id = %msg.id.as_str(), "FencedRun lost WorkerHost ownership before executor admission");
+            return Handled::LeaveAndDisconnect;
         }
         envelope.run
     } else {
@@ -2398,8 +2500,23 @@ mod tests {
             let core = Arc::clone(core);
             tokio::spawn(async move {
                 while let Some(command) = control_rx.recv().await {
-                    let result = core.deliver(&command.to, &command.message).await;
-                    let _ = command.result.send(result);
+                    match command {
+                        ActorControlCommand::Deliver {
+                            to,
+                            message,
+                            result,
+                        } => {
+                            let _ = result.send(core.deliver(&to, &message).await);
+                        }
+                        ActorControlCommand::ObserveSelf {
+                            mailbox,
+                            role,
+                            result,
+                        } => {
+                            let _ = result
+                                .send(Ok(core.current_host_observation(&mailbox, &role).await));
+                        }
+                    }
                 }
             });
         }
@@ -2431,6 +2548,111 @@ mod tests {
             events,
             source: source.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn queued_fenced_run_fails_worker_admission_after_slot_wait_and_replacement() {
+        use crate::core::AuthenticatedHost;
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let me = AgentRef {
+            session_id: "worker".into(),
+            role: Some("worker".into()),
+        };
+        let host = || AuthenticatedHost {
+            host_ref: "worker-host".into(),
+            credential_expires_at: Utc::now() + chrono::Duration::minutes(5),
+            host_capabilities: None,
+            max_slots: None,
+        };
+        let (_first_streams, _first_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), host())
+            .await
+            .unwrap();
+        let first = core
+            .current_host_observation("worker", "worker")
+            .await
+            .unwrap();
+        let run: bamboo_subagent::RunSpec = serde_json::from_value(serde_json::json!({
+            "assignment":"queued work",
+            "logical_session":{
+                "session_id":"logical-child","parent_session_id":"logical-parent",
+                "root_session_id":"logical-root",
+                "creation":{"created_at":Utc::now(),"spawn_depth":1}
+            },
+            "activation_run_id":"activation-1","execution_epoch":1,
+            "permission_policy":{
+                "revision":1,"bypass_permissions":false,
+                "session_id":"logical-child","policy":{},
+                "environment_lease":{
+                    "version":1,"actor_id":"logical-child",
+                    "activation_run_id":"activation-1","execution_epoch":1,
+                    "admit_before":Utc::now()+chrono::Duration::minutes(2),
+                    "git_commit":"a".repeat(40),"content_sha256":"b".repeat(64),
+                    "workspace_relpath":"."
+                }
+            }
+        }))
+        .unwrap();
+        let envelope = FencedRunEnvelope::for_observation(run, &first).unwrap();
+        let outcomes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uplink = test_run_uplink(&me, &core, None, &outcomes);
+        assert!(uplink.fenced_run_is_current(&me, &envelope).await.unwrap());
+
+        // The worker's handler can sit behind its execution-slot semaphore.
+        // When it eventually admits the queued Run, the old generation fails.
+        let (_successor_streams, _successor_lease) = core
+            .subscribe_scoped_environment_lease_v1("worker", Some("worker"), host())
+            .await
+            .unwrap();
+        assert!(!uplink.fenced_run_is_current(&me, &envelope).await.unwrap());
+
+        struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl bamboo_subagent::ChildExecutor for Probe {
+            async fn run(
+                &self,
+                _spec: bamboo_subagent::RunSpec,
+                _events: bamboo_subagent::EventSink,
+                _steer: bamboo_subagent::SteerInbox,
+                _cancel: CancellationToken,
+            ) -> bamboo_subagent::ChildOutcome {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bamboo_subagent::ChildOutcome::completed("should not execute")
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let message = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "parent".into(),
+                role: Some("host".into()),
+            },
+            kind: InboxKind::FencedRun,
+            body: serde_json::to_value(envelope).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        let handled = handle_run(
+            &Probe(Arc::clone(&calls)),
+            &me,
+            message,
+            CancellationToken::new(),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &uplink,
+            Duration::from_secs(1),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            true,
+        )
+        .await;
+        assert!(matches!(handled, Handled::LeaveAndDisconnect));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     async fn serve_retry_run<E>(

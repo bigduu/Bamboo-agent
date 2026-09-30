@@ -3,7 +3,7 @@
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_broker::{client_config_trusting_cert, BrokerClient};
-use bamboo_domain::Session;
+use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, Session};
 use bamboo_storage::SessionStoreV2;
 use bamboo_subagent::{
     provision::{ChildIdentity, ExecutorSpec, ModelRefSpec, ScopedCredential},
@@ -544,7 +544,11 @@ async fn fixture() {
     let policy = json!({"peers":[{"credential":HOST,"mailbox":"remote-parent","role":"host","host":"host-node","expires_at":expiry,
         "destinations":[{"mailbox":"remote-worker","kinds":["fenced_run","steer"]}],"cancel":["remote-worker"],"presence":["worker"]},
         {"credential":WORKER,"mailbox":"remote-worker","role":"worker","host":"worker-node","expires_at":expiry,
-        "destinations":[{"mailbox":"remote-parent","kinds":["event","outcome","session_message_admitted","approval_request"]}]},
+        "destinations":[{"mailbox":"remote-parent","kinds":["event","outcome","session_message_admitted","approval_request"]}],
+        "max_slots":1,
+        "host_capabilities":{"placement_class":"remote","project_ids":[],"allow_unscoped_project":true,
+            "trust_zone":"trusted","workspace_labels":["clean-git"],"executors":["bamboo-runtime"],
+            "tools":[],"network_zones":["internal"],"network_isolation":true}},
         {"credential":OBSERVER,"mailbox":"remote-observer","role":"observer","host":"observer-node","expires_at":expiry,
         "destinations":[],"presence":["worker"]}]});
     let mut c = command(&data);
@@ -716,7 +720,8 @@ async fn fixture() {
     let config = json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":provider,"model":"remote-root"}},
         "defaults":{"chat":{"provider":"openai","model":"remote-root"},"subagent_models":{"worker":{"provider":"openai","model":"remote-child"}}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":2,"remote_placements":[{"role":ROLE,"endpoint":url,
-            "token_env":"BAMBOO_REMOTE_HOST_TOKEN","ca_cert_file":cert,"broker_peer":{"parent_mailbox":"remote-parent","parent_role":"host","worker_mailbox":"remote-worker","worker_role":"worker"}}]}});
+            "token_env":"BAMBOO_REMOTE_HOST_TOKEN","ca_cert_file":cert,"broker_peer":{"parent_mailbox":"remote-parent","parent_role":"host","worker_mailbox":"remote-worker","worker_role":"worker"},
+            "placement_requirements":{"trust_zone":"trusted","workspace_label":"clean-git","network_zone":"internal","require_network_isolation":true}}]}});
     // Initialize provider/defaults once; restarts update only the selected route.
     {
         let mut candidate =
@@ -913,6 +918,27 @@ async fn fixture() {
     wait_runs_settled(&data).await;
     resident.stop();
     assert!(h.0.try_wait().unwrap().is_some() && resident.0.try_wait().unwrap().is_some());
+    // SIGKILL left no Host-validated terminal checkpoint. The Worker's old
+    // broker Outcome is still queued, but cannot alone retire the Actor fence.
+    // Use the recorded lease deadline for safe cold takeover; the new link
+    // must still ignore the stale Event/Outcome frames from that old Run.
+    let orphaned = SessionStoreV2::new(data.to_path_buf())
+        .await
+        .unwrap()
+        .inspect_actor(&child_id)
+        .await
+        .unwrap()
+        .activation
+        .expect("old Actor activation after Host SIGKILL");
+    assert_eq!(orphaned.status, ActorActivationStatus::Running);
+    let remaining = (orphaned.lease_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    assert!(
+        remaining <= Duration::from_secs(90),
+        "unexpectedly long orphaned Actor lease: {remaining:?}"
+    );
+    tokio::time::sleep(remaining + Duration::from_millis(200)).await;
     resident = worker(&data, &replacement_spec, &url, &cert, "cold");
     let (mut h, base) = host(&data, &config, "cold").await;
     turn(&client, &base, &p, 1, 0).await;

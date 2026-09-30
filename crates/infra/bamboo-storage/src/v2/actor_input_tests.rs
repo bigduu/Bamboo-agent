@@ -234,6 +234,104 @@ fn release_locks(f: &Fixture) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[tokio::test]
+async fn unowned_actor_claim_seed_then_confirmation_preserves_cursor_and_ack_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+    let parent = Session::new("seed-parent", "model");
+    let mut child = Session::new_child_of("seed-child", &parent, "model", "task");
+    child.add_message(Message::user("initial task"));
+    store.save_session(&parent).await.unwrap();
+    store.save_session(&child).await.unwrap();
+    store.ensure_actor(&child.id).await.unwrap();
+    let inbox = crate::FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
+    let envelope = SessionMessageEnvelope::user_input(&child.id, "warm correction");
+    let receipt = inbox.deliver(&envelope).await.unwrap();
+    inbox
+        .mark_activation_eligible(
+            &child.id,
+            receipt.generation,
+            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+        )
+        .await
+        .unwrap();
+    let claim = inbox
+        .claim_for_turn(&child.id, 1, Some("warm-run"))
+        .await
+        .unwrap()
+        .remove(0);
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&ActorActivationClaim {
+            actor_id: child.id.clone(),
+            run_id: "warm-run".into(),
+            lease_owner: "remote-host".into(),
+            lease_expires_at: now + LeaseDuration::seconds(80),
+            inbox_generation: 0,
+            placement_ref: Some(bamboo_domain::ActorPlacementRef {
+                class: bamboo_domain::ActorPlacementClass::Remote,
+                lease_id: "slot-1".into(),
+                slot_epoch: Some(1),
+            }),
+            now,
+        })
+        .await
+        .unwrap();
+    let fence = activation.fence();
+    store.start_activation(&fence, now).await.unwrap();
+    let request = |session: &Session| ActorClaimContextSeed {
+        fence: fence.clone(),
+        expected_created_at: session.created_at,
+        expected_messages: session.messages.clone(),
+        expected_provider_transcript: session.provider_transcript.clone(),
+        expected_admission: session.session_inbox_admission().cloned(),
+        claims: vec![claim.clone()],
+    };
+
+    let mut unfenced = child.clone();
+    unfenced.add_message(envelope.to_provider_message().unwrap());
+    assert!(store.save_session(&unfenced).await.is_err());
+    let seeded = store
+        .seed_actor_claim_context(inbox.clone(), request(&child))
+        .await
+        .unwrap();
+    assert_eq!(seeded.messages.len(), child.messages.len() + 1);
+    assert!(seeded
+        .messages
+        .iter()
+        .any(|message| bamboo_domain::is_matching_session_message(message, &envelope)));
+    assert!(!seeded
+        .session_inbox_admission()
+        .is_some_and(|cursor| cursor.contains(&envelope.id)));
+    assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    assert_eq!(inbox.inspect(&child.id).await.unwrap().claimed, 1);
+
+    let confirmed = store
+        .confirm_actor_claim_context(inbox.clone(), request(&seeded))
+        .await
+        .unwrap();
+    assert!(confirmed
+        .session_inbox_admission()
+        .is_some_and(|cursor| cursor.contains(&envelope.id)));
+    assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    inbox.ack(&child.id, &claim).await.unwrap();
+    assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
+    store
+        .finish_activation(&fence, Utc::now(), ActorActivationFinish::Succeeded)
+        .await
+        .unwrap();
+    let reopened = SessionStoreV2::new(temp.path().into()).await.unwrap();
+    let durable = reopened.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(durable.messages.len(), 2);
+    assert!(durable
+        .session_inbox_admission()
+        .is_some_and(|cursor| cursor.contains(&envelope.id)));
+    assert!(reopened
+        .confirm_actor_claim_context(inbox, request(&durable))
+        .await
+        .is_err());
+}
 fn held(f: &Fixture) {
     for path in lock_paths(f) {
         let file = std::fs::OpenOptions::new()
