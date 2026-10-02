@@ -82,6 +82,38 @@ pub struct TicketView {
     pub assignments: Vec<Assignment>,
     pub requests: Vec<PendingRequest>,
     pub submissions: Vec<Submission>,
+    #[serde(default = "all_inspect_sections")]
+    pub sections: BTreeSet<InspectSection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectSection {
+    Assignments,
+    Requests,
+    Submissions,
+}
+
+pub fn all_inspect_sections() -> BTreeSet<InspectSection> {
+    BTreeSet::from([
+        InspectSection::Assignments,
+        InspectSection::Requests,
+        InspectSection::Submissions,
+    ])
+}
+
+pub struct InspectOptions {
+    pub sections: BTreeSet<InspectSection>,
+    pub depth: usize,
+    pub budget_bytes: usize,
+    pub fixed_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextArtifact {
+    pub source: DependencyInput,
+    pub artifact: Artifact,
+    pub utf8: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +125,8 @@ pub struct WorkContextPacket {
     pub binding: ScopeBinding,
     pub contract: Contract,
     pub inputs: Vec<DependencyInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifacts: Vec<ContextArtifact>,
     pub result_contract: String,
 }
 
@@ -285,6 +319,31 @@ impl TicketService {
         budget_bytes: usize,
         fixed_commit: Option<&str>,
     ) -> Result<ReadEnvelope<Vec<TicketView>>> {
+        self.work_inspect_sections(
+            authority,
+            ids,
+            &InspectOptions {
+                sections: all_inspect_sections(),
+                depth,
+                budget_bytes,
+                fixed_commit: fixed_commit.map(str::to_owned),
+            },
+        )
+    }
+
+    /// Ticket/contract is always present. The response declares selected
+    /// sections so an omitted request/attempt history cannot look empty.
+    pub fn work_inspect_sections(
+        &self,
+        authority: &Authority,
+        ids: &[String],
+        options: &InspectOptions,
+    ) -> Result<ReadEnvelope<Vec<TicketView>>> {
+        let (depth, budget_bytes, fixed_commit) = (
+            options.depth,
+            options.budget_bytes,
+            options.fixed_commit.as_deref(),
+        );
         if ids.len() > 32 || depth > 4 || !(128..=65536).contains(&budget_bytes) {
             return Err(Error::InvalidTransition(
                 "inspect <=32 IDs, depth<=4, budget 128..65536".into(),
@@ -315,20 +374,29 @@ impl TicketService {
             let assignments = snapshot
                 .assignments
                 .values()
-                .filter(|a| a.work_id == id && can_read_private(authority, &a.id))
+                .filter(|a| {
+                    options.sections.contains(&InspectSection::Assignments)
+                        && a.work_id == id
+                        && can_read_private(authority, &a.id)
+                })
                 .cloned()
                 .collect();
             let requests = snapshot
                 .requests
                 .values()
-                .filter(|r| r.work_id == id && can_read_work_private(authority, &snapshot, &id))
+                .filter(|r| {
+                    options.sections.contains(&InspectSection::Requests)
+                        && r.work_id == id
+                        && can_read_work_private(authority, &snapshot, &id)
+                })
                 .cloned()
                 .collect();
             let submissions = snapshot
                 .submissions
                 .values()
                 .filter(|s| {
-                    s.work_id == id
+                    options.sections.contains(&InspectSection::Submissions)
+                        && s.work_id == id
                         && (can_read_private(authority, &s.assignment_id)
                             || ticket.accepted_submission.as_deref() == Some(&s.id))
                 })
@@ -344,6 +412,7 @@ impl TicketService {
                 assignments,
                 requests,
                 submissions,
+                sections: options.sections.clone(),
             });
         }
         if canonical_bytes(&data)?.len() > budget_bytes {
@@ -452,11 +521,62 @@ impl TicketService {
             return Err(Error::ScopeDenied("sibling context denied".into()));
         }
         let work = &snapshot.tickets[&assignment.work_id];
-        if work.contract_revision != assignment.contract_revision {
+        if work.contract_revision != assignment.contract_revision
+            || work.generation != assignment.generation
+            || work.state != WorkState::Active
+            || work.active_assignment.as_deref() != Some(assignment_id)
+            || assignment.dependency_inputs.iter().any(|i| {
+                snapshot.tickets.get(&i.work_id).is_none_or(|upstream| {
+                    upstream.state != WorkState::Accepted
+                        || upstream.accepted_submission.as_deref() != Some(i.submission_id.as_str())
+                        || upstream.contract_revision != i.contract_revision
+                })
+            })
+        {
             return Err(Error::RevisionConflict);
+        }
+        if !(128..=65536).contains(&budget_bytes) {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        let mut input_artifacts = Vec::new();
+        let mut input_bytes = 0usize;
+        for input in &assignment.dependency_inputs {
+            let submission = snapshot
+                .submissions
+                .get(&input.submission_id)
+                .ok_or(Error::RevisionConflict)?;
+            if submission.work_id != input.work_id
+                || submission.contract_revision != input.contract_revision
+                || submission
+                    .artifacts
+                    .iter()
+                    .map(|a| a.sha256.clone())
+                    .collect::<Vec<_>>()
+                    != input.artifact_hashes
+            {
+                return Err(Error::RevisionConflict);
+            }
+            for artifact in &submission.artifacts {
+                let bytes = self.read_artifact(authority, artifact, budget_bytes)?;
+                input_bytes = input_bytes.saturating_add(bytes.len());
+                if input_bytes > budget_bytes {
+                    return Err(Error::ContextBudgetExceeded);
+                }
+                let utf8 = String::from_utf8(bytes).map_err(|_| {
+                    Error::AuthorityUnavailable(
+                        "input Artifact requires a supported lossless UTF-8 resolver".into(),
+                    )
+                })?;
+                input_artifacts.push(ContextArtifact {
+                    source: input.clone(),
+                    artifact: artifact.clone(),
+                    utf8,
+                });
+            }
         }
         let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
             assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
+            input_artifacts,
             result_contract:"Submit exact assignment/generation/contract/input versions, artifact hashes and evidence. Completion means submitted.".into() };
         if canonical_bytes(&packet)?.len() > budget_bytes {
             return Err(Error::ContextBudgetExceeded);
@@ -484,6 +604,8 @@ impl TicketService {
                 Operation::Start { .. }
                     | Operation::UpdateContract { .. }
                     | Operation::Cancel { .. }
+                    | Operation::Pause { .. }
+                    | Operation::Ready { .. }
                     | Operation::Reopen { .. }
             )
         }) {

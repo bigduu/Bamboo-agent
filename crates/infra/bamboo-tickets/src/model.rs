@@ -52,6 +52,9 @@ pub struct Ticket {
     pub contract: Contract,
     pub state: WorkState,
     pub blocked: Option<BlockReason>,
+    /// Explicit user pause survives stop confirmation until an explicit resume.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     pub archived: bool,
     pub active_assignment: Option<String>,
     pub current_submission: Option<String>,
@@ -445,6 +448,10 @@ pub enum Operation {
     },
     Cancel {
         work_id: String,
+    },
+    Pause {
+        work_id: String,
+        reason: String,
     },
     ConfirmStopped {
         assignment_id: String,

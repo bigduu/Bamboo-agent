@@ -349,3 +349,215 @@ fn measure_full_manifest_write_amplification_at_bounded_fixture_sizes() {
         );
     }
 }
+
+#[test]
+fn inspect_sections_declare_omissions_and_legacy_inspect_keeps_all_sections() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "sections");
+    start(&service, &work, "start-sections");
+    execute(
+        &service,
+        "question",
+        vec![Operation::Ask {
+            work_id: work.clone(),
+            temp_id: "request".into(),
+            prompt: "A precise question".into(),
+            action: None,
+        }],
+    );
+    let read = service
+        .work_inspect_sections(
+            &supervisor(),
+            std::slice::from_ref(&work),
+            &InspectOptions {
+                sections: BTreeSet::from([InspectSection::Requests]),
+                depth: 0,
+                budget_bytes: 65536,
+                fixed_commit: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(read.data[0].requests.len(), 1);
+    assert!(read.data[0].assignments.is_empty());
+    assert_eq!(
+        read.data[0].sections,
+        BTreeSet::from([InspectSection::Requests])
+    );
+    let all = service
+        .work_inspect(&supervisor(), &[work], 0, 65536, None)
+        .unwrap();
+    assert_eq!(all.data[0].assignments.len(), 1);
+    assert_eq!(all.data[0].sections, all_inspect_sections());
+}
+
+#[test]
+fn accepted_dependency_context_has_complete_verified_bytes_or_refuses_dispatch_packet() {
+    for bytes in [
+        "完整 accepted result\nwith exact quotes: \"x\"".as_bytes(),
+        &[0xff, 0x00][..],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let service = TicketService::open(root.path(), binding()).unwrap();
+        let upstream = create(&service, "upstream");
+        let (attempt, worker) = start(&service, &upstream, "start-upstream");
+        let runtime = Authority::from_verified_host(binding(), Principal::Runtime);
+        let artifact = service.store_artifact(&runtime, bytes).unwrap();
+        let submitted = service
+            .prepare_command(
+                &worker,
+                "submit-input",
+                vec![Operation::Submit {
+                    assignment_id: attempt,
+                    temp_id: "submission".into(),
+                    artifacts: vec![artifact.clone()],
+                    evidence: vec!["verified".into()],
+                }],
+            )
+            .unwrap();
+        let submission = service.execute(&worker, &submitted).unwrap().ids["submission"].clone();
+        let saved = service.published().unwrap().1.submissions[&submission].clone();
+        service
+            .execute(
+                &runtime,
+                &service
+                    .prepare_command(
+                        &runtime,
+                        "input-owned-stop",
+                        vec![Operation::RuntimeStopped {
+                            assignment_id: saved.assignment_id,
+                            receipt: saved.runtime,
+                            completed: true,
+                        }],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let user = Authority::from_verified_host(
+            binding(),
+            Principal::User {
+                user_id: "human".into(),
+            },
+        );
+        service
+            .execute(
+                &user,
+                &service
+                    .prepare_command(
+                        &user,
+                        "accept-input",
+                        vec![Operation::Accept {
+                            work_id: upstream.clone(),
+                            submission_id: submission.clone(),
+                            evidence: vec!["User reviewed input".into()],
+                        }],
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let downstream = create(&service, "downstream");
+        execute(
+            &service,
+            "dependency",
+            vec![Operation::SetDependencies {
+                work_id: downstream.clone(),
+                depends_on: BTreeSet::from([upstream.clone()]),
+            }],
+        );
+        let (assignment, worker) = start(&service, &downstream, "start-downstream");
+        match service.child_context_packet(&worker, &assignment, 65536) {
+            Ok(packet) => {
+                assert!(std::str::from_utf8(bytes).is_ok());
+                assert_eq!(packet.input_artifacts.len(), 1);
+                let input = &packet.input_artifacts[0];
+                assert_eq!(input.utf8.as_bytes(), bytes);
+                assert_eq!(input.source.work_id, upstream);
+                assert_eq!(input.source.submission_id, submission);
+                assert_eq!(input.source.contract_revision, 1);
+                assert_eq!(input.artifact, artifact);
+                let budget = canonical_bytes(&packet).unwrap().len() - 1;
+                assert!(matches!(
+                    service.child_context_packet(&worker, &assignment, budget),
+                    Err(Error::ContextBudgetExceeded)
+                ));
+                let original_contract = service.published().unwrap().1.tickets[&downstream]
+                    .contract
+                    .clone();
+                execute(
+                    &service,
+                    "revoke-upstream",
+                    vec![Operation::Reopen { work_id: upstream }],
+                );
+                assert!(service
+                    .child_context_packet(&worker, &assignment, 65536)
+                    .is_err());
+                assert_eq!(
+                    service.published().unwrap().1.tickets[&downstream].contract,
+                    original_contract
+                );
+            }
+            Err(Error::AuthorityUnavailable(_)) => assert!(std::str::from_utf8(bytes).is_err()),
+            other => panic!("unexpected input resolution: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn external_artifact_without_trusted_resolver_cannot_become_worker_context() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let upstream = create(&service, "external");
+    let (attempt, worker) = start(&service, &upstream, "external-start");
+    let request = service
+        .prepare_command(
+            &worker,
+            "external-submit",
+            vec![Operation::Submit {
+                assignment_id: attempt,
+                temp_id: "s".into(),
+                artifacts: vec![Artifact {
+                    uri: "artifact://external.txt".into(),
+                    sha256: content_hash(b"external"),
+                }],
+                evidence: vec!["external fixture".into()],
+            }],
+        )
+        .unwrap();
+    let submission = service.execute(&worker, &request).unwrap().ids["s"].clone();
+    let user = Authority::from_verified_host(
+        binding(),
+        Principal::User {
+            user_id: "human".into(),
+        },
+    );
+    service
+        .execute(
+            &user,
+            &service
+                .prepare_command(
+                    &user,
+                    "external-accept",
+                    vec![Operation::Accept {
+                        work_id: upstream.clone(),
+                        submission_id: submission,
+                        evidence: vec!["fixture acceptance".into()],
+                    }],
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    let downstream = create(&service, "consumer");
+    execute(
+        &service,
+        "external-dep",
+        vec![Operation::SetDependencies {
+            work_id: downstream.clone(),
+            depends_on: BTreeSet::from([upstream]),
+        }],
+    );
+    let (attempt, worker) = start(&service, &downstream, "consumer-start");
+    assert!(matches!(
+        service.child_context_packet(&worker, &attempt, 65536),
+        Err(Error::AuthorityUnavailable(_))
+    ));
+}

@@ -28,8 +28,9 @@ pub fn parameters(name: &str) -> Value {
         ),
         "work_inspect" => object(
             json!({"ids":ids,"depth":{"type":"integer","minimum":0,"maximum":4},
+            "sections":{"type":"array","uniqueItems":true,"maxItems":3,"items":{"type":"string","enum":["assignments","requests","submissions"]}},
             "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id}),
-            &["ids", "depth", "budget_bytes", "fixed_commit"],
+            &["ids", "sections", "depth", "budget_bytes", "fixed_commit"],
         ),
         "work_changes" => object(
             json!({"since_seq":{"type":"integer","minimum":0},"limit":limit,"cursor":cursor}),
@@ -65,6 +66,12 @@ pub fn parameters(name: &str) -> Value {
                     ),
                     update,
                     operation("cancel", json!({"work_id":id}), &["work_id"]),
+                    operation(
+                        "pause",
+                        json!({"work_id":id,"reason":id}),
+                        &["work_id", "reason"],
+                    ),
+                    operation("ready", json!({"work_id":id}), &["work_id"]),
                     reopen,
                 ]
             } else {

@@ -434,3 +434,34 @@ the existing engine/storage/server warnings and no unrelated lint repairs.
 P6 is not fully accepted yet: complete accepted artifact input bytes,
 inspect section selection, pause and safe explicit retry remain in the next
 focused local slice. P7/P8/P9 and default-enable gates remain outstanding.
+
+### Local slice 14: complete dependency context and execution controls
+
+Worktree `bamboo-1481-context-controls`, branch
+`bamboo/feat/1481-context-controls`, based on `603c38d3`.
+The Child packet now carries every accepted managed UTF-8 Artifact's complete
+bytes, content hash and exact source Work/submission/contract revisions.
+The current generation, contract and accepted inputs are revalidated. The
+whole encoded packet must fit 64 KiB: hard inputs are never truncated; missing,
+external-without-resolver, corrupt and unsupported binary inputs fail closed.
+Empty optional packet fields preserve canonical historical fingerprints.
+`work_inspect` accepts declared history sections; omitted sections cannot be
+mistaken for an empty authoritative history. Legacy requests select all.
+
+Explicit pause commits blocked state and revokes execution before requesting
+Runtime interruption. Confirmed stop releases a clean attempt, while pause
+remains until explicit ready/reopen. Substantial contract steering interrupts
+the old run. Reopen can detach only an owned-process-confirmed stopped attempt
+with reconciled effects; lease expiry and unknown effects cannot authorize
+retry. Cancellation/steering preserve an already unknown disposition.
+
+PASS: service 37 tests (1 storage unit, 9 bounded queries, 5 file authority,
+22 command contracts); native plan bridge 5; server Ticket integration 8;
+Ticket all-target Clippy with `-D warnings`. The actual Host/native controlled
+provider tests pass 3/3 in 19.93s: pause/stop/fresh-generation resume,
+steer/stop/explicit retry, and accepted input bytes reaching a downstream model
+request twice. Full immutable history remains verified by the publication
+fault tests. No general continuation, shell access or effect-exactly-once claim.
+Server Clippy passes in 55.97s with the existing engine/storage/server
+warnings. P6's local bounded query/context/control gate is accepted;
+P7/P8/P9 remain.

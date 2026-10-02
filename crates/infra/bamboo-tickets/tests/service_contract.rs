@@ -1196,6 +1196,19 @@ fn stopped_process_does_not_release_an_unknown_external_effect() {
         snapshot.assignments[&id].state,
         AssignmentState::OutcomeUnknown
     );
+    assert!(matches!(
+        service.execute(
+            &user(),
+            &command(
+                &service,
+                "unsafe-retry",
+                vec![Operation::Reopen {
+                    work_id: snapshot.assignments[&id].work_id.clone(),
+                }]
+            )
+        ),
+        Err(Error::ResourceBlocked(_))
+    ));
     assert!(service
         .execute(
             &runtime(),
@@ -1351,5 +1364,133 @@ fn goal_requires_its_own_acceptance_evidence() {
     assert_eq!(
         service.published().unwrap().1.tickets[&parent.ids["parent"]].state,
         WorkState::Blocked
+    );
+}
+
+#[test]
+fn pause_stays_blocked_after_owned_stop_and_resumes_only_explicitly() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "pause", BTreeSet::new());
+    let (old, worker) = start(&service, &work, "start-pause");
+    let receipt = service.published().unwrap().1.assignments[&old]
+        .runtime
+        .clone()
+        .unwrap();
+    execute(
+        &service,
+        &user(),
+        "pause",
+        vec![Operation::Pause {
+            work_id: work.clone(),
+            reason: "User postponed this work".into(),
+        }],
+    );
+    assert!(service.authorize_tool(&worker, "Task").is_err());
+    assert!(matches!(
+        service.execute(
+            &user(),
+            &command(
+                &service,
+                "too-early",
+                vec![Operation::Reopen {
+                    work_id: work.clone()
+                }]
+            )
+        ),
+        Err(Error::ResourceBlocked(_))
+    ));
+    assert!(service
+        .execute(
+            &user(),
+            &command(
+                &service,
+                "too-early-ready",
+                vec![Operation::Ready {
+                    work_id: work.clone()
+                }]
+            )
+        )
+        .is_err());
+    execute(
+        &service,
+        &runtime(),
+        "owned-stop",
+        vec![Operation::RuntimeStopped {
+            assignment_id: old.clone(),
+            receipt,
+            completed: false,
+        }],
+    );
+    let state = service.published().unwrap().1;
+    assert!(state.tickets[&work].paused);
+    assert_eq!(state.tickets[&work].state, WorkState::Blocked);
+    assert!(state.tickets[&work].active_assignment.is_none());
+    drop(service);
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    assert!(service.published().unwrap().1.tickets[&work].paused);
+    execute(
+        &service,
+        &user(),
+        "resume",
+        vec![Operation::Ready {
+            work_id: work.clone(),
+        }],
+    );
+    let next = execute(
+        &service,
+        &user(),
+        "fresh-start",
+        vec![Operation::Start {
+            work_id: work.clone(),
+            temp_id: "next".into(),
+            workspace: None,
+        }],
+    )
+    .ids["next"]
+        .clone();
+    let late = submit(&service, &old, &worker, "late-old");
+    let state = service.published().unwrap().1;
+    assert_eq!(state.assignments[&next].generation, 2);
+    assert!(state.submissions[&late].stale);
+    assert_eq!(
+        state.tickets[&work].active_assignment.as_deref(),
+        Some(next.as_str())
+    );
+    assert!(state.tickets[&work].current_submission.is_none());
+}
+
+#[test]
+fn explicit_retry_after_owned_failed_stop_creates_fresh_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "retry", BTreeSet::new());
+    let (old, _) = start(&service, &work, "start-retry");
+    let receipt = service.published().unwrap().1.assignments[&old]
+        .runtime
+        .clone()
+        .unwrap();
+    execute(
+        &service,
+        &runtime(),
+        "failed-stop",
+        vec![Operation::RuntimeStopped {
+            assignment_id: old,
+            receipt,
+            completed: false,
+        }],
+    );
+    execute(
+        &service,
+        &user(),
+        "explicit-retry",
+        vec![Operation::Reopen {
+            work_id: work.clone(),
+        }],
+    );
+    let (next, _) = start(&service, &work, "next-retry");
+    assert_eq!(
+        service.published().unwrap().1.assignments[&next].generation,
+        2
     );
 }

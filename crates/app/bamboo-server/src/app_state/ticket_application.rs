@@ -255,7 +255,9 @@ impl TicketApplication {
             return;
         };
         for work in command.operations.iter().filter_map(|op| match op {
-            Operation::Cancel { work_id } => Some(work_id),
+            Operation::Cancel { work_id }
+            | Operation::Pause { work_id, .. }
+            | Operation::UpdateContract { work_id, .. } => Some(work_id),
             _ => None,
         }) {
             let Some(assignment_id) = snapshot
@@ -266,6 +268,14 @@ impl TicketApplication {
                 continue;
             };
             let assignment = snapshot.assignments[assignment_id].clone();
+            if assignment.process_stopped
+                || !matches!(
+                    assignment.state,
+                    AssignmentState::Cancelling | AssignmentState::OutcomeUnknown
+                )
+            {
+                continue;
+            }
             let service = service.clone();
             let adapter = adapter.clone();
             tokio::spawn(async move {

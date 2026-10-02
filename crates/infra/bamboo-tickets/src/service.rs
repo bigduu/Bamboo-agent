@@ -711,6 +711,7 @@ fn apply(
                     contract: contract.clone(),
                     state: WorkState::Draft,
                     blocked: None,
+                    paused: false,
                     archived: false,
                     active_assignment: None,
                     current_submission: None,
@@ -728,10 +729,13 @@ fn apply(
                 .tickets
                 .get_mut(&id)
                 .ok_or_else(|| invalid("ticket not found"))?;
-            if work.state != WorkState::Draft {
-                return Err(invalid("ready requires draft"));
+            if work.state != WorkState::Draft && !(work.paused && work.active_assignment.is_none())
+            {
+                return Err(invalid("ready requires draft or a stopped explicit pause"));
             }
             work.state = WorkState::Ready;
+            work.paused = false;
+            work.blocked = None;
             touch(work, seq);
         }
         UpdateContract { work_id, contract } => {
@@ -750,7 +754,9 @@ fn apply(
                     .assignments
                     .get_mut(id)
                     .ok_or_else(|| invalid("assignment missing"))?;
-                a.state = AssignmentState::Cancelling;
+                if a.state != AssignmentState::OutcomeUnknown {
+                    a.state = AssignmentState::Cancelling;
+                }
                 a.record_revision += 1;
                 a.updated_seq = seq;
             }
@@ -759,14 +765,20 @@ fn apply(
             work.contract_revision += 1;
             work.accepted_submission = None;
             work.current_submission = None;
-            if old.active_assignment.is_some() {
+            if old.active_assignment.is_some() || old.paused {
                 work.state = WorkState::Blocked;
                 work.blocked = Some(BlockReason {
-                    reason: "contract changed; waiting for old run to stop".into(),
+                    reason: if old.paused {
+                        "explicitly paused; contract changed"
+                    } else {
+                        "contract changed; waiting for old run to stop"
+                    }
+                    .into(),
                     resume_state: WorkState::Ready,
                 });
             } else {
                 work.state = WorkState::Ready;
+                work.blocked = None;
             }
             touch(work, seq);
             invalidate_requests(snapshot, &work_id);
@@ -1309,17 +1321,53 @@ fn apply(
                 .get_mut(work_id)
                 .ok_or_else(|| invalid("work missing"))?;
             work.state = WorkState::Cancelled;
+            work.paused = false;
+            work.blocked = None;
             work.accepted_submission = None;
             touch(work, seq);
             if let Some(id) = &work.active_assignment {
                 let a = snapshot.assignments.get_mut(id).expect("assignment");
-                a.state = AssignmentState::Cancelling;
+                if a.state != AssignmentState::OutcomeUnknown {
+                    a.state = AssignmentState::Cancelling;
+                }
                 a.record_revision += 1;
                 a.updated_seq = seq;
             }
             invalidate_requests(snapshot, work_id);
             invalidate_dependents(snapshot, work_id);
             invalidate_parent_goals(snapshot, work_id);
+        }
+        Pause { work_id, reason } => {
+            authority.supervisor()?;
+            let old = ticket(snapshot, work_id)?.clone();
+            if old.kind != TicketKind::Work
+                || reason.trim().is_empty()
+                || !matches!(
+                    old.state,
+                    WorkState::Draft | WorkState::Ready | WorkState::Active | WorkState::Blocked
+                )
+            {
+                return Err(invalid("pause requires unfinished Work and a reason"));
+            }
+            if let Some(id) = &old.active_assignment {
+                let a = snapshot.assignments.get_mut(id).expect("assignment");
+                if !a.process_stopped {
+                    if a.state != AssignmentState::OutcomeUnknown {
+                        a.state = AssignmentState::Cancelling;
+                    }
+                    a.record_revision += 1;
+                    a.updated_seq = seq;
+                }
+            }
+            let work = snapshot.tickets.get_mut(work_id).expect("work");
+            work.paused = true;
+            work.state = WorkState::Blocked;
+            work.blocked = Some(BlockReason {
+                reason: reason.clone(),
+                resume_state: WorkState::Ready,
+            });
+            touch(work, seq);
+            invalidate_requests(snapshot, work_id);
         }
         ConfirmStopped {
             assignment_id,
@@ -1359,6 +1407,7 @@ fn apply(
             if work.active_assignment.as_deref() == Some(assignment_id) {
                 work.active_assignment = None;
                 if work.state == WorkState::Blocked
+                    && !work.paused
                     && work
                         .blocked
                         .as_ref()
@@ -1406,7 +1455,7 @@ fn apply(
             let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
             // A late stopped run affects its own attempt only.
             if work.active_assignment.as_deref() == Some(assignment_id) {
-                if cancelled && !effects_unknown {
+                if (cancelled || work.paused) && !effects_unknown {
                     work.active_assignment = None;
                     touch(work, seq);
                 } else if effects_unknown || !completed {
@@ -1490,15 +1539,21 @@ fn apply(
         }
         Reopen { work_id } => {
             authority.supervisor()?;
+            let old = ticket(snapshot, work_id)?.clone();
+            if let Some(id) = &old.active_assignment {
+                let a = assignment(snapshot, id)?;
+                if !a.process_stopped || holds_resources(a) {
+                    return Err(Error::ResourceBlocked(
+                        "old execution or unreconciled effects still own resources".into(),
+                    ));
+                }
+            }
             let work = snapshot
                 .tickets
                 .get_mut(work_id)
                 .ok_or_else(|| invalid("work missing"))?;
-            if work.active_assignment.is_some() {
-                return Err(Error::ResourceBlocked(
-                    "old execution still owns resources".into(),
-                ));
-            }
+            work.active_assignment = None;
+            work.paused = false;
             work.state = WorkState::Ready;
             work.blocked = None;
             work.accepted_submission = None;
@@ -1570,7 +1625,7 @@ fn apply(
             snapshot.tickets.insert(id.clone(), Ticket { id, scope_id: snapshot.binding.scope_id.clone(), kind: TicketKind::Work,
                 parent: None, depends_on: BTreeSet::new(), record_revision: 1, contract_revision: 1, generation: 0, contract: contract.clone(),
                 state: WorkState::Blocked, blocked: Some(BlockReason { reason: "imported legacy task requires explicit review; no runtime ownership transferred".into(), resume_state: WorkState::Submitted }),
-                archived: false, active_assignment: None, current_submission: None, accepted_submission: None, updated_seq: seq, import_source: Some(source.clone()) });
+                paused: false, archived: false, active_assignment: None, current_submission: None, accepted_submission: None, updated_seq: seq, import_source: Some(source.clone()) });
             snapshot.graph_revision += 1;
         }
     }
@@ -1719,6 +1774,9 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
         }
         if work.scope_id != snapshot.binding.scope_id {
             return Err(Error::ScopeDenied("cross-scope Ticket".into()));
+        }
+        if work.paused && (work.state != WorkState::Blocked || work.blocked.is_none()) {
+            return Err(invalid("paused Work requires an explicit blocked reason"));
         }
         if let Some(parent) = &work.parent {
             let parent = ticket(snapshot, parent)?;

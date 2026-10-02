@@ -88,6 +88,18 @@ pub struct InspectRequest {
     pub depth: usize,
     pub budget_bytes: usize,
     pub fixed_commit: Option<String>,
+    #[serde(default)]
+    pub sections: Option<std::collections::BTreeSet<InspectSection>>,
+}
+impl InspectRequest {
+    pub fn options(&self) -> InspectOptions {
+        InspectOptions {
+            sections: self.sections.clone().unwrap_or_else(all_inspect_sections),
+            depth: self.depth,
+            budget_bytes: self.budget_bytes,
+            fixed_commit: self.fixed_commit.clone(),
+        }
+    }
 }
 
 pub async fn inspect(
@@ -96,12 +108,10 @@ pub async fn inspect(
     body: web::Json<InspectRequest>,
 ) -> std::result::Result<HttpResponse, TicketHttpError> {
     let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
-    Ok(HttpResponse::Ok().json(service.work_inspect(
+    Ok(HttpResponse::Ok().json(service.work_inspect_sections(
         &authority,
         &body.ids,
-        body.depth,
-        body.budget_bytes,
-        body.fixed_commit.as_deref(),
+        &body.options(),
     )?))
 }
 

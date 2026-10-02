@@ -110,12 +110,10 @@ impl TicketTool {
             }
             "work_inspect" => {
                 let request: InspectRequest = decode(args)?;
-                Ok(serde_json::to_value(service.work_inspect(
+                Ok(serde_json::to_value(service.work_inspect_sections(
                     &authority,
                     &request.ids,
-                    request.depth,
-                    request.budget_bytes,
-                    request.fixed_commit.as_deref(),
+                    &request.options(),
                 )?)?)
             }
             "work_changes" => {
@@ -183,10 +181,10 @@ impl Tool for TicketTool {
         match self.name {
             "work_overview" => "Read exact published Work/Goal counts, pending questions/approvals and acceptance counts. Start here. Snapshot seq/epoch is the CAS base, not an execution permission.",
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
-            "work_inspect" => "Inspect up to 32 scope IDs, bounded containment depth and byte budget. Read concrete contract revisions, requests and submissions before changing or accepting them.",
+            "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
             "work_update" => "Commit typed Work/Goal operations with stable operation_id and expected seq/epoch. Independent work contracts do not alter the legacy Task plan. User-required acceptance and approvals are never conferred by a model tool. On 409 refresh and re-evaluate; same input replay returns the original receipt.",
-            _ => "Commit start/steer/cancel/retry intents and enqueue through the existing Runtime. Returns accepted_for_dispatch with assignment receipt and admission observations immediately; this is not worker completion or acceptance. Unknown execution is quarantined, never automatically retried.",
+            _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
         }
     }
     fn parameters_schema(&self) -> Value {

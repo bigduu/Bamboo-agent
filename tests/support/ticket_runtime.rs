@@ -109,6 +109,7 @@ pub struct Probe {
     pub calls: AtomicUsize,
     pub root_calls: AtomicUsize,
     pub held: AtomicUsize,
+    pub input_checks: AtomicUsize,
     pub release: tokio::sync::Notify,
 }
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
@@ -116,6 +117,12 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .as_array()
         .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Task");
     let (delta, finish) = if task_only {
+        let messages = body["messages"].to_string();
+        if messages.contains("TICKET_ACCEPTED_INPUT_E2E") {
+            assert!(messages.contains("input_artifacts"));
+            assert!(messages.contains("TICKET_E2E_1481_DONE"));
+            probe.input_checks.fetch_add(1, Ordering::SeqCst);
+        }
         probe.calls.fetch_add(1, Ordering::SeqCst);
         let has_plan = body["messages"]
             .as_array()
