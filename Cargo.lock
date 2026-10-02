@@ -1566,6 +1566,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-tickets"
+version = "0.0.0"
+dependencies = [
+ "fs2",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "bamboo-tool-event-recorder-example"
 version = "0.1.0"
 dependencies = [

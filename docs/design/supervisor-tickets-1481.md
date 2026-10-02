@@ -68,3 +68,18 @@ changes are authorized in this task.
 
 P0 baseline and interface audit recorded. P1–P9 and A1–A12 remain unaccepted
 until individual test and runtime evidence is recorded below.
+
+### Local slice 1: domain and file authority
+
+The foundational `bamboo-tickets` crate contains the separate version axes and
+content-addressed full revisions/manifest/commit/HEAD, a lifetime OS writer
+lock, fixed commit reads and verified readonly exports. Its focused storage
+suite has four passing tests, including every publication I/O boundary.
+`cargo clippy -p bamboo-tickets --offline --locked --all-targets -- -D warnings`
+passes. Only local APFS process-crash/flush behavior is evidenced here; power
+loss and other filesystem types are not accepted.
+
+Ticket command implementation is a subsequent local branch/worktree. During
+its initial focused verification, twelve tests passed, including 48 actual
+process-exit boundaries and a second-process writer-lock rejection. That
+evidence does not accept live dispatch, OS Worker isolation, model routing or UI.
