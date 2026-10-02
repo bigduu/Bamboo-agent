@@ -167,3 +167,19 @@ dependencies; it is not a strict-warning pass. This is the in-process adapter
 slice only. The native Worker HostBridge, real dispatch, filesystem sandbox and
 true #1481 Runtime acceptance still require subsequent slices. Synthetic
 receipts in these tests are not real admission evidence.
+
+### Local slice 5: opt-in native Task ceiling
+
+Worktree `bamboo-1481-task-ceiling`; branch
+`bamboo/feat/1481-native-task-ceiling`. The actual framework Task instance is
+eligible for an explicit native ceiling. Host selects Task alone only for a
+Ticket child; ordinary/native legacy sessions keep their five-name surface.
+Custom same-name owners and disabled Task do not acquire this ceiling. Four
+tool-entry/ceiling tests and three Host ownership/compatibility tests pass.
+The macOS server-test linker emits its existing large unwind-section warning;
+the test executable starts and all selected tests pass. No linker repair added.
+
+The P3 follow-up canonical compatibility test passes: absent optional Step
+status and legacy receipt request bytes retain their original canonical form.
+This prevents a schema-compatible read from changing old request hashes.
+Native plan callbacks and dispatch remain a subsequent slice.

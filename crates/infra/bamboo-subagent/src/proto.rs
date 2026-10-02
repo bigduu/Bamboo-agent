@@ -233,7 +233,7 @@ fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NativeToolCeiling {
-    pub const NAMES: [&'static str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+    pub const NAMES: [&'static str; 6] = ["Bash", "Edit", "Glob", "Read", "Task", "Write"];
     pub const MAX_BYTES: usize = 16 * 1024;
 
     pub fn validate(&self) -> Result<(), &'static str> {
