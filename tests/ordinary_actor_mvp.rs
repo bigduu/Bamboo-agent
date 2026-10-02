@@ -474,7 +474,10 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
             panic!(
                 "four-child held timeout: {}",
                 json!({"round":round,"ready_mask":probe.ready.load(Ordering::SeqCst),
-                "parent_status":parent.last_run_status(),"results":results,"children":children,"runs":runs,"worker_outcomes":worker_outcomes})
+                "parent_status":parent.last_run_status(),"results":results,"children":children,"runs":runs,"worker_outcomes":worker_outcomes,
+                "checkpoint_errors":std::fs::read_to_string(data.join("host.log")).unwrap_or_default()
+                    .lines().filter(|line| line.contains("Actor correction checkpoint rejected or unconfirmed"))
+                    .take(4).map(|line| bounded_diagnostic(line, 1024).to_owned()).collect::<Vec<_>>()})
             );
         }
         let held_parent = held_parent.unwrap();

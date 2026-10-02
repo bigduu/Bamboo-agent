@@ -352,13 +352,44 @@ async fn checkpoint_lineage_real_before_replace_detects_legal_parent_write_and_a
             }
             let after_deliberate_parent_change = ancestor_files(&f);
             hook.release();
+            let rejected = task.await.unwrap();
             assert!(
-                task.await.unwrap().is_err(),
+                rejected.is_err(),
                 "published after ancestor drift {port:?}/{change}"
             );
             assert_eq!(files(&f.target()), before);
             assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
             no_temps(&f.target());
+            if matches!(port, Port::InputNew) && change == 0 {
+                assert_eq!(
+                    rejected.unwrap_err(),
+                    ActorInputCheckpointError::PrefixConflict.to_string()
+                );
+                // The legal Parent save changed the byte witness, not this
+                // Child's prefix or identity. The identical fenced request may
+                // try again; it still neither ACKs nor releases the owned input.
+                let committed = f
+                    .inbox
+                    .checkpoint_actor_input(f.input(&f.current))
+                    .await
+                    .unwrap();
+                assert_eq!(committed.status, ActorInputCheckpointStatus::NewCheckpoint);
+                assert_eq!(
+                    committed.session.messages.len(),
+                    f.current.messages.len() + 1
+                );
+                assert!(!f
+                    .inbox
+                    .was_admitted(ID, &f.claim.claim.envelope.id)
+                    .await
+                    .unwrap());
+                assert!(f
+                    .target()
+                    .join("inbox/cur")
+                    .join(&f.claim.claim.claim_id)
+                    .exists());
+                assert_eq!(ancestor_files(&f), after_deliberate_parent_change);
+            }
         }
     }
 }

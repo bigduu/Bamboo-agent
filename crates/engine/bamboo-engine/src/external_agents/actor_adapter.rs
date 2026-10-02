@@ -4490,12 +4490,31 @@ impl PlainActorActivation {
         Box::pin(async move {
             // The worker receives the committed pre-input prefix. Only typed
             // delivery adds the User; the Host-private bookkeeper is not a grant.
-            let committed = self.input_inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
-                fence: self.fence.clone(), expected_created_at: self.created_at,
-                claim: claim.clone(), expected_messages: session.messages.clone(),
+            let request = bamboo_storage::ActorInputCheckpoint {
+                fence: self.fence.clone(),
+                expected_created_at: self.created_at,
+                claim: claim.clone(),
+                expected_messages: session.messages.clone(),
                 expected_provider_transcript: session.provider_transcript.clone(),
                 expected_admission: session.session_inbox_admission().cloned(),
-            }).await.map_err(|error| {
+            };
+            let mut retries = 0;
+            let committed = loop {
+                let result = self.input_inbox.checkpoint_actor_input(request.clone()).await;
+                if matches!(&result, Err(bamboo_storage::ActorInputCheckpointError::PrefixConflict))
+                    && retries < 3
+                {
+                    // A Parent can save ordinary tool/wait state while this
+                    // Child checkpoints. PrefixConflict guarantees no publish;
+                    // retry the SAME Child prefix, claim and fence, with every
+                    // storage authority check repeated. Never adopt a changed
+                    // Child transcript or retry an unconfirmed publication.
+                    tokio::time::sleep(Duration::from_millis(10 << retries)).await;
+                    retries += 1;
+                    continue;
+                }
+                break result;
+            }.map_err(|error| {
                 tracing::warn!(%error, "Actor correction checkpoint rejected or unconfirmed; no worker dispatch or ACK");
                 AgentError::LLM("Actor correction checkpoint unconfirmed; durable Inbox and history are preserved".into())
             })?;
