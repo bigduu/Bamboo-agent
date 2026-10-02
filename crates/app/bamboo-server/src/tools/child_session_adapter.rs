@@ -218,6 +218,15 @@ impl ChildSessionAdapter {
             let Some(generation) = child.recoverable_child_launch_generation() else {
                 continue;
             };
+            // Ticket recovery must query its immutable key and current writer
+            // permission before enqueueing. The generic legacy boot pass cannot
+            // supply that proof or resurrect an old Assignment.
+            if child
+                .metadata
+                .contains_key(bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY)
+            {
+                continue;
+            }
             let Some(parent_id) = child.parent_session_id.as_deref() else {
                 continue;
             };

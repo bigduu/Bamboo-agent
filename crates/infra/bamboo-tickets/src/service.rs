@@ -143,7 +143,8 @@ impl TicketService {
             for assignment in snapshot.assignments.values_mut() {
                 if matches!(
                     assignment.state,
-                    AssignmentState::Admitted
+                    AssignmentState::DispatchPending
+                        | AssignmentState::Admitted
                         | AssignmentState::Running
                         | AssignmentState::Cancelling
                 ) {

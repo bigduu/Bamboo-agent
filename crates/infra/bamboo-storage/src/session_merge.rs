@@ -45,7 +45,11 @@ use bamboo_domain::{
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
+    "gold_config",
+    "workflow.run_ids.v1",
+    "ticket.runtime.dispatch.v1",
+];
 const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "workspace_source",
     "workspace_binding_status",

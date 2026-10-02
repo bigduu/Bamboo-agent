@@ -3483,6 +3483,39 @@ impl ExternalChildRunner for ActorChildRunner {
             } else {
                 permission_policy.clone()
             };
+            if session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            {
+                let admission = async {
+                    let service = ticket_service
+                        .as_ref()
+                        .ok_or_else(|| AgentError::LLM("Ticket authority unavailable".into()))?;
+                    let runtime = session_inbox_runtime.as_ref().ok_or_else(|| {
+                        AgentError::LLM("Ticket activation runtime unavailable".into())
+                    })?;
+                    let run_id = bound_activation_run_id
+                        .as_deref()
+                        .ok_or_else(|| AgentError::LLM("Ticket activation owner missing".into()))?;
+                    crate::ticket_runtime::admit_ticket_run(service, runtime, session, run_id)
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))
+                }
+                .await;
+                if let Err(error) = admission {
+                    if let (Some(runtime), Some(run_id)) = (
+                        session_inbox_runtime.as_ref(),
+                        bound_activation_run_id.as_deref(),
+                    ) {
+                        runtime
+                            .router
+                            .detach_delivery_sink(&job.child_session_id, run_id)
+                            .await;
+                    }
+                    actor.worker.kill().await;
+                    return Err(error);
+                }
+            }
             let mut run_spec = RunSpec {
                 // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                 assignment: assignment.clone(),

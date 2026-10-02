@@ -237,3 +237,31 @@ assertion expected seq zero despite writer initialization; corrected to compare
 against the pre-operation seq. Restart replay only reads a prior receipt: the
 old Worker remains fenced and cannot resume Task execution. This does not count
 as P5 Runtime admission/restart evidence or real-model semantic evaluation.
+
+## P5 canonical dispatch/admission boundary (2026-10-02)
+
+The `bamboo/feat/1481-runtime-dispatch` slice starts from `4c26c72a`.
+Server ensure/query maps an immutable dispatch key to one deterministic Child.
+It verifies the canonical Supervisor proof, incarnation and orchestration-mode
+revision. A changed spec hash is rejected. Creation uses the existing one-shot
+Child factory, exact launch generation and scheduler; the Composite runner now
+forwards the Host-only TicketService port. No extra LLM/placement scheduler was
+introduced. The API is Host-only and dispatch policy defaults off.
+
+After canonical Inbox activation registration and before RunSpec is sent, the
+Actor driver persists the exact key/spec/run/session receipt and Child birth in
+its existing control plane, then commits Ticket admission/running. A failed or
+uncertain Ticket publication does not grant Worker permission. Queries identify
+prepared-but-uncommitted receipts as unknown. Old pending/running permissions
+are fenced at writer restart. The generic legacy pending-child boot pass skips
+Ticket dispatches; unknown dispatches are never automatically re-enqueued.
+Runtime metadata merging preserves this Host receipt across a stale final save.
+
+Validation: server check passed; engine Ticket/admission 10/10; storage metadata
+compatibility 14/14; TicketService 27/27; format/diff checks passed. Server clippy
+completed with the existing engine 19 and server 6 warnings, with no warnings in
+the new modules. The two new tests use real V2 storage and canonical activation
+registration with controlled failures. They do not launch a Worker or prove
+process kill recovery. P5 terminal submission, fresh-process create-to-accept,
+actual intent/admission/receipt kill windows, P6 model tools, P7 semantics,
+Lotus and P9 remain outstanding. Dispatch remains disabled by default.
