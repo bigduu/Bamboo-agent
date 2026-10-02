@@ -131,6 +131,8 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// Opt-in, host-owned scope authority. It is never copied into the Worker.
+    fn set_ticket_service(&self, _service: Option<Arc<bamboo_tickets::TicketService>>) {}
     /// A narrow, pre-persistence compatibility check on the actual registered
     /// runner. Unknown/custom routes fail closed for required one-shot packets.
     async fn validate_required_child_context_route(

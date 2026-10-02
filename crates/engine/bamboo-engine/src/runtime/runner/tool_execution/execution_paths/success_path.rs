@@ -57,7 +57,7 @@ async fn refresh_workflow_tool_side_effects(ctx: &mut SuccessPathContext<'_>) {
 
 pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_>) -> bool {
     let ticket_result =
-        task::maybe_apply_ticket_task(ctx.tool_call, ctx.result, ctx.session, ctx.config);
+        task::maybe_apply_ticket_task(ctx.tool_call, ctx.result, ctx.session, ctx.config).await;
     let result = ticket_result.as_ref().unwrap_or(ctx.result);
 
     // Server tools mutate a repository-owned Session clone. Pull only the

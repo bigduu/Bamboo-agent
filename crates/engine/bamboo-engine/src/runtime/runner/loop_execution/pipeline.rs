@@ -2025,6 +2025,14 @@ fn spawn_task_evaluation_if_needed(
     // once per Task-tool write rather than every round of tool activity (which
     // bumps `TaskLoopContext::version` without changing the plan). A task list
     // that never went through the Task tool is never auto-evaluated.
+    if config.ticket_worker_plan.is_some() {
+        // The legacy evaluator writes Session/root control planes. New Ticket
+        // plans change only through their authority-bound Task port.
+        if let Some(ctx) = state.task_context.as_mut() {
+            ctx.task_list_dirty = false;
+        }
+        return Ok(());
+    }
     let task_list_dirty = state
         .task_context
         .as_ref()

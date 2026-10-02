@@ -8,12 +8,30 @@ use bamboo_tools::TaskTool;
 use std::sync::Arc;
 
 pub const TICKET_LOCAL_PLAN_KEY: &str = "ticket.local_plan.v1";
+pub use bamboo_tickets as tickets;
+pub const TICKET_PLAN_PACKET_KEY: &str = "ticket.local_plan.packet.v1";
+pub const TICKET_PLAN_ACTION: &str = "_ticket_local_plan_v1";
+pub mod remote;
+
+/// This host-installed port is never constructed from model tool arguments.
+#[async_trait::async_trait]
+pub trait WorkerLocalPlan: Send + Sync {
+    fn run_id(&self) -> &str;
+    fn bind_session(&self, session: &mut Session) -> Result<()>;
+    async fn apply_task(
+        &self,
+        session: &mut Session,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<TaskList>;
+}
 
 pub struct TicketWorkerPlan {
     service: Arc<TicketService>,
     authority: Authority,
     assignment_id: String,
     session_id: String,
+    supervisor_session_id: String,
     run_id: String,
 }
 
@@ -44,6 +62,7 @@ impl TicketWorkerPlan {
             authority,
             assignment_id: assignment_id.into(),
             session_id: receipt.session_id.clone(),
+            supervisor_session_id: snapshot.binding.supervisor_session_id.clone(),
             run_id: receipt.run_id.clone(),
         })
     }
@@ -53,6 +72,7 @@ impl TicketWorkerPlan {
         self.service.authorize_tool(&self.authority, "Task")?;
         if session.kind != SessionKind::Child
             || session.id != self.session_id
+            || session.parent_session_id.as_deref() != Some(&self.supervisor_session_id)
             || session
                 .agent_runtime_state
                 .as_ref()
@@ -106,6 +126,9 @@ impl TicketWorkerPlan {
     ) -> Result<TaskList> {
         if session.kind != SessionKind::Child
             || session.id != self.session_id
+            || session.parent_session_id.as_deref() != Some(&self.supervisor_session_id)
+            || tool_call_id.is_empty()
+            || tool_call_id.len() > 128
             || session.metadata.get(TICKET_LOCAL_PLAN_KEY) != Some(&self.assignment_id)
             || session
                 .agent_runtime_state
@@ -189,3 +212,21 @@ impl TicketWorkerPlan {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[async_trait::async_trait]
+impl WorkerLocalPlan for TicketWorkerPlan {
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+    fn bind_session(&self, session: &mut Session) -> Result<()> {
+        self.bind_session(session)
+    }
+    async fn apply_task(
+        &self,
+        session: &mut Session,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<TaskList> {
+        self.apply_task(session, call_id, args)
+    }
+}

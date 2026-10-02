@@ -298,8 +298,9 @@ async fn ticket_task_projection_never_patches_root_or_session_authority() {
     let mut config = AgentLoopConfig::default();
     config.persistence = Some(persistence.clone());
     config.bind_ticket_worker_plan(plan);
-    let result =
-        super::maybe_apply_ticket_task(&tool_call, &result, &mut fixture.session, &config).unwrap();
+    let result = super::maybe_apply_ticket_task(&tool_call, &result, &mut fixture.session, &config)
+        .await
+        .unwrap();
     assert!(result.success, "{}", result.result);
     let (tx, mut rx) = mpsc::channel(4);
     let mut context = None;
@@ -332,8 +333,8 @@ async fn ticket_task_projection_never_patches_root_or_session_authority() {
     );
 }
 
-#[test]
-fn forged_ticket_marker_fails_closed_without_runtime_capability() {
+#[tokio::test]
+async fn forged_ticket_marker_fails_closed_without_runtime_capability() {
     let (call, result) = task_call_and_result();
     let mut child = Session::new_child("forged", "root", "model", "forged");
     child.metadata.insert(
@@ -342,6 +343,7 @@ fn forged_ticket_marker_fails_closed_without_runtime_capability() {
     );
     let rejected =
         super::maybe_apply_ticket_task(&call, &result, &mut child, &AgentLoopConfig::default())
+            .await
             .unwrap();
     assert!(!rejected.success);
     assert!(child.task_list.is_none());

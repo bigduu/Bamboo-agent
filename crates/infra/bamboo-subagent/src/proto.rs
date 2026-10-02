@@ -116,6 +116,9 @@ impl LocalToolMessages {
     pub const MAX_PAIRS: usize = 32;
 
     pub fn supports_tools(tools: &[String], read_only: bool) -> bool {
+        if tools == ["Task"] {
+            return true;
+        }
         !tools.is_empty()
             && !(read_only && tools.len() == 1 && tools[0] == "Glob")
             && tools

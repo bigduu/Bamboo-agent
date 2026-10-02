@@ -2197,6 +2197,29 @@ impl ChildExecutor for BambooRuntimeExecutor {
             event_tx,
             cancel.clone(),
         );
+        match bamboo_engine::ticket_worker_plan::remote::RemoteWorkerPlan::from_run(
+            &run,
+            tree_host.clone(),
+        )
+        .await
+        {
+            Ok(Some(plan)) => {
+                // This first Ticket route exposes no arbitrary filesystem or
+                // shell tool. Worker cache storage cannot grant TicketStore access.
+                if self
+                    .native_tool_ceiling
+                    .as_ref()
+                    .is_none_or(|c| c.tools != ["Task"])
+                {
+                    return ChildOutcome::error(
+                        "Ticket native route requires Task-only tool ceiling",
+                    );
+                }
+                builder = builder.ticket_worker_plan(Arc::new(plan));
+            }
+            Ok(None) => {}
+            Err(error) => return ChildOutcome::error(error.to_string()),
+        }
         if self.native_tool_ceiling.is_some() {
             // The runtime requires a manager; explicit empty selection prevents
             // workspace auto-selection or a retained workflow expanding this Run.
@@ -2656,6 +2679,259 @@ mod tests {
     }
 
     struct QuestionTool(HostBridge);
+
+    struct TicketPlanProvider(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LLMProvider for TicketPlanProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains("Private Root plan")),
+                "Root plan must never enter the Worker's provider context"
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|s| s.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["Task"]
+            );
+            let chunks = if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                vec![Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                    id:"ticket-task-call".into(), tool_type:"function".into(),
+                    function:bamboo_domain::FunctionCall { name:"Task".into(), arguments:serde_json::json!({"tasks":[{"id":"owned-step","content":"Own native step","status":"in_progress"}]}).to_string() }
+                }])), Ok(LLMChunk::Done)]
+            } else {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.tool_call_id.as_deref() == Some("ticket-task-call")
+                            && m.tool_success == Some(true)),
+                    "the next round must observe the Host-committed Task result"
+                );
+                vec![
+                    Ok(LLMChunk::Token("Task saved by Host".into())),
+                    Ok(LLMChunk::Done),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_worker_loop_routes_task_to_host_local_plan_without_root_write() {
+        use bamboo_engine::ticket_worker_plan::{
+            remote::apply_host_plan_request, tickets::*, TICKET_LOCAL_PLAN_KEY,
+            TICKET_PLAN_PACKET_KEY,
+        };
+        use std::collections::BTreeSet;
+        let temp = tempfile::tempdir().unwrap();
+        let service = TicketService::open(
+            temp.path().join("tickets"),
+            ScopeBinding {
+                scope_id: "ticket-fixture".into(),
+                supervisor_session_id: "parent".into(),
+                binding_revision: 1,
+            },
+        )
+        .unwrap();
+        let binding = service.published().unwrap().1.binding;
+        let supervisor = Authority::from_verified_host(
+            binding.clone(),
+            Principal::Supervisor {
+                session_id: "parent".into(),
+            },
+        );
+        let command = service
+            .prepare_command(
+                &supervisor,
+                "create",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: Contract {
+                            title: "Native plan".into(),
+                            objective: "Record own steps".into(),
+                            constraints: vec!["No root changes".into()],
+                            acceptance: vec!["Host receipt".into()],
+                            user_acceptance_required: true,
+                            allowed_tools: BTreeSet::from(["Task".into()]),
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "work".into(),
+                    },
+                    Operation::Start {
+                        work_id: "work".into(),
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let receipt = service.execute(&supervisor, &command).unwrap();
+        let assignment = receipt.ids["assignment"].clone();
+        let snapshot = service.published().unwrap().1;
+        let a = &snapshot.assignments[&assignment];
+        let runtime = Authority::from_verified_host(binding, Principal::Runtime);
+        // The actual Worker loop runs below. Admission is synthetic in this
+        // adapter test; process-level Runtime dispatch is accepted separately.
+        let command = service
+            .prepare_command(
+                &runtime,
+                "admit",
+                vec![
+                    Operation::Admitted {
+                        assignment_id: assignment.clone(),
+                        receipt: RuntimeReceipt {
+                            dispatch_key: a.dispatch_key.clone(),
+                            spec_hash: snapshot.intents[&a.dispatch_key].spec_hash.clone(),
+                            run_id: "ticket-fixture-run".into(),
+                            session_id: "ticket-fixture-child".into(),
+                        },
+                    },
+                    Operation::Running {
+                        assignment_id: assignment.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        service.execute(&runtime, &command).unwrap();
+        let packet = service
+            .child_context_packet(&runtime, &assignment, 65536)
+            .unwrap();
+        let mut run = protocol_run("ticket-fixture-child", "ticket-fixture-run", Vec::new());
+        run.messages[0]["metadata"] = serde_json::json!({(TICKET_PLAN_PACKET_KEY):packet});
+        let created_at = run
+            .logical_session
+            .as_ref()
+            .unwrap()
+            .creation
+            .as_ref()
+            .unwrap()
+            .created_at;
+        let store = Arc::new(
+            SessionStoreV2::new(temp.path().join("worker-cache"))
+                .await
+                .unwrap(),
+        );
+        // A real SessionStore requires a canonical Root context. Keep a Root
+        // plan here to prove the Worker updates neither it nor its messages.
+        let mut root = Session::new("parent", "test-model");
+        root.task_list = Some(bamboo_tools::TaskTool::task_list_from_args(
+            &serde_json::json!({"tasks":[{"id":"parent-step","content":"Private Root plan","status":"pending"}]}),
+            "parent",
+        ).unwrap());
+        store.save_session(&root).await.unwrap();
+        let root_plan = serde_json::to_value(&root.task_list).unwrap();
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            Default::default(),
+        ));
+        let provider = Arc::new(TicketPlanProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let mut executor = worker_executor_for_store(provider.clone(), store.clone(), inbox).await;
+        executor.run_tools = Some(Arc::new(
+            bamboo_tools::BuiltinToolExecutor::new()
+                .with_native_tool_ceiling(vec!["Task".into()])
+                .unwrap(),
+        ));
+        executor.native_tool_ceiling = Some(bamboo_subagent::proto::NativeToolCeiling {
+            version: 1,
+            child_session_id: "ticket-fixture-child".into(),
+            parent_session_id: "parent".into(),
+            root_session_id: "parent".into(),
+            created_at,
+            spawn_depth: 1,
+            project_id: None,
+            tools: vec!["Task".into()],
+        });
+        let mut caller =
+            Session::new_child("ticket-fixture-child", "parent", "test-model", "Fixture");
+        caller.created_at = created_at;
+        caller
+            .metadata
+            .insert(TICKET_LOCAL_PLAN_KEY.into(), assignment.clone());
+        let (host, mut requests) = HostBridge::channel();
+        let host_service = service.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let projection = apply_host_plan_request(
+                    &host_service,
+                    &caller,
+                    "ticket-fixture-run",
+                    &request.body["args"],
+                    request.body["tool_call_id"].as_str().unwrap(),
+                )
+                .unwrap();
+                let _ = request.reply.send(serde_json::json!({"result":projection}));
+            }
+        });
+        let (events, mut rx) = EventSink::channel();
+        let drain = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_tx, steer) = bamboo_subagent::executor::SteerInbox::channel();
+        let outcome = executor
+            .run(
+                run,
+                events.with_host_bridge(host),
+                steer,
+                CancellationToken::new(),
+            )
+            .await;
+        let observed = drain.await.unwrap();
+        assert_eq!(
+            outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{:?}",
+            outcome
+        );
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "legacy Task evaluator must not run"
+        );
+        let plan = &service.published().unwrap().1.assignments[&assignment].plan;
+        assert_eq!(plan.plan_revision, 1, "Worker events: {observed:?}");
+        assert_eq!(plan.steps[0].id, "owned-step");
+        let root_after = store.load_session("parent").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(root_after.task_list).unwrap(),
+            root_plan
+        );
+        assert_eq!(
+            serde_json::to_value(root_after.messages).unwrap(),
+            serde_json::to_value(root.messages).unwrap()
+        );
+        assert_eq!(
+            store
+                .load_session("ticket-fixture-child")
+                .await
+                .unwrap()
+                .unwrap()
+                .task_list
+                .as_ref()
+                .unwrap()
+                .items[0]
+                .id,
+            "owned-step"
+        );
+        pump.await.unwrap();
+    }
 
     #[async_trait]
     impl bamboo_agent_core::tools::ToolExecutor for QuestionTool {

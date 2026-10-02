@@ -8,7 +8,7 @@ use bamboo_agent_core::{AgentEvent, Session};
 mod progress;
 mod taskwrite;
 
-pub(super) fn maybe_apply_ticket_task(
+pub(super) async fn maybe_apply_ticket_task(
     tool_call: &ToolCall,
     result: &ToolResult,
     session: &mut Session,
@@ -24,15 +24,16 @@ pub(super) fn maybe_apply_ticket_task(
     {
         return None;
     }
-    let outcome = (|| {
+    let outcome = async {
         let plan = config.ticket_worker_plan.as_ref().ok_or_else(|| {
             bamboo_tickets::Error::ScopeDenied(
                 "Ticket Worker requires a trusted LocalPlan permit".into(),
             )
         })?;
         let args = serde_json::from_str(&tool_call.function.arguments)?;
-        plan.apply_task(session, &tool_call.id, &args)
-    })();
+        plan.apply_task(session, &tool_call.id, &args).await
+    }
+    .await;
     let mut resolved = result.clone();
     if let Err(error) = outcome {
         resolved.success = false;

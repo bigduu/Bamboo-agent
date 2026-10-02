@@ -153,7 +153,13 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|previous| matches!(previous.status, AgentStatusState::Suspended));
-    let mut runtime_state = AgentRuntimeState::new(&session_id);
+    let mut runtime_state = AgentRuntimeState::new(
+        config
+            .ticket_worker_plan
+            .as_ref()
+            .map(|plan| plan.run_id())
+            .unwrap_or(&session_id),
+    );
     // Permission mode is a per-session sticky posture (set via PATCH /sessions
     // and persisted in runtime.json). Each run rebuilds a fresh runtime state,
     // so carry the exact typed mode forward instead of resetting it.

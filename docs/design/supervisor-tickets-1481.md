@@ -183,3 +183,37 @@ The P3 follow-up canonical compatibility test passes: absent optional Step
 status and legacy receipt request bytes retain their original canonical form.
 This prevents a schema-compatible read from changing old request hashes.
 Native plan callbacks and dispatch remain a subsequent slice.
+
+### Local slice 6: native HostBridge / private plan
+
+Worktree `bamboo-1481-native`; branch `bamboo/feat/1481-native-local-plan`,
+based on `0495353f`. The fresh required Child packet carries only the bounded
+Work contract/inputs. Native bootstrap compares its complete canonical hash
+with the Host's verified packet; equal revision numbers cannot authorize
+modified constraints. Each Task callback reloads the exact live Child birth
+and Run, then commits through TicketService. Oversized plans fail before
+publication. Successful Worker Task events require the exact Host callback
+payload/receipt; Worker plan-update events cannot publish Root changes.
+
+The real AgentRuntime Worker loop executes Task over this callback and retains
+the Host Run ID throughout startup. Its provider context excludes the Root
+private plan, and Root Task/messages remain unchanged. Legacy Task evaluation
+does not write a second authority. This test uses a scripted provider and
+synthetic admission; it is not real-model semantic evaluation or P5 dispatch.
+The initial opt-in native ceiling remains Task-only, with no arbitrary shell
+or filesystem tools. Same-UID arbitrary shell isolation is not claimed.
+
+Evidence: seven focused Ticket/creation/capability/replay tests, ten affected
+Task tests, three local-transcript tests, all 26 TicketService tests and 32
+Worker tests pass. The Worker suite uses CI's `RUST_MIN_STACK=8388608`; its two
+loopback fixtures require local socket access outside the execution sandbox.
+Without those test permissions it reports 30 pass / 2 permission failures;
+the default thread stack also aborts an existing deep Worker fixture.
+Formatting and whitespace checks pass. Engine clippy completes with 19 known
+legacy warnings, not a strict-warning pass. The publication fixture, scripted
+provider loop, Host callback tests and real-model evaluation remain distinct.
+
+P5 stable dispatch/admission receipts, actual terminal submission, P7 semantic
+resolution, P8 Lotus and P9 acceptance are still unrun. Generated Task IDs and
+the exact raw tool payload need a separate receipt-replay follow-up before
+claiming arbitrary Task-call replay; current replay evidence uses explicit IDs.

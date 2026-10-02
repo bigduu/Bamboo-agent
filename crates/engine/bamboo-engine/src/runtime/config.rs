@@ -357,7 +357,7 @@ pub struct AgentLoopConfig {
     /// Keep tool guidance stable while activation updates append to model context.
     pub freeze_tool_exposure_for_cache: bool,
     /// Host-installed exact Assignment/Run permit; never taken from model args.
-    pub(crate) ticket_worker_plan: Option<Arc<crate::ticket_worker_plan::TicketWorkerPlan>>,
+    pub(crate) ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
@@ -633,7 +633,7 @@ impl Default for AgentLoopConfig {
 impl AgentLoopConfig {
     pub fn bind_ticket_worker_plan(
         &mut self,
-        plan: Arc<crate::ticket_worker_plan::TicketWorkerPlan>,
+        plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
     ) {
         self.ticket_worker_plan = Some(plan);
     }
