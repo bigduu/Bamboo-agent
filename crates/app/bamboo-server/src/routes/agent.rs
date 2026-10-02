@@ -85,6 +85,21 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             settings::enforce_access_password_middleware,
         ))
         .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .service(
+            web::scope("/tickets")
+                .route("/scope", web::get().to(agent::tickets::scope))
+                .route("/overview", web::get().to(agent::tickets::overview))
+                .route("/search", web::post().to(agent::tickets::search))
+                .route("/inspect", web::post().to(agent::tickets::inspect))
+                .route("/changes", web::post().to(agent::tickets::changes))
+                .route("/update", web::post().to(agent::tickets::update))
+                .route("/dispatch", web::post().to(agent::tickets::dispatch))
+                .route(
+                    "/dispatch/{key:.*}",
+                    web::get().to(agent::tickets::dispatch_query),
+                )
+                .route("/artifacts/{hash}", web::get().to(agent::tickets::artifact)),
+        )
         .route(
             "/browser/sessions/{session_id}",
             web::put().to(agent::browser::open),

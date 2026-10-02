@@ -296,3 +296,42 @@ planes with controlled saved completion checkpoints. They do not launch a
 Worker process and do not satisfy the P5 actual fresh one-shot exit criterion.
 Application scope/feature-flag wiring, dispatch recovery, confirmed-stop
 resource release, real model semantics, and Lotus acceptance remain pending.
+
+### Local slice 10: opt-in application scope and actual single-Work Runtime
+
+Worktree `bamboo-1481-application`; branch
+`bamboo/feat/1481-ticket-application`, based on `c02c2da9`. AppState now owns
+one TicketService bound to the canonical Supervisor incarnation and Root tool
+authority revision. Independent `features.ticket_mutation` and
+`features.ticket_dispatch` flags default off. Only a fresh atomic Supervisor
+bootstrap initializes a scope; existing or interrupted incomplete bootstraps
+require explicit recovery/attach instead of automatic takeover. Turning flags
+off preserves readable records and the result postprocessing service.
+
+Authenticated owner endpoints under `/api/v1/tickets` expose scope, overview,
+bounded search/inspect/changes, typed update/dispatch, immutable-key dispatch
+query, and referenced Artifact reads. Client Authority/role/approved/private
+source fields are refused. Run-scoped Worker credentials cannot become User
+authority. The existing Child adapter/scheduler admits committed intents;
+responses distinguish accepted-for-dispatch from Worker completion.
+
+Validation: application tests 3/3 and HTTP wire test 1/1 pass. Server Clippy
+retains the baseline engine/storage/server warnings; no new warnings remain.
+The actual-process fixture `tests/ticket_runtime_mvp.rs` launches the compiled
+local Host and native Worker against a controlled loopback HTTP provider. It
+checks real admission, exact private Task callback, canonical Submission and
+Artifact bytes, explicit User acceptance, then Host restart and same dispatch
+receipt/run with no additional Worker provider calls. Two successive diagnostic
+runs pass (14.33s and 14.58s). Run with `RUST_MIN_STACK=8388608 cargo test
+-p bamboo-agent --test ticket_runtime_mvp --locked --offline -- --nocapture`.
+
+The initial fixture run timed out waiting for submitted after 90 seconds;
+its temporary Child state was not retained, so the cause remains unconfirmed.
+Subsequent fixtures retain an identified `/tmp/bamboo-1481-ticket-runtime-*`
+directory on failure and report seq, Work/Assignment state, private plan
+revision, dispatch receipt, provider call count, and Host log. Successful
+fixtures clean only their own stopped test data. These are controlled-provider
+Runtime passes, not real-model semantic evaluation or full P5/P9 acceptance.
+Confirmed-stop/cancel resource release, crash-window result reconciliation,
+model-facing tools, P7 semantics, Lotus integration, and the full A1–A12
+matrix remain subsequent work. No remote publication or production changes.

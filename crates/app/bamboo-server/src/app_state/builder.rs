@@ -310,6 +310,14 @@ impl AppState {
         let embedded_broker = maybe_embed_broker(&mut config, &data_dir).await;
 
         let config = Arc::new(RwLock::new(config));
+        let tickets = Arc::new(
+            super::ticket_application::TicketApplication::open(
+                &data_dir,
+                storage.clone(),
+                config.clone(),
+            )
+            .await,
+        );
 
         // Build one coherent configured-default/root provider pair. The process
         // globals below intentionally remain first-registration-wins, while
@@ -799,6 +807,7 @@ impl AppState {
             },
         ));
         external_runner.set_actor_directory_store(Some(session_store.clone()));
+        external_runner.set_ticket_service(tickets.service().ok());
         external_runner.set_actor_event_observer(Some(actor_event_hub.clone()));
         // Recover Host-checkpointed broker terminal receipts before launching
         // pending children. The scan uses the physical canonical Child tree;
@@ -1160,6 +1169,7 @@ impl AppState {
             recovered_launches: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
+        tickets.bind_adapter(child_adapter.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator
@@ -1261,6 +1271,7 @@ impl AppState {
             session_activation_router,
             session_messenger,
             spawn_scheduler,
+            tickets,
             child_completion_coordinator,
             guardian_spawner,
             bash_resume_hook,
