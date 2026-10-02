@@ -83,3 +83,29 @@ Ticket command implementation is a subsequent local branch/worktree. During
 its initial focused verification, twelve tests passed, including 48 actual
 process-exit boundaries and a second-process writer-lock rejection. That
 evidence does not accept live dispatch, OS Worker isolation, model routing or UI.
+
+### Local slice 2: application commands
+
+Worktree: `bamboo-1481-commands`; branch: `bamboo/feat/1481-ticket-commands`,
+based on foundational commit `dc442538`. TicketService owns atomic typed
+batches, receipt deduplication before CAS, trusted-host identity checks,
+private LocalPlans, exact approval consumption, retained stale submissions,
+dependency/Goal invalidation and explicit legacy import. It checks canonical
+worktree claims and excludes its authority directory from declared write roots.
+These checks are not OS sandbox enforcement and are not presented as such.
+
+Focused suite: 4 file-authority tests plus 15 service tests, including one
+subprocess helper exercised by the real process-crash test. The crash test
+checks 48 actual exit windows plus a competing OS writer. The deterministic
+entry point `cargo run -p bamboo-tickets --offline --locked --example single_work`
+computes 2+3 in a fixture thread, submits its hash and accepts the exact
+submission only after fixture-user evidence; output is labelled
+`deterministic_service_fixture`. No live Runtime or provider is used.
+
+P3 is still open: ordinary/native Task execution is not yet wired to this
+service LocalPlan. P5 is still gated by #1479 and the missing real admission
+key/query port. P7 model evaluation, P8 Lotus, and P9 real acceptance remain
+unrun. Import currently produces a blocked record requiring review; it does
+not migrate running Session ownership or create acceptance for legacy output.
+Artifact URI/hash syntax is checked, but artifact bytes need a trusted host
+artifact resolver before automated quality acceptance can be enabled.

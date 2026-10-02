@@ -1,9 +1,11 @@
 //! Trusted-host application service. No model, network or Worker runs under its lock.
 //! This store owns contracts, not Session transcripts or Jiandu memory.
 mod model;
+mod service;
 pub mod store;
 
 pub use model::*;
+pub use service::{Authority, Principal, TicketService};
 pub use store::{FaultPoint, Health, PublicationFault};
 
 #[derive(Debug, thiserror::Error)]

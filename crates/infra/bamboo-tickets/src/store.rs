@@ -73,6 +73,9 @@ fn valid_hash(hash: &str) -> bool {
 }
 
 impl FileStore {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err(Error::AuthorityUnavailable(
@@ -294,6 +297,26 @@ impl FileStore {
         let mut hash = String::new();
         checked_file(&self.root.join("HEAD"))?.read_to_string(&mut hash)?;
         let snapshot = self.load_snapshot(&hash)?;
+        let mut next = Some(hash.clone());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut upper_seq = None;
+        while let Some(commit_hash) = next {
+            if !seen.insert(commit_hash.clone()) {
+                return Err(Error::AuthorityUnavailable("commit ancestry cycle".into()));
+            }
+            let ancestor = self.load_snapshot(&commit_hash)?;
+            if ancestor.binding != snapshot.binding
+                || upper_seq.is_some_and(|seq| ancestor.seq >= seq)
+            {
+                return Err(Error::AuthorityUnavailable(
+                    "invalid commit ancestry".into(),
+                ));
+            }
+            upper_seq = Some(ancestor.seq);
+            let commit: Commit =
+                serde_json::from_slice(&self.read_object("commits", &commit_hash)?)?;
+            next = commit.parent;
+        }
         Ok((hash, snapshot))
     }
 
