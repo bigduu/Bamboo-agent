@@ -151,6 +151,20 @@ impl TicketService {
                     assignment.state = AssignmentState::OutcomeUnknown;
                     assignment.updated_seq = snapshot.seq;
                     assignment.record_revision += 1;
+                    if let Some(work) = snapshot.tickets.get_mut(&assignment.work_id) {
+                        if work.active_assignment.as_deref() == Some(&assignment.id)
+                            && work.state == WorkState::Active
+                        {
+                            work.state = WorkState::Blocked;
+                            work.blocked = Some(BlockReason {
+                                reason:
+                                    "writer restarted; Runtime execution requires reconciliation"
+                                        .into(),
+                                resume_state: WorkState::Ready,
+                            });
+                            touch(work, snapshot.seq);
+                        }
+                    }
                 }
             }
             for request in snapshot.requests.values_mut() {
@@ -525,6 +539,14 @@ fn touch(ticket: &mut Ticket, seq: u64) {
     ticket.updated_seq = seq;
 }
 fn active_permit(snapshot: &Snapshot, assignment: &Assignment) -> Result<()> {
+    current_attempt(snapshot, assignment)?;
+    if assignment.process_stopped {
+        return Err(Error::ScopeDenied("Worker process has stopped".into()));
+    }
+    Ok(())
+}
+
+fn current_attempt(snapshot: &Snapshot, assignment: &Assignment) -> Result<()> {
     let work = ticket(snapshot, &assignment.work_id)?;
     if assignment.authority_epoch != snapshot.authority_epoch
         || assignment.contract_revision != work.contract_revision
@@ -833,6 +855,7 @@ fn apply(
                     state: AssignmentState::DispatchPending,
                     dispatch_key: dispatch_key.clone(),
                     runtime: None,
+                    process_stopped: false,
                     dependency_inputs: inputs,
                     plan: LocalPlan {
                         plan_revision: 0,
@@ -1153,7 +1176,7 @@ fn apply(
                 validate_artifact(artifact)?;
             }
             let work = ticket(snapshot, &a.work_id)?;
-            let stale = active_permit(snapshot, &a).is_err()
+            let stale = current_attempt(snapshot, &a).is_err()
                 || work.state == WorkState::Blocked
                 || dependencies(snapshot, work).ok().as_ref() != Some(&a.dependency_inputs);
             let id = allocate(temp_id, ids)?;
@@ -1315,7 +1338,10 @@ fn apply(
                 .assignments
                 .get_mut(assignment_id)
                 .expect("assignment");
-            a.state = AssignmentState::Cancelled;
+            a.process_stopped = true;
+            if a.state != AssignmentState::Submitted {
+                a.state = AssignmentState::Cancelled;
+            }
             a.record_revision += 1;
             a.updated_seq = seq;
             let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
@@ -1332,6 +1358,102 @@ fn apply(
                 }
                 touch(work, seq);
             }
+        }
+        RuntimeStopped {
+            assignment_id,
+            receipt,
+            completed,
+        } => {
+            authority.runtime()?;
+            let a = assignment(snapshot, assignment_id)?.clone();
+            if a.runtime.as_ref() != Some(receipt) {
+                return Err(Error::ScopeDenied(
+                    "stop proof differs from Runtime receipt".into(),
+                ));
+            }
+            let effects_unknown = a.effects.values().any(|effect| {
+                matches!(
+                    effect.state,
+                    EffectState::Started | EffectState::OutcomeUnknown
+                )
+            });
+            let cancelled = ticket(snapshot, &a.work_id)?.state == WorkState::Cancelled;
+            let updated = snapshot
+                .assignments
+                .get_mut(assignment_id)
+                .expect("assignment");
+            updated.process_stopped = true;
+            updated.record_revision += 1;
+            updated.updated_seq = seq;
+            if effects_unknown {
+                updated.state = AssignmentState::OutcomeUnknown;
+            } else if cancelled {
+                updated.state = AssignmentState::Cancelled;
+            } else if !completed && updated.state != AssignmentState::Submitted {
+                updated.state = AssignmentState::Failed;
+            }
+            let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
+            // A late stopped run affects its own attempt only.
+            if work.active_assignment.as_deref() == Some(assignment_id) {
+                if cancelled && !effects_unknown {
+                    work.active_assignment = None;
+                    touch(work, seq);
+                } else if effects_unknown || !completed {
+                    work.blocked = Some(BlockReason {
+                        reason: if effects_unknown {
+                            "stopped process has unreconciled external effects"
+                        } else {
+                            "Runtime stopped without a completed result"
+                        }
+                        .into(),
+                        resume_state: WorkState::Ready,
+                    });
+                    if !cancelled {
+                        work.state = WorkState::Blocked;
+                    }
+                    touch(work, seq);
+                }
+            }
+        }
+        ReconcileCompleted {
+            assignment_id,
+            receipt,
+        } => {
+            authority.runtime()?;
+            let a = assignment(snapshot, assignment_id)?.clone();
+            let work = ticket(snapshot, &a.work_id)?;
+            if !a.process_stopped
+                || a.runtime.as_ref() != Some(receipt)
+                || a.effects.values().any(|effect| {
+                    matches!(
+                        effect.state,
+                        EffectState::Started | EffectState::OutcomeUnknown
+                    )
+                })
+                || work.generation != a.generation
+                || work.contract_revision != a.contract_revision
+                || work.active_assignment.as_deref() != Some(assignment_id)
+                || work.state == WorkState::Cancelled
+                || dependencies(snapshot, work)? != a.dependency_inputs
+                || !matches!(
+                    a.state,
+                    AssignmentState::OutcomeUnknown | AssignmentState::Running
+                )
+            {
+                return Err(invalid("canonical completed attempt cannot be reconciled"));
+            }
+            let a = snapshot
+                .assignments
+                .get_mut(assignment_id)
+                .expect("assignment");
+            a.authority_epoch = snapshot.authority_epoch;
+            a.state = AssignmentState::Running;
+            a.record_revision += 1;
+            a.updated_seq = seq;
+            let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
+            work.state = WorkState::Active;
+            work.blocked = None;
+            touch(work, seq);
         }
         OutcomeUnknown {
             assignment_id,
@@ -1445,15 +1567,22 @@ fn apply(
 }
 
 pub(crate) fn holds_resources(a: &Assignment) -> bool {
-    matches!(
-        a.state,
-        AssignmentState::DispatchPending
-            | AssignmentState::Admitted
-            | AssignmentState::Running
-            | AssignmentState::Cancelling
-            | AssignmentState::OutcomeUnknown
-            | AssignmentState::Submitted
-    )
+    (!a.process_stopped
+        || a.effects.values().any(|effect| {
+            matches!(
+                effect.state,
+                EffectState::Started | EffectState::OutcomeUnknown
+            )
+        }))
+        && matches!(
+            a.state,
+            AssignmentState::DispatchPending
+                | AssignmentState::Admitted
+                | AssignmentState::Running
+                | AssignmentState::Cancelling
+                | AssignmentState::OutcomeUnknown
+                | AssignmentState::Submitted
+        )
 }
 
 fn validate_contract(contract: &Contract) -> Result<()> {

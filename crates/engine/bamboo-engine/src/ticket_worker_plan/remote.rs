@@ -5,6 +5,8 @@ use bamboo_subagent::executor::HostBridge;
 use bamboo_tickets::WorkContextPacket;
 use serde::{Deserialize, Serialize};
 
+pub const TICKET_BOOTSTRAP_POSTURE_PENDING: &str = "ticket_bootstrap_posture_pending";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanProjection {
@@ -81,13 +83,24 @@ impl RemoteWorkerPlan {
                 "invalid native LocalPlan binding".into(),
             ));
         }
-        let data = host
-            .subagent_call(
-                serde_json::json!({(TICKET_PLAN_ACTION): {"read":true}}),
-                "ticket-plan-bootstrap",
-            )
-            .await
-            .map_err(Error::AuthorityUnavailable)?;
+        // Events and callback controls use distinct transport lanes. A queued
+        // posture event may arrive after this read. Retry only the Host's exact
+        // pending-posture response, never a mutation or general authority error.
+        let request = serde_json::json!({(TICKET_PLAN_ACTION): {"read":true}});
+        let mut attempts = 0;
+        let data = loop {
+            match host
+                .subagent_call(request.clone(), "ticket-plan-bootstrap")
+                .await
+            {
+                Ok(data) => break data,
+                Err(error) if error == TICKET_BOOTSTRAP_POSTURE_PENDING && attempts < 16 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(Error::AuthorityUnavailable(error)),
+            }
+        };
         let initial: PlanProjection = serde_json::from_value(data)?;
         if initial.assignment_id != packet.assignment_id
             || initial.generation != packet.generation

@@ -6,6 +6,60 @@ use bamboo_storage::{FileSessionInbox, LockedSessionStore, SessionStoreV2};
 use bamboo_tickets::{Contract, FaultPoint, TicketKind};
 use std::collections::BTreeSet;
 
+#[tokio::test]
+async fn ticket_completed_checkpoint_recovers_unpublished_stop_and_submission_after_restart() {
+    let mut f = Fixture::new().await;
+    let _registration = f
+        .runtime
+        .router
+        .register_run(&f.child.id, "host-run")
+        .await
+        .unwrap();
+    admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+        .await
+        .unwrap();
+    let receipt = read_dispatch(&f.child).unwrap().unwrap().receipt.unwrap();
+    // Controlled Host checkpoint fixture, not a real process-stop assertion.
+    f.child.metadata.insert("ticket.runtime.owned_stop.v1".into(), serde_json::json!({"receipt":receipt,"child_birth":f.child.created_at,"pid":1234,"completed":true}).to_string());
+    f.child.metadata_version += 1;
+    f.child.set_last_run_status("completed");
+    f.child.messages.push(bamboo_domain::Message::assistant(
+        "saved result bytes",
+        None,
+    ));
+    f.storage.save_session(&f.child).await.unwrap();
+    let Fixture {
+        dir,
+        service,
+        storage,
+        child,
+        ..
+    } = f;
+    let binding = service.published().unwrap().1.binding;
+    drop(service);
+    let service = TicketService::open(dir.path().join("tickets"), binding).unwrap();
+    let receipt = checkpoint_ticket_result(&service, storage.as_ref(), &child, "host-run")
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = service.published().unwrap().1;
+    let submission = &snapshot.submissions[&receipt.ids["submission"]];
+    assert!(!submission.stale);
+    let assignment = &snapshot.assignments[&submission.assignment_id];
+    assert!(assignment.process_stopped);
+    assert_eq!(
+        snapshot.tickets[&submission.work_id].state,
+        WorkState::Submitted
+    );
+    assert!(
+        crate::ticket_worker_plan::TicketWorkerPlan::from_runtime_receipt(
+            Arc::new(service),
+            &assignment.id
+        )
+        .is_err()
+    );
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     service: Arc<TicketService>,
@@ -182,6 +236,10 @@ async fn canonical_activation_receipt_is_stable_queryable_and_fenced_after_resta
     let binding = f.spec.binding.clone();
     drop(f.service);
     let restarted = Arc::new(TicketService::open(f.dir.path().join("tickets"), binding).unwrap());
+    // Existing Session boot reconciliation uses an error display status for
+    // an abandoned runner. It is not a physical-stop/effect receipt.
+    f.child.set_last_run_status("error");
+    f.storage.save_session(&f.child).await.unwrap();
     assert!(
         matches!(query_dispatch(f.storage.as_ref(), &restarted, &f.key, &f.spec).await.unwrap(), DispatchObservation::OutcomeUnknown { receipt:Some(ref r), .. } if r == &receipt)
     );

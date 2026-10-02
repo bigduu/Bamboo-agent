@@ -1025,6 +1025,7 @@ pub struct BrokerTerminalReceiptReconciler {
     store: Arc<bamboo_storage::SessionStoreV2>,
     bus: Option<bamboo_subagent::BusEndpoint>,
     remote: HashMap<String, Option<ReceiptRemoteRoute>>,
+    ticket_service: Option<Arc<bamboo_tickets::TicketService>>,
 }
 
 struct ReceiptRemoteRoute {
@@ -1057,6 +1058,7 @@ impl BrokerTerminalReceiptReconciler {
         }
         Self {
             store,
+            ticket_service: None,
             bus: subagents.broker.clone().and_then(|broker| {
                 (!broker.endpoint.trim().is_empty() && !broker.token.is_empty()).then_some(
                     bamboo_subagent::BusEndpoint {
@@ -1067,6 +1069,14 @@ impl BrokerTerminalReceiptReconciler {
             }),
             remote,
         }
+    }
+
+    pub fn with_ticket_service(
+        mut self,
+        service: Option<Arc<bamboo_tickets::TicketService>>,
+    ) -> Self {
+        self.ticket_service = service;
+        self
     }
 
     /// One physical-tree scan. Every Child is independent; a failed route,
@@ -1195,6 +1205,24 @@ impl BrokerTerminalReceiptReconciler {
             .map(String::as_str)
             .unwrap_or("worker");
         for receipt in receipts {
+            if current
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+                && current.last_run_status().as_deref() == Some("completed")
+            {
+                let service = self
+                    .ticket_service
+                    .as_ref()
+                    .ok_or("Ticket authority unavailable; no result ACK")?;
+                crate::ticket_runtime::checkpoint_ticket_result(
+                    service,
+                    self.store.as_ref(),
+                    &current,
+                    &receipt.activation_run_id,
+                )
+                .await
+                .map_err(|_| "Ticket result not checkpointed; broker receipt retained")?;
+            }
             let local_mailbox = format!("p-{}", child.id);
             // The committed receipt records the route used by this run. A
             // later role configuration change must not redirect its ACK.
@@ -3950,7 +3978,44 @@ impl ExternalChildRunner for ActorChildRunner {
         if remote {
             drop(actor);
         } else if required_context.is_some() {
-            actor.worker.kill().await;
+            if session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            {
+                let service = self.ticket_service.lock().recover_poison().clone();
+                let runtime = self.session_inbox_runtime.lock().recover_poison().clone();
+                let owned_run_id = crate::ticket_runtime::read_dispatch(session)
+                    .ok()
+                    .flatten()
+                    .and_then(|dispatch| dispatch.receipt.map(|receipt| receipt.run_id));
+                match actor.worker.kill_confirmed().await {
+                    Ok(proof) => {
+                        if let (Some(service), Some(runtime), Some(run_id)) =
+                            (service, runtime, owned_run_id.as_deref())
+                        {
+                            if let Err(error) = crate::ticket_runtime::checkpoint_owned_ticket_stop(
+                                &service,
+                                &runtime,
+                                session,
+                                run_id,
+                                &proof,
+                                result.is_ok(),
+                            )
+                            .await
+                            {
+                                // The canonical terminal save can retain output
+                                // and retry this stop fact before broker ACK.
+                                tracing::warn!(child_id = %session.id, %error, "Ticket owned-process stop publication retained for reconciliation");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(child_id = %session.id, %error, "Ticket process stop remains unconfirmed; resources retained");
+                    }
+                }
+            } else {
+                actor.worker.kill().await;
+            }
         } else {
             match &result {
                 Ok(_) => self.release_bus_worker(&pool_key, actor).await,
@@ -7649,7 +7714,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             || (args.get("action").and_then(|value| value.as_str()) == Some("create")
                                 && args.get("wait").and_then(|value| value.as_bool()) == Some(true));
                         let checkpoint_payload = args.get(PARENT_QUESTION_CHECKPOINT_ACTION).cloned();
-                        let result = if valid_shape
+                        let ticket_bootstrap_pending = valid_shape
+                            && logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+                            && args == serde_json::json!({(crate::ticket_worker_plan::TICKET_PLAN_ACTION): {"read":true}})
+                            && permission_handshake.is_awaiting()
+                            && !cancel_token.is_cancelled();
+                        let result = if ticket_bootstrap_pending {
+                            // A read control can overtake the queued posture
+                            // event on the separate lanes. Keep the handshake
+                            // fence; the exact bootstrap read may retry briefly.
+                            serde_json::json!({"error":crate::ticket_worker_plan::remote::TICKET_BOOTSTRAP_POSTURE_PENDING})
+                        } else if valid_shape
                             && (!logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
                                 || args.get(crate::ticket_worker_plan::TICKET_PLAN_ACTION).is_some())
                             && !cancel_token.is_cancelled()

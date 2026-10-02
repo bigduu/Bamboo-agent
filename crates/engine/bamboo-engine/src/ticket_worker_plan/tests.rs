@@ -451,12 +451,26 @@ async fn native_bridge_writes_only_host_bound_plan_and_rejects_other_run() {
     let service = f.service.clone();
     let caller = f.session.clone();
     let pump = tokio::spawn(async move {
+        let mut pending_once = true;
         while let Some(request) = requests.recv().await {
             assert_eq!(
                 request.kind,
                 bamboo_subagent::executor::HostRequestKind::SubAgent
             );
             let id = request.body["tool_call_id"].as_str().unwrap();
+            if pending_once {
+                assert_eq!(id, "ticket-plan-bootstrap");
+                assert_eq!(
+                    request.body["args"],
+                    json!({(TICKET_PLAN_ACTION):{"read":true}})
+                );
+                pending_once = false;
+                request
+                    .reply
+                    .send(json!({"error":super::remote::TICKET_BOOTSTRAP_POSTURE_PENDING}))
+                    .unwrap();
+                continue;
+            }
             let result = apply_host_plan_request(
                 &service,
                 &caller,

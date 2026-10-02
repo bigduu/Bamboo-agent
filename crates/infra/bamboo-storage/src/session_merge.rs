@@ -49,6 +49,7 @@ const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
     "gold_config",
     "workflow.run_ids.v1",
     "ticket.runtime.dispatch.v1",
+    "ticket.runtime.owned_stop.v1",
 ];
 const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "workspace_source",

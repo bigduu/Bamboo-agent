@@ -819,7 +819,8 @@ impl AppState {
             bamboo_engine::external_agents::actor_adapter::BrokerTerminalReceiptReconciler::new(
                 session_store.clone(),
                 &config_snapshot,
-            ),
+            )
+            .with_ticket_service(tickets.service().ok()),
         );
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),

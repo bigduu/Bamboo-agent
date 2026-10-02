@@ -335,3 +335,36 @@ Runtime passes, not real-model semantic evaluation or full P5/P9 acceptance.
 Confirmed-stop/cancel resource release, crash-window result reconciliation,
 model-facing tools, P7 semantics, Lotus integration, and the full A1–A12
 matrix remain subsequent work. No remote publication or production changes.
+### Local slice 11: cancellation and completion reconciliation
+
+Worktree `bamboo-1481-runtime-recovery`, branch
+`bamboo/feat/1481-runtime-recovery`, based on `e4374e6d`.
+Host-owned native process reaping now persists an independent stop checkpoint
+bound to the exact Child birth and run receipt. Canonical completion recovery
+publishes stop/submission before the existing broker receipt ACK. Recovery
+never resumes a stopped Worker or grants its tools. Cancellation commits first
+and interrupts the existing Child asynchronously. Started/unknown external
+effects retain claims even after process stop; no external exactly-once claim.
+
+Actual isolated Host/native HTTP-provider fixtures pass: complete private
+Task/Submission/user acceptance/restart; cancellation while the provider is
+held; and abrupt Host loss followed by original-receipt replay, unknown
+quarantine and zero additional Worker provider calls. These are real process
+tests with controlled provider responses, not semantic model evaluation.
+
+The new native regression initially failed before any provider call: the
+bootstrap read control overtook its permission-posture event on distinct
+transport lanes. Only that exact read now retries the explicit pending-posture
+response, bounded to 16 retries. Permission fences and mutation failures are
+unchanged. Actual Host-loss tests also exposed a missing Work blocked reason
+and a Session orphan `error` display masking Ticket outcome_unknown; both are
+fixed and covered. Failed fixture directories/logs remain under the unique
+`/tmp/bamboo-1481-ticket-*` prefixes. The earlier slice-10 90-second timeout
+still has no retained cause and is not retrospectively declared resolved.
+
+Focused service suite: 32 passing tests; native plan bridge: 5 passing tests;
+owned-process reaping regression: 1 passing test. Runtime tests and precise
+actual admission/result publication exits are tracked separately. A7/P5 is
+not fully accepted until those exits and the existing owner barrier regression
+pass. Clippy completes with existing engine/storage/server warnings; no
+unrelated lint repair is included. P6 model tools, P7/P8/P9 remain in progress.

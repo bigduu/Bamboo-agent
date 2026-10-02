@@ -13,7 +13,7 @@ use crate::execution::spawn::SessionInboxRuntimeBinding;
 
 pub const TICKET_DISPATCH_KEY: &str = "ticket.runtime.dispatch.v1";
 mod result;
-pub use result::checkpoint_ticket_result;
+pub use result::{checkpoint_owned_ticket_stop, checkpoint_ticket_result};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,7 +119,8 @@ pub fn require_dispatch_permission(
         .get(&dispatch.assignment_id)
         .ok_or_else(|| Error::ScopeDenied("Assignment missing".into()))?;
     let work = &snapshot.tickets[&assignment.work_id];
-    if snapshot.binding != dispatch.binding
+    if assignment.process_stopped
+        || snapshot.binding != dispatch.binding
         || snapshot
             .intents
             .get(&dispatch.dispatch_key)
@@ -219,6 +220,15 @@ pub async fn query_dispatch(
             return Ok(DispatchObservation::OutcomeUnknown {
                 receipt: Some(receipt),
                 reason: "Runtime receipt prepared but Ticket admission not confirmed".into(),
+            });
+        }
+        if snapshot.assignments[&spec.assignment_id].state == AssignmentState::OutcomeUnknown {
+            // Startup may mark the Session's abandoned runner as an error.
+            // That display status cannot prove the old OS process stopped or
+            // reconcile its effects, so preserve the authoritative quarantine.
+            return Ok(DispatchObservation::OutcomeUnknown {
+                receipt: Some(receipt),
+                reason: "Ticket attempt requires Runtime stop/result reconciliation".into(),
             });
         }
         let status = child.last_run_status();

@@ -136,6 +136,9 @@ pub struct Assignment {
     pub state: AssignmentState,
     pub dispatch_key: String,
     pub runtime: Option<RuntimeReceipt>,
+    /// Host-confirmed owned-process termination, independent of business state.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub process_stopped: bool,
     pub dependency_inputs: Vec<DependencyInput>,
     pub plan: LocalPlan,
     pub workspace: Option<ExecutionWorkspace>,
@@ -446,6 +449,15 @@ pub enum Operation {
     ConfirmStopped {
         assignment_id: String,
         effects_reconciled: bool,
+    },
+    RuntimeStopped {
+        assignment_id: String,
+        receipt: RuntimeReceipt,
+        completed: bool,
+    },
+    ReconcileCompleted {
+        assignment_id: String,
+        receipt: RuntimeReceipt,
     },
     OutcomeUnknown {
         assignment_id: String,

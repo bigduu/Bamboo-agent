@@ -991,6 +991,240 @@ fn resources_remain_claimed_after_submission_until_runtime_confirms_stopped() {
 }
 
 #[test]
+fn stopped_attempt_cannot_execute_tools_but_retains_successful_submission_state() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "A", BTreeSet::new());
+    let (id, worker) = start(&service, &work, "start-A");
+    let receipt = service.published().unwrap().1.assignments[&id]
+        .runtime
+        .clone()
+        .unwrap();
+    let stop = command(
+        &service,
+        "stop-A",
+        vec![Operation::RuntimeStopped {
+            assignment_id: id.clone(),
+            receipt: receipt.clone(),
+            completed: true,
+        }],
+    );
+    assert!(matches!(
+        service.execute(&worker, &stop),
+        Err(Error::ScopeDenied(_))
+    ));
+    let mut wrong = receipt.clone();
+    wrong.run_id = "forged-run".into();
+    assert!(matches!(
+        service.execute(
+            &runtime(),
+            &command(
+                &service,
+                "wrong-stop",
+                vec![Operation::RuntimeStopped {
+                    assignment_id: id.clone(),
+                    receipt: wrong,
+                    completed: true
+                }]
+            )
+        ),
+        Err(Error::ScopeDenied(_))
+    ));
+    service.execute(&runtime(), &stop).unwrap();
+    assert!(service.authorize_tool(&worker, "Task").is_err());
+    let result = submit(&service, &id, &worker, "submit-stopped");
+    let snapshot = service.published().unwrap().1;
+    assert!(!snapshot.submissions[&result].stale);
+    assert_eq!(snapshot.tickets[&work].state, WorkState::Submitted);
+    execute(
+        &service,
+        &runtime(),
+        "confirm-stopped",
+        vec![Operation::ConfirmStopped {
+            assignment_id: id.clone(),
+            effects_reconciled: true,
+        }],
+    );
+    assert_eq!(
+        service.published().unwrap().1.assignments[&id].state,
+        AssignmentState::Submitted
+    );
+}
+
+#[test]
+fn completion_reconciliation_requires_stopped_exact_current_attempt() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "A", BTreeSet::new());
+    let (id, _) = start(&service, &work, "start-A");
+    let receipt = service.published().unwrap().1.assignments[&id]
+        .runtime
+        .clone()
+        .unwrap();
+    let op = Operation::ReconcileCompleted {
+        assignment_id: id.clone(),
+        receipt: receipt.clone(),
+    };
+    assert!(service
+        .execute(&runtime(), &command(&service, "no-stop", vec![op.clone()]))
+        .is_err());
+    execute(
+        &service,
+        &runtime(),
+        "stop",
+        vec![Operation::RuntimeStopped {
+            assignment_id: id.clone(),
+            receipt: receipt.clone(),
+            completed: true,
+        }],
+    );
+    let epoch = service.published().unwrap().1.authority_epoch;
+    drop(service);
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    assert!(service.published().unwrap().1.authority_epoch > epoch);
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work].state,
+        WorkState::Blocked
+    );
+    execute(&service, &runtime(), "reconcile", vec![op.clone()]);
+    let snapshot = service.published().unwrap().1;
+    assert!(snapshot.assignments[&id].process_stopped);
+    assert_eq!(
+        snapshot.assignments[&id].authority_epoch,
+        snapshot.authority_epoch
+    );
+    execute(
+        &service,
+        &supervisor(),
+        "cancel",
+        vec![Operation::Cancel {
+            work_id: work.clone(),
+        }],
+    );
+    assert!(service
+        .execute(
+            &runtime(),
+            &command(&service, "cancelled-reconcile", vec![op])
+        )
+        .is_err());
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work].state,
+        WorkState::Cancelled
+    );
+}
+
+#[test]
+fn stopped_process_does_not_release_an_unknown_external_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "A", BTreeSet::new());
+    let (id, worker) = start(&service, &work, "start-A");
+    let action = Action {
+        kind: "payment".into(),
+        target: "A".into(),
+        data_hash: content_hash(b"data"),
+        amount: Some("10 CNY".into()),
+        permissions: BTreeSet::new(),
+        risk: "fixture".into(),
+    };
+    let fingerprint = content_hash(&canonical_bytes(&action).unwrap());
+    let request = execute(
+        &service,
+        &worker,
+        "ask",
+        vec![Operation::Ask {
+            work_id: work,
+            temp_id: "request".into(),
+            prompt: "Approve exact action?".into(),
+            action: Some(action),
+        }],
+    )
+    .ids["request"]
+        .clone();
+    execute(
+        &service,
+        &user(),
+        "approve",
+        vec![Operation::DecideApproval {
+            request_id: request.clone(),
+            prompt_revision: 1,
+            fingerprint: fingerprint.clone(),
+            approve: true,
+        }],
+    );
+    execute(
+        &service,
+        &worker,
+        "consume",
+        vec![Operation::ConsumeApproval {
+            request_id: request,
+            fingerprint: fingerprint.clone(),
+            attempt_id: "attempt".into(),
+        }],
+    );
+    execute(
+        &service,
+        &worker,
+        "effect-started",
+        vec![Operation::RecordEffect {
+            assignment_id: id.clone(),
+            attempt_id: "attempt".into(),
+            effect: Effect {
+                action_fingerprint: fingerprint,
+                state: EffectState::Started,
+                provider_receipt: None,
+            },
+        }],
+    );
+    let receipt = service.published().unwrap().1.assignments[&id]
+        .runtime
+        .clone()
+        .unwrap();
+    execute(
+        &service,
+        &runtime(),
+        "stopped",
+        vec![Operation::RuntimeStopped {
+            assignment_id: id.clone(),
+            receipt: receipt.clone(),
+            completed: true,
+        }],
+    );
+    let snapshot = service.published().unwrap().1;
+    assert!(snapshot.assignments[&id].process_stopped);
+    assert_eq!(
+        snapshot.assignments[&id].state,
+        AssignmentState::OutcomeUnknown
+    );
+    assert!(service
+        .execute(
+            &runtime(),
+            &command(
+                &service,
+                "release",
+                vec![Operation::ConfirmStopped {
+                    assignment_id: id.clone(),
+                    effects_reconciled: true,
+                }]
+            )
+        )
+        .is_err());
+    assert!(service
+        .execute(
+            &runtime(),
+            &command(
+                &service,
+                "reconcile",
+                vec![Operation::ReconcileCompleted {
+                    assignment_id: id,
+                    receipt,
+                }]
+            )
+        )
+        .is_err());
+}
+
+#[test]
 fn explicit_import_is_idempotent_and_legacy_completed_never_becomes_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let service = TicketService::open(dir.path(), binding()).unwrap();

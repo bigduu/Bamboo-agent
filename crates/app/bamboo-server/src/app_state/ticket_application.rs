@@ -7,8 +7,8 @@ use std::{
 
 use bamboo_config::Config;
 use bamboo_domain::{SessionAuthorityIdentity, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
-use bamboo_engine::ticket_runtime;
 use bamboo_engine::ticket_worker_plan::tickets::*;
+use bamboo_engine::{session_app::child_session::ChildSessionPort, ticket_runtime};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -167,7 +167,9 @@ impl TicketApplication {
             ));
         }
         let (service, authority) = self.authority(principal).await?;
-        service.work_update(&authority, command)
+        let receipt = service.work_update(&authority, command)?;
+        self.cancel_after_commit(&service, command);
+        Ok(receipt)
     }
 
     /// Commit before enqueue, return admission observations without waiting for
@@ -181,6 +183,7 @@ impl TicketApplication {
         }
         let (service, authority) = self.authority(principal).await?;
         let receipt = service.work_dispatch(&authority, command)?;
+        self.cancel_after_commit(&service, command);
         let snapshot = service.published()?.1;
         let mut runtime = Vec::new();
         let mut errors = Vec::new();
@@ -201,6 +204,78 @@ impl TicketApplication {
         Ok(
             json!({"status":"accepted_for_dispatch", "receipt":receipt,"runtime":runtime,"errors":errors}),
         )
+    }
+
+    fn cancel_after_commit(&self, service: &Arc<TicketService>, command: &Command) {
+        let Some(adapter) = self.adapter.get() else {
+            return;
+        };
+        let Ok((_, snapshot)) = service.published() else {
+            return;
+        };
+        for work in command.operations.iter().filter_map(|op| match op {
+            Operation::Cancel { work_id } => Some(work_id),
+            _ => None,
+        }) {
+            let Some(assignment_id) = snapshot
+                .tickets
+                .get(work)
+                .and_then(|w| w.active_assignment.as_ref())
+            else {
+                continue;
+            };
+            let assignment = snapshot.assignments[assignment_id].clone();
+            let service = service.clone();
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+                // Cancellation interrupts existing execution even if future
+                // dispatch is disabled. Runner/lease disappearance alone does
+                // not grant a stopped-process or released-resource fact.
+                if let Err(error) = adapter.cancel_child_run_and_wait(&child_id).await {
+                    tracing::warn!(assignment_id = %assignment.id, %error, "Ticket cancellation retained for reconciliation");
+                    return;
+                }
+                let Ok(current) = service.published() else {
+                    return;
+                };
+                let a = &current.1.assignments[&assignment.id];
+                if a.runtime.is_some() || a.process_stopped {
+                    return;
+                }
+                // An exact cancelled launch with no prepared Run receipt cannot
+                // have received a RunSpec. Check canonical Host control plane.
+                let Ok(Some(child)) = adapter.storage.load_runtime_control_plane(&child_id).await
+                else {
+                    return;
+                };
+                let Ok(Some(dispatch)) = ticket_runtime::read_dispatch(&child) else {
+                    return;
+                };
+                if dispatch.assignment_id != a.id
+                    || dispatch.receipt.is_some()
+                    || child.last_run_status().as_deref() != Some("cancelled")
+                    || !child.is_child_launch_cancelled(child.child_launch_generation())
+                {
+                    return;
+                }
+                let authority =
+                    Authority::from_verified_host(current.1.binding, Principal::Runtime);
+                let id = format!("runtime-queued-stop/{}", a.dispatch_key);
+                if let Ok(command) = service.prepare_command(
+                    &authority,
+                    &id,
+                    vec![Operation::ConfirmStopped {
+                        assignment_id: a.id.clone(),
+                        effects_reconciled: true,
+                    }],
+                ) {
+                    if let Err(error) = service.execute(&authority, &command) {
+                        tracing::warn!(assignment_id = %a.id, %error, "Ticket queued cancellation stop not published");
+                    }
+                }
+            });
+        }
     }
 
     async fn ensure(
