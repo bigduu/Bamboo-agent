@@ -166,6 +166,82 @@ fn submit(service: &TicketService, id: &str, worker: &Authority, op: &str) -> St
 }
 
 #[test]
+fn managed_artifact_bytes_are_scoped_manifest_reachable_and_backup_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scope");
+    let service = TicketService::open(&root, binding()).unwrap();
+    let work = create(&service, "Artifact", BTreeSet::new());
+    let (id, worker) = start(&service, &work, "start-artifact");
+    assert!(service
+        .store_artifact(&worker, b"forged host bytes")
+        .is_err());
+    let bytes = "完整 canonical output\nwith evidence".as_bytes();
+    let artifact = service.store_artifact(&runtime(), bytes).unwrap();
+    assert_eq!(artifact.sha256, content_hash(bytes));
+    assert!(service.read_artifact(&user(), &artifact, 65536).is_err());
+    let seq = service.published().unwrap().1.seq;
+    let missing = Artifact {
+        uri: format!("{}{}", store::MANAGED_ARTIFACT_PREFIX, "0".repeat(64)),
+        sha256: "0".repeat(64),
+    };
+    assert!(service
+        .execute(
+            &worker,
+            &command(
+                &service,
+                "missing-bytes",
+                vec![Operation::Submit {
+                    assignment_id: id.clone(),
+                    temp_id: "s".into(),
+                    artifacts: vec![missing],
+                    evidence: vec!["declared hash is insufficient".into()],
+                }]
+            )
+        )
+        .is_err());
+    assert_eq!(service.published().unwrap().1.seq, seq);
+    execute(
+        &service,
+        &worker,
+        "real-bytes",
+        vec![Operation::Submit {
+            assignment_id: id,
+            temp_id: "s".into(),
+            artifacts: vec![artifact.clone()],
+            evidence: vec!["Host checkpoint".into()],
+        }],
+    );
+    assert_eq!(
+        service.read_artifact(&worker, &artifact, 65536).unwrap(),
+        bytes
+    );
+    assert!(matches!(
+        service.read_artifact(&user(), &artifact, 1),
+        Err(Error::ContextBudgetExceeded)
+    ));
+    let sibling = create(&service, "Sibling", BTreeSet::new());
+    let (_, sibling_worker) = start(&service, &sibling, "start-sibling");
+    assert!(matches!(
+        service.read_artifact(&sibling_worker, &artifact, 65536),
+        Err(Error::ScopeDenied(_))
+    ));
+    let backup = dir.path().join("backup");
+    let commit = service.export(&backup).unwrap();
+    let copy = TicketService::open(&backup, binding()).unwrap();
+    assert!(matches!(copy.health(), Health::ReadOnly { .. }));
+    assert_eq!(copy.published().unwrap().0, commit);
+    assert_eq!(
+        copy.read_artifact(&user(), &artifact, 65536).unwrap(),
+        bytes
+    );
+    drop(copy);
+    std::fs::write(backup.join("objects").join(&artifact.sha256), b"truncated").unwrap();
+    let damaged = TicketService::open(&backup, binding()).unwrap();
+    assert!(matches!(damaged.health(), Health::ReadOnly { .. }));
+    assert!(damaged.published().is_err());
+}
+
+#[test]
 fn single_work_closed_loop_requires_exact_submission_and_user_acceptance() {
     let dir = tempfile::tempdir().unwrap();
     let service = TicketService::open(dir.path(), binding()).unwrap();

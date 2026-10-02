@@ -199,6 +199,56 @@ impl TicketService {
             .export(destination.as_ref())
     }
 
+    /// Host computes the content hash from verified output bytes, never from
+    /// a Worker's declared URI/hash. Publication occurs with the Submission.
+    pub fn store_artifact(&self, authority: &Authority, bytes: &[u8]) -> Result<Artifact> {
+        let store = self.inner.lock().expect("store mutex");
+        let snapshot = &store
+            .published
+            .as_ref()
+            .ok_or_else(|| Error::AuthorityUnavailable("no verified snapshot".into()))?
+            .1;
+        validate_authority(authority, snapshot)?;
+        authority.runtime()?;
+        store.store_artifact(bytes)
+    }
+
+    /// Own submissions and versioned dependency inputs only for a Worker;
+    /// Supervisor/User reads still require a referenced scope Artifact.
+    pub fn read_artifact(
+        &self,
+        authority: &Authority,
+        artifact: &Artifact,
+        budget: usize,
+    ) -> Result<Vec<u8>> {
+        let store = self.inner.lock().expect("store mutex");
+        let snapshot = &store
+            .published
+            .as_ref()
+            .ok_or_else(|| Error::AuthorityUnavailable("no verified snapshot".into()))?
+            .1;
+        validate_authority(authority, snapshot)?;
+        let permitted = snapshot.submissions.values().any(|submission| {
+            submission.artifacts.contains(artifact)
+                && match &authority.principal {
+                    Principal::Worker { assignment_id, .. } => {
+                        submission.assignment_id == *assignment_id
+                            || snapshot.assignments[assignment_id]
+                                .dependency_inputs
+                                .iter()
+                                .any(|input| input.submission_id == submission.id)
+                    }
+                    _ => true,
+                }
+        });
+        if !permitted {
+            return Err(Error::ScopeDenied(
+                "Artifact is not a readable scope reference".into(),
+            ));
+        }
+        store.read_artifact(artifact, budget)
+    }
+
     pub(crate) fn snapshot_parent(&self, commit: &str) -> Result<Option<String>> {
         self.inner
             .lock()

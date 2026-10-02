@@ -2610,6 +2610,34 @@ impl ExternalChildRunner for ActorChildRunner {
         activation_run_id: &str,
         save_succeeded: bool,
     ) -> Result<(), String> {
+        if save_succeeded
+            && session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+        {
+            let service = self
+                .ticket_service
+                .lock()
+                .recover_poison()
+                .clone()
+                .ok_or_else(|| {
+                    "Ticket authority unavailable for terminal checkpoint".to_string()
+                })?;
+            let runtime = self
+                .session_inbox_runtime
+                .lock()
+                .recover_poison()
+                .clone()
+                .ok_or_else(|| "Ticket runtime unavailable for terminal checkpoint".to_string())?;
+            crate::ticket_runtime::checkpoint_ticket_result(
+                &service,
+                runtime.storage.as_ref(),
+                session,
+                activation_run_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
         let key = (
             session.id.clone(),
             session.created_at,

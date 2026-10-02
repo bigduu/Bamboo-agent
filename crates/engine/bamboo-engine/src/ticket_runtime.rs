@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::execution::spawn::SessionInboxRuntimeBinding;
 
 pub const TICKET_DISPATCH_KEY: &str = "ticket.runtime.dispatch.v1";
+mod result;
+pub use result::checkpoint_ticket_result;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

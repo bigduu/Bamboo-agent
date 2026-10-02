@@ -9,7 +9,22 @@ use std::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::{canonical_bytes, content_hash, Error, Result, ScopeBinding, Snapshot};
+use crate::{canonical_bytes, content_hash, Artifact, Error, Result, ScopeBinding, Snapshot};
+
+pub const MANAGED_ARTIFACT_PREFIX: &str = "artifact://ticket/";
+pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+
+fn managed_artifact_hash(artifact: &Artifact) -> Result<Option<&str>> {
+    let Some(hash) = artifact.uri.strip_prefix(MANAGED_ARTIFACT_PREFIX) else {
+        return Ok(None);
+    };
+    if !valid_hash(hash) || hash != artifact.sha256 {
+        return Err(Error::InvalidTransition(
+            "managed Artifact URI/hash mismatch".into(),
+        ));
+    }
+    Ok(Some(hash))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Health {
@@ -58,6 +73,17 @@ pub struct FileStore {
     fault: Option<PublicationFault>,
 }
 
+impl Drop for FileStore {
+    fn drop(&mut self) {
+        // fork temporarily inherits the locked open-file description, even
+        // when exec will close it. Authority ends with this writer, not with
+        // an unrelated subprocess's inherited descriptor. An unlock failure
+        // remains conservative: closing the final descriptor still releases
+        // the lock; another writer never bypasses a retained lock.
+        let _ = FileExt::unlock(&self._writer_lock);
+    }
+}
+
 fn checked_file(path: &Path) -> Result<File> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(Error::AuthorityUnavailable("symlink in authority".into()));
@@ -73,6 +99,32 @@ fn valid_hash(hash: &str) -> bool {
 }
 
 impl FileStore {
+    pub(crate) fn store_artifact(&self, bytes: &[u8]) -> Result<Artifact> {
+        if self.health != Health::Writable {
+            return Err(Error::AuthorityUnavailable(
+                "Artifact write requires writable authority".into(),
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        let sha256 = self.write_object("objects", bytes)?;
+        Ok(Artifact {
+            uri: format!("{MANAGED_ARTIFACT_PREFIX}{sha256}"),
+            sha256,
+        })
+    }
+
+    pub(crate) fn read_artifact(&self, artifact: &Artifact, budget: usize) -> Result<Vec<u8>> {
+        let hash = managed_artifact_hash(artifact)?.ok_or_else(|| {
+            Error::AuthorityUnavailable("external Artifact requires a trusted resolver".into())
+        })?;
+        let metadata = checked_file(&self.root.join("objects").join(hash))?.metadata()?;
+        if metadata.len() > budget.min(MAX_ARTIFACT_BYTES) as u64 {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        self.read_object("objects", hash)
+    }
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -231,6 +283,17 @@ impl FileStore {
                 .cloned()
                 .ok_or_else(|| Error::AuthorityUnavailable("snapshot is not an object".into()))?;
             let mut objects = BTreeMap::new();
+            // Blob references participate in the same full manifest and fixed
+            // export as revisions. An orphan blob written before a failed
+            // Submission is harmless; referenced blobs must verify in full.
+            for submission in snapshot.submissions.values() {
+                for artifact in &submission.artifacts {
+                    if let Some(hash) = managed_artifact_hash(artifact)? {
+                        self.read_artifact(artifact, MAX_ARTIFACT_BYTES)?;
+                        objects.insert(format!("blob:{hash}"), hash.to_owned());
+                    }
+                }
+            }
             for category in [
                 "tickets",
                 "assignments",
@@ -351,6 +414,21 @@ impl FileStore {
             let (category, id) = key
                 .split_once(':')
                 .ok_or_else(|| Error::AuthorityUnavailable("malformed manifest key".into()))?;
+            if category == "blob" {
+                if id != hash {
+                    return Err(Error::AuthorityUnavailable(
+                        "blob manifest hash mismatch".into(),
+                    ));
+                }
+                self.read_artifact(
+                    &Artifact {
+                        uri: format!("{MANAGED_ARTIFACT_PREFIX}{hash}"),
+                        sha256: hash.clone(),
+                    },
+                    MAX_ARTIFACT_BYTES,
+                )?;
+                continue;
+            }
             let section = value
                 .get_mut(category)
                 .and_then(|v| v.as_object_mut())
@@ -365,6 +443,22 @@ impl FileStore {
             return Err(Error::AuthorityUnavailable(
                 "snapshot header mismatch".into(),
             ));
+        }
+        for submission in snapshot.submissions.values() {
+            for artifact in &submission.artifacts {
+                if let Some(hash) = managed_artifact_hash(artifact)? {
+                    if manifest
+                        .objects
+                        .get(&format!("blob:{hash}"))
+                        .map(String::as_str)
+                        != Some(hash)
+                    {
+                        return Err(Error::AuthorityUnavailable(
+                            "full manifest omits referenced Artifact".into(),
+                        ));
+                    }
+                }
+            }
         }
         Ok(snapshot)
     }
@@ -440,4 +534,28 @@ fn copy_synced(destination: &Path, category: &str, hash: &str, bytes: &[u8]) -> 
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_writer_releases_lock_despite_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let binding = ScopeBinding {
+            scope_id: "scope".into(),
+            supervisor_session_id: "supervisor".into(),
+            binding_revision: 1,
+        };
+        let store = FileStore::open(root.path(), binding.clone()).unwrap();
+        // A duplicate shares the open-file description, as a subprocess does
+        // between fork and exec. It does not own the TicketService lifetime.
+        let inherited = store._writer_lock.try_clone().unwrap();
+        assert!(FileStore::open(root.path(), binding.clone()).is_err());
+        drop(store);
+        let reopened = FileStore::open(root.path(), binding).unwrap();
+        assert_eq!(reopened.health, Health::Writable);
+        drop(inherited);
+    }
 }

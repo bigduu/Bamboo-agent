@@ -197,6 +197,132 @@ async fn canonical_activation_receipt_is_stable_queryable_and_fenced_after_resta
 }
 
 #[tokio::test]
+async fn canonical_completion_submits_exact_output_once_and_requires_user_acceptance() {
+    let mut f = Fixture::new().await;
+    let _registration = f
+        .runtime
+        .router
+        .register_run(&f.child.id, "host-run")
+        .await
+        .unwrap();
+    admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+        .await
+        .unwrap();
+    f.child.add_message(bamboo_domain::Message::assistant(
+        "Verified final output",
+        None,
+    ));
+    f.child.set_last_run_status("completed");
+    assert!(
+        checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+            .await
+            .unwrap()
+            .is_none(),
+        "unsaved Worker output is not a canonical result"
+    );
+    f.storage.save_session(&f.child).await.unwrap();
+    assert!(
+        checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "forged-run")
+            .await
+            .is_err()
+    );
+    let receipt = checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+        .await
+        .unwrap()
+        .unwrap();
+    let state = f.service.published().unwrap().1;
+    let submission = &state.submissions[&receipt.ids["submission"]];
+    assert!(!submission.stale);
+    assert_eq!(submission.generation, f.spec.generation);
+    assert_eq!(state.tickets[&f.spec.work_id].state, WorkState::Submitted);
+    assert!(state.tickets[&f.spec.work_id].accepted_submission.is_none());
+    let user = Authority::from_verified_host(
+        f.spec.binding.clone(),
+        Principal::User {
+            user_id: "fixture-user".into(),
+        },
+    );
+    assert_eq!(
+        f.service
+            .read_artifact(&user, &submission.artifacts[0], 65536)
+            .unwrap(),
+        b"Verified final output"
+    );
+    let seq = state.seq;
+    assert_eq!(
+        checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(f.service.published().unwrap().1.seq, seq);
+    execute_runtime_command(
+        &f.service,
+        &user,
+        "accept-exact-result",
+        vec![Operation::Accept {
+            work_id: f.spec.work_id.clone(),
+            submission_id: submission.id.clone(),
+            evidence: vec!["User verified this exact output".into()],
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        f.service.published().unwrap().1.tickets[&f.spec.work_id].state,
+        WorkState::Accepted
+    );
+}
+
+#[tokio::test]
+async fn late_canonical_output_is_archived_without_reversing_cancel() {
+    let mut f = Fixture::new().await;
+    let _registration = f
+        .runtime
+        .router
+        .register_run(&f.child.id, "host-run")
+        .await
+        .unwrap();
+    admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+        .await
+        .unwrap();
+    let supervisor = Authority::from_verified_host(
+        f.spec.binding.clone(),
+        Principal::Supervisor {
+            session_id: f.supervisor.id.clone(),
+        },
+    );
+    execute_runtime_command(
+        &f.service,
+        &supervisor,
+        "cancel",
+        vec![Operation::Cancel {
+            work_id: f.spec.work_id.clone(),
+        }],
+    )
+    .unwrap();
+    f.child.add_message(bamboo_domain::Message::assistant(
+        "Late original output",
+        None,
+    ));
+    f.child.set_last_run_status("completed");
+    f.storage.save_session(&f.child).await.unwrap();
+    let receipt = checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = f.service.published().unwrap().1;
+    assert!(snapshot.submissions[&receipt.ids["submission"]].stale);
+    assert_eq!(
+        snapshot.tickets[&f.spec.work_id].state,
+        WorkState::Cancelled
+    );
+    assert!(snapshot.tickets[&f.spec.work_id]
+        .current_submission
+        .is_none());
+}
+
+#[tokio::test]
 async fn prepared_receipt_survives_ticket_publication_failure_and_no_run_is_authorized() {
     let mut f = Fixture::new().await;
     let _registration = f

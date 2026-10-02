@@ -265,3 +265,34 @@ registration with controlled failures. They do not launch a Worker or prove
 process kill recovery. P5 terminal submission, fresh-process create-to-accept,
 actual intent/admission/receipt kill windows, P6 model tools, P7 semantics,
 Lotus and P9 remain outstanding. Dispatch remains disabled by default.
+### Local slice 9: canonical Runtime result checkpoint
+
+Worktree `bamboo-1481-runtime-results`; branch
+`bamboo/feat/1481-runtime-results`, based on `0609cc3a`. A completed Child's
+canonical saved checkpoint, exact birth/run, immutable dispatch spec, and
+trusted Supervisor proof must match before Host postprocessing creates a
+Submission. Unsaved output and a forged run are refused. Publication failure
+keeps the existing durable-delivery acknowledgement pending. Duplicate
+checkpoint processing returns the same receipt; cancellation preserves the
+late Submission as stale. Submitted Work still requires explicit acceptance.
+
+Final UTF-8 output is stored as a content-addressed Artifact under the scope
+writer; the full manifest and verified fixed backup include its bytes. Reads
+require a referenced Submission and Worker scope/input checks. Missing or
+corrupt Artifact bytes cannot become a published authority snapshot.
+
+Validation: engine `ticket_` tests 12/12; TicketService 29/29 (one unit, six
+query, five authority, seventeen contract tests); server check; TicketService
+all-target Clippy with `-D warnings`; formatting and whitespace checks pass.
+The initial complete TicketService run failed one immediate reopen with a
+retained OS lock. A descriptor-duplication regression reproduced that failure
+deterministically. Explicit writer teardown now unlocks before closing so a
+subprocess's temporary inherited descriptor cannot extend authority lifetime;
+the regression and the actual second-process writer-rejection test both pass.
+This does not bypass a live writer lock.
+
+The two new engine tests use real canonical storage and activation control
+planes with controlled saved completion checkpoints. They do not launch a
+Worker process and do not satisfy the P5 actual fresh one-shot exit criterion.
+Application scope/feature-flag wiring, dispatch recovery, confirmed-stop
+resource release, real model semantics, and Lotus acceptance remain pending.
