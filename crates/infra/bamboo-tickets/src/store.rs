@@ -71,6 +71,8 @@ pub struct FileStore {
     pub health: Health,
     pub published: Option<(String, Snapshot)>,
     fault: Option<PublicationFault>,
+    #[cfg(feature = "test-utils")]
+    operation_fault: Option<(String, PublicationFault)>,
 }
 
 impl Drop for FileStore {
@@ -162,6 +164,8 @@ impl FileStore {
             health: Health::Writable,
             published: None,
             fault: None,
+            #[cfg(feature = "test-utils")]
+            operation_fault: None,
         };
         let head = store.root.join("HEAD");
         if head.exists() {
@@ -201,6 +205,27 @@ impl FileStore {
 
     pub fn set_fault(&mut self, fault: Option<PublicationFault>) {
         self.fault = fault;
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn set_operation_fault(&mut self, prefix: String, fault: PublicationFault) {
+        self.operation_fault = Some((prefix, fault));
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn publish_operation(&mut self, snapshot: Snapshot, id: &str) -> Result<String> {
+        let selected = self
+            .operation_fault
+            .as_ref()
+            .filter(|(prefix, _)| id.starts_with(prefix))
+            .map(|(_, fault)| fault.clone());
+        let previous = self.fault.clone();
+        if let Some(fault) = selected {
+            self.fault = Some(fault);
+        }
+        let result = self.publish(snapshot);
+        self.fault = previous;
+        result
     }
 
     fn hit(&self, point: FaultPoint) -> Result<()> {

@@ -1402,6 +1402,7 @@ dependencies = [
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
+ "bamboo-tickets",
  "bamboo-tools",
  "base64 0.23.1",
  "bytes",

@@ -368,3 +368,34 @@ actual admission/result publication exits are tracked separately. A7/P5 is
 not fully accepted until those exits and the existing owner barrier regression
 pass. Clippy completes with existing engine/storage/server warnings; no
 unrelated lint repair is included. P6 model tools, P7/P8/P9 remain in progress.
+
+### Local slice 12: real publication exits and owner gates
+
+Worktree `bamboo-1481-runtime-fault-acceptance`, branch
+`bamboo/feat/1481-runtime-fault-acceptance`, based on `a125a2f9`.
+The `ticket-runtime-fixtures` build feature installs an operation-scoped exit
+hook only for the isolated fixture Host. Normal builds do not read the fixture
+environment variables. Existing publication fault boundaries are reused; no
+additional scheduling, crash-retry framework or production environment changes.
+
+`cargo test -p bamboo-agent --test ticket_runtime_publication --features
+ticket-runtime-fixtures --locked --offline -- --nocapture`: PASS, 3 cases / 6
+real process exits, 25.68s. HEAD-before/after intent exits show zero Worker
+calls. Admission exits retain the prepared exact run receipt, remain unknown
+and never send a RunSpec. Result exits recover one nonstale exact-byte
+Submission before broker ACK with exactly the original two Worker calls.
+
+The unchanged #1483 owner entry point `ordinary_actor_mvp` /
+`actual_four_children_two_rounds_collect_parent_results` passes on this stack:
+4 actual Workers, 2 rounds, 8 unique outcomes, 26.73s. The existing
+`session_app::child_completion_coordinator::tests` suite passes 49/49,
+including callback/index barriers, partial admission and Any/FirstError short
+circuit behavior. No duplicate #1479/#1480 implementation is included.
+TicketService fixture-feature Clippy passes with `-D warnings`; normal server
+build passes. These tests accept P5's local fresh-worker recovery bridge and
+A7's local publication/owner integration gates. They do not accept P7 model
+semantics, Lotus UI, arbitrary shell isolation or external exactly-once effects.
+
+Runnable commands use `RUST_MIN_STACK=8388608`, `CARGO_INCREMENTAL=0` and the
+shared build target documented above. Mutation and dispatch remain default-off.
+No remote publication or production migration has been performed.

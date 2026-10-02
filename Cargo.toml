@@ -240,6 +240,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_F
 name = "bamboo"
 path = "src/bin/bamboo.rs"
 
+[features]
+ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
+
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"

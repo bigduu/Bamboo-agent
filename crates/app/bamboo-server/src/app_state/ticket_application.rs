@@ -102,7 +102,48 @@ impl TicketApplication {
         }
         drop(config);
         let (binding, _) = ticket_runtime::verified_scope_binding(storage, &supervisor.id).await?;
-        TicketService::open(scope_root, binding)
+        let service = TicketService::open(scope_root, binding)?;
+        #[cfg(feature = "ticket-runtime-fixtures")]
+        Self::install_fixture_exit(&service)?;
+        Ok(service)
+    }
+
+    /// Compile-time opt-in for isolated process-exit acceptance only. Normal
+    /// builds neither read these fixture variables nor expose the installer.
+    #[cfg(feature = "ticket-runtime-fixtures")]
+    fn install_fixture_exit(service: &TicketService) -> Result<()> {
+        let Ok(prefix) = std::env::var("BAMBOO_TICKET_FIXTURE_OPERATION_PREFIX") else {
+            return Ok(());
+        };
+        if !matches!(
+            prefix.as_str(),
+            "fixture-intent" | "runtime-admit/" | "runtime-submit/"
+        ) {
+            return Err(Error::AuthorityUnavailable(
+                "unsupported Ticket fixture operation".into(),
+            ));
+        }
+        let point = match std::env::var("BAMBOO_TICKET_FIXTURE_BOUNDARY").as_deref() {
+            Ok("before_head") => FaultPoint::BeforeHeadRename,
+            Ok("after_head") => FaultPoint::AfterHeadRename,
+            _ => {
+                return Err(Error::AuthorityUnavailable(
+                    "unsupported Ticket fixture boundary".into(),
+                ))
+            }
+        };
+        let label = prefix.clone();
+        service.set_operation_publication_fault(
+            prefix,
+            Arc::new(move |observed| {
+                if observed == point {
+                    eprintln!("TICKET_FIXTURE_EXIT {label} {observed:?}");
+                    std::process::exit(71);
+                }
+                Ok(())
+            }),
+        );
+        Ok(())
     }
 
     pub fn service(&self) -> Result<Arc<TicketService>> {

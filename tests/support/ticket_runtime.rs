@@ -17,26 +17,38 @@ impl Drop for Host {
 }
 
 pub fn start(data: &Path, port: u16) -> Host {
-    let log = std::fs::File::create(data.join("host.log")).unwrap();
-    Host(
-        Command::new(env!("CARGO_BIN_EXE_bamboo"))
-            .args([
-                "serve",
-                "--bind",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--data-dir",
-            ])
-            .arg(data)
-            .current_dir(data)
-            .env("BAMBOO_JIANDU_DATA_DIR", data.join("jiandu"))
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    )
+    start_with_fault(data, port, None)
+}
+pub fn start_with_fault(data: &Path, port: u16, fault: Option<(&str, &str)>) -> Host {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data.join("host.log"))
+        .unwrap();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_bamboo"));
+    process
+        .args([
+            "serve",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--data-dir",
+        ])
+        .arg(data)
+        .current_dir(data)
+        .env("BAMBOO_JIANDU_DATA_DIR", data.join("jiandu"))
+        .env("RUST_LOG", "info")
+        .env_remove("BAMBOO_TICKET_FIXTURE_OPERATION_PREFIX")
+        .env_remove("BAMBOO_TICKET_FIXTURE_BOUNDARY")
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log));
+    if let Some((prefix, boundary)) = fault {
+        process
+            .env("BAMBOO_TICKET_FIXTURE_OPERATION_PREFIX", prefix)
+            .env("BAMBOO_TICKET_FIXTURE_BOUNDARY", boundary);
+    }
+    Host(process.spawn().unwrap())
 }
 
 pub async fn get(client: &reqwest::Client, base: &str, path: &str) -> Value {
@@ -140,8 +152,12 @@ pub struct Fixture {
     pub probe: web::Data<Probe>,
     provider: actix_web::dev::ServerHandle,
 }
+#[allow(dead_code)] // Shared by integration targets using different fixture cases.
 impl Fixture {
     pub async fn new() -> Self {
+        Self::with_fault(None).await
+    }
+    pub async fn with_fault(fault: Option<(&str, &str)>) -> Self {
         let temp = tempfile::Builder::new()
             .prefix("bamboo-1481-ticket-lifecycle-")
             .tempdir_in("/tmp")
@@ -189,7 +205,7 @@ impl Fixture {
             .timeout(Duration::from_secs(15))
             .build()
             .unwrap();
-        let mut host = start(&data, port);
+        let mut host = start_with_fault(&data, port, fault);
         ready(&client, &base, &mut host, &data).await;
 
         Self {

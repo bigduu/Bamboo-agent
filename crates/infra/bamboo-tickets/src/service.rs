@@ -274,6 +274,14 @@ impl TicketService {
         self.inner.lock().expect("store mutex").set_fault(fault);
     }
 
+    #[cfg(feature = "test-utils")]
+    pub fn set_operation_publication_fault(&self, prefix: String, fault: PublicationFault) {
+        self.inner
+            .lock()
+            .expect("store mutex")
+            .set_operation_fault(prefix, fault);
+    }
+
     pub fn execute(&self, authority: &Authority, command: &Command) -> Result<OperationReceipt> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
@@ -348,6 +356,9 @@ impl TicketService {
         };
         next.receipts
             .insert(command.operation_id.clone(), receipt.clone());
+        #[cfg(feature = "test-utils")]
+        store.publish_operation(next, &command.operation_id)?;
+        #[cfg(not(feature = "test-utils"))]
         store.publish(next)?;
         Ok(receipt)
     }
