@@ -224,6 +224,9 @@ impl TicketService {
         if command.operation_id.is_empty() || command.operation_id.len() > 256 {
             return Err(Error::InvalidTransition("invalid operation id".into()));
         }
+        if let Some(source) = &command.source {
+            validate_command_source(authority, source)?;
+        }
         let hash = content_hash(&canonical_bytes(command)?);
         if let Some(receipt) = snapshot.receipts.get(&command.operation_id) {
             if receipt.principal != authority.identity() {
@@ -292,6 +295,29 @@ impl TicketService {
         operation_id: &str,
         operations: Vec<Operation>,
     ) -> Result<Command> {
+        self.prepare_request(authority, operation_id, operations, None)
+    }
+
+    /// The original adapter input determines replay, including fields which do
+    /// not change its projected operations. Generated operations remain frozen.
+    pub fn prepare_source_command(
+        &self,
+        authority: &Authority,
+        operation_id: &str,
+        operations: Vec<Operation>,
+        source: CommandSource,
+    ) -> Result<Command> {
+        validate_command_source(authority, &source)?;
+        self.prepare_request(authority, operation_id, operations, Some(source))
+    }
+
+    fn prepare_request(
+        &self,
+        authority: &Authority,
+        operation_id: &str,
+        operations: Vec<Operation>,
+        source: Option<CommandSource>,
+    ) -> Result<Command> {
         let (_, snapshot) = self.published()?;
         validate_authority(authority, &snapshot)?;
         if let Some(receipt) = snapshot.receipts.get(operation_id) {
@@ -304,7 +330,11 @@ impl TicketService {
                 ));
             }
             let original: Command = serde_json::from_str(&receipt.canonical_request)?;
-            if canonical_bytes(&original.operations)? != canonical_bytes(&operations)? {
+            let same_input = match &source {
+                Some(source) => source_matches(&original, source)?,
+                None => canonical_bytes(&original.operations)? == canonical_bytes(&operations)?,
+            };
+            if !same_input {
                 return Err(Error::IdempotencyConflict);
             }
             return Ok(original);
@@ -315,7 +345,38 @@ impl TicketService {
             expected_seq: snapshot.seq,
             expected_epoch: snapshot.authority_epoch,
             operations,
+            source,
         })
+    }
+
+    /// Read an immutable original command before regenerating any adapter IDs.
+    /// Scope/subject and the complete canonical input are checked first. The
+    /// caller may replay this exact command, never replace its typed operations.
+    pub fn replay_source_command(
+        &self,
+        authority: &Authority,
+        operation_id: &str,
+        source: &CommandSource,
+    ) -> Result<Option<Command>> {
+        let (_, snapshot) = self.published()?;
+        validate_authority(authority, &snapshot)?;
+        let Some(receipt) = snapshot.receipts.get(operation_id) else {
+            return Ok(None);
+        };
+        if receipt.principal != authority.identity() {
+            return Err(Error::ScopeDenied("receipt subject".into()));
+        }
+        validate_command_source(authority, source)?;
+        if receipt.canonical_request.is_empty() {
+            return Err(Error::AuthorityUnavailable(
+                "legacy receipt lacks canonical request; retry needs original command".into(),
+            ));
+        }
+        let original: Command = serde_json::from_str(&receipt.canonical_request)?;
+        if !source_matches(&original, source)? {
+            return Err(Error::IdempotencyConflict);
+        }
+        Ok(Some(original))
     }
 
     /// Checks the tool entry, not just the final result. A lease is not permission.
@@ -335,6 +396,31 @@ impl TicketService {
         }
         Ok(())
     }
+}
+
+fn validate_command_source(authority: &Authority, source: &CommandSource) -> Result<()> {
+    if !matches!(authority.principal, Principal::Worker { .. }) {
+        return Err(Error::ScopeDenied(
+            "Worker adapter input requires Worker identity".into(),
+        ));
+    }
+    match source {
+        CommandSource::WorkerTask { arguments } if arguments.is_object() => {}
+        _ => return Err(invalid("adapter arguments must be an object")),
+    }
+    if canonical_bytes(source)?.len() > 65536 {
+        return Err(invalid("adapter input exceeds 64 KiB"));
+    }
+    Ok(())
+}
+
+fn source_matches(command: &Command, source: &CommandSource) -> Result<bool> {
+    let stored = command.source.as_ref().ok_or_else(|| {
+        Error::AuthorityUnavailable(
+            "legacy adapter receipt lacks original input; retry needs original command".into(),
+        )
+    })?;
+    Ok(canonical_bytes(stored)? == canonical_bytes(source)?)
 }
 
 pub(crate) fn validate_authority(authority: &Authority, snapshot: &Snapshot) -> Result<()> {

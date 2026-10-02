@@ -2,7 +2,8 @@
 //! projection; the scope TicketService LocalPlan remains the sole authority.
 use bamboo_domain::{Session, SessionKind, TaskItemStatus, TaskList};
 use bamboo_tickets::{
-    Authority, Error, LocalStep, Operation, Principal, Result, StepStatus, TicketService,
+    Authority, CommandSource, Error, LocalStep, Operation, Principal, Result, StepStatus,
+    TicketService,
 };
 use bamboo_tools::TaskTool;
 use std::sync::Arc;
@@ -142,6 +143,22 @@ impl TicketWorkerPlan {
         self.service.authorize_tool(&self.authority, "Task")?;
         let (_, snapshot) = self.service.published()?;
         let assignment = &snapshot.assignments[&self.assignment_id];
+        let op_id = format!("worker-plan/{}/{tool_call_id}", assignment.dispatch_key);
+        let source = CommandSource::WorkerTask {
+            arguments: args.clone(),
+        };
+        // Replay before parsing against the current plan: retained item IDs and
+        // titles may have changed since this exact call was first committed.
+        if let Some(command) =
+            self.service
+                .replay_source_command(&self.authority, &op_id, &source)?
+        {
+            self.service.execute(&self.authority, &command)?;
+            self.bind_session(session)?;
+            return session.task_list.clone().ok_or_else(|| {
+                Error::InvalidTransition("Task produced an empty authoritative plan".into())
+            });
+        }
         let task_list = TaskTool::task_list_from_args_with_existing(
             args,
             &self.session_id,
@@ -165,41 +182,17 @@ impl TicketWorkerPlan {
                 }),
             })
             .collect();
-        let op_id = format!("worker-plan/{}/{tool_call_id}", assignment.dispatch_key);
         let operation = Operation::ReplacePlan {
             assignment_id: self.assignment_id.clone(),
             expected_plan_revision: assignment.plan.plan_revision,
             steps,
         };
-        // A repeated call must retain the original expected plan revision too.
-        let operations = if let Some(receipt) = snapshot.receipts.get(&op_id) {
-            let original: bamboo_tickets::Command =
-                serde_json::from_str(&receipt.canonical_request)?;
-            let Some(Operation::ReplacePlan {
-                expected_plan_revision,
-                ..
-            }) = original.operations.first()
-            else {
-                return Err(Error::IdempotencyConflict);
-            };
-            match operation {
-                Operation::ReplacePlan {
-                    assignment_id,
-                    steps,
-                    ..
-                } => vec![Operation::ReplacePlan {
-                    assignment_id,
-                    expected_plan_revision: *expected_plan_revision,
-                    steps,
-                }],
-                _ => unreachable!(),
-            }
-        } else {
-            vec![operation]
-        };
-        let command = self
-            .service
-            .prepare_command(&self.authority, &op_id, operations)?;
+        let command = self.service.prepare_source_command(
+            &self.authority,
+            &op_id,
+            vec![operation],
+            source,
+        )?;
         self.service.execute(&self.authority, &command)?;
         // Receipt replay may occur after a newer plan write. Never project the
         // old call's payload over the current authoritative plan.

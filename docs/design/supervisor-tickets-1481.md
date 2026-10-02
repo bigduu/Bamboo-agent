@@ -217,3 +217,23 @@ P5 stable dispatch/admission receipts, actual terminal submission, P7 semantic
 resolution, P8 Lotus and P9 acceptance are still unrun. Generated Task IDs and
 the exact raw tool payload need a separate receipt-replay follow-up before
 claiming arbitrary Task-call replay; current replay evidence uses explicit IDs.
+
+## P3 original Task-call replay follow-up (2026-10-02)
+
+The `bamboo/feat/1481-worker-call-replay` slice starts from `d874dcca`.
+Optional CommandSource retains canonical original Worker Task arguments together
+with the immutable Command receipt. The Task adapter reads this input before
+regenerating a plan projection, so a call with generated IDs can replay after a
+later rename. A changed raw payload conflicts even when its projected Steps
+would be the same. Replays project the current plan and cannot roll it back.
+Source metadata is bounded and confers no identity or capability; typed operation
+checks still apply. Missing source in legacy adapter receipts requires the
+original Command rather than reconstructing a potentially different request.
+
+Validation: bamboo-tickets 27/27 (6 queries + 5 authority + 16 service), engine
+TicketWorkerPlan 5/5 including generated-ID/rename/restart replay, strict tickets
+all-targets clippy, workspace format and diff checks passed. One initial new-test
+assertion expected seq zero despite writer initialization; corrected to compare
+against the pre-operation seq. Restart replay only reads a prior receipt: the
+old Worker remains fenced and cannot resume Task execution. This does not count
+as P5 Runtime admission/restart evidence or real-model semantic evaluation.

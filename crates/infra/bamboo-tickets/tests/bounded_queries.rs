@@ -36,6 +36,7 @@ fn execute(service: &TicketService, id: &str, ops: Vec<Operation>) -> OperationR
                 binding: binding(),
                 expected_seq: state.seq,
                 expected_epoch: state.authority_epoch,
+                source: None,
                 operations: ops,
             },
         )
@@ -86,6 +87,7 @@ fn start(service: &TicketService, work: &str, op: &str) -> (String, Authority) {
         binding: binding(),
         expected_seq: state.seq,
         expected_epoch: state.authority_epoch,
+        source: None,
         operations: vec![Operation::Admitted {
             assignment_id: id.clone(),
             receipt: receipt.clone(),

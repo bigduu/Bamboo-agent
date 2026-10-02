@@ -322,6 +322,83 @@ fn own_steps_empty_initial_plan_replay_does_not_roll_back_newer_projection() {
 }
 
 #[test]
+fn generated_ids_replay_original_input_after_rename_and_writer_restart() {
+    let mut f = Fixture::new();
+    let plan = f.plan();
+    plan.bind_session(&mut f.session).unwrap();
+    let first = json!({"tasks":[{"content":"Initial step","status":"pending"}]});
+    let list = plan
+        .apply_task(&mut f.session, "generated", &first)
+        .unwrap();
+    let id = list.items[0].id.clone();
+    let snapshot = f.service.published().unwrap().1;
+    let op_id = format!(
+        "worker-plan/{}/generated",
+        snapshot.assignments[&f.assignment].dispatch_key
+    );
+    let original_receipt = snapshot.receipts[&op_id].clone();
+    plan.apply_task(
+        &mut f.session,
+        "rename",
+        &json!({"tasks":[{"id":id,"content":"Renamed step","status":"completed"}]}),
+    )
+    .unwrap();
+    let seq = f.service.published().unwrap().1.seq;
+    plan.apply_task(&mut f.session, "generated", &first)
+        .unwrap();
+    assert_eq!(f.service.published().unwrap().1.seq, seq);
+    assert_eq!(
+        f.session.task_list.as_ref().unwrap().items[0].description,
+        "Renamed step"
+    );
+    assert_eq!(
+        f.session.task_list.as_ref().unwrap().items[0].status,
+        TaskItemStatus::Completed
+    );
+    let changed =
+        json!({"tasks":[{"content":"Initial step","status":"pending","phase":"execution"}]});
+    assert!(matches!(
+        plan.apply_task(&mut f.session, "generated", &changed),
+        Err(Error::IdempotencyConflict)
+    ));
+    // A late concurrent adapter may have already generated different steps.
+    // The original source input, rather than that second projection, owns replay.
+    let source = CommandSource::WorkerTask { arguments: first };
+    let original = f
+        .service
+        .prepare_source_command(&plan.authority, &op_id, vec![], source.clone())
+        .unwrap();
+    assert_eq!(
+        f.service
+            .execute(&plan.authority, &original)
+            .unwrap()
+            .committed_seq,
+        original_receipt.committed_seq
+    );
+    let authority = plan.authority.clone();
+    let binding = snapshot.binding;
+    drop(plan);
+    drop(f.service);
+    let restarted = Arc::new(TicketService::open(f._dir.path(), binding).unwrap());
+    let epoch_seq = restarted.published().unwrap().1.seq;
+    let original = restarted
+        .replay_source_command(&authority, &op_id, &source)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted
+            .execute(&authority, &original)
+            .unwrap()
+            .request_hash,
+        original_receipt.request_hash
+    );
+    assert_eq!(restarted.published().unwrap().1.seq, epoch_seq);
+    // Immutable receipt lookup grants no renewed execution permission.
+    assert!(restarted.authorize_tool(&authority, "Task").is_err());
+    assert!(TicketWorkerPlan::from_runtime_receipt(restarted, &f.assignment).is_err());
+}
+
+#[test]
 fn exact_child_run_and_live_generation_are_required() {
     let mut f = Fixture::new();
     let plan = f.plan();

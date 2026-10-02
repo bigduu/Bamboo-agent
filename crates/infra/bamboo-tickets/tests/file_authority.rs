@@ -14,6 +14,12 @@ fn optional_local_plan_fields_preserve_older_canonical_bytes() {
         canonical_bytes(&parsed).unwrap(),
         canonical_bytes(&receipt).unwrap()
     );
+    let command = serde_json::json!({"operation_id":"old", "binding":binding(), "expected_seq":0,"expected_epoch":1,"operations":[]});
+    let parsed: Command = serde_json::from_value(command.clone()).unwrap();
+    assert_eq!(
+        canonical_bytes(&parsed).unwrap(),
+        canonical_bytes(&command).unwrap()
+    );
 }
 use std::{
     fs,

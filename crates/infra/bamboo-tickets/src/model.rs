@@ -344,6 +344,15 @@ pub struct Command {
     pub expected_seq: u64,
     pub expected_epoch: u64,
     pub operations: Vec<Operation>,
+    /// Original adapter input for generated IDs. It confers no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CommandSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandSource {
+    WorkerTask { arguments: serde_json::Value },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

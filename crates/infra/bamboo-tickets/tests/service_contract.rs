@@ -47,6 +47,7 @@ fn command(service: &TicketService, id: &str, operations: Vec<Operation>) -> Com
         binding: binding(),
         expected_seq: snapshot.seq,
         expected_epoch: snapshot.authority_epoch,
+        source: None,
         operations,
     }
 }
@@ -80,6 +81,27 @@ fn create(service: &TicketService, title: &str, dependencies: BTreeSet<String>) 
     )
     .ids["work"]
         .clone()
+}
+
+#[test]
+fn adapter_source_does_not_grant_worker_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TicketService::open(dir.path(), binding()).unwrap();
+    let initial_seq = service.published().unwrap().1.seq;
+    let source = CommandSource::WorkerTask {
+        arguments: serde_json::json!({"tasks":[]}),
+    };
+    assert!(matches!(
+        service.prepare_source_command(&user(), "fake", vec![], source.clone()),
+        Err(Error::ScopeDenied(_))
+    ));
+    let mut cmd = command(&service, "fake", vec![]);
+    cmd.source = Some(source);
+    assert!(matches!(
+        service.execute(&supervisor(), &cmd),
+        Err(Error::ScopeDenied(_))
+    ));
+    assert_eq!(service.published().unwrap().1.seq, initial_seq);
 }
 fn start(service: &TicketService, work: &str, op: &str) -> (String, Authority) {
     let id = execute(
