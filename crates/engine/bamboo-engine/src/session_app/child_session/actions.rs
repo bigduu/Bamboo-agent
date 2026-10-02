@@ -17,7 +17,57 @@ use super::{
 
 pub async fn create_child_action(
     port: &dyn ChildSessionPort,
+    input: CreateChildInput,
+) -> Result<CreateChildResult, ChildSessionError> {
+    if input
+        .runtime_metadata
+        .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "Ticket LocalPlan binding requires the trusted work-child entry point".into(),
+        ));
+    }
+    create_child_action_inner(port, input, None).await
+}
+
+/// Host-only fresh work assignment creation; no model tool deserializes this port.
+pub async fn create_ticket_child_action(
+    port: &dyn ChildSessionPort,
     mut input: CreateChildInput,
+    service: &bamboo_tickets::TicketService,
+    authority: &bamboo_tickets::Authority,
+    assignment_id: &str,
+) -> Result<CreateChildResult, ChildSessionError> {
+    if !matches!(authority.principal(), bamboo_tickets::Principal::Runtime) {
+        return Err(ChildSessionError::Execution(
+            "Ticket child creation requires trusted Runtime".into(),
+        ));
+    }
+    let packet = service
+        .child_context_packet(authority, assignment_id, 65536)
+        .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    if input.parent_session.id != packet.binding.supervisor_session_id
+        || input.auto_run
+        || input.lifecycle.as_deref() == Some("resident")
+        || input.context_fork.unwrap_or(0) > 0
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "Ticket child requires fresh one-shot, exact Supervisor and explicit dispatch".into(),
+        ));
+    }
+    input.assignment_prompt =
+        serde_json::to_string(&packet).map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    input.runtime_metadata.insert(
+        crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+        assignment_id.into(),
+    );
+    create_child_action_inner(port, input, Some(packet)).await
+}
+
+async fn create_child_action_inner(
+    port: &dyn ChildSessionPort,
+    mut input: CreateChildInput,
+    ticket_context: Option<bamboo_tickets::WorkContextPacket>,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
@@ -420,8 +470,19 @@ pub async fn create_child_action(
         child.add_message(Message::user(assignment));
     }
 
-    if let Some(parent_task_list) = input.parent_session.task_list.clone() {
-        child.set_task_list(parent_task_list);
+    if ticket_context.is_none() {
+        if let Some(parent_task_list) = input.parent_session.task_list.clone() {
+            child.set_task_list(parent_task_list);
+        }
+    } else {
+        // The new work path never inherits Root Tasks. Its authoritative empty
+        // LocalPlan was created atomically with Assignment + DispatchIntent.
+        child.task_list = None;
+        child.metadata.insert(
+            "ticket.work_contract_ref.v1".into(),
+            serde_json::to_string(&ticket_context)
+                .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
+        );
     }
 
     // Persist any per-child tool denylist so the spawn path (enqueue_child_run

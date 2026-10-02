@@ -303,6 +303,7 @@ fn five_plans_and_five_questions_are_independent_and_answered_out_of_order() {
                     parent: None,
                     title: format!("private {name}"),
                     completed: false,
+                    status: None,
                 }],
             }],
         );

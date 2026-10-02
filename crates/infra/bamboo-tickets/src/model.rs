@@ -101,6 +101,17 @@ pub struct LocalStep {
     pub parent: Option<String>,
     pub title: String,
     pub completed: bool,
+    #[serde(default)]
+    pub status: Option<StepStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +263,9 @@ pub struct OperationReceipt {
     pub operation_id: String,
     pub principal: String,
     pub request_hash: String,
+    /// Immutable canonical request for host-generated retries after restart.
+    #[serde(default)]
+    pub canonical_request: String,
     pub committed_seq: u64,
     pub ids: BTreeMap<String, String>,
 }

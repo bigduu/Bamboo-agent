@@ -56,6 +56,10 @@ async fn refresh_workflow_tool_side_effects(ctx: &mut SuccessPathContext<'_>) {
 }
 
 pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_>) -> bool {
+    let ticket_result =
+        task::maybe_apply_ticket_task(ctx.tool_call, ctx.result, ctx.session, ctx.config);
+    let result = ticket_result.as_ref().unwrap_or(ctx.result);
+
     // Server tools mutate a repository-owned Session clone. Pull only the
     // workflow activation namespace into the runner's live Session before the
     // next round and before any later runtime save can overwrite those changes.
@@ -65,14 +69,14 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         ctx.event_tx,
         ctx.session_id,
         ctx.tool_call,
-        ctx.result,
+        result,
         ctx.round,
     )
     .await;
 
     task::maybe_handle_taskwrite(
         ctx.tool_call,
-        ctx.result,
+        result,
         ctx.session,
         ctx.session_id,
         ctx.event_tx,
@@ -84,25 +88,19 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
     workspace::maybe_apply_workspace_update(
         ctx.session,
         ctx.tool_call,
-        ctx.result,
+        result,
         ctx.session_id,
         ctx.config.project_context_resolver.as_deref(),
         ctx.event_tx,
     )
     .await;
 
-    goal::maybe_apply_goal_update(
-        ctx.session,
-        ctx.tool_call,
-        ctx.result,
-        ctx.config,
-        ctx.round,
-    );
+    goal::maybe_apply_goal_update(ctx.session, ctx.tool_call, result, ctx.config, ctx.round);
 
     if clarification::maybe_handle_user_question_tool(clarification::UserQuestionToolContext {
         tool_call: ctx.tool_call,
         permission_replay_origin: ctx.permission_replay_origin,
-        result: ctx.result,
+        result,
         session: ctx.session,
         event_tx: ctx.event_tx,
         metrics_collector: ctx.metrics_collector,
@@ -123,12 +121,12 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         ctx.round_id,
         AgentEvent::ToolComplete {
             tool_call_id: ctx.tool_call.id.clone(),
-            result: ctx.result.clone(),
+            result: result.clone(),
         },
     )
     .await;
 
-    if !ctx.result.success {
+    if !result.success {
         ctx.state
             .mark_unsuccessful_tool(&ctx.tool_call.function.name);
 
@@ -139,7 +137,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
             &ctx.tool_call.function.name,
             &ctx.tool_call.id,
             &ctx.tool_call.function.arguments,
-            &ctx.result.result,
+            &result.result,
         ))
         .await;
     }
@@ -151,12 +149,12 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
             "tool_name": ctx.tool_call.function.name,
             "tool_call_id": ctx.tool_call.id,
             "duration_ms": ctx.tool_duration.as_millis(),
-            "success": ctx.result.success,
+            "success": result.success,
         })
     );
 
     let outcome = handle_tool_result_with_agentic_support_and_persistence(
-        ctx.result,
+        result,
         ctx.tool_call,
         ctx.event_tx,
         ctx.session,

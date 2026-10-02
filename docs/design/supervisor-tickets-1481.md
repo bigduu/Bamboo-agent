@@ -146,3 +146,24 @@ evidence for 200 concurrent Workers. `work_dispatch` currently accepts
 start/steer/cancel/retry typed operations; pause belongs to the next Runtime
 slice. Model tool registration, true dispatch and Lotus are not accepted by
 these pure service reads.
+
+### Local slice 4: trusted Task / LocalPlan adapter
+
+Worktree `bamboo-1481-plans`; branch `bamboo/feat/1481-worker-local-plan`.
+The trusted work-child creation entry omits the inherited Root TaskList and
+injects a readonly, bounded contract packet. Legacy child/root entry points
+retain their old behavior. A marked Ticket child without a Runtime capability
+fails closed; successful writes update only the Assignment LocalPlan and its
+private display projection, with no Session/root task-authority patch.
+Immutable receipts retain the canonical request for generated adapter retries;
+reuse preserves the original expected revision and payload checks. An older
+call replay after a later plan revision cannot roll the projection back.
+
+Verification: four new adapter/identity/replay tests pass; all ten affected Task
+tests pass, including old Root/child behavior. All 25 TicketService tests pass;
+TicketService strict clippy, formatting and engine compilation pass. Engine
+clippy completes with existing warnings in the Actor/legacy child code and its
+dependencies; it is not a strict-warning pass. This is the in-process adapter
+slice only. The native Worker HostBridge, real dispatch, filesystem sandbox and
+true #1481 Runtime acceptance still require subsequent slices. Synthetic
+receipts in these tests are not real admission evidence.

@@ -22,8 +22,8 @@ mod tests;
 
 pub use actions::{
     apply_child_session_update, assemble_session_tree, build_session_tree_action,
-    cancel_child_action, create_child_action, delete_child_action, get_child_action,
-    list_children_action, rollback_failed_wait_launch, run_child_action,
+    cancel_child_action, create_child_action, create_ticket_child_action, delete_child_action,
+    get_child_action, list_children_action, rollback_failed_wait_launch, run_child_action,
     send_message_to_child_action, send_message_to_child_action_with_gate, update_child_action,
     update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
 };

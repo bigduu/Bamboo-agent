@@ -35,6 +35,9 @@ pub enum Principal {
 }
 
 impl Authority {
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
     /// This Rust port is host-only. Never map client JSON directly to this call.
     pub fn from_verified_host(binding: ScopeBinding, principal: Principal) -> Self {
         Self { binding, principal }
@@ -270,6 +273,8 @@ impl TicketService {
             operation_id: command.operation_id.clone(),
             principal: authority.identity(),
             request_hash: hash,
+            canonical_request: String::from_utf8(canonical_bytes(command)?)
+                .expect("canonical JSON is UTF-8"),
             committed_seq: next.seq,
             ids,
         };
@@ -277,6 +282,40 @@ impl TicketService {
             .insert(command.operation_id.clone(), receipt.clone());
         store.publish(next)?;
         Ok(receipt)
+    }
+
+    /// Builds repeatable commands for a trusted host ingress/tool adapter.
+    /// Replayed logical operations retain the original CAS request, not a new one.
+    pub fn prepare_command(
+        &self,
+        authority: &Authority,
+        operation_id: &str,
+        operations: Vec<Operation>,
+    ) -> Result<Command> {
+        let (_, snapshot) = self.published()?;
+        validate_authority(authority, &snapshot)?;
+        if let Some(receipt) = snapshot.receipts.get(operation_id) {
+            if receipt.principal != authority.identity() {
+                return Err(Error::ScopeDenied("receipt subject".into()));
+            }
+            if receipt.canonical_request.is_empty() {
+                return Err(Error::AuthorityUnavailable(
+                    "legacy receipt lacks canonical request; retry needs original command".into(),
+                ));
+            }
+            let original: Command = serde_json::from_str(&receipt.canonical_request)?;
+            if canonical_bytes(&original.operations)? != canonical_bytes(&operations)? {
+                return Err(Error::IdempotencyConflict);
+            }
+            return Ok(original);
+        }
+        Ok(Command {
+            operation_id: operation_id.into(),
+            binding: snapshot.binding,
+            expected_seq: snapshot.seq,
+            expected_epoch: snapshot.authority_epoch,
+            operations,
+        })
     }
 
     /// Checks the tool entry, not just the final result. A lease is not permission.
@@ -1318,6 +1357,12 @@ fn validate_plan(steps: &[LocalStep]) -> Result<()> {
         return Err(invalid("duplicate/empty Step id"));
     }
     for step in steps {
+        if step
+            .status
+            .is_some_and(|status| (status == StepStatus::Completed) != step.completed)
+        {
+            return Err(invalid("Step status/completed mismatch"));
+        }
         let mut seen = BTreeSet::new();
         let mut next = Some(step.id.as_str());
         while let Some(id) = next {
