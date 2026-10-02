@@ -2803,7 +2803,7 @@ impl ExternalChildRunner for ActorChildRunner {
                         .native_tool_ceiling
                         .as_ref()
                         .is_none_or(|ceiling| !ceiling.tools.is_empty())
-                        || pre_ack_input(session)?.is_none())
+                        || (!plain_completed_history(session) && pre_ack_input(session)?.is_none()))
                 {
                     return Err(plain_actor_unsupported());
                 }
@@ -4017,7 +4017,8 @@ async fn require_unowned_glob(
 }
 
 // Zero-tool or read-only Glob named Child of a durable Ultra Root.
-// Glob uses its typed tail; fresh zero-tool supports two bounded corrections.
+// Glob uses its typed tail; zero-tool supports new input after a plain completion
+// as well as two bounded corrections within a Running activation.
 // No lease renewal/reclaim, raw steering, remote activation or automatic restart.
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
@@ -4036,7 +4037,7 @@ struct PlainActorActivation {
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports a fresh plain activation, two bounded corrections while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4048,6 +4049,20 @@ fn plain_initial_history(session: &Session) -> bool {
     }) && session.provider_transcript.is_empty()
         && session.session_inbox_admission().is_none()
         && session.pending_injected_messages().is_none()
+}
+// Selection only. Canonical terminal status/new input are checked at start;
+// the existing fenced input checkpoint validates the complete durable prefix.
+fn plain_completed_history(session: &Session) -> bool {
+    session.provider_transcript.is_empty()
+        && session.pending_injected_messages().is_none()
+        && session
+            .messages
+            .last()
+            .is_some_and(|message| message.role == Role::Assistant && !message.content.is_empty())
+        && !session
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool || message.tool_calls.is_some())
 }
 // Selection only. Storage's closed raw bookkeeper/current-prefix validator is
 // still mandatory after the actual replacement claim; this metadata is no grant.
@@ -4190,6 +4205,10 @@ impl PlainActorActivation {
                 && backlog.pending == 0
                 && backlog.claimed == 0
                 && backlog.generation == 0;
+            let new_input = backlog.pending == 1
+                && backlog.claimed == 0
+                && backlog.oldest_generation == Some(backlog.generation)
+                && backlog.activation_pending();
             let retry = allow_failed_retry
                 && entry.actor.state == ActorLogicalState::Failed
                 && entry.actor.current_attempt > 0
@@ -4197,10 +4216,17 @@ impl PlainActorActivation {
                     old.status == bamboo_domain::ActorActivationStatus::Failed
                         && backlog.generation > old.inbox_generation
                 })
-                && backlog.pending == 1
-                && backlog.claimed == 0
-                && backlog.oldest_generation == Some(backlog.generation)
-                && backlog.activation_pending();
+                && new_input;
+            let continuation = allow_failed_retry
+                && release_worker.is_some()
+                && entry.actor.state == ActorLogicalState::Cold
+                && entry.actor.current_attempt > 0
+                && entry.activation.as_ref().is_some_and(|old| {
+                    old.status == bamboo_domain::ActorActivationStatus::Succeeded
+                        && backlog.generation > old.inbox_generation
+                })
+                && new_input
+                && plain_completed_history(session);
             let input_inbox = bamboo_storage::FileSessionInbox::new(
                 store.clone(),
                 bamboo_domain::SessionInboxLimits::default(),
@@ -4214,14 +4240,17 @@ impl PlainActorActivation {
             } else {
                 None
             };
-            if recovery.is_some()
+            if (recovery.is_some() || continuation)
                 && (!entry.actor.matches_session(session)
                     || entry.actor.project_id
                         != project_id_for_actor_run(session)?.map(|id| id.to_string()))
             {
                 return Err(plain_actor_unsupported());
             }
-            if recovery.is_none() && ((!fresh && !retry) || !plain_initial_history(session)) {
+            if recovery.is_none()
+                && !continuation
+                && ((!fresh && !retry) || !plain_initial_history(session))
+            {
                 return Err(plain_actor_unsupported());
             }
             let duration = crate::runtime::execution::spawn::watchdog_policy_for_session(session)
@@ -8164,6 +8193,130 @@ mod tests {
     use super::*;
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
+
+    #[tokio::test]
+    async fn completed_plain_continuation_requires_one_input_and_current_identity() {
+        for case in [
+            "valid",
+            "two-inputs",
+            "tool-history",
+            "stale-lineage",
+            "no-release",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let parent = Session::new("continuation-parent", "model");
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                Session::new_child_of("continuation-child", &parent, "model", "first task");
+            child.add_message(bamboo_agent_core::Message::assistant("first result", None));
+            if case == "tool-history" {
+                let mut tool = bamboo_agent_core::Message::assistant("old tool result", None);
+                tool.role = Role::Tool;
+                child.add_message(tool);
+            }
+            child.set_last_run_status("completed");
+            store.save_session(&child).await.unwrap();
+            store.ensure_actor(&child.id).await.unwrap();
+            let policy = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+            bind_local_control_plane(store.as_ref(), &child.id, policy.as_ref()).await;
+            let now = chrono::Utc::now();
+            let old = store
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: child.id.clone(),
+                    run_id: "first-run".into(),
+                    lease_owner: "first-owner".into(),
+                    lease_expires_at: now + chrono::Duration::minutes(1),
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now,
+                })
+                .await
+                .unwrap();
+            store.start_activation(&old.fence(), now).await.unwrap();
+            store
+                .finish_activation(&old.fence(), now, ActorActivationFinish::Succeeded)
+                .await
+                .unwrap();
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                Default::default(),
+            ));
+            for slot in 0..if case == "two-inputs" { 2 } else { 1 } {
+                let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+                    &child.id,
+                    format!("new task {slot}"),
+                );
+                let receipt = inbox.deliver(&envelope).await.unwrap();
+                inbox
+                    .mark_activation_eligible(
+                        &child.id,
+                        receipt.generation,
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let storage: Arc<dyn Storage> = store.clone();
+            let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage));
+            let binding = actor_binding(store.clone(), inbox, persistence);
+            let _registration = binding
+                .router
+                .register_run(&child.id, "second-run")
+                .await
+                .unwrap();
+            if case == "stale-lineage" {
+                child.parent_session_id = Some("foreign-parent".into());
+            }
+            let result = PlainActorActivation::start(
+                store.clone(),
+                &child,
+                &binding,
+                Some("second-run"),
+                Some(policy),
+                true,
+                (case != "no-release").then_some("second-worker"),
+            )
+            .await;
+            if case == "valid" {
+                let activation = result.expect("one new input on a completed plain Child");
+                assert_eq!(activation.fence.attempt, old.attempt + 1);
+                assert_eq!(activation.fence.actor_id, child.id);
+                assert_eq!(activation.inbox_generation, 1);
+                activation
+                    .finish(ActorActivationFinish::Failed)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "unsupported continuation {case} must fail before claim"
+                );
+                assert_eq!(
+                    store
+                        .inspect_actor(&child.id)
+                        .await
+                        .unwrap()
+                        .actor
+                        .current_attempt,
+                    old.attempt
+                );
+            }
+            let canonical = store.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(
+                canonical.parent_session_id.as_deref(),
+                Some(parent.id.as_str())
+            );
+            assert!(canonical
+                .messages
+                .iter()
+                .any(|message| message.content == "first result"));
+        }
+    }
 
     #[tokio::test]
     async fn pre_dispatch_placement_failure_fails_only_claimed_activation() {
