@@ -109,3 +109,40 @@ unrun. Import currently produces a blocked record requiring review; it does
 not migrate running Session ownership or create acceptance for legacy output.
 Artifact URI/hash syntax is checked, but artifact bytes need a trusted host
 artifact resolver before automated quality acceptance can be enabled.
+
+### Recovery and stable dependency handoff (2026-10-02)
+
+The executor reconnected. Original commits `7c0c7703`, `dc442538`, and
+`7e2f04ea` and their worktrees were preserved. The interrupted P6 patch left
+no partial files; its worktree was clean. P6's isolated branch was rebased
+onto `685328ec6114f13a0a5fda27b380b37dbff62dc4`, the accepted #1483 squash
+commit, without changing the original branches. Replayed local commits are
+`7dd333c6`, `c194affd`, and `7c792963` respectively.
+
+GitHub confirms #1483 merged at 17:06:53 UTC, closes #1479/#1480/#1478, and
+its exact source head is `0520ad4bd9fef15ac06697cd1964f34c48e9c11e`.
+CI run `37031388437` reports success; required Test job `110932382202`
+reports success. Its downloaded log contains
+`actual_four_children_two_rounds_collect_parent_results ... ok`. Other
+skipped CI jobs remain skipped, not locally accepted #1481 coverage. These
+stable repairs are consumed without copying the owner's former WIP or
+reimplementing their Child completion/continuation/linker changes.
+
+### Local slice 3: bounded reads and context
+
+Six focused query tests pass: snapshot-stable pagination across publication,
+query-bound/missing cursor resync, inspect/context budget refusal, Worker
+private-read isolation, fixed changes high watermark with intermediate
+revisions, and full-manifest measurement. Reads directly scan immutable
+authoritative revisions: `index_seq` equals the fixed snapshot sequence; no
+second authoritative stream/index is introduced. Changes derive from commit
+ancestry, with a 256-commit scan bound and explicit `resync_required`.
+Inspect is bounded to 32 IDs/depth 4/64 KiB and never truncates a contract.
+
+Local APFS sample: 5/50/200 records produced full manifests of
+842/5972/23332 bytes. One-record update elapsed 314/68/105 ms in this run,
+including flushes. These small samples are not throughput guarantees or
+evidence for 200 concurrent Workers. `work_dispatch` currently accepts
+start/steer/cancel/retry typed operations; pause belongs to the next Runtime
+slice. Model tool registration, true dispatch and Lotus are not accepted by
+these pure service reads.

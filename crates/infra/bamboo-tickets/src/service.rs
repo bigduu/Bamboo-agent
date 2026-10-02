@@ -195,6 +195,13 @@ impl TicketService {
             .export(destination.as_ref())
     }
 
+    pub(crate) fn snapshot_parent(&self, commit: &str) -> Result<Option<String>> {
+        self.inner
+            .lock()
+            .expect("store mutex")
+            .parent_commit(commit)
+    }
+
     pub fn set_publication_fault(&self, fault: Option<PublicationFault>) {
         self.inner.lock().expect("store mutex").set_fault(fault);
     }
@@ -291,7 +298,7 @@ impl TicketService {
     }
 }
 
-fn validate_authority(authority: &Authority, snapshot: &Snapshot) -> Result<()> {
+pub(crate) fn validate_authority(authority: &Authority, snapshot: &Snapshot) -> Result<()> {
     if authority.binding != snapshot.binding {
         return Err(Error::ScopeDenied("scope binding changed".into()));
     }

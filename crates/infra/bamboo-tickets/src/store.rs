@@ -369,6 +369,11 @@ impl FileStore {
         Ok(snapshot)
     }
 
+    pub(crate) fn parent_commit(&self, hash: &str) -> Result<Option<String>> {
+        let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
+        Ok(commit.parent)
+    }
+
     /// Export one fixed commit and every immutable reachable ancestor/object.
     /// The resulting directory is a backup, not a new writable authority.
     pub fn export(&self, destination: &Path) -> Result<String> {
