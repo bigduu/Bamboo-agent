@@ -43,6 +43,16 @@ fn parse_warning_log_details<'a>(
 ) -> (String, &'a str) {
     if execution_name.eq_ignore_ascii_case("browser")
         || execution_name.eq_ignore_ascii_case("browser_eval")
+        || [
+            "work_overview",
+            "work_search",
+            "work_inspect",
+            "work_changes",
+            "work_update",
+            "work_dispatch",
+        ]
+        .iter()
+        .any(|name| execution_name.eq_ignore_ascii_case(name))
     {
         ("[redacted]".to_string(), "[redacted]")
     } else {
@@ -2425,6 +2435,10 @@ mod hook_tests {
                 r#"{"action":"type","text":"private browser input"#,
             ),
             ("browser_eval", r#"{"code":"private page source"#),
+            (
+                "work_update",
+                r#"{"operations":[{"objective":"private work instructions"#,
+            ),
         ] {
             let (_, warning) = parse_tool_args_best_effort(raw);
             let warning = warning.expect("malformed JSON warning");

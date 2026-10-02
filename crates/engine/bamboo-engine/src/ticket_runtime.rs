@@ -156,6 +156,42 @@ pub fn read_dispatch(session: &Session) -> Result<Option<TicketDispatchBinding>>
         .transpose()
 }
 
+/// Ticket owns this child's result/recovery lifecycle. A short Supervisor turn
+/// must not acquire the ordinary SubAgent orphan wait on its behalf. Inspect
+/// the canonical Host control plane; a model label or a cached replica cannot
+/// confer this exemption. Explicit SubAgent waits keep their existing policy.
+pub(crate) async fn is_independent_ticket_child(
+    storage: &dyn Storage,
+    parent: &Session,
+    child_id: &str,
+) -> bool {
+    let Ok((binding, canonical_parent)) = verified_scope_binding(storage, &parent.id).await else {
+        return false;
+    };
+    if canonical_parent.created_at != parent.created_at
+        || canonical_parent.authority_identity != parent.authority_identity
+        || canonical_parent.root_tool_authority_revision != parent.root_tool_authority_revision
+    {
+        return false;
+    }
+    let Ok(Some(child)) = storage.load_runtime_control_plane(child_id).await else {
+        return false;
+    };
+    let Ok(Some(dispatch)) = read_dispatch(&child) else {
+        return false;
+    };
+    child.kind == SessionKind::Child
+        && child.parent_session_id.as_deref() == Some(parent.id.as_str())
+        && child.id == ticket_child_id(&dispatch.dispatch_key)
+        && !dispatch.dispatch_key.is_empty()
+        && !dispatch.assignment_id.is_empty()
+        && dispatch.binding == binding
+        && child
+            .metadata
+            .get(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+            == Some(&dispatch.assignment_id)
+}
+
 pub async fn query_dispatch(
     storage: &dyn Storage,
     service: &TicketService,

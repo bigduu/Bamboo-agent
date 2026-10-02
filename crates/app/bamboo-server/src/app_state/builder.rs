@@ -1048,6 +1048,7 @@ impl AppState {
             parent_approval_reviewer,
         );
         external_runner.set_canonical_subagent_tool(Some(canonical_subagent_tool));
+        let tools = crate::tools::ticket_tools::overlay(tools, tickets.clone());
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(

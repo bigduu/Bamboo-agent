@@ -1,4 +1,5 @@
 // Shared isolated process fixture; it never reads the user provider settings.
+#![allow(dead_code)] // Integration targets use different subsets of this fixture.
 use actix_web::{web, App, HttpResponse, HttpServer};
 use serde_json::{json, Value};
 use std::{
@@ -106,6 +107,7 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
 #[derive(Default)]
 pub struct Probe {
     pub calls: AtomicUsize,
+    pub root_calls: AtomicUsize,
     pub held: AtomicUsize,
     pub release: tokio::sync::Notify,
 }
@@ -132,6 +134,65 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 json!({"tool_calls":[{"index":0,"id":"ticket-native-plan","type":"function","function":{"name":"Task","arguments":args.to_string()}}]}),
                 "tool_calls",
             )
+        }
+    } else if body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "work_overview")
+    }) && body["messages"]
+        .to_string()
+        .contains("TICKET_SUPERVISOR_E2E")
+    {
+        let phase = probe.root_calls.fetch_add(1, Ordering::SeqCst);
+        let result = |id: &str| -> Value {
+            let message = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+                .expect("Host tool result in provider history");
+            let value: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            if let Some(inner) = value.get("result").and_then(Value::as_str) {
+                serde_json::from_str(inner).unwrap()
+            } else {
+                value
+            }
+        };
+        let call = match phase {
+            0 => Some(("ticket-root-overview", "work_overview", json!({}))),
+            1 => {
+                let overview = result("ticket-root-overview");
+                Some((
+                    "ticket-root-create",
+                    "work_update",
+                    json!({"operation_id":"root-create", "expected_seq":overview["snapshot"]["seq"], "expected_epoch":overview["snapshot"]["authority_epoch"], "operations":[
+                    {"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[], "contract":{"title":"TICKET_SUPERVISOR_E2E","objective":"WAIT_FOR_CANCEL TICKET_E2E_1481","constraints":["Own plan only"],"acceptance":["Exact output"],"user_acceptance_required":true,"allowed_tools":["Task"]}},
+                    {"op":"ready","work_id":"work"}]}),
+                ))
+            }
+            2 => {
+                let created = result("ticket-root-create");
+                let overview = result("ticket-root-overview");
+                Some((
+                    "ticket-root-dispatch",
+                    "work_dispatch",
+                    json!({"operation_id":"root-dispatch", "expected_seq":created["receipt"]["committed_seq"],"expected_epoch":overview["snapshot"]["authority_epoch"],"operations":[{"op":"start","work_id":created["receipt"]["ids"]["work"],"temp_id":"assignment","workspace":null}]}),
+                ))
+            }
+            _ => {
+                assert_eq!(
+                    result("ticket-root-dispatch")["status"],
+                    "accepted_for_dispatch"
+                );
+                None
+            }
+        };
+        match call {
+            Some((id, name, args)) => (
+                json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}),
+                "tool_calls",
+            ),
+            None => (json!({"content":"TICKET_SUPERVISOR_DISPATCHED"}), "stop"),
         }
     } else {
         (json!({"content":"auxiliary"}), "stop")

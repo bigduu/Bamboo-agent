@@ -1152,6 +1152,21 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
+    if !inherited_tool_wait {
+        let mut ordinary = Vec::with_capacity(active.len());
+        for child_id in active {
+            if !crate::ticket_runtime::is_independent_ticket_child(
+                storage.as_ref(),
+                session,
+                &child_id,
+            )
+            .await
+            {
+                ordinary.push(child_id);
+            }
+        }
+        active = ordinary;
+    }
     if active.is_empty() && !inherited_tool_wait {
         return Ok(None);
     }

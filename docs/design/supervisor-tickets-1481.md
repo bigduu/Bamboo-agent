@@ -399,3 +399,38 @@ semantics, Lotus UI, arbitrary shell isolation or external exactly-once effects.
 Runnable commands use `RUST_MIN_STACK=8388608`, `CARGO_INCREMENTAL=0` and the
 shared build target documented above. Mutation and dispatch remain default-off.
 No remote publication or production migration has been performed.
+
+### Local slice 13: bounded Supervisor model tools and short rounds
+
+Worktree `bamboo-1481-supervisor-tools`, branch
+`bamboo/feat/1481-supervisor-tools`, based on `499f416a`.
+Six model functions are conditionally installed when this same Host's
+TicketApplication is available. HTTP and model tools share one authority and
+published service. The original executing Supervisor incarnation is checked;
+arguments cannot provide scope authority, User approval, ingress provenance,
+or Worker/Runtime outcomes. Plan mode cannot mutate. Queries and commands
+retain bounded schemas, typed operations, CAS and exact-input receipts.
+Ticket argument repair warnings redact private content.
+
+The first actual Host fixture failed because the ordinary SubAgent orphan
+wait included Ticket-owned children, preventing a short Supervisor reply.
+The retained fixture is `/tmp/bamboo-1481-ticket-lifecycle-ZZhWuY/host` and
+`/tmp/1481-tools-actual.log`. The narrow correction inspects canonical Host
+child/parent binding and Assignment metadata. It excludes only independent
+Ticket children from a newly inferred wait; explicit waits and ordinary
+children retain their existing behavior. Malformed/old/sibling records cannot
+confer the exemption. No #1479/#1480 coordinator implementation is duplicated.
+
+PASS: 3 tool authority/receipt/schema tests; 19 capability loading tests;
+6 Ticket Runtime tests; 4 existing orphan/Bash wait tests; 1 argument privacy
+test. The actual Host + controlled provider fixture passes in 14.95s: the
+Native Worker remains held while the Supervisor returns, receives a second
+human message and completes a second short reply, with no Root TaskList write.
+The unchanged owner four-Worker/two-round entry point passes again in 18.57s,
+with 8 unique outcomes. These controlled-provider checks are wiring evidence,
+not real-model semantic evaluation. Server Clippy passes in 55.67s with
+the existing engine/storage/server warnings and no unrelated lint repairs.
+
+P6 is not fully accepted yet: complete accepted artifact input bytes,
+inspect section selection, pause and safe explicit retry remain in the next
+focused local slice. P7/P8/P9 and default-enable gates remain outstanding.

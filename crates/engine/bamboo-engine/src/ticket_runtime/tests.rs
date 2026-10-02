@@ -71,6 +71,30 @@ struct Fixture {
     child: Session,
 }
 
+#[tokio::test]
+async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait() {
+    let f = Fixture::new().await;
+    assert!(is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);
+    let ordinary = Session::new_child_of("ordinary", &f.supervisor, "model", "ordinary");
+    f.storage.save_session(&ordinary).await.unwrap();
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &ordinary.id).await);
+    let mut old_parent = f.supervisor.clone();
+    old_parent.created_at -= chrono::Duration::seconds(1);
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &old_parent, &f.child.id).await);
+    let mut changed = f.child.clone();
+    changed.metadata.insert(
+        crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+        "sibling".into(),
+    );
+    f.storage.save_session(&changed).await.unwrap();
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);
+    changed
+        .metadata
+        .insert(TICKET_DISPATCH_KEY.into(), "not a Host binding".into());
+    f.storage.save_session(&changed).await.unwrap();
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);
+}
+
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
