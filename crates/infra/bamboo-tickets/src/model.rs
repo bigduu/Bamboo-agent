@@ -101,7 +101,7 @@ pub struct LocalStep {
     pub parent: Option<String>,
     pub title: String,
     pub completed: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StepStatus>,
 }
 
@@ -264,7 +264,7 @@ pub struct OperationReceipt {
     pub principal: String,
     pub request_hash: String,
     /// Immutable canonical request for host-generated retries after restart.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub canonical_request: String,
     pub committed_seq: u64,
     pub ids: BTreeMap<String, String>,

@@ -1,4 +1,20 @@
 use bamboo_tickets::{store::FileStore, *};
+
+#[test]
+fn optional_local_plan_fields_preserve_older_canonical_bytes() {
+    let step = serde_json::json!({"id":"s","parent":null,"title":"Old step","completed":false});
+    let parsed: LocalStep = serde_json::from_value(step.clone()).unwrap();
+    assert_eq!(
+        canonical_bytes(&parsed).unwrap(),
+        canonical_bytes(&step).unwrap()
+    );
+    let receipt = serde_json::json!({"operation_id":"old","principal":"worker","request_hash":"h","committed_seq":3,"ids":{}});
+    let parsed: OperationReceipt = serde_json::from_value(receipt.clone()).unwrap();
+    assert_eq!(
+        canonical_bytes(&parsed).unwrap(),
+        canonical_bytes(&receipt).unwrap()
+    );
+}
 use std::{
     fs,
     sync::{
