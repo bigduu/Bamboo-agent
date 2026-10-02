@@ -1494,3 +1494,138 @@ fn explicit_retry_after_owned_failed_stop_creates_fresh_generation() {
         2
     );
 }
+
+#[test]
+fn question_answer_before_owned_stop_stays_blocked_and_fresh_context_has_only_own_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "question-yield", BTreeSet::new());
+    let (old, worker) = start(&service, &work, "question-start");
+    let packet = service.child_context_packet(&worker, &old, 65536).unwrap();
+    let ops = vec![
+        Operation::Ask {
+            work_id: work.clone(),
+            temp_id: "question".into(),
+            prompt: "Own question".into(),
+            action: None,
+        },
+        Operation::YieldForInput {
+            assignment_id: old.clone(),
+            request_id: "question".into(),
+            packet_hash: content_hash(&canonical_bytes(&packet).unwrap()),
+        },
+    ];
+    let held = command(&service, "question-yield", ops);
+    let receipt = service.execute(&worker, &held).unwrap();
+    let question = receipt.ids["question"].clone();
+    assert_eq!(service.execute(&worker, &held).unwrap(), receipt);
+    assert!(service.authorize_tool(&worker, "Task").is_err());
+    assert!(service.execute(&user(), &held).is_err());
+    execute(
+        &service,
+        &user(),
+        "answer-first",
+        vec![Operation::Answer {
+            request_id: question.clone(),
+            prompt_revision: 1,
+            answer: "Own exact answer".into(),
+        }],
+    );
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work].state,
+        WorkState::Blocked
+    );
+    assert!(service
+        .execute(
+            &user(),
+            &command(
+                &service,
+                "premature-reopen",
+                vec![Operation::Reopen {
+                    work_id: work.clone()
+                }]
+            )
+        )
+        .is_err());
+    let runtime_receipt = service.published().unwrap().1.assignments[&old]
+        .runtime
+        .clone()
+        .unwrap();
+    execute(
+        &service,
+        &runtime(),
+        "question-owned-stop",
+        vec![Operation::RuntimeStopped {
+            assignment_id: old,
+            receipt: runtime_receipt,
+            completed: true,
+        }],
+    );
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work].state,
+        WorkState::Ready
+    );
+    let (next, next_worker) = start(&service, &work, "question-fresh-start");
+    let packet = service
+        .child_context_packet(&next_worker, &next, 65536)
+        .unwrap();
+    assert_eq!(packet.answers.len(), 1);
+    assert_eq!(packet.answers[0].request_id, question);
+    assert_eq!(packet.answers[0].generation, 1);
+    assert_eq!(packet.answers[0].answer, "Own exact answer");
+    assert_eq!(packet.generation, 2);
+    assert!(service.published().unwrap().1.assignments[&next]
+        .plan
+        .steps
+        .is_empty());
+}
+
+#[test]
+fn restart_quarantines_unstopped_question_and_keeps_request_for_reconciliation() {
+    let root = tempfile::tempdir().unwrap();
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let work = create(&service, "unstopped-question", BTreeSet::new());
+    let (assignment, worker) = start(&service, &work, "unstopped-start");
+    let packet = service
+        .child_context_packet(&worker, &assignment, 65536)
+        .unwrap();
+    let receipt = execute(
+        &service,
+        &worker,
+        "unstopped-question",
+        vec![
+            Operation::Ask {
+                work_id: work.clone(),
+                temp_id: "q".into(),
+                prompt: "Own question".into(),
+                action: None,
+            },
+            Operation::YieldForInput {
+                assignment_id: assignment.clone(),
+                request_id: "q".into(),
+                packet_hash: content_hash(&canonical_bytes(&packet).unwrap()),
+            },
+        ],
+    );
+    drop(service);
+    let service = TicketService::open(root.path(), binding()).unwrap();
+    let state = service.published().unwrap().1;
+    assert_eq!(
+        state.assignments[&assignment].state,
+        AssignmentState::OutcomeUnknown
+    );
+    assert_eq!(
+        state.requests[&receipt.ids["q"]].status,
+        RequestStatus::Open
+    );
+    assert!(service
+        .execute(
+            &user(),
+            &command(
+                &service,
+                "unknown-reopen",
+                vec![Operation::Reopen { work_id: work }]
+            )
+        )
+        .is_err());
+}

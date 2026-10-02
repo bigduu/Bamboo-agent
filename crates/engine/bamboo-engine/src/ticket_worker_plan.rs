@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub const TICKET_LOCAL_PLAN_KEY: &str = "ticket.local_plan.v1";
 pub use bamboo_tickets as tickets;
 pub const TICKET_PLAN_PACKET_KEY: &str = "ticket.local_plan.packet.v1";
+pub const TICKET_QUESTION_YIELD_KEY: &str = "ticket.worker.question_yield.v1";
 pub const TICKET_PLAN_ACTION: &str = "_ticket_local_plan_v1";
 pub mod remote;
 
@@ -39,6 +40,14 @@ pub struct TicketWorkerPlan {
 impl TicketWorkerPlan {
     /// The caller must obtain the receipt from Runtime, never Worker arguments.
     pub fn from_runtime_receipt(service: Arc<TicketService>, assignment_id: &str) -> Result<Self> {
+        let plan = Self::from_receipt_identity(service, assignment_id)?;
+        plan.service.authorize_tool(&plan.authority, "Task")?;
+        Ok(plan)
+    }
+
+    // Identity alone permits only a cached exact-input reply. New commands and
+    // bootstrap reads still require the current live execution permit.
+    fn from_receipt_identity(service: Arc<TicketService>, assignment_id: &str) -> Result<Self> {
         let (_, snapshot) = service.published()?;
         let assignment = snapshot
             .assignments
@@ -57,7 +66,6 @@ impl TicketWorkerPlan {
                 session_id: receipt.session_id.clone(),
             },
         );
-        service.authorize_tool(&authority, "Task")?;
         Ok(Self {
             service,
             authority,
@@ -71,6 +79,10 @@ impl TicketWorkerPlan {
     /// Install only after the trusted host confirms the exact Run/Session receipt.
     pub fn bind_session(&self, session: &mut Session) -> Result<()> {
         self.service.authorize_tool(&self.authority, "Task")?;
+        self.project_session(session)
+    }
+
+    fn project_session(&self, session: &mut Session) -> Result<()> {
         if session.kind != SessionKind::Child
             || session.id != self.session_id
             || session.parent_session_id.as_deref() != Some(&self.supervisor_session_id)
@@ -116,6 +128,16 @@ impl TicketWorkerPlan {
         session
             .metadata
             .insert(TICKET_LOCAL_PLAN_KEY.into(), self.assignment_id.clone());
+        if let Some(request) = assignment
+            .awaiting_request
+            .as_ref()
+            .and_then(|id| snapshot.requests.get(id))
+        {
+            session.metadata.insert(
+                TICKET_QUESTION_YIELD_KEY.into(),
+                serde_json::to_string(request)?,
+            );
+        }
         Ok(())
     }
 
@@ -140,7 +162,6 @@ impl TicketWorkerPlan {
                 "LocalPlan execution identity changed".into(),
             ));
         }
-        self.service.authorize_tool(&self.authority, "Task")?;
         let (_, snapshot) = self.service.published()?;
         let assignment = &snapshot.assignments[&self.assignment_id];
         let op_id = format!("worker-plan/{}/{tool_call_id}", assignment.dispatch_key);
@@ -154,11 +175,13 @@ impl TicketWorkerPlan {
                 .replay_source_command(&self.authority, &op_id, &source)?
         {
             self.service.execute(&self.authority, &command)?;
-            self.bind_session(session)?;
+            self.project_session(session)?;
             return session.task_list.clone().ok_or_else(|| {
                 Error::InvalidTransition("Task produced an empty authoritative plan".into())
             });
         }
+        self.service.authorize_tool(&self.authority, "Task")?;
+        let question = question_prompt(args)?;
         let task_list = TaskTool::task_list_from_args_with_existing(
             args,
             &self.session_id,
@@ -187,20 +210,54 @@ impl TicketWorkerPlan {
             expected_plan_revision: assignment.plan.plan_revision,
             steps,
         };
-        let command = self.service.prepare_source_command(
-            &self.authority,
-            &op_id,
-            vec![operation],
-            source,
-        )?;
+        let mut operations = vec![operation];
+        if let Some(prompt) = question {
+            let packet =
+                self.service
+                    .child_context_packet(&self.authority, &self.assignment_id, 65536)?;
+            let packet_hash =
+                bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&packet)?);
+            operations.push(Operation::Ask {
+                work_id: assignment.work_id.clone(),
+                temp_id: "question".into(),
+                prompt,
+                action: None,
+            });
+            operations.push(Operation::YieldForInput {
+                assignment_id: self.assignment_id.clone(),
+                request_id: "question".into(),
+                packet_hash,
+            });
+        }
+        let command =
+            self.service
+                .prepare_source_command(&self.authority, &op_id, operations, source)?;
         self.service.execute(&self.authority, &command)?;
         // Receipt replay may occur after a newer plan write. Never project the
         // old call's payload over the current authoritative plan.
-        self.bind_session(session)?;
+        self.project_session(session)?;
         session.task_list.clone().ok_or_else(|| {
             Error::InvalidTransition("Task produced an empty authoritative plan".into())
         })
     }
+}
+
+fn question_prompt(args: &serde_json::Value) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Question {
+        prompt: String,
+    }
+    let Some(raw) = args.get("question") else {
+        return Ok(None);
+    };
+    let q: Question = serde_json::from_value(raw.clone())?;
+    if q.prompt.trim().is_empty() || q.prompt.len() > 2048 {
+        return Err(Error::InvalidTransition(
+            "question prompt must be 1..2048 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(Some(q.prompt))
 }
 
 #[cfg(test)]

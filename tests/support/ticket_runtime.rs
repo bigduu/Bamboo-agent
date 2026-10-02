@@ -110,6 +110,8 @@ pub struct Probe {
     pub root_calls: AtomicUsize,
     pub held: AtomicUsize,
     pub input_checks: AtomicUsize,
+    pub questions: AtomicUsize,
+    pub answer_checks: AtomicUsize,
     pub release: tokio::sync::Notify,
 }
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
@@ -124,6 +126,44 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             probe.input_checks.fetch_add(1, Ordering::SeqCst);
         }
         probe.calls.fetch_add(1, Ordering::SeqCst);
+        let content = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(letter) = ["A", "B", "C", "D", "E"]
+            .into_iter()
+            .find(|l| content.contains(&format!("TICKET_QUESTION_E2E:{l}")))
+        {
+            assert!(
+                body["tools"][0]["function"]["parameters"]["properties"]["question"].is_object()
+            );
+            if !content.contains(&format!("答案 {letter}")) {
+                probe.questions.fetch_add(1, Ordering::SeqCst);
+                let args = json!({"tasks":[{"id":"own-step","content":format!("Own private plan {letter}"),"status":"blocked"}],"question":{"prompt":format!("问题 {letter}：请给出专属答案")}});
+                let delta = json!({"tool_calls":[{"index":0,"id":"ticket-native-question","type":"function","function":{"name":"Task","arguments":args.to_string()}}]});
+                let event = json!({"id":"ticket-question","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":"tool_calls"}]});
+                return HttpResponse::Ok()
+                    .content_type("text/event-stream")
+                    .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+            }
+            assert!(
+                content.contains(&format!("答案 {letter}")),
+                "versioned own answer missing"
+            );
+            for other in ["A", "B", "C", "D", "E"]
+                .into_iter()
+                .filter(|o| *o != letter)
+            {
+                assert!(
+                    !content.contains(&format!("答案 {other}")),
+                    "sibling answer leaked"
+                );
+            }
+            probe.answer_checks.fetch_add(1, Ordering::SeqCst);
+        }
         let has_plan = body["messages"]
             .as_array()
             .unwrap()

@@ -38,6 +38,11 @@ pub(super) async fn maybe_apply_ticket_task(
     if let Err(error) = outcome {
         resolved.success = false;
         resolved.result = error.to_string();
+    } else if let Some(request) = session
+        .metadata
+        .get(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY)
+    {
+        resolved.result = serde_json::json!({"status":"waiting_for_answer","request":serde_json::from_str::<serde_json::Value>(request).unwrap_or_default()}).to_string();
     }
     Some(resolved)
 }

@@ -465,3 +465,45 @@ fault tests. No general continuation, shell access or effect-exactly-once claim.
 Server Clippy passes in 55.97s with the existing engine/storage/server
 warnings. P6's local bounded query/context/control gate is accepted;
 P7/P8/P9 remain.
+
+### Local slice 15: native questions and fresh answer-bound attempts
+
+Worktree `bamboo-1481-worker-questions`, branch
+`bamboo/feat/1481-worker-questions`, based on `15a0d46d`.
+A Host-bound native Task callback can atomically save its own LocalPlan and
+one bounded question, then end that one-shot Run. The Assignment remains
+blocked while the Host independently reaps its process. An answer received
+before that stop is saved without releasing execution. After exact stop and
+all answers, explicit dispatch creates a fresh generation and empty private
+plan. Its context carries only this Work's answered question records with
+request, prompt, contract and source-attempt versions. No resident/native
+continuation or new tool permission is introduced.
+
+The initial actual fixture retained questions but failed resume with
+`local_tool_history_unsupported` (`/tmp/1481-questions-actual2.log`, retained
+`/private/tmp/bamboo-1481-ticket-lifecycle-iShy7m/host`). The local transcript
+validator had required an assistant report. Only an exact Host question Task
+receipt now permits a tool-ending transcript; arbitrary Worker observations
+cannot grant it. A subsequent 28.14s controlled fixture passed, but additional
+canonical checks found its final broker save still blocked: `completed Child
+has no terminal transcript reply`. The retained diagnostic is
+`/private/tmp/bamboo-1481-ticket-lifecycle-VpL8KF/host/host.log`; that earlier
+pass alone does not accept the terminal lifecycle. The existing broker receipt
+ledger now consumes a Rust-only Host proof over the exact Child birth, run,
+Task source receipt and full transcript. Ordinary completion APIs still reject
+a metadata-only exception. The same prefix/hash/save/ACK protocol is reused.
+
+PASS: service 39 (1 unit, 9 query, 5 file authority, 24 command contracts),
+native plan 6, existing local transcript 3, exact question transcript guard 1,
+Ticket Runtime result/recovery 6, broker receipt/recovery 12, Ticket all-target
+Clippy with `-D warnings`. The final actual controlled-provider entry point
+`ticket_worker_questions` passes in 28.98s: five canonical completed/yielded
+children and owned stops, Host restart, E/B/D/A/C exact answers, five fresh
+generation-2 submissions, retained unanswered items and no sibling answers.
+Questions create no fake Submission, and each initial worker uses one model
+request. Real-model semantic evaluation and Lotus remain outstanding; this
+fixture is deterministic routing/lifecycle evidence, not semantic quality.
+The unchanged existing child-completion coordinator passes 49/49 (3.31s).
+Actual pause/steer/accepted-input regressions pass 3/3 (19.70s). Server
+all-target Clippy completes in 3m06s with the existing engine 19, storage 1
+and server 6 library warnings; this slice introduces no new warnings there.

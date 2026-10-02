@@ -180,6 +180,12 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
             // after ALL tool calls finish, once `waiting_for_children` is set.
             false
         }
-        ToolHandlingOutcome::Continue => false,
+        ToolHandlingOutcome::Continue => {
+            ctx.config.ticket_worker_plan.is_some()
+                && ctx
+                    .session
+                    .metadata
+                    .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY)
+        }
     }
 }

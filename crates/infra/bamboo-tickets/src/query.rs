@@ -117,6 +117,19 @@ pub struct ContextArtifact {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnsweredInput {
+    pub request_id: String,
+    pub work_id: String,
+    pub assignment_id: Option<String>,
+    pub generation: u64,
+    pub contract_revision: u64,
+    pub prompt_revision: u64,
+    pub prompt: String,
+    pub answer: String,
+    pub updated_seq: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkContextPacket {
     pub contract_ref: String,
     pub contract_revision: u64,
@@ -127,6 +140,8 @@ pub struct WorkContextPacket {
     pub inputs: Vec<DependencyInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<ContextArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<AnsweredInput>,
     pub result_contract: String,
 }
 
@@ -577,6 +592,10 @@ impl TicketService {
         let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
             assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
             input_artifacts,
+            answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision
+                && r.generation < assignment.generation && r.kind == RequestKind::Question && r.status == RequestStatus::Answered)
+                .map(|r|AnsweredInput { request_id:r.id.clone(),work_id:r.work_id.clone(),assignment_id:r.assignment_id.clone(),generation:r.generation,
+                    contract_revision:r.contract_revision,prompt_revision:r.prompt_revision,prompt:r.prompt.clone(),answer:r.answer.clone().expect("answered question"),updated_seq:r.updated_seq }).collect(),
             result_contract:"Submit exact assignment/generation/contract/input versions, artifact hashes and evidence. Completion means submitted.".into() };
         if canonical_bytes(&packet)?.len() > budget_bytes {
             return Err(Error::ContextBudgetExceeded);

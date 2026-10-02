@@ -2587,7 +2587,11 @@ async fn handle_tool_calls_path(
         waiting_for_children = true;
     }
 
-    if awaiting_clarification || waiting_for_children {
+    let ticket_question_yield = frame.config.ticket_worker_plan.is_some()
+        && session
+            .metadata
+            .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
+    if ticket_question_yield || awaiting_clarification || waiting_for_children {
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
             frame.metrics_collector,
             frame.round_id,
@@ -2608,9 +2612,24 @@ async fn handle_tool_calls_path(
                 .unwrap_or(0),
             round_error,
         );
+        if ticket_question_yield {
+            session.metadata.insert(
+                "runtime.completion_reason".into(),
+                "ticket_question_yield".into(),
+            );
+            let _ = frame
+                .event_tx
+                .send(AgentEvent::Complete {
+                    usage: to_event_token_usage(
+                        round_usage.prompt_tokens,
+                        round_usage.completion_tokens,
+                    ),
+                })
+                .await;
+        }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: false,
+            sent_complete: ticket_question_yield,
         });
     }
 

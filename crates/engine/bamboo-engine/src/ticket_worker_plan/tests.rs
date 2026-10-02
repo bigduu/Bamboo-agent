@@ -569,3 +569,38 @@ async fn native_bridge_writes_only_host_bound_plan_and_rejects_other_run() {
     drop(remote);
     pump.await.unwrap();
 }
+
+#[test]
+fn native_question_callback_is_atomic_exact_replay_and_rejects_json_approval() {
+    let mut f = Fixture::new();
+    let plan = f.plan();
+    plan.bind_session(&mut f.session).unwrap();
+    let args = json!({"tasks":[{"id":"own","content":"Own blocked step","status":"blocked"}],"question":{"prompt":"Own precise question"}});
+    let first = remote::apply_host_plan_request(
+        &f.service,
+        &f.session,
+        "fixture-run",
+        &json!({(TICKET_PLAN_ACTION):{"task":args}}),
+        "question-call",
+    )
+    .unwrap();
+    let question = first.question.unwrap();
+    assert_eq!(
+        question.assignment_id.as_deref(),
+        Some(f.assignment.as_str())
+    );
+    assert_eq!(question.kind, bamboo_tickets::RequestKind::Question);
+    let seq = f.service.published().unwrap().1.seq;
+    let replay = remote::apply_host_plan_request(
+        &f.service,
+        &f.session,
+        "fixture-run",
+        &json!({(TICKET_PLAN_ACTION):{"task":args}}),
+        "question-call",
+    )
+    .unwrap();
+    assert_eq!(replay.question.unwrap().id, question.id);
+    assert_eq!(f.service.published().unwrap().1.seq, seq);
+    assert!(remote::apply_host_plan_request(&f.service, &f.session, "fixture-run", &json!({(TICKET_PLAN_ACTION):{"task":{"tasks":[{"content":"Any","status":"blocked"}],"question":{"prompt":"Own","approved":true}}}}), "forged-question").is_err());
+    assert!(f.service.published().unwrap().1.submissions.is_empty());
+}

@@ -17,6 +17,8 @@ pub struct PlanProjection {
     pub binding: bamboo_tickets::ScopeBinding,
     pub task_list: Option<TaskList>,
     pub plan_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<bamboo_tickets::PendingRequest>,
 }
 
 pub struct RemoteWorkerPlan {
@@ -206,6 +208,20 @@ impl WorkerLocalPlan for RemoteWorkerPlan {
         }
         session.task_list = Some(plan.clone());
         session.set_task_list_version_meta(projection.plan_revision.to_string());
+        if let Some(q) = projection.question {
+            if q.kind != bamboo_tickets::RequestKind::Question
+                || q.work_id != self.packet.contract_ref
+                || q.assignment_id.as_deref() != Some(self.packet.assignment_id.as_str())
+                || q.generation != self.packet.generation
+                || q.contract_revision != self.packet.contract_revision
+                || q.worker_packet_hash.as_deref() != Some(projection.packet_hash.as_str())
+            {
+                return Err(Error::ScopeDenied("Host question binding changed".into()));
+            }
+            session
+                .metadata
+                .insert(TICKET_QUESTION_YIELD_KEY.into(), serde_json::to_string(&q)?);
+        }
         Ok(plan)
     }
 }
@@ -230,7 +246,7 @@ pub fn apply_host_plan_request(
         .metadata
         .get(TICKET_LOCAL_PLAN_KEY)
         .ok_or_else(|| Error::ScopeDenied("Child has no LocalPlan capability".into()))?;
-    let plan = TicketWorkerPlan::from_runtime_receipt(Arc::new(service.clone()), assignment)?;
+    let plan = TicketWorkerPlan::from_receipt_identity(Arc::new(service.clone()), assignment)?;
     if plan.run_id() != run_id || plan.session_id != caller.id {
         return Err(Error::ScopeDenied(
             "Host Run differs from admission receipt".into(),
@@ -241,13 +257,23 @@ pub fn apply_host_plan_request(
         .agent_runtime_state
         .get_or_insert_with(Default::default)
         .run_id = run_id.into();
-    plan.bind_session(&mut projection)?;
-    let packet_hash =
-        packet_fingerprint(&service.child_context_packet(&plan.authority, assignment, 65536)?)?;
+    plan.project_session(&mut projection)?;
+    let saved_question = service.published()?.1.assignments[assignment]
+        .awaiting_request
+        .clone();
+    let packet_hash = if let Some(request) = saved_question {
+        service.published()?.1.requests[&request]
+            .worker_packet_hash
+            .clone()
+            .ok_or_else(|| Error::AuthorityUnavailable("question packet hash missing".into()))?
+    } else {
+        packet_fingerprint(&service.child_context_packet(&plan.authority, assignment, 65536)?)?
+    };
     if body.get("read") != Some(&serde_json::Value::Bool(true)) {
         let task = body
             .get("task")
             .ok_or_else(|| Error::InvalidTransition("Task payload missing".into()))?;
+        let prompt = question_prompt(task)?;
         // Refuse a plan that cannot fit the existing bounded callback reply
         // before committing it. A transport budget must not become a partial
         // success in which the Host writes but the Worker cannot read its plan.
@@ -272,13 +298,23 @@ pub fn apply_host_plan_request(
             binding: snapshot.binding,
             task_list: Some(candidate),
             plan_revision: a.plan.plan_revision.saturating_add(1),
+            question: None,
         };
-        if serde_json::to_vec(&serde_json::json!({"result":candidate}))?.len() > 16 * 1024 - 256 {
+        let question_budget = prompt
+            .as_ref()
+            .map_or(0, |p| p.len().saturating_mul(2).saturating_add(2048));
+        if serde_json::to_vec(&serde_json::json!({"result":candidate}))?
+            .len()
+            .saturating_add(question_budget)
+            > 16 * 1024 - 256
+        {
             return Err(Error::InvalidTransition(
                 "native LocalPlan exceeds HostBridge reply budget".into(),
             ));
         }
         plan.apply_task(&mut projection, call_id, task)?;
+    } else {
+        service.authorize_tool(&plan.authority, "Task")?;
     }
     let plan_revision = projection
         .task_list_version_meta()
@@ -294,6 +330,11 @@ pub fn apply_host_plan_request(
         binding: snapshot.binding,
         task_list: projection.task_list,
         plan_revision,
+        question: a
+            .awaiting_request
+            .as_ref()
+            .and_then(|id| snapshot.requests.get(id))
+            .cloned(),
     })
 }
 

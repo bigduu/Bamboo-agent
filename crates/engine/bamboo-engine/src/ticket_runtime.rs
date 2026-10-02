@@ -13,7 +13,9 @@ use crate::execution::spawn::SessionInboxRuntimeBinding;
 
 pub const TICKET_DISPATCH_KEY: &str = "ticket.runtime.dispatch.v1";
 mod result;
-pub use result::{checkpoint_owned_ticket_stop, checkpoint_ticket_result};
+pub use result::{
+    checkpoint_owned_ticket_stop, checkpoint_ticket_result, question_terminal_call_id,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

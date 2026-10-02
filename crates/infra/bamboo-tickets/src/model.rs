@@ -142,6 +142,8 @@ pub struct Assignment {
     /// Host-confirmed owned-process termination, independent of business state.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub process_stopped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_request: Option<String>,
     pub dependency_inputs: Vec<DependencyInput>,
     pub plan: LocalPlan,
     pub workspace: Option<ExecutionWorkspace>,
@@ -239,6 +241,9 @@ pub struct PendingRequest {
     pub status: RequestStatus,
     pub answer: Option<String>,
     pub consumed_attempt: Option<String>,
+    /// Host-derived context hash for replaying an exact yielded Task callback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_packet_hash: Option<String>,
     pub updated_seq: u64,
 }
 
@@ -404,6 +409,11 @@ pub enum Operation {
         temp_id: String,
         prompt: String,
         action: Option<Action>,
+    },
+    YieldForInput {
+        assignment_id: String,
+        request_id: String,
+        packet_hash: String,
     },
     Answer {
         request_id: String,

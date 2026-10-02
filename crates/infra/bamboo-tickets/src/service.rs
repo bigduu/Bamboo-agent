@@ -147,7 +147,8 @@ impl TicketService {
                         | AssignmentState::Admitted
                         | AssignmentState::Running
                         | AssignmentState::Cancelling
-                ) {
+                ) || assignment.state == AssignmentState::Blocked && !assignment.process_stopped
+                {
                     assignment.state = AssignmentState::OutcomeUnknown;
                     assignment.updated_seq = snapshot.seq;
                     assignment.record_revision += 1;
@@ -879,6 +880,7 @@ fn apply(
                     dispatch_key: dispatch_key.clone(),
                     runtime: None,
                     process_stopped: false,
+                    awaiting_request: None,
                     dependency_inputs: inputs,
                     plan: LocalPlan {
                         plan_revision: 0,
@@ -1058,6 +1060,7 @@ fn apply(
                     status: RequestStatus::Open,
                     answer: None,
                     consumed_attempt: None,
+                    worker_packet_hash: None,
                     updated_seq: seq,
                 },
             );
@@ -1079,6 +1082,69 @@ fn apply(
             request.answer = Some(answer.clone());
             request.status = RequestStatus::Answered;
             request.updated_seq = seq;
+            let work_id = request.work_id.clone();
+            let waiting = snapshot.assignments.values().any(|a| {
+                a.work_id == work_id
+                    && a.awaiting_request.is_some()
+                    && a.process_stopped
+                    && a.generation == snapshot.tickets[&work_id].generation
+                    && a.contract_revision == snapshot.tickets[&work_id].contract_revision
+            });
+            let unanswered = snapshot
+                .requests
+                .values()
+                .any(|r| r.work_id == work_id && r.status == RequestStatus::Open);
+            let work = snapshot.tickets.get_mut(&work_id).expect("work");
+            if waiting
+                && !unanswered
+                && work.state == WorkState::Blocked
+                && !work.paused
+                && work.active_assignment.is_none()
+            {
+                work.state = WorkState::Ready;
+                work.blocked = None;
+                touch(work, seq);
+            }
+        }
+        YieldForInput {
+            assignment_id,
+            request_id,
+            packet_hash,
+        } => {
+            let a = assignment(snapshot, assignment_id)?.clone();
+            authority.worker(&a)?;
+            active_permit(snapshot, &a)?;
+            let request_id = resolve(request_id, ids);
+            validate_request(snapshot, &request_id, 1)?;
+            let r = &snapshot.requests[&request_id];
+            if r.kind != RequestKind::Question
+                || r.assignment_id.as_deref() != Some(assignment_id)
+                || r.work_id != a.work_id
+                || packet_hash.len() != 64
+                || !packet_hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("question yield binding mismatch"));
+            }
+            snapshot
+                .requests
+                .get_mut(&request_id)
+                .expect("request")
+                .worker_packet_hash = Some(packet_hash.clone());
+            let a = snapshot
+                .assignments
+                .get_mut(assignment_id)
+                .expect("assignment");
+            a.awaiting_request = Some(request_id);
+            a.state = AssignmentState::Blocked;
+            a.record_revision += 1;
+            a.updated_seq = seq;
+            let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
+            work.state = WorkState::Blocked;
+            work.blocked = Some(BlockReason {
+                reason: "awaiting a precise User answer and owned process stop".into(),
+                resume_state: WorkState::Ready,
+            });
+            touch(work, seq);
         }
         DecideApproval {
             request_id,
@@ -1438,6 +1504,11 @@ fn apply(
                 )
             });
             let cancelled = ticket(snapshot, &a.work_id)?.state == WorkState::Cancelled;
+            let waiting = a.awaiting_request.is_some();
+            let unanswered = snapshot
+                .requests
+                .values()
+                .any(|r| r.work_id == a.work_id && r.status == RequestStatus::Open);
             let updated = snapshot
                 .assignments
                 .get_mut(assignment_id)
@@ -1449,13 +1520,27 @@ fn apply(
                 updated.state = AssignmentState::OutcomeUnknown;
             } else if cancelled {
                 updated.state = AssignmentState::Cancelled;
+            } else if waiting {
+                updated.state = AssignmentState::Blocked;
             } else if !completed && updated.state != AssignmentState::Submitted {
                 updated.state = AssignmentState::Failed;
             }
             let work = snapshot.tickets.get_mut(&a.work_id).expect("work");
             // A late stopped run affects its own attempt only.
             if work.active_assignment.as_deref() == Some(assignment_id) {
-                if (cancelled || work.paused) && !effects_unknown {
+                if waiting
+                    && !effects_unknown
+                    && !cancelled
+                    && a.generation == work.generation
+                    && a.contract_revision == work.contract_revision
+                {
+                    work.active_assignment = None;
+                    if !unanswered && !work.paused {
+                        work.state = WorkState::Ready;
+                        work.blocked = None;
+                    }
+                    touch(work, seq);
+                } else if (cancelled || work.paused) && !effects_unknown {
                     work.active_assignment = None;
                     touch(work, seq);
                 } else if effects_unknown || !completed {
@@ -1643,6 +1728,7 @@ pub(crate) fn holds_resources(a: &Assignment) -> bool {
         && matches!(
             a.state,
             AssignmentState::DispatchPending
+                | AssignmentState::Blocked
                 | AssignmentState::Admitted
                 | AssignmentState::Running
                 | AssignmentState::Cancelling
@@ -1822,6 +1908,21 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     }
     for a in snapshot.assignments.values() {
         ticket(snapshot, &a.work_id)?;
+        if let Some(id) = &a.awaiting_request {
+            let r = snapshot
+                .requests
+                .get(id)
+                .ok_or_else(|| invalid("Assignment question reference missing"))?;
+            if r.kind != RequestKind::Question
+                || r.assignment_id.as_deref() != Some(a.id.as_str())
+                || r.work_id != a.work_id
+                || r.generation != a.generation
+                || r.contract_revision != a.contract_revision
+                || r.worker_packet_hash.as_ref().is_none_or(|h| h.len() != 64)
+            {
+                return Err(invalid("Assignment question binding invalid"));
+            }
+        }
         let intent = snapshot
             .intents
             .get(&a.dispatch_key)

@@ -2618,17 +2618,54 @@ impl ExternalChildRunner for ActorChildRunner {
         {
             return Err("stale Child activation cannot prepare broker receipt".into());
         }
-        store
-            .prepare_broker_terminal_receipt(
+        let ticket_service = self.ticket_service.lock().recover_poison().clone();
+        let yielded_call = if expected_status == "completed"
+            && session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+        {
+            let service = ticket_service
+                .as_deref()
+                .ok_or("Ticket authority unavailable for broker question")?;
+            crate::ticket_runtime::question_terminal_call_id(service, session, activation_run_id)
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        if let Some(call_id) = yielded_call {
+            let proof = bamboo_storage::v2::HostToolYield::from_verified_host(
                 session,
                 activation_run_id,
-                &delivery.broker_identity,
-                &delivery.parent_mailbox,
-                &delivery.correlation_id,
-                &delivery.message_ids,
+                &call_id,
             )
-            .await
-            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+            .map_err(|e| e.to_string())?;
+            store
+                .prepare_broker_tool_yield_receipt(
+                    session,
+                    bamboo_storage::v2::BrokerTerminalRoute {
+                        activation_run_id,
+                        broker_identity: &delivery.broker_identity,
+                        parent_mailbox: &delivery.parent_mailbox,
+                        broker_correlation_id: &delivery.correlation_id,
+                        message_ids: &delivery.message_ids,
+                    },
+                    &proof,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            store
+                .prepare_broker_terminal_receipt(
+                    session,
+                    activation_run_id,
+                    &delivery.broker_identity,
+                    &delivery.parent_mailbox,
+                    &delivery.correlation_id,
+                    &delivery.message_ids,
+                )
+                .await
+                .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+        }
         Ok(true)
     }
 
@@ -5017,6 +5054,9 @@ struct LocalToolCollector {
     messages: Option<Vec<bamboo_agent_core::Message>>,
     starts: HashMap<String, (String, serde_json::Value)>,
     outcomes: HashMap<String, (bool, String)>,
+    // Installed only by the Host's exact Task callback receipt. Worker event
+    // JSON and transcript metadata cannot grant this terminal exception.
+    ticket_yield: Option<(String, bamboo_tickets::PendingRequest)>,
 }
 
 impl LocalToolCollector {
@@ -5298,13 +5338,23 @@ impl LocalToolCollector {
             }
         }
         let last = suffix.last().ok_or_else(local_tool_history_unsupported)?;
+        let question_terminal = self.ticket_yield.as_ref().is_some_and(|(id, question)| {
+            last.role == Role::Tool
+                && last.tool_call_id.as_ref() == Some(id)
+                && last.tool_success == Some(true)
+                && self.starts.get(id).is_some_and(|(name, _)| name == "Task")
+                && terminal.is_none_or(str::is_empty)
+                && serde_json::from_str::<serde_json::Value>(&last.content).ok()
+                    == Some(serde_json::json!({"status":"waiting_for_answer", "request":question}))
+        });
+        let report_terminal = last.role == Role::Assistant
+            && last.tool_calls.is_none()
+            && last.phase != Some(bamboo_domain::MessagePhase::Commentary)
+            && terminal == Some(last.content.as_str());
         if !pending.is_empty()
             || used.len() != self.outcomes.len()
             || self.starts.keys().any(|id| !used.contains(id))
-            || last.role != Role::Assistant
-            || last.tool_calls.is_some()
-            || last.phase == Some(bamboo_domain::MessagePhase::Commentary)
-            || terminal != Some(last.content.as_str())
+            || !(report_terminal || question_terminal)
         {
             return Err(local_tool_history_unsupported());
         }
@@ -7742,6 +7792,13 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                                 Ok(projection) => {
                                                     logical_session.task_list = projection.task_list.clone();
                                                     logical_session.set_task_list_version_meta(projection.plan_revision.to_string());
+                                                    if let Some(question) = &projection.question {
+                                                        let raw = serde_json::to_string(question).map_err(|_| local_tool_history_unsupported())?;
+                                                        logical_session.metadata.insert(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY.into(), raw);
+                                                        if let Some(collector) = local_history.as_mut() {
+                                                            collector.ticket_yield = Some((tool_call_id.clone(), question.clone()));
+                                                        }
+                                                    }
                                                     if let Some(task) = args[crate::ticket_worker_plan::TICKET_PLAN_ACTION].get("task") {
                                                         committed_plan_calls.insert(tool_call_id.clone(), task.clone());
                                                         if let Some(task_list) = projection.task_list.clone() {
@@ -9471,6 +9528,61 @@ mod tests {
         })
         .unwrap();
         assert!(!collector.ticket_event(&forged_root, &receipts).unwrap());
+    }
+
+    #[test]
+    fn ticket_question_terminal_requires_exact_host_receipt_and_tool_result() {
+        use bamboo_agent_core::{FunctionCall, Message, ToolCall};
+        let mut host = Session::new("question-child", "model");
+        host.messages.push(Message::user("own assignment"));
+        let question: bamboo_tickets::PendingRequest = serde_json::from_value(serde_json::json!({
+            "id":"own-question", "work_id":"own-work", "assignment_id":"own-assignment",
+            "generation":1, "contract_revision":1, "prompt_revision":1,
+            "kind":{"kind":"question"}, "prompt":"精确问题", "status":"open",
+            "answer":null, "consumed_attempt":null, "worker_packet_hash":"a".repeat(64), "updated_seq":3
+        })).unwrap();
+        let args = serde_json::json!({"tasks":[{"content":"own step","status":"blocked"}], "question":{"prompt":"精确问题"}});
+        for case in ["exact", "no_host_receipt", "forged_request", "fake_report"] {
+            let mut returned =
+                serde_json::json!({"status":"waiting_for_answer", "request":question});
+            if case == "forged_request" {
+                returned["request"]["id"] = serde_json::json!("sibling-question");
+            }
+            let text = returned.to_string();
+            let rows = [
+                Message::assistant(
+                    "",
+                    Some(vec![ToolCall {
+                        id: "own-call".into(),
+                        tool_type: "function".into(),
+                        function: FunctionCall {
+                            name: "Task".into(),
+                            arguments: args.to_string(),
+                        },
+                    }]),
+                ),
+                Message::tool_result_with_status("own-call", &text, true),
+            ];
+            let collector = LocalToolCollector {
+                messages: Some(host.messages.iter().cloned().chain(rows).collect()),
+                starts: HashMap::from([("own-call".into(), ("Task".into(), args.clone()))]),
+                outcomes: HashMap::from([("own-call".into(), (true, text))]),
+                ticket_yield: (case != "no_host_receipt")
+                    .then(|| ("own-call".into(), question.clone())),
+            };
+            let terminal = if case == "fake_report" {
+                Some("fake delivery")
+            } else {
+                Some("")
+            };
+            assert_eq!(
+                collector
+                    .suffix(&host, &["Task".into()], false, terminal)
+                    .is_ok(),
+                case == "exact",
+                "{case}"
+            );
+        }
     }
 
     #[test]

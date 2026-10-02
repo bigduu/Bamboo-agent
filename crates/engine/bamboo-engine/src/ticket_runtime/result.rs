@@ -6,6 +6,107 @@ use bamboo_tickets::OperationReceipt;
 
 pub const TICKET_OWNED_STOP_KEY: &str = "ticket.runtime.owned_stop.v1";
 
+/// A question ends the local one-shot Run without claiming a delivery. Only
+/// the authoritative Assignment and exact raw Task operation receipt can
+/// grant this broker-terminal exception; Worker metadata cannot grant it.
+pub fn question_terminal_call_id(
+    service: &TicketService,
+    session: &Session,
+    run_id: &str,
+) -> Result<Option<String>> {
+    let Some(dispatch) = read_dispatch(session)? else {
+        return Ok(None);
+    };
+    let snapshot = service.published()?.1;
+    let a = snapshot
+        .assignments
+        .get(&dispatch.assignment_id)
+        .ok_or_else(|| Error::ScopeDenied("yield Assignment missing".into()))?;
+    let Some(request_id) = &a.awaiting_request else {
+        return Ok(None);
+    };
+    let receipt = a
+        .runtime
+        .as_ref()
+        .ok_or_else(|| Error::ScopeDenied("yield admission missing".into()))?;
+    if session.kind != SessionKind::Child
+        || snapshot.binding != dispatch.binding
+        || dispatch.receipt.as_ref() != Some(receipt)
+        || receipt.run_id != run_id
+        || receipt.session_id != session.id
+        || dispatch.receipt_created_at != Some(session.created_at)
+        || session.parent_session_id.as_deref()
+            != Some(snapshot.binding.supervisor_session_id.as_str())
+    {
+        return Err(Error::ScopeDenied(
+            "yield execution identity changed".into(),
+        ));
+    }
+    let last = session
+        .messages
+        .last()
+        .filter(|m| m.role == Role::Tool && m.tool_success == Some(true))
+        .ok_or_else(|| Error::ScopeDenied("yield Tool result missing".into()))?;
+    let call_id = last
+        .tool_call_id
+        .as_ref()
+        .ok_or_else(|| Error::ScopeDenied("yield call missing".into()))?;
+    let q = &snapshot.requests[request_id];
+    let raw = session
+        .metadata
+        .get(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY)
+        .ok_or_else(|| Error::ScopeDenied("Host yield question missing".into()))?;
+    let original: bamboo_tickets::PendingRequest = serde_json::from_str(raw)?;
+    if original.id != q.id
+        || original.work_id != a.work_id
+        || original.assignment_id.as_deref() != Some(a.id.as_str())
+        || original.generation != a.generation
+        || original.contract_revision != a.contract_revision
+        || original.prompt_revision != q.prompt_revision
+        || original.prompt != q.prompt
+        || original.worker_packet_hash != q.worker_packet_hash
+        || original.kind != bamboo_tickets::RequestKind::Question
+        || serde_json::from_str::<serde_json::Value>(&last.content)?
+            != serde_json::json!({"status":"waiting_for_answer", "request":original})
+    {
+        return Err(Error::ScopeDenied("yield question result changed".into()));
+    }
+    let calls: Vec<_> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten())
+        .filter(|call| &call.id == call_id)
+        .collect();
+    if calls.len() != 1 || calls[0].function.name != "Task" {
+        return Err(Error::ScopeDenied("yield Task pair missing".into()));
+    }
+    let authority = Authority::from_verified_host(
+        snapshot.binding,
+        Principal::Worker {
+            assignment_id: a.id.clone(),
+            generation: a.generation,
+            run_id: run_id.into(),
+            session_id: session.id.clone(),
+        },
+    );
+    let source = bamboo_tickets::CommandSource::WorkerTask {
+        arguments: serde_json::from_str(&calls[0].function.arguments)?,
+    };
+    if service
+        .replay_source_command(
+            &authority,
+            &format!("worker-plan/{}/{call_id}", a.dispatch_key),
+            &source,
+        )?
+        .is_none()
+    {
+        return Err(Error::ScopeDenied(
+            "yield Task source receipt missing".into(),
+        ));
+    }
+    Ok(Some(call_id.clone()))
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnedStopCheckpoint {
@@ -179,6 +280,37 @@ pub async fn checkpoint_ticket_result(
         return Err(Error::ScopeDenied(
             "completed Child differs from immutable Assignment".into(),
         ));
+    }
+    if let Some(request_id) = &assignment.awaiting_request {
+        let question = snapshot
+            .requests
+            .get(request_id)
+            .ok_or_else(|| Error::ScopeDenied("yield question missing".into()))?;
+        if question.assignment_id.as_deref() != Some(assignment.id.as_str())
+            || question.work_id != assignment.work_id
+            || question.generation != assignment.generation
+            || question.contract_revision != assignment.contract_revision
+        {
+            return Err(Error::ScopeDenied("yield question binding changed".into()));
+        }
+        if let Some(raw) = canonical.metadata.get(TICKET_OWNED_STOP_KEY) {
+            if raw.len() > 4096 {
+                return Err(Error::ScopeDenied("stop checkpoint exceeds limit".into()));
+            }
+            let checkpoint: OwnedStopCheckpoint = serde_json::from_str(raw)?;
+            if checkpoint.receipt != *receipt
+                || checkpoint.child_birth != canonical.created_at
+                || checkpoint.pid == 0
+            {
+                return Err(Error::ScopeDenied(
+                    "question stop checkpoint mismatch".into(),
+                ));
+            }
+            checkpoint_stop_operation(service, &snapshot.binding, &assignment.id, &checkpoint)?;
+        }
+        // Ending a one-shot question run is a capacity release, not a delivery.
+        // Its durable request/stop survives replay without a fake Submission.
+        return Ok(None);
     }
     let output = canonical
         .messages
