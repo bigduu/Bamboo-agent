@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ParentQuestion, ParentQuestionOutcome, ParentQuestionResolution, ProjectId, ProjectStatus,
-    Session, SessionActivationPolicy, SessionKind, SessionMessageEnvelope, SessionMessageId,
-    PARENT_QUESTION_REQUEST_KEY,
+    RuntimeSessionPersistence, Session, SessionActivationPolicy, SessionKind,
+    SessionMessageEnvelope, SessionMessageId, PARENT_QUESTION_REQUEST_KEY,
 };
 use chrono::{DateTime, Utc};
 use tokio::time::MissedTickBehavior;
@@ -27,6 +27,7 @@ pub(super) struct ParentQuestionCoordinator {
     messenger: Arc<bamboo_engine::SessionMessenger>,
     projects: Arc<bamboo_projects::ProjectStore>,
     shutdown: CancellationToken,
+    parent_outcome_writer: Option<bamboo_engine::SessionRepository>,
 }
 
 impl ParentQuestionCoordinator {
@@ -43,6 +44,7 @@ impl ParentQuestionCoordinator {
             messenger,
             projects,
             shutdown,
+            parent_outcome_writer: None,
         }
     }
 
@@ -79,6 +81,11 @@ impl ParentQuestionCoordinator {
         ) {
             return Err("ParentQuestion Actor lineage is unavailable or retired".into());
         }
+        let parent_writer = self
+            .sessions
+            .bind_parent_outcome_writer(caller_session_id)
+            .await
+            .map_err(|_| "ParentQuestion Root writer is unavailable")?;
         if child
             .metadata
             .get("runtime.parent_question.unavailable_at_deadline_v1")
@@ -92,7 +99,12 @@ impl ParentQuestionCoordinator {
             if existing.request != question {
                 return Err("ParentQuestion terminal identity changed".into());
             }
-            self.reconcile_after_reply(&child.id).await?;
+            self.reconcile_after_reply(&child.id, parent_writer.repository())
+                .await?;
+            parent_writer
+                .finish()
+                .await
+                .map_err(|_| "ParentQuestion Root control completion is unconfirmed")?;
             return match existing.outcome {
                 ParentQuestionOutcome::Answer { text } => Ok(ParentQuestionReplyReceipt {
                     answer: text,
@@ -111,14 +123,28 @@ impl ParentQuestionCoordinator {
         question.validate_answer(answer).map_err(str::to_string)?;
         if Utc::now() >= question.deadline {
             let _ = outcome::expire(&self.sessions, &parent, &question).await;
-            let _ = self.reconcile_after_reply(&child.id).await;
+            let _ = self
+                .reconcile_after_reply(&child.id, parent_writer.repository())
+                .await;
             return Err("ParentQuestion deadline elapsed".into());
         }
-        let (state, recorded) =
-            outcome::answer(&self.store, &self.sessions, &parent, &question, answer)
-                .await
-                .map_err(|_| "ParentQuestion answer CAS is unconfirmed")?;
-        self.reconcile_after_reply(&child.id).await?;
+        let root_owner = parent_writer.repository().root_actor_writer();
+        let (state, recorded) = outcome::answer(
+            &self.store,
+            &self.sessions,
+            &parent,
+            &question,
+            answer,
+            root_owner.as_ref(),
+        )
+        .await
+        .map_err(|_| "ParentQuestion answer CAS is unconfirmed")?;
+        self.reconcile_after_reply(&child.id, parent_writer.repository())
+            .await?;
+        parent_writer
+            .finish()
+            .await
+            .map_err(|_| "ParentQuestion Root control completion is unconfirmed")?;
         match state {
             State::Terminal(ParentQuestionResolution {
                 outcome: ParentQuestionOutcome::Answer { text },
@@ -144,8 +170,13 @@ impl ParentQuestionCoordinator {
     /// Child successor do not nest on that same Tokio worker stack. Awaiting
     /// retains the tool's confirmation/error boundary; a lost task is retried
     /// from the Child's durable resolution marker by the paced reconciler.
-    async fn reconcile_after_reply(&self, child_id: &str) -> Result<ReconcileDisposition, String> {
-        let this = self.clone();
+    async fn reconcile_after_reply(
+        &self,
+        child_id: &str,
+        parent_writer: &bamboo_engine::SessionRepository,
+    ) -> Result<ReconcileDisposition, String> {
+        let mut this = self.clone();
+        this.parent_outcome_writer = Some(parent_writer.clone());
         let child_id = child_id.to_owned();
         tokio::spawn(async move { this.reconcile_child(&child_id).await })
             .await
@@ -307,9 +338,14 @@ impl ParentQuestionCoordinator {
                     )
                     .await
                     .map_err(|_| "ParentQuestion Child wake admission is unconfirmed")?;
-                outcome::append_terminal(&self.sessions, &resolution)
-                    .await
-                    .map_err(|_| "ParentQuestion parent terminal is unconfirmed")?;
+                outcome::append_terminal(
+                    self.parent_outcome_writer
+                        .as_ref()
+                        .unwrap_or(&self.sessions),
+                    &resolution,
+                )
+                .await
+                .map_err(|_| "ParentQuestion parent terminal is unconfirmed")?;
                 outcome::finish_answer(&self.sessions, &parent, &resolution)
                     .await
                     .map_err(|_| "ParentQuestion Child answer finalization is unconfirmed")?;
@@ -321,9 +357,14 @@ impl ParentQuestionCoordinator {
                     })?;
             }
             ParentQuestionOutcome::Expired => {
-                outcome::append_terminal(&self.sessions, &resolution)
-                    .await
-                    .map_err(|_| "ParentQuestion parent timeout terminal is unconfirmed")?;
+                outcome::append_terminal(
+                    self.parent_outcome_writer
+                        .as_ref()
+                        .unwrap_or(&self.sessions),
+                    &resolution,
+                )
+                .await
+                .map_err(|_| "ParentQuestion parent timeout terminal is unconfirmed")?;
                 let wake = resolution
                     .expiry_parent_wake_envelope()
                     .ok_or("ParentQuestion parent timeout wake is invalid")?;
@@ -890,6 +931,7 @@ mod tests {
             &parent,
             &fixture.question,
             "A",
+            None,
         )
         .await
         .unwrap();

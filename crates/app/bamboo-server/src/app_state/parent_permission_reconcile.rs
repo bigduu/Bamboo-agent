@@ -182,6 +182,7 @@ pub(super) fn spawn_deadline(
     let store = Arc::downgrade(store);
     let persistence = Arc::downgrade(sessions.persistence());
     let cache = Arc::downgrade(sessions.cache());
+    let parent_route = sessions.downgrade_parent_outcome_route();
     tokio::spawn(async move {
         let mut retry_interval = INITIAL_RETRY_INTERVAL;
         loop {
@@ -203,7 +204,11 @@ pub(super) fn spawn_deadline(
                     break;
                 };
                 let storage: Arc<dyn Storage> = store;
-                let sessions = SessionRepository::new(cache, storage, persistence);
+                let Some(sessions) =
+                    parent_route.rebind(SessionRepository::new(cache, storage, persistence))
+                else {
+                    break;
+                };
                 outcome::expire(&sessions, &request).await
             };
             match result {
@@ -240,6 +245,7 @@ fn spawn_parent_load_retry(
     let store = Arc::downgrade(store);
     let persistence = Arc::downgrade(sessions.persistence());
     let cache = Arc::downgrade(sessions.cache());
+    let parent_route = sessions.downgrade_parent_outcome_route();
     tokio::spawn(async move {
         let mut retry_interval = INITIAL_RETRY_INTERVAL;
         loop {
@@ -255,7 +261,11 @@ fn spawn_parent_load_retry(
             match store.load_session(&parent_id).await {
                 Ok(Some(parent)) => {
                     let storage: Arc<dyn Storage> = store.clone();
-                    let sessions = SessionRepository::new(cache, storage, persistence);
+                    let Some(sessions) =
+                        parent_route.rebind(SessionRepository::new(cache, storage, persistence))
+                    else {
+                        break;
+                    };
                     let mut report = ReconcileReport::default();
                     reconcile_parent(&parent, &sessions, Some((&store, &shutdown)), &mut report)
                         .await;
@@ -465,8 +475,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_request_expires_at_its_own_deadline_without_a_global_sweep() {
-        let seed = seed_request(chrono::Duration::seconds(5), false).await;
+    async fn activated_idle_root_request_expires_at_its_own_deadline_without_a_global_sweep() {
+        use bamboo_domain::{
+            ActorActivationFinish, ActorActivationStatus, ActorDirectoryPort,
+            RuntimeSessionPersistence,
+        };
+
+        let mut seed = seed_request(chrono::Duration::seconds(5), false).await;
+        seed.sessions = seed.sessions.with_root_actor_directory(seed.store.clone());
+        let parent = seed
+            .store
+            .load_session("permission-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut initial = seed
+            .sessions
+            .bind_root_actor_execution(&parent, "before-permission-deadline")
+            .await
+            .unwrap()
+            .unwrap();
+        let original_fence = initial.owner.fence.clone();
+        initial
+            .directory
+            .finish_activation(
+                &original_fence,
+                Utc::now(),
+                ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        initial.disarm_abandonment();
+        drop(initial);
         let shutdown = CancellationToken::new();
         let report = reconcile_startup(&seed.store, &seed.sessions, &shutdown).await;
         assert_eq!(report.denied, 0);
@@ -482,7 +522,27 @@ mod tests {
                     .unwrap();
                 if outcome::state(&parent, &seed.request) == Ok(State::Terminal(false)) {
                     assert_eq!(parent.messages.len(), 2);
-                    break;
+                    let current = seed
+                        .store
+                        .inspect_actor("permission-parent")
+                        .await
+                        .unwrap()
+                        .activation
+                        .unwrap();
+                    if current.fence().attempt > original_fence.attempt
+                        && current.status == ActorActivationStatus::Succeeded
+                    {
+                        let cached = bamboo_engine::read_cached_session(
+                            seed.sessions.cache(),
+                            "permission-parent",
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            outcome::state(&cached, &seed.request),
+                            Ok(State::Terminal(false))
+                        );
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

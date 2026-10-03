@@ -247,6 +247,63 @@ pub struct SessionMessageEnvelope {
 }
 
 impl SessionMessageEnvelope {
+    /// Carry a validated chat prompt through the existing typed instruction
+    /// payload. Its User presentation and stable turn identity are retained;
+    /// only the owned Root consumer applies the prompt at its checkpoint.
+    pub fn with_root_chat_prompt(
+        mut self,
+        system_prompt: String,
+    ) -> Result<Self, SessionMessageValidationError> {
+        let SessionMessageBody::Content(content) = &self.body else {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        };
+        if self.source != SessionMessageSource::User || self.kind != SessionMessageKind::UserInput {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
+        let content = content.clone();
+        self.source = SessionMessageSource::Runtime {
+            subsystem: "chat".into(),
+        };
+        self.kind = SessionMessageKind::RuntimeInstruction;
+        self.body = SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: "root_chat_turn_v1".into(),
+            content: Some(content.clone()),
+            data: Some(serde_json::json!({ "system_prompt": system_prompt })),
+            provider_message: Some(SessionProviderMessage {
+                content,
+                metadata: Default::default(),
+                never_compress: false,
+            }),
+        });
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn root_chat_prompt(&self) -> Result<Option<&str>, SessionMessageValidationError> {
+        let SessionMessageBody::RuntimeInstruction(instruction) = &self.body else {
+            return Ok(None);
+        };
+        if instruction.instruction != "root_chat_turn_v1" {
+            return Ok(None);
+        }
+        if self.kind != SessionMessageKind::RuntimeInstruction
+            || self.source
+                != (SessionMessageSource::Runtime {
+                    subsystem: "chat".into(),
+                })
+        {
+            return Err(SessionMessageValidationError::KindSourceBodyMismatch);
+        }
+        instruction
+            .data
+            .as_ref()
+            .and_then(|data| data.get("system_prompt"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .map(Some)
+            .ok_or(SessionMessageValidationError::EmptyRuntimeContent)
+    }
+
     /// Reserved user-guidance correlation markers include a server-selected
     /// run fence. The fence controls scheduling, not the logical retry identity.
     pub fn is_guidance(&self) -> bool {
@@ -387,6 +444,7 @@ impl SessionMessageEnvelope {
             }
             _ => {}
         }
+        self.root_chat_prompt()?;
         Ok(())
     }
 
@@ -1058,6 +1116,18 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Release only this exact live claim for recovery. Preserve its typed body
+    /// and counters; an expired or replaced token cannot release a successor.
+    async fn release_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox release unsupported".into(),
+        ))
+    }
+
     /// Read exact wake readiness from the canonical queue and lease state.
     /// Backends without a joint lock and exact eligibility check fail closed.
     async fn inspect_wake_readiness(
@@ -1276,6 +1346,39 @@ pub trait SessionActivationPort: Send + Sync {
 mod tests {
     use super::*;
     use crate::{ImageUrlRef, Role};
+
+    #[test]
+    fn root_chat_prompt_keeps_turn_presentation_and_semantic_retry_identity() {
+        let user = SessionMessageEnvelope::user_input("root", "visible User turn");
+        let first = user
+            .clone()
+            .with_root_chat_prompt("new System prompt".into())
+            .unwrap();
+        let retry = user
+            .clone()
+            .with_root_chat_prompt("new System prompt".into())
+            .unwrap();
+        assert_eq!(first.idempotency_semantics(), retry.idempotency_semantics());
+        let message = first.to_provider_message().unwrap();
+        assert_eq!(message.id, user.id.as_str());
+        assert_eq!(message.created_at, user.created_at);
+        assert_eq!(message.role, Role::User);
+        assert_eq!(message.content, "visible User turn");
+        assert!(!message.never_compress);
+        assert_eq!(first.root_chat_prompt().unwrap(), Some("new System prompt"));
+        let changed = user
+            .with_root_chat_prompt("different System prompt".into())
+            .unwrap();
+        assert_ne!(
+            first.idempotency_semantics(),
+            changed.idempotency_semantics()
+        );
+        let mut forged = first;
+        forged.source = SessionMessageSource::Runtime {
+            subsystem: "unrelated".into(),
+        };
+        assert!(forged.validate().is_err());
+    }
 
     #[test]
     fn multimodal_envelope_round_trips_and_keeps_provider_role_valid() {

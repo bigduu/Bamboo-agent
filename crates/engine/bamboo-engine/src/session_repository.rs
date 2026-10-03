@@ -21,6 +21,13 @@ use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
 
+#[path = "session_repository_root_inbox.rs"]
+mod root_inbox;
+
+#[path = "session_repository_parent_outcome.rs"]
+mod parent_outcome;
+pub use parent_outcome::{ParentOutcomeRoute, ParentOutcomeWriter};
+
 #[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
@@ -31,6 +38,13 @@ pub struct SessionRepository {
     cache: SessionCache,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
+    root_actor_directory: Option<Arc<dyn bamboo_domain::ActorDirectoryPort>>,
+    root_actor_owner: Option<(
+        Arc<dyn bamboo_domain::ActorDirectoryPort>,
+        Arc<bamboo_domain::RootActorRuntimeWrite>,
+    )>,
+    root_actor_writers:
+        Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     #[cfg(test)]
     post_durable_hook: Option<PostDurableHook>,
 }
@@ -45,9 +59,145 @@ impl SessionRepository {
             cache,
             storage,
             persistence,
+            root_actor_directory: None,
+            root_actor_owner: None,
+            root_actor_writers: Arc::new(Default::default()),
             #[cfg(test)]
             post_durable_hook: None,
         }
+    }
+
+    async fn bind_root_actor_execution_inner(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        if session.kind != bamboo_domain::SessionKind::Root
+            || !session.authority_identity.is_ordinary()
+        {
+            return Ok(None);
+        }
+        let Some(directory) = self.root_actor_directory.clone() else {
+            return Ok(None);
+        };
+        if !self.storage.supports_root_actor_runtime_write() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Root Actor execution requires a fenced storage writer",
+            ));
+        }
+        let Some(durable) = self.storage.load_root_authority(&session.id).await? else {
+            return Err(root_actor_binding_error(
+                "Root must be persisted before activation",
+            ));
+        };
+        if session.created_at != durable.created_at
+            || session.id != durable.id
+            || session.project_id_meta() != durable.project_id_meta()
+            || session.authority_identity != durable.authority_identity
+        {
+            return Err(root_actor_binding_error(
+                "Root identity changed before activation",
+            ));
+        }
+        let lease_duration = std::time::Duration::from_secs(15);
+        let now = chrono::Utc::now();
+        let claimed = directory
+            .claim_activation(&bamboo_domain::ActorActivationClaim {
+                actor_id: session.id.clone(),
+                run_id: run_id.to_string(),
+                lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
+                lease_expires_at: now + chrono::Duration::seconds(15),
+                inbox_generation: session
+                    .session_inbox_admission()
+                    .map_or(0, |a| a.last_admitted_sequence),
+                placement_ref: None,
+                now,
+            })
+            .await
+            .map_err(root_actor_binding_error)?;
+        let owner = bamboo_domain::RootActorRuntimeWrite {
+            fence: claimed.fence(),
+            created_at: durable.created_at,
+        };
+        let bound = self.bind_root_response_writer(owner.clone())?;
+        let live_owner = bound
+            .root_actor_owner
+            .as_ref()
+            .expect("bound Root owner")
+            .1
+            .clone();
+        let abandon_directory = directory.clone();
+        let abandon_fence = owner.fence.clone();
+        let binding = bamboo_domain::RootActorExecutionBinding::new(
+            Arc::new(bound),
+            directory.clone(),
+            owner,
+            lease_duration,
+            move || {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = abandon_directory
+                            .finish_activation(
+                                &abandon_fence,
+                                chrono::Utc::now(),
+                                bamboo_domain::ActorActivationFinish::Cancelled,
+                            )
+                            .await;
+                    });
+                }
+            },
+        );
+        directory
+            .start_activation(&binding.owner.fence, chrono::Utc::now())
+            .await
+            .map_err(root_actor_binding_error)?;
+        // Keep only a weak route to this exact execution's capability. Host
+        // parent-outcome adapters never reconstruct an owner from observation.
+        self.root_actor_writers
+            .insert(session.id.clone(), Arc::downgrade(&live_owner));
+        Ok(Some(binding))
+    }
+
+    /// Build a response coordinator from the exact reserved execution's
+    /// capability. This does not claim or observe a different Actor owner.
+    pub(crate) fn bind_root_response_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+    ) -> std::io::Result<Self> {
+        let directory = self.root_actor_directory.clone().ok_or_else(|| {
+            root_actor_binding_error("Root response requires its Host Actor directory")
+        })?;
+        let host_cache = self.cache.clone();
+        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
+            host_cache.insert(
+                saved.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+            );
+        });
+        let bound_store = self
+            .persistence
+            .bind_root_actor_writer(owner.clone(), publisher)?;
+        // Deferred repository callbacks can only update this execution-private
+        // cache. The shared Host cache is published inside V2's physical guard.
+        let mut bound = Self::new(
+            Arc::new(Default::default()),
+            self.storage.clone(),
+            Arc::new(bound_store),
+        );
+        bound.root_actor_owner = Some((directory.clone(), Arc::new(owner)));
+        bound.root_actor_writers = self.root_actor_writers.clone();
+        Ok(bound)
+    }
+
+    /// Enable durable ordinary Root execution ownership in a Host whose
+    /// storage implements the named final writer boundary.
+    pub fn with_root_actor_directory(
+        mut self,
+        directory: Arc<dyn bamboo_domain::ActorDirectoryPort>,
+    ) -> Self {
+        self.root_actor_directory = Some(directory);
+        self
     }
 
     #[cfg(test)]
@@ -398,6 +548,37 @@ fn root_authority_storage_preference(
 /// refresh) instead of a bespoke adapter.
 #[async_trait::async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
+    fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.root_actor_owner
+            .as_ref()
+            .map(|(_, owner)| (**owner).clone())
+    }
+
+    fn root_actor_execution_required(&self, session: &Session) -> bool {
+        self.root_actor_directory.is_some()
+            && session.kind == bamboo_domain::SessionKind::Root
+            && session.authority_identity.is_ordinary()
+    }
+
+    async fn bind_root_actor_execution(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        let repository = self.clone();
+        let session = session.clone();
+        let run_id = run_id.to_string();
+        // The complete claim/start handoff owns its state if the adapter stops
+        // waiting. An unobserved returned binding drops its exact-fence cleanup.
+        tokio::spawn(async move {
+            repository
+                .bind_root_actor_execution_inner(&session, &run_id)
+                .await
+        })
+        .await
+        .map_err(|error| root_actor_binding_error(format!("Root binding task failed: {error}")))?
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         // Runtime authorization reads through this same cache. Refresh it even
         // when durable storage fails so a current activation can never observe
@@ -633,6 +814,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
+        self.admit_owned_root_inbox(session, inbox, active_run_id)
+            .await
+    }
+
     async fn checkpoint_retrieval_window(
         &self,
         expected_base: &Session,
@@ -702,6 +893,18 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            if session_id != owner.fence.actor_id {
+                return Err(root_actor_binding_error(
+                    "bound execution cannot load another Root",
+                ));
+            }
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            return self.storage.load_session(session_id).await;
+        }
         self.try_load(session_id).await
     }
 
@@ -2527,4 +2730,11 @@ mod tests {
             );
         }
     }
+}
+
+fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
+    )
 }

@@ -64,6 +64,7 @@ pub struct SessionExecutionReservation {
     cancel_token: CancellationToken,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
+    root_actor: Option<Box<RootActorExecution>>,
     armed: bool,
 }
 
@@ -78,6 +79,68 @@ impl SessionExecutionReservation {
 
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Bind before an adapter persists execution state or admits a provider.
+    /// A duplicate call on this exact reservation retains the same capability.
+    pub async fn bind_root_actor(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        if self.root_actor.is_none() {
+            if self.session_id != session.id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Root binding target mismatch",
+                ));
+            }
+            if let Some(binding) = agent
+                .persistence()
+                .bind_root_actor_execution(session, &self.run_id)
+                .await?
+            {
+                self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execution_persistence(
+        &self,
+    ) -> Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        self.root_actor.as_ref().map(|owner| owner.persistence())
+    }
+
+    pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.root_actor
+            .as_ref()
+            .map(|owner| owner.binding.owner.clone())
+    }
+
+    /// Response frames travel with the exact reserved Root until its detached
+    /// adapter can publish them through the existing fenced event forwarder.
+    pub fn queue_root_response_event(&mut self, event: AgentEvent) -> Option<AgentEvent> {
+        let Some(owner) = self.root_actor.as_mut() else {
+            return Some(event);
+        };
+        owner.response_events.push(event);
+        None
+    }
+
+    pub fn take_root_response_events(&mut self) -> Vec<AgentEvent> {
+        self.root_actor
+            .as_mut()
+            .map(|owner| std::mem::take(&mut owner.response_events))
+            .unwrap_or_default()
+    }
+
+    /// Finish a valid adapter-owned pause only after its actual history
+    /// publication barrier. Abandonment remains the rejected-startup fallback.
+    pub async fn finish_root_actor(&mut self, outcome: bamboo_domain::ActorActivationFinish) {
+        if let Some(owner) = self.root_actor.take() {
+            (*owner).finish(outcome).await;
+        }
     }
 
     /// Build the handoff owned by a router activation launch.
@@ -97,6 +160,7 @@ impl SessionExecutionReservation {
             cancel_token: reservation.cancel_token,
             runners,
             activation: SessionExecutionActivationOwnership::UnpublishedActivation(router),
+            root_actor: None,
             armed: true,
         }
     }
@@ -120,6 +184,7 @@ impl SessionExecutionReservation {
             cancel_token: reservation.cancel_token,
             runners,
             activation,
+            root_actor: None,
             armed: true,
         }
     }
@@ -146,6 +211,8 @@ impl SessionExecutionReservation {
     pub(crate) async fn rollback_unpublished_activation(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
+        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
         let activation = std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
@@ -195,6 +262,11 @@ impl SessionExecutionReservation {
     pub async fn abandon(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
+        if let Some(owner) = self.root_actor.take() {
+            (*owner)
+                .finish(bamboo_domain::ActorActivationFinish::Cancelled)
+                .await;
+        }
         let activation = std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
@@ -404,6 +476,7 @@ pub async fn reserve_session_execution(
         cancel_token: reservation.cancel_token,
         runners: runners.clone(),
         activation: SessionExecutionActivationOwnership::Unrouted,
+        root_actor: None,
         armed: true,
     };
 
@@ -748,6 +821,25 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 );
                 return;
             }
+            if execution_reservation.root_actor.is_none()
+                && agent.persistence().root_actor_execution_required(&session)
+            {
+                let message =
+                    "Root execution route requires a bound Actor writer and event handoff";
+                tracing::warn!(%session_id, "{message}");
+                let _ = mpsc_tx
+                    .send(AgentEvent::Error {
+                        message: message.into(),
+                    })
+                    .await;
+                execution_reservation.abandon().await;
+                return;
+            }
+            let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
+            let root_actor_bound = root_actor.is_some();
+            let agent = root_actor.as_ref().map_or(agent.clone(), |owner| {
+                Arc::new(agent.with_execution_persistence(owner.persistence()))
+            });
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
 
@@ -1011,6 +1103,17 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // lingering in its optimistic-settle window.
             finalize_runner(&runners, &session_id, &result).await;
 
+            if let Some(owner) = root_actor.take() {
+                let outcome = if result.as_ref().is_err_and(|error| error.is_cancelled()) {
+                    bamboo_domain::ActorActivationFinish::Cancelled
+                } else if result.is_err() || !history_committed {
+                    bamboo_domain::ActorActivationFinish::Failed
+                } else {
+                    bamboo_domain::ActorActivationFinish::Succeeded
+                };
+                owner.finish(outcome).await;
+            }
+
             let finalization = if let Some(registration) = activation_registration.take() {
                 registration.finish(executed_admitted_generation).await
             } else {
@@ -1045,7 +1148,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
 
             // Preserve normal I/O failure behavior, but never overwrite a
             // current Root's cache with a rejected authority/incarnation.
-            if !authority_conflict {
+            if !authority_conflict && !root_actor_bound {
                 sessions_cache.insert(
                     session_id.clone(),
                     Arc::new(crate::SessionSnapshot::new(session)),
@@ -1167,6 +1270,84 @@ fn selected_skill_mode_for_session(session: &Session) -> Option<String> {
     }
 }
 
+pub(super) struct RootActorExecution {
+    binding: bamboo_domain::RootActorExecutionBinding,
+    stop_renewal: CancellationToken,
+    renewal: Option<tokio::task::JoinHandle<()>>,
+    response_events: Vec<AgentEvent>,
+}
+
+impl RootActorExecution {
+    pub(super) fn start(binding: bamboo_domain::RootActorExecutionBinding) -> Self {
+        let stop_renewal = CancellationToken::new();
+        let stop = stop_renewal.clone();
+        let directory = binding.directory.clone();
+        let fence = binding.owner.fence.clone();
+        let duration = binding.lease_duration;
+        let renewal = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(duration / 3);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = interval.tick() => {
+                        let now = chrono::Utc::now();
+                        let expires = now + chrono::Duration::from_std(duration).expect("bounded Root lease");
+                        if let Err(error) = directory.renew_activation(&fence, now, expires).await {
+                            // An in-flight provider response may still arrive.
+                            // Its next load/write/effect boundary rejects this
+                            // fence; never retry a side effect or cancel a new owner.
+                            tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
+                                %error, "Root Actor renewal lost its execution authority");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            binding,
+            stop_renewal,
+            renewal: Some(renewal),
+            response_events: Vec::new(),
+        }
+    }
+
+    pub(super) fn persistence(
+        &self,
+    ) -> std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> {
+        self.binding.persistence.clone()
+    }
+
+    pub(super) async fn finish(mut self, outcome: bamboo_domain::ActorActivationFinish) {
+        self.stop_renewal.cancel();
+        if let Some(renewal) = self.renewal.take() {
+            let _ = renewal.await;
+        }
+        let directory = self.binding.directory.clone();
+        let fence = self.binding.owner.fence.clone();
+        let finish = tokio::spawn(async move {
+            if let Err(error) = directory
+                .finish_activation(&fence, chrono::Utc::now(), outcome)
+                .await
+            {
+                tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
+                    %error, "Root Actor finish rejected its obsolete execution fence");
+            }
+        });
+        self.binding.disarm_abandonment();
+        let _ = finish.await;
+    }
+}
+
+impl Drop for RootActorExecution {
+    fn drop(&mut self) {
+        self.stop_renewal.cancel();
+        // Binding Drop schedules exact-fence abandonment. Never abort a
+        // started filesystem job: its actual physical guards own its lifetime.
+    }
+}
+
 #[cfg(test)]
 mod reservation_tests {
     use super::*;
@@ -1222,6 +1403,7 @@ mod reservation_tests {
             cancel_token: CancellationToken::new(),
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::Unrouted,
+            root_actor: None,
             armed: true,
         };
 
@@ -1252,6 +1434,7 @@ mod reservation_tests {
             cancel_token: live_cancel_token.clone(),
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::RegistrationPending(router.clone()),
+            root_actor: None,
             armed: true,
         };
 

@@ -41,6 +41,15 @@ pub trait ResumeExecutionPort: Send + Sync {
         event_sender: &broadcast::Sender<AgentEvent>,
     ) -> SessionExecutionReserveOutcome;
 
+    /// Prepare the exact reserved successor before a pending-response CAS.
+    /// Hosts with ordinary Root ownership bind its fenced writer here.
+    async fn prepare_response_execution(
+        &self,
+        _reservation: &mut SessionExecutionReservation,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Get or create the long-lived broadcast sender for session events.
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent>;
 
@@ -92,12 +101,18 @@ pub struct ResponseResumeHandoff {
 }
 
 impl ResponseResumeHandoff {
+    pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.execution_reservation.root_actor_writer()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.event_sender.subscribe()
     }
 
-    pub fn publish_event(&self, event: AgentEvent) {
-        let _ = self.event_sender.send(event);
+    pub fn publish_event(&mut self, event: AgentEvent) {
+        if let Some(event) = self.execution_reservation.queue_root_response_event(event) {
+            let _ = self.event_sender.send(event);
+        }
     }
 
     pub async fn abandon(self) {
@@ -120,7 +135,20 @@ pub async fn reserve_response_resume_handoff(
             .reserve_session_execution(session_id, &event_sender)
             .await
         {
-            SessionExecutionReserveOutcome::Reserved(execution_reservation) => {
+            SessionExecutionReserveOutcome::Reserved(mut execution_reservation) => {
+                if let Err(error) = port
+                    .prepare_response_execution(&mut execution_reservation)
+                    .await
+                {
+                    let run_id = execution_reservation.run_id().to_string();
+                    tracing::debug!(%session_id, %error, "response successor is not ready; question retained");
+                    execution_reservation.abandon().await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ResumeOutcome::AlreadyRunning { run_id });
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
                 return Ok(ResponseResumeHandoff {
                     execution_reservation,
                     event_sender,

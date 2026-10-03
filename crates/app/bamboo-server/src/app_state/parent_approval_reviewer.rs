@@ -1255,52 +1255,58 @@ mod tests {
         use bamboo_server_tools::{ParentRequestReplyPort, ParentRequestReplyState};
         let mut f = Fixture::new().await;
         f.reviewer.explicit_reply_window = Duration::from_secs(30);
-        let mut review = Box::pin(f.scoped(&f.body));
-        let envelope = tokio::select! {
-            _ = &mut review => panic!("review finished before a parent reply"),
-            envelope = await_live_request(&f) => envelope,
-        };
-        let (reply, other) = tokio::join!(
-            f.reviewer.resolve(
-                "approval-parent",
-                envelope.id.as_str(),
-                ParentRequestOption::ApproveOnce
-            ),
-            super::super::parent_permission_outcome::resolve_with_receipt(
-                &f.reviewer.sessions,
-                &envelope,
-                false
-            ),
-        );
-        if let Some(live) = f
-            .reviewer
-            .live_reviews
-            .lock()
-            .unwrap()
-            .get(envelope.id.as_str())
-        {
-            live.changed
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-        }
-        let reply = reply.unwrap();
-        let (other_state, other_wrote) = other.unwrap();
-        assert_eq!(
-            reply.state == ParentRequestReplyState::Recorded,
-            !other_wrote
-        );
-        let winner = matches!(
-            other_state,
-            super::super::parent_permission_outcome::State::Terminal(true)
-        );
-        assert_eq!(
-            reply.decision,
-            if winner {
-                ParentRequestOption::ApproveOnce
-            } else {
-                ParentRequestOption::Deny
+        let replies = async {
+            let envelope = await_live_request(&f).await;
+            let (reply, other) = tokio::join!(
+                f.reviewer.resolve(
+                    "approval-parent",
+                    envelope.id.as_str(),
+                    ParentRequestOption::ApproveOnce
+                ),
+                super::super::parent_permission_outcome::resolve_with_receipt(
+                    &f.reviewer.sessions,
+                    &envelope,
+                    false
+                ),
+            );
+            if let Some(live) = f
+                .reviewer
+                .live_reviews
+                .lock()
+                .unwrap()
+                .get(envelope.id.as_str())
+            {
+                live.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
             }
-        );
-        assert_eq!(review.await, ChildApprovalReview::Reply(winner));
+            let reply = reply.unwrap();
+            let (other_state, other_wrote) = other.unwrap();
+            assert_eq!(
+                reply.state == ParentRequestReplyState::Recorded,
+                !other_wrote
+            );
+            let winner = matches!(
+                other_state,
+                super::super::parent_permission_outcome::State::Terminal(true)
+            );
+            assert_eq!(
+                reply.decision,
+                if winner {
+                    ParentRequestOption::ApproveOnce
+                } else {
+                    ParentRequestOption::Deny
+                }
+            );
+            winner
+        };
+        // A paused review can retain a persistence guard while another task
+        // observes its live request. Keep polling it as both replies race.
+        let (reviewed, winner) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(f.scoped(&f.body), replies)
+        })
+        .await
+        .expect("concurrent replies and live review must finish together");
+        assert_eq!(reviewed, ChildApprovalReview::Reply(winner));
         let parent = f
             .store
             .load_session("approval-parent")

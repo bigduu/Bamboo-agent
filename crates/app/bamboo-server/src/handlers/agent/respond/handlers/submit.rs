@@ -142,7 +142,7 @@ async fn submit_response_inner(
     }
 
     let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
-    let handoff = match bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+    let mut handoff = match bamboo_engine::session_app::resume::reserve_response_resume_handoff(
         &resume_port,
         &session_id,
         std::time::Duration::from_secs(15),
@@ -174,9 +174,25 @@ async fn submit_response_inner(
     // exact handoff must reach its detached owner without a cancellation point.
     let config_snapshot = state.config.read().await.clone();
 
+    let bound_access =
+        match bamboo_engine::session_app::repository::SessionAccess::bind_response_writer(
+            state.as_ref(),
+            handoff.root_actor_writer(),
+        ) {
+            Ok(access) => access,
+            Err(error) => {
+                handoff.abandon().await;
+                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(format!("Response writer unavailable: {error}"))
+            })));
+            }
+        };
+    let response_access: &dyn bamboo_engine::session_app::repository::SessionAccess =
+        bound_access.as_deref().unwrap_or(state.as_ref());
+
     let submission = if let Some(permission_receipt) = permission_receipt {
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
-            state.as_ref(),
+            response_access,
             input,
             req.expected_tool_call_id.clone(),
             permission_receipt,
@@ -185,7 +201,7 @@ async fn submit_response_inner(
         .await
     } else {
         bamboo_engine::session_app::respond::submit_pending_response_checked_guarded(
-            state.as_ref(),
+            response_access,
             input,
             req.expected_tool_call_id.clone(),
             response_guard,

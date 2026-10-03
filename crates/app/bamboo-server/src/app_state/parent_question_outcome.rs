@@ -39,10 +39,11 @@ pub(super) async fn answer(
     parent: &Session,
     question: &ParentQuestion,
     text: &str,
+    root_owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
 ) -> Result<(State, bool), ()> {
     question.validate_answer(text).map_err(|_| ())?;
     let (saved, wrote) = store
-        .answer_parent_question(question, text, |saved| {
+        .answer_parent_question_with_root_writer(question, text, root_owner, |saved| {
             sessions.cache().insert(
                 saved.id.clone(),
                 std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
@@ -254,6 +255,11 @@ pub(super) async fn append_terminal(
     resolution: &ParentQuestionResolution,
 ) -> Result<(), ()> {
     let terminal = resolution.terminal_envelope().ok_or(())?;
+    let writer = sessions
+        .bind_parent_outcome_writer(&resolution.request.parent.session_id)
+        .await
+        .map_err(|_| ())?;
+    let sessions = writer.repository();
     sessions
         .persistence()
         .mutate_runtime_session_and_publish(
@@ -276,6 +282,7 @@ pub(super) async fn append_terminal(
         .map_err(|_| ())?
         .map_err(|_| ())?
         .ok_or(())?;
+    writer.finish().await.map_err(|_| ())?;
     Ok(())
 }
 
