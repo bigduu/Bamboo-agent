@@ -17,8 +17,7 @@ impl ResponseError for TicketHttpError {
         StatusCode::from_u16(self.0.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
     }
     fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code())
-            .json(serde_json::json!({"error":self.0.to_string()}))
+        crate::error::json_error(self.status_code(), self.0.to_string())
     }
 }
 
@@ -295,6 +294,53 @@ pub async fn artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn ticket_error_envelope_preserves_exact_conflict_and_authority_semantics() {
+        let cases = [
+            (
+                Error::RevisionConflict,
+                StatusCode::CONFLICT,
+                "revision_conflict",
+            ),
+            (
+                Error::IdempotencyConflict,
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+            ),
+            (
+                Error::ScopeDenied("owner required".into()),
+                StatusCode::FORBIDDEN,
+                "scope_denied: owner required",
+            ),
+            (
+                Error::InvalidTransition("stale request".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_transition: stale request",
+            ),
+            (
+                Error::ResourceBlocked("live run".into()),
+                StatusCode::LOCKED,
+                "resource_blocked: live run",
+            ),
+            (
+                Error::AuthorityUnavailable("verify HEAD".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authority_unavailable: verify HEAD",
+            ),
+            (Error::ResyncRequired, StatusCode::GONE, "resync_required"),
+        ];
+        for (error, status, message) in cases {
+            let response = TicketHttpError(error).error_response();
+            assert_eq!(response.status(), status);
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], message);
+        }
+    }
 
     #[test]
     fn ticket_http_cannot_select_authority_or_private_worker_adapter_source() {

@@ -144,3 +144,12 @@ The fixture now supplies all six schemas while retaining the exact allowlist
 assertion and forbidden-tool checks. Production catalog filtering is unchanged.
 Focused verification of this fixture is queued after the running worker/browser
 acceptance, avoiding any source/binary replacement during actual Host tests.
+
+The same original workspace run also caught our Ticket HTTP error adapter
+returning a flat error string. It now uses the existing canonical `json_error`
+helper, preserving status codes and exact conflict/authority messages. A wire
+regression covers 409, 403, 422, 423, 503 and cursor-gap 410 envelopes; the existing
+native-source tripwire remains unchanged. Lotus already parses nested canonical
+messages, including exact revision conflicts. This is a bounded integration fix,
+not a new error protocol. Validation is queued after the original three runners;
+their earlier source/binary tags and failures remain preserved.
