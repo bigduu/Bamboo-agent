@@ -70,7 +70,7 @@ bamboo init
 bamboo serve
 ```
 
-`init` 交互式配置 provider，并在 `~/.bamboo/config.json` 中加密保存密钥。选择你的 provider/账号实际支持的模型。包含前端的构建可打开 **http://127.0.0.1:9562**。在另一个终端运行：
+`init` 交互式配置 provider，并在 Bamboo 数据目录（通常为 `~/.bamboo/`）下加密保存密钥。`config.json` 保存配置元数据，不保存加密后的 provider 密钥。选择你的 provider/账号实际支持的模型。包含前端的构建可打开 **http://127.0.0.1:9562**。在另一个终端运行：
 
 ```bash
 bamboo health
@@ -88,7 +88,7 @@ bamboo history <session-id>
 bamboo -p "接下来应该读哪些文件？" -s <session-id>
 ```
 
-Headless 运行使用完整 agent 运行时和已配置的 provider。工具权限请求或提问可能暂停执行：可在浏览器界面回应，或先运行 `bamboo respond <session-id> --pending`，再运行 `bamboo respond <session-id> "<answer>"`。不要仅为了跑通示例而关闭权限检查。
+Headless 运行使用完整 agent 运行时和已配置的 provider。交互式 `bamboo -p` 因工具权限请求或提问暂停时，请在同一个终端回答提示。浏览器回应和 `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` 面向独立运行的 `bamboo serve` 所拥有的任务，不能解除进程内 headless 任务的等待。不要仅为了跑通示例而关闭权限检查。
 
 还没有密钥？`bamboo -p "ping" --echo` **仅用于传输链路冒烟**：它使用 echo executor 而非 LLM，不证明模型推理或工具任务成功。
 

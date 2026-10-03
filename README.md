@@ -70,7 +70,7 @@ bamboo init
 bamboo serve
 ```
 
-`init` interactively configures your provider and stores its key encrypted at rest in `~/.bamboo/config.json`. Use a model available to your provider/account. With the frontend included, open **http://127.0.0.1:9562**. In another terminal:
+`init` interactively configures your provider and stores its key encrypted at rest under the Bamboo data directory (normally `~/.bamboo/`). `config.json` holds configuration metadata rather than the encrypted provider key. Use a model available to your provider/account. With the frontend included, open **http://127.0.0.1:9562**. In another terminal:
 
 ```bash
 bamboo health
@@ -88,7 +88,7 @@ bamboo history <session-id>
 bamboo -p "What should I read next?" -s <session-id>
 ```
 
-Headless runs use the full agent runtime and the configured provider. A tool permission or question can pause the run: use the browser interface or `bamboo respond <session-id> --pending`, then `bamboo respond <session-id> "<answer>"`. Do not disable permission checks just to make an example finish.
+Headless runs use the full agent runtime and the configured provider. If an interactive `bamboo -p` run pauses for a tool permission or question, answer the prompt in that same terminal. Browser responses and `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` target runs owned by a separately running `bamboo serve`; they do not unblock the in-process headless run. Do not disable permission checks just to make an example finish.
 
 No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it uses an echo executor, not an LLM, and does not demonstrate model reasoning or successful tool work.
 
