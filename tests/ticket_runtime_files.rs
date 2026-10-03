@@ -11,6 +11,7 @@ use std::{path::Path, process::Command, sync::atomic::Ordering, time::Duration};
 #[actix_web::test]
 async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance()
 {
+    use bamboo_engine::ticket_worker_plan::tickets::{ScopeBinding, TicketService};
     use std::os::unix::fs::MetadataExt;
     let mut f = Fixture::with_fault(Some(("worker-file/", "before_head_enospc"))).await;
     let repo = f.temp.join("repo");
@@ -113,10 +114,18 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         "native PID actually reaped"
     );
     assert_eq!(view["data"][0]["ticket"]["state"], "blocked");
+    assert_eq!(view["data"][0]["ticket"]["current_submission"], json!(null));
+    assert_eq!(
+        view["data"][0]["ticket"]["accepted_submission"],
+        json!(null)
+    );
+    // Canonical terminal recovery may already archive the stopped attempt.
+    // Such history must never become a current or accepted Submission.
     assert!(view["data"][0]["submissions"]
         .as_array()
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|s| s["stale"] == true && s["generation"] == 1 && s["assignment_id"] == assignment));
     let effects = view["data"][0]["assignments"][0]["effects"]
         .as_object()
         .unwrap();
@@ -166,6 +175,19 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     assert_eq!(plan["process_stopped"], true);
     assert_eq!(plan["observed_sha256"], plan["intended_sha256"]);
     assert!(plan["request"].is_object(), "{plan}");
+    let binding: ScopeBinding = serde_json::from_value(plan["request"]["binding"].clone()).unwrap();
+    let scope_root = f
+        .data
+        .join("tickets")
+        .join(binding.scope_id.strip_prefix("supervisor/").unwrap());
+    let offline_snapshot = || {
+        TicketService::open_offline(&scope_root, binding.clone())
+            .unwrap()
+            .published()
+            .unwrap()
+            .1
+    };
+    let submissions_before_ack = serde_json::to_value(offline_snapshot().submissions).unwrap();
     let request = f.temp.join("file-reconciliation-request.json");
     std::fs::write(
         &request,
@@ -192,6 +214,11 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         receipt
     );
     assert_eq!(
+        serde_json::to_value(offline_snapshot().submissions).unwrap(),
+        submissions_before_ack,
+        "offline acknowledgement/replay never creates or rewrites Submission history"
+    );
+    assert_eq!(
         std::fs::metadata(&file).unwrap().ino(),
         inode,
         "plan/ack/replay never rewrite"
@@ -201,10 +228,19 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     let reconciled = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
     assert_eq!(reconciled["data"][0]["ticket"]["state"], "blocked");
     assert_eq!(reconciled["data"][0]["ticket"]["paused"], true);
+    assert_eq!(
+        reconciled["data"][0]["ticket"]["current_submission"],
+        json!(null)
+    );
+    assert_eq!(
+        reconciled["data"][0]["ticket"]["accepted_submission"],
+        json!(null)
+    );
     assert!(reconciled["data"][0]["submissions"]
         .as_array()
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|s| s["stale"] == true && s["generation"] == 1 && s["assignment_id"] == assignment));
     assert_eq!(reconciled["data"][0]["assignments"][0]["state"], "failed");
     assert_eq!(
         f.probe.calls.load(Ordering::SeqCst),
@@ -235,8 +271,14 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     .await
     .unwrap();
     assert_eq!(completed["data"][0]["ticket"]["generation"], 2);
-    let submission = &completed["data"][0]["submissions"][0];
+    let submission = completed["data"][0]["submissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == completed["data"][0]["ticket"]["current_submission"])
+        .unwrap();
     assert_eq!(submission["generation"], 2);
+    assert_eq!(submission["stale"], false);
     let accept = command(&f.client, &f.base, "file-retry-accept", json!([
         {"op":"accept","work_id":work,"submission_id":submission["id"],"evidence":["Verified generation 2 exact managed code"]}
     ])).await;
@@ -246,9 +288,22 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     assert_eq!(accepted["data"][0]["ticket"]["state"], "accepted");
     assert_eq!(accepted["data"][0]["ticket"]["generation"], 2);
     assert_eq!(
-        accepted["data"][0]["submissions"].as_array().unwrap().len(),
+        accepted["data"][0]["ticket"]["current_submission"],
+        submission["id"]
+    );
+    assert_eq!(
+        accepted["data"][0]["ticket"]["accepted_submission"],
+        submission["id"]
+    );
+    let submissions = accepted["data"][0]["submissions"].as_array().unwrap();
+    assert_eq!(
+        submissions.iter().filter(|s| s["stale"] == false).count(),
         1
     );
+    assert!(submissions
+        .iter()
+        .filter(|s| s["id"] != submission["id"])
+        .all(|s| s["stale"] == true && s["generation"] == 1 && s["assignment_id"] == assignment));
     f.finish().await;
 }
 

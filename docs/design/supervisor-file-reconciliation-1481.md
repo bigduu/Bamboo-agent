@@ -102,3 +102,21 @@ separate local follow-up. The original runner terminated; a detached `/tmp`
 worktree at the same current commit is prepared for subsequent acceptance,
 without changing the implementation branch or other sessions. HTTP ingress,
 actual native, full-workspace and browser tests have not run at this checkpoint.
+
+The temporary acceptance checkout at `7e05ed43` subsequently passed all eight
+Engine terminal-recovery tests and the integrated HTTP hook/provenance case.
+The first HTTP compile encountered ENOSPC; a subsequent fixture needed the
+normal loopback peer identity before its owner-access assertion could run.
+Both earlier failures remain in the evidence logs.
+
+Native4 ran three actual Host/native tests: isolated coding and live-PID lease
+fencing passed. The offline-file case reached the stopped PID, observed bytes,
+idempotent acknowledgement and restarted Host, then failed an overly strict
+empty-history assertion. Its committed snapshot proves the old generation-1
+Submission is stale, while Work remains blocked/paused with no current or
+accepted Submission. The test now checks that the offline acknowledgement and
+replay neither create nor rewrite Submission history, permits only stale old
+results, and verifies that generation 2 alone supplies the accepted reference.
+This assertion correction changes no production behavior; its focused native
+rerun is pending. Evidence: `../1481-evidence/1481-native4-7e05.log` and
+`../1481-evidence/1481-native4-failed-snapshot.json`.
