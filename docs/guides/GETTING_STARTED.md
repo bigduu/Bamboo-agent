@@ -31,7 +31,7 @@ rest](../config-reference.md#encryption-at-rest)). Verify the install is
 sound at any point with:
 
 ```bash
-bamboo doctor    # config present, provider keyed, server reachable — exits non-zero on a blocking problem
+bamboo doctor    # checks config/credentials; reports server reachability; exits non-zero on config/credential errors
 ```
 
 ## 3. Your first agent turn — three ways

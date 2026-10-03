@@ -77,7 +77,7 @@ bamboo health
 bamboo doctor
 ```
 
-健康检查端点是 `GET /api/v1/health`。`doctor` 也检查配置/provider 就绪状态；服务未启动时可能失败。`serve --port`、`--bind`、`--data-dir`、`--static-dir` 和 `--workers` 可覆盖配置，完整参数见 `bamboo serve --help`。
+健康检查端点是 `GET /api/v1/health`，`bamboo health` 需要可达的服务。`doctor` 检查配置与 provider 凭据，相关错误会使其失败；服务可达性探测仅提供信息，服务未启动本身不会让 `doctor` 失败。`serve --port`、`--bind`、`--data-dir`、`--static-dir` 和 `--workers` 可覆盖配置，完整参数见 `bamboo serve --help`。
 
 ### 从终端处理任务
 

@@ -77,7 +77,7 @@ bamboo health
 bamboo doctor
 ```
 
-The health endpoint is `GET /api/v1/health`. `doctor` also checks configuration/provider readiness and can fail when the server is not running. `serve --port`, `--bind`, `--data-dir`, `--static-dir`, and `--workers` override configuration; run `bamboo serve --help` for the full list.
+The health endpoint is `GET /api/v1/health`; `bamboo health` requires a reachable server. `doctor` checks configuration and provider credentials, failing on those errors; its server-reachability probe is informational, so an absent server alone does not make `doctor` fail. `serve --port`, `--bind`, `--data-dir`, `--static-dir`, and `--workers` override configuration; run `bamboo serve --help` for the full list.
 
 ### Work from the terminal
 
