@@ -6129,7 +6129,7 @@ impl Storage for SessionStoreV2 {
     async fn publish_root_actor_runtime_event(
         &self,
         owner: &bamboo_domain::RootActorRuntimeWrite,
-        publish: Box<dyn FnOnce() + Send>,
+        publish: bamboo_domain::storage::RootActorRuntimeEventPublisher,
     ) -> io::Result<()> {
         self.publish_root_actor_runtime_event_impl(owner, publish)
             .await

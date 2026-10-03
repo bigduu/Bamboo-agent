@@ -94,7 +94,7 @@ impl SessionStoreV2 {
     pub(super) async fn publish_root_actor_runtime_event_impl(
         &self,
         owner: &RootActorRuntimeWrite,
-        publish: Box<dyn FnOnce() + Send>,
+        publish: bamboo_domain::storage::RootActorRuntimeEventPublisher,
     ) -> io::Result<()> {
         validate_session_id(&owner.fence.actor_id)?;
         let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -112,8 +112,7 @@ impl SessionStoreV2 {
         );
         Self::default_writer_job(&guards, move || {
             proof.validate()?;
-            publish();
-            Ok(())
+            publish(&|| proof.validate().map(|_| ()))
         })
         .await
     }

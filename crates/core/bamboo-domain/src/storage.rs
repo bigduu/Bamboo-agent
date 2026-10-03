@@ -22,6 +22,12 @@ pub struct RootActorRuntimeWrite {
 /// retain the same physical guards and revalidate the owner before invoking it.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
+/// The final sink receives a fresh owner check while the physical authority
+/// guards remain owned by the publication job. Check immediately before each
+/// final effect, including after any journal scan performed by the sink.
+pub type RootActorRuntimeEventPublisher =
+    Box<dyn FnOnce(&dyn Fn() -> std::io::Result<()>) -> std::io::Result<()> + Send>;
+
 /// Trait for session storage backends.
 ///
 /// Provides an abstract interface for persisting and retrieving session data.
@@ -41,7 +47,7 @@ pub trait Storage: Send + Sync {
     async fn publish_root_actor_runtime_event(
         &self,
         owner: &RootActorRuntimeWrite,
-        publish: Box<dyn FnOnce() + Send>,
+        publish: RootActorRuntimeEventPublisher,
     ) -> std::io::Result<()> {
         let _ = (owner, publish);
         Err(std::io::Error::new(
