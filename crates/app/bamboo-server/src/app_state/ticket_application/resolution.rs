@@ -135,7 +135,10 @@ impl TicketApplication {
                 ),
                 provider_message: Some(SessionProviderMessage {
                     content,
-                    metadata: Default::default(),
+                    metadata: json!({"hidden_from_ui":true})
+                        .as_object()
+                        .expect("metadata object")
+                        .clone(),
                     never_compress: true,
                 }),
             }),

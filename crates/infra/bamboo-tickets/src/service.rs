@@ -243,19 +243,36 @@ impl TicketService {
             .ok_or_else(|| Error::AuthorityUnavailable("no verified snapshot".into()))?
             .1;
         validate_authority(authority, snapshot)?;
-        let permitted = snapshot.submissions.values().any(|submission| {
-            submission.artifacts.contains(artifact)
-                && match &authority.principal {
-                    Principal::Worker { assignment_id, .. } => {
-                        submission.assignment_id == *assignment_id
-                            || snapshot.assignments[assignment_id]
-                                .dependency_inputs
-                                .iter()
-                                .any(|input| input.submission_id == submission.id)
+        let permitted = (!matches!(authority.principal, Principal::Worker { .. })
+            && (snapshot
+                .migration
+                .as_ref()
+                .and_then(|r| r.supervisor_snapshot.as_ref())
+                == Some(artifact)
+                || snapshot
+                    .legacy_attachment
+                    .as_ref()
+                    .and_then(|s| s.artifact.as_ref())
+                    == Some(artifact)
+                || snapshot.tickets.values().any(|work| {
+                    work.import_source
+                        .as_ref()
+                        .and_then(|s| s.artifact.as_ref())
+                        == Some(artifact)
+                })))
+            || snapshot.submissions.values().any(|submission| {
+                submission.artifacts.contains(artifact)
+                    && match &authority.principal {
+                        Principal::Worker { assignment_id, .. } => {
+                            submission.assignment_id == *assignment_id
+                                || snapshot.assignments[assignment_id]
+                                    .dependency_inputs
+                                    .iter()
+                                    .any(|input| input.submission_id == submission.id)
+                        }
+                        _ => true,
                     }
-                    _ => true,
-                }
-        });
+            });
         if !permitted {
             return Err(Error::ScopeDenied(
                 "Artifact is not a readable scope reference".into(),
@@ -302,6 +319,13 @@ impl TicketService {
             validate_command_source(authority, source)?;
         }
         let hash = content_hash(&canonical_bytes(command)?);
+        if snapshot
+            .migration
+            .as_ref()
+            .is_some_and(|r| r.request.operation_id == command.operation_id)
+        {
+            return Err(Error::IdempotencyConflict);
+        }
         if let Some(receipt) = snapshot.receipts.get(&command.operation_id) {
             if receipt.principal != authority.identity() {
                 return Err(Error::ScopeDenied("receipt subject".into()));
@@ -389,7 +413,8 @@ impl TicketService {
                     "legacy receipt lacks canonical request; retry needs original command".into(),
                 ));
             }
-            let original: Command = serde_json::from_str(&receipt.canonical_request)?;
+            let original: Command = serde_json::from_str(&receipt.canonical_request)
+                .map_err(|_| Error::IdempotencyConflict)?;
             let same_input = match &source {
                 Some(source) => source_matches(&original, source)?,
                 None => canonical_bytes(&original.operations)? == canonical_bytes(&operations)?,
@@ -432,7 +457,8 @@ impl TicketService {
                 "legacy receipt lacks canonical request; retry needs original command".into(),
             ));
         }
-        let original: Command = serde_json::from_str(&receipt.canonical_request)?;
+        let original: Command = serde_json::from_str(&receipt.canonical_request)
+            .map_err(|_| Error::IdempotencyConflict)?;
         if !source_matches(&original, source)? {
             return Err(Error::IdempotencyConflict);
         }
@@ -1675,6 +1701,25 @@ fn apply(
                     .insert(resolution.message_id.clone(), resolution.clone());
             }
         }
+        AttachLegacy { source } => {
+            authority.user()?;
+            if source.session_id != snapshot.binding.supervisor_session_id
+                || source.task_id != "_scope_attach"
+                || source.artifact.is_none()
+            {
+                return Err(invalid(
+                    "attach requires a verified complete Supervisor snapshot",
+                ));
+            }
+            if let Some(prior) = &snapshot.legacy_attachment {
+                if canonical_bytes(prior)? != canonical_bytes(source)? {
+                    return Err(Error::IdempotencyConflict);
+                }
+            } else {
+                snapshot.legacy_attachment = Some(source.clone());
+                snapshot.schema = 2;
+            }
+        }
         Import {
             temp_id,
             contract,
@@ -1682,6 +1727,9 @@ fn apply(
         } => {
             authority.supervisor()?;
             validate_contract(contract)?;
+            if source.artifact.is_some() {
+                snapshot.schema = 2;
+            }
             if source.session_id.is_empty()
                 || source.task_id.is_empty()
                 || source.snapshot_hash.len() != 64
@@ -1846,6 +1894,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    crate::migration::validate_migration(snapshot)?;
     crate::resolution::validate_history(snapshot)?;
     for (id, work) in &snapshot.tickets {
         if id != &work.id {

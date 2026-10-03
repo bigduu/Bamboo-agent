@@ -360,6 +360,7 @@ pub struct Fixture {
     pub client: reqwest::Client,
     pub host: Option<Host>,
     pub probe: web::Data<Probe>,
+    pub synthetic_config: Vec<u8>,
     provider: actix_web::dev::ServerHandle,
 }
 #[allow(dead_code)] // Shared by integration targets using different fixture cases.
@@ -400,16 +401,14 @@ impl Fixture {
         let running = server.run();
         let provider_handle = running.handle();
         actix_web::rt::spawn(running);
-        std::fs::write(
-            data.join("config.json"),
+        let synthetic_config =
             serde_json::to_vec(&json!({"provider":"openai","setup":{"completed":true},
         "features":{"provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"fixture","base_url":url,"model":"ticket-model"}},
         "defaults":{"chat":{"provider":"openai","model":"ticket-model"}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":5}}))
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap();
+        std::fs::write(data.join("config.json"), &synthetic_config).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -430,6 +429,7 @@ impl Fixture {
             client,
             host: Some(host),
             probe: calls,
+            synthetic_config,
             provider: provider_handle,
         }
     }

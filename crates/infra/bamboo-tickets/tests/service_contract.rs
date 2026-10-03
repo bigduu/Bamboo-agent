@@ -764,6 +764,84 @@ fn after_head_rename_failure_is_readonly_until_restart_and_receipt_survives() {
     assert_eq!(receipt.ids.len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn injected_enospc_and_eacces_preserve_receipts_and_fence_uncertain_publication() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    // macOS and Linux errno values; no real volume fill or chmod is performed.
+    for errno in [28, 13] {
+        for (index, point) in [
+            FaultPoint::BeforeWrite,
+            FaultPoint::BeforeFileSync,
+            FaultPoint::BeforeHeadRename,
+            FaultPoint::AfterHeadRename,
+            FaultPoint::BeforeDirectorySync,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = dir.path().join(format!("errno-{errno}-{index}"));
+            let service = TicketService::open(&root, binding()).unwrap();
+            let request = command(
+                &service,
+                "create-errno",
+                vec![Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract("Errno recovery"),
+                    depends_on: BTreeSet::new(),
+                }],
+            );
+            let old = service.published().unwrap().0;
+            let renamed = Arc::new(AtomicBool::new(false));
+            let renamed_at_hook = renamed.clone();
+            service.set_publication_fault(Some(Arc::new(move |observed| {
+                if observed == FaultPoint::AfterHeadRename {
+                    renamed_at_hook.store(true, Ordering::SeqCst);
+                }
+                // Exercise the HEAD's directory flush, not an earlier object's.
+                if observed == point
+                    && (point != FaultPoint::BeforeDirectorySync
+                        || renamed_at_hook.load(Ordering::SeqCst))
+                {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                } else {
+                    Ok(())
+                }
+            })));
+            let failure = service.execute(&supervisor(), &request).unwrap_err();
+            assert!(matches!(failure, Error::Io(ref error) if error.raw_os_error() == Some(errno)));
+            assert_eq!(service.published().unwrap().0, old);
+            let receipt = if renamed.load(Ordering::SeqCst) {
+                assert!(matches!(service.health(), Health::ReadOnly { .. }));
+                assert!(service.execute(&supervisor(), &request).is_err());
+                drop(service);
+                let recovered = TicketService::open(&root, binding()).unwrap();
+                let persisted = recovered.published().unwrap().1.receipts["create-errno"].clone();
+                assert_eq!(
+                    recovered.execute(&supervisor(), &request).unwrap(),
+                    persisted
+                );
+                persisted
+            } else {
+                assert_eq!(service.health(), Health::Writable);
+                assert!(service.published().unwrap().1.receipts.is_empty());
+                service.set_publication_fault(None);
+                let receipt = service.execute(&supervisor(), &request).unwrap();
+                drop(service);
+                receipt
+            };
+            let recovered = TicketService::open(&root, binding()).unwrap();
+            assert_eq!(recovered.execute(&supervisor(), &request).unwrap(), receipt);
+            let snapshot = recovered.published().unwrap().1;
+            assert_eq!(snapshot.tickets.len(), 1);
+            assert_eq!(snapshot.receipts.len(), 1);
+        }
+    }
+}
+
 #[test]
 fn every_publication_failure_boundary_recovers_a_complete_old_or_new_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -1246,6 +1324,7 @@ fn explicit_import_is_idempotent_and_legacy_completed_never_becomes_accepted() {
         task_id: "old-task".into(),
         snapshot_hash: content_hash(b"old snapshot"),
         original_state: "completed".into(),
+        artifact: None,
     };
     let op = Operation::Import {
         temp_id: "import".into(),

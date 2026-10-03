@@ -209,6 +209,16 @@ impl TicketApplication {
         principal: Principal,
         command: &Command,
     ) -> Result<OperationReceipt> {
+        if command.operations.iter().any(|op| {
+            matches!(
+                op,
+                Operation::Import { .. } | Operation::AttachLegacy { .. }
+            )
+        }) {
+            return Err(Error::ScopeDenied(
+                "legacy attach/import requires the explicit verified offline Host port".into(),
+            ));
+        }
         if !self.config.read().await.features.ticket_mutation {
             return Err(Error::AuthorityUnavailable(
                 "Ticket mutation feature is disabled".into(),

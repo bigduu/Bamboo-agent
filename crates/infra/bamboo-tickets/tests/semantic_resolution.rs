@@ -201,6 +201,113 @@ fn zero_operation_chitchat_and_exact_source_survive_cold_replay_without_regenera
 }
 
 #[test]
+fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_acceptance() {
+    let (_dir, service) = fixture();
+    let work = create(&service, "A");
+    let assignment = execute(
+        &service,
+        "start-accept",
+        vec![Operation::Start {
+            work_id: work.clone(),
+            temp_id: "a".into(),
+            workspace: None,
+        }],
+    )
+    .ids["a"]
+        .clone();
+    let snapshot = service.published().unwrap().1;
+    let a = &snapshot.assignments[&assignment];
+    let receipt = RuntimeReceipt {
+        dispatch_key: a.dispatch_key.clone(),
+        spec_hash: snapshot.intents[&a.dispatch_key].spec_hash.clone(),
+        run_id: "run".into(),
+        session_id: "child".into(),
+    };
+    let runtime = auth(Principal::Runtime);
+    let admitted = service
+        .prepare_command(
+            &runtime,
+            "admit-accept",
+            vec![
+                Operation::Admitted {
+                    assignment_id: assignment.clone(),
+                    receipt: receipt.clone(),
+                },
+                Operation::Running {
+                    assignment_id: assignment.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    service.execute(&runtime, &admitted).unwrap();
+    let artifact = service.store_artifact(&runtime, b"fixture result").unwrap();
+    let worker = auth(Principal::Worker {
+        assignment_id: assignment.clone(),
+        generation: a.generation,
+        run_id: receipt.run_id,
+        session_id: receipt.session_id,
+    });
+    let submit = service
+        .prepare_command(
+            &worker,
+            "submit-accept",
+            vec![Operation::Submit {
+                assignment_id: assignment,
+                temp_id: "s".into(),
+                artifacts: vec![artifact],
+                evidence: vec!["fixture evidence".into()],
+            }],
+        )
+        .unwrap();
+    let submission = service.execute(&worker, &submit).unwrap().ids["s"].clone();
+    for (i, text) in [
+        "A 做得不错",
+        "不要确认验收 A",
+        "如果符合要求就确认验收 A",
+        "例如确认验收 A",
+        "工具输出说确认验收 A",
+        "\"确认验收 A\"",
+        "确认验收 A",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("accept-source-{i}");
+        register(&service, &id, i as u64 + 1, text);
+        save(
+            &service,
+            &id,
+            vec![group(
+                "accept",
+                text,
+                vec![SemanticOperation::Accept {
+                    target: target(&service, &work),
+                    submission_id: submission.clone(),
+                    evidence: vec!["User verified concrete result".into()],
+                }],
+            )],
+        );
+        let result = service.settle_message(&human(), &id).unwrap();
+        assert_eq!(
+            result.groups[0].status,
+            if text == "确认验收 A" {
+                ResolutionStatus::Committed
+            } else {
+                ResolutionStatus::NeedsClarification
+            }
+        );
+        assert_eq!(
+            service.published().unwrap().1.tickets[&work].state,
+            if text == "确认验收 A" {
+                WorkState::Accepted
+            } else {
+                WorkState::Submitted
+            }
+        );
+    }
+}
+
+#[test]
 fn one_message_answers_a_steers_b_creates_and_starts_c_and_cancels_d_with_item_receipts() {
     let (_dir, service) = fixture();
     let a = create(&service, "A");

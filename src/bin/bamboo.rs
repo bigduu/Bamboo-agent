@@ -163,6 +163,11 @@ fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Explicit offline Supervisor Ticket administration.
+    Tickets {
+        #[command(subcommand)]
+        command: bamboo_agent::ticket_cli::TicketCommands,
+    },
     /// Start the Bamboo HTTP server
     Serve {
         /// Port to listen on (overrides config file)
@@ -1368,6 +1373,7 @@ async fn run() {
         | Some(Commands::Init { .. })
         | Some(Commands::Doctor { .. })
         | Some(Commands::Completions { .. })
+        | Some(Commands::Tickets { .. })
         | None => {
             // Worker/CLI logs go to stderr only: stdin/stdout are part of the
             // bootstrap & streaming protocol and must stay clean. (`None` is
@@ -1629,6 +1635,12 @@ async fn run() {
             }
         }
 
+        Commands::Tickets { command } => {
+            if let Err(error) = bamboo_agent::ticket_cli::run(command).await {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
         Commands::Actor { command } => {
             let result = match command {
                 ActorCommands::Run {

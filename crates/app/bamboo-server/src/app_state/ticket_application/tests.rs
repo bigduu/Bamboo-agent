@@ -120,3 +120,42 @@ async fn ticket_application_changed_root_authority_fences_every_call() {
         Err(Error::ScopeDenied(_))
     ));
 }
+
+#[tokio::test]
+async fn ticket_application_rejects_unverified_json_legacy_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let app = TicketApplication::open(root.path(), storage, config(true)).await;
+    let user = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(user.clone()).await.unwrap();
+    let source = ImportSource {
+        session_id: "legacy".into(),
+        task_id: "old".into(),
+        snapshot_hash: "a".repeat(64),
+        original_state: "completed".into(),
+        artifact: None,
+    };
+    let before = service.published().unwrap();
+    for (index, operation) in [
+        Operation::Import {
+            temp_id: "work".into(),
+            contract: contract(),
+            source: source.clone(),
+        },
+        Operation::AttachLegacy { source },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = service
+            .prepare_command(&authority, &format!("unverified-{index}"), vec![operation])
+            .unwrap();
+        assert!(matches!(
+            app.update(user.clone(), &command).await,
+            Err(Error::ScopeDenied(_))
+        ));
+    }
+    assert_eq!(service.published().unwrap().0, before.0);
+}

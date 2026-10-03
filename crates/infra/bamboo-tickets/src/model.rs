@@ -326,6 +326,9 @@ pub struct ImportSource {
     pub task_id: String,
     pub snapshot_hash: String,
     pub original_state: String,
+    /// Full canonical legacy Session snapshot, verified and stored by Host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -342,6 +345,10 @@ pub struct Snapshot {
     pub receipts: BTreeMap<String, OperationReceipt>,
     pub intents: BTreeMap<String, DispatchIntent>,
     pub resolutions: BTreeMap<String, MessageResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<crate::migration::MigrationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_attachment: Option<ImportSource>,
 }
 
 impl Snapshot {
@@ -359,6 +366,8 @@ impl Snapshot {
             receipts: BTreeMap::new(),
             intents: BTreeMap::new(),
             resolutions: BTreeMap::new(),
+            migration: None,
+            legacy_attachment: None,
         }
     }
 }
@@ -508,6 +517,9 @@ pub enum Operation {
     Import {
         temp_id: String,
         contract: Contract,
+        source: ImportSource,
+    },
+    AttachLegacy {
         source: ImportSource,
     },
 }

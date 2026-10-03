@@ -671,3 +671,152 @@ original-Supervisor tool proof, exact existing dispatch/query and result ports,
 and the Ticket-only independent-child wait exemption. No owned Inbox lease
 expiry or generic Root/runtime ownership is enabled; #1334/#1341 retain their
 existing implementation owner. Other worktrees are untouched.
+
+## Slice 20 — explicit offline legacy import and authority transfer (P9)
+
+Worktree `bamboo-1481-offline-migration`, branch
+`bamboo/feat/1481-offline-transfer`, based on `e3b1029d`. The P8 Lotus work is
+locally committed as `f5fc47f`; its final startup CSS is 105971/106000 bytes,
+with the original budget unchanged. No remote writes or production migration
+are performed.
+
+`bamboo tickets` exposes read-only `preview`, explicit `attach`/`import`, fixed
+read-only `backup`, `migration-plan` and stopped-host `migrate`. Preview copies
+and validates a bounded complete source Session tree in a temporary directory;
+it never initializes the source. Import verifies the reviewed canonical source
+hash, selected exact Task IDs and canonical Supervisor incarnation. A managed
+immutable source Artifact preserves the whole original Session, Task states and
+evidence. Old completed Tasks become blocked needs-review, with no fabricated
+Submission, acceptance or transferred execution. Ordinary HTTP/model mutations
+cannot provide an import source. Exact retries reuse the original receipt,
+including recovery after the Ticket commit precedes the canonical Root flag.
+Active, previously executed or ownership-unknown legacy Roots stay preview-only
+pending the existing Root ownership reconciliation boundary.
+
+Schema 1 bytes remain compatible for existing records. Full source imports and
+offline transfers publish schema 2; a schema-1 binary cannot downgrade or write
+that HEAD. Migration holds both local writer OS locks, checks the current fixed
+commit/CAS, canonical binding, stopped Root/known children and reconciled effect
+ledger, then publishes original retirement before copying. Every reachable full
+revision, manifest, commit and managed blob is verified. The copy retains a
+durable read-only marker while its new epoch is published; original HEAD then
+consumes that exact activation before the marker is removed and directory
+flushed. Original authority remains retired. Incomplete staging resumes only
+the same bound request; corruption is never silently repaired. The immutable
+OperationReceipt stays identical through all stages and retries; transfer stage
+is a separate observation. Old approvals expire, and old pending intents cannot
+acquire new run authority. Existing terminal keys remain queryable with the same
+run receipt. The canonical Supervisor tree and Inbox receipts are preserved;
+the existing Session index rebuild recovers only derived indexes and grants no
+new activation permission. Provider configuration/credentials do not migrate.
+
+Internal decision wake envelopes use the existing `hidden_from_ui` metadata.
+Semantic user-required accept additionally needs an explicit complete current
+Human clause naming the Work/submission, so a model proposal cannot promote
+chatter, negation, conditions or quoted tool text into user confirmation.
+
+PASS: Ticket domain 61 unique tests; `/tmp/1481-p9-domain-final1.log` and final
+acceptance-source regression `/tmp/1481-p9-semantic-final2.log` (17/17, 10.34s).
+The additional errno recovery test passes ten injected ENOSPC/EACCES cases
+across write, file flush, HEAD replacement and the following directory flush
+(`/tmp/1481-p9-errno-final.log`, 1/1, 2.73s), bringing distinct domain checks to
+62. It never fills a physical volume or changes permissions; those physical
+failure mechanisms remain untested.
+The offline suite injects failures at 40 retirement, 234 export and 76 activation/
+marker-release I/O boundaries (306.51s); existing storage tests cover 32 I/O and
+48 actual process-exit publication boundaries. These are local filesystem /
+injected I/O observations, not a power-loss or external-effect guarantee.
+
+PASS: actual Host/native migration and flag rollback 2/2 (27.75s),
+`/tmp/1481-offline-host-actual9.log`; final related native regression 19/19,
+`/tmp/1481-p9-native-regression1.log`. It includes six actual exit-71 windows,
+short Supervisor/held worker, same-message A/B/C/D operations, five questions,
+owned cancellation, unknown execution quarantine, accepted inputs, CLI migration
+and generation 2, and in-flight result preservation with both flags disabled.
+Earlier failed test runs are retained: malformed legacy fixture data, missing
+derived index, staged Inbox activation expectation, terminal lookup expectation,
+and a destination fixture credential reference. The fixes passed the above
+runs; no production key/configuration was changed.
+
+PASS: final explicit offline Host checks 4/4 (4.42s), including interrupted
+attach recovery with unchanged Ticket HEAD (`/tmp/1481-p9-offline-host-final.log`);
+server Ticket library checks 11/11 (3.36s,
+`/tmp/1481-p9-server-ticket2.log`). These are targeted checks, not a claim that
+the entire server/workspace suite was rerun.
+
+PASS: final current Lotus Chromium 1/1, 45.5s
+(`/tmp/1481-p9-lotus-browser4.log`); actual Host cross-check 1/1, 94.87s including
+browser wait (`/tmp/1481-p9-browser-fixture4.log`). Five exact own answers produce
+five generation-2 Submissions with stopped native processes, all still awaiting
+acceptance. The UI retains definite decision conflicts through read refresh;
+explicit ordinary-question retry is bounded to three user clicks. Approval and
+uncertain-ACK behavior is unchanged. Internal decision wake messages are hidden
+after replay. Screenshots were inspected; full Runtime evidence is retained as
+`../1481-evidence/p9-ui-final4*`. The first final attempt exposed an error being
+cleared by refresh and failed; attempt 2 was cancelled before the browser to
+rebuild; attempt 3 was interrupted by exec-server transport recovery with no
+test completion. These reports remain alongside the successful final run.
+
+PASS: complete Lotus 2049/2049 tests (123 files), type-check, lint, architecture,
+build and package budgets (`/tmp/1481-p9-lotus-final-verify.log`); CSS remains
+105971/106000 bytes, startup JS 1422851 raw / 432706 gzip bytes. Rust all-target
+Clippy for Ticket/server/agent passes with existing unrelated warnings
+(`/tmp/1481-p9-clippy-final.log`); Ticket all-target strict `-D warnings` passes
+(`/tmp/1481-p9-ticket-strict-clippy.log`). No baseline warnings were suppressed.
+Final formatting and both repository diff checks pass. The unchanged existing
+#1479 coordinator passes 49/49 on this final stack in 3.62s
+(`/tmp/1481-p9-coordinator-final.log`); the original owner and runtime protocol
+boundaries are preserved.
+
+### Runnable local entry points
+
+Build the local CLI with `cargo build -p bamboo-agent --locked --offline`.
+Stop both relevant Hosts before attach/import or migration. Example commands use
+operator-chosen offline data directories, not the user's production store:
+
+```sh
+bamboo tickets preview --data-dir <source> --source-session <exact-session-id>
+bamboo tickets attach --data-dir <source> --expected-snapshot <preview-hash> --operation-id <stable-id> --task-id <exact-task-id>
+bamboo tickets import --data-dir <source> --source-session <exact-session-id> --expected-snapshot <preview-hash> --operation-id <stable-id> --task-id <exact-task-id>
+bamboo tickets backup --data-dir <source> --destination <new-backup-directory>
+bamboo tickets migration-plan --data-dir <source> --destination <existing-empty-data-directory> --operation-id <stable-id>
+bamboo tickets migrate --data-dir <source> --request <reviewed-request.json>
+```
+
+Save only the `migration-plan` result's `.request` object in the reviewed JSON
+request file. `migrate` requires that exact fixed source commit and destination;
+after interruption, reuse the identical request/operation ID. Ordinary backups
+remain read-only. Configure a destination provider independently through its
+already-authorized setup before enabling new execution.
+
+The complete encoded Supervisor tree is capped at 1 MiB, 512 regular UTF-8
+files and depth 8; symlinks/unsafe paths are rejected. Larger histories are
+refused, never truncated. Mutation/dispatch remain independently default off.
+The real native ceiling is Task-only. Arbitrary same-UID shell/coding filesystem
+isolation, remote lease expiry with a physically surviving coding process,
+other filesystem platforms, sudden power loss and real irreversible provider
+effects are **UNRUN**, not inferred from these tests. #1334/#1341 retain the
+existing #791 owner; this stack does not activate owned Inbox lease expiry or
+claim completion of the general Root/runtime writer/ACK/release protocol.
+
+### A1–A12 evidence status in the supported opt-in local scope
+
+| Item | Status | Evidence and limit |
+| --- | --- | --- |
+| A1 | PASS | One short Supervisor plus held native worker; five independent actual Work/Assignment/plans. |
+| A2 | PASS | Five native questions E/B/D/A/C, restart and exact own-answer context; real-model E/no-reference proposals evaluated separately. |
+| A3 | PASS | Actual same Human A-answer/B-steer/C-create-ready-start/D-cancel and restart receipt; atomic fake/domain negative cases. |
+| A4 | PASS | Exact A-only buttons, stale revisions/generations/fingerprints and malformed references; 12-case live proposal evaluation has zero wrong approvals. Synthetic actions never execute. |
+| A5 | PASS, bounded | Ordinary/native private Task plans and sibling/root denials; native tool ceiling is Task-only, no arbitrary shell claim. |
+| A6 | PASS | Concurrent CAS/receipt and ingress/proposal replay; all publication/process-exit windows and frozen migration receipt. |
+| A7 | PASS | Six actual Host exit windows plus reused #1479 coordinator 49/49 and four-Worker barriers; no duplicate owner fixes. |
+| A8 | PASS | Late generation domain archive; actual pause/steer/cancel/owned stop and Host-loss quarantine without automatic redispatch. |
+| A9 | PASS | Explicit exact submission acceptance, accepted input bytes, downstream invalidation and independent Goal evidence. |
+| A10 | PASS | Fixed pagination, coverage/omissions, cursor resync and stale event/request state; actual current Lotus browser evidence. |
+| A11 | PARTIAL | Canonical worktree claims and unconfirmed/unknown-effect ownership are tested; actual local cancellation/unknown runs are tested. Physical arbitrary coding writes and remote lease-expiry survivor case are UNRUN. |
+| A12 | PASS, bounded | Full reachable hashes/readonly backup, fixed stopped-authority transfer, original retirement/new epoch, Inbox receipt preservation and import replay; active/unknown legacy import stays read-only. |
+
+P0–P8 have the local evidence recorded above. The Task-only P9 local rollout is
+validated by the recorded bounded tests; the full A11 coding/remote lease gate
+and independent current-head review remain open. The tracker is not marked
+fully complete or default-enabled. No push, PR, merge or deployment is authorized.

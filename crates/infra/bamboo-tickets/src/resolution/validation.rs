@@ -218,6 +218,67 @@ fn approval_text(
     Ok(())
 }
 
+fn acceptance_text(
+    snapshot: &Snapshot,
+    record: &HumanIngressRecord,
+    quote: &str,
+    target: &TicketReference,
+    submission: &str,
+) -> Result<()> {
+    let work = snapshot
+        .tickets
+        .get(target.id())
+        .ok_or(Error::RevisionConflict)?;
+    if !work.contract.user_acceptance_required {
+        return Ok(());
+    }
+    let title = &work.contract.title;
+    let named = quote.contains(&work.id)
+        || quote.contains(submission)
+        || snapshot
+            .tickets
+            .values()
+            .filter(|w| &w.contract.title == title)
+            .count()
+            == 1
+            && quote.contains(title);
+    let complete = record
+        .text
+        .split(['，', ',', '；', ';', '。', '\n'])
+        .any(|part| part.trim() == quote.trim());
+    let lower = quote.trim().to_lowercase();
+    let affirmative = |clause: &str| {
+        [
+            "验收通过",
+            "确认验收",
+            "接受交付",
+            "接受成果",
+            "accept ",
+            "i accept ",
+        ]
+        .iter()
+        .any(|s| clause.starts_with(s))
+    };
+    let explicit = affirmative(&lower)
+        || [work.id.as_str(), title.as_str(), submission]
+            .iter()
+            .any(|name| {
+                lower
+                    .strip_prefix(&name.to_lowercase())
+                    .is_some_and(|rest| affirmative(rest.trim_start_matches([' ', ':', '：'])))
+            });
+    let refused = [
+        "不", "未", "暂", "如果", "假如", "假设", "例如", "比如", "之前", "?", "？", "not ",
+        "don't ", "if ", "example", "\"", "“", "「", "`", ">",
+    ]
+    .iter()
+    .any(|s| lower.contains(s));
+    if !named || !complete || !explicit || refused {
+        return Err(clarify("user-required acceptance needs an explicit complete current Human clause identifying the Work/submission"));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_group(
     snapshot: &Snapshot,
     record: &HumanIngressRecord,
@@ -273,6 +334,13 @@ pub(super) fn validate_group(
                     return Err(Error::RevisionConflict);
                 }
                 approval_text(snapshot, record, &group.source_quote, q, *approve)?;
+            }
+            SemanticOperation::Accept {
+                target,
+                submission_id,
+                ..
+            } => {
+                acceptance_text(snapshot, record, &group.source_quote, target, submission_id)?;
             }
             _ => {}
         }

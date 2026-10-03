@@ -44,6 +44,8 @@ pub enum FaultPoint {
     AfterObjectRename,
     BeforeHeadRename,
     AfterHeadRename,
+    BeforeBackupRelease,
+    AfterBackupRelease,
 }
 
 /// A host/test hook: invoked at every actual persistence boundary. It may return
@@ -71,6 +73,7 @@ pub struct FileStore {
     pub health: Health,
     pub published: Option<(String, Snapshot)>,
     fault: Option<PublicationFault>,
+    pub(crate) offline_original_writable: bool,
     #[cfg(feature = "test-utils")]
     operation_fault: Option<(String, PublicationFault)>,
 }
@@ -164,6 +167,7 @@ impl FileStore {
             health: Health::Writable,
             published: None,
             fault: None,
+            offline_original_writable: false,
             #[cfg(feature = "test-utils")]
             operation_fault: None,
         };
@@ -199,6 +203,17 @@ impl FileStore {
             store.health = Health::ReadOnly {
                 reason: "backup requires verified stopped-authority migration".into(),
             };
+        }
+        if let Some((_, snapshot)) = &store.published {
+            if let Some(receipt) = &snapshot.migration {
+                if receipt.stage != crate::MigrationStage::DestinationActivated
+                    || receipt.request.destination_root != store.root.to_string_lossy()
+                {
+                    store.health = Health::ReadOnly {
+                        reason: "retired or relocated authority; offline migration required".into(),
+                    };
+                }
+            }
         }
         Ok(store)
     }
@@ -311,12 +326,10 @@ impl FileStore {
             // Blob references participate in the same full manifest and fixed
             // export as revisions. An orphan blob written before a failed
             // Submission is harmless; referenced blobs must verify in full.
-            for submission in snapshot.submissions.values() {
-                for artifact in &submission.artifacts {
-                    if let Some(hash) = managed_artifact_hash(artifact)? {
-                        self.read_artifact(artifact, MAX_ARTIFACT_BYTES)?;
-                        objects.insert(format!("blob:{hash}"), hash.to_owned());
-                    }
+            for artifact in snapshot_artifacts(&snapshot) {
+                if let Some(hash) = managed_artifact_hash(artifact)? {
+                    self.read_artifact(artifact, MAX_ARTIFACT_BYTES)?;
+                    objects.insert(format!("blob:{hash}"), hash.to_owned());
                 }
             }
             for category in [
@@ -347,10 +360,13 @@ impl FileStore {
             );
             let manifest = self.write_object(
                 "manifests",
-                &canonical_bytes(&Manifest { schema: 1, objects })?,
+                &canonical_bytes(&Manifest {
+                    schema: snapshot.schema,
+                    objects,
+                })?,
             )?;
             let commit = Commit {
-                schema: 1,
+                schema: snapshot.schema,
                 seq: snapshot.seq,
                 parent: self.published.as_ref().map(|(hash, _)| hash.clone()),
                 manifest,
@@ -412,7 +428,7 @@ impl FileStore {
         let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
         let manifest: Manifest =
             serde_json::from_slice(&self.read_object("manifests", &commit.manifest)?)?;
-        if commit.schema != 1 || manifest.schema != 1 {
+        if !matches!(commit.schema, 1 | 2) || manifest.schema != commit.schema {
             return Err(Error::AuthorityUnavailable("unsupported schema".into()));
         }
         let header = manifest
@@ -464,24 +480,23 @@ impl FileStore {
             );
         }
         let snapshot: Snapshot = serde_json::from_value(serde_json::Value::Object(value))?;
-        if snapshot.schema != 1 || snapshot.seq != commit.seq {
+        if snapshot.schema != commit.schema || snapshot.seq != commit.seq {
             return Err(Error::AuthorityUnavailable(
                 "snapshot header mismatch".into(),
             ));
         }
-        for submission in snapshot.submissions.values() {
-            for artifact in &submission.artifacts {
-                if let Some(hash) = managed_artifact_hash(artifact)? {
-                    if manifest
-                        .objects
-                        .get(&format!("blob:{hash}"))
-                        .map(String::as_str)
-                        != Some(hash)
-                    {
-                        return Err(Error::AuthorityUnavailable(
-                            "full manifest omits referenced Artifact".into(),
-                        ));
-                    }
+        crate::migration::validate_migration(&snapshot)?;
+        for artifact in snapshot_artifacts(&snapshot) {
+            if let Some(hash) = managed_artifact_hash(artifact)? {
+                if manifest
+                    .objects
+                    .get(&format!("blob:{hash}"))
+                    .map(String::as_str)
+                    != Some(hash)
+                {
+                    return Err(Error::AuthorityUnavailable(
+                        "full manifest omits referenced Artifact".into(),
+                    ));
                 }
             }
         }
@@ -496,8 +511,64 @@ impl FileStore {
     /// Export one fixed commit and every immutable reachable ancestor/object.
     /// The resulting directory is a backup, not a new writable authority.
     pub fn export(&self, destination: &Path) -> Result<String> {
-        if destination.exists() {
-            return Err(Error::InvalidTransition("export destination exists".into()));
+        self.export_with_marker(
+            destination,
+            b"Original authority and runs must stop before migration.",
+            false,
+        )
+    }
+
+    pub(crate) fn export_migration(&self, destination: &Path, hash: &str) -> Result<String> {
+        self.export_with_marker(destination, format!("migration:{hash}").as_bytes(), true)
+    }
+
+    fn export_with_marker(
+        &self,
+        destination: &Path,
+        marker: &[u8],
+        resume: bool,
+    ) -> Result<String> {
+        let new_destination = !destination.exists();
+        if !new_destination {
+            if !resume || fs::symlink_metadata(destination)?.file_type().is_symlink() {
+                return Err(Error::InvalidTransition(
+                    "export destination exists or is not this migration".into(),
+                ));
+            }
+        } else {
+            fs::create_dir(destination)?;
+        }
+        let marker_path = destination.join("BACKUP_READ_ONLY");
+        if marker_path.exists() {
+            if read_checked(&marker_path)? != marker {
+                return Err(Error::IdempotencyConflict);
+            }
+        } else {
+            // The exact retired source binds this new path before mkdir. A
+            // crash during marker creation can leave only inert staging; no
+            // existing objects/HEAD or mismatching marker may be repaired.
+            for entry in fs::read_dir(destination)? {
+                let entry = entry?;
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".backup-staging-")
+                    || !entry.file_type()?.is_file()
+                {
+                    return Err(Error::AuthorityUnavailable(
+                        "unmarked export destination is not empty staging".into(),
+                    ));
+                }
+            }
+            let staging = destination.join(format!(".backup-staging-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staging, marker)?;
+            self.hit(FaultPoint::BeforeObjectRename)?;
+            fs::rename(staging, &marker_path)?;
+            self.hit(FaultPoint::AfterObjectRename)?;
+            self.sync_dir(destination)?;
+            if let Some(parent) = destination.parent() {
+                self.sync_dir(parent)?;
+            }
         }
         let head = self
             .published
@@ -505,21 +576,29 @@ impl FileStore {
             .ok_or_else(|| Error::AuthorityUnavailable("no published snapshot".into()))?
             .0
             .clone();
-        fs::create_dir(destination)?;
         for category in ["objects", "manifests", "commits"] {
-            fs::create_dir(destination.join(category))?;
+            let dir = destination.join(category);
+            if dir.exists() {
+                if !checked_file(&dir)?.metadata()?.is_dir() {
+                    return Err(Error::AuthorityUnavailable(
+                        "export category is not a directory".into(),
+                    ));
+                }
+            } else {
+                fs::create_dir(dir)?;
+            }
         }
         let mut next = Some(head.clone());
         while let Some(hash) = next {
             self.load_snapshot(&hash)?;
             let bytes = self.read_object("commits", &hash)?;
             let commit: Commit = serde_json::from_slice(&bytes)?;
-            copy_synced(destination, "commits", &hash, &bytes)?;
+            self.copy_synced(destination, "commits", &hash, &bytes)?;
             let bytes = self.read_object("manifests", &commit.manifest)?;
             let manifest: Manifest = serde_json::from_slice(&bytes)?;
-            copy_synced(destination, "manifests", &commit.manifest, &bytes)?;
+            self.copy_synced(destination, "manifests", &commit.manifest, &bytes)?;
             for hash in manifest.objects.values() {
-                copy_synced(
+                self.copy_synced(
                     destination,
                     "objects",
                     hash,
@@ -528,37 +607,100 @@ impl FileStore {
             }
             next = commit.parent;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination.join("HEAD"))?;
-        file.write_all(head.as_bytes())?;
-        file.sync_all()?;
-        fs::write(
-            destination.join("BACKUP_READ_ONLY"),
-            b"Original authority and runs must stop before migration.",
-        )?;
-        checked_file(&destination.join("BACKUP_READ_ONLY"))?.sync_all()?;
-        for category in ["objects", "manifests", "commits"] {
-            checked_file(&destination.join(category))?.sync_all()?;
+        if destination.join("HEAD").exists() {
+            if read_checked(&destination.join("HEAD"))? != head.as_bytes() {
+                return Err(Error::IdempotencyConflict);
+            }
+        } else {
+            let staging = destination.join(format!(".HEAD-{}", uuid::Uuid::new_v4()));
+            self.write_synced(&staging, head.as_bytes())?;
+            self.hit(FaultPoint::BeforeHeadRename)?;
+            fs::rename(staging, destination.join("HEAD"))?;
+            self.hit(FaultPoint::AfterHeadRename)?;
         }
-        checked_file(destination)?.sync_all()?;
+        for category in ["objects", "manifests", "commits"] {
+            self.sync_dir(&destination.join(category))?;
+        }
+        self.sync_dir(destination)?;
         if let Some(parent) = destination.parent() {
-            checked_file(parent)?.sync_all()?;
+            self.sync_dir(parent)?;
         }
         Ok(head)
     }
+
+    fn copy_synced(
+        &self,
+        destination: &Path,
+        category: &str,
+        hash: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let dir = destination.join(category);
+        let path = dir.join(hash);
+        if path.exists() {
+            return if read_checked(&path)? == bytes {
+                Ok(())
+            } else {
+                Err(Error::AuthorityUnavailable("corrupt export object".into()))
+            };
+        }
+        let staging = dir.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+        self.write_synced(&staging, bytes)?;
+        self.hit(FaultPoint::BeforeObjectRename)?;
+        fs::rename(staging, path)?;
+        self.hit(FaultPoint::AfterObjectRename)?;
+        self.sync_dir(&dir)
+    }
+
+    pub(crate) fn publish_offline(&mut self, snapshot: Snapshot) -> Result<String> {
+        self.health = Health::Writable;
+        let result = self.publish(snapshot);
+        self.health = Health::ReadOnly {
+            reason: "offline migration; runtime permission withheld".into(),
+        };
+        result
+    }
+
+    pub(crate) fn release_backup(&self) -> Result<()> {
+        if self.root.join("BACKUP_READ_ONLY").exists() {
+            self.hit(FaultPoint::BeforeBackupRelease)?;
+            fs::remove_file(self.root.join("BACKUP_READ_ONLY"))?;
+            self.hit(FaultPoint::AfterBackupRelease)?;
+            self.sync_dir(&self.root)?;
+        }
+        Ok(())
+    }
 }
 
-fn copy_synced(destination: &Path, category: &str, hash: &str, bytes: &[u8]) -> Result<()> {
-    let path = destination.join(category).join(hash);
-    if path.exists() {
-        return Ok(());
-    }
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+fn snapshot_artifacts(snapshot: &Snapshot) -> impl Iterator<Item = &Artifact> {
+    snapshot
+        .submissions
+        .values()
+        .flat_map(|s| s.artifacts.iter())
+        .chain(
+            snapshot
+                .tickets
+                .values()
+                .filter_map(|w| w.import_source.as_ref().and_then(|s| s.artifact.as_ref())),
+        )
+        .chain(
+            snapshot
+                .legacy_attachment
+                .iter()
+                .filter_map(|s| s.artifact.as_ref()),
+        )
+        .chain(
+            snapshot
+                .migration
+                .iter()
+                .filter_map(|r| r.supervisor_snapshot.as_ref()),
+        )
+}
+
+fn read_checked(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    checked_file(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
