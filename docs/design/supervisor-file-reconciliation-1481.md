@@ -163,3 +163,33 @@ PASS: all 78 Ticket tests with all targets and test-utils, format check, and str
 ## Stable Root ownership dependency adoption
 
 Reuse merged PR #1501 at fbf9067adc3faa1db8f0d8b8ae7d013a4683ec40 and its already merged prerequisites, as a local patch over d99940d6. The original #1479/#1480 baseline remains 685328ec; no owner implementation is rewritten. Fourteen files overlap with #1481; thirteen apply without conflict. The chat workflow conflict retains the stable post-transaction activation and the existing queued-ingress duplicate-publication guard. All non-overlapping upstream files must match the stable source exactly. This adoption is not A12 acceptance; the historical Root fixture and affected integration checks are still pending.
+
+## Completed plain historical Root import on stable ownership ports
+
+The historical import adapter consumes the merged #1501/#1488/#1489 Actor and
+Root proof without implementing another ownership protocol. It validates a
+frozen full file tree, including initialized Actor census, birth, Project and
+terminal activation. Root authority deliberately strips messages, so transcript
+eligibility separately reads the already validated Main bytes. A plain
+zero-tool completed local Root may contribute immutable history only. Initial
+provider route metadata is permitted; native provider output groups, resets,
+route switches, tool history, compaction, children, unknown and active execution
+remain read-only. The legacy logical loop address and physical Actor Run UUID
+retain separate meanings. Import never reactivates or transfers the old Run.
+
+The historical preview emits `complete_root_files_v1`; its reviewed hash and
+Artifact cover every bounded canonical source file, including Runtime,
+Actor/census and Root tool-authority proof. Inert import retains its existing
+`canonical_session_v1` format. Old completed Tasks become blocked needs-review,
+with no current/accepted Submission. Receipt replay precedes new eligibility
+and CAS checks, while a live Ticket writer blocks the offline import.
+
+Actual Host/CLI historical acceptance passed on be748403 plus the two-file
+A12 overlay: real /chat and /execute, terminal physical Run, actual Host stop,
+Main-history/census/birth/expired-run rejection, reviewed full-tree import,
+identical receipt replay, exact original Actor preservation and Host restart
+without old Root activation. Evidence:
+`../1481-evidence/1481-macbook-a12-be748403-external-v10-historical.log`.
+Earlier fixture failures are retained. The four existing offline Host cases and both actual migration/feature rollback
+cases also pass on this stable stack (7 tests total). Final integrated regression
+and browser checks remain pending at this entry.

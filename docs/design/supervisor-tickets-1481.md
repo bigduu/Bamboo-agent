@@ -816,12 +816,15 @@ claim completion of the general Root/runtime writer/ACK/release protocol.
 | A9 | PASS | Explicit exact submission acceptance, accepted input bytes, downstream invalidation and independent Goal evidence. |
 | A10 | PASS | Fixed pagination, coverage/omissions, cursor resync and stale event/request state; actual current Lotus browser evidence. |
 | A11 | PASS, bounded local | Eight file-port tests plus two actual Host/native Git tests: real writes, sibling/cache denial, same-worktree 423 while native PID remains alive after controlled-clock FileHostRegistry slot expiry/reuse, and admission only after actual reap. Started/unknown writes remain quarantined without automatic retry; production Root activation fencing is not claimed. |
-| A12 | PARTIAL | Full reachable hashes/readonly backup, stopped-authority transfer, original retirement/new epoch, schema-3 code evidence, Inbox receipt preservation and inert import replay pass. Historical executed-session write handoff remains blocked on stable #1488/#1489; active/unknown imports stay read-only. |
+| A12 | PASS, bounded local | Seven current-stable tests pass: actual completed plain historical Root full-file import and identical receipt replay without acceptance or old Run activation, four offline Host compatibility cases, and two actual migration/feature rollback cases. Complete reachable hashes, stopped authority, retirement/new epoch and Inbox/Artifact receipts are preserved. Tool/native/compacted/active/unknown historical execution remains read-only. |
 
 P0–P8 have the local evidence recorded above. Task-only and bounded native
-coding P9 paths have actual Runtime evidence. Historical executed-session write
-handoff, production Root activation integration and independent current-head
-review remain open, so the tracker is not fully complete or default-enabled.
+coding P9 paths have actual Runtime evidence. The bounded plain historical Root
+import now consumes stable #1501 ownership ports and has real Host/CLI evidence.
+The final integrated current-head regression and browser check are pending;
+independent backend review is not rerun under the no-new-paid-agent constraint.
+Default mutation and dispatch remain off. Unsupported historical execution
+requires its existing ownership reconciliation; it is never auto-adopted.
 No push, PR, merge or deployment is authorized.
 
 ## Slice 21: bounded Assignment file authority (local-only)

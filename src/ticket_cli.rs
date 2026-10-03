@@ -2,8 +2,9 @@
 //! it never runs initialization/migration against the user's source directory.
 use anyhow::{bail, ensure, Context};
 use bamboo_domain::{
-    ActorDirectoryEntry, ActorLogicalState, AgentStatusState, Session, SessionAuthorityIdentity,
-    Storage, DEFAULT_SUPERVISOR_SESSION_ID,
+    ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryPort, ActorLogicalState,
+    AgentStatusState, Role, Session, SessionAuthorityIdentity, Storage,
+    DEFAULT_SUPERVISOR_SESSION_ID,
 };
 use bamboo_engine::{ticket_runtime, ticket_worker_plan::tickets::*};
 use bamboo_storage::SessionStoreV2;
@@ -196,6 +197,19 @@ struct SourceSnapshot {
     files: SourceFiles,
     file_bytes: Vec<u8>,
     cold: bool,
+    historical_plain_root: bool,
+}
+
+impl SourceSnapshot {
+    fn import_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        if self.historical_plain_root {
+            // Preserve the complete canonical tree, including the actual
+            // terminal Actor/census/runtime proofs, as one reviewed artifact.
+            Ok(self.file_bytes.clone())
+        } else {
+            Ok(canonical_bytes(&self.session)?)
+        }
+    }
 }
 
 fn selector(id: &str) -> anyhow::Result<()> {
@@ -345,10 +359,42 @@ async fn read_source(data: &Path, id: &str) -> anyhow::Result<SourceSnapshot> {
         .load_root_authority(id)
         .await?
         .context("canonical source Root missing")?;
+    // Root authority deliberately omits conversation messages. Eligibility
+    // must inspect the full transcript from this same frozen, validated tree;
+    // an empty control-plane projection is never evidence of zero effects.
+    // A temporary copy has no rebuildable Root index. Its complete Main was
+    // already schema/birth/identity checked by load_root_authority above.
+    let history: Session = serde_json::from_slice(
+        &files
+            .get("session.json")
+            .context("complete source Root missing")?
+            .bytes,
+    )?;
+    ensure!(
+        history.id == session.id
+            && history.created_at == session.created_at
+            && history.authority_identity == session.authority_identity,
+        "complete source Root identity mismatch"
+    );
     let actor = files
         .get("actor-authority.json")
         .map(|f| serde_json::from_slice::<ActorDirectoryEntry>(&f.bytes))
         .transpose()?;
+    ensure!(
+        actor.is_some() == files.contains_key("actor-authority.initialized.json"),
+        "Actor census witnesses incomplete; read-only reconciliation required"
+    );
+    if let Some(actor) = &actor {
+        // Reuse V2's birth/Project/census validation on the frozen temporary
+        // copy. This never initializes or repairs the original source. Reject
+        // an observation which needed to change even the temporary authority.
+        let verified = storage.inspect_actor(id).await?;
+        ensure!(
+            &verified == actor,
+            "Actor authority changed during validation"
+        );
+    }
+    let has_children = files.keys().any(|p| p.starts_with("children/"));
     let cold = actor
         .as_ref()
         .is_none_or(|a| a.actor.state == ActorLogicalState::Cold && a.activation.is_none())
@@ -357,7 +403,54 @@ async fn read_source(data: &Path, id: &str) -> anyhow::Result<SourceSnapshot> {
             .agent_runtime_state
             .as_ref()
             .is_none_or(|r| r.status == AgentStatusState::Idle)
-        && !files.keys().any(|p| p.starts_with("children/"));
+        && !has_children;
+    // Historical import grants no old execution capability. The supported
+    // first path is a completed ordinary local Root with a complete zero-tool
+    // history and exact final Runtime/Actor identity. Expiry, a status string,
+    // failed/cancelled attempts, summaries and unknown effects are not proof.
+    let historical_plain_root = session.authority_identity.is_ordinary()
+        && !has_children
+        && session.last_run_status().as_deref() == Some("completed")
+        && history.conversation_summary.is_none()
+        && history.compression_events.is_empty()
+        // Selecting a provider records route metadata even for a plain
+        // Chat-Completions turn. Only the initial route selection is allowed;
+        // provider-minted groups, resets and route switches remain read-only.
+        && history.provider_transcript.state_revision() <= 1
+        && history.provider_transcript.epoch() == 0
+        && history.provider_transcript.last_reset_reason().is_none()
+        && history.provider_transcript.groups().is_empty()
+        && history.messages.iter().all(|message| {
+            message.role != Role::Tool
+                && !message.compressed
+                && message.tool_call_id.is_none()
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_none_or(|calls| calls.is_empty())
+        })
+        && actor.as_ref().is_some_and(|entry| {
+            entry.actor.state == ActorLogicalState::Cold
+                && entry.activation.as_ref().is_some_and(|activation| {
+                    activation.status == ActorActivationStatus::Succeeded
+                        && activation.placement_ref.is_none()
+                        && activation.project_id == entry.actor.project_id
+                        && session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+                            runtime.status == AgentStatusState::Completed
+                                // V1's misleading `run_id` is the logical
+                                // loop address. The physical Run identity is
+                                // exclusively activation.run_id in V2's
+                                // validated terminal Actor authority.
+                                && runtime.version == bamboo_domain::AGENT_RUNTIME_STATE_VERSION
+                                && runtime.run_id == session.id
+                                && runtime.round.total_tool_calls == 0
+                                && runtime.tools.active_tool_calls == 0
+                                && runtime.waiting_for_children.is_none()
+                                && runtime.waiting_for_bash.is_none()
+                                && runtime.memory.compression_events_count == 0
+                        })
+                })
+        });
     let mut after = SourceFiles::new();
     collect(&directory, Path::new(""), &mut after)?;
     ensure!(
@@ -369,6 +462,7 @@ async fn read_source(data: &Path, id: &str) -> anyhow::Result<SourceSnapshot> {
         files,
         file_bytes,
         cold,
+        historical_plain_root,
     })
 }
 
@@ -413,8 +507,10 @@ pub async fn preview(data: &Path, id: &str) -> anyhow::Result<Value> {
         .map(|l| l.items.as_slice())
         .unwrap_or(&[]);
     Ok(
-        json!({"source_session_id":id,"source_snapshot_hash":content_hash(&canonical_bytes(&source.session)?),
-        "read_only":!source.cold,"reason":if source.cold{"inert canonical Root; explicit reviewed import eligible"}else{"active/previous execution requires owned-stop reconciliation; preview only"},
+        json!({"source_session_id":id,"source_snapshot_hash":content_hash(&source.import_bytes()?),
+        "source_snapshot_format":if source.historical_plain_root{"complete_root_files_v1"}else{"canonical_session_v1"},
+        "read_only":!source.cold && !source.historical_plain_root,
+        "reason":if source.cold{"inert canonical Root; explicit reviewed import eligible"}else if source.historical_plain_root{"verified completed plain local Root; immutable history import only; stop Host first"}else{"active/unknown/unsupported execution requires owned-stop reconciliation; preview only"},
         "task_count":tasks.len(),"truncated":tasks.len()>32,"omitted_count":tasks.len().saturating_sub(32),
         "mapping":tasks.iter().take(32).map(|t|json!({"task_id":t.id,"title":t.description,"original_state":t.status,"import_state":"needs_review","parent_id":t.parent_id,"depends_on":t.depends_on})).collect::<Vec<_>>()}),
     )
@@ -497,10 +593,10 @@ pub async fn legacy_commit(
         }
     }
     ensure!(
-        source.cold,
+        source.cold || (!attach && source.historical_plain_root),
         "source is read-only: canonical execution ownership is not inert"
     );
-    let bytes = canonical_bytes(&source.session)?;
+    let bytes = source.import_bytes()?;
     ensure!(
         content_hash(&bytes) == expected,
         "revision_conflict: source snapshot changed"
