@@ -1,5 +1,9 @@
 # Bamboo 🎋
 
+![Bamboo brand illustration: bamboo beside a stream, symbolizing resilience.](docs/assets/bamboo-nature-hero.png)
+
+*Brand illustration, not a software screenshot. Bamboo symbolizes resilience.*
+
 ### Run an AI agent on your project, from your terminal or your own app.
 
 Bamboo is the local agent harness at the core of [Zenith](https://github.com/bigduu/Zenith). Give it a workspace and a configured model: it can read files, use tools, keep sessions, and expose the same runtime to a browser, desktop shell, or Rust application.

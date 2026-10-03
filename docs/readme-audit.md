@@ -68,3 +68,16 @@ were used.
 
 No branch for Supervisor #1481 or the #791 owner was changed; no remote write,
 submodule pin update, release, deployment, or PR creation was performed.
+
+## Approved brand illustration
+
+The user-approved nature illustration is saved at `docs/assets/bamboo-nature-hero.png`.
+The original PNG was visually inspected and decoded, and its SHA-256 matched
+the approved image package. It is a brand illustration, not a software screenshot;
+the README alt text and visible caption say so. Existing source/release and
+recording limits still apply. The older artwork remains in repository history
+and any existing SVG asset is preserved.
+
+- Pixels: 1672 × 941 (RGB PNG)
+- Bytes: 2219576
+- SHA-256: `6a30f5406e6361be6fe17eed5d454661cf8e7f1f99bf2156310a1f64caf4e5f5`

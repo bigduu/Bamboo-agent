@@ -1,5 +1,9 @@
 # Bamboo 🎋
 
+![Bamboo 品牌插画：溪流旁的竹子，寓意韧性。](docs/assets/bamboo-nature-hero.png)
+
+*品牌插画，非软件截图。竹子象征韧性。*
+
 ### 在终端或自己的应用里，让 AI agent 处理你的项目。
 
 Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness 核心。为它指定工作区并配置模型，就可以读取文件、调用工具、保存会话，并把同一套运行时接入浏览器、桌面外壳或 Rust 应用。
