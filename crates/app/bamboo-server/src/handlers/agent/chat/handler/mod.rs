@@ -1355,6 +1355,24 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         None
     };
 
+    let queue_root_input = match state
+        .session_store
+        .root_actor_input_required(&session)
+        .await
+    {
+        Ok(required) => required,
+        Err(error) => {
+            if let Some(staging) = staged_workflow_activation.as_mut() {
+                staging.release().await;
+            }
+            return crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to classify Root input: {error}"),
+            );
+        }
+    };
+    let metadata_before_input = session.metadata.clone();
+    let runtime_metadata_before_input = session.runtime_metadata.clone();
     // Image handling stays in the handler layer (depends on AppState attachment reader).
     if let Err(response) = images::append_user_message(
         &state,
@@ -1369,6 +1387,43 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         }
         return response;
     }
+
+    let queued_input = if queue_root_input {
+        let message = session
+            .messages
+            .pop()
+            .expect("append_user_message produced a User turn");
+        // A queued turn has not replaced the previous execution's handoff yet.
+        // Restore the entire metadata checkpoint, including startup/error keys.
+        session.metadata = metadata_before_input;
+        session.runtime_metadata = runtime_metadata_before_input;
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input(session.id.clone(), message.content);
+        envelope.id = match bamboo_domain::SessionMessageId::parse(&message.id) {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Invalid Root input identity: {error}"),
+                );
+            }
+        };
+        envelope.created_at = message.created_at;
+        envelope.body =
+            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
+                text: match &envelope.body {
+                    bamboo_domain::SessionMessageBody::Content(content) => content.text.clone(),
+                    _ => unreachable!(),
+                },
+                parts: message.content_parts.unwrap_or_default(),
+            });
+        Some(envelope)
+    } else {
+        None
+    };
 
     if retire_workflow {
         // The old candidate can otherwise be restored on the next execute,
@@ -1387,7 +1442,8 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
     }
 
-    if staged_workflow_activation.is_some() || retire_workflow {
+    if staged_workflow_activation.is_some() || retire_workflow || queued_input.is_some() {
+        let workflow_changed = staged_workflow_activation.is_some() || retire_workflow;
         let mut staging = staged_workflow_activation;
         if let Some(staging) = staging.as_ref() {
             staging.apply(&mut session.metadata);
@@ -1407,26 +1463,65 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
                 }
                 return Err(error.to_string());
             }
+            let admission = if let Some(envelope) = queued_input {
+                match commit_state
+                    .session_messenger
+                    .admit_with_activation_intent(
+                        envelope,
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(admission) => Some(admission),
+                    Err(error) => {
+                        if let Some(staging) = staging.as_mut() {
+                            staging.release().await;
+                        }
+                        return Err(error.to_string());
+                    }
+                }
+            } else {
+                None
+            };
             #[cfg(test)]
             wait_at_workflow_post_save_test_barrier(&commit_session_id).await;
 
             // The durable user turn and exact snapshot now own the next
             // execution. Only now may the prior live activation be released.
-            if let Err(error) = commit_state
-                .skill_manager
-                .release_activation_for_workspace(&commit_session_id, None)
-                .await
-            {
-                tracing::error!(
-                    session_id = %commit_session_id,
-                    %error,
-                    "failed to release prior Workflow activation after commit"
-                );
+            if workflow_changed {
+                if let Err(error) = commit_state
+                    .skill_manager
+                    .release_activation_for_workspace(&commit_session_id, None)
+                    .await
+                {
+                    tracing::error!(
+                        session_id = %commit_session_id,
+                        %error,
+                        "failed to release prior Workflow activation after commit"
+                    );
+                }
             }
             if let Some(staging) = staging.as_mut() {
                 staging.release().await;
             }
-            publish_committed_chat(&commit_state, &session);
+            // Activation startup acquires the same Host lock. The complete
+            // metadata/pin/admission transaction must release it first.
+            drop(_workflow_commit_guard);
+            drop(_persistence_guard);
+            if let Some(admission) = admission {
+                if let Err(error) = commit_state
+                    .session_messenger
+                    .activate_prepared(&admission)
+                    .await
+                {
+                    // Body and immediate eligibility are already durable. The
+                    // existing activation recovery can retry this same input.
+                    tracing::warn!(session_id = %commit_session_id, %error, "Root chat input awaits activation");
+                }
+            } else {
+                publish_committed_chat(&commit_state, &session);
+            }
             Ok::<(), String>(())
         });
         match commit.await {

@@ -233,14 +233,16 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
         "{}",
         reply.text().await.unwrap()
     );
-    assert!(client
-        .post(format!("{base}/execute/remote-root"))
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .is_success());
+    if number == 1 {
+        assert!(client
+            .post(format!("{base}/execute/remote-root"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let root = cold(&p.data, "remote-root").await;
@@ -355,6 +357,27 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
     })
     .await
     .unwrap();
+    // This fixture intentionally kills and replaces Hosts between operations.
+    // A transcript checkpoint precedes actual Root owner finalization; wait
+    // for that durable finish before killing this successful Host. Hard-kill
+    // recovery across a still-live Root lease has its own ownership fixture.
+    let root = SessionStoreV2::new(p.data.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let current = bamboo_domain::ActorDirectoryPort::inspect_actor(&root, "remote-root")
+                .await
+                .unwrap();
+            if current
+                .activation
+                .is_some_and(|activation| !activation.status.is_live())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("successful Root owner is durably finished before this fixture replaces its Host");
 }
 async fn wait_calls(p: &Probe, count: usize) {
     tokio::time::timeout(Duration::from_secs(30), async {

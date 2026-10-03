@@ -35,6 +35,37 @@ pub type RootActorRuntimeEventPublisher =
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Bind an Inbox to this exact Root execution before opting into owned
+    /// claims. Unsupported/custom queues fail closed, without a legacy claim.
+    fn bind_root_actor_inbox(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    ) -> std::io::Result<std::sync::Arc<dyn crate::SessionInboxPort>> {
+        let _ = (owner, inbox);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support owned Root Inbox admission",
+        ))
+    }
+
+    /// Commit the typed message and cursor through the existing full writer,
+    /// then ACK while retaining the same Root and Inbox physical guards.
+    async fn save_root_actor_input(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &Session,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+        claim: &crate::SessionInboxOwnedClaim,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, inbox, claim, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root input checkpoints",
+        ))
+    }
+
     /// Probe before claiming an Actor; unsupported backends must not leave a
     /// claimed execution whose writes fall back to an ordinary snapshot save.
     fn supports_root_actor_runtime_write(&self) -> bool {

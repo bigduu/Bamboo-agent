@@ -73,6 +73,23 @@ impl ResumeExecutionPort for AppStateResumeRef {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
 
+    async fn prepare_response_execution(
+        &self,
+        reservation: &mut bamboo_engine::execution::SessionExecutionReservation,
+    ) -> std::io::Result<()> {
+        use bamboo_engine::session_app::repository::SessionAccess;
+        let session = self
+            .0
+            .session_repo
+            .inspect_for_response(reservation.session_id())
+            .await
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "response session missing")
+            })?;
+        reservation.bind_root_actor(&self.0.agent, &session).await
+    }
+
     fn dispatch_resume_execution(
         &self,
         request: ResumeSpawnRequest,
@@ -213,6 +230,23 @@ impl ResumeExecutionPort for AppStateResumeRef {
             gold_config.clone(),
             execution_reservation.root_actor_writer(),
         );
+        let response_events = execution_reservation.take_root_response_events();
+        if !response_events.is_empty() {
+            for event in response_events {
+                if mpsc_tx.send(event).await.is_err() {
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+            if !history_commit_barrier
+                .send_and_wait(&mpsc_tx, session_id.clone())
+                .await
+            {
+                tracing::warn!(%session_id, "Root response publication was not confirmed");
+                execution_reservation.abandon().await;
+                return;
+            }
+        }
 
         let model_roster = bamboo_engine::ModelRoster {
             model: Some(model),

@@ -16,6 +16,15 @@ pub enum RetrievalWindowCheckpointOutcome {
     Rebased,
 }
 
+/// Provider-boundary admission through the bound Root writer. None from the
+/// port below means this execution does not use ordinary Root authority.
+#[derive(Debug, Default)]
+pub struct RootInboxAdmission {
+    pub merged: usize,
+    pub committed_messages: Vec<crate::Message>,
+    pub admission_error: Option<String>,
+}
+
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
 ///
@@ -131,6 +140,12 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {
+    /// Immutable capability already captured by this concrete execution.
+    /// An unbound Host/default persister never supplies a current owner.
+    fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
+        None
+    }
+
     /// Whether this Host requires an explicit execution capability for the
     /// proposed Root. A route without a bound event/persistence handoff must
     /// reject before claiming or making a provider call.
@@ -335,6 +350,15 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    async fn admit_root_inbox(
+        &self,
+        _session: &mut Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _active_run_id: Option<&str>,
+    ) -> io::Result<Option<RootInboxAdmission>> {
+        Ok(None)
+    }
+
     /// Atomically commit a staged retrieval-window transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.
@@ -498,6 +522,10 @@ impl Drop for RootActorExecutionBinding {
 
 #[async_trait::async_trait]
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
+    fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
+        (**self).root_actor_writer()
+    }
+
     fn root_actor_execution_required(&self, session: &Session) -> bool {
         (**self).root_actor_execution_required(session)
     }
@@ -593,6 +621,17 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> io::Result<Option<RootInboxAdmission>> {
+        (**self)
+            .admit_root_inbox(session, inbox, active_run_id)
+            .await
     }
 
     async fn checkpoint_retrieval_window(

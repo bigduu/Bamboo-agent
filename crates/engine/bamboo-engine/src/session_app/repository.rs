@@ -14,6 +14,20 @@ use crate::SessionRepository;
 /// server types.
 #[async_trait]
 pub trait SessionAccess: Send + Sync {
+    /// Use the exact successor's Root capability for a response CAS. External
+    /// adapters without the named writer reject a Root handoff before consume.
+    fn bind_response_writer(
+        &self,
+        owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    ) -> Result<Option<std::sync::Arc<dyn SessionAccess>>, SessionSaveError> {
+        if owner.is_some() {
+            return Err(SessionSaveError::StorageError(
+                "Root response writer is unsupported".into(),
+            ));
+        }
+        Ok(None)
+    }
+
     /// Load a session by ID (from cache or storage).
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError>;
 
@@ -74,6 +88,19 @@ pub trait SessionAccess: Send + Sync {
 /// can use a `SessionRepository` directly as a `SessionAccess`.
 #[async_trait]
 impl SessionAccess for SessionRepository {
+    fn bind_response_writer(
+        &self,
+        owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    ) -> Result<Option<std::sync::Arc<dyn SessionAccess>>, SessionSaveError> {
+        owner
+            .map(|owner| {
+                self.bind_root_response_writer(owner)
+                    .map(|bound| std::sync::Arc::new(bound) as std::sync::Arc<dyn SessionAccess>)
+                    .map_err(|error| SessionSaveError::StorageError(error.to_string()))
+            })
+            .transpose()
+    }
+
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {
         // Historical contract: absence is an error, not Ok(None).
         match SessionRepository::load(self, id).await {

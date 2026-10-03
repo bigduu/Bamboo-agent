@@ -362,16 +362,20 @@ async fn actual_four_children_two_rounds_collect_parent_results() {
             response.text().await.unwrap()
         );
         let store = SessionStoreV2::new(data.clone()).await.unwrap();
-        let dispatch: Value = client
-            .post(format!("{base}/execute/four-child-root"))
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(dispatch["status"], "started");
+        if round == 1 {
+            let dispatch: Value = client
+                .post(format!("{base}/execute/four-child-root"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(dispatch["status"], "started");
+        }
+        // Later chat inputs activate the existing Root. The held four-child
+        // wait and all canonical outcomes below prove that actual round.
         let held_parent = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");

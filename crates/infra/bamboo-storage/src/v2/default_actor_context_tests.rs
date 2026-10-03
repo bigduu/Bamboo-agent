@@ -416,13 +416,19 @@ impl DefaultWriteHook {
             .wake
             .wait_timeout_while(s, DEADLINE, |s| !s.entered)
             .unwrap();
+        let entered = s.entered;
+        let timed_out = t.timed_out();
+        drop(s);
         assert!(
-            s.entered && !t.timed_out(),
+            entered && !timed_out,
             "actual filesystem job never reached barrier"
         );
     }
     pub(super) fn release(&self) {
-        self.state.lock().unwrap().released = true;
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released = true;
         self.wake.notify_all();
     }
 }
@@ -761,7 +767,15 @@ async fn aborted_owned_root_job_retains_guards_until_expired_owner_rejection_and
     for runtime_only in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let (first, second, mut incoming) = stores(home.path()).await;
-        let owner = running_root_writer(&first, &incoming, 250).await;
+        let owner = running_root_writer(&first, &incoming, 15_000).await;
+        let activation = first
+            .inspect_actor(ID)
+            .await
+            .unwrap()
+            .activation
+            .expect("the real Root activation must exist before the filesystem job");
+        assert_eq!(activation.fence(), owner.fence);
+        let lease_expires_at = activation.lease_expires_at;
         incoming.conversation_summary.as_mut().unwrap().content = "obsolete aborted writer".into();
         let before = snapshot(&home.path().join("sessions").join(ID));
         let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -791,7 +805,9 @@ async fn aborted_owned_root_job_retains_guards_until_expired_owner_rejection_and
         hook.wait();
         job.abort();
         assert!(job.await.unwrap_err().is_cancelled());
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(remaining) = lease_expires_at.signed_duration_since(Utc::now()).to_std() {
+            tokio::time::sleep(remaining + Duration::from_millis(1)).await;
+        }
         physical_locks_held(&first);
         let successor = {
             let second = second.clone();

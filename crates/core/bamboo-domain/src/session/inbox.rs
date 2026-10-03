@@ -1058,6 +1058,18 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Release only this exact live claim for recovery. Preserve its typed body
+    /// and counters; an expired or replaced token cannot release a successor.
+    async fn release_owned(
+        &self,
+        _target_session_id: &str,
+        _claim: &SessionInboxOwnedClaim,
+    ) -> Result<(), SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "owned Inbox release unsupported".into(),
+        ))
+    }
+
     /// Read exact wake readiness from the canonical queue and lease state.
     /// Backends without a joint lock and exact eligibility check fail closed.
     async fn inspect_wake_readiness(

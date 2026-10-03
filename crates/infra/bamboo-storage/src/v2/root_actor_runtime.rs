@@ -73,7 +73,7 @@ impl RootActorWriteProof {
         Ok(overlay_runtime_sidecar(main, Some(side)))
     }
 
-    fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {
+    pub(super) fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {
         let durable = self.validate()?;
         if incoming.id != durable.id
             || incoming.kind != SessionKind::Root
@@ -85,6 +85,20 @@ impl RootActorWriteProof {
             || incoming.project_id_meta() != durable.project_id_meta()
         {
             return Err(conflict("candidate Root identity or Project changed"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_deadline(&self, deadline: DateTime<Utc>) -> io::Result<()> {
+        self.validate()?;
+        let bytes = actor_transcript::regular_bytes(&self.directory.join("actor-authority.json"))
+            .map_err(conflict)?;
+        let entry: ActorDirectoryEntry = actor_transcript::decode(&bytes).map_err(conflict)?;
+        let now = Utc::now();
+        let current =
+            actor_directory::current_live(&entry, &self.owner.fence, now).map_err(conflict)?;
+        if deadline <= now || deadline > current.lease_expires_at {
+            return Err(conflict("Inbox lease exceeds current Root lease"));
         }
         Ok(())
     }
@@ -127,7 +141,16 @@ impl SessionStoreV2 {
         if let Some(proof) = guards.root_actor.as_ref() {
             let incoming = incoming.clone();
             let proof = proof.clone();
-            Self::default_writer_job(guards, move || proof.validate_candidate(&incoming)).await
+            let input = guards.input.clone();
+            Self::default_writer_job(guards, move || {
+                proof.validate_candidate(&incoming)?;
+                if let Some(input) = input {
+                    input.validate(false)?;
+                    input.validate_transcript(&incoming)?;
+                }
+                Ok(())
+            })
+            .await
         } else {
             self.check_default_actor_context(incoming, directory, full)
                 .await
@@ -143,8 +166,13 @@ impl SessionStoreV2 {
             .root_actor
             .clone()
             .ok_or_else(|| conflict("cache publication has no bound owner"))?;
+        let input = guards.input.clone();
         Self::default_writer_job(guards, move || {
             let committed = proof.validate()?;
+            if let Some(input) = input {
+                input.validate(false)?;
+                input.validate_transcript(&committed)?;
+            }
             publish(&committed);
             Ok(())
         })

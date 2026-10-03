@@ -53,6 +53,7 @@ async fn publish_root_event(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_event_forwarder(
     state: actix_web::web::Data<AppState>,
     session_id: String,
@@ -771,6 +772,148 @@ mod tests {
         })
         .await
         .expect("provider purpose should appear");
+    }
+
+    async fn close_bound_gold_forwarder(
+        state: &actix_web::web::Data<AppState>,
+        session: &bamboo_agent_core::Session,
+        gold_config: GoldConfig,
+    ) {
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+
+        let session_id = session.id.as_str();
+        let session_tx = state.get_session_event_sender(session_id).await;
+        let mut session_rx = session_tx.subscribe();
+        let mut account_rx = state.account_sink.subscribe();
+        let mut reservation = match reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            session_id,
+            &session_tx,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+                panic!("the initial gold fixture run must reserve ownership: {run_id}")
+            }
+        };
+        reservation
+            .bind_root_actor(&state.agent, session)
+            .await
+            .expect("the initial Root must bind through its real execution reservation");
+        let run_id = reservation.run_id().to_string();
+        let root_actor = reservation
+            .root_actor_writer()
+            .expect("the ordinary Root forwarder requires its actual Actor owner");
+        state
+            .agent_runners
+            .write()
+            .await
+            .get_mut(session_id)
+            .unwrap()
+            .status = AgentStatus::Running;
+
+        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
+        let mut history = spawn_event_forwarder_with_root_actor(
+            state.clone(),
+            session_id.to_string(),
+            run_id.clone(),
+            mpsc_rx,
+            session_tx,
+            Some(gold_config),
+            Some(root_actor),
+        );
+        mpsc_tx
+            .send(AgentEvent::Token {
+                content: "before-close".into(),
+            })
+            .await
+            .expect("the bound old run must send its token before closing");
+        assert!(timeout(
+            Duration::from_secs(30),
+            history.send_and_wait(&mpsc_tx, session_id.into()),
+        )
+        .await
+        .expect("the bound old run must reach its physical history publication"));
+
+        timeout(Duration::from_secs(30), async {
+            let mut started = false;
+            let mut token = false;
+            let mut committed = false;
+            while !(started && token && committed) {
+                match session_rx.recv().await.expect("old Root session broadcast") {
+                    AgentEvent::ExecutionStarted {
+                        run_id: started_id, ..
+                    } => {
+                        assert_eq!(started_id, run_id);
+                        started = true;
+                    }
+                    AgentEvent::Token { content } if content == "before-close" => token = true,
+                    AgentEvent::SessionHistoryCommitted {
+                        session_id: committed_id,
+                        ..
+                    } => {
+                        assert_eq!(committed_id, session_id);
+                        committed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("old Root started/token/history must publish before its owner finishes");
+        timeout(Duration::from_secs(30), async {
+            let mut started = false;
+            let mut committed = false;
+            while !(started && committed) {
+                let change = account_rx.recv().await.expect("old Root account broadcast");
+                if change.session_id.as_deref() != Some(session_id) {
+                    continue;
+                }
+                match &change.event {
+                    AgentEvent::ExecutionStarted {
+                        run_id: started_id, ..
+                    } => {
+                        assert_eq!(started_id, &run_id);
+                        started = true;
+                    }
+                    AgentEvent::SessionHistoryCommitted { .. } => committed = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("old Root account/history must publish before its owner finishes");
+        let journaled =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert!(journaled.iter().any(|change| {
+            change.session_id.as_deref() == Some(session_id)
+                && matches!(
+                    &change.event,
+                    AgentEvent::ExecutionStarted { run_id: started_id, .. }
+                        if started_id == &run_id
+                )
+        }));
+        assert!(journaled.iter().any(|change| {
+            change.session_id.as_deref() == Some(session_id)
+                && matches!(&change.event, AgentEvent::SessionHistoryCommitted { .. })
+        }));
+
+        reservation
+            .finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded)
+            .await;
+        // This port fixture has no spawned old runner to finish its router
+        // registration. Release that exact reservation before Gold reserves
+        // the successor; the Root Actor has already finished successfully.
+        reservation.abandon().await;
+        let mut runners = state.agent_runners.write().await;
+        let runner = runners.get_mut(session_id).unwrap();
+        assert_eq!(runner.run_id, run_id);
+        runner.status = AgentStatus::Completed;
+        drop(runners);
+        drop(mpsc_tx);
     }
 
     // ── is_critical_event ──────────────────────────────────────────────
@@ -1511,42 +1654,7 @@ mod tests {
             }),
         );
         state.save_and_cache_session(&mut session).await;
-
-        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
-        runner.run_id = "gold-run".to_string();
-        runner.status = AgentStatus::Running;
-        runner.event_sender = session_tx.clone();
-        state
-            .agent_runners
-            .write()
-            .await
-            .insert(session_id.to_string(), runner);
-
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.to_string(),
-            "gold-run".to_string(),
-            mpsc_rx,
-            session_tx,
-            Some(test_gold_config()),
-        );
-
-        mpsc_tx
-            .send(AgentEvent::Token {
-                content: "before-close".into(),
-            })
-            .await
-            .expect("should send token before close");
-        state
-            .agent_runners
-            .write()
-            .await
-            .get_mut(session_id)
-            .unwrap()
-            .status = AgentStatus::Completed;
-        drop(mpsc_tx);
+        close_bound_gold_forwarder(&state, &session, test_gold_config()).await;
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;
         wait_for_provider_purpose(provider.as_ref(), "agent_loop").await;
@@ -1555,13 +1663,8 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        // The gold answer (pending_question cleared + auto-answer message)
-        // lands in the memory cache first; `load_session_merged` can still
-        // surface the stale storage copy until persistence catches up, because
-        // its prefer-storage heuristic favours a storage session that still
-        // carries the pending question (`memory.pending=None && storage.pending=Some`).
-        // Poll until the merged view has settled so the assertions are
-        // deterministic rather than racing the memory↔storage convergence.
+        // The detached successor owns the accepted answer. Observe its shared
+        // cache after the actual bound checkpoint and resume-marker consume.
         let after = timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(session) =
@@ -1648,46 +1751,11 @@ mod tests {
         );
         state.save_and_cache_session(&mut session).await;
 
-        let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
-        let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
-        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
-        runner.run_id = "gold-run".to_string();
-        runner.status = AgentStatus::Running;
-        runner.event_sender = session_tx.clone();
-        state
-            .agent_runners
-            .write()
-            .await
-            .insert(session_id.to_string(), runner);
-
         let mut gold_config = test_gold_config();
         gold_config.auto_answer_enabled = true;
         gold_config.auto_continue_enabled = true;
         gold_config.max_auto_continuations = 3;
-
-        spawn_event_forwarder(
-            state.clone(),
-            session_id.to_string(),
-            "gold-run".to_string(),
-            mpsc_rx,
-            session_tx,
-            Some(gold_config),
-        );
-
-        mpsc_tx
-            .send(AgentEvent::Token {
-                content: "before-close".into(),
-            })
-            .await
-            .expect("should send token before close");
-        state
-            .agent_runners
-            .write()
-            .await
-            .get_mut(session_id)
-            .unwrap()
-            .status = AgentStatus::Completed;
-        drop(mpsc_tx);
+        close_bound_gold_forwarder(&state, &session, gold_config).await;
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;
         wait_for_provider_purpose(provider.as_ref(), "agent_loop").await;
@@ -1696,9 +1764,8 @@ mod tests {
             AgentStatus::Running | AgentStatus::Completed
         ));
 
-        // See the sibling test: poll until the merged view has settled (the
-        // gold answer is visible) so the assertions don't race the
-        // memory↔storage convergence in `load_session_merged`.
+        // Observe the detached successor's accepted answer, as in the sibling
+        // test, before checking that no separate Gold continuation was added.
         let after = timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(session) =

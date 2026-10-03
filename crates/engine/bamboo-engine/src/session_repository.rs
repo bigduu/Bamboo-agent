@@ -21,6 +21,13 @@ use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
 
+#[path = "session_repository_root_inbox.rs"]
+mod root_inbox;
+
+#[path = "session_repository_parent_outcome.rs"]
+mod parent_outcome;
+pub use parent_outcome::{ParentOutcomeRoute, ParentOutcomeWriter};
+
 #[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
@@ -34,8 +41,10 @@ pub struct SessionRepository {
     root_actor_directory: Option<Arc<dyn bamboo_domain::ActorDirectoryPort>>,
     root_actor_owner: Option<(
         Arc<dyn bamboo_domain::ActorDirectoryPort>,
-        bamboo_domain::RootActorRuntimeWrite,
+        Arc<bamboo_domain::RootActorRuntimeWrite>,
     )>,
+    root_actor_writers:
+        Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     #[cfg(test)]
     post_durable_hook: Option<PostDurableHook>,
 }
@@ -52,6 +61,7 @@ impl SessionRepository {
             persistence,
             root_actor_directory: None,
             root_actor_owner: None,
+            root_actor_writers: Arc::new(Default::default()),
             #[cfg(test)]
             post_durable_hook: None,
         }
@@ -110,24 +120,13 @@ impl SessionRepository {
             fence: claimed.fence(),
             created_at: durable.created_at,
         };
-        let host_cache = self.cache.clone();
-        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
-            host_cache.insert(
-                saved.id.clone(),
-                Arc::new(crate::SessionSnapshot::new(saved.clone())),
-            );
-        });
-        let bound_store = self
-            .persistence
-            .bind_root_actor_writer(owner.clone(), publisher)?;
-        // Deferred repository callbacks can only update this execution-private
-        // cache. The shared Host cache is published inside V2's physical guard.
-        let mut bound = Self::new(
-            Arc::new(Default::default()),
-            self.storage.clone(),
-            Arc::new(bound_store),
-        );
-        bound.root_actor_owner = Some((directory.clone(), owner.clone()));
+        let bound = self.bind_root_response_writer(owner.clone())?;
+        let live_owner = bound
+            .root_actor_owner
+            .as_ref()
+            .expect("bound Root owner")
+            .1
+            .clone();
         let abandon_directory = directory.clone();
         let abandon_fence = owner.fence.clone();
         let binding = bamboo_domain::RootActorExecutionBinding::new(
@@ -153,7 +152,42 @@ impl SessionRepository {
             .start_activation(&binding.owner.fence, chrono::Utc::now())
             .await
             .map_err(root_actor_binding_error)?;
+        // Keep only a weak route to this exact execution's capability. Host
+        // parent-outcome adapters never reconstruct an owner from observation.
+        self.root_actor_writers
+            .insert(session.id.clone(), Arc::downgrade(&live_owner));
         Ok(Some(binding))
+    }
+
+    /// Build a response coordinator from the exact reserved execution's
+    /// capability. This does not claim or observe a different Actor owner.
+    pub(crate) fn bind_root_response_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+    ) -> std::io::Result<Self> {
+        let directory = self.root_actor_directory.clone().ok_or_else(|| {
+            root_actor_binding_error("Root response requires its Host Actor directory")
+        })?;
+        let host_cache = self.cache.clone();
+        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
+            host_cache.insert(
+                saved.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+            );
+        });
+        let bound_store = self
+            .persistence
+            .bind_root_actor_writer(owner.clone(), publisher)?;
+        // Deferred repository callbacks can only update this execution-private
+        // cache. The shared Host cache is published inside V2's physical guard.
+        let mut bound = Self::new(
+            Arc::new(Default::default()),
+            self.storage.clone(),
+            Arc::new(bound_store),
+        );
+        bound.root_actor_owner = Some((directory.clone(), Arc::new(owner)));
+        bound.root_actor_writers = self.root_actor_writers.clone();
+        Ok(bound)
     }
 
     /// Enable durable ordinary Root execution ownership in a Host whose
@@ -514,6 +548,12 @@ fn root_authority_storage_preference(
 /// refresh) instead of a bespoke adapter.
 #[async_trait::async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
+    fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.root_actor_owner
+            .as_ref()
+            .map(|(_, owner)| (**owner).clone())
+    }
+
     fn root_actor_execution_required(&self, session: &Session) -> bool {
         self.root_actor_directory.is_some()
             && session.kind == bamboo_domain::SessionKind::Root
@@ -771,6 +811,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                     );
                 }
             })
+            .await
+    }
+
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
+        self.admit_owned_root_inbox(session, inbox, active_run_id)
             .await
     }
 

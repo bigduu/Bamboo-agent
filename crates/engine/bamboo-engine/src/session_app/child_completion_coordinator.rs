@@ -1697,13 +1697,29 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                 // Busy must reach the router before it commits a launched
                 // generation. Its existing recovery backoff can then retry the
                 // durable input when the old Host's actual lease expires.
-                if self.agent.persistence().root_actor_execution_required(&session) && self.root_account_sink.is_none() {
-                    execution_reservation.rollback_unpublished_activation().await;
-                    return Err(bamboo_domain::SessionActivationError::Internal("Root activation has no actual account sink".into()));
+                if self
+                    .agent
+                    .persistence()
+                    .root_actor_execution_required(&session)
+                    && self.root_account_sink.is_none()
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(
+                        "Root activation has no actual account sink".into(),
+                    ));
                 }
-                if let Err(error) = execution_reservation.bind_root_actor(&self.agent, &session).await {
-                    execution_reservation.rollback_unpublished_activation().await;
-                    return Err(bamboo_domain::SessionActivationError::Internal(format!("Root Actor reservation rejected: {error}")));
+                if let Err(error) = execution_reservation
+                    .bind_root_actor(&self.agent, &session)
+                    .await
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!(
+                        "Root Actor reservation rejected: {error}"
+                    )));
                 }
                 // Launch and rollback share one exact RAII reservation. Dropping
                 // an unlaunched SessionActivationLaunch cannot race a raw slot
@@ -1729,8 +1745,10 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // this closure, so only now may the prepared snapshot
                         // replace the shared cache entry.
                         if execution_reservation.root_actor_writer().is_none() {
-                            launch_sessions.insert(launch_session_id,
-                                Arc::new(crate::SessionSnapshot::new(launch_session)));
+                            launch_sessions.insert(
+                                launch_session_id,
+                                Arc::new(crate::SessionSnapshot::new(launch_session)),
+                            );
                         }
                         let request = ResumeSpawnRequest {
                             session_id: request_session_id,

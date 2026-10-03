@@ -8,6 +8,187 @@ use bamboo_engine::session_app::chat::{
 };
 
 #[actix_web::test]
+async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
+    use actix_web::{test, web};
+    use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::AppState::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let request = || {
+        serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+            "session_id": "owned-chat-image", "message": "first", "model": "test-model",
+        }))
+        .unwrap()
+    };
+    let first = super::handler(
+        state.clone(),
+        test::TestRequest::post().to_http_request(),
+        web::Json(request()),
+    )
+    .await;
+    assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    let mut session = state
+        .storage
+        .load_session("owned-chat-image")
+        .await
+        .unwrap()
+        .unwrap();
+    session.set_last_run_status("error");
+    session.set_last_run_error("previous execution");
+    state.save_and_cache_session(&mut session).await;
+    let metadata = session.metadata.clone();
+    let before_messages = session.messages.clone();
+    let sender = state.get_session_event_sender(&session.id).await;
+    let mut reservation = match reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        &session.id,
+        &sender,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        SessionExecutionReserveOutcome::AlreadyRunning { .. } => {
+            panic!("fixture must reserve its Root")
+        }
+    };
+    reservation
+        .bind_root_actor(&state.agent, &session)
+        .await
+        .unwrap();
+    let image_request = || {
+        serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "session_id": session.id, "message": "second with image", "model": "test-model",
+        "images": [{"base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8aUAAAAASUVORK5CYII=", "type":"image/png"}],
+    })).unwrap()
+    };
+    for _ in 0..2 {
+        let response = super::handler(
+            state.clone(),
+            test::TestRequest::post()
+                .insert_header(("Idempotency-Key", "owned-image-turn"))
+                .to_http_request(),
+            web::Json(image_request()),
+        )
+        .await;
+        let status = response.status();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let queued = state
+        .storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&queued.messages).unwrap(),
+        serde_json::to_value(&before_messages).unwrap(),
+        "ingress must not rewrite protected Main"
+    );
+    for key in [
+        "last_run_status",
+        "last_run_error",
+        "execute.pending_turn_message_id",
+        "execute.startup_handoff_at",
+    ] {
+        assert_eq!(
+            queued.metadata.get(key),
+            metadata.get(key),
+            "queued input must preserve {key}"
+        );
+    }
+    assert_eq!(queued.last_run_status().as_deref(), Some("error"));
+    assert_eq!(
+        queued.last_run_error().as_deref(),
+        Some("previous execution")
+    );
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&session.id)
+            .await
+            .unwrap()
+            .pending,
+        1
+    );
+    let persistence = reservation
+        .execution_persistence()
+        .expect("actual Root writer");
+    let mut consumed = queued;
+    let admission = persistence
+        .admit_root_inbox(
+            &mut consumed,
+            state.session_inbox.clone(),
+            Some(reservation.run_id()),
+        )
+        .await
+        .unwrap()
+        .expect("owned Root consumer");
+    assert!(admission.admission_error.is_none());
+    assert_eq!(admission.merged, 1);
+    let message = admission.committed_messages.first().unwrap();
+    assert_eq!(message.content, "second with image");
+    let parts = message
+        .content_parts
+        .as_ref()
+        .expect("multimodal typed input");
+    assert_eq!(parts.len(), 2);
+    assert!(
+        matches!(&parts[0], bamboo_domain::MessagePart::Text { text } if text == "second with image")
+    );
+    assert!(
+        matches!(&parts[1], bamboo_domain::MessagePart::ImageUrl { image_url } if image_url.url.starts_with("bamboo-attachment://owned-chat-image/"))
+    );
+    let id = bamboo_domain::SessionMessageId::parse(&message.id).unwrap();
+    assert!(consumed.session_inbox_admission().unwrap().contains(&id));
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&session.id)
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
+    let durable = state
+        .storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable
+            .messages
+            .iter()
+            .filter(|m| m.id == message.id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::to_value(
+            &bamboo_engine::read_cached_session(&state.sessions, &session.id)
+                .unwrap()
+                .messages
+        )
+        .unwrap(),
+        serde_json::to_value(&durable.messages).unwrap()
+    );
+    reservation.abandon().await;
+}
+
+#[actix_web::test]
 async fn typed_workflow_candidate_is_pinned_exactly_and_stale_revision_fails_closed() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());

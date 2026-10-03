@@ -22,6 +22,13 @@ use bamboo_engine::session_app::repository::SessionAccess;
 // defined once there, not duplicated here.
 #[async_trait::async_trait]
 impl SessionAccess for AppState {
+    fn bind_response_writer(
+        &self,
+        owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    ) -> Result<Option<Arc<dyn SessionAccess>>, SessionSaveError> {
+        self.session_repo.bind_response_writer(owner)
+    }
+
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {
         SessionAccess::load_session(&self.session_repo, id).await
     }

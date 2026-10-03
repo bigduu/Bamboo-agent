@@ -64,7 +64,7 @@ pub struct SessionExecutionReservation {
     cancel_token: CancellationToken,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
-    root_actor: Option<RootActorExecution>,
+    root_actor: Option<Box<RootActorExecution>>,
     armed: bool,
 }
 
@@ -100,7 +100,7 @@ impl SessionExecutionReservation {
                 .bind_root_actor_execution(session, &self.run_id)
                 .await?
             {
-                self.root_actor = Some(RootActorExecution::start(binding));
+                self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
             }
         }
         Ok(())
@@ -118,11 +118,28 @@ impl SessionExecutionReservation {
             .map(|owner| owner.binding.owner.clone())
     }
 
+    /// Response frames travel with the exact reserved Root until its detached
+    /// adapter can publish them through the existing fenced event forwarder.
+    pub fn queue_root_response_event(&mut self, event: AgentEvent) -> Option<AgentEvent> {
+        let Some(owner) = self.root_actor.as_mut() else {
+            return Some(event);
+        };
+        owner.response_events.push(event);
+        None
+    }
+
+    pub fn take_root_response_events(&mut self) -> Vec<AgentEvent> {
+        self.root_actor
+            .as_mut()
+            .map(|owner| std::mem::take(&mut owner.response_events))
+            .unwrap_or_default()
+    }
+
     /// Finish a valid adapter-owned pause only after its actual history
     /// publication barrier. Abandonment remains the rejected-startup fallback.
     pub async fn finish_root_actor(&mut self, outcome: bamboo_domain::ActorActivationFinish) {
         if let Some(owner) = self.root_actor.take() {
-            owner.finish(outcome).await;
+            (*owner).finish(outcome).await;
         }
     }
 
@@ -246,7 +263,7 @@ impl SessionExecutionReservation {
         self.armed = false;
         self.cancel_token.cancel();
         if let Some(owner) = self.root_actor.take() {
-            owner
+            (*owner)
                 .finish(bamboo_domain::ActorActivationFinish::Cancelled)
                 .await;
         }
@@ -818,7 +835,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 execution_reservation.abandon().await;
                 return;
             }
-            let mut root_actor = execution_reservation.root_actor.take();
+            let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
             let root_actor_bound = root_actor.is_some();
             let agent = root_actor.as_ref().map_or(agent.clone(), |owner| {
                 Arc::new(agent.with_execution_persistence(owner.persistence()))
@@ -1257,6 +1274,7 @@ pub(super) struct RootActorExecution {
     binding: bamboo_domain::RootActorExecutionBinding,
     stop_renewal: CancellationToken,
     renewal: Option<tokio::task::JoinHandle<()>>,
+    response_events: Vec<AgentEvent>,
 }
 
 impl RootActorExecution {
@@ -1291,6 +1309,7 @@ impl RootActorExecution {
             binding,
             stop_renewal,
             renewal: Some(renewal),
+            response_events: Vec::new(),
         }
     }
 

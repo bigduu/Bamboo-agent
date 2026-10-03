@@ -632,8 +632,30 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
+        self.save_session_rebasing_task_conflicts_with_input(session, None)
+            .await
+    }
+
+    async fn save_session_rebasing_task_conflicts_with_input(
+        &self,
+        session: &mut Session,
+        input: Option<&(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+    ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.save_runtime_snapshot(session, false).await {
+            let result = if let Some((inbox, claim)) = input {
+                let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+                    std::io::Error::other("Root input checkpoint requires a bound writer")
+                })?;
+                self.storage
+                    .save_root_actor_input(owner, session, inbox.clone(), claim, publish.clone())
+                    .await
+            } else {
+                self.save_runtime_snapshot(session, false).await
+            };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -1118,6 +1140,32 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        self.checkpoint_runtime_session_with_input(session, None, publish)
+            .await
+    }
+
+    pub async fn checkpoint_root_input(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+    ) -> std::io::Result<()> {
+        self.checkpoint_runtime_session_with_input(session, Some((inbox, claim.clone())), |_, _| {})
+            .await
+    }
+
+    async fn checkpoint_runtime_session_with_input<F>(
+        &self,
+        session: &mut Session,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
@@ -1142,7 +1190,9 @@ impl LockedSessionStore {
             let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
-        let mut result = self.save_session_rebasing_task_conflicts(session).await;
+        let mut result = self
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+            .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
                 .as_ref()
@@ -1165,7 +1215,9 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &durable);
             adopt_fresher_disk_permission_posture(session, &durable);
             let _ = adopt_durable_tagged_child_wait(session, &durable);
-            result = self.save_session_rebasing_task_conflicts(session).await;
+            result = self
+                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+                .await;
         }
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());

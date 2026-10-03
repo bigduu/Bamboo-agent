@@ -94,6 +94,9 @@ mod compact_main;
 mod compact_main_tests;
 mod default_actor_context;
 mod host_registry;
+mod root_actor_input;
+#[cfg(test)]
+mod root_actor_input_tests;
 mod root_actor_runtime;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -106,6 +109,7 @@ mod startup_sidecar_tests;
 #[cfg(test)]
 mod task_publication_lifetime_tests;
 use default_actor_context::DefaultWriterGuards;
+pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -6122,6 +6126,27 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    fn bind_root_actor_inbox(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    ) -> io::Result<Arc<dyn bamboo_domain::SessionInboxPort>> {
+        let inbox = self.bound_root_inbox(owner, &inbox)?;
+        Ok(Arc::new(inbox))
+    }
+
+    async fn save_root_actor_input(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_input_impl(owner, session, inbox, claim, publish)
+            .await
+    }
+
     fn supports_root_actor_runtime_write(&self) -> bool {
         true
     }

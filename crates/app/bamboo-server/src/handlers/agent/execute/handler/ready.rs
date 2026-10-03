@@ -157,7 +157,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     {
         execution_reservation.abandon().await;
         return HttpResponse::Conflict().json(serde_json::json!({
-            "status": "rejected", "session_id": session_id, "error": error.to_string()
+            "status": "rejected", "session_id": session_id,
+            "error": crate::error::error_value(error.to_string())
         }));
     }
     let execution_persistence = execution_reservation.execution_persistence();
