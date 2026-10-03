@@ -169,6 +169,22 @@ impl SessionStoreV2 {
     where
         F: FnOnce(&Session) + Send,
     {
+        self.answer_parent_question_with_root_writer(question, text, None, publish)
+            .await
+    }
+
+    /// A runtime answer retains its original Root capability through the
+    /// existing Child answer transaction and every final filesystem replace.
+    pub async fn answer_parent_question_with_root_writer<F>(
+        &self,
+        question: &ParentQuestion,
+        text: &str,
+        root_owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+        publish: F,
+    ) -> io::Result<Option<(Session, bool)>>
+    where
+        F: FnOnce(&Session) + Send,
+    {
         if question.validate_answer(text).is_err()
             || validate_session_id(&question.child.session_id).is_err()
             || validate_session_id(&question.parent.session_id).is_err()
@@ -178,10 +194,39 @@ impl SessionStoreV2 {
         let started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
+        // Root -> Child is fixed acquisition order. Retain both physical
+        // Session guards even on replay/cache-only publication and cancellation.
+        let root_guard = if root_owner.is_some() {
+            Some(
+                self.acquire_session_write_lock(&question.parent.session_id, SaveKind::Full)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let writer = self
             .acquire_session_write_lock(&question.child.session_id, SaveKind::Full)
             .await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, task, writer);
+        let origin = if let Some(owner) = root_owner {
+            if owner.fence.actor_id != question.parent.session_id
+                || owner.created_at != question.parent.created_at
+            {
+                return Err(root_actor_runtime::conflict(
+                    "Parent answer Root execution target changed",
+                ));
+            }
+            let proof = root_actor_runtime::RootActorWriteProof::new(
+                self.sessions_dir.join(&question.parent.session_id),
+                owner.clone(),
+            );
+            proof.validate()?;
+            Some(proof)
+        } else {
+            None
+        };
+        let guards = DefaultWriterGuards::shared_with_root_origin(
+            lifecycle, task, writer, root_guard, origin,
+        );
         let Some(parent) = self
             .load_session_unlocked(&question.parent.session_id)
             .await?
@@ -205,6 +250,9 @@ impl SessionStoreV2 {
         if let Some(terminal) = ParentQuestionResolution::from_child(&parent, &child, &question.id)
         {
             if terminal.request == *question {
+                if let Some(proof) = &guards.root_origin {
+                    proof.validate()?;
+                }
                 publish(&child);
                 return Ok(Some((child, false)));
             }
@@ -235,6 +283,9 @@ impl SessionStoreV2 {
         );
         self.save_session_after_lock(&child, started, &guards, Some(question))
             .await?;
+        if let Some(proof) = &guards.root_origin {
+            proof.validate()?;
+        }
         publish(&child);
         Ok(Some((child, true)))
     }
@@ -244,6 +295,135 @@ impl SessionStoreV2 {
 mod tests {
     use super::*;
     use bamboo_domain::{FunctionCall, ParentQuestionResolution, PendingQuestion, ToolCall};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_root_answer_cannot_publish_child_winner_at_final_main_replace() {
+        use super::super::default_actor_context_tests::DefaultWriteHook;
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort, RootActorRuntimeWrite};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Release(Arc<DefaultWriteHook>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let mut parent = Session::new("origin-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child = Session::new_child_of("origin-child", &parent, "model", "Child");
+        child.add_message(Message::user("assignment"));
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        let observed = observation(&child.messages, PendingQuestionSource::AgenticClarification);
+        let (before, question) = store
+            .checkpoint_parent_question(&child, &parent, &observed)
+            .await
+            .unwrap()
+            .unwrap();
+        parent.add_message(question.envelope().to_provider_message().unwrap());
+        store.save_session(&parent).await.unwrap();
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(2);
+        let claim = store
+            .claim_activation(&ActorActivationClaim {
+                actor_id: parent.id.clone(),
+                run_id: "answer-a".into(),
+                lease_owner: "host-a".into(),
+                lease_expires_at: deadline,
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .unwrap();
+        store
+            .start_activation(&claim.fence(), Utc::now())
+            .await
+            .unwrap();
+        let owner = RootActorRuntimeWrite {
+            fence: claim.fence(),
+            created_at: parent.created_at,
+        };
+        let child_path = store
+            .sessions_dir
+            .join(&parent.id)
+            .join("children")
+            .join(&child.id)
+            .join("session.json");
+        let bytes = std::fs::read(&child_path).unwrap();
+        let hook = DefaultWriteHook::install(
+            &store,
+            "session.json",
+            DurableWritePhase::BeforeReplace,
+            false,
+        );
+        let _release = Release(hook.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let published = calls.clone();
+        let active = store.clone();
+        let request = question.clone();
+        let job = tokio::spawn(async move {
+            active
+                .answer_parent_question_with_root_writer(&request, "A", Some(&owner), move |_| {
+                    published.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+        });
+        hook.wait();
+        while Utc::now() <= deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hook.release();
+        assert!(tokio::time::timeout(Duration::from_secs(10), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert_eq!(std::fs::read(&child_path).unwrap(), bytes);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let cold = store.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&cold.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+        assert_eq!(
+            ParentQuestionResolution::from_child(&parent, &cold, &question.id),
+            None
+        );
+        let other = SessionStoreV2::new(temp.path().into()).await.unwrap();
+        let now = Utc::now();
+        let successor = other
+            .claim_activation(&ActorActivationClaim {
+                actor_id: parent.id.clone(),
+                run_id: "answer-b".into(),
+                lease_owner: "host-b".into(),
+                lease_expires_at: now + chrono::Duration::seconds(30),
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .unwrap();
+        assert!(successor.lease_epoch > claim.lease_epoch);
+        other
+            .start_activation(&successor.fence(), Utc::now())
+            .await
+            .unwrap();
+        let owner = RootActorRuntimeWrite {
+            fence: successor.fence(),
+            created_at: parent.created_at,
+        };
+        let (saved, wrote) = other
+            .answer_parent_question_with_root_writer(&question, "B", Some(&owner), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(saved.messages.last().unwrap().content, "B");
+        assert!(ParentQuestionResolution::from_child(&parent, &saved, &question.id).is_some());
+    }
 
     fn observation(
         prefix: &[Message],

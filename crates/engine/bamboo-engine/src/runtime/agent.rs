@@ -53,6 +53,17 @@ impl Agent {
         Agent { runtime }
     }
 
+    /// One execution's immutable persistence capability. Shared tool/provider
+    /// resources remain on the existing runtime; default callers stay unbound.
+    pub(crate) fn with_execution_persistence(
+        &self,
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.persistence = persistence;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Return a new builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()

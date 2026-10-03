@@ -18,9 +18,8 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
-    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
-    reserve_session_execution, spawn_session_execution, SessionExecutionArgs,
-    SessionExecutionReserveOutcome,
+    create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
+    spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
@@ -109,6 +108,7 @@ pub struct ConnectContext {
     pub agent_runners: Arc<TokioRwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<TokioRwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    pub root_account_sink: Option<Arc<bamboo_engine::events::AccountEventSink>>,
     pub app_data_dir: Option<PathBuf>,
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub provider_registry: Arc<ProviderRegistry>,
@@ -124,6 +124,35 @@ pub struct ConnectContext {
     /// call is checked against on resume (issue #458; see
     /// `approvals::EngineResponder`).
     pub permission_checker: Arc<dyn bamboo_tools::permission::PermissionChecker>,
+}
+
+impl ConnectContext {
+    pub(super) async fn bind_root_execution(
+        &self,
+        reservation: &mut bamboo_engine::execution::SessionExecutionReservation,
+        session: &Session,
+    ) -> std::io::Result<Option<bamboo_engine::events::RootActorEventPublication>> {
+        if self
+            .agent
+            .persistence()
+            .root_actor_execution_required(session)
+            && self.root_account_sink.is_none()
+        {
+            return Err(std::io::Error::other(
+                "Root Connect execution requires its Host account sink",
+            ));
+        }
+        reservation.bind_root_actor(&self.agent, session).await?;
+        Ok(reservation.root_actor_writer().map(|owner| {
+            bamboo_engine::events::RootActorEventPublication::new(
+                self.session_repo.storage().clone(),
+                self.root_account_sink
+                    .clone()
+                    .expect("required Root sink checked before binding"),
+                owner,
+            )
+        }))
+    }
 }
 
 /// Per-chat runtime state: whether a run is currently executing, the FIFO
@@ -811,6 +840,14 @@ impl ConnectBridge {
                 .unwrap_or_default(),
             &self.ctx.workspace_resolver,
         );
+        // Root activation validates durable birth before owning the first User
+        // turn. Publish the inert identity before registering its chat mapping.
+        let mut session = session;
+        self.ctx
+            .session_repo
+            .save(&mut session)
+            .await
+            .map_err(|error| format!("Unable to persist the new Connect session: {error}"))?;
         self.set_session_id_for_key(key, &session.id).await;
         Ok(session)
     }
@@ -868,7 +905,7 @@ impl ConnectBridge {
         let session_id = session.id.clone();
         let session_tx =
             get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
-        let execution_reservation = match reserve_session_execution(
+        let mut execution_reservation = match reserve_session_execution(
             &self.ctx.agent,
             &self.ctx.agent_runners,
             &self.ctx.session_event_senders,
@@ -889,6 +926,23 @@ impl ConnectBridge {
             }
         };
         let rx = session_tx.subscribe();
+        let root_publication = match self
+            .ctx
+            .bind_root_execution(&mut execution_reservation, &session)
+            .await
+        {
+            Ok(publication) => publication,
+            Err(error) => {
+                execution_reservation.abandon().await;
+                reply_text(
+                    &platform,
+                    reply_ctx,
+                    &format!("Unable to start this session: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
 
         // Only the exact shared runner/router owner may publish a new prompt or
         // mutate process-global permission workspace state.
@@ -902,18 +956,32 @@ impl ConnectBridge {
                 return;
             }
         }
-        self.ctx.session_repo.save_and_cache(&mut session).await;
+        if let Some(persistence) = execution_reservation.execution_persistence() {
+            if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                execution_reservation.abandon().await;
+                reply_text(
+                    &platform,
+                    reply_ctx,
+                    &format!("Unable to persist this turn: {error}"),
+                )
+                .await;
+                return;
+            }
+        } else {
+            self.ctx.session_repo.save_and_cache(&mut session).await;
+        }
 
         self.set_cancel_token(key, execution_reservation.cancel_token().clone())
             .await;
 
         let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
-            create_event_forwarder_with_history_commit_barrier(
+            create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
                 session_tx.clone(),
                 self.ctx.agent_runners.clone(),
                 self.ctx.account_feed_inbox.clone(),
+                root_publication,
             );
 
         // Auxiliary (fast/background/summarization) model resolver — mirrors
@@ -1535,6 +1603,7 @@ mod tests {
             agent_runners: state.agent_runners.clone(),
             session_event_senders: state.session_event_senders.clone(),
             account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
             app_data_dir: Some(state.app_data_dir.clone()),
             config: state.config.clone(),
             provider_registry: state.provider_registry.clone(),

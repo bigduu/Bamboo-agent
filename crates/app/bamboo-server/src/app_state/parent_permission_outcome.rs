@@ -278,6 +278,11 @@ async fn commit_mode(
     mode: CommitMode,
 ) -> Result<(State, bool), ()> {
     let typed = ParentRequest::from_forced_permission_envelope(request).ok_or(())?;
+    let writer = sessions
+        .bind_parent_outcome_writer(&request.target_session_id)
+        .await
+        .map_err(|_| ())?;
+    let sessions = writer.repository();
     let wrote = AtomicBool::new(false);
     let result = sessions
         .persistence()
@@ -326,5 +331,6 @@ async fn commit_mode(
         .map_err(|_| ())?
         .map_err(|_| ())?
         .ok_or(())?;
+    writer.finish().await.map_err(|_| ())?;
     Ok((state(&result, request)?, wrote.load(Ordering::Relaxed)))
 }

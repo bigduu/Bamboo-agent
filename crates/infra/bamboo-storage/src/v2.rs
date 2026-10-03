@@ -94,6 +94,10 @@ mod compact_main;
 mod compact_main_tests;
 mod default_actor_context;
 mod host_registry;
+mod root_actor_input;
+#[cfg(test)]
+mod root_actor_input_tests;
+mod root_actor_runtime;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
@@ -105,6 +109,7 @@ mod startup_sidecar_tests;
 #[cfg(test)]
 mod task_publication_lifetime_tests;
 use default_actor_context::DefaultWriterGuards;
+pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -5725,6 +5730,219 @@ impl SessionStoreV2 {
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
+    async fn save_runtime_state_with_owner(
+        &self,
+        session: &Session,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+        publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
+    ) -> io::Result<()> {
+        // Fast path: write ONLY the small runtime sidecar (no messages), leaving
+        // session.json — which carries the full conversation history — untouched.
+        // Legacy sessions retain O(1) I/O in conversation length. Initialized
+        // Actor protection compares actual durable context, including main birth.
+        validate_session_id(&session.id)?;
+        let mut rel = self.resolve_rel_path(&session.id).await;
+        if rel.is_none() && session.kind == SessionKind::Root {
+            // The index is only a hint. Another Store may have created this
+            // Root since our index loaded. Keep the existing Root on the
+            // runtime path so a context update cannot overwrite its history.
+            // Either canonical file is enough to select this path, never to
+            // authorize it: the final guard requires the complete valid pair.
+            let directory = self.sessions_dir.join(&session.id);
+            for file in ["session.json", RUNTIME_SIDECAR_FILE] {
+                match fs::symlink_metadata(directory.join(file)).await {
+                    Ok(_) => {
+                        rel = Some(Self::root_rel_path(&session.id));
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let Some(rel) = rel else {
+            // Session was never fully persisted yet — fall back to a full save so
+            // session.json and the index get created. Deliberately acquire no
+            // shared Task guard before this call: `save_session` owns that
+            // boundary, avoiding a same-instance shared-lock re-entry.
+            if owner.is_some() {
+                return Err(root_actor_runtime::conflict(
+                    "Root runtime source is missing",
+                ));
+            }
+            return self.save_session(session).await;
+        };
+        let total_started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Runtime)
+            .await?;
+        let guards = DefaultWriterGuards::shared_with_root_actor(
+            lifecycle,
+            runtime_task,
+            session_write,
+            owner.map(|owner| {
+                root_actor_runtime::RootActorWriteProof::new(
+                    self.sessions_dir.join(&session.id),
+                    owner.clone(),
+                )
+            }),
+        );
+        self.check_default_or_root_actor_context(
+            session,
+            &self.abs_path_from_rel(&rel),
+            false,
+            &guards,
+        )
+        .await?;
+        self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_save(session).await?;
+        self.validate_child_project_for_write(session, false, Some(&rel))
+            .await?;
+        self.reject_regressing_runtime_task(session).await?;
+        if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
+            let index_bytes = fs::read(&self.index_path).await?;
+            let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
+                .map_err(|error| other_io_error(format!("invalid sessions index: {error}")))?;
+            let globally_indexed = global_index.sessions.get(&session.id).is_some_and(|entry| {
+                entry.kind == SessionKind::Root
+                    && entry.root_session_id == session.id
+                    && entry.rel_path == Self::root_rel_path(&session.id)
+            });
+            if !globally_indexed {
+                // A cold, indexless Root may be damaged. Check its complete pair
+                // before publishing even a runtime checkpoint. The established
+                // indexed path remains bounded independently of transcript size.
+                self.load_authoritative_root_session(&session.id)
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(format!(
+                                "Root canonical index recovery unavailable: {error}"
+                            )),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(
+                                "Root canonical index recovery is missing".into(),
+                            ),
+                        )
+                    })?;
+            }
+        }
+        let abs_dir = self.abs_path_from_rel(&rel);
+        let mut stages = SaveStageDurations::default();
+        let serialization_started = Instant::now();
+        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        stages.serialization = serialization_started.elapsed();
+        let serialized_bytes = runtime_bytes.len();
+        let root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
+        guards.hold_tree(tree);
+        let tree_projection_changed = read_actor_tree_session_projection(&abs_dir, session)
+            .await
+            .as_ref()
+            != Some(&actor_tree_session_projection(session));
+        if tree_projection_changed {
+            let root = if session.kind == SessionKind::Root {
+                Some(session.clone())
+            } else {
+                self.actor_tree_root_for_child_write(root_id).await?
+            };
+            if let Some(root) = root.as_ref() {
+                self.bump_actor_tree_revision(root).await?;
+            }
+        }
+        let filesystem_started = Instant::now();
+        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
+            .await?;
+        stages.filesystem_commit = filesystem_started.elapsed();
+
+        // Workspace and Project ownership are part of the list/index API
+        // contract. Runtime updates must therefore be reflected without waiting
+        // for a later full session save. Avoid rewriting the global index when
+        // neither normalized value changed.
+        let workspace_path = session
+            .workspace_path_meta()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let project_id = normalized_project_id(session);
+        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
+            entry.workspace_path != workspace_path || entry.project_id != project_id
+        });
+        if runtime_index_changed {
+            let index_started = Instant::now();
+            let index_updated = self
+                .update_index(|index| {
+                    if let Some(entry) = index.sessions.get_mut(&session.id) {
+                        entry.workspace_path = workspace_path;
+                        entry.project_id = project_id;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })
+                .await?;
+            if !index_updated && session.kind == SessionKind::Root {
+                // Exceptional recovery of a globally missing index entry must
+                // preserve the real history count, not the caller's snapshot.
+                // This index recovery reads main too. Legacy runtime saves
+                // without Actor authority retain the transcript-independent path.
+                let authoritative = self
+                    .load_authoritative_root_session(&session.id)
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            bamboo_domain::SessionAuthorityConflict(format!(
+                                "Root canonical index recovery unavailable: {error}"
+                            )),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        other_io_error("runtime Root disappeared during index repair")
+                    })?;
+                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
+                    .await?;
+            }
+            stages.index_publication = index_started.elapsed();
+        }
+        let index_entry_count = self.index.read().await.sessions.len();
+        let total = total_started.elapsed();
+        self.persistence_metrics.record_save(
+            SaveKind::Runtime,
+            total,
+            stages,
+            serialized_bytes,
+            session.messages.len(),
+            index_entry_count,
+        );
+        tracing::debug!(
+            target: "bamboo.session_persistence",
+            session_id = %session.id,
+            save_type = "runtime",
+            phase = "durable_commit",
+            serialized_bytes,
+            message_count = session.messages.len(),
+            index_entry_count,
+            total_ms = total.as_millis() as u64,
+            "session runtime-state commit completed"
+        );
+        if let Some(publish) = publish {
+            self.publish_root_actor_runtime(&guards, publish).await?;
+        }
+        Ok(())
+    }
+
     async fn save_session_after_lock(
         &self,
         session: &Session,
@@ -5733,8 +5951,13 @@ impl SessionStoreV2 {
         answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
         let intended_rel = Self::default_writer_rel_path(session)?;
-        self.check_default_actor_context(session, &self.abs_path_from_rel(&intended_rel), true)
-            .await?;
+        self.check_default_or_root_actor_context(
+            session,
+            &self.abs_path_from_rel(&intended_rel),
+            true,
+            guards,
+        )
+        .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_full_save(session).await?;
         self.validate_child_project_for_write(session, true, None)
@@ -5903,6 +6126,51 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    fn bind_root_actor_inbox(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    ) -> io::Result<Arc<dyn bamboo_domain::SessionInboxPort>> {
+        let inbox = self.bound_root_inbox(owner, &inbox)?;
+        Ok(Arc::new(inbox))
+    }
+
+    async fn save_root_actor_input(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_input_impl(owner, session, inbox, claim, publish)
+            .await
+    }
+
+    fn supports_root_actor_runtime_write(&self) -> bool {
+        true
+    }
+
+    async fn publish_root_actor_runtime_event(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        publish: bamboo_domain::storage::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        self.publish_root_actor_runtime_event_impl(owner, publish)
+            .await
+    }
+
+    async fn save_root_actor_runtime(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &Session,
+        runtime_only: bool,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_runtime_impl(owner, session, runtime_only, publish)
+            .await
+    }
+
     async fn root_mode_operation(
         &self,
         request: &RootModeOperationRequest,
@@ -6081,188 +6349,8 @@ impl Storage for SessionStoreV2 {
     }
 
     async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
-        // Fast path: write ONLY the small runtime sidecar (no messages), leaving
-        // session.json — which carries the full conversation history — untouched.
-        // Legacy sessions retain O(1) I/O in conversation length. Initialized
-        // Actor protection compares actual durable context, including main birth.
-        validate_session_id(&session.id)?;
-        let mut rel = self.resolve_rel_path(&session.id).await;
-        if rel.is_none() && session.kind == SessionKind::Root {
-            // The index is only a hint. Another Store may have created this
-            // Root since our index loaded. Keep the existing Root on the
-            // runtime path so a context update cannot overwrite its history.
-            // Either canonical file is enough to select this path, never to
-            // authorize it: the final guard requires the complete valid pair.
-            let directory = self.sessions_dir.join(&session.id);
-            for file in ["session.json", RUNTIME_SIDECAR_FILE] {
-                match fs::symlink_metadata(directory.join(file)).await {
-                    Ok(_) => {
-                        rel = Some(Self::root_rel_path(&session.id));
-                        break;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        let Some(rel) = rel else {
-            // Session was never fully persisted yet — fall back to a full save so
-            // session.json and the index get created. Deliberately acquire no
-            // shared Task guard before this call: `save_session` owns that
-            // boundary, avoiding a same-instance shared-lock re-entry.
-            return self.save_session(session).await;
-        };
-        let total_started = Instant::now();
-        let lifecycle = self.lock_default_writer_lifecycle().await?;
-        let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let session_write = self
-            .acquire_session_write_lock(&session.id, SaveKind::Runtime)
-            .await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
-        self.check_default_actor_context(session, &self.abs_path_from_rel(&rel), false)
-            .await?;
-        self.validate_authority_for_save(session).await?;
-        self.validate_root_context_for_save(session).await?;
-        self.validate_child_project_for_write(session, false, Some(&rel))
-            .await?;
-        self.reject_regressing_runtime_task(session).await?;
-        if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
-            let index_bytes = fs::read(&self.index_path).await?;
-            let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
-                .map_err(|error| other_io_error(format!("invalid sessions index: {error}")))?;
-            let globally_indexed = global_index.sessions.get(&session.id).is_some_and(|entry| {
-                entry.kind == SessionKind::Root
-                    && entry.root_session_id == session.id
-                    && entry.rel_path == Self::root_rel_path(&session.id)
-            });
-            if !globally_indexed {
-                // A cold, indexless Root may be damaged. Check its complete pair
-                // before publishing even a runtime checkpoint. The established
-                // indexed path remains bounded independently of transcript size.
-                self.load_authoritative_root_session(&session.id)
-                    .await
-                    .map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            bamboo_domain::SessionAuthorityConflict(format!(
-                                "Root canonical index recovery unavailable: {error}"
-                            )),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            bamboo_domain::SessionAuthorityConflict(
-                                "Root canonical index recovery is missing".into(),
-                            ),
-                        )
-                    })?;
-            }
-        }
-        let abs_dir = self.abs_path_from_rel(&rel);
-        let mut stages = SaveStageDurations::default();
-        let serialization_started = Instant::now();
-        let runtime_snapshot = runtime_sidecar_snapshot(session);
-        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
-            .map_err(|error| other_io_error(error.to_string()))?;
-        stages.serialization = serialization_started.elapsed();
-        let serialized_bytes = runtime_bytes.len();
-        let root_id = if session.kind == SessionKind::Root {
-            session.id.as_str()
-        } else {
-            session.root_session_id.as_str()
-        };
-        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
-        guards.hold_tree(tree);
-        let tree_projection_changed = read_actor_tree_session_projection(&abs_dir, session)
+        self.save_runtime_state_with_owner(session, None, None)
             .await
-            .as_ref()
-            != Some(&actor_tree_session_projection(session));
-        if tree_projection_changed {
-            let root = if session.kind == SessionKind::Root {
-                Some(session.clone())
-            } else {
-                self.actor_tree_root_for_child_write(root_id).await?
-            };
-            if let Some(root) = root.as_ref() {
-                self.bump_actor_tree_revision(root).await?;
-            }
-        }
-        let filesystem_started = Instant::now();
-        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
-            .await?;
-        stages.filesystem_commit = filesystem_started.elapsed();
-
-        // Workspace and Project ownership are part of the list/index API
-        // contract. Runtime updates must therefore be reflected without waiting
-        // for a later full session save. Avoid rewriting the global index when
-        // neither normalized value changed.
-        let workspace_path = session
-            .workspace_path_meta()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let project_id = normalized_project_id(session);
-        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
-            entry.workspace_path != workspace_path || entry.project_id != project_id
-        });
-        if runtime_index_changed {
-            let index_started = Instant::now();
-            let index_updated = self
-                .update_index(|index| {
-                    if let Some(entry) = index.sessions.get_mut(&session.id) {
-                        entry.workspace_path = workspace_path;
-                        entry.project_id = project_id;
-                        return Ok(true);
-                    }
-                    Ok(false)
-                })
-                .await?;
-            if !index_updated && session.kind == SessionKind::Root {
-                // Exceptional recovery of a globally missing index entry must
-                // preserve the real history count, not the caller's snapshot.
-                // This index recovery reads main too. Legacy runtime saves
-                // without Actor authority retain the transcript-independent path.
-                let authoritative = self
-                    .load_authoritative_root_session(&session.id)
-                    .await
-                    .map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            bamboo_domain::SessionAuthorityConflict(format!(
-                                "Root canonical index recovery unavailable: {error}"
-                            )),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        other_io_error("runtime Root disappeared during index repair")
-                    })?;
-                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
-                    .await?;
-            }
-            stages.index_publication = index_started.elapsed();
-        }
-        let index_entry_count = self.index.read().await.sessions.len();
-        let total = total_started.elapsed();
-        self.persistence_metrics.record_save(
-            SaveKind::Runtime,
-            total,
-            stages,
-            serialized_bytes,
-            session.messages.len(),
-            index_entry_count,
-        );
-        tracing::debug!(
-            target: "bamboo.session_persistence",
-            session_id = %session.id,
-            save_type = "runtime",
-            phase = "durable_commit",
-            serialized_bytes,
-            message_count = session.messages.len(),
-            index_entry_count,
-            total_ms = total.as_millis() as u64,
-            "session runtime-state commit completed"
-        );
-        Ok(())
     }
 
     async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {

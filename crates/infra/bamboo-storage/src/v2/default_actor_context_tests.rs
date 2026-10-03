@@ -416,13 +416,19 @@ impl DefaultWriteHook {
             .wake
             .wait_timeout_while(s, DEADLINE, |s| !s.entered)
             .unwrap();
+        let entered = s.entered;
+        let timed_out = t.timed_out();
+        drop(s);
         assert!(
-            s.entered && !t.timed_out(),
+            entered && !timed_out,
             "actual filesystem job never reached barrier"
         );
     }
     pub(super) fn release(&self) {
-        self.state.lock().unwrap().released = true;
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released = true;
         self.wake.notify_all();
     }
 }
@@ -634,5 +640,196 @@ async fn replacement_errors_preserve_actual_confirmation_boundary_and_release_gu
                 .to_string_lossy()
                 .contains("durable.tmp."));
         }
+    }
+}
+
+async fn running_root_writer(
+    store: &SessionStoreV2,
+    base: &Session,
+    duration_ms: i64,
+) -> bamboo_domain::RootActorRuntimeWrite {
+    let mut request = claim(&base.id);
+    request.lease_expires_at = request.now + ChronoDuration::milliseconds(duration_ms);
+    let activation = store.claim_activation(&request).await.unwrap();
+    store
+        .start_activation(&activation.fence(), Utc::now())
+        .await
+        .unwrap();
+    bamboo_domain::RootActorRuntimeWrite {
+        fence: activation.fence(),
+        created_at: base.created_at,
+    }
+}
+
+fn root_writer_rejected(error: io::Error) {
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    assert!(error
+        .to_string()
+        .contains("Root Actor runtime authority rejected"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_root_full_and_runtime_publish_canonical_cache_under_physical_guards() {
+    for runtime_only in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (first, second, mut incoming) = stores(home.path()).await;
+        let owner = running_root_writer(&first, &incoming, 10_000).await;
+        incoming.conversation_summary.as_mut().unwrap().content = "current owner summary".into();
+        if !runtime_only {
+            incoming.add_message(Message::assistant("current owner answer", None));
+        }
+        let seen = Arc::new(StdMutex::new(None));
+        let seen_in_callback = seen.clone();
+        let check_store = first.clone();
+        first
+            .save_root_actor_runtime(
+                &owner,
+                &incoming,
+                runtime_only,
+                Arc::new(move |saved| {
+                    physical_locks_held(&check_store);
+                    *seen_in_callback.lock().unwrap() = Some(saved.clone());
+                }),
+            )
+            .await
+            .unwrap();
+        let loaded = second.load_session(ID).await.unwrap().unwrap();
+        let published = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            serde_json::to_value(&published).unwrap(),
+            serde_json::to_value(&loaded).unwrap()
+        );
+        assert_eq!(
+            published.conversation_summary.unwrap().content,
+            "current owner summary"
+        );
+        assert!(
+            !published.messages.is_empty(),
+            "runtime-only callback must retain durable history"
+        );
+        // A default caller still cannot acquire this privilege after activation.
+        let mut unbound = loaded.clone();
+        unbound.conversation_summary.as_mut().unwrap().content = "unbound".into();
+        rejected(first.save_runtime_state(&unbound).await.unwrap_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_root_expiry_at_actual_replace_rejects_before_cache_or_canonical_mutation() {
+    for runtime_only in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (first, second, mut incoming) = stores(home.path()).await;
+        let owner = running_root_writer(&first, &incoming, 250).await;
+        incoming.conversation_summary.as_mut().unwrap().content = "obsolete".into();
+        incoming.add_message(Message::assistant("obsolete", None));
+        let before = snapshot(&home.path().join("sessions").join(ID));
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = published.clone();
+        let hook = DefaultWriteHook::install(
+            &first,
+            RUNTIME_SIDECAR_FILE,
+            DurableWritePhase::BeforeReplace,
+            false,
+        );
+        let _release = Release(hook.clone());
+        let job = {
+            let first = first.clone();
+            tokio::spawn(async move {
+                first
+                    .save_root_actor_runtime(
+                        &owner,
+                        &incoming,
+                        runtime_only,
+                        Arc::new(move |_| {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }),
+                    )
+                    .await
+            })
+        };
+        hook.wait();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        physical_locks_held(&first);
+        hook.release();
+        root_writer_rejected(job.await.unwrap().unwrap_err());
+        assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(snapshot(&home.path().join("sessions").join(ID)), before);
+        let successor = second.claim_activation(&claim(ID)).await.unwrap();
+        assert_eq!(successor.attempt, 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_owned_root_job_retains_guards_until_expired_owner_rejection_and_reclaim() {
+    for runtime_only in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (first, second, mut incoming) = stores(home.path()).await;
+        let owner = running_root_writer(&first, &incoming, 15_000).await;
+        let activation = first
+            .inspect_actor(ID)
+            .await
+            .unwrap()
+            .activation
+            .expect("the real Root activation must exist before the filesystem job");
+        assert_eq!(activation.fence(), owner.fence);
+        let lease_expires_at = activation.lease_expires_at;
+        incoming.conversation_summary.as_mut().unwrap().content = "obsolete aborted writer".into();
+        let before = snapshot(&home.path().join("sessions").join(ID));
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = published.clone();
+        let hook = DefaultWriteHook::install(
+            &first,
+            RUNTIME_SIDECAR_FILE,
+            DurableWritePhase::BeforeReplace,
+            false,
+        );
+        let _release = Release(hook.clone());
+        let job = {
+            let first = first.clone();
+            tokio::spawn(async move {
+                first
+                    .save_root_actor_runtime(
+                        &owner,
+                        &incoming,
+                        runtime_only,
+                        Arc::new(move |_| {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }),
+                    )
+                    .await
+            })
+        };
+        hook.wait();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        while let Ok(remaining) = lease_expires_at.signed_duration_since(Utc::now()).to_std() {
+            tokio::time::sleep(remaining + Duration::from_millis(1)).await;
+        }
+        physical_locks_held(&first);
+        let successor = {
+            let second = second.clone();
+            tokio::spawn(async move { second.claim_activation(&claim(ID)).await })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(50), async {
+            while !successor.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err());
+        physical_locks_held(&first);
+        hook.release();
+        let successor = tokio::time::timeout(DEADLINE, successor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor.attempt, 2);
+        assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
+        let after = snapshot(&home.path().join("sessions").join(ID));
+        assert_eq!(&after[..2], &before[..2]);
     }
 }

@@ -488,6 +488,10 @@ fn unconditional_task_patch_would_regress(
 /// sessions proceed concurrently.
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
+    root_actor_writer: Option<(
+        bamboo_domain::RootActorRuntimeWrite,
+        bamboo_domain::RootActorRuntimePublisher,
+    )>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Serializes recoverable child/root Task transactions. Per-session locks
     /// still provide the data isolation; this gate ensures a retained recovery
@@ -539,8 +543,46 @@ impl LockedSessionStore {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self {
             storage,
+            root_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Immutable per-execution binding; shares the existing process locks and
+    /// never changes the default writer's authority.
+    pub fn bind_root_actor_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<Self> {
+        if !self.storage.supports_root_actor_runtime_write() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "storage does not support a Root Actor writer",
+            ));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            root_actor_writer: Some((owner, publish)),
+            locks: self.locks.clone(),
+            task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
+        })
+    }
+
+    async fn save_runtime_snapshot(
+        &self,
+        session: &Session,
+        runtime_only: bool,
+    ) -> std::io::Result<()> {
+        if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+            self.storage
+                .save_root_actor_runtime(owner, session, runtime_only, publish.clone())
+                .await
+        } else if runtime_only {
+            self.storage.save_runtime_state(session).await
+        } else {
+            self.storage.save_session(session).await
         }
     }
 
@@ -590,8 +632,30 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
+        self.save_session_rebasing_task_conflicts_with_input(session, None)
+            .await
+    }
+
+    async fn save_session_rebasing_task_conflicts_with_input(
+        &self,
+        session: &mut Session,
+        input: Option<&(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+    ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_session(session).await {
+            let result = if let Some((inbox, claim)) = input {
+                let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+                    std::io::Error::other("Root input checkpoint requires a bound writer")
+                })?;
+                self.storage
+                    .save_root_actor_input(owner, session, inbox.clone(), claim, publish.clone())
+                    .await
+            } else {
+                self.save_runtime_snapshot(session, false).await
+            };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -626,7 +690,7 @@ impl LockedSessionStore {
         session: &mut Session,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_runtime_state(session).await {
+            match self.save_runtime_snapshot(session, true).await {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -1076,8 +1140,56 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        self.checkpoint_runtime_session_with_input(session, None, publish)
+            .await
+    }
+
+    pub async fn checkpoint_root_input(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+    ) -> std::io::Result<()> {
+        self.checkpoint_runtime_session_with_input(session, Some((inbox, claim.clone())), |_, _| {})
+            .await
+    }
+
+    async fn checkpoint_runtime_session_with_input<F>(
+        &self,
+        session: &mut Session,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
+
+        // This context update belongs to the exact input, not the ordinary
+        // append-only runner snapshot. A durable typed turn is already proof
+        // of its first checkpoint: reconciling its lost ACK must not replay an
+        // old prompt over a subsequent committed prompt.
+        let input_prompt = match input.as_ref() {
+            Some((_, claim))
+                if !latest.as_ref().is_some_and(|durable| {
+                    durable.messages.iter().any(|message| {
+                        bamboo_domain::is_matching_session_message(message, &claim.claim.envelope)
+                    })
+                }) =>
+            {
+                claim
+                    .claim
+                    .envelope
+                    .root_chat_prompt()
+                    .map_err(std::io::Error::other)?
+                    .map(str::to_owned)
+            }
+            _ => None,
+        };
 
         if let Some(latest) = latest.as_ref() {
             ensure_model_context_checkpoint_is_current(session, latest)?;
@@ -1100,7 +1212,17 @@ impl LockedSessionStore {
             let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
-        let mut result = self.save_session_rebasing_task_conflicts(session).await;
+        if let Some(prompt) = input_prompt.as_deref() {
+            session
+                .messages
+                .retain(|message| message.role != bamboo_domain::Role::System);
+            session
+                .messages
+                .insert(0, bamboo_domain::Message::system(prompt));
+        }
+        let mut result = self
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+            .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
                 .as_ref()
@@ -1123,7 +1245,17 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &durable);
             adopt_fresher_disk_permission_posture(session, &durable);
             let _ = adopt_durable_tagged_child_wait(session, &durable);
-            result = self.save_session_rebasing_task_conflicts(session).await;
+            if let Some(prompt) = input_prompt.as_deref() {
+                session
+                    .messages
+                    .retain(|message| message.role != bamboo_domain::Role::System);
+                session
+                    .messages
+                    .insert(0, bamboo_domain::Message::system(prompt));
+            }
+            result = self
+                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+                .await;
         }
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());

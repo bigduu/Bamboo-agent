@@ -1077,19 +1077,9 @@ async fn fixture_with_followups(
             "actual Root correction chat: {status}; {}",
             bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
         );
-        let dispatch: Value = client
-            .post(format!("{base}/execute/plain-root"))
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(
-            dispatch["status"], "started",
-            "actual Root turn: {dispatch}"
-        );
+        // An activated Root's chat queues and activates this input itself.
+        // Observe its actual Tool receipt below; a redundant execute can race
+        // the automatic turn's completion and legitimately report completed.
         let pending = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
@@ -1220,14 +1210,8 @@ async fn fixture_with_followups(
             "actual cold Root recovery chat: {status}; {}",
             bounded_diagnostic(&response.text().await.unwrap_or_default(), 512)
         );
-        assert!(client
-            .post(format!("{base}/execute/plain-root"))
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .is_success());
+        // The persisted Root remains activated after restart. Its chat input
+        // starts recovery; the real Child provider below proves the handoff.
         tokio::time::timeout(Duration::from_secs(60), async {
             while probe.child_calls.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1339,16 +1323,8 @@ async fn fixture_with_followups(
                 "actual correction chat: {}",
                 bounded_diagnostic(&response.text().await.unwrap(), 512)
             );
-            let dispatch: Value = client
-                .post(format!("{base}/execute/plain-root"))
-                .json(&json!({}))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(dispatch["status"], "started");
+            // Chat activates the existing Root. Wait for its unique canonical
+            // Tool result and settled runner instead of starting it again.
             let end = if turn == 2 && mode == TwoFollowups::Overflow {
                 3
             } else {
