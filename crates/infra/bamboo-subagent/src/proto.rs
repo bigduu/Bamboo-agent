@@ -161,7 +161,8 @@ impl LocalToolMessages {
                     != *value
                     || message.id.is_empty()
                     || message.id.len() > 128
-                    || message.reasoning.is_some()
+                    || (message.reasoning.is_some()
+                        && message.role != bamboo_domain::Role::Assistant)
                     || message.reasoning_signature.is_some()
                     || message.content_parts.is_some()
                     || message.image_ocr.is_some()
@@ -971,6 +972,41 @@ mod tests {
         ));
         assert!(!LocalToolMessages::supports_tools(&["Glob".into()], true));
         assert!(!LocalToolMessages::supports_tools(&["Bash".into()], false));
+    }
+
+    #[test]
+    fn local_tool_messages_preserve_bounded_assistant_reasoning_without_provider_authority() {
+        let mut assistant = bamboo_domain::Message::assistant("complete report", None);
+        assistant.reasoning = Some("Complete ordinary text reasoning 🪷.".into());
+        let raw = serde_json::to_value(&assistant).unwrap();
+        let data = LocalToolMessages::Complete {
+            version: 1,
+            messages: vec![raw.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(data.validate().unwrap()).unwrap(),
+            serde_json::json!([raw])
+        );
+
+        for mutation in ["signature", "tool", "user", "system", "compressed", "bytes"] {
+            let mut message = assistant.clone();
+            match mutation {
+                "signature" => {
+                    message.reasoning_signature = Some("opaque-provider-signature".into())
+                }
+                "tool" => message.role = bamboo_domain::Role::Tool,
+                "user" => message.role = bamboo_domain::Role::User,
+                "system" => message.role = bamboo_domain::Role::System,
+                "compressed" => message.compressed = true,
+                "bytes" => message.reasoning = Some("🪷".repeat(LocalToolMessages::MAX_BYTES)),
+                _ => unreachable!(),
+            }
+            let changed = LocalToolMessages::Complete {
+                version: 1,
+                messages: vec![serde_json::to_value(&message).unwrap()],
+            };
+            assert!(changed.validate().is_err(), "{mutation}");
+        }
     }
 
     #[test]

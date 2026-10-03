@@ -419,6 +419,9 @@ pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
                 "name": t.function.name,
                 "description": t.function.description,
                 "parameters": sanitize_openai_function_parameters_schema(&t.function.parameters),
+                // Our schemas use omission for optional routing fields. Responses
+                // may normalize an unspecified strict mode into required fields.
+                "strict": false,
             })
         })
         .collect()
@@ -3208,6 +3211,40 @@ mod tests {
         assert_eq!(out[0]["description"], "Search things");
         assert!(out[0].get("function").is_none());
         assert!(out[0].get("parameters").is_some());
+        assert_eq!(out[0]["strict"], false);
+    }
+
+    #[test]
+    fn ordinary_responses_tools_preserve_optional_delegation_fields() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "SubAgent".to_string(),
+                description: "Delegate a task; omit unused routing fields".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "intent": {"type": "string", "enum": ["chat", "inspect", "control", "ask_parent"]},
+                        "target": {"type": "string"},
+                        "role": {"type": "string"},
+                        "message": {"type": "string"},
+                        "reply_to": {"type": "string"}
+                    }
+                }),
+            },
+        }];
+        let out = tools_to_responses_json(&tools);
+        assert_eq!(out[0]["strict"], false);
+        assert!(out[0]["parameters"].get("required").is_none());
+        assert_eq!(
+            out[0]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(out[0]["parameters"]["additionalProperties"], false);
     }
 
     fn loading_schema(name: &str) -> ToolSchema {

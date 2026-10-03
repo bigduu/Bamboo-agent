@@ -19,16 +19,23 @@ pub(crate) fn effective_guide_activation(
     config: &AgentLoopConfig,
     session: &Session,
 ) -> std::collections::BTreeSet<String> {
-    if config.freeze_tool_exposure_for_cache {
-        if let Some(frozen) = session
+    let mut activated = if config.freeze_tool_exposure_for_cache {
+        session
             .metadata
             .get(EXPOSURE_ACTIVATED)
             .and_then(|raw| serde_json::from_str(raw).ok())
-        {
-            return frozen;
-        }
+            .unwrap_or_else(|| activated_discoverable_tools(session))
+    } else {
+        activated_discoverable_tools(session)
+    };
+    // Ultra Roots rely on delegation for execution, so the compact contract
+    // must be visible even if guide exposure froze before the mode was selected.
+    // This derived presentation policy neither persists user activation nor
+    // changes the live catalog or execution authority.
+    if session.root_orchestration_only_enabled() {
+        activated.insert("SubAgent".to_string());
     }
-    activated_discoverable_tools(session)
+    activated
 }
 
 /// Capture presentation only; the catalog and execution authority are rebuilt live.

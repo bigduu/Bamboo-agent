@@ -5167,8 +5167,12 @@ impl LocalToolCollector {
                     return Err(local_tool_history_unsupported());
                 }
             }
-            AgentEvent::ReasoningToken { .. }
-            | AgentEvent::ContextSummarized { .. }
+            AgentEvent::ReasoningToken { .. } => {
+                // Text reasoning is a stream observation. Its complete value
+                // is preserved by the bounded typed completion, which still
+                // rejects signatures and unsupported provider state.
+            }
+            AgentEvent::ContextSummarized { .. }
             | AgentEvent::ContextArchived { .. }
             | AgentEvent::ContextCompressionStatus { .. }
             | AgentEvent::NeedClarification { .. }
@@ -9435,6 +9439,14 @@ mod tests {
         host: &Session,
         denied_write: bool,
     ) -> (LocalToolCollector, Vec<bamboo_agent_core::Message>) {
+        local_tool_sample_with_reasoning(host, denied_write, None)
+    }
+
+    fn local_tool_sample_with_reasoning(
+        host: &Session,
+        denied_write: bool,
+        reasoning: Option<&str>,
+    ) -> (LocalToolCollector, Vec<bamboo_agent_core::Message>) {
         use bamboo_agent_core::{FunctionCall, Message, ToolCall};
         let calls = ["Read", "Write"]
             .map(|name| ToolCall {
@@ -9447,7 +9459,18 @@ mod tests {
             })
             .to_vec();
         let mut rows = vec![Message::assistant("checking", Some(calls))];
+        rows[0].reasoning = reasoning.map(str::to_owned);
         let mut collector = LocalToolCollector::default();
+        if let Some(reasoning) = reasoning {
+            assert!(collector
+                .event(
+                    &serde_json::to_value(AgentEvent::ReasoningToken {
+                        content: reasoning.into(),
+                    })
+                    .unwrap()
+                )
+                .unwrap());
+        }
         for name in ["Read", "Write"] {
             let denied = name == "Write" && denied_write;
             let id = format!("local-{name}");
@@ -9488,6 +9511,17 @@ mod tests {
                 .unwrap();
         }
         rows.push(Message::assistant("complete exact report", None));
+        rows.last_mut().unwrap().reasoning = reasoning.map(str::to_owned);
+        if let Some(reasoning) = reasoning {
+            assert!(collector
+                .event(
+                    &serde_json::to_value(AgentEvent::ReasoningToken {
+                        content: reasoning.into(),
+                    })
+                    .unwrap()
+                )
+                .unwrap());
+        }
         let mut messages = host.messages.clone();
         if let Some(system) = messages
             .iter_mut()
@@ -9715,7 +9749,13 @@ mod tests {
                 })
                 .unwrap()
             )
-            .is_err());
+            .unwrap());
+        assert!(
+            empty
+                .suffix(&host, &tools, false, Some("complete exact report"))
+                .is_err(),
+            "stream observations alone cannot commit history"
+        );
         let (mut completed, _) = local_tool_sample(&host, false);
         assert!(completed.event(&serde_json::json!({"type":"local_client_tool_messages_v1","version":1,"messages":[]})).is_err());
     }
@@ -9750,6 +9790,7 @@ mod tests {
     async fn local_tool_history_checkpoint_preserves_confirmed_input_and_cold_pairs_or_refuses() {
         for case in [
             "success",
+            "reasoning",
             "concurrent_input",
             "checkpoint_error",
             "stale_prefix",
@@ -9804,7 +9845,9 @@ mod tests {
                 .unwrap();
             assert!(inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
             let before = serde_json::to_value(&child).unwrap();
-            let (collector, rows) = local_tool_sample(&child, false);
+            let reasoning = (case == "reasoning")
+                .then_some("Complete plain reasoning before Read and the final reply 🪷.");
+            let (collector, rows) = local_tool_sample_with_reasoning(&child, false, reasoning);
             let mut binding = binding;
             let late = bamboo_domain::SessionMessageEnvelope::user_input(
                 &child.id,
@@ -9865,7 +9908,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if !matches!(case, "success" | "concurrent_input") {
+            if !matches!(case, "success" | "reasoning" | "concurrent_input") {
                 assert!(result.is_err(), "{case}");
                 assert_eq!(
                     serde_json::to_value(&child).unwrap(),

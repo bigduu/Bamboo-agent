@@ -126,12 +126,15 @@ fn invalid(message: &str) -> SessionInboxError {
 
 // Field order releases Inbox FD, process, then the complete original authority
 // (reverse sorted Sessions, Task and lifecycle for Supervisor followups).
-pub(super) enum InboxAuthority {
+pub(crate) enum InboxAuthority {
     Lifecycle {
         _guard: crate::v2::SessionLifecycleReadGuard,
     },
     Actor {
         _guard: Arc<crate::v2::ActorInputGuards>,
+    },
+    Root {
+        _guard: Arc<crate::v2::DefaultWriterPhysicalGuards>,
     },
     Supervisor {
         _guard: crate::v2::SupervisorFollowupGuard,
@@ -153,6 +156,7 @@ pub(super) type FilesystemHook = Arc<dyn Fn(&str, &Path) -> std::io::Result<()> 
 #[derive(Clone)]
 pub(crate) struct OwnedFilesystem {
     guards: Arc<OwnedGuards>,
+    check: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
     #[cfg(test)]
     hook: Option<FilesystemHook>,
 }
@@ -170,6 +174,7 @@ impl OwnedFilesystem {
             // This capture outlives cancellation of the async transaction itself.
             let _guards = &filesystem.guards;
             filesystem.observe(event, &path)?;
+            filesystem.validate()?;
             job(&filesystem, &path)
         })
         .await
@@ -180,6 +185,27 @@ impl OwnedFilesystem {
         #[cfg(test)]
         if let Some(hook) = &self.hook {
             hook(_event, _path)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_check(
+        mut self,
+        check: Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>,
+    ) -> Self {
+        let previous = self.check.take();
+        self.check = Some(Arc::new(move || {
+            if let Some(previous) = &previous {
+                previous()?;
+            }
+            check()
+        }));
+        self
+    }
+
+    fn validate(&self) -> std::io::Result<()> {
+        if let Some(check) = &self.check {
+            check()?;
         }
         Ok(())
     }
@@ -208,6 +234,7 @@ impl OwnedFilesystem {
                 return Err(error);
             }
             filesystem.observe("replace", path)?;
+            filesystem.validate()?;
             replace(&temp, path)?;
             filesystem.observe("after_replace", path)
         })
@@ -433,12 +460,19 @@ impl FileSessionInbox {
         &self,
         target: &str,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        if let Some(owner) = &self.root_owner {
+            return self
+                .sessions
+                .root_owned_inbox_filesystem(self, target, owner)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()));
+        }
         let lifecycle = self.lock_lifecycle().await?;
         self.filesystem_with_authority(target, InboxAuthority::Lifecycle { _guard: lifecycle })
             .await
     }
 
-    pub(super) async fn filesystem_with_authority(
+    pub(crate) async fn filesystem_with_authority(
         &self,
         target: &str,
         authority: InboxAuthority,
@@ -481,6 +515,7 @@ impl FileSessionInbox {
             dir,
             OwnedFilesystem {
                 guards,
+                check: None,
                 #[cfg(test)]
                 hook: self.owned_fs_hook.clone(),
             },
@@ -728,6 +763,20 @@ impl FileSessionInbox {
         #[cfg(test)]
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
+        let actual_request;
+        let request = if self.root_owner.is_some() {
+            let now = Utc::now();
+            actual_request = SessionInboxLeaseRequest {
+                consumer: request.consumer.clone(),
+                now,
+                duration: expires_at - now,
+            };
+            actual_request.expires_at()?;
+            &actual_request
+        } else {
+            request
+        };
         for queue in ["new", "cur", "corrupt", DEAD_LETTER_DIR] {
             filesystem
                 .create_dir(&dir.join(queue))
@@ -769,7 +818,13 @@ impl FileSessionInbox {
                 {
                     return Err(invalid("Inbox terminal lease mismatch"));
                 }
-                filesystem
+                let terminal_filesystem = if let Some(owner) = &self.root_owner {
+                    let proof = self.sessions.root_inbox_terminal_check(owner, &envelope);
+                    filesystem.clone().with_check(proof)
+                } else {
+                    filesystem.clone()
+                };
+                terminal_filesystem
                     .remove(&path)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -863,9 +918,11 @@ impl FileSessionInbox {
             };
             let name = Self::owned_name(generation, &lease.token);
             let canonical = dir.join("cur").join(&name);
+            let lease_filesystem =
+                self.root_lease_filesystem(filesystem.clone(), lease.token.expires_at)?;
             // The unknown kind first fences an old already-held ACK at the
             // old path. Rename then fences it at the path boundary as well.
-            self.write_owned_transport(&path, &wrapper, &lease, &filesystem)
+            self.write_owned_transport(&path, &wrapper, &lease, &lease_filesystem)
                 .await?;
             #[cfg(test)]
             if self.owned_after_write_failure {
@@ -878,7 +935,7 @@ impl FileSessionInbox {
                 {
                     return Err(invalid("Inbox lease incarnation already exists"));
                 }
-                filesystem
+                lease_filesystem
                     .rotate(&path, &canonical)
                     .await
                     .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
@@ -896,6 +953,18 @@ impl FileSessionInbox {
         target: &str,
         claim: &SessionInboxOwnedClaim,
         now: DateTime<Utc>,
+    ) -> Result<(SessionMessageEnvelope, Option<SessionInboxActivationIntent>), SessionInboxError>
+    {
+        self.locked_owned_claim(dir, target, claim, now, false)
+    }
+
+    pub(crate) fn locked_owned_claim(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        now: DateTime<Utc>,
+        allow_terminal: bool,
     ) -> Result<(SessionMessageEnvelope, Option<SessionInboxActivationIntent>), SessionInboxError>
     {
         use std::io::Read;
@@ -951,7 +1020,8 @@ impl FileSessionInbox {
             return Err(invalid("Inbox claim mismatch"));
         }
         match std::fs::symlink_metadata(Self::admitted_path(dir, &actual.claim.envelope.id)) {
-            Ok(_) => return Err(invalid("Inbox claim is already terminal")),
+            Ok(_) if !allow_terminal => return Err(invalid("Inbox claim is already terminal")),
+            Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
         }
@@ -1009,13 +1079,25 @@ impl FileSessionInbox {
         #[cfg(test)]
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
-        let (wrapper, mut stored) = self.current_owned(&dir, target, claim, request.now).await?;
+        let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
+        let filesystem = if self.root_owner.is_some() {
+            self.exact_claim_filesystem(filesystem, &dir, target, claim, false)
+        } else {
+            filesystem
+        };
+        let now = if self.root_owner.is_some() {
+            Utc::now()
+        } else {
+            request.now
+        };
+        let (wrapper, mut stored) = self.current_owned(&dir, target, claim, now).await?;
         #[cfg(test)]
         if let Some((entered, release)) = &self.owned_renew_pause {
             entered.notify_one();
             release.notified().await;
         }
         stored.token.expires_at = stored.token.expires_at.max(expires_at);
+        let filesystem = self.root_lease_filesystem(filesystem, stored.token.expires_at)?;
         self.write_owned_transport(
             &dir.join("cur").join(&claim.claim.claim_id),
             &wrapper,
@@ -1070,20 +1152,102 @@ impl FileSessionInbox {
                 )
                 .await;
         }
-        let (_, stored) = self.current_owned(&dir, target, claim, now).await?;
+        let filesystem = if let Some(owner) = &self.root_owner {
+            filesystem.with_check(
+                self.sessions
+                    .root_inbox_terminal_check(owner, &claim.claim.envelope),
+            )
+        } else {
+            filesystem
+        };
+        self.ack_owned_with_filesystem(&dir, target, claim, now, filesystem)
+            .await
+    }
+
+    pub(crate) async fn ack_owned_with_filesystem(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        now: DateTime<Utc>,
+        filesystem: OwnedFilesystem,
+    ) -> Result<(), SessionInboxError> {
+        let filesystem = if self.root_owner.is_some() {
+            self.exact_claim_filesystem(filesystem, dir, target, claim, true)
+        } else {
+            filesystem
+        };
+        let now = if self.root_owner.is_some() {
+            Utc::now()
+        } else {
+            now
+        };
+        let (_, stored) = self.current_owned(dir, target, claim, now).await?;
         #[cfg(test)]
         if let Some((entered, release)) = &self.owned_ack_pause {
             entered.notify_one();
             release.notified().await;
         }
         self.ack_unlocked(
-            &dir,
+            dir,
             target,
             &claim.claim,
             AckAuthority::Owned {
                 lease: &stored,
                 filesystem: &filesystem,
             },
+        )
+        .await
+    }
+
+    fn root_lease_filesystem(
+        &self,
+        filesystem: OwnedFilesystem,
+        deadline: DateTime<Utc>,
+    ) -> Result<OwnedFilesystem, SessionInboxError> {
+        Ok(if let Some(owner) = &self.root_owner {
+            filesystem.with_check(self.sessions.root_inbox_lease_check(owner, deadline))
+        } else {
+            filesystem
+        })
+    }
+
+    fn exact_claim_filesystem(
+        &self,
+        filesystem: OwnedFilesystem,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        allow_terminal: bool,
+    ) -> OwnedFilesystem {
+        let inbox = self.clone();
+        let dir = dir.to_owned();
+        let target = target.to_owned();
+        let claim = claim.clone();
+        filesystem.with_check(Arc::new(move || {
+            inbox
+                .locked_owned_claim(&dir, &target, &claim, Utc::now(), allow_terminal)
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        }))
+    }
+
+    pub(super) async fn release_owned_impl(
+        &self,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+    ) -> Result<(), SessionInboxError> {
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let filesystem = self.exact_claim_filesystem(filesystem, &dir, target, claim, false);
+        let (wrapper, mut stored) = self.current_owned(&dir, target, claim, Utc::now()).await?;
+        // Keep the original typed transport and all retry/failure evidence.
+        // The next consumer reclaims it with a strictly greater epoch.
+        stored.token.expires_at = Utc::now();
+        self.write_owned_transport(
+            &dir.join("cur").join(&claim.claim.claim_id),
+            &wrapper,
+            &stored,
+            &filesystem,
         )
         .await
     }

@@ -38,8 +38,8 @@ const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "session_inbox_owned.rs"]
 mod owned;
-pub(crate) use owned::OwnedFilesystem;
-use owned::{AckAuthority, InboxAuthority, StoredLease};
+use owned::{AckAuthority, StoredLease};
+pub(crate) use owned::{InboxAuthority, OwnedFilesystem};
 
 struct StoredInboxReceipt {
     delivery: SessionInboxReceipt,
@@ -139,6 +139,7 @@ impl UnownedActorClaimGuard {
 #[derive(Clone)]
 pub struct FileSessionInbox {
     sessions: Arc<SessionStoreV2>,
+    root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
     limits: SessionInboxLimits,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
@@ -171,6 +172,7 @@ impl FileSessionInbox {
     pub fn new(sessions: Arc<SessionStoreV2>, limits: SessionInboxLimits) -> Self {
         Self {
             sessions,
+            root_owner: None,
             limits,
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -196,6 +198,31 @@ impl FileSessionInbox {
             #[cfg(test)]
             owned_scope_drop: None,
         }
+    }
+
+    pub(crate) fn bind_root_owner(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        sessions_dir: &Path,
+    ) -> std::io::Result<Self> {
+        if self.sessions.root_sessions_directory() != sessions_dir {
+            return Err(std::io::Error::other(
+                "Root Inbox belongs to a different storage directory",
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root_owner = Some(owner.clone());
+        Ok(bound)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_owned_filesystem_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn(&str, &Path) -> std::io::Result<()> + Send + Sync>,
+    ) -> Self {
+        let mut inbox = self.clone();
+        inbox.owned_fs_hook = Some(hook);
+        inbox
     }
 
     /// Storage-only opt-in; this result is not provider or worker admission.
@@ -1225,6 +1252,17 @@ impl SessionInboxPort for FileSessionInbox {
         let target = target.to_owned();
         let claim = claim.clone();
         owned::complete_owned(async move { inbox.ack_owned_impl(&target, &claim, now).await }).await
+    }
+
+    async fn release_owned(
+        &self,
+        target: &str,
+        claim: &bamboo_domain::SessionInboxOwnedClaim,
+    ) -> Result<(), SessionInboxError> {
+        let inbox = self.clone();
+        let target = target.to_owned();
+        let claim = claim.clone();
+        owned::complete_owned(async move { inbox.release_owned_impl(&target, &claim).await }).await
     }
 
     async fn inspect_owned_leases(

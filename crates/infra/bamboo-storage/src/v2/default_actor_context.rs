@@ -6,10 +6,20 @@ use bamboo_domain::{ActorDirectoryEntry, ActorLogicalState, SessionAuthorityConf
 
 // Field order releases Session, Task, lifecycle, reversing acquisition order.
 pub(super) struct DefaultWriterGuards {
-    // Keep this before Session/Task/lifecycle so it drops first. A cancelled
-    // async caller cannot release the Root lock while a spawned write remains.
+    pub(super) root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    pub(super) root_origin: Option<super::root_actor_runtime::RootActorWriteProof>,
+    pub(super) input: Option<super::root_actor_input::RootActorInputProof>,
+    pub(super) _input_filesystem: Option<crate::session_inbox::OwnedFilesystem>,
+    pub(crate) physical: Arc<DefaultWriterPhysicalGuards>,
+}
+
+// Inbox jobs retain only these acquired guards, never the enclosing writer
+// which also owns the Inbox filesystem. This keeps the ownership graph acyclic.
+pub(crate) struct DefaultWriterPhysicalGuards {
+    // Retain the complete acquired scope in canonical and Inbox jobs alike.
     tree: std::sync::Mutex<Option<ActorTreeWriteGuard>>,
     _session: SessionWriteGuard,
+    _root_session: Option<SessionWriteGuard>,
     _task: TaskGuard,
     _lifecycle: LifecycleGuard,
 }
@@ -33,11 +43,27 @@ impl DefaultWriterGuards {
         task: RuntimeTaskTransactionReadGuard,
         session: SessionWriteGuard,
     ) -> Arc<Self> {
+        Self::shared_with_root_actor(lifecycle, task, session, None)
+    }
+
+    pub(super) fn shared_with_root_actor(
+        lifecycle: SessionLifecycleReadGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        session: SessionWriteGuard,
+        root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            tree: std::sync::Mutex::new(None),
-            _session: session,
-            _task: TaskGuard::Shared { _guard: task },
-            _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
+            root_actor,
+            root_origin: None,
+            input: None,
+            _input_filesystem: None,
+            physical: Arc::new(DefaultWriterPhysicalGuards {
+                tree: std::sync::Mutex::new(None),
+                _session: session,
+                _root_session: None,
+                _task: TaskGuard::Shared { _guard: task },
+                _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
+            }),
         })
     }
 
@@ -47,15 +73,38 @@ impl DefaultWriterGuards {
         session: SessionWriteGuard,
     ) -> Arc<Self> {
         Arc::new(Self {
-            tree: std::sync::Mutex::new(None),
-            _session: session,
-            _task: TaskGuard::Exclusive { _guard: task },
-            _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
+            root_actor: None,
+            root_origin: None,
+            input: None,
+            _input_filesystem: None,
+            physical: Arc::new(DefaultWriterPhysicalGuards {
+                tree: std::sync::Mutex::new(None),
+                _session: session,
+                _root_session: None,
+                _task: TaskGuard::Exclusive { _guard: task },
+                _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
+            }),
         })
     }
 
     pub(super) fn hold_tree(&self, tree: ActorTreeWriteGuard) {
-        *self.tree.lock().expect("Actor tree writer guard") = Some(tree);
+        *self.physical.tree.lock().expect("Actor tree writer guard") = Some(tree);
+    }
+
+    pub(super) fn shared_with_root_origin(
+        lifecycle: SessionLifecycleReadGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        child: SessionWriteGuard,
+        root: Option<SessionWriteGuard>,
+        origin: Option<super::root_actor_runtime::RootActorWriteProof>,
+    ) -> Arc<Self> {
+        let mut guards = Self::shared(lifecycle, task, child);
+        let unique = Arc::get_mut(&mut guards).expect("fresh answer writer");
+        unique.root_origin = origin;
+        Arc::get_mut(&mut unique.physical)
+            .expect("fresh physical guards")
+            ._root_session = root;
+        guards
     }
 }
 
@@ -167,6 +216,18 @@ fn main_context(session: &Session) -> io::Result<serde_json::Value> {
 }
 
 impl SessionStoreV2 {
+    /// Ingress routing only: activated or unknown ordinary Root authority
+    /// requires queued input. This never initializes authority or permits a
+    /// default write; that writer rechecks its physical authority at commit.
+    pub async fn root_actor_input_required(&self, session: &Session) -> io::Result<bool> {
+        if session.kind != SessionKind::Root || !session.authority_identity.is_ordinary() {
+            return Ok(false);
+        }
+        let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
+        let (record, marker) = self.default_actor_observation(&directory).await;
+        Ok(!permits_unfenced_context(&record, &marker, Some(session)))
+    }
+
     pub(super) async fn lock_default_writer_lifecycle(
         &self,
     ) -> io::Result<SessionLifecycleReadGuard> {
@@ -303,13 +364,27 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         let path = path.to_path_buf();
+        let root_actor = guards.root_actor.clone();
+        let root_origin = guards.root_origin.clone();
+        let input = guards.input.clone();
         #[cfg(test)]
         let hook = self.default_write_hook.lock().unwrap().clone();
         Self::default_writer_job(guards, move || {
             durable_atomic_write_blocking(&path, &bytes, |phase| {
                 #[cfg(test)]
                 if let Some(hook) = &hook {
-                    return hook.visit(&path, phase);
+                    hook.visit(&path, phase)?;
+                }
+                if matches!(phase, DurableWritePhase::BeforeReplace) {
+                    if let Some(proof) = &root_actor {
+                        proof.validate()?;
+                    }
+                    if let Some(proof) = &root_origin {
+                        proof.validate()?;
+                    }
+                    if let Some(proof) = &input {
+                        proof.validate(false)?;
+                    }
                 }
                 let _ = phase;
                 Ok(())

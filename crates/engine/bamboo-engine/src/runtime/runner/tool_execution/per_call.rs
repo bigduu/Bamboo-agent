@@ -441,6 +441,13 @@ async fn execute_tool_call_only_with_execution_name(
     let dispatch =
         ctx.tools
             .execute_exact_with_context_outcome(ctx.tool_call, execution_name, tool_ctx);
+    let dispatch = bamboo_agent_core::tools::context::with_root_actor_tool_writer(
+        ctx.config
+            .persistence
+            .as_ref()
+            .and_then(|persistence| persistence.root_actor_writer()),
+        dispatch,
+    );
     let (needs_human, result, post_tool_hook_eligible) =
         match bamboo_tools::with_hook_permission_override(
             permission_override,

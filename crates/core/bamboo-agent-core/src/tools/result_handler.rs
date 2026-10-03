@@ -570,8 +570,11 @@ async fn execute_sub_actions_with_persistence(
         )
         .with_executing_supervisor(executing_supervisor);
 
-        match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)
-            .await
+        match super::context::with_root_actor_tool_writer(
+            None,
+            execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx),
+        )
+        .await
         {
             Ok(result) => {
                 let _ = event_tx

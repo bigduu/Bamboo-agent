@@ -16,10 +16,10 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    create_event_forwarder_with_history_commit_barrier, finalize_runner, reserve_runner_core,
-    reserve_session_execution, spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion,
-    ChildCompletionHandler, ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
+    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ReserveOutcome,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -199,10 +199,27 @@ fn build_child_completion_envelope(
             return (Some(value.to_string()), identity);
         }
         let digest = hex::encode(Sha256::digest(value.as_bytes()));
-        let retrieval_view = if label == "error" { "error" } else { "result" };
+        let retrieval_view = if label == "error" {
+            "diagnostics"
+        } else {
+            "result"
+        };
+        let inspection = serde_json::json!({
+            "intent": "inspect", "target": child_session_id, "message": retrieval_view,
+        });
+        let recovery = if label == "error" {
+            format!(
+                "Check observed status and recovery diagnostics by calling SubAgent with {inspection}. \
+                 Detailed execution errors remain available to the authenticated inspector."
+            )
+        } else {
+            format!(
+                "Read it in bounded slices by calling SubAgent with {inspection}; use message=\"messages\" for transcript previews. \
+                 Follow returned cursors with a JSON-encoded view/cursor query in message, omitting unused query fields."
+            )
+        };
         let mut summary = format!(
-            "Child {label} could not fit in the durable inline envelope ({} UTF-8 bytes, sha256={digest}). \
-             Read it in bounded slices with SubAgent.get(child_session_id=\"{child_session_id}\", view=\"{retrieval_view}\"); use view=\"messages\" for transcript previews.",
+            "Child {label} could not fit in the durable inline envelope ({} UTF-8 bytes, sha256={digest}). {recovery}",
             value.len()
         );
         if !compact {
@@ -512,7 +529,7 @@ fn runtime_resume_message(
 
     // Fold the child's full final response back into the parent — no
     // truncation. Sub-agents are first-class agents whose complete conclusion
-    // should be available to the parent without an extra `SubAgent.get` round
+    // should be available to the parent without an extra SubAgent inspection round
     // trip. The message is left compressible (see `never_compress` below) so a
     // long transcript can still be reclaimed under parent compaction.
     let final_response = child_final_response.map(str::to_string);
@@ -526,10 +543,14 @@ fn runtime_resume_message(
         }
     }
 
-    body.push_str(
+    let inspection = serde_json::json!({
+        "intent": "inspect", "target": completion.child_session_id, "message": "messages",
+    });
+    body.push_str(&format!(
         "\n\nResume the parent task using this child result and continue from the previous plan. \
-         If you need transcript evidence, call SubAgent.get(child_session_id, view=\"messages\") and follow its cursor; use view=\"message\" for a selected full message.",
-    );
+         If you need transcript evidence, call SubAgent with {inspection}. \
+         Follow returned cursors with a JSON-encoded view/cursor query in message; use view=\"message\" and message_id inside that query for a selected full message. Omit unused query fields.",
+    ));
 
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
@@ -542,14 +563,14 @@ fn runtime_resume_message(
     }));
     // Allow parent-side compaction to reclaim this (now untruncated) message if
     // the parent context grows — important once children nest and fold full
-    // results upward. The `SubAgent.get` hint preserves recoverability.
+    // results upward. The compact inspection hint preserves recoverability.
     message.never_compress = false;
     message
 }
 
 /// The hidden resume message for a completed **guardian** review: a directive,
 /// verdict-tailored note that carries the reviewer's findings straight into the
-/// parent (so it can act without a `SubAgent.get`), mirroring
+/// parent (so it can act without a SubAgent inspection), mirroring
 /// [`runtime_resume_message`]'s hidden/compressible shape.
 fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdict) -> Message {
     let mut body = if verdict.approve {
@@ -571,9 +592,13 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
             body.push_str(&format!("\n{}. {}", idx + 1, finding));
         }
     }
-    body.push_str(
-        "\n\nIf you need guardian transcript evidence, call SubAgent.get(child_session_id, view=\"messages\") and follow its cursor.",
-    );
+    let inspection = serde_json::json!({
+        "intent": "inspect", "target": completion.child_session_id, "message": "messages",
+    });
+    body.push_str(&format!(
+        "\n\nIf you need guardian transcript evidence, call SubAgent with {inspection}. \
+         Follow returned cursors with a JSON-encoded view/cursor query in message, omitting unused query fields.",
+    ));
 
     let mut message = Message::user(body);
     message.metadata = Some(serde_json::json!({
@@ -600,6 +625,7 @@ pub struct ChildCompletionCoordinator {
     provider_router: Arc<ProviderModelRouter>,
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
+    root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
@@ -612,6 +638,11 @@ pub struct ChildCompletionCoordinator {
 }
 
 impl ChildCompletionCoordinator {
+    pub fn with_root_account_sink(mut self, sink: Arc<crate::events::AccountEventSink>) -> Self {
+        self.root_account_sink = Some(sink);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn Storage>,
@@ -638,6 +669,7 @@ impl ChildCompletionCoordinator {
             provider_router,
             app_data_dir,
             account_feed_inbox,
+            root_account_sink: None,
             root_tools: Arc::new(RwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
@@ -1269,6 +1301,34 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             return;
         }
 
+        if self
+            .agent
+            .persistence()
+            .root_actor_execution_required(&session)
+            && self.root_account_sink.is_none()
+        {
+            tracing::warn!(%session_id, "Root resume has no actual account sink; rejecting before Actor claim");
+            execution_reservation.abandon().await;
+            return;
+        }
+        if let Err(error) = execution_reservation
+            .bind_root_actor(&self.agent, &session)
+            .await
+        {
+            tracing::warn!(%session_id, %error, "Root coordinator resume Actor binding rejected");
+            execution_reservation.abandon().await;
+            return;
+        }
+        let root_publication = execution_reservation.root_actor_writer().map(|owner| {
+            crate::events::RootActorEventPublication::new(
+                self.storage.clone(),
+                self.root_account_sink
+                    .clone()
+                    .expect("required Root actual account sink checked before claim"),
+                owner,
+            )
+        });
+
         let Some(root_tools) = self.root_tools.read().await.clone() else {
             tracing::error!(%session_id, "cannot resume parent after child completion: root tool surface is not initialized");
             return;
@@ -1351,12 +1411,13 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .or(config.gold_config.clone());
 
         let (mpsc_tx, _forwarder, history_commit_barrier) =
-            create_event_forwarder_with_history_commit_barrier(
+            crate::execution::create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
                 event_sender,
                 self.agent_runners.clone(),
                 self.account_feed_inbox.clone(),
+                root_publication,
             );
 
         let config_handle = self.config.clone();
@@ -1623,7 +1684,7 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         let run_id = reservation.run_id.clone();
         let launch = match launch_plan {
             LaunchPlan::Root(config) => {
-                let execution_reservation =
+                let mut execution_reservation =
                     SessionExecutionReservation::from_activation_placeholder(
                         target_session_id,
                         reservation,
@@ -1633,6 +1694,33 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             .clone(),
                         self.agent_runners.clone(),
                     );
+                // Busy must reach the router before it commits a launched
+                // generation. Its existing recovery backoff can then retry the
+                // durable input when the old Host's actual lease expires.
+                if self
+                    .agent
+                    .persistence()
+                    .root_actor_execution_required(&session)
+                    && self.root_account_sink.is_none()
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(
+                        "Root activation has no actual account sink".into(),
+                    ));
+                }
+                if let Err(error) = execution_reservation
+                    .bind_root_actor(&self.agent, &session)
+                    .await
+                {
+                    execution_reservation
+                        .rollback_unpublished_activation()
+                        .await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!(
+                        "Root Actor reservation rejected: {error}"
+                    )));
+                }
                 // Launch and rollback share one exact RAII reservation. Dropping
                 // an unlaunched SessionActivationLaunch cannot race a raw slot
                 // removal against the reservation's router-placeholder cleanup.
@@ -1656,10 +1744,12 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // The router publishes the exact owner before invoking
                         // this closure, so only now may the prepared snapshot
                         // replace the shared cache entry.
-                        launch_sessions.insert(
-                            launch_session_id,
-                            Arc::new(crate::SessionSnapshot::new(launch_session)),
-                        );
+                        if execution_reservation.root_actor_writer().is_none() {
+                            launch_sessions.insert(
+                                launch_session_id,
+                                Arc::new(crate::SessionSnapshot::new(launch_session)),
+                            );
+                        }
                         let request = ResumeSpawnRequest {
                             session_id: request_session_id,
                             session,
@@ -2463,19 +2553,20 @@ fn child_wait_watchdog_resume_message(body: String) -> Message {
 }
 
 fn empty_child_wait_message() -> Message {
-    child_wait_watchdog_resume_message(
+    let inspection = serde_json::json!({"intent": "inspect", "message": "tree"});
+    child_wait_watchdog_resume_message(format!(
         "Runtime notification: this session was suspended waiting for child sessions, but the \
          wait tracked no children (internal inconsistency). The session has been resumed; use \
-         SubAgent.list to inspect child state and continue the task."
-            .to_string(),
-    )
+         SubAgent with {inspection} to inspect child state and continue the task.",
+    ))
 }
 
 fn child_wait_lease_expired_message(child_ids: &[String]) -> Message {
+    let inspection = serde_json::json!({"intent": "inspect", "message": "tree"});
     child_wait_watchdog_resume_message(format!(
         "Runtime notification: the wait lease for child session(s) [{}] expired before they all \
          reported completion. They were NOT cancelled and may still be running or already \
-         finished — verify their actual status with SubAgent.list / SubAgent.get before assuming \
+         finished — verify their actual status by calling SubAgent with {inspection} before assuming \
          anything, then continue the task.",
         child_ids.join(", ")
     ))
@@ -3660,6 +3751,42 @@ mod tests {
         assert!(lease.content.contains("c-1"));
     }
 
+    #[test]
+    fn runtime_child_guidance_uses_compact_inspection_calls() {
+        let completion = make_completion("completed");
+        let child_inspection = serde_json::json!({
+            "intent": "inspect", "target": "child-1", "message": "messages",
+        })
+        .to_string();
+        let tree_inspection =
+            serde_json::json!({"intent": "inspect", "message": "tree"}).to_string();
+        for (message, expected_call) in [
+            (
+                runtime_resume_message(&completion, 0, Some("evidence")),
+                &child_inspection,
+            ),
+            (
+                guardian_resume_message(&completion, &GuardianVerdict::approved()),
+                &child_inspection,
+            ),
+            (empty_child_wait_message(), &tree_inspection),
+            (
+                child_wait_lease_expired_message(&["child-1".to_string()]),
+                &tree_inspection,
+            ),
+        ] {
+            assert!(message.content.contains(expected_call));
+            for legacy in [
+                "SubAgent.get",
+                "SubAgent.list",
+                "SubAgent.wait",
+                "child_session_id=",
+            ] {
+                assert!(!message.content.contains(legacy), "stale hint: {legacy}");
+            }
+        }
+    }
+
     // ── on_child_completed terminality guard (issue #546) ────────────────
 
     #[test]
@@ -3702,8 +3829,10 @@ mod tests {
         };
         let stored = outcome.result.as_deref().unwrap();
         assert!(stored.contains("sha256="));
-        assert!(stored.contains("SubAgent.get"));
-        assert!(stored.contains("view=\"result\""));
+        assert!(stored.contains("\"intent\":\"inspect\""));
+        assert!(stored.contains("\"target\":\"child-1\""));
+        assert!(stored.contains("\"message\":\"result\""));
+        assert!(!stored.contains("SubAgent.get"));
         assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
 
         // Retry-only completion timestamps and provider presentation do not
@@ -3740,7 +3869,10 @@ mod tests {
             panic!("typed child outcome");
         };
         let stored = outcome.error.as_deref().expect("bounded error");
-        assert!(stored.contains("view=\"error\""));
+        assert!(stored.contains(r#""message":"diagnostics""#));
+        assert!(stored.contains("authenticated inspector"));
+        assert!(!stored.contains("bounded slices"));
+        assert!(!stored.contains("cursors"));
         assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
         let metadata_error = outcome
             .provider_message
@@ -3774,8 +3906,8 @@ mod tests {
         };
         let error = outcome.error.as_deref().unwrap();
         let stored_result = outcome.result.as_deref().unwrap();
-        assert!(error.contains("view=\"error\""));
-        assert!(stored_result.contains("view=\"result\""));
+        assert!(error.contains(r#""message":"diagnostics""#));
+        assert!(stored_result.contains(r#""message":"result""#));
         assert!(!error.contains("Bounded tail"));
         assert!(!stored_result.contains("Bounded tail"));
         assert_eq!(
@@ -3834,7 +3966,7 @@ mod tests {
         };
         let provider = outcome.provider_message.as_ref().unwrap();
         assert!(provider.content.text.contains("Guardian review REJECTED"));
-        assert!(provider.content.text.contains("view=\"result\""));
+        assert!(provider.content.text.contains(r#""message":"result""#));
         assert_eq!(
             provider.metadata.get("guardian_approved"),
             Some(&serde_json::json!(false))

@@ -511,6 +511,31 @@ async fn admit_session_inbox(
             ..Default::default()
         };
     };
+    match persistence
+        .admit_root_inbox(session, inbox.clone(), active_run_id)
+        .await
+    {
+        Ok(Some(admission)) => {
+            if let Some(error) = &admission.admission_error {
+                tracing::warn!(session_id = %session.id, %error, "owned Root Inbox admission stopped");
+            }
+            return InboxAdmission {
+                merged: admission.merged,
+                committed_messages: admission.committed_messages,
+                admission_error: admission
+                    .admission_error
+                    .map(|_| INBOX_CLAIM_UNRESOLVED.to_string()),
+            };
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %session.id, %error, "owned Root Inbox admission failed");
+            return InboxAdmission {
+                admission_error: Some(INBOX_CLAIM_UNRESOLVED.to_string()),
+                ..Default::default()
+            };
+        }
+        Ok(None) => {}
+    }
     let claims = match inbox.claim_for_turn(&session.id, 128, active_run_id).await {
         Ok(claims) => claims,
         Err(error) => {

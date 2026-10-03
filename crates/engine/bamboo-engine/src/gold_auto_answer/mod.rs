@@ -239,7 +239,7 @@ where
         "Applying Gold auto-answer for pending clarification"
     );
 
-    let handoff = match crate::session_app::resume::reserve_response_resume_handoff(
+    let mut handoff = match crate::session_app::resume::reserve_response_resume_handoff(
         resume_port,
         session_id,
         std::time::Duration::from_secs(15),
@@ -263,12 +263,23 @@ where
         reasoning_effort: current.reasoning_effort,
     };
 
+    let bound_access = match state.bind_response_writer(handoff.root_actor_writer()) {
+        Ok(access) => access,
+        Err(error) => {
+            handoff.abandon().await;
+            return GoldAutoAnswerOutcome::Skipped {
+                reason: format!("response_writer_unavailable:{error}"),
+            };
+        }
+    };
+    let response_access: &dyn SessionAccess = bound_access.as_deref().unwrap_or(state);
+
     // Gold (eval) auto-answers do not record permission grants; eval sessions
     // should run with a permissive posture (e.g. BypassPermissions) so they never
     // pause for approval in the first place.
     let (updated_session, _submitted_answer, plan_mode_transition, _permission_grants) =
         match submit_pending_response_with_source_checked_guarded(
-            state,
+            response_access,
             respond_input,
             Some(evaluated_tool_call_id),
             ResponseSource::Gold,
@@ -291,6 +302,12 @@ where
         };
 
     let plan_mode_event = plan_mode_transition_event(session_id, plan_mode_transition.as_ref());
+    let root_response = handoff.root_actor_writer().is_some();
+    if root_response {
+        if let Some(event) = plan_mode_event.clone() {
+            handoff.publish_event(event);
+        }
+    }
     let resume_config = build_resume_config_snapshot(
         state,
         &config_snapshot,
@@ -310,7 +327,7 @@ where
     // The execution handoff is already owned by a detached task, so this
     // replayable metadata publication cannot strand the committed answer if
     // the Gold evaluator is cancelled while awaiting its runner/cache locks.
-    if let Some(event) = plan_mode_event {
+    if let Some(event) = plan_mode_event.filter(|_| !root_response) {
         publish_replayable_session_event(state, session_id, event).await;
     }
 

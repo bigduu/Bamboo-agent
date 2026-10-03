@@ -497,7 +497,8 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
 
         // Account-scoped durable change feed. It is initialized before the
         // Project tool surface so non-HTTP Project mutations publish the same
@@ -660,8 +661,8 @@ impl AppState {
                 .expect("agent runtime should be fully configured"),
         );
 
-        let child_completion_coordinator =
-            Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
+        let child_completion_coordinator = Arc::new(
+            bamboo_engine::ChildCompletionCoordinator::new(
                 storage.clone(),
                 persistence.clone(),
                 sessions.clone(),
@@ -673,7 +674,9 @@ impl AppState {
                 provider_router.clone(),
                 data_dir.clone(),
                 Some(account_sink.inbox()),
-            ));
+            )
+            .with_root_account_sink(account_sink.clone()),
+        );
         session_activation_router
             .set_spawner(child_completion_coordinator.clone())
             .await;
@@ -907,6 +910,7 @@ impl AppState {
             provider_registry.clone(),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
+            Some(account_sink.clone()),
             notification_relay_deps.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
@@ -1123,7 +1127,8 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
 
         // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
         // platforms (Telegram first). Fully inert when `config.connect.platforms`
@@ -1137,6 +1142,7 @@ impl AppState {
                 agent_runners.clone(),
                 session_event_senders.clone(),
                 Some(account_sink.inbox()),
+                Some(account_sink.clone()),
                 Some(data_dir.clone()),
                 config.clone(),
                 provider_registry.clone(),

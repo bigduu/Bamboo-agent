@@ -486,6 +486,15 @@ struct NoopChildRunner;
 
 #[async_trait::async_trait]
 impl bamboo_engine::execution::spawn::ExternalChildRunner for NoopChildRunner {
+    async fn validate_required_child_context_route(
+        &self,
+        _session: &Session,
+    ) -> Result<(), String> {
+        // This fixture admits local children without executing them. Named
+        // profiles use the same bookkeeping path with required context.
+        Ok(())
+    }
+
     async fn should_handle(&self, _session: &Session) -> bool {
         true
     }
@@ -7040,37 +7049,58 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     port.skip_successful_enqueue.store(true, Ordering::SeqCst);
     let tool = SubAgentTool::new(port.clone(), h.adapter.clone());
     let message = "  Analyze this complete task 🪷\n\nPreserve every instruction and the trailing whitespace.  ";
-    let result = invoke_completed(
-        &tool,
+    for (index, args) in [
         json!({"message":message}),
-        subagent_test_ctx(&h.parent_session_id, "compact-create"),
-    )
-    .await
-    .unwrap();
-    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-    let child_id = payload["actor_id"].as_str().unwrap();
-    assert_eq!(payload["observed_status"], "running_in_background");
-    assert_eq!(
-        port.last_admit_child_id.read().unwrap().as_deref(),
-        Some(child_id)
-    );
-    let child = h.storage.load_session(child_id).await.unwrap().unwrap();
-    assert_eq!(
-        child.parent_session_id.as_deref(),
-        Some(h.parent_session_id.as_str())
-    );
-    assert_eq!(child.metadata["assignment_prompt"], message);
-    assert!(child
-        .messages
-        .iter()
-        .any(|m| m.role == Role::User && m.content.contains(message)));
-    assert_eq!(
-        child.workspace.as_deref(),
-        Some(h.workspace_path.to_str().unwrap())
-    );
-    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
-    assert!(payload.get("child_session_id").is_none());
-    assert!(payload.get("runtime_kind").is_none());
+        json!({"intent":"chat", "role":"explorer", "target":"", "reply_to":"", "message":message}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = invoke_completed(
+            &tool,
+            args,
+            subagent_test_ctx(&h.parent_session_id, &format!("compact-create-{index}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("compact create variant {index} failed: {error}"));
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child_id = payload["actor_id"].as_str().unwrap();
+        assert_eq!(payload["observed_status"], "running_in_background");
+        assert_eq!(
+            port.last_admit_child_id.read().unwrap().as_deref(),
+            Some(child_id)
+        );
+        let child = h.storage.load_session(child_id).await.unwrap().unwrap();
+        assert_eq!(
+            child.parent_session_id.as_deref(),
+            Some(h.parent_session_id.as_str())
+        );
+        assert_eq!(child.metadata["assignment_prompt"], message);
+        // Named roles encode the complete task as JSON in their protected
+        // context packet; the generic worker keeps the literal assignment.
+        let visible_assignment = if index == 0 {
+            message.to_owned()
+        } else {
+            serde_json::to_string(message).unwrap()
+        };
+        assert!(child
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains(&visible_assignment)));
+        if index == 1 {
+            assert_eq!(child.subagent_type().as_deref(), Some("explorer"));
+            assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
+            assert!(child_session::named_profile::has_named_profile(&child));
+            child_session::named_profile::validate_named_profile(&child).unwrap();
+        }
+        assert_eq!(
+            child.workspace.as_deref(),
+            Some(h.workspace_path.to_str().unwrap())
+        );
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        assert!(payload.get("child_session_id").is_none());
+        assert!(payload.get("runtime_kind").is_none());
+    }
     let schema = tool.parameters_schema();
     assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
     assert!(schema["properties"].get("action").is_none());

@@ -2469,13 +2469,20 @@ mod tests {
     fn local_completion_preserves_message_data_and_refuses_provider_state() {
         let mut session = Session::new("local-completion", "model");
         session.add_message(Message::user("full canonical input"));
-        session.add_message(Message::assistant("complete", None));
+        let reasoning = "Plain assistant reasoning 🪷\nThe second line remains complete.";
+        session.add_message(Message::assistant_with_reasoning(
+            "complete",
+            None,
+            Some(reasoning.into()),
+        ));
         let before = serde_json::to_value(&session).unwrap();
         let data = local_tool_completion(&session).unwrap();
+        let messages = data.validate().unwrap();
         assert_eq!(
-            serde_json::to_value(data.validate().unwrap()).unwrap(),
-            before["messages"]
+            messages.last().unwrap().reasoning.as_deref(),
+            Some(reasoning)
         );
+        assert_eq!(serde_json::to_value(&messages).unwrap(), before["messages"]);
         session.append_provider_transcript_group(session.messages[0].id.clone(), None, vec![
             bamboo_domain::session::provider_transcript::ProviderTranscriptItem::try_from_payload(
                 bamboo_domain::ProviderFamily::OpenAi,
@@ -2490,6 +2497,10 @@ mod tests {
         session.messages.last_mut().unwrap().reasoning_signature = Some("opaque".into());
         assert!(local_tool_completion(&session).is_err());
         assert_eq!(session.messages[0].content, "full canonical input");
+        assert_eq!(
+            session.messages.last().unwrap().reasoning.as_deref(),
+            Some(reasoning)
+        );
     }
 
     #[test]
@@ -3728,6 +3739,401 @@ mod tests {
             serde_json::to_value(binding.assignment_message()).unwrap(),
         ];
         run
+    }
+
+    const LOCAL_HISTORY_READ_TEXT: &str = "FULL_READ_FIRST 🪷\nFULL_READ_LAST 🪷\n";
+    const LOCAL_HISTORY_REASONING: &str =
+        "Inspect the complete bounded fixture before reporting 🪷.";
+    const LOCAL_HISTORY_REPORT: &str = "Read both fixture lines; complete evidence retained 🪷.";
+
+    struct LocalHistoryReadProvider {
+        file_path: PathBuf,
+        with_reasoning: bool,
+        calls: std::sync::Mutex<
+            Vec<(
+                Vec<Message>,
+                Vec<String>,
+                Option<bamboo_domain::ReasoningEffort>,
+            )>,
+        >,
+    }
+
+    impl LocalHistoryReadProvider {
+        fn response(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            effort: Option<bamboo_domain::ReasoningEffort>,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            let mut calls = self.calls.lock().unwrap();
+            let round = calls.len();
+            calls.push((
+                messages.to_vec(),
+                tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect(),
+                effort,
+            ));
+            drop(calls);
+            let mut chunks: Vec<bamboo_llm::provider::Result<LLMChunk>> = Vec::new();
+            match round {
+                0 => {
+                    if self.with_reasoning {
+                        chunks.push(Ok(LLMChunk::ReasoningToken(LOCAL_HISTORY_REASONING.into())));
+                    }
+                    chunks.push(Ok(LLMChunk::Token("Reading the bounded fixture.".into())));
+                    chunks.push(Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                        id: "local-history-read".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_domain::FunctionCall {
+                            name: "Read".into(),
+                            arguments: serde_json::json!({"file_path": self.file_path}).to_string(),
+                        },
+                    }])));
+                }
+                1 => chunks.push(Ok(LLMChunk::Token(LOCAL_HISTORY_REPORT.into()))),
+                _ => panic!("local history fixture unexpectedly requested round {round}"),
+            }
+            chunks.push(Ok(LLMChunk::Done));
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for LocalHistoryReadProvider {
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&bamboo_llm::provider::LLMRequestOptions>,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.response(
+                messages,
+                tools,
+                options.and_then(|options| options.reasoning_effort),
+            )
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.response(messages, tools, None)
+        }
+    }
+
+    // Reproduce the worker contract selected for a named local explorer: strict
+    // assignment, immutable Read/Glob ceiling, read-only audit and per-Run effort.
+    // Catalog selection belongs to Host tests; these runs use the real SDK loop,
+    // builtin Read, isolated persistence, event forwarding and completion encoder.
+    async fn strict_local_history_read_fixture(
+        with_reasoning: bool,
+    ) -> (
+        tempfile::TempDir,
+        BambooRuntimeExecutor,
+        Arc<SessionStoreV2>,
+        Arc<LocalHistoryReadProvider>,
+        RunSpec,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("assigned.txt");
+        tokio::fs::write(&file_path, LOCAL_HISTORY_READ_TEXT)
+            .await
+            .unwrap();
+        let store = Arc::new(
+            SessionStoreV2::new(temp.path().join("worker"))
+                .await
+                .unwrap(),
+        );
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let provider = Arc::new(LocalHistoryReadProvider {
+            file_path,
+            with_reasoning,
+            calls: Default::default(),
+        });
+        let mut executor = worker_executor_for_store(provider.clone(), store.clone(), inbox).await;
+        let id = if with_reasoning {
+            "reasoning-explorer"
+        } else {
+            "plain-explorer"
+        };
+        let mut run = required_packet_run(id, false);
+        run.reasoning_effort = Some("max".into());
+        let identity = run.logical_session.as_ref().unwrap();
+        let birth = identity.creation.as_ref().unwrap();
+        let ceiling = bamboo_subagent::proto::NativeToolCeiling {
+            version: 1,
+            child_session_id: identity.session_id.clone(),
+            parent_session_id: identity.parent_session_id.clone().unwrap(),
+            root_session_id: identity.root_session_id.clone(),
+            created_at: birth.created_at,
+            spawn_depth: birth.spawn_depth,
+            project_id: run.project_id.clone(),
+            tools: vec!["Glob".into(), "Read".into()],
+        };
+        let mut spec = spec_with(
+            "openai",
+            "unused-fixture-key",
+            Some(("openai", "test-model")),
+        );
+        spec.identity.child_id = id.into();
+        spec.identity.parent_id = identity.parent_session_id.clone();
+        spec.identity.role = "explorer".into();
+        spec.identity.depth = birth.spawn_depth;
+        spec.storage_dir = Some(temp.path().join("worker").to_string_lossy().into_owned());
+        spec.workspace = Some(temp.path().to_string_lossy().into_owned());
+        spec.capabilities.required_child_context = true;
+        spec.capabilities.child_creation_identity = true;
+        spec.capabilities.native_tool_ceiling_required = true;
+        spec.capabilities.native_tool_ceiling = Some(ceiling.clone());
+        spec.capabilities.enforce_permissions = true;
+        spec.capabilities.read_only = true;
+        spec.capabilities.auto_approve_permissions = true;
+        spec.capabilities.permission_requested_mode = "auto".into();
+        spec.capabilities.permission_effective_mode = "plan".into();
+        validate_native_startup(&spec).unwrap();
+        assert!(matches!(
+            spec.placement,
+            bamboo_subagent::provision::Placement::Local
+        ));
+        assert_eq!(spec.identity.role, "explorer");
+        assert!(ceiling.matches_run(&run));
+        assert!(bamboo_subagent::proto::LocalToolMessages::supports_tools(
+            &ceiling.tools,
+            true
+        ));
+
+        let permission = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+        permission.set_confirm_threshold(bamboo_tools::permission::RiskLevel::High);
+        let checker = Arc::new(bamboo_tools::permission::ReadOnlyCommandChecker::new(
+            Arc::new(bamboo_tools::permission::ConfigPermissionChecker::new(
+                permission.clone(),
+            )),
+        ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::new_with_permissions(checker)
+                .with_native_tool_ceiling(ceiling.tools.clone())
+                .unwrap(),
+        );
+        let denied_path = temp.path().join("denied.txt");
+        let denied = tools
+            .execute(&ToolCall {
+                id: "denied-write".into(),
+                tool_type: "function".into(),
+                function: bamboo_domain::FunctionCall {
+                    name: "Write".into(),
+                    arguments: serde_json::json!({"file_path":denied_path,"content":"forbidden"})
+                        .to_string(),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("native_tool_ceiling_denied"));
+        assert!(!denied_path.exists());
+
+        executor.run_tools = Some(tools);
+        executor.workspace = spec.workspace;
+        executor.provisioned_permission =
+            provisioned_permission_resolution(&spec.capabilities).unwrap();
+        executor.permission_config = Some(permission);
+        executor.read_only_child = true;
+        executor.required_child_context = true;
+        executor.child_creation_identity = true;
+        executor.native_tool_ceiling = Some(ceiling);
+        executor.local_tool_history = true;
+        (temp, executor, store, provider, run)
+    }
+
+    async fn assert_strict_local_history_read(with_reasoning: bool) {
+        use bamboo_subagent::proto::{ActorEventBatcher, ChildFrame, LocalToolMessages};
+        let (temp, executor, _store, provider, run) =
+            strict_local_history_read_fixture(with_reasoning).await;
+        let id = run.logical_session.as_ref().unwrap().session_id.clone();
+        let prefix: Vec<Message> = run
+            .messages
+            .iter()
+            .cloned()
+            .map(|message| serde_json::from_value(message).unwrap())
+            .collect();
+        let (sink, mut receiver) = EventSink::channel();
+        let capture = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            executor.run(
+                run.clone(),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("strict local Read round trip must finish");
+        let events = capture.await.unwrap();
+        let cold_store = SessionStoreV2::new(temp.path().join("worker"))
+            .await
+            .unwrap();
+        let saved = cold_store.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(saved.kind, SessionKind::Child);
+        assert_eq!(
+            saved.root_thinking_mode(),
+            bamboo_domain::RootThinkingMode::Standard
+        );
+        assert_eq!(
+            saved.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Max)
+        );
+        assert!(saved.agent_runtime_state.as_ref().unwrap().read_only);
+        assert!(bamboo_domain::ChildContextBinding::from_session(&saved)
+            .unwrap()
+            .is_some());
+        assert!(saved.provider_transcript.is_empty());
+        let expected_prefix: Vec<_> = prefix
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .collect();
+        let transcript: Vec<_> = saved
+            .messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .collect();
+        assert_eq!(transcript.len(), expected_prefix.len() + 3);
+        assert_eq!(
+            serde_json::to_value(&transcript[..expected_prefix.len()]).unwrap(),
+            serde_json::to_value(&expected_prefix).unwrap()
+        );
+        let assistant = transcript[expected_prefix.len()];
+        assert_eq!(assistant.role, Role::Assistant);
+        assert_eq!(assistant.content, "Reading the bounded fixture.");
+        assert_eq!(
+            assistant.reasoning.as_deref(),
+            with_reasoning.then_some(LOCAL_HISTORY_REASONING)
+        );
+        assert!(assistant.reasoning_signature.is_none());
+        let calls = assistant.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "local-history-read");
+        assert_eq!(calls[0].function.name, "Read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            serde_json::json!({"file_path":provider.file_path})
+        );
+        let result = transcript[expected_prefix.len() + 1];
+        assert_eq!(result.role, Role::Tool);
+        assert_eq!(result.tool_call_id.as_deref(), Some("local-history-read"));
+        assert_eq!(result.tool_success, Some(true));
+        assert!(result.content.contains("FULL_READ_FIRST 🪷"));
+        assert!(result.content.contains("FULL_READ_LAST 🪷"));
+        assert_eq!(transcript.last().unwrap().content, LOCAL_HISTORY_REPORT);
+        assert!(transcript.last().unwrap().tool_calls.is_none());
+
+        let requests = provider.calls.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (_, tools, effort) in requests.iter() {
+            assert_eq!(
+                tools.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+                ["Glob", "Read"].into_iter().collect()
+            );
+            assert_eq!(*effort, Some(bamboo_domain::ReasoningEffort::Max));
+        }
+        assert!(requests[1]
+            .0
+            .iter()
+            .any(|message| message.id == result.id && message.content == result.content));
+        drop(requests);
+        assert_eq!(
+            events.first().unwrap()["type"],
+            "permission_posture_activated"
+        );
+        let read_start = events
+            .iter()
+            .position(|event| event["type"] == "tool_start")
+            .unwrap();
+        let reasoning = events
+            .iter()
+            .position(|event| event["type"] == "reasoning_token");
+        assert_eq!(reasoning.is_some(), with_reasoning);
+        if let Some(index) = reasoning {
+            assert!(index < read_start);
+            assert_eq!(events[index]["content"], LOCAL_HISTORY_REASONING);
+        }
+        let read_complete = events
+            .iter()
+            .find(|event| event["type"] == "tool_complete")
+            .unwrap();
+        let typed: AgentEvent = serde_json::from_value(read_complete.clone()).unwrap();
+        let AgentEvent::ToolComplete {
+            tool_call_id,
+            result: observed,
+        } = typed
+        else {
+            unreachable!()
+        };
+        assert_eq!(tool_call_id, "local-history-read");
+        assert_eq!(observed.result, result.content);
+        assert!(observed.success);
+
+        let mut batcher = ActorEventBatcher::for_run(&run, None, Some("fixture-worker".into()));
+        let mut batches = Vec::new();
+        for event in &events {
+            batches.extend(batcher.push(event.clone()));
+        }
+        batches.extend(batcher.flush());
+        let mut next = 1;
+        let mut decoded = Vec::new();
+        for batch in batches {
+            batch.validate().unwrap();
+            assert_eq!(batch.first_seq, next);
+            next = batch.last_seq + 1;
+            let wire = ChildFrame::EventBatch { batch }.to_text();
+            let ChildFrame::EventBatch { batch } = ChildFrame::from_text(&wire).unwrap() else {
+                unreachable!()
+            };
+            decoded.extend(batch.events);
+        }
+        assert_eq!(
+            decoded, events,
+            "the real wire encoder must retain every event"
+        );
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == LocalToolMessages::TYPE)
+            .collect();
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.result.as_deref(), Some(LOCAL_HISTORY_REPORT));
+        assert_eq!(completions.len(), 1);
+        let completion: LocalToolMessages = serde_json::from_value(completions[0].clone()).unwrap();
+        let messages = completion.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::to_value(&saved.messages).unwrap(),
+            "completion DATA must preserve the entire cold worker history"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_local_history_plain_read_preserves_complete_worker_messages_and_events() {
+        assert_strict_local_history_read(false).await;
+    }
+
+    #[tokio::test]
+    async fn strict_local_history_reasoning_read_preserves_complete_worker_history_on_completion() {
+        assert_strict_local_history_read(true).await;
     }
 
     #[tokio::test]
