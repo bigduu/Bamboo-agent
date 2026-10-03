@@ -207,3 +207,23 @@ and confirm that the unrelated conditional B clause does not block explicit A
 approval. This extends the existing review's conditional approval/acceptance
 fix; it adds no model dispatcher or new paid model evaluation.
 Evidence: `../1481-evidence/1481-macbook-semantic-context-9c485842-status.json`.
+
+## Exact Work/request title boundary closeout
+
+The negative-only fixture on unchanged 6f500e4c reproduced a wrong approval:
+`批准 CA` committed the current A request. The validator now matches complete
+Work/request/submission references, rejecting prefix/suffix fragments and a
+short title contained in a different known longer title. Explicit no-space
+Chinese clauses such as `批准A` and `确认验收A` remain supported. Uncertain
+references require clarification; no semantic dispatcher or authority expands.
+The reproduction remains as a failure log, and the complete changed semantic
+suite passes 20/20 with format and strict all-target Ticket Clippy.
+Evidence: `../1481-evidence/1481-macbook-title-repro-6f500e4c-status.json` and
+`../1481-evidence/1481-macbook-title-guard-6f500e4c-status.json`.
+
+The single full affected workspace run at 6f500e4c completed unchanged with
+9,919 passes, zero failures, 154 ignored cases across 154 targets; analytics is
+excluded and live-model tests are ignored. That exact-head evidence is retained.
+This later two-source-file guard has its own focused regression above; the
+complete workspace is not rerun or claimed for the later head. Final actual
+Lotus/Host browser validation follows against the guard commit.

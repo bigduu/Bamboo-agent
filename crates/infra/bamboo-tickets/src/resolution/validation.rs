@@ -178,6 +178,47 @@ fn explicit_amount_matches(text: &str, amount: Option<&str>) -> bool {
             == amount.trim().to_lowercase()
 }
 
+fn exact_name(text: &str, name: &str) -> bool {
+    let reference_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-');
+    text.match_indices(name).any(|(offset, _)| {
+        let before = &text[..offset];
+        let after = &text[offset + name.len()..];
+        let left = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !reference_char(c))
+            || [
+                "批准",
+                "同意",
+                "确认验收",
+                "验收通过",
+                "接受交付",
+                "接受成果",
+            ]
+            .contains(&before.trim());
+        left && after.chars().next().is_none_or(|c| !reference_char(c))
+    })
+}
+
+fn names_work(snapshot: &Snapshot, quote: &str, work: &Ticket) -> bool {
+    if exact_name(quote, &work.id) {
+        return true;
+    }
+    let title = &work.contract.title;
+    snapshot
+        .tickets
+        .values()
+        .filter(|other| &other.contract.title == title)
+        .count()
+        == 1
+        && exact_name(quote, title)
+        && !snapshot.tickets.values().any(|other| {
+            other.id != work.id
+                && other.contract.title.contains(title)
+                && quote.contains(&other.contract.title)
+        })
+}
+
 fn approval_text(
     snapshot: &Snapshot,
     record: &HumanIngressRecord,
@@ -185,14 +226,8 @@ fn approval_text(
     q: &PendingRequest,
     approve: bool,
 ) -> Result<()> {
-    let title = &snapshot.tickets[&q.work_id].contract.title;
-    let same_title = snapshot
-        .tickets
-        .values()
-        .filter(|t| &t.contract.title == title)
-        .count();
-    let exact_id = quote.contains(&q.work_id) || quote.contains(&q.id);
-    if !(exact_id || same_title == 1 && quote.contains(title)) {
+    let work = &snapshot.tickets[&q.work_id];
+    if !(exact_name(quote, &q.id) || names_work(snapshot, quote, work)) {
         return Err(clarify(
             "approval must identify one exact current Work/request",
         ));
@@ -294,15 +329,7 @@ fn acceptance_text(
         return Ok(());
     }
     let title = &work.contract.title;
-    let named = quote.contains(&work.id)
-        || quote.contains(submission)
-        || snapshot
-            .tickets
-            .values()
-            .filter(|w| &w.contract.title == title)
-            .count()
-            == 1
-            && quote.contains(title);
+    let named = names_work(snapshot, quote, work) || exact_name(quote, submission);
     let complete = record
         .text
         .split(['，', ',', '；', ';', '。', '\n'])

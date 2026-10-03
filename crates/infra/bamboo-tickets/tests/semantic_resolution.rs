@@ -204,6 +204,7 @@ fn zero_operation_chitchat_and_exact_source_survive_cold_replay_without_regenera
 fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_acceptance() {
     let (_dir, service) = fixture();
     let work = create(&service, "A");
+    let _other = create(&service, "A/B");
     let assignment = execute(
         &service,
         "start-accept",
@@ -262,6 +263,11 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
     let submission = service.execute(&worker, &submit).unwrap().ids["s"].clone();
     for (i, (text, quote)) in [
         "A 做得不错",
+        "I accept CA",
+        "接受交付 A/B",
+        "I accept AA",
+        "接受交付 CA",
+        "验收通过 A1",
         "不要确认验收 A",
         "如果符合要求就确认验收 A",
         "例如确认验收 A",
@@ -286,7 +292,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         ("If CI passes, I accept A", "I accept A"),
         ("I accept A, when CI passes", "I accept A"),
         ("例如，确认验收 A", "确认验收 A"),
-        ("确认验收 A", "确认验收 A"),
+        ("确认验收A", "确认验收A"),
     ])
     .enumerate()
     {
@@ -308,7 +314,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         let result = service.settle_message(&human(), &id).unwrap();
         assert_eq!(
             result.groups[0].status,
-            if text == "确认验收 A" {
+            if text == "确认验收A" {
                 ResolutionStatus::Committed
             } else {
                 ResolutionStatus::NeedsClarification
@@ -316,7 +322,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         );
         assert_eq!(
             service.published().unwrap().1.tickets[&work].state,
-            if text == "确认验收 A" {
+            if text == "确认验收A" {
                 WorkState::Accepted
             } else {
                 WorkState::Submitted
@@ -697,6 +703,11 @@ fn saved_group_replays_after_restart_without_regenerating_proposal_or_dispatch_i
 fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_action() {
     for (text, quote) in [
         ("可以", "可以"),
+        ("批准 CA", "批准 CA"),
+        ("批准 A/B", "批准 A/B"),
+        ("批准 AA", "批准 AA"),
+        ("批准 A1", "批准 A1"),
+        ("I approve CA", "I approve CA"),
         ("如果审计通过，批准 A", "批准 A"),
         ("批准 A，如果审计通过", "批准 A"),
         ("If finance confirms, I approve A", "I approve A"),
@@ -735,6 +746,7 @@ fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_actio
     ] {
         let (_dir, service) = fixture();
         let a = create(&service, "A");
+        let _other = create(&service, "A/B");
         let b = create(&service, "B");
         let qa = ask(&service, &a, "A", true);
         let qb = ask(&service, &b, "B", true);
@@ -754,6 +766,32 @@ fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_actio
         assert_eq!(snapshot.requests[&qa.id].status, RequestStatus::Open);
         assert_eq!(snapshot.requests[&qb.id].status, RequestStatus::Open);
     }
+}
+
+#[test]
+fn partial_canonical_request_id_cannot_authorize_an_exact_current_request() {
+    let (_dir, service) = fixture();
+    let work = create(&service, "A");
+    let q = ask(&service, &work, "A", true);
+    let text = format!("I approve {}_old", q.id);
+    register(&service, "partial-id", 1, &text);
+    save(
+        &service,
+        "partial-id",
+        vec![group("approve", &text, vec![decision(&q, true)])],
+    );
+    assert_eq!(
+        service
+            .settle_message(&human(), "partial-id")
+            .unwrap()
+            .groups[0]
+            .status,
+        ResolutionStatus::NeedsClarification
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&q.id].status,
+        RequestStatus::Open
+    );
 }
 
 #[test]
@@ -827,11 +865,11 @@ fn explicit_approval_a_never_releases_b_and_explicit_denial_remains_distinct() {
     let b = create(&service, "B");
     let qa = ask(&service, &a, "A", true);
     let qb = ask(&service, &b, "B", true);
-    register(&service, "approve-a", 1, "如果审计通过，批准 B；批准 A");
+    register(&service, "approve-a", 1, "如果审计通过，批准 B；批准A");
     save(
         &service,
         "approve-a",
-        vec![group("a", "批准 A", vec![decision(&qa, true)])],
+        vec![group("a", "批准A", vec![decision(&qa, true)])],
     );
     assert_eq!(
         service
