@@ -227,3 +227,17 @@ excluded and live-model tests are ignored. That exact-head evidence is retained.
 This later two-source-file guard has its own focused regression above; the
 complete workspace is not rerun or claimed for the later head. Final actual
 Lotus/Host browser validation follows against the guard commit.
+
+## Final actual browser verification
+
+Actual Host and built Lotus acceptance pass at backend 39bb3272 and frontend
+291363e1: Host 1/1, Playwright 1/1, E/B/D/A/C correctly answered, five current
+generation-2 submissions, stale approval status 422, and no browser errors.
+The test binary and bundle hashes are recorded in
+`../1481-evidence/1481-macbook-final-browser-status.json`; source stayed clean.
+This completes the supported local closure. Complete Rust regression remains
+correctly attributed to 6f500e4c, with the later title/ID guard's 20-case focused
+and strict-Clippy results recorded separately. A subsequent documentation-only
+commit does not change the tested backend or frontend. Fresh current-head
+backend independent/model evaluation is unrun; defaults remain off and no
+remote operation was performed.

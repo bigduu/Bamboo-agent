@@ -1,5 +1,7 @@
 # Supervisor tickets implementation ledger (#1481)
 
+Current supported-scope closeout: see [2026-10-03 final local closeout](#2026-10-03-final-local-closeout). Earlier sections retain dated checkpoint status.
+
 ## P0 baseline (2026-10-02)
 
 Isolated checkout: `/Users/bigduu/Documents/Codex/2026-10-02/task/bamboo-1481`.
@@ -821,8 +823,10 @@ claim completion of the general Root/runtime writer/ACK/release protocol.
 P0–P8 have the local evidence recorded above. Task-only and bounded native
 coding P9 paths have actual Runtime evidence. The bounded plain historical Root
 import now consumes stable #1501 ownership ports and has real Host/CLI evidence.
-The final integrated current-head regression and browser check are pending;
-independent backend review is not rerun under the no-new-paid-agent constraint.
+The complete affected regression passes at 6f500e4c (9,919/0/154 ignored).
+The later exact-reference guard passes its 20-case focused suite and strict
+Clippy, and actual current backend 39bb3272 / Lotus 291363e1 browser checks pass.
+Independent backend review is not rerun under the no-new-paid-agent constraint.
 Default mutation and dispatch remain off. Unsupported historical execution
 requires its existing ownership reconciliation; it is never auto-adopted.
 No push, PR, merge or deployment is authorized.
@@ -926,3 +930,81 @@ stop. A safe operator interface to reconcile/release these file effects is not
 implemented; no Worker JSON or automatic retry may clear them. This is a recovery
 limitation, not an external exactly-once guarantee. Full workspace completion and
 current Lotus bundle/browser acceptance still await their final logs.
+
+## 2026-10-03 final local closeout
+
+Implementation is complete for the supported opt-in single-local-writer scope.
+Mutation and dispatch defaults remain off. No push, PR, Git merge, deployment,
+production migration or persistent permission/credential change was performed.
+
+The implementation worktree is
+`/Users/bigduu/Documents/Codex/2026-10-02/task/bamboo-1481-file-reconciliation`,
+branch `bamboo/feat/1481-file-reconciliation`, code commit `39bb3272`. Lotus is
+`lotus-1481-ticket-overview`, branch `lotus-next/feat/1481-ticket-overview`,
+commit `291363e1`. The following documentation commit changes no tested code.
+Reuse #1479/#1480 baseline 685328ec and merged #1501 stable ownership dependency
+fbf9067a; the one-parent local patch preserves existing owner implementations.
+
+| Phase | Supported implementation and evidence |
+| --- | --- |
+| P0 | Isolated branches/worktrees, owner inventory and frozen interface/identity audit. |
+| P1–P2 | Separate version axes, full immutable revisions/manifest/commit, unique HEAD, process writer lock, receipt-before-CAS, failure/quarantine/recovery and exact import/transfer. |
+| P3–P4 | Private worker LocalPlan, scoped ordinary/native tools, exact questions/approval/submission and independent Work/Goal acceptance; old Task compatibility. |
+| P5 | Existing deterministic Runtime admission/query, stable dispatch key, owned-stop/resource/effect fencing and complete Inbox result collection. |
+| P6 | Fixed-snapshot bounded reads, explicit coverage/omissions, context contracts and cursor resync. |
+| P7 | Durable zero-to-many semantic operations and per-group outcomes; conservative exact Human approval/acceptance proof, conditional/amount/reference negatives. |
+| P8 | Negotiated composer, shared ingress lock and activation recovery, many pending cards, stale/budget/connection safeguards. |
+| P9 | Actual Host/native/CLI/browser five-worker flow, exit windows, restart, explicit needs-review historical import, retired-source/new-epoch migration and opt-in rollback. |
+
+A1–A12 have passing evidence in the bounded scope described in the matrix
+above. Runtime process fixtures use a deterministic synthetic provider. Actual
+model proposal evaluation is separate and never stands in for those processes.
+
+| Check | Exact implementation tag | Result |
+| --- | --- | --- |
+| Complete affected Rust workspace with runtime fixtures/test-utils, excluding analytics | 6f500e4c | 154 targets; 9,919 pass, 0 fail, 154 ignored; source unchanged. Includes 50 named coordinator/ownership tests, actual four-Actor/two-round and complete five-worker/native/exit/migration flows. |
+| Later exact-name/request-ID guard, including reproduced CA-to-A failure | 39bb3272 (verified source overlay) | 20 semantic pass; fmt and strict all-target Ticket Clippy pass. Full workspace was not rerun at this later head. |
+| A12 historical Root + offline compatibility + actual migration/rollback | 9c485842 verified overlay, also included in 6f500e4c workspace | 1 + 4 + 2 pass; old completed is blocked needs-review with no accepted Submission; exact original Actor survives replay/restart. |
+| Lotus unit/types/lint/architecture | d1ac2aae production/test bytes retained by 291363e1 | 2,073 pass in 123 files; focused 107 pass; other checks pass. |
+| Lotus clean build/package and completed independent read-only review | 291363e1 | Build/package pass, sourceDirty=false, zero review findings; original budgets unchanged. |
+| Actual Host + built Lotus browser | 39bb3272 / 291363e1 | Host 1/1 and Playwright 1/1 pass; E/B/D/A/C, five generation-2 submitted, stale approval 422, no browser errors. |
+| Earlier live gpt-6-sol synthetic proposal-only evaluation | 32d6e4a | 12/12 pass, zero fixture wrong approvals; no Runtime/provider action executed. Current-head live evaluation and fresh backend model review are UNRUN. |
+
+The 6f500e4c full-workspace result is not relabelled as a later-head run. The
+later difference is only two semantic source/test files plus documentation;
+that change has focused validation and the fresh built browser/Host evidence.
+Initial compile/fixture/package/lint failures and the reproduced wrong approval
+remain in the evidence directory. The earlier workspace run's three failures
+were fixed; the new complete run has zero failures.
+
+Evidence is in `../1481-evidence/1481-final-closeout.json`, including commit,
+source, bundle/binary hashes and pass/fail/unrun provenance. Browser detail is
+`p9-ui-2913-39bb3272.done`; the external APFS compilation cache remained
+`/Volumes/WD_BLACK/rust-cache/targets/bamboo-1481-68729dad737c` with unchanged
+global cache settings.
+
+Runnable isolated acceptance (never a production data directory):
+
+```sh
+cargo test -p bamboo-agent --features ticket-runtime-fixtures --test ticket_offline_runtime --locked -- --nocapture
+cargo test -p bamboo-agent --features ticket-runtime-fixtures --test ticket_runtime_files --locked -- --nocapture
+# Browser fixture: choose a fresh info path and start this from the Bamboo repo.
+BAMBOO_TICKET_FIXTURE_STATIC_DIR=/private/tmp/lotus-1481-acceptance-54b22c7/dist \
+BAMBOO_TICKET_FIXTURE_INFO=/tmp/ticket-1481-new-run.json \
+cargo test -p bamboo-agent --test ticket_browser_fixture --locked current_lotus_five_native_questions_browser_fixture -- --ignored --exact --nocapture --test-threads=1
+# In a second terminal from the built Lotus acceptance checkout:
+LOTUS_TICKET_FIXTURE_INFO=/tmp/ticket-1481-new-run.json \
+npm exec --offline -- playwright test --config=playwright.tickets.config.ts
+```
+
+CLI entrypoints are `bamboo tickets preview`, reviewed `attach`/`import`,
+`backup`, `migration-plan`/`migrate` and `file-reconcile-plan`/`file-reconcile`.
+Hosts/owned execution must be stopped and unknown effects reconciled before an
+authorized writable transfer. A plain completed historical Root imports only
+immutable history; unsupported tool/native/compacted/active/unknown history
+stays read-only. Generic resident/native/remote continuation, distributed or
+200-way production concurrency, no-downtime authority moves, analytics, actual
+power-loss and arbitrary external actions remain unrun/deferred. External
+side-effects are not claimed exactly once. Structured validity does not prove
+substantive delivery quality; user-required Work and Goal acceptance still
+need their own evidence.
