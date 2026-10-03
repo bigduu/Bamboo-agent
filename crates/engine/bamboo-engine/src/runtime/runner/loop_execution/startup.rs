@@ -188,11 +188,12 @@ pub(super) async fn initialize_loop_state(
         // An interrupted wait remains durable during this reasoning turn.
         // The inbox coordinator prepares an explicit interruption by clearing
         // the suspension and setting Idle while retaining the existing wait.
-        // Preserve that exact lease, including an untagged safety-net wait;
-        // ordinary Suspended untagged waits still follow the startup cleanup.
-        let prepared_wait_interrupt = previous.status == AgentStatusState::Idle
-            && previous.suspension.is_none()
-            && session.last_run_status().as_deref() == Some("suspended");
+        // Preserve that exact lease, including an untagged safety-net wait.
+        // The previous run can have ended by cancellation or error: its
+        // terminal label does not undo the coordinator's prepared interruption.
+        // Ordinary Suspended untagged waits still follow the startup cleanup.
+        let prepared_wait_interrupt =
+            previous.status == AgentStatusState::Idle && previous.suspension.is_none();
         runtime_state.waiting_for_children = previous
             .waiting_for_children
             .as_ref()
@@ -460,7 +461,13 @@ mod tests {
         use bamboo_agent_core::storage::Storage;
         use bamboo_domain::{ChildWaitPolicy, WaitingForChildrenState};
 
-        for (tagged, prepared_interrupt) in [(true, false), (false, false), (false, true)] {
+        for (tagged, prepared_interrupt, last_status) in [
+            (true, false, "suspended"),
+            (false, false, "suspended"),
+            (false, true, "suspended"),
+            (false, true, "cancelled"),
+            (false, true, "error"),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let skills_dir = directory.path().join("skills");
             std::fs::create_dir_all(&skills_dir).unwrap();
@@ -495,9 +502,7 @@ mod tests {
             if tagged {
                 wait.registered_by_tool_call_id = Some("original-tool-call".into());
             }
-            if prepared_interrupt {
-                session.set_last_run_status("suspended");
-            }
+            session.set_last_run_status(last_status);
             let runtime = session.agent_runtime_state.get_or_insert_default();
             runtime.status = if prepared_interrupt {
                 AgentStatusState::Idle
@@ -531,7 +536,11 @@ mod tests {
                 session.agent_runtime_state.as_ref().unwrap(),
                 saved.agent_runtime_state.as_ref().unwrap(),
             ] {
-                assert_eq!(runtime.waiting_for_children.as_ref(), expected);
+                assert_eq!(
+                    runtime.waiting_for_children.as_ref(),
+                    expected,
+                    "prepared={prepared_interrupt}, tagged={tagged}, last_status={last_status}"
+                );
                 assert!(runtime.suspension.is_none());
             }
             assert_eq!(state.runtime_state.status, AgentStatusState::Running);
