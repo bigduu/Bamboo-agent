@@ -16,10 +16,10 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    create_event_forwarder_with_history_commit_barrier, finalize_runner, reserve_runner_core,
-    reserve_session_execution, spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion,
-    ChildCompletionHandler, ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
+    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ReserveOutcome,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -625,6 +625,7 @@ pub struct ChildCompletionCoordinator {
     provider_router: Arc<ProviderModelRouter>,
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
+    root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
@@ -637,6 +638,11 @@ pub struct ChildCompletionCoordinator {
 }
 
 impl ChildCompletionCoordinator {
+    pub fn with_root_account_sink(mut self, sink: Arc<crate::events::AccountEventSink>) -> Self {
+        self.root_account_sink = Some(sink);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn Storage>,
@@ -663,6 +669,7 @@ impl ChildCompletionCoordinator {
             provider_router,
             app_data_dir,
             account_feed_inbox,
+            root_account_sink: None,
             root_tools: Arc::new(RwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
@@ -1294,6 +1301,34 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             return;
         }
 
+        if self
+            .agent
+            .persistence()
+            .root_actor_execution_required(&session)
+            && self.root_account_sink.is_none()
+        {
+            tracing::warn!(%session_id, "Root resume has no actual account sink; rejecting before Actor claim");
+            execution_reservation.abandon().await;
+            return;
+        }
+        if let Err(error) = execution_reservation
+            .bind_root_actor(&self.agent, &session)
+            .await
+        {
+            tracing::warn!(%session_id, %error, "Root coordinator resume Actor binding rejected");
+            execution_reservation.abandon().await;
+            return;
+        }
+        let root_publication = execution_reservation.root_actor_writer().map(|owner| {
+            crate::events::RootActorEventPublication::new(
+                self.storage.clone(),
+                self.root_account_sink
+                    .clone()
+                    .expect("required Root actual account sink checked before claim"),
+                owner,
+            )
+        });
+
         let Some(root_tools) = self.root_tools.read().await.clone() else {
             tracing::error!(%session_id, "cannot resume parent after child completion: root tool surface is not initialized");
             return;
@@ -1376,12 +1411,13 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .or(config.gold_config.clone());
 
         let (mpsc_tx, _forwarder, history_commit_barrier) =
-            create_event_forwarder_with_history_commit_barrier(
+            crate::execution::create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
                 event_sender,
                 self.agent_runners.clone(),
                 self.account_feed_inbox.clone(),
+                root_publication,
             );
 
         let config_handle = self.config.clone();
@@ -1648,7 +1684,7 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         let run_id = reservation.run_id.clone();
         let launch = match launch_plan {
             LaunchPlan::Root(config) => {
-                let execution_reservation =
+                let mut execution_reservation =
                     SessionExecutionReservation::from_activation_placeholder(
                         target_session_id,
                         reservation,
@@ -1658,6 +1694,17 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             .clone(),
                         self.agent_runners.clone(),
                     );
+                // Busy must reach the router before it commits a launched
+                // generation. Its existing recovery backoff can then retry the
+                // durable input when the old Host's actual lease expires.
+                if self.agent.persistence().root_actor_execution_required(&session) && self.root_account_sink.is_none() {
+                    execution_reservation.rollback_unpublished_activation().await;
+                    return Err(bamboo_domain::SessionActivationError::Internal("Root activation has no actual account sink".into()));
+                }
+                if let Err(error) = execution_reservation.bind_root_actor(&self.agent, &session).await {
+                    execution_reservation.rollback_unpublished_activation().await;
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!("Root Actor reservation rejected: {error}")));
+                }
                 // Launch and rollback share one exact RAII reservation. Dropping
                 // an unlaunched SessionActivationLaunch cannot race a raw slot
                 // removal against the reservation's router-placeholder cleanup.
@@ -1681,10 +1728,10 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // The router publishes the exact owner before invoking
                         // this closure, so only now may the prepared snapshot
                         // replace the shared cache entry.
-                        launch_sessions.insert(
-                            launch_session_id,
-                            Arc::new(crate::SessionSnapshot::new(launch_session)),
-                        );
+                        if execution_reservation.root_actor_writer().is_none() {
+                            launch_sessions.insert(launch_session_id,
+                                Arc::new(crate::SessionSnapshot::new(launch_session)));
+                        }
                         let request = ResumeSpawnRequest {
                             session_id: request_session_id,
                             session,

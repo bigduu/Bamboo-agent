@@ -653,8 +653,8 @@ impl AppState {
                 .expect("agent runtime should be fully configured"),
         );
 
-        let child_completion_coordinator =
-            Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
+        let child_completion_coordinator = Arc::new(
+            bamboo_engine::ChildCompletionCoordinator::new(
                 storage.clone(),
                 persistence.clone(),
                 sessions.clone(),
@@ -666,7 +666,9 @@ impl AppState {
                 provider_router.clone(),
                 data_dir.clone(),
                 Some(account_sink.inbox()),
-            ));
+            )
+            .with_root_account_sink(account_sink.clone()),
+        );
         session_activation_router
             .set_spawner(child_completion_coordinator.clone())
             .await;

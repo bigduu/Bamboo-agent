@@ -118,6 +118,14 @@ impl SessionExecutionReservation {
             .map(|owner| owner.binding.owner.clone())
     }
 
+    /// Finish a valid adapter-owned pause only after its actual history
+    /// publication barrier. Abandonment remains the rejected-startup fallback.
+    pub async fn finish_root_actor(&mut self, outcome: bamboo_domain::ActorActivationFinish) {
+        if let Some(owner) = self.root_actor.take() {
+            owner.finish(outcome).await;
+        }
+    }
+
     /// Build the handoff owned by a router activation launch.
     ///
     /// The value starts unpublished. Its launch closure must call
@@ -186,6 +194,8 @@ impl SessionExecutionReservation {
     pub(crate) async fn rollback_unpublished_activation(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
+        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
         let activation = std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,

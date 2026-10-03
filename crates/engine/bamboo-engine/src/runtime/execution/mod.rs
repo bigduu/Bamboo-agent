@@ -31,7 +31,8 @@ pub use agent_spawn::{
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
 pub use event_forwarder::{
     create_event_forwarder, create_event_forwarder_with_history_commit_barrier,
-    history_commit_barrier, AccountFeedInbox, HistoryCommitAcknowledger, HistoryCommitBarrier,
+    create_event_forwarder_with_root_actor, history_commit_barrier, AccountFeedInbox,
+    HistoryCommitAcknowledger, HistoryCommitBarrier,
 };
 pub use runner_lifecycle::{
     finalize_runner, finalize_runner_exact, reserve_runner_core, status_from_execution_result,

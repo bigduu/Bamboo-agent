@@ -34,64 +34,13 @@ async fn publish_root_event(
     publish: Box<dyn FnOnce() -> bool + Send>,
 ) -> std::io::Result<()> {
     if let Some(owner) = owner {
-        let storage = state.storage.clone();
-        let sink = state.account_sink.clone();
-        let owner_for_queue = owner.clone();
-        let event = event.clone();
-        let session_id = session_id.to_owned();
-        let (queued, receipt) = tokio::sync::oneshot::channel();
-        state
-            .storage
-            .publish_root_actor_runtime_event(
-                owner,
-                Box::new(move |check_current| {
-                    check_current()?;
-                    if !publish() {
-                        return Err(std::io::Error::other(
-                            "Root per-session event publication was retired",
-                        ));
-                    }
-                    check_current()?;
-                    let confirmation = if event.is_durable_change() {
-                        Some(
-                            sink.record_root_actor(
-                                storage,
-                                owner_for_queue,
-                                Some(&session_id),
-                                &event,
-                            )
-                            .ok_or_else(|| {
-                                std::io::Error::other(
-                                    "Root account event queue rejected publication",
-                                )
-                            })?,
-                        )
-                    } else {
-                        None
-                    };
-                    let _ = queued.send(confirmation);
-                    Ok(())
-                }),
-            )
-            .await?;
-        // The account writer needs the same physical Root guards. Await only
-        // after the per-session publication job has released those guards.
-        let confirmation = receipt
-            .await
-            .map_err(|_| std::io::Error::other("Root account admission receipt closed"))?;
-        if let Some(confirmation) = confirmation {
-            if !tokio::time::timeout(std::time::Duration::from_secs(30), confirmation)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(false)
-            {
-                return Err(std::io::Error::other(
-                    "Root account final publication was not confirmed",
-                ));
-            }
-        }
-        Ok(())
+        bamboo_engine::events::RootActorEventPublication::new(
+            state.storage.clone(),
+            state.account_sink.clone(),
+            owner.clone(),
+        )
+        .publish(session_id, event, publish)
+        .await
     } else {
         state.account_sink.record(Some(session_id), event);
         if publish() {

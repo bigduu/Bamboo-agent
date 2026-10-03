@@ -29,8 +29,9 @@ use tokio::sync::broadcast;
 
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
+use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
-use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forwarder};
+use crate::handlers::agent::execute::spawn_agent_execution;
 
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
@@ -98,6 +99,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 %error,
                 "cannot resume server session without exact router ownership"
             );
+            return;
+        }
+
+        if let Err(error) = execution_reservation
+            .bind_root_actor(&self.0.agent, &session)
+            .await
+        {
+            tracing::warn!(%session_id, %error, "Root resume Actor binding rejected before execution");
+            execution_reservation.abandon().await;
             return;
         }
 
@@ -194,13 +204,14 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<bamboo_agent_core::AgentEvent>(100);
 
         let state = self.0.clone();
-        let history_commit_barrier = spawn_event_forwarder(
+        let mut history_commit_barrier = spawn_event_forwarder_with_root_actor(
             state.clone(),
             session_id.clone(),
             execution_reservation.run_id().to_string(),
             mpsc_rx,
             event_sender,
             gold_config.clone(),
+            execution_reservation.root_actor_writer(),
         );
 
         let model_roster = bamboo_engine::ModelRoster {
@@ -400,6 +411,16 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
 
+                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                            match persistence.load_runtime_session(&session_id).await {
+                                Ok(Some(_)) => {}
+                                result => {
+                                    tracing::warn!(%session_id, ?result, "Root replay lost its execution owner before tool handoff");
+                                    return;
+                                }
+                            }
+                        }
+
                         // Only an admitted replay emits lifecycle start.
                         let mut emitter = bamboo_tools::ToolEmitter::new(
                             &tool_call.id,
@@ -480,7 +501,18 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                                 ),
                                             })
                                             .await;
-                                        state.save_and_cache_session(&mut session).await;
+                                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                                            if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                                                tracing::warn!(%session_id, %error, "Root replay pause checkpoint rejected");
+                                                return;
+                                            }
+                                        } else { state.save_and_cache_session(&mut session).await; }
+                                        if !history_commit_barrier.send_and_wait(&mpsc_tx, session_id.clone()).await {
+                                            tracing::warn!(%session_id, "Root replay pause history publication was not confirmed");
+                                            return;
+                                        }
+                                        execution_reservation.finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded).await;
+                                        execution_reservation.abandon().await;
                                         return;
                                     }
                                     Ok(None) => {}
@@ -541,7 +573,12 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     );
                     return;
                 }
-                if blocked_by_tool_authority {
+                if let Some(persistence) = execution_reservation.execution_persistence() {
+                    if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                        tracing::warn!(%session_id, %error, "Root replay checkpoint rejected before continuation");
+                        return;
+                    }
+                } else if blocked_by_tool_authority {
                     if let Err(error) = state
                         .session_repo
                         .save_replay_resolution(&mut session)
