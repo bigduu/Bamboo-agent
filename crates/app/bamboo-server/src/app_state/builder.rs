@@ -489,7 +489,8 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
 
         // Account-scoped durable change feed. It is initialized before the
         // Project tool surface so non-HTTP Project mutations publish the same
@@ -1112,7 +1113,8 @@ impl AppState {
             sessions.clone(),
             storage.clone(),
             persistence.clone(),
-        );
+        )
+        .with_root_actor_directory(session_store.clone());
 
         // bamboo-connect (#452 / epic #447): drives bamboo sessions from IM
         // platforms (Telegram first). Fully inert when `config.connect.platforms`

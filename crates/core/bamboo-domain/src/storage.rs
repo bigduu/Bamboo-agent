@@ -10,6 +10,18 @@ use crate::{
     SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
 };
 
+/// A concrete ordinary Root execution's write capability. This is never read
+/// from Session metadata or an HTTP request.
+#[derive(Debug, Clone)]
+pub struct RootActorRuntimeWrite {
+    pub fence: crate::ActorActivationFence,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Synchronous cache publication at the storage commit boundary. Implementors
+/// retain the same physical guards and revalidate the owner before invoking it.
+pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
+
 /// Trait for session storage backends.
 ///
 /// Provides an abstract interface for persisting and retrieving session data.
@@ -17,6 +29,45 @@ use crate::{
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Probe before claiming an Actor; unsupported backends must not leave a
+    /// claimed execution whose writes fall back to an ordinary snapshot save.
+    fn supports_root_actor_runtime_write(&self) -> bool {
+        false
+    }
+
+    /// Publish a synchronous runtime event through the same current-owner
+    /// boundary as canonical writes. The callback must be the actual sink,
+    /// rather than an async queue that could publish after a replacement.
+    async fn publish_root_actor_runtime_event(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        publish: Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<()> {
+        let _ = (owner, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root runtime events",
+        ))
+    }
+
+    /// Reuse the existing full/runtime publication protocol under a current
+    /// ordinary Root fence. Validate birth/owner/expiry immediately before each
+    /// canonical replacement and publish only a confirmed snapshot while the
+    /// physical guards are still held. Never fall back to `save_session`.
+    async fn save_root_actor_runtime(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &Session,
+        runtime_only: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, runtime_only, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support fenced Root runtime writes",
+        ))
+    }
+
     /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
     /// A backend without this authority protocol fails closed.
     async fn root_mode_operation(

@@ -9,6 +9,7 @@ pub(super) struct DefaultWriterGuards {
     // Keep this before Session/Task/lifecycle so it drops first. A cancelled
     // async caller cannot release the Root lock while a spawned write remains.
     tree: std::sync::Mutex<Option<ActorTreeWriteGuard>>,
+    pub(super) root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
     _session: SessionWriteGuard,
     _task: TaskGuard,
     _lifecycle: LifecycleGuard,
@@ -33,8 +34,18 @@ impl DefaultWriterGuards {
         task: RuntimeTaskTransactionReadGuard,
         session: SessionWriteGuard,
     ) -> Arc<Self> {
+        Self::shared_with_root_actor(lifecycle, task, session, None)
+    }
+
+    pub(super) fn shared_with_root_actor(
+        lifecycle: SessionLifecycleReadGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        session: SessionWriteGuard,
+        root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tree: std::sync::Mutex::new(None),
+            root_actor,
             _session: session,
             _task: TaskGuard::Shared { _guard: task },
             _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
@@ -48,6 +59,7 @@ impl DefaultWriterGuards {
     ) -> Arc<Self> {
         Arc::new(Self {
             tree: std::sync::Mutex::new(None),
+            root_actor: None,
             _session: session,
             _task: TaskGuard::Exclusive { _guard: task },
             _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
@@ -303,13 +315,19 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
         let path = path.to_path_buf();
+        let root_actor = guards.root_actor.clone();
         #[cfg(test)]
         let hook = self.default_write_hook.lock().unwrap().clone();
         Self::default_writer_job(guards, move || {
             durable_atomic_write_blocking(&path, &bytes, |phase| {
                 #[cfg(test)]
                 if let Some(hook) = &hook {
-                    return hook.visit(&path, phase);
+                    hook.visit(&path, phase)?;
+                }
+                if matches!(phase, DurableWritePhase::BeforeReplace) {
+                    if let Some(proof) = &root_actor {
+                        proof.validate()?;
+                    }
                 }
                 let _ = phase;
                 Ok(())

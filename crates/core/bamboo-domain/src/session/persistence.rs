@@ -131,6 +131,24 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {
+    /// Whether this Host requires an explicit execution capability for the
+    /// proposed Root. A route without a bound event/persistence handoff must
+    /// reject before claiming or making a provider call.
+    fn root_actor_execution_required(&self, _session: &Session) -> bool {
+        false
+    }
+
+    /// Host execution binding, never a request DTO. Legacy embedders have no
+    /// ActorDirectory; a host that enables one must reject unsupported storage
+    /// before claiming rather than returning an unfenced writer.
+    async fn bind_root_actor_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        Ok(None)
+    }
+
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
@@ -435,8 +453,62 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     }
 }
 
+/// Ownership passed from the canonical repository into one concrete runtime.
+/// The runtime owns renewal and finish; dropping an execution must release its
+/// own fence without ever finishing a replacement owner.
+pub struct RootActorExecutionBinding {
+    pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    pub directory: Arc<dyn crate::ActorDirectoryPort>,
+    pub owner: crate::RootActorRuntimeWrite,
+    pub lease_duration: std::time::Duration,
+    abandon: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl RootActorExecutionBinding {
+    pub fn new(
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+        directory: Arc<dyn crate::ActorDirectoryPort>,
+        owner: crate::RootActorRuntimeWrite,
+        lease_duration: std::time::Duration,
+        abandon: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            persistence,
+            directory,
+            owner,
+            lease_duration,
+            abandon: Some(Box::new(abandon)),
+        }
+    }
+
+    /// The runtime calls this only after handing finish to an owned detached
+    /// job, so cancellation of the waiter cannot strand this execution.
+    pub fn disarm_abandonment(&mut self) {
+        self.abandon.take();
+    }
+}
+
+impl Drop for RootActorExecutionBinding {
+    fn drop(&mut self) {
+        if let Some(abandon) = self.abandon.take() {
+            abandon();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
+    fn root_actor_execution_required(&self, session: &Session) -> bool {
+        (**self).root_actor_execution_required(session)
+    }
+
+    async fn bind_root_actor_execution(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        (**self).bind_root_actor_execution(session, run_id).await
+    }
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
     }

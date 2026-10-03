@@ -708,6 +708,11 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        if self.persistence.root_actor_execution_required(session) {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "Root execution route requires a bound Actor writer and event handoff".into(),
+            ));
+        }
         let session_activation_notifications = match self.activation_router.as_ref() {
             Some(router) => Some(Arc::new(parking_lot::Mutex::new(
                 router.subscribe(&session.id).await,

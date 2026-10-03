@@ -488,6 +488,10 @@ fn unconditional_task_patch_would_regress(
 /// sessions proceed concurrently.
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
+    root_actor_writer: Option<(
+        bamboo_domain::RootActorRuntimeWrite,
+        bamboo_domain::RootActorRuntimePublisher,
+    )>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Serializes recoverable child/root Task transactions. Per-session locks
     /// still provide the data isolation; this gate ensures a retained recovery
@@ -539,8 +543,46 @@ impl LockedSessionStore {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self {
             storage,
+            root_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Immutable per-execution binding; shares the existing process locks and
+    /// never changes the default writer's authority.
+    pub fn bind_root_actor_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<Self> {
+        if !self.storage.supports_root_actor_runtime_write() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "storage does not support a Root Actor writer",
+            ));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            root_actor_writer: Some((owner, publish)),
+            locks: self.locks.clone(),
+            task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
+        })
+    }
+
+    async fn save_runtime_snapshot(
+        &self,
+        session: &Session,
+        runtime_only: bool,
+    ) -> std::io::Result<()> {
+        if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+            self.storage
+                .save_root_actor_runtime(owner, session, runtime_only, publish.clone())
+                .await
+        } else if runtime_only {
+            self.storage.save_runtime_state(session).await
+        } else {
+            self.storage.save_session(session).await
         }
     }
 
@@ -591,7 +633,7 @@ impl LockedSessionStore {
         session: &mut Session,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_session(session).await {
+            match self.save_runtime_snapshot(session, false).await {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)
@@ -626,7 +668,7 @@ impl LockedSessionStore {
         session: &mut Session,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            match self.storage.save_runtime_state(session).await {
+            match self.save_runtime_snapshot(session, true).await {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if is_task_control_plane_save_conflict(&error)

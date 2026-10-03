@@ -26,13 +26,49 @@ fn is_critical_event(event: &AgentEvent) -> bool {
     event.is_replayable_session_state()
 }
 
+async fn publish_root_event(
+    state: &AppState,
+    owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    publish: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<()> {
+    if let Some(owner) = owner {
+        state
+            .storage
+            .publish_root_actor_runtime_event(owner, publish)
+            .await
+    } else {
+        publish();
+        Ok(())
+    }
+}
+
 pub(crate) fn spawn_event_forwarder(
+    state: actix_web::web::Data<AppState>,
+    session_id: String,
+    run_id: String,
+    mpsc_rx: mpsc::Receiver<AgentEvent>,
+    session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
+    gold_config: Option<GoldConfig>,
+) -> HistoryCommitBarrier {
+    spawn_event_forwarder_with_root_actor(
+        state,
+        session_id,
+        run_id,
+        mpsc_rx,
+        session_tx,
+        gold_config,
+        None,
+    )
+}
+
+pub(crate) fn spawn_event_forwarder_with_root_actor(
     state: actix_web::web::Data<AppState>,
     session_id: String,
     run_id: String,
     mut mpsc_rx: mpsc::Receiver<AgentEvent>,
     session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     gold_config: Option<GoldConfig>,
+    root_actor: Option<bamboo_domain::RootActorRuntimeWrite>,
 ) -> HistoryCommitBarrier {
     let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
     // Always-on relay: previously the notification relay only started when an
@@ -53,6 +89,21 @@ pub(crate) fn spawn_event_forwarder(
 
     tokio::spawn(
         async move {
+            if root_actor.is_none() {
+                match state.storage.load_session(&session_id).await {
+                    Ok(Some(session)) if state.agent.persistence().root_actor_execution_required(&session) => {
+                        tracing::warn!(%session_id, %run_id,
+                            "Root event route requires an explicit Actor handoff before publication");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%session_id, %run_id, %error,
+                            "event route could not prove its Session identity");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // Capture the reservation generation at the call site. This task
             // may start only after a clarification answer has replaced the
             // shared runner entry; reading that mutable registry here would
@@ -63,19 +114,25 @@ pub(crate) fn spawn_event_forwarder(
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
             let (publication, visible_messages) = {
-                let runners = state.agent_runners.read().await;
+                let runners = state.agent_runners.clone().read_owned().await;
                 let Some(runner) = runners
                     .get(&session_id)
                     .filter(|runner| runner.run_id == run_id)
                 else {
                     return;
                 };
-                state.account_sink.record(Some(&session_id), &started_event);
-                let _ = session_tx.send(started_event);
-                (
-                    runner.event_publication.clone(),
-                    runner.visible_messages.clone(),
-                )
+                let publication = runner.event_publication.clone();
+                let visible_messages = runner.visible_messages.clone();
+                let publish_state = state.clone();
+                let publish_session = session_id.clone();
+                let publish_tx = session_tx.clone();
+                let result = publish_root_event(state.get_ref(), root_actor.as_ref(), Box::new(move || {
+                    let _runners = runners;
+                    publish_state.account_sink.record(Some(&publish_session), &started_event);
+                    let _ = publish_tx.send(started_event);
+                })).await;
+                if result.is_err() { return; }
+                (publication, visible_messages)
             };
             let mut forwarded_lifecycle_ids = HashSet::new();
             let mut tool_event_display = NativeToolEventDisplay::default();
@@ -121,37 +178,24 @@ pub(crate) fn spawn_event_forwarder(
                 if needs_runner_update {
                     let is_history_commit =
                         matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-                    let mut runners = state.agent_runners.write().await;
-                    let Some(runner) = runners
-                        .get_mut(&session_id)
-                        .filter(|runner| runner.run_id == run_id)
-                    else {
+                    let mut runners = state.agent_runners.clone().write_owned().await;
+                    if !runners.get(&session_id).is_some_and(|runner| runner.run_id == run_id) { return; }
+                    let publish_state = state.clone();
+                    let publish_session = session_id.clone();
+                    let publish_tx = session_tx.clone();
+                    let acknowledge = history_commit_acknowledger.clone();
+                    let result = publish_root_event(state.get_ref(), root_actor.as_ref(), Box::new(move || {
+                        let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
+                        if is_critical_event(&event) { runner.push_critical_event(event.clone()); }
+                        if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) { runner.last_budget_event = Some(event.clone()); }
+                        let route = event.session_id().unwrap_or(&publish_session);
+                        publish_state.account_sink.record(Some(route), &event);
+                        let _ = publish_tx.send(event);
+                        if is_history_commit { acknowledge.acknowledge(); }
+                    })).await;
+                    if let Err(error) = result {
+                        tracing::warn!(%session_id, %run_id, %error, "obsolete Root runtime event rejected before publication");
                         return;
-                    };
-                    if is_critical_event(&event) {
-                        runner.push_critical_event(event.clone());
-                        tracing::trace!(
-                            "[{}] Cached critical event for late subscribers",
-                            session_id
-                        );
-                    }
-                    if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) {
-                        runner.last_budget_event = Some(event.clone());
-                        // Fires once per agent round — far too hot for debug.
-                        tracing::trace!(
-                            "[{}] Stored budget event for late subscribers",
-                            session_id
-                        );
-                    }
-                    // Hold exact generation ownership through the synchronous
-                    // account/broadcast publication. A successor reservation
-                    // needs this write lock and therefore cannot interleave a
-                    // new Started before this old frame.
-                    let route_session_id = event.session_id().unwrap_or(&session_id);
-                    state.account_sink.record(Some(route_session_id), &event);
-                    let _ = session_tx.send(event);
-                    if is_history_commit {
-                        history_commit_acknowledger.acknowledge();
                     }
                 } else {
                     let is_history_commit =
@@ -165,6 +209,33 @@ pub(crate) fn spawn_event_forwarder(
                         _ => None,
                     };
                     let terminal_reason = visible_terminal_reason(&event);
+                    if (terminal_reason.is_some() || is_history_commit) && root_actor.is_some() {
+                        let publish_state = state.clone();
+                        let publish_session = session_id.clone();
+                        let publish_tx = session_tx.clone();
+                        let publication = publication.clone();
+                        let visible = visible_messages.clone();
+                        let acknowledge = history_commit_acknowledger.clone();
+                        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let publication_accepted = accepted.clone();
+                        let result = publish_root_event(state.get_ref(), root_actor.as_ref(), Box::new(move || {
+                            let published = publication.publish(|| {
+                                if let Some(round_count) = round_count { visible.begin_round(round_count); }
+                                if let Some(content) = visible_token { visible.append(content); }
+                                let route = event.session_id().unwrap_or(&publish_session);
+                                publish_state.account_sink.record(Some(route), &event);
+                                let _ = publish_tx.send(event);
+                                if let Some(reason) = terminal_reason { visible.mark_terminal(reason); }
+                                if is_history_commit { visible.history_committed(); acknowledge.acknowledge(); }
+                            });
+                            publication_accepted.store(published, std::sync::atomic::Ordering::Release);
+                        })).await;
+                        if let Err(error) = result {
+                            tracing::warn!(%session_id, %run_id, %error, "obsolete Root terminal event rejected before publication");
+                            return;
+                        }
+                        if !accepted.load(std::sync::atomic::Ordering::Acquire) { return; }
+                    } else {
                     if !publication.publish(|| {
                         if let Some(round_count) = round_count {
                             visible_messages.begin_round(round_count);
@@ -186,6 +257,7 @@ pub(crate) fn spawn_event_forwarder(
                     }
                     if is_history_commit {
                         history_commit_acknowledger.acknowledge();
+                    }
                     }
                 }
             }
