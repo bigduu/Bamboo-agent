@@ -2217,7 +2217,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
                 let ceiling = self.native_tool_ceiling.as_ref().expect("verified ceiling");
                 match bamboo_engine::ticket_worker_plan::files::RemoteFileExecutor::new(
-                    self.agent.default_tools().clone(),
+                    self.run_tools
+                        .clone()
+                        .unwrap_or_else(|| self.agent.default_tools().clone()),
                     tree_host.clone().expect("verified bridge"),
                     session.id.clone(),
                     &ceiling.tools,

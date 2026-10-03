@@ -120,3 +120,17 @@ results, and verifies that generation 2 alone supplies the accepted reference.
 This assertion correction changes no production behavior; its focused native
 rerun is pending. Evidence: `../1481-evidence/1481-native4-7e05.log` and
 `../1481-evidence/1481-native4-failed-snapshot.json`.
+
+Native5 passed that focused actual Host/native/CLI case in 22.24s, exit 0.
+The original coding and live-PID lease cases had already passed Native4.
+The current complete workspace run excludes only analytics and is collecting
+its terminal result. It found a reproducible Ticket adapter regression:
+the bounded file wrapper selected Agent defaults instead of the explicitly
+selected per-Run tool executor. A test with empty Agent defaults and a trusted
+Task-only Run therefore exposed no Task schema. The wrapper now retains the
+Run-selected executor before applying its existing Task/Read/Write ceiling and
+Host-bound permission/context checks. No authority or tool allowance expands.
+The existing worker-loop/private-plan regression directly covers this fix.
+Evidence: `../1481-evidence/1481-workspace-f00bd52e.log` and
+`../1481-evidence/1481-adapter-failure-backtrace.log`; post-fix worker verification
+remains pending. No repeated full-workspace or review run was started.
