@@ -193,3 +193,17 @@ without old Root activation. Evidence:
 Earlier fixture failures are retained. The four existing offline Host cases and both actual migration/feature rollback
 cases also pass on this stable stack (7 tests total). Final integrated regression
 and browser checks remain pending at this entry.
+
+## Conditional context validation follow-up
+
+Positive approval and user-required acceptance now retain comma-separated
+conditions from the surrounding Human sentence. A model quote such as
+`确认验收 A` cannot authorize `如果 CI 通过，确认验收 A`, and trailing English
+conditions have the same guard. A separate semicolon-delimited explicit action
+keeps its own evidence. Nineteen deterministic semantic tests, format and strict
+all-target Ticket Clippy pass at 9c485842 plus the verified two-file overlay.
+The tests cover both condition orderings, Chinese/English and example text,
+and confirm that the unrelated conditional B clause does not block explicit A
+approval. This extends the existing review's conditional approval/acceptance
+fix; it adds no model dispatcher or new paid model evaluation.
+Evidence: `../1481-evidence/1481-macbook-semantic-context-9c485842-status.json`.

@@ -260,7 +260,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         )
         .unwrap();
     let submission = service.execute(&worker, &submit).unwrap().ids["s"].clone();
-    for (i, text) in [
+    for (i, (text, quote)) in [
         "A 做得不错",
         "不要确认验收 A",
         "如果符合要求就确认验收 A",
@@ -277,9 +277,17 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         "I accept A after CI passes",
         "I accept A conditional on CI passing",
         "I accept A contingent on CI passing",
-        "确认验收 A",
     ]
     .into_iter()
+    .map(|text| (text, text))
+    .chain([
+        ("如果 CI 通过，确认验收 A", "确认验收 A"),
+        ("确认验收 A，如果 CI 通过", "确认验收 A"),
+        ("If CI passes, I accept A", "I accept A"),
+        ("I accept A, when CI passes", "I accept A"),
+        ("例如，确认验收 A", "确认验收 A"),
+        ("确认验收 A", "确认验收 A"),
+    ])
     .enumerate()
     {
         let id = format!("accept-source-{i}");
@@ -289,7 +297,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
             &id,
             vec![group(
                 "accept",
-                text,
+                quote,
                 vec![SemanticOperation::Accept {
                     target: target(&service, &work),
                     submission_id: submission.clone(),
@@ -689,6 +697,11 @@ fn saved_group_replays_after_restart_without_regenerating_proposal_or_dispatch_i
 fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_action() {
     for (text, quote) in [
         ("可以", "可以"),
+        ("如果审计通过，批准 A", "批准 A"),
+        ("批准 A，如果审计通过", "批准 A"),
+        ("If finance confirms, I approve A", "I approve A"),
+        ("I approve A, when finance confirms", "I approve A"),
+        ("例如，批准 A", "批准 A"),
         ("不要批准 A", "批准 A"),
         ("批准 A？", "批准 A？"),
         ("批准 A，但金额改为 200 CNY", "批准 A"),
@@ -814,7 +827,7 @@ fn explicit_approval_a_never_releases_b_and_explicit_denial_remains_distinct() {
     let b = create(&service, "B");
     let qa = ask(&service, &a, "A", true);
     let qb = ask(&service, &b, "B", true);
-    register(&service, "approve-a", 1, "批准 A");
+    register(&service, "approve-a", 1, "如果审计通过，批准 B；批准 A");
     save(
         &service,
         "approve-a",

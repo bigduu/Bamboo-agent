@@ -134,6 +134,22 @@ fn conditional_text(text: &str) -> bool {
     })
 }
 
+fn unconditional_human_context(record: &HumanIngressRecord, quote: &str) -> bool {
+    // A comma may separate a condition from its action. The model cannot
+    // discard that condition by quoting only the affirmative fragment. A
+    // separate sentence/semicolon action retains its own approval evidence.
+    record.text.split(['；', ';', '。', '\n']).any(|sentence| {
+        let lower = sentence.to_lowercase();
+        sentence
+            .split(['，', ','])
+            .any(|part| part.trim() == quote.trim())
+            && !conditional_text(&lower)
+            && !["如果", "假如", "假设", "例如", "比如"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+    })
+}
+
 fn explicit_amount_matches(text: &str, amount: Option<&str>) -> bool {
     let markers: Vec<_> = text
         .match_indices("金额")
@@ -209,6 +225,7 @@ fn approval_text(
     .any(|p| lower.starts_with(p));
     if approve {
         if !positive
+            || !unconditional_human_context(record, quote)
             || conditional_text(&lower)
             || [
                 "?",
@@ -317,7 +334,13 @@ fn acceptance_text(
     ]
     .iter()
     .any(|s| lower.contains(s));
-    if !named || !complete || !explicit || refused || conditional_text(&lower) {
+    if !named
+        || !complete
+        || !explicit
+        || refused
+        || conditional_text(&lower)
+        || !unconditional_human_context(record, quote)
+    {
         return Err(clarify("user-required acceptance needs an explicit complete current Human clause identifying the Work/submission"));
     }
     Ok(())
