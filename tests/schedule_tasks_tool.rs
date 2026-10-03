@@ -207,6 +207,7 @@ fn build_manager(
             broadcast::Sender<AgentEvent>,
         >::new())),
         account_feed_inbox: None,
+        root_account_sink: None,
         app_data_dir: None,
         trigger_engine: bamboo_agent::server::schedule_app::default_trigger_engine(),
         project_store: Arc::new(bamboo_projects::ProjectStore::open(dir).expect("Project store")),
