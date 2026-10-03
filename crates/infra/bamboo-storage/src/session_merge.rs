@@ -1169,6 +1169,28 @@ impl LockedSessionStore {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
+        // This context update belongs to the exact input, not the ordinary
+        // append-only runner snapshot. A durable typed turn is already proof
+        // of its first checkpoint: reconciling its lost ACK must not replay an
+        // old prompt over a subsequent committed prompt.
+        let input_prompt = match input.as_ref() {
+            Some((_, claim))
+                if !latest.as_ref().is_some_and(|durable| {
+                    durable.messages.iter().any(|message| {
+                        bamboo_domain::is_matching_session_message(message, &claim.claim.envelope)
+                    })
+                }) =>
+            {
+                claim
+                    .claim
+                    .envelope
+                    .root_chat_prompt()
+                    .map_err(std::io::Error::other)?
+                    .map(str::to_owned)
+            }
+            _ => None,
+        };
+
         if let Some(latest) = latest.as_ref() {
             ensure_model_context_checkpoint_is_current(session, latest)?;
             let incoming_count = session.messages.len();
@@ -1190,6 +1212,14 @@ impl LockedSessionStore {
             let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
+        if let Some(prompt) = input_prompt.as_deref() {
+            session
+                .messages
+                .retain(|message| message.role != bamboo_domain::Role::System);
+            session
+                .messages
+                .insert(0, bamboo_domain::Message::system(prompt));
+        }
         let mut result = self
             .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
             .await;
@@ -1215,6 +1245,14 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &durable);
             adopt_fresher_disk_permission_posture(session, &durable);
             let _ = adopt_durable_tagged_child_wait(session, &durable);
+            if let Some(prompt) = input_prompt.as_deref() {
+                session
+                    .messages
+                    .retain(|message| message.role != bamboo_domain::Role::System);
+                session
+                    .messages
+                    .insert(0, bamboo_domain::Message::system(prompt));
+            }
             result = self
                 .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
                 .await;

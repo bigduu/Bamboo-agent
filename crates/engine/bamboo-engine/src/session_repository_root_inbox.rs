@@ -165,7 +165,8 @@ impl SessionRepository {
         }
         let before = session.clone();
         if !matching {
-            session.add_message(envelope.to_provider_message().map_err(io::Error::other)?);
+            let message = envelope.to_provider_message().map_err(io::Error::other)?;
+            session.add_message(message);
         }
         session
             .session_inbox_admission_mut()

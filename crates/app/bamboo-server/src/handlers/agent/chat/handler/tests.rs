@@ -63,6 +63,7 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
     let image_request = || {
         serde_json::from_value::<super::ChatRequest>(serde_json::json!({
         "session_id": session.id, "message": "second with image", "model": "test-model",
+        "system_prompt": "ROOT_PROMPT_REPLACED", "enhance_prompt": "ROOT_ENHANCE_ADDED",
         "images": [{"base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8aUAAAAASUVORK5CYII=", "type":"image/png"}],
     })).unwrap()
     };
@@ -138,6 +139,14 @@ async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once
         .expect("owned Root consumer");
     assert!(admission.admission_error.is_none());
     assert_eq!(admission.merged, 1);
+    let system_prompts: Vec<_> = consumed
+        .messages
+        .iter()
+        .filter(|message| message.role == bamboo_domain::Role::System)
+        .collect();
+    assert_eq!(system_prompts.len(), 1);
+    assert!(system_prompts[0].content.contains("ROOT_PROMPT_REPLACED"));
+    assert!(system_prompts[0].content.contains("ROOT_ENHANCE_ADDED"));
     let message = admission.committed_messages.first().unwrap();
     assert_eq!(message.content, "second with image");
     let parts = message

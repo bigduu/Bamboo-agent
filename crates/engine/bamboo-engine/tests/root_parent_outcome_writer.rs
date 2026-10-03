@@ -7,7 +7,9 @@ use std::{io, sync::Arc, time::Duration};
 use bamboo_agent_core::tools::context::{root_actor_tool_writer, with_root_actor_tool_writer};
 use bamboo_domain::{
     ActorActivation, ActorActivationFinish, ActorActivationStatus, ActorDirectoryPort, Message,
-    RootActorExecutionBinding, RuntimeSessionPersistence, Session, Storage,
+    Role, RootActorExecutionBinding, RuntimeSessionPersistence, Session, SessionActivationPolicy,
+    SessionInboxConsumerId, SessionInboxLeaseRequest, SessionInboxLimits, SessionInboxPort,
+    SessionMessageEnvelope, Storage,
 };
 use bamboo_engine::{read_cached_session, SessionRepository, SessionSnapshot};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
@@ -342,4 +344,92 @@ async fn weak_host_route_rebinds_activated_parent_deadline_cas_without_keeping_h
     drop(rebound);
     drop(f.host_a);
     assert!(route.rebind(repository(f.b.clone())).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_input_ack_recovery_preserves_a_later_owned_prompt_checkpoint() {
+    let f = Fixture::new().await;
+    let binding = f.bind(&f.host_a, "prompt-recovery").await;
+    let raw = Arc::new(bamboo_storage::FileSessionInbox::new(
+        f.a.clone(),
+        SessionInboxLimits::default(),
+    ));
+    let envelope = SessionMessageEnvelope::user_input(ROOT, "prompt turn")
+        .with_root_chat_prompt("PROMPT_A".into())
+        .unwrap();
+    raw.deliver_with_activation_intent(
+        &envelope,
+        SessionActivationPolicy::InterruptSpecificWait,
+        None,
+    )
+    .await
+    .unwrap();
+    let inbox =
+        f.a.bind_root_actor_inbox(&binding.owner, raw.clone())
+            .unwrap();
+    let claim = inbox
+        .claim_owned(
+            ROOT,
+            1,
+            Some("prompt-recovery"),
+            &SessionInboxLeaseRequest {
+                consumer: SessionInboxConsumerId::new(),
+                now: Utc::now(),
+                duration: chrono::Duration::seconds(2),
+            },
+        )
+        .await
+        .unwrap()
+        .remove(0);
+
+    // A full actual Root checkpoint reached Main before its exact input ACK.
+    let mut committed = f.a.load_session(ROOT).await.unwrap().unwrap();
+    committed.messages.insert(0, Message::system("PROMPT_A"));
+    committed.add_message(envelope.to_provider_message().unwrap());
+    committed
+        .session_inbox_admission_mut()
+        .record(envelope.id.clone(), claim.claim.generation);
+    f.a.save_root_actor_runtime(&binding.owner, &committed, false, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    assert!(!raw.was_admitted(ROOT, &envelope.id).await.unwrap());
+
+    // Another owned context update is committed before the lost ACK recovers.
+    committed
+        .messages
+        .retain(|message| message.role != Role::System);
+    committed.messages.insert(0, Message::system("PROMPT_B"));
+    f.a.save_root_actor_runtime(&binding.owner, &committed, false, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    while Utc::now() < claim.lease.expires_at {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut recovered = f.a.load_session(ROOT).await.unwrap().unwrap();
+    let admission = binding
+        .persistence
+        .admit_root_inbox(&mut recovered, raw.clone(), Some("prompt-recovery"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.merged, 0);
+    assert!(admission.admission_error.is_none(), "{admission:?}");
+    assert!(raw.was_admitted(ROOT, &envelope.id).await.unwrap());
+    let canonical = f.a.load_session(ROOT).await.unwrap().unwrap();
+    let cached = read_cached_session(f.host_a.cache(), ROOT).unwrap();
+    for session in [&recovered, &canonical, &cached] {
+        assert_eq!(count(session, "PROMPT_A"), 0);
+        assert_eq!(count(session, "PROMPT_B"), 1);
+        assert_eq!(count(session, "prompt turn"), 1);
+        assert_eq!(session.messages[0].content, "PROMPT_B");
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .count(),
+            1
+        );
+    }
+    finish(binding).await;
 }
