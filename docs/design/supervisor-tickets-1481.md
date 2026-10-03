@@ -627,3 +627,47 @@ P7 is locally covered by the above bounded proposal/Host tests. P8 real browser
 and P9 migration/full acceptance remain separate gates; flags remain default off.
 The parent thread outgoing relay tool is unavailable in this environment;
 progress continues in the current thread and this ledger, not remote comments.
+
+## Slice 19 — P8 current Lotus / real Host browser acceptance
+
+The isolated Lotus worktree is `lotus-1481-ticket-overview` on
+`lotus-next/feat/1481-ticket-overview`, baseline `1131c275`. It negotiates the
+canonical Supervisor scope and uses one normal composer with optional bounded
+message references. The panel reads a fixed authoritative snapshot plus bounded
+changes, renders all questions/approvals and submitted artifacts, rejects stale
+generation/contract/request versions, and keeps exact uncertain-ACK retries.
+Only an ordinary question's definite `revision_conflict` receives one bounded
+rebase after the same request is revalidated; approvals never auto-rebase.
+
+`tests/ticket_browser_fixture.rs` starts the actual local Host/native workers,
+waits for five durable questions and owned stop facts, restarts the Host, serves
+the current Lotus build, and checks the browser's five fresh generation-2
+Submissions and exact answers. Chromium answers E/B/D/A/C through real cards,
+reloads mid-flow, uses an optional reference in the ordinary composer, approves
+A while B stays open, changes B's material contract, and proves old buttons and
+requests cannot succeed or revive after reload. Workers remain submitted until
+explicit acceptance. Controlled provider results here are separate from the
+12-case real configured-model proposal evaluation in Slice 18.
+
+PASS: Chromium 1/1, 28.6s (`/tmp/1481-lotus-browser4.log`); actual Host fixture
+1/1, 111.68s including browser wait (`/tmp/1481-browser-fixture-run4.log`).
+Screenshots and full Runtime checks are retained in `../1481-evidence`, prefixed
+`p8-ui-fixture4`. Earlier failed browser attempts are retained too; they exposed
+coverage naming and an ordinary answer CAS race, and then a controlled-provider
+fixture wake omission, all corrected before this pass.
+
+Reproduce by building Lotus, then setting `BAMBOO_TICKET_FIXTURE_STATIC_DIR` to
+its `dist` and `BAMBOO_TICKET_FIXTURE_INFO` to a fresh evidence JSON path while
+running the ignored `current_lotus_five_native_questions_browser_fixture` test.
+After `TICKET_BROWSER_READY`, set `LOTUS_TICKET_FIXTURE_INFO` to that path and run
+`npm exec --offline -- playwright test --config=playwright.tickets.config.ts`.
+No production configuration or data is used. The Host fixture expires after
+360s and retains temporary state on failure.
+
+P9 explicit legacy attach/import and offline migration remain separate.
+Shared #791 integration contracts changed by the stack are optional Chat API
+message IDs/references, durable Inbox Human-source sequencing and replay,
+original-Supervisor tool proof, exact existing dispatch/query and result ports,
+and the Ticket-only independent-child wait exemption. No owned Inbox lease
+expiry or generic Root/runtime ownership is enabled; #1334/#1341 retain their
+existing implementation owner. Other worktrees are untouched.

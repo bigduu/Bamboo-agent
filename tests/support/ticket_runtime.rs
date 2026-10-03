@@ -49,6 +49,9 @@ pub fn start_with_fault(data: &Path, port: u16, fault: Option<(&str, &str)>) -> 
             .env("BAMBOO_TICKET_FIXTURE_OPERATION_PREFIX", prefix)
             .env("BAMBOO_TICKET_FIXTURE_BOUNDARY", boundary);
     }
+    if let Ok(path) = std::env::var("BAMBOO_TICKET_FIXTURE_STATIC_DIR") {
+        process.arg("--static-dir").arg(path);
+    }
     Host(process.spawn().unwrap())
 }
 
@@ -106,6 +109,7 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
 
 #[derive(Default)]
 pub struct Probe {
+    pub ui_fixture: std::sync::atomic::AtomicBool,
     pub calls: AtomicUsize,
     pub root_calls: AtomicUsize,
     pub held: AtomicUsize,
@@ -181,6 +185,71 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 json!({"tool_calls":[{"index":0,"id":"ticket-native-plan","type":"function","function":{"name":"Task","arguments":args.to_string()}}]}),
                 "tool_calls",
             )
+        }
+    } else if probe.ui_fixture.load(Ordering::SeqCst)
+        && body["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t["function"]["name"] == "work_overview")
+        })
+    {
+        // Controlled browser fixture only: the real single Supervisor reads
+        // committed requests, proposes chatter once, then dispatches ready
+        // question Workers through the existing tool/Runtime admission path.
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        let value = || {
+            let raw: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+            raw.get("result")
+                .and_then(Value::as_str)
+                .map(|s| serde_json::from_str(s).unwrap())
+                .unwrap_or(raw)
+        };
+        let call = match last["tool_call_id"].as_str() {
+            Some("ticket-ui-overview") => {
+                let view = value();
+                if view["pending_message"]["input"].is_object() {
+                    Some((
+                        "ticket-ui-resolve",
+                        "work_update",
+                        json!({"message_id":view["pending_message"]["input"]["message_id"],"proposal":{"groups":[]}}),
+                    ))
+                } else {
+                    Some((
+                        "ticket-ui-search",
+                        "work_search",
+                        json!({"filter":{"query":"TICKET_QUESTION_E2E","kind":"work","state":"ready","updated_after":null,"updated_before":null,"include_archived":false},"limit":100,"cursor":null,"fixed_commit":null}),
+                    ))
+                }
+            }
+            Some("ticket-ui-search") => {
+                let search = value();
+                let ops: Vec<_> = search["data"].as_array().expect("bounded ready Work search").iter().map(|row|json!({"op":"start","work_id":row["id"],"temp_id":format!("resume-{}",row["id"].as_str().unwrap()),"workspace":null})).collect();
+                if ops.is_empty() {
+                    None
+                } else {
+                    Some((
+                        "ticket-ui-dispatch",
+                        "work_dispatch",
+                        json!({"operation_id":format!("ui-resume-{}",search["snapshot"]["seq"]),"expected_seq":search["snapshot"]["seq"],"expected_epoch":search["snapshot"]["authority_epoch"],"operations":ops}),
+                    ))
+                }
+            }
+            Some("ticket-ui-resolve") => Some(("ticket-ui-overview", "work_overview", json!({}))),
+            Some("ticket-ui-dispatch") => {
+                if value()["status_code"] == 409 {
+                    Some(("ticket-ui-overview", "work_overview", json!({})))
+                } else {
+                    None
+                }
+            }
+            _ => Some(("ticket-ui-overview", "work_overview", json!({}))),
+        };
+        match call {
+            Some((id, name, args)) => (
+                json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}),
+                "tool_calls",
+            ),
+            None => (json!({"content":"UI_TICKET_SUPERVISOR_ACK"}), "stop"),
         }
     } else if body["tools"].as_array().is_some_and(|tools| {
         tools
@@ -308,6 +377,10 @@ impl Fixture {
         eprintln!("Ticket fixture data: {}", data.display());
         std::fs::create_dir_all(&data).unwrap();
         let calls = web::Data::new(Probe::default());
+        calls.ui_fixture.store(
+            std::env::var_os("BAMBOO_TICKET_FIXTURE_STATIC_DIR").is_some(),
+            Ordering::SeqCst,
+        );
         let provider_calls = calls.clone();
         let server = HttpServer::new(move || {
             App::new()
@@ -329,7 +402,7 @@ impl Fixture {
         actix_web::rt::spawn(running);
         std::fs::write(
             data.join("config.json"),
-            serde_json::to_vec(&json!({"provider":"openai",
+            serde_json::to_vec(&json!({"provider":"openai","setup":{"completed":true},
         "features":{"provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"fixture","base_url":url,"model":"ticket-model"}},
         "defaults":{"chat":{"provider":"openai","model":"ticket-model"}},
