@@ -136,6 +136,7 @@ async fn native_dispatch(
         frame: &frame,
         session,
         runtime_state: &mut runtime,
+        policy_guard: &mut super::ToolPolicyGuard::default(),
         task_context: &mut task_context,
         compression_model_name: None,
         compression_model_provider: None,

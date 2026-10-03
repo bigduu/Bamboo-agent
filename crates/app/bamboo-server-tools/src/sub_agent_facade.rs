@@ -105,7 +105,7 @@ pub(super) fn description() -> &'static str {
 
 /// Must run before launch-owner classification. Only legacy calls retain the
 /// previous missing-action → create behavior.
-pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
+pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
     if !args.is_object() {
         return Err(invalid("SubAgent arguments must be an object"));
     }
@@ -122,6 +122,19 @@ pub(super) fn normalize(args: Value) -> Result<NormalizedCall, ToolError> {
             args,
             projection: None,
         });
+    }
+    // Some compatible providers materialize unused optional fields as empty
+    // strings or null. Treat only these exact sentinels as omission before
+    // choosing a route; non-empty identifiers still require canonical checks.
+    // Keep the legacy/compact conflict check above on the original input.
+    let object = args.as_object_mut().expect("object checked above");
+    for field in ["target", "role", "reply_to"] {
+        if object
+            .get(field)
+            .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
+        {
+            object.remove(field);
+        }
     }
     let has_role = args.get("role").is_some();
     let has_target = args.get("target").is_some();
@@ -971,6 +984,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_empty_optional_fields_do_not_become_parent_replies() {
+        let message = "  Audit Bamboo worktrees.\nPreserve the full assignment.  ";
+        let captured = normalize(json!({
+            "intent":"chat", "target":"", "role":"explorer", "message":message, "reply_to":""
+        }))
+        .unwrap();
+        assert_eq!(captured.projection, Some(Projection::Chat));
+        assert_eq!(captured.args["action"], "create");
+        assert_eq!(captured.args["subagent_type"], "explorer");
+        assert_eq!(captured.args["prompt"], message);
+
+        for sentinel in [json!(""), Value::Null] {
+            let worker = normalize(json!({"target":sentinel, "role":sentinel,
+                "reply_to":sentinel, "message":message}))
+            .unwrap();
+            assert_eq!(worker.args["subagent_type"], "worker");
+            let correction = normalize(json!({"target":"child", "role":sentinel,
+                "reply_to":sentinel, "message":message}))
+            .unwrap();
+            assert_eq!(correction.args["action"], "send_message");
+            let tree = normalize(json!({"intent":"inspect", "target":sentinel,
+                "role":sentinel, "reply_to":sentinel}))
+            .unwrap();
+            assert_eq!(tree.projection, Some(Projection::Tree));
+            let audit = normalize(json!({"intent":"inspect", "target":sentinel,
+                "role":sentinel, "reply_to":sentinel, "message":"forced_permission_audit"}))
+            .unwrap();
+            assert_eq!(audit.projection, Some(Projection::ForcedPermissionAudit));
+            let cancel = normalize(json!({"intent":"control", "target":"child",
+                "role":sentinel, "reply_to":sentinel, "message":"cancel"}))
+            .unwrap();
+            assert_eq!(cancel.args["action"], "cancel");
+            let reply = normalize(json!({"intent":"chat", "target":sentinel,
+                "role":sentinel, "reply_to":"request_123", "message":"deny"}))
+            .unwrap();
+            assert_eq!(reply.projection, Some(Projection::ParentRequestReply));
+            assert_eq!(reply.args["reply_to"], "request_123");
+            let question = normalize(json!({"intent":"ask_parent", "target":sentinel,
+                "role":sentinel, "reply_to":sentinel, "message":"Which option?"}))
+            .unwrap();
+            assert_eq!(question.projection, Some(Projection::ParentQuestionAsk));
+        }
+    }
+
+    #[test]
+    fn builtin_subagent_tutorial_examples_match_the_real_facade() {
+        let guide = bamboo_tools::guide::builtin_guides::builtin_guide_spec("SubAgent")
+            .expect("SubAgent guide");
+        for example in guide.examples {
+            let normalized = normalize(example.parameters)
+                .unwrap_or_else(|error| panic!("{}: {error}", example.scenario));
+            assert!(
+                normalized.projection.is_some(),
+                "{} used the legacy API",
+                example.scenario
+            );
+        }
+    }
+
+    #[test]
     fn complete_message_and_target_normalize_before_owner_classification() {
         let message = "  Keep this full task 🪷\n\nDo not trim the ending.  ";
         let create = normalize(json!({"message":message})).unwrap();
@@ -1012,10 +1085,13 @@ mod tests {
             json!({"target":" child ", "message":"task"}),
             json!({"intent":"control", "target":"child", "message":"retire"}),
             json!({"role":" explorer ", "message":"task"}),
-            json!({"role":null, "message":"task"}),
+            json!({"role":" ", "message":"task"}),
+            json!({"role":false, "message":"task"}),
             json!({"target":"child", "role":"explorer", "message":"task"}),
             json!({"intent":"inspect", "role":"reviewer"}),
-            json!({"intent":"inspect", "role":null}),
+            json!({"intent":"inspect", "role":" "}),
+            json!({"action":"list", "target":"", "reply_to":null}),
+            json!({"prompt":"task", "role":null}),
             json!({"intent":"control", "role":"implementer", "target":"child", "message":"retry"}),
         ] {
             assert!(normalize(args).is_err());
@@ -1036,7 +1112,9 @@ mod tests {
             normalize(json!({"reply_to":request.as_str(),"message":"Use option A"})).unwrap();
         assert_eq!(answer.args["message"], "Use option A");
         for bad in [
-            json!({"reply_to":null,"message":"deny"}),
+            json!({"reply_to":" ","message":"deny"}),
+            json!({"reply_to":" request ","message":"deny"}),
+            json!({"reply_to":false,"message":"deny"}),
             json!({"reply_to":request.as_str(),"message":" "}),
             json!({"reply_to":request.as_str(),"message":"x".repeat(bamboo_domain::PARENT_ANSWER_MAX_BYTES + 1)}),
             json!({"reply_to":request.as_str(),"message":"deny ","target":"child"}),
@@ -1092,7 +1170,7 @@ mod tests {
             Some(Projection::ForcedPermissionAudit)
         );
         for args in [
-            json!({"intent":"inspect","target":null,"message":"forced_permission_audit"}),
+            json!({"intent":"inspect","target":" ","message":"forced_permission_audit"}),
             json!({"intent":"inspect","target":"other","message":"forced_permission_audit"}),
             json!({"intent":"inspect","message":"forced_permission_audit ","reply_to":null}),
             json!({"intent":"inspect","message":"forced_permission_audit","parent_session_id":"other"}),

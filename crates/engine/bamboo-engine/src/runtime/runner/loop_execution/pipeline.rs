@@ -2442,6 +2442,7 @@ async fn handle_tool_calls_path(
     mut round_usage: MetricsTokenUsage,
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
+    policy_guard: &mut crate::runtime::runner::tool_execution::ToolPolicyGuard,
     auxiliary_models: &crate::runtime::config::AuxiliaryModelConfig,
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
@@ -2531,6 +2532,7 @@ async fn handle_tool_calls_path(
                 frame,
                 session,
                 runtime_state,
+                policy_guard,
                 task_context,
                 compression_model_name: compression_model
                     .as_deref()
@@ -2817,7 +2819,32 @@ async fn run_pipeline_inner(
     // unrelated reason (or completes normally).
     session.metadata.remove("runtime.budget_exceeded_kind");
 
+    let mut tool_policy_guard = crate::runtime::runner::tool_execution::ToolPolicyGuard::new(
+        config.max_tool_calls_per_round,
+        config.max_consecutive_failures_per_tool,
+    );
+
     loop {
+        if let Some(message) = tool_policy_guard.delegation_failure_message() {
+            // The preceding round has already persisted every tool response and
+            // accounted for its usage. Stop before another model request rather
+            // than recording a phantom round or retrying a terminal tool error.
+            let error = if cancel_token.is_cancelled() {
+                AgentError::Cancelled
+            } else {
+                AgentError::Tool(message)
+            };
+            if let Some(metrics) = state.metrics_collector.as_ref() {
+                metrics.session_completed(
+                    state.session_id.clone(),
+                    map_turn_error_status(&error).1,
+                    Utc::now(),
+                );
+            }
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+            abort_in_flight_evaluations(state, event_tx, "delegation_failure_limit").await;
+            return Err(error);
+        }
         refresh_auxiliary_models_for_round(state, config);
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
@@ -3434,6 +3461,7 @@ async fn run_pipeline_inner(
                         round_activity.token_usage(),
                         session,
                         &mut state.runtime_state,
+                        &mut tool_policy_guard,
                         &state.auxiliary_models,
                         &state.model_name,
                         &mut state.task_context,
@@ -6504,6 +6532,332 @@ mod tests {
             }
         }
         assert_eq!(completes, 1, "exactly one terminal Complete");
+    }
+
+    struct DelegationLoopProvider {
+        calls: AtomicUsize,
+        finish_after: Option<usize>,
+        calls_per_round: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for DelegationLoopProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.finish_after == Some(round) {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Delegation corrected.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls((0..self.calls_per_round).map(|offset| bamboo_agent_core::tools::ToolCall {
+                    id: format!("delegation-{}", round * self.calls_per_round + offset),
+                    tool_type: "function".into(),
+                    function: bamboo_agent_core::tools::FunctionCall {
+                        name: "SubAgent".into(),
+                        arguments: r#"{"intent":"chat","role":"explorer","target":"","reply_to":"","message":"Audit worktrees"}"#.into(),
+                    },
+                }).collect())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct DelegationLoopExecutor {
+        calls: AtomicUsize,
+        success_on: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for DelegationLoopExecutor {
+        async fn execute(
+            &self,
+            _: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.success_on == Some(call) {
+                Ok(bamboo_agent_core::tools::ToolResult::text(
+                    true,
+                    "child created",
+                ))
+            } else {
+                Err(bamboo_agent_core::tools::ToolError::InvalidArguments(
+                    "ParentRequest reply requires chat intent and omits target and role".into(),
+                ))
+            }
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "SubAgent".into(),
+                    description: "Delegate a task".into(),
+                    parameters: serde_json::json!({"type":"object", "properties":{}}),
+                },
+            }]
+        }
+    }
+
+    fn delegation_loop_config() -> AgentLoopConfig {
+        AgentLoopConfig {
+            prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".into()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(10),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_subagent_failures_stop_native_run_and_a_fresh_run_resets_the_guard() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("delegation-failure-loop", "model");
+        session.add_message(Message::user("Audit worktrees"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(DelegationLoopProvider {
+            calls: AtomicUsize::new(0),
+            finish_after: None,
+            calls_per_round: 1,
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: None,
+        });
+        let config = delegation_loop_config();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for run in 1..=2 {
+            let mut state = e2e_loop_state(&session.id);
+            let error = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                executor.clone(),
+                &cancel,
+                &config,
+                &mut state,
+            )
+            .await
+            .expect_err("delegation circuit must stop before the round budget");
+            assert!(
+                matches!(error, AgentError::Tool(ref message) if message.contains("3 consecutive failures") && message.contains("omit unused target and reply_to"))
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3 * run);
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 3 * run);
+            for call in 0..3 * run {
+                assert_eq!(
+                    session
+                        .messages
+                        .iter()
+                        .filter(|message| message.tool_call_id.as_deref()
+                            == Some(format!("delegation-{call}").as_str()))
+                        .count(),
+                    1,
+                    "every failed tool call needs one durable response"
+                );
+            }
+            assert!(!session.metadata.contains_key("runtime.completion_reason"));
+            session.add_message(Message::user("Retry after correcting the call"));
+        }
+    }
+
+    #[tokio::test]
+    async fn corrected_subagent_call_clears_failure_streak_in_the_real_loop() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("delegation-correction-loop", "model");
+        session.add_message(Message::user("Audit worktrees"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(DelegationLoopProvider {
+            calls: AtomicUsize::new(0),
+            finish_after: Some(5),
+            calls_per_round: 1,
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: Some(2),
+        });
+        let config = delegation_loop_config();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut state = e2e_loop_state(&session.id);
+        let complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("a corrected call must reset the streak");
+        assert!(complete);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
+    }
+
+    struct CancelAfterThirdDelegationRound(tokio_util::sync::CancellationToken);
+
+    #[async_trait::async_trait]
+    impl AgentHook for CancelAfterThirdDelegationRound {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterRound
+        }
+
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if matches!(payload, HookPayload::Round { round: 3 }) {
+                self.0.cancel();
+            }
+            HookResult::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_circuit_records_terminal_session_metrics_and_prioritizes_cancel() {
+        use bamboo_metrics::storage::MetricsStorage;
+        use std::sync::atomic::Ordering;
+        for cancelled in [false, true] {
+            let mut session = Session::new("delegation-terminal-metrics", "model");
+            session.add_message(Message::user("Audit worktrees"));
+            let (_dir, collector, storage) = create_pipeline_metrics().await;
+            crate::runtime::runner::metrics_lifecycle::record_session_started(
+                Some(&collector),
+                &session.id,
+                "model",
+                session.created_at,
+                session.messages.len() as u32,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let provider = Arc::new(DelegationLoopProvider {
+                calls: AtomicUsize::new(0),
+                finish_after: None,
+                calls_per_round: 1,
+            });
+            let executor = Arc::new(DelegationLoopExecutor {
+                calls: AtomicUsize::new(0),
+                success_on: None,
+            });
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut config = delegation_loop_config();
+            if cancelled {
+                let mut hooks = crate::runtime::hooks::HookRunner::new();
+                hooks.register(Arc::new(CancelAfterThirdDelegationRound(cancel.clone())));
+                config.hook_runner = Arc::new(hooks);
+            }
+            let mut state = e2e_loop_state(&session.id);
+            state.metrics_collector = Some(collector);
+            let error = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                executor.clone(),
+                &cancel,
+                &config,
+                &mut state,
+            )
+            .await
+            .expect_err("terminal delegation failure");
+            assert_eq!(matches!(error, AgentError::Cancelled), cancelled);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 3);
+            let expected = if cancelled {
+                MetricsSessionStatus::Cancelled
+            } else {
+                MetricsSessionStatus::Error
+            };
+            let detail = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(detail) = storage.session_detail(&session.id).await.unwrap() {
+                        if detail.session.status == expected
+                            && detail.session.completed_at.is_some()
+                        {
+                            break detail;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("terminal metric persisted");
+            assert_eq!(detail.rounds.len(), 3, "no phantom fourth round");
+            assert!(detail
+                .rounds
+                .iter()
+                .all(|round| round.status == MetricsRoundStatus::Error));
+            assert_eq!(
+                detail.session.total_token_usage.prompt_tokens,
+                state.runtime_state.round.total_prompt_tokens
+            );
+            assert_eq!(
+                detail.session.total_token_usage.completion_tokens,
+                state.runtime_state.round.total_completion_tokens
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_subagent_batch_executes_at_most_three_calls_and_records_every_response() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("delegation-batch", "model");
+        session.add_message(Message::user("Audit worktrees"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(DelegationLoopProvider {
+            calls: AtomicUsize::new(0),
+            finish_after: None,
+            calls_per_round: 4,
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: None,
+        });
+        let mut state = e2e_loop_state(&session.id);
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect_err("bounded failing batch");
+        assert!(matches!(error, AgentError::Tool(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 3);
+        for call in 0..4 {
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref()
+                        == Some(format!("delegation-{call}").as_str()))
+                    .count(),
+                1
+            );
+        }
+        assert!(session
+            .messages
+            .iter()
+            .any(
+                |message| message.tool_call_id.as_deref() == Some("delegation-3")
+                    && message.content.contains("circuit limit")
+            ));
     }
 
     /// Always emits a tool call so the loop can never self-terminate — forces the
@@ -10099,6 +10453,7 @@ mod tests {
                 },
                 &mut session,
                 &mut runtime_state,
+                &mut crate::runtime::runner::tool_execution::ToolPolicyGuard::default(),
                 &auxiliary_models,
                 "model",
                 &mut task_context,
@@ -10167,6 +10522,8 @@ mod tests {
                 frame: &frame,
                 session: &mut session,
                 runtime_state: &mut runtime_state,
+                policy_guard: &mut crate::runtime::runner::tool_execution::ToolPolicyGuard::default(
+                ),
                 task_context: &mut task_context,
                 // No compression model -> mid-turn compression short-circuits, so
                 // the healthy path is exercised without any auxiliary LLM call.
@@ -10400,6 +10757,7 @@ mod tests {
                 },
                 &mut session,
                 &mut runtime_state,
+                &mut crate::runtime::runner::tool_execution::ToolPolicyGuard::default(),
                 &auxiliary_models,
                 "model",
                 &mut task_context,

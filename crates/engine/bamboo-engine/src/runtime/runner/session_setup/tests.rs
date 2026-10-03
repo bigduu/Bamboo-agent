@@ -1111,6 +1111,133 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_names.contains("mcp__external__read"));
 }
 
+#[test]
+fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
+    use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
+    let config = crate::runtime::config::AgentLoopConfig {
+        freeze_tool_exposure_for_cache: true,
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: vec![
+            schema("SubAgent"),
+            schema("Read"),
+            schema("Bash"),
+            schema("Edit"),
+        ],
+    };
+    let mut root = Session::new("ultra-guide", "model");
+    resolve_tool_schemas_for_round(&config, &tools, &mut root);
+    assert_eq!(root.metadata["prompt_tool_exposure_activated"], "[]");
+
+    // Selecting Ultra after the presentation cache froze must still expose
+    // the contract without requiring user activation or the old prompt flag.
+    root.set_root_orchestration_only(true).unwrap();
+    assert!(!root.root_orchestration_prompt_enabled());
+    assert!(bamboo_tools::exposure::activated_discoverable_tools(&root).is_empty());
+    assert_eq!(
+        effective_guide_activation(&config, &root),
+        std::collections::BTreeSet::from(["SubAgent".to_string()])
+    );
+    let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut root);
+    let names = schemas
+        .iter()
+        .map(|schema| schema.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["Read", "SubAgent"]);
+    assert!(!schemas[1].function.description.contains("Discoverable"));
+    let guide = super::prompt_setup::build_tool_guide_context(
+        &config,
+        &schemas,
+        crate::runtime::context::DEFAULT_BASE_PROMPT,
+        &root.id,
+        &effective_guide_activation(&config, &root),
+    );
+    assert!(guide.contains("**SubAgent**"));
+    assert!(guide.contains("omit unused fields"));
+    assert!(guide.contains("intent=inspect"));
+    assert!(guide.contains("ParentRequest"));
+    assert!(guide.contains("approve_once or deny"));
+    let spec = bamboo_tools::guide::builtin_guides::builtin_guide_spec("SubAgent")
+        .expect("SubAgent guide");
+    for example in spec.examples.iter().take(2) {
+        assert!(guide.contains(&serde_json::to_string(&example.parameters).unwrap()));
+    }
+    assert_eq!(root.metadata["prompt_tool_exposure_activated"], "[]");
+    assert!(bamboo_tools::exposure::activated_discoverable_tools(&root).is_empty());
+}
+
+#[test]
+fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() {
+    use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["SubAgent".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("SubAgent"), schema("Read"), schema("Bash")],
+    };
+    let mut root = Session::new("disabled-ultra-guide", "model");
+    root.set_root_orchestration_only(true).unwrap();
+    let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut root);
+    assert_eq!(
+        schemas
+            .iter()
+            .map(|schema| schema.function.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Read"]
+    );
+    let guide = super::prompt_setup::build_tool_guide_context(
+        &config,
+        &schemas,
+        "Base prompt",
+        &root.id,
+        &effective_guide_activation(&config, &root),
+    );
+    assert!(!guide.contains("**SubAgent**"));
+
+    let ordinary_config = crate::runtime::config::AgentLoopConfig::default();
+    let child = Session::new_child_of("worker", &root, "model", "worker");
+    assert!(!effective_guide_activation(&ordinary_config, &child).contains("SubAgent"));
+    let child_schemas =
+        resolve_available_tool_schemas_for_session(&ordinary_config, &tools, &child);
+    assert!(child_schemas
+        .iter()
+        .any(|schema| schema.function.name == "Bash"));
+    assert!(child_schemas
+        .iter()
+        .find(|schema| schema.function.name == "SubAgent")
+        .unwrap()
+        .function
+        .description
+        .contains("Discoverable"));
+    root.set_root_orchestration_only(false).unwrap();
+    assert!(!effective_guide_activation(&ordinary_config, &root).contains("SubAgent"));
+}
+
+#[test]
+fn default_delegation_prompts_use_the_compact_subagent_contract() {
+    let base = crate::runtime::context::DEFAULT_BASE_PROMPT;
+    for field in ["intent", "target", "role", "message", "reply_to"] {
+        assert!(base.contains(&format!("`{field}`")), "missing {field}");
+    }
+    assert!(base.contains("workspace paths and files"));
+    assert!(base.contains("runtime manages activation and waiting"));
+    for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
+        for stale in [
+            "set `workspace`",
+            "lifecycle=resident",
+            "stable `name`",
+            "SubAgent.wait",
+            "run/send_message",
+            "explicit workspace",
+            "then wait once",
+        ] {
+            assert!(!prompt.contains(stale), "stale SubAgent guidance: {stale}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_tools() {
     let config = crate::runtime::config::AgentLoopConfig::default();
