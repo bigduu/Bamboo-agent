@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -48,6 +48,7 @@ struct Probe {
     child_ready: AtomicBool,
     root_ready: AtomicBool,
     late_response_emitted: AtomicBool,
+    requests: Mutex<Vec<Value>>,
     release_child: tokio::sync::watch::Sender<bool>,
     release_root: tokio::sync::watch::Sender<bool>,
 }
@@ -90,6 +91,25 @@ fn tool_call(id: &str, name: &str, args: Value) -> (Value, &'static str) {
 
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
+    let tools: Vec<_> = body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .take(32)
+        .collect();
+    let diagnostic = json!({
+        "model":body["model"],"tools":tools,
+        "has_input":has_user(&body,INPUT),"has_successor":has_user(&body,SUCCESSOR),
+        "matched_previous_root_classifier":body["model"] == "inbox-root" && tools.contains(&"SubAgent")
+    });
+    {
+        let mut requests = probe.requests.lock().unwrap();
+        if requests.len() < 24 {
+            eprintln!("ordinary fixture provider request: {diagnostic}");
+            requests.push(diagnostic);
+        }
+    }
     let (delta, finish) = if body["model"] == "inbox-child" {
         assert_eq!(
             probe.child_calls.fetch_add(1, Ordering::SeqCst),
@@ -100,7 +120,10 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         probe.child_ready.store(true, Ordering::SeqCst);
         released(&probe.release_child).await;
         (json!({"content":CHILD_RESULT}), "stop")
-    } else if body["model"] == "inbox-root" && body["tools"].to_string().contains("SubAgent") {
+    } else if body["model"] == "inbox-root" {
+        // Foreground identity is the configured model. The runtime may project
+        // the tool catalog after cancellation; that does not turn a Root
+        // request into a background title or summary request.
         if matches!(probe.case, Case::PendingRestart) && !has_user(&body, INPUT) {
             probe.root_ready.store(true, Ordering::SeqCst);
             released(&probe.release_root).await;
@@ -250,6 +273,7 @@ impl Fixture {
             child_ready: AtomicBool::new(false),
             root_ready: AtomicBool::new(false),
             late_response_emitted: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
             release_child,
             release_root,
         });
@@ -262,7 +286,7 @@ impl Fixture {
                     "/v1/models",
                     web::get().to(|| async {
                         HttpResponse::Ok()
-                            .json(json!({"data":[{"id":"inbox-root"},{"id":"inbox-child"}]}))
+                            .json(json!({"data":[{"id":"inbox-root"},{"id":"inbox-child"},{"id":"inbox-auxiliary"}]}))
                     }),
                 )
         })
@@ -275,8 +299,8 @@ impl Fixture {
         actix_web::rt::spawn(running);
         std::fs::write(data.join("config.json"), serde_json::to_vec(&json!({
             "provider":"openai","features":{"provider_model_ref":true},
-            "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"inbox-root"}},
-            "defaults":{"chat":{"provider":"openai","model":"inbox-root"}},
+            "providers":{"openai":{"api_key":"fixture","base_url":provider_url,"model":"inbox-root","fast_model":"inbox-auxiliary"}},
+            "defaults":{"chat":{"provider":"openai","model":"inbox-root"},"fast":{"provider":"openai","model":"inbox-auxiliary"}},
             "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}
         })).unwrap()).unwrap();
         if matches!(case, Case::Permission) {
@@ -435,6 +459,7 @@ impl Fixture {
                         "admission":session.session_inbox_admission(),"messages_newest_first":messages,
                         "child_calls":self.probe.child_calls.load(Ordering::SeqCst),
                         "input_calls":self.probe.input_calls.load(Ordering::SeqCst),
+                        "provider_requests":self.probe.requests.lock().unwrap().clone(),
                         "child_ready":self.probe.child_ready.load(Ordering::SeqCst),
                         "root_ready":self.probe.root_ready.load(Ordering::SeqCst),"host_logs":logs
                     })
@@ -622,6 +647,16 @@ async fn waiting_ordinary_root_handles_durable_input_retains_child_result_and_re
 async fn cancelled_root_provider_response_cannot_commit_over_successor_input() {
     let mut fixture = Fixture::new(Case::Cancel).await;
     fixture.held_child().await;
+    let original_wait = serde_json::to_value(
+        fixture
+            .canonical()
+            .await
+            .agent_runtime_state
+            .unwrap()
+            .waiting_for_children
+            .unwrap(),
+    )
+    .unwrap();
     fixture.guidance(INPUT_ID, INPUT).await;
     let probe = fixture.probe.clone();
     fixture
@@ -637,11 +672,27 @@ async fn cancelled_root_provider_response_cannot_commit_over_successor_input() {
         })
         .await;
     fixture.guidance(SUCCESSOR_ID, SUCCESSOR).await;
-    fixture
+    let successor = fixture
         .wait("successor input commits", |session| {
             has_reply(session, SUCCESSOR_REPLY)
+                && session.last_run_status().as_deref() == Some("suspended")
         })
         .await;
+    assert!(!*fixture.probe.release_child.borrow());
+    assert_eq!(
+        serde_json::to_value(
+            successor
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref()
+                .unwrap()
+        )
+        .unwrap(),
+        original_wait,
+        "successor reasoning preserves the original held Child wait lease"
+    );
     fixture.probe.release_root.send_replace(true);
     let probe = fixture.probe.clone();
     fixture
