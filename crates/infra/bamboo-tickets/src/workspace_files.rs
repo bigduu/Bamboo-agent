@@ -111,28 +111,17 @@ impl TicketService {
             Error::ScopeDenied("file capability has no isolated workspace".into())
         })?;
         let path = Path::new(op.path());
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
-            || path
-                .components()
-                .any(|c| matches!(c, Component::Normal(n) if n == ".git" || n == ".bamboo"))
+        let root = file_root(&store, workspace, path)?;
+        if matches!(op, FileOperation::Write { .. })
+            && assignment.effects.values().any(|effect| {
+                matches!(
+                    effect.state,
+                    EffectState::Started | EffectState::OutcomeUnknown
+                )
+            })
         {
-            return Err(Error::ScopeDenied(
-                "file path must be absolute without traversal, .git or .bamboo control directories"
-                    .into(),
-            ));
-        }
-        let root = workspace
-            .write_roots
-            .iter()
-            .map(Path::new)
-            .find(|root| path.starts_with(root))
-            .ok_or_else(|| Error::ScopeDenied("file outside Assignment write roots".into()))?;
-        if store.root().starts_with(root) || root.starts_with(store.root()) {
-            return Err(Error::ScopeDenied(
-                "TicketStore cannot be a Worker file root".into(),
+            return Err(Error::ResourceBlocked(
+                "unresolved Assignment effect; no new file writes".into(),
             ));
         }
         let (dir, name) = physical::parent(root, path)?;
@@ -171,7 +160,7 @@ impl TicketService {
         let artifact = store.store_artifact(content.as_bytes())?;
         let mut started = snapshot.clone();
         started.seq += 1;
-        started.schema = 3;
+        started.schema = 4;
         let a = started
             .assignments
             .get_mut(assignment_id)
@@ -185,6 +174,10 @@ impl TicketService {
                 state: EffectState::Started,
                 provider_receipt: None,
                 artifact: Some(artifact.clone()),
+                file_intent: Some(FileWriteIntent {
+                    principal: authority.identity(),
+                    canonical_request: String::from_utf8(canonical_bytes(op)?).expect("JSON UTF-8"),
+                }),
             },
         );
         // Commit intent and complete immutable content before any physical write.
@@ -227,6 +220,49 @@ impl TicketService {
             artifact: Some(artifact),
         })
     }
+}
+
+fn file_root<'a>(
+    store: &store::FileStore,
+    workspace: &'a ExecutionWorkspace,
+    path: &Path,
+) -> Result<&'a Path> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        || path
+            .components()
+            .any(|c| matches!(c, Component::Normal(n) if n == ".git" || n == ".bamboo"))
+    {
+        return Err(Error::ScopeDenied(
+            "file path must be absolute without traversal, .git or .bamboo control directories"
+                .into(),
+        ));
+    }
+    let root = workspace
+        .write_roots
+        .iter()
+        .map(Path::new)
+        .find(|root| path.starts_with(root))
+        .ok_or_else(|| Error::ScopeDenied("file outside Assignment write roots".into()))?;
+    if store.root().starts_with(root) || root.starts_with(store.root()) {
+        return Err(Error::ScopeDenied(
+            "TicketStore cannot be a Worker file root".into(),
+        ));
+    }
+    Ok(root)
+}
+
+pub(crate) fn observed_hash(
+    store: &store::FileStore,
+    workspace: &ExecutionWorkspace,
+    file_path: &str,
+) -> Result<Option<String>> {
+    let path = Path::new(file_path);
+    let root = file_root(store, workspace, path)?;
+    let (dir, name) = physical::parent(root, path)?;
+    Ok(physical::read(&dir, &name)?.map(|bytes| content_hash(&bytes)))
 }
 
 #[cfg(unix)]

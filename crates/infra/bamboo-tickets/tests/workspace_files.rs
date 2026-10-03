@@ -143,7 +143,7 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
         Err(Error::IdempotencyConflict)
     ));
     let (commit, s) = f.service.published().unwrap();
-    assert_eq!(s.schema, 3);
+    assert_eq!(s.schema, 4);
     assert_eq!(
         s.assignments[&f.assignment]
             .effects
@@ -167,11 +167,11 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
     let backup = f._temp.path().join("backup");
     assert_eq!(f.service.export(&backup).unwrap(), commit);
     let restored = TicketService::open_offline(&backup, s.binding).unwrap();
-    assert_eq!(restored.published().unwrap().1.schema, 3);
+    assert_eq!(restored.published().unwrap().1.schema, 4);
 }
 
 #[test]
-fn schema_three_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
+fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
     let f = fixture();
     let path = Path::new(&f.workspace.worktree).join("code.rs");
     let artifact = f
@@ -230,7 +230,7 @@ fn schema_three_file_evidence_survives_stopped_offline_transfer_without_downgrad
     destination
         .activate_migrated_copy(&source, &user, &request, &proof)
         .unwrap();
-    assert_eq!(destination.published().unwrap().1.schema, 3);
+    assert_eq!(destination.published().unwrap().1.schema, 4);
     assert_eq!(
         destination
             .read_artifact(&user, &artifact, FILE_BYTES_LIMIT)
@@ -476,6 +476,14 @@ fn file_changed_but_receipt_publication_failed_never_repeats_effect() {
         f.service.workspace_file(&f.worker, "write", &op),
         Err(Error::ResourceBlocked(_))
     ));
+    assert!(matches!(
+        f.service.workspace_file(
+            &f.worker,
+            "new-call-id",
+            &write(&path, "new content", Some(content_hash(b"new content"))),
+        ),
+        Err(Error::ResourceBlocked(_))
+    ));
     assert_eq!(
         f.service.published().unwrap().1.assignments[&f.assignment]
             .effects
@@ -497,4 +505,397 @@ fn file_changed_but_receipt_publication_failed_never_repeats_effect() {
         result
     );
     assert_eq!(fs::read_to_string(path).unwrap(), "new content");
+}
+
+#[cfg(feature = "test-utils")]
+fn unknown_file(f: &Fixture, name: &str) -> String {
+    use std::sync::Arc;
+    let path = Path::new(&f.workspace.worktree).join(name);
+    f.service.set_operation_publication_fault(
+        "worker-file/".into(),
+        Arc::new(|point| {
+            if point == FaultPoint::BeforeHeadRename {
+                Err(std::io::Error::from_raw_os_error(28))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    assert!(f
+        .service
+        .workspace_file(&f.worker, name, &write(&path, "intended code", None))
+        .is_err());
+    f.service.set_publication_fault(None);
+    f.service.published().unwrap().1.assignments[&f.assignment]
+        .effects
+        .iter()
+        .find(|(_, e)| {
+            e.file_intent
+                .as_ref()
+                .unwrap()
+                .canonical_request
+                .contains(name)
+        })
+        .unwrap()
+        .0
+        .clone()
+}
+
+#[cfg(feature = "test-utils")]
+fn stopped(f: &Fixture) {
+    let s = f.service.published().unwrap().1;
+    execute(
+        &f.service,
+        &Authority::from_verified_host(s.binding, Principal::Runtime),
+        "actual-stop",
+        vec![Operation::RuntimeStopped {
+            assignment_id: f.assignment.clone(),
+            receipt: s.assignments[&f.assignment].runtime.clone().unwrap(),
+            completed: false,
+        }],
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "test-utils")]
+fn user(f: &Fixture) -> Authority {
+    Authority::from_verified_host(
+        f.service.published().unwrap().1.binding,
+        Principal::User {
+            user_id: "operator".into(),
+        },
+    )
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn explicit_observed_file_ack_requires_stop_and_releases_only_without_retry_or_acceptance() {
+    use std::os::unix::fs::MetadataExt;
+    let f = fixture();
+    let effect = unknown_file(&f, "recover.rs");
+    let who = user(&f);
+    assert!(f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &effect,
+            "file-reconcile/one",
+            "verified bytes"
+        )
+        .unwrap()
+        .request
+        .is_none());
+    assert!(matches!(
+        f.service
+            .file_reconciliation_plan(&f.worker, &f.assignment, &effect, "x", "e"),
+        Err(Error::ScopeDenied(_))
+    ));
+    stopped(&f);
+    let plan = f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &effect,
+            "file-reconcile/one",
+            "verified intended code after stop",
+        )
+        .unwrap();
+    let request = plan.request.unwrap();
+    let path = Path::new(&f.workspace.worktree).join("recover.rs");
+    let inode = fs::metadata(&path).unwrap().ino();
+    let receipt = f.service.reconcile_file_effect(&who, &request).unwrap();
+    assert_eq!(receipt.ids["resource_released"], "true");
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "intended code");
+    let s = f.service.published().unwrap().1;
+    let a = &s.assignments[&f.assignment];
+    let w = &s.tickets[&a.work_id];
+    assert_eq!(a.state, AssignmentState::Failed);
+    assert_eq!(w.state, WorkState::Blocked);
+    assert!(w.active_assignment.is_none());
+    assert!(s.submissions.is_empty());
+    assert!(a.effects[&effect]
+        .provider_receipt
+        .as_ref()
+        .unwrap()
+        .starts_with("local-file-observed:"));
+    assert_eq!(
+        f.service.reconcile_file_effect(&who, &request).unwrap(),
+        receipt
+    );
+    let mut changed = request.clone();
+    changed.evidence.push('!');
+    assert!(matches!(
+        f.service.reconcile_file_effect(&who, &changed),
+        Err(Error::IdempotencyConflict)
+    ));
+    let other = Authority::from_verified_host(
+        s.binding,
+        Principal::User {
+            user_id: "other".into(),
+        },
+    );
+    assert!(matches!(
+        f.service.reconcile_file_effect(&other, &request),
+        Err(Error::ScopeDenied(_))
+    ));
+    assert!(matches!(
+        f.service.authorize_tool(&f.worker, "Write"),
+        Err(Error::ScopeDenied(_))
+    ));
+    let host = Authority::from_verified_host(
+        f.service.published().unwrap().1.binding,
+        Principal::Supervisor {
+            session_id: "root".into(),
+        },
+    );
+    execute(
+        &f.service,
+        &host,
+        "explicit-next",
+        vec![
+            Operation::Ready {
+                work_id: a.work_id.clone(),
+            },
+            Operation::Start {
+                work_id: a.work_id.clone(),
+                temp_id: "next".into(),
+                workspace: Some(f.workspace.clone()),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        f.service.published().unwrap().1.tickets[&a.work_id].generation,
+        2
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn changed_file_stale_plan_and_one_of_two_effects_never_release_unresolved_claims() {
+    let mut f = fixture();
+    let first = unknown_file(&f, "one.rs");
+    // Inspect an existing full ledger with multiple uncertain file intents.
+    // The current live port prevents creating another Write after uncertainty.
+    let root = f._temp.path().join("authority");
+    let binding = f.service.published().unwrap().1.binding;
+    drop(f.service);
+    let mut store = store::FileStore::open(&root, binding.clone()).unwrap();
+    let mut s = store.published.as_ref().unwrap().1.clone();
+    s.seq += 1;
+    let a = s.assignments.get_mut(&f.assignment).unwrap();
+    let mut second_effect = a.effects[&first].clone();
+    let second_path = Path::new(&f.workspace.worktree).join("two.rs");
+    fs::write(&second_path, "intended code").unwrap();
+    let canonical = canonical_bytes(&write(&second_path, "intended code", None)).unwrap();
+    second_effect.action_fingerprint = content_hash(&canonical);
+    second_effect
+        .file_intent
+        .as_mut()
+        .unwrap()
+        .canonical_request = String::from_utf8(canonical).unwrap();
+    let second = format!(
+        "worker-file/{}",
+        content_hash(b"fixture-second-frozen-intent")
+    );
+    a.effects.insert(second.clone(), second_effect);
+    a.record_revision += 1;
+    a.updated_seq = s.seq;
+    store.publish(s).unwrap();
+    drop(store);
+    f.service = TicketService::open(&root, binding).unwrap();
+    stopped(&f);
+    let who = user(&f);
+    let r = f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &first,
+            "file-reconcile/first",
+            "inspect",
+        )
+        .unwrap()
+        .request
+        .unwrap();
+    let path = Path::new(&f.workspace.worktree).join("one.rs");
+    fs::write(&path, "different").unwrap();
+    assert!(matches!(
+        f.service.reconcile_file_effect(&who, &r),
+        Err(Error::RevisionConflict)
+    ));
+    assert!(f
+        .service
+        .file_reconciliation_plan(&who, &f.assignment, &first, "other", "inspect")
+        .unwrap()
+        .request
+        .is_none());
+    fs::write(&path, "intended code").unwrap();
+    let receipt = f.service.reconcile_file_effect(&who, &r).unwrap();
+    assert_eq!(receipt.ids["resource_released"], "false");
+    assert_eq!(
+        f.service.published().unwrap().1.assignments[&f.assignment].state,
+        AssignmentState::OutcomeUnknown
+    );
+    let mut stale = r;
+    stale.operation_id = "file-reconcile/stale".into();
+    assert!(matches!(
+        f.service.reconcile_file_effect(&who, &stale),
+        Err(Error::RevisionConflict)
+    ));
+    let r = f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &second,
+            "file-reconcile/second",
+            "inspect",
+        )
+        .unwrap()
+        .request
+        .unwrap();
+    assert_eq!(
+        f.service.reconcile_file_effect(&who, &r).unwrap().ids["resource_released"],
+        "true"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn metadata_failure_replays_frozen_observation_receipt_and_schema_three_remains_quarantined() {
+    use std::sync::Arc;
+    let f = fixture();
+    let effect = unknown_file(&f, "recover.rs");
+    stopped(&f);
+    let who = user(&f);
+    let r = f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &effect,
+            "file-reconcile/fault",
+            "inspect",
+        )
+        .unwrap()
+        .request
+        .unwrap();
+    f.service.set_operation_publication_fault(
+        "file-reconcile/".into(),
+        Arc::new(|p| {
+            if p == FaultPoint::BeforeHeadRename {
+                Err(std::io::Error::from_raw_os_error(13))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    assert!(f.service.reconcile_file_effect(&who, &r).is_err());
+    f.service.set_publication_fault(None);
+    assert_eq!(
+        f.service.published().unwrap().1.assignments[&f.assignment].effects[&effect].state,
+        EffectState::Started
+    );
+    let path = Path::new(&f.workspace.worktree).join("recover.rs");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "intended code");
+    let root = f._temp.path().join("authority");
+    let binding = f.service.published().unwrap().1.binding;
+    drop(f.service);
+    let service = TicketService::open_offline(&root, binding.clone()).unwrap();
+    let receipt = service.reconcile_file_effect(&who, &r).unwrap();
+    assert!(matches!(service.health(), Health::ReadOnly { .. }));
+    drop(service);
+    let service = TicketService::open_offline(&root, binding.clone()).unwrap();
+    assert_eq!(service.reconcile_file_effect(&who, &r).unwrap(), receipt);
+    drop(service);
+    // Produce the exact supported prior format with complete immutable objects,
+    // not a malformed/truncated on-disk edit. A legacy unknown cannot be cleared.
+    let mut store = store::FileStore::open(&root, binding.clone()).unwrap();
+    let mut s = store.published.as_ref().unwrap().1.clone();
+    s.seq += 1;
+    s.schema = 3;
+    let e = s
+        .assignments
+        .get_mut(&f.assignment)
+        .unwrap()
+        .effects
+        .get_mut(&effect)
+        .unwrap();
+    e.file_intent = None;
+    e.state = EffectState::Started;
+    e.provider_receipt = None;
+    s.assignments.get_mut(&f.assignment).unwrap().state = AssignmentState::OutcomeUnknown;
+    s.receipts.remove(&effect);
+    s.receipts.remove(&r.operation_id);
+    store.publish(s).unwrap();
+    drop(store);
+    let service = TicketService::open_offline(&root, binding).unwrap();
+    assert!(service
+        .file_reconciliation_plan(&who, &f.assignment, &effect, "legacy", "inspect")
+        .unwrap()
+        .request
+        .is_none());
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn offline_observation_uncertain_head_keeps_readonly_until_verified_reopen() {
+    use std::{os::unix::fs::MetadataExt, sync::Arc};
+    let f = fixture();
+    let effect = unknown_file(&f, "uncertain.rs");
+    stopped(&f);
+    let who = user(&f);
+    let r = f
+        .service
+        .file_reconciliation_plan(
+            &who,
+            &f.assignment,
+            &effect,
+            "file-reconcile/uncertain",
+            "inspect",
+        )
+        .unwrap()
+        .request
+        .unwrap();
+    let root = f._temp.path().join("authority");
+    let binding = f.service.published().unwrap().1.binding;
+    let path = Path::new(&f.workspace.worktree).join("uncertain.rs");
+    let inode = fs::metadata(&path).unwrap().ino();
+    assert!(TicketService::open_offline(&root, binding.clone()).is_err());
+    drop(f.service);
+    let service = TicketService::open_offline(&root, binding.clone()).unwrap();
+    service.set_operation_publication_fault(
+        "file-reconcile/".into(),
+        Arc::new(|point| {
+            if point == FaultPoint::AfterHeadRename {
+                Err(std::io::Error::from_raw_os_error(13))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    assert!(service.reconcile_file_effect(&who, &r).is_err());
+    service.set_publication_fault(None);
+    assert!(matches!(
+        service.reconcile_file_effect(&who, &r),
+        Err(Error::AuthorityUnavailable(_))
+    ));
+    assert!(service
+        .file_reconciliation_plan(&who, &f.assignment, &effect, "fresh", "inspect")
+        .unwrap()
+        .request
+        .is_none());
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    drop(service);
+    let service = TicketService::open_offline(&root, binding).unwrap();
+    assert_eq!(
+        service.reconcile_file_effect(&who, &r).unwrap().ids["resource_released"],
+        "true"
+    );
+    assert!(matches!(service.health(), Health::ReadOnly { .. }));
+    assert_eq!(fs::metadata(path).unwrap().ino(), inode);
 }

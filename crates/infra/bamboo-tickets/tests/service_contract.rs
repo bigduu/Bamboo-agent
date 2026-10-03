@@ -575,6 +575,7 @@ fn approval_is_exact_question_answer_cannot_authorize_and_consumption_is_bound()
                 state: EffectState::Started,
                 provider_receipt: None,
                 artifact: None,
+                file_intent: None,
             },
         }],
     );
@@ -1253,6 +1254,7 @@ fn stopped_process_does_not_release_an_unknown_external_effect() {
                 state: EffectState::Started,
                 provider_receipt: None,
                 artifact: None,
+                file_intent: None,
             },
         }],
     );

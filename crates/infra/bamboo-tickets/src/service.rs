@@ -1242,6 +1242,7 @@ fn apply(
                         state: EffectState::Planned,
                         provider_receipt: None,
                         artifact: None,
+                        file_intent: None,
                     },
                 );
         }
@@ -1257,7 +1258,10 @@ fn apply(
                 .effects
                 .get(attempt_id)
                 .ok_or_else(|| invalid("action attempt was not atomically authorized"))?;
-            if attempt_id.starts_with("worker-file/") || old.artifact != effect.artifact {
+            if attempt_id.starts_with("worker-file/")
+                || old.artifact != effect.artifact
+                || old.file_intent != effect.file_intent
+            {
                 return Err(Error::ScopeDenied(
                     "Host file receipts cannot be supplied by Worker".into(),
                 ));
@@ -1917,6 +1921,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     crate::migration::validate_migration(snapshot)?;
+    crate::file_reconciliation::validate_file_intents(snapshot)?;
     crate::resolution::validate_history(snapshot)?;
     for (id, work) in &snapshot.tickets {
         if id != &work.id {

@@ -428,7 +428,7 @@ impl FileStore {
         let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
         let manifest: Manifest =
             serde_json::from_slice(&self.read_object("manifests", &commit.manifest)?)?;
-        if !matches!(commit.schema, 1..=3) || manifest.schema != commit.schema {
+        if !matches!(commit.schema, 1..=4) || manifest.schema != commit.schema {
             return Err(Error::AuthorityUnavailable("unsupported schema".into()));
         }
         let header = manifest

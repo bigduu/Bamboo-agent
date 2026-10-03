@@ -177,6 +177,17 @@ pub struct Effect {
     pub provider_receipt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<Artifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_intent: Option<FileWriteIntent>,
+}
+
+/// Complete Host-created request, committed before a workspace replacement.
+/// Schema 4 prevents older writers from discarding this recovery evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileWriteIntent {
+    pub principal: String,
+    pub canonical_request: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

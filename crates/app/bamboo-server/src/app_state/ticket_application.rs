@@ -107,39 +107,48 @@ impl TicketApplication {
         let (binding, _) = ticket_runtime::verified_scope_binding(storage, &supervisor.id).await?;
         let service = TicketService::open(scope_root, binding)?;
         #[cfg(feature = "ticket-runtime-fixtures")]
-        Self::install_fixture_exit(&service)?;
+        Self::install_fixture_fault(&service)?;
         Ok(service)
     }
 
-    /// Compile-time opt-in for isolated process-exit acceptance only. Normal
+    /// Compile-time opt-in for isolated process-exit/I/O acceptance only. Normal
     /// builds neither read these fixture variables nor expose the installer.
     #[cfg(feature = "ticket-runtime-fixtures")]
-    fn install_fixture_exit(service: &TicketService) -> Result<()> {
+    fn install_fixture_fault(service: &TicketService) -> Result<()> {
         let Ok(prefix) = std::env::var("BAMBOO_TICKET_FIXTURE_OPERATION_PREFIX") else {
             return Ok(());
         };
-        if !matches!(
-            prefix.as_str(),
-            "fixture-intent" | "runtime-admit/" | "runtime-submit/"
-        ) {
-            return Err(Error::AuthorityUnavailable(
-                "unsupported Ticket fixture operation".into(),
-            ));
-        }
-        let point = match std::env::var("BAMBOO_TICKET_FIXTURE_BOUNDARY").as_deref() {
-            Ok("before_head") => FaultPoint::BeforeHeadRename,
-            Ok("after_head") => FaultPoint::AfterHeadRename,
+        let (point, errno) = match std::env::var("BAMBOO_TICKET_FIXTURE_BOUNDARY").as_deref() {
+            Ok("before_head") => (FaultPoint::BeforeHeadRename, None),
+            Ok("after_head") => (FaultPoint::AfterHeadRename, None),
+            Ok("before_head_enospc") => (FaultPoint::BeforeHeadRename, Some(28)),
+            Ok("before_head_eacces") => (FaultPoint::BeforeHeadRename, Some(13)),
             _ => {
                 return Err(Error::AuthorityUnavailable(
                     "unsupported Ticket fixture boundary".into(),
                 ))
             }
         };
+        if !matches!(
+            (prefix.as_str(), errno),
+            (
+                "fixture-intent" | "runtime-admit/" | "runtime-submit/",
+                None
+            ) | ("worker-file/", Some(13 | 28))
+        ) {
+            return Err(Error::AuthorityUnavailable(
+                "unsupported Ticket fixture operation".into(),
+            ));
+        }
         let label = prefix.clone();
         service.set_operation_publication_fault(
             prefix,
             Arc::new(move |observed| {
                 if observed == point {
+                    if let Some(errno) = errno {
+                        eprintln!("TICKET_FIXTURE_IO {label} {observed:?} errno={errno}");
+                        return Err(std::io::Error::from_raw_os_error(errno));
+                    }
                     eprintln!("TICKET_FIXTURE_EXIT {label} {observed:?}");
                     std::process::exit(71);
                 }

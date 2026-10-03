@@ -16,9 +16,30 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+mod reconcile;
 
 #[derive(Debug, Subcommand)]
 pub enum TicketCommands {
+    /// Observe an uncertain file effect offline; print an exact User request.
+    FileReconcilePlan {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        assignment_id: String,
+        #[arg(long)]
+        effect_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Consume a reviewed file observation request; never rewrite the file.
+    FileReconcile {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Read-only legacy Task mapping and ownership eligibility.
     Preview {
         #[arg(long)]
@@ -77,6 +98,25 @@ pub enum TicketCommands {
 
 pub async fn run(command: TicketCommands) -> anyhow::Result<()> {
     let value = match command {
+        TicketCommands::FileReconcilePlan {
+            data_dir,
+            assignment_id,
+            effect_id,
+            operation_id,
+            evidence,
+        } => {
+            reconcile::plan(
+                &data_dir,
+                &assignment_id,
+                &effect_id,
+                &operation_id,
+                &evidence,
+            )
+            .await?
+        }
+        TicketCommands::FileReconcile { data_dir, request } => {
+            reconcile::commit(&data_dir, &request).await?
+        }
         TicketCommands::Preview {
             data_dir,
             source_session,

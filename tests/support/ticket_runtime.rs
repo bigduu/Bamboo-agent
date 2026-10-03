@@ -84,7 +84,9 @@ pub async fn command(client: &reqwest::Client, base: &str, id: &str, operations:
 }
 
 pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: &Path) {
-    tokio::time::timeout(Duration::from_secs(45), async {
+    // A cold full Host (skills/config/HTTP workers) exceeded 45s under local
+    // build load. Keep a bounded startup allowance before product assertions.
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if let Some(status) = host.0.try_wait().unwrap() {
                 panic!(
