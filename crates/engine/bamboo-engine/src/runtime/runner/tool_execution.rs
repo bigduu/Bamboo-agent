@@ -18,6 +18,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
+pub(crate) use policy::ToolPolicyGuard;
+
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
     let budget = session.effective_token_budget()?;
@@ -438,6 +440,7 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
     pub(crate) frame: &'a crate::runtime::runner::round_frame::RoundFrame<'frame>,
     pub(crate) session: &'a mut Session,
     pub(crate) runtime_state: &'a mut AgentRuntimeState,
+    pub(crate) policy_guard: &'a mut ToolPolicyGuard,
     pub(crate) task_context: &'a mut Option<TaskLoopContext>,
     pub(crate) compression_model_name: Option<&'a str>,
     pub(crate) compression_model_provider: Option<&'a Arc<dyn LLMProvider>>,
@@ -454,6 +457,7 @@ pub(crate) async fn execute_round_tool_calls(
         frame,
         session,
         runtime_state,
+        policy_guard,
         task_context,
         compression_model_name,
         compression_model_provider,
@@ -486,7 +490,7 @@ pub(crate) async fn execute_round_tool_calls(
     let available_tool_schemas = available_tool_schemas.as_slice();
 
     let mut state = RoundExecutionState::default();
-    let mut policy_guard = policy::ToolPolicyGuard::new(
+    policy_guard.begin_round(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
@@ -540,7 +544,7 @@ pub(crate) async fn execute_round_tool_calls(
                         runtime_state,
                         task_context,
                         &mut state,
-                        &mut policy_guard,
+                        policy_guard,
                         0,
                     )
                     .await?;
@@ -581,7 +585,7 @@ pub(crate) async fn execute_round_tool_calls(
                     runtime_state,
                     task_context,
                     &mut state,
-                    &mut policy_guard,
+                    policy_guard,
                     0,
                 )
                 .await?;
@@ -827,7 +831,7 @@ pub(crate) async fn execute_round_tool_calls(
             runtime_state,
             task_context,
             &mut state,
-            &mut policy_guard,
+            policy_guard,
             0,
         )
         .await?;
@@ -1231,6 +1235,7 @@ mod tests {
             frame: &frame,
             session: &mut session,
             runtime_state: &mut runtime_state,
+            policy_guard: &mut super::ToolPolicyGuard::default(),
             task_context: &mut task_context,
             compression_model_name: None,
             compression_model_provider: None,

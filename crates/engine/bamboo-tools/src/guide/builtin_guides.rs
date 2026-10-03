@@ -506,19 +506,49 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "SubAgent" => Some(guide(
             "SubAgent",
             ToolCategory::TaskManagement,
-            "Delegate a bounded task with message and optional role. Omit target to create a durable child; include its logical ActorId as target to correct or continue that child. Use intent=inspect to view the child or current tree, and intent=control with message=cancel or retry to manage it. A child may use intent=ask_parent for a bounded clarification.",
+            "Use only intent, target, role, message, and reply_to; omit unused fields. For chat (the default intent), put the complete assignment and needed paths in message: omit target to create a child, or reuse its returned logical ActorId to correct or continue it. role selects a profile only on creation; tools and permissions come from the runtime. intent=inspect with message=tree shows the owned tree; with target, message selects overview, diagnostics, messages, result, or error. For a page or selected full message, JSON-encode view/cursor/message_id inside message and omit unused query fields. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question. Direct parents reply with intent=chat, the exact pending ParentRequest id in reply_to, and the answer in message, omitting target and role; forced permission accepts exactly approve_once or deny. The runtime manages activation and waiting.",
             "Do not use proactively for simple one-step tasks; from a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
                     "Delegate read-only exploration",
-                    json!({"role":"explorer","message":"Inspect parser entrypoints and report the data flow. Do not modify files."}),
+                    json!({"intent":"chat","role":"explorer","message":"Scope: inspect parser entrypoints in /workspace/project. Inputs: src/parser.rs and its callers. Allowed actions: read files only. Acceptance: report data flow with file references. Non-goals: edits, commits, or delivery. Stop after reporting evidence and blockers; forked context cannot expand this assignment."}),
                     "Give the child a complete, narrow task and choose its read-only role.",
                 ),
                 example(
                     "Correct an existing child",
-                    json!({"target":"child_123","message":"Focus on error handling only and report the specific risks."}),
+                    json!({"intent":"chat","target":"child_123","message":"Focus on error handling only and report the specific risks."}),
                     "Reuse the returned logical ActorId to keep the correction in the same child.",
+                ),
+                example(
+                    "Inspect a child's result",
+                    json!({"intent":"inspect","target":"child_123","message":"result"}),
+                    "Read bounded evidence from the returned child identity; follow its cursor using a JSON-encoded query in message.",
+                ),
+                example(
+                    "Inspect the current tree",
+                    json!({"intent":"inspect","message":"tree"}),
+                    "Omit target to inspect the tree owned by this session.",
+                ),
+                example(
+                    "Read the next transcript page",
+                    json!({"intent":"inspect","target":"child_123","message":"{\"view\":\"messages\",\"cursor\":\"returned_cursor\"}"}),
+                    "Copy the returned cursor unchanged; view and cursor are inside message, not top-level fields.",
+                ),
+                example(
+                    "Answer a child's clarification",
+                    json!({"intent":"chat","reply_to":"request_123","message":"Keep the existing error behavior and add coverage for the missing-input case."}),
+                    "Use the exact pending ParentRequest id and omit target and role.",
+                ),
+                example(
+                    "Answer a forced-permission request",
+                    json!({"intent":"chat","reply_to":"request_456","message":"approve_once"}),
+                    "For the exact pending forced-permission request, message must be approve_once or deny.",
+                ),
+                example(
+                    "Ask the direct parent for clarification",
+                    json!({"intent":"ask_parent","message":"Should the missing-input case preserve the current error text?"}),
+                    "A child asks a bounded question and omits target, role, and reply_to; the runtime suspends it until its direct parent replies.",
                 ),
             ],
         )),
@@ -727,6 +757,8 @@ mod tests {
         assert!(guide.when_to_use.contains("intent=inspect"));
         assert!(guide.when_to_use.contains("intent=control"));
         assert!(guide.when_to_use.contains("intent=ask_parent"));
+        assert!(guide.when_to_use.contains("omit unused fields"));
+        assert!(guide.when_to_use.contains("ParentRequest"));
         assert!(!guide.when_to_use.contains("action="));
         for example in &guide.examples {
             let fields = example
@@ -737,7 +769,69 @@ mod tests {
                 .keys()
                 .all(|field| ["intent", "target", "role", "message", "reply_to"]
                     .contains(&field.as_str())));
+            assert!(
+                fields
+                    .values()
+                    .all(|value| { value.as_str().is_some_and(|text| !text.trim().is_empty()) }),
+                "unused fields must be omitted, not empty strings or nulls"
+            );
+            if fields.contains_key("target") {
+                assert!(!fields.contains_key("role"));
+                assert!(!fields.contains_key("reply_to"));
+            }
+            if fields.contains_key("reply_to") {
+                assert_eq!(fields["intent"], "chat");
+                assert!(!fields.contains_key("target"));
+                assert!(!fields.contains_key("role"));
+            }
         }
+    }
+
+    #[test]
+    fn subagent_guide_examples_cover_delegation_inspection_and_parent_replies() {
+        let guide = builtin_guide_spec("SubAgent").expect("SubAgent guide should exist");
+        let examples = guide
+            .examples
+            .iter()
+            .map(|example| &example.parameters)
+            .collect::<Vec<_>>();
+        assert!(examples.iter().any(|args| {
+            args["intent"] == "chat" && args.get("role").is_some() && args.get("target").is_none()
+        }));
+        assert!(examples
+            .iter()
+            .any(|args| { args["intent"] == "chat" && args.get("target").is_some() }));
+        assert!(examples
+            .iter()
+            .any(|args| { args["intent"] == "inspect" && args["message"] == "result" }));
+        assert!(examples.iter().any(|args| {
+            args["intent"] == "inspect" && args["message"] == "tree" && args.get("target").is_none()
+        }));
+        assert!(examples.iter().any(|args| {
+            args["intent"] == "chat"
+                && args.get("reply_to").is_some()
+                && args["message"] == "approve_once"
+        }));
+        assert!(examples.iter().any(|args| {
+            args["intent"] == "chat"
+                && args.get("reply_to").is_some()
+                && args["message"] != "approve_once"
+        }));
+
+        let query = examples
+            .iter()
+            .find_map(|args| {
+                (args["intent"] == "inspect")
+                    .then(|| args["message"].as_str())
+                    .flatten()
+                    .and_then(|message| serde_json::from_str::<serde_json::Value>(message).ok())
+            })
+            .expect("a valid JSON-encoded inspection page example");
+        assert_eq!(query["view"], "messages");
+        assert!(query["cursor"]
+            .as_str()
+            .is_some_and(|cursor| !cursor.is_empty()));
+        assert!(query.get("message_id").is_none());
     }
 
     #[test]
