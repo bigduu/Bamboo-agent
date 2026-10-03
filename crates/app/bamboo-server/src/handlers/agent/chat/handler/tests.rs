@@ -2329,6 +2329,7 @@ mod optional_model_e2e {
                     test::TestRequest::post()
                         .uri("/api/v1/chat")
                         .set_json(body)
+                        .peer_addr("127.0.0.1:5700".parse().unwrap())
                         .to_request(),
                 )
                 .await;
