@@ -136,3 +136,113 @@ fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
         64
     );
 }
+
+#[tokio::test]
+async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved() {
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let ingress = VerifiedUserIngress::from_verified_host(
+        "hello".into(),
+        HumanIngressRecord {
+            user_id: "host-owner".into(),
+            source_ingress_seq: 1,
+            text: "你好".into(),
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
+        },
+    )
+    .unwrap();
+    service.register_user_ingress(&user, &ingress).unwrap();
+    let seq = service.published().unwrap().1.seq;
+    let mut read_only = f.ctx();
+    read_only.plan_read_only = true;
+    assert!(
+        invoke(&f.tool("work_overview"), json!({}), read_only)
+            .await
+            .0
+    );
+    assert_eq!(
+        service.published().unwrap().1.seq,
+        seq,
+        "Plan reads cannot pin/publish a message basis"
+    );
+    let overview = invoke(&f.tool("work_overview"), json!({}), f.ctx()).await;
+    assert_eq!(
+        overview.1["pending_message"]["input"]["human"]["text"],
+        "你好"
+    );
+    let bypass = invoke(
+        &f.tool("work_update"),
+        f.mutation("bypass", json!([])),
+        f.ctx(),
+    )
+    .await;
+    assert_eq!(bypass.1["status_code"], 423);
+    let args = json!({"message_id":"hello","proposal":{"groups":[]}});
+    let resolved = invoke(&f.tool("work_update"), args.clone(), f.ctx()).await;
+    assert!(resolved.0);
+    let seq = service.published().unwrap().1.seq;
+    assert_eq!(
+        invoke(&f.tool("work_update"), args, f.ctx()).await,
+        resolved
+    );
+    assert_eq!(service.published().unwrap().1.seq, seq);
+    assert!(
+        invoke(&f.tool("work_overview"), json!({}), f.ctx()).await.1["pending_message"].is_null()
+    );
+    assert_eq!(service.published().unwrap().1.tickets.len(), 0);
+}
+
+#[tokio::test]
+async fn semantic_proposal_preserves_independent_group_results_and_no_json_user_grant() {
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    service
+        .register_user_ingress(
+            &user,
+            &VerifiedUserIngress::from_verified_host(
+                "mixed".into(),
+                HumanIngressRecord {
+                    user_id: "host-owner".into(),
+                    source_ingress_seq: 1,
+                    text: "创建报告；那个先等等".into(),
+                    thread_id: None,
+                    in_reply_to: None,
+                    correlation_id: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let args = json!({"message_id":"mixed","proposal":{"groups":[
+        {"group_id":"create","item_ids":["report"],"source_quote":"创建报告","clarification":null,"operations":[{"op":"create","temp_id":"report","kind":"work","parent":null,"depends_on":[],"contract":{"title":"报告","objective":"一份报告","constraints":[],"acceptance":["证据"],"user_acceptance_required":true,"allowed_tools":["Task"]}}]},
+        {"group_id":"ambiguous","item_ids":["pause"],"source_quote":"那个先等等","operations":[],"clarification":"请指定需要暂停的 Work"}
+    ]}});
+    let result = invoke(&f.tool("work_update"), args.clone(), f.ctx()).await;
+    assert!(result.0);
+    assert_eq!(result.1["resolution"]["groups"][0]["status"], "committed");
+    assert_eq!(
+        result.1["resolution"]["groups"][1]["status"],
+        "needs_clarification"
+    );
+    assert_eq!(service.published().unwrap().1.tickets.len(), 1);
+    let mut forged = args;
+    forged["user_id"] = json!("someone-else");
+    assert_eq!(
+        invoke(&f.tool("work_update"), forged, f.ctx()).await.1["status_code"],
+        422
+    );
+}

@@ -1172,6 +1172,7 @@ impl AppState {
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         tickets.bind_adapter(child_adapter.clone());
+        tickets.bind_messenger(session_messenger.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator

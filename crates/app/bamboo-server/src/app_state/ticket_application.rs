@@ -20,9 +20,11 @@ pub struct TicketApplication {
     service: Option<Arc<TicketService>>,
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
+    messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
 }
 
+mod resolution;
 #[cfg(test)]
 mod tests;
 
@@ -39,6 +41,7 @@ impl TicketApplication {
             service,
             unavailable,
             adapter: OnceLock::new(),
+            messenger: OnceLock::new(),
             workspace: root
                 .join("workspaces")
                 .join(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -159,6 +162,9 @@ impl TicketApplication {
     pub fn bind_adapter(&self, adapter: Arc<ChildSessionAdapter>) {
         let _ = self.adapter.set(adapter);
     }
+    pub fn bind_messenger(&self, messenger: Arc<bamboo_engine::SessionMessenger>) {
+        let _ = self.messenger.set(messenger);
+    }
 
     pub async fn authority(&self, principal: Principal) -> Result<(Arc<TicketService>, Authority)> {
         let service = self.service()?;
@@ -188,7 +194,7 @@ impl TicketApplication {
                     json!({"available": true, "binding": service.published().map(|(_,s)| s.binding).ok(),
                     "health": match service.health() { Health::Writable => "writable", _ => "read_only" },
                     "mutation_enabled": flags.ticket_mutation, "dispatch_enabled": flags.ticket_dispatch,
-                    "capabilities":{"ticket_scope_v1":true,"multi_pending_v1":true,"precise_request_response_v1":true,"message_references_v1":true},
+                    "capabilities":{"ticket_scope_v1":true,"multi_pending_v1":true,"precise_request_response_v1":true,"message_references_v1":true,"semantic_messages_v1":true},
                     "overview": overview})
                 }
                 Err(error) => json!({"available":false,"reason":error.to_string()}),
@@ -208,9 +214,19 @@ impl TicketApplication {
                 "Ticket mutation feature is disabled".into(),
             ));
         }
-        let (service, authority) = self.authority(principal).await?;
+        let (service, authority) = self.authority(principal.clone()).await?;
         let receipt = service.work_update(&authority, command)?;
         self.cancel_after_commit(&service, command);
+        if matches!(principal, Principal::User { .. })
+            && command.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    Operation::Answer { .. } | Operation::DecideApproval { .. }
+                )
+            })
+        {
+            self.wake_after_receipt(&receipt).await;
+        }
         Ok(receipt)
     }
 
@@ -225,7 +241,16 @@ impl TicketApplication {
         }
         let (service, authority) = self.authority(principal).await?;
         let receipt = service.work_dispatch(&authority, command)?;
-        self.cancel_after_commit(&service, command);
+        self.enqueue_receipt(&service, command, receipt).await
+    }
+
+    async fn enqueue_receipt(
+        &self,
+        service: &Arc<TicketService>,
+        command: &Command,
+        receipt: OperationReceipt,
+    ) -> Result<Value> {
+        self.cancel_after_commit(service, command);
         let snapshot = service.published()?.1;
         let mut runtime = Vec::new();
         let mut errors = Vec::new();

@@ -209,30 +209,63 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             0 => Some(("ticket-root-overview", "work_overview", json!({}))),
             1 => {
                 let overview = result("ticket-root-overview");
+                let input = &overview["pending_message"]["input"];
+                let proposal = if input["human"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TICKET_MULTI_E2E")
+                {
+                    let candidate = |title: &str| {
+                        input["candidates"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|c| c["contract"]["title"] == title)
+                            .unwrap()
+                    };
+                    let a = candidate("A");
+                    let b = candidate("B");
+                    let d = candidate("D");
+                    let q = &a["requests"][0];
+                    let mut contract = b["contract"].clone();
+                    contract["objective"] = json!("英文报告B");
+                    json!({"groups":[
+                        {"group_id":"answer-A","item_ids":["answer"],"source_quote":"A使用绿色","clarification":null,"operations":[{"op":"answer","target":{"request_id":q["id"],"work_id":q["work_id"],"assignment_id":q["assignment_id"],"generation":q["generation"],"contract_revision":q["contract_revision"],"prompt_revision":q["prompt_revision"]},"answer":"绿色"}]},
+                        {"group_id":"steer-B","item_ids":["steer"],"source_quote":"B改为英文","clarification":null,"operations":[{"op":"steer","target":b["target"],"contract":contract}]},
+                        {"group_id":"new-C","item_ids":["create-start"],"source_quote":"新建并开始C","clarification":null,"operations":[
+                            {"op":"create","temp_id":"C","kind":"work","parent":null,"depends_on":[],"contract":{"title":"C","objective":"WAIT_FOR_CANCEL TICKET_E2E_1481","constraints":[],"acceptance":["具体成果"],"user_acceptance_required":true,"allowed_tools":["Task"]}},
+                            {"op":"ready","target":{"ref":"temporary","id":"C"}},
+                            {"op":"start","target":{"ref":"temporary","id":"C"},"temp_id":"assignment-C","workspace":null}]},
+                        {"group_id":"cancel-D","item_ids":["cancel"],"source_quote":"取消D","clarification":null,"operations":[{"op":"cancel","target":d["target"]}]}
+                    ]})
+                } else {
+                    json!({"groups":[{"group_id":"new-work","item_ids":["create-start"],"source_quote":input["human"]["text"],"clarification":null,"operations":[
+                    {"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[], "contract":{"title":"TICKET_SUPERVISOR_E2E","objective":"WAIT_FOR_CANCEL TICKET_E2E_1481","constraints":["Own plan only"],"acceptance":["Exact output"],"user_acceptance_required":true,"allowed_tools":["Task"]}},
+                    {"op":"ready","target":{"ref":"temporary","id":"work"}},
+                    {"op":"start","target":{"ref":"temporary","id":"work"},"temp_id":"assignment","workspace":null}]}]})
+                };
                 Some((
                     "ticket-root-create",
                     "work_update",
-                    json!({"operation_id":"root-create", "expected_seq":overview["snapshot"]["seq"], "expected_epoch":overview["snapshot"]["authority_epoch"], "operations":[
-                    {"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[], "contract":{"title":"TICKET_SUPERVISOR_E2E","objective":"WAIT_FOR_CANCEL TICKET_E2E_1481","constraints":["Own plan only"],"acceptance":["Exact output"],"user_acceptance_required":true,"allowed_tools":["Task"]}},
-                    {"op":"ready","work_id":"work"}]}),
+                    json!({"message_id":input["message_id"],"proposal":proposal}),
                 ))
             }
             2 => {
                 let created = result("ticket-root-create");
-                let overview = result("ticket-root-overview");
-                Some((
-                    "ticket-root-dispatch",
-                    "work_dispatch",
-                    json!({"operation_id":"root-dispatch", "expected_seq":created["receipt"]["committed_seq"],"expected_epoch":overview["snapshot"]["authority_epoch"],"operations":[{"op":"start","work_id":created["receipt"]["ids"]["work"],"temp_id":"assignment","workspace":null}]}),
-                ))
-            }
-            _ => {
-                assert_eq!(
-                    result("ticket-root-dispatch")["status"],
-                    "accepted_for_dispatch"
-                );
+                assert_eq!(created["resolution"]["groups"][0]["status"], "committed");
+                assert_eq!(created["dispatch"][0]["status"], "accepted_for_dispatch");
                 None
             }
+            3 => Some(("ticket-root-overview-next", "work_overview", json!({}))),
+            4 => {
+                let overview = result("ticket-root-overview-next");
+                Some((
+                    "ticket-root-noop",
+                    "work_update",
+                    json!({"message_id":overview["pending_message"]["input"]["message_id"],"proposal":{"groups":[]}}),
+                ))
+            }
+            _ => None,
         };
         match call {
             Some((id, name, args)) => (

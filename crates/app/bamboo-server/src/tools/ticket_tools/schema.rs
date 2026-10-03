@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 
-fn object(properties: Value, required: &[&str]) -> Value {
+pub(super) fn object(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object", "additionalProperties":false, "properties":properties, "required":required})
 }
-fn operation(name: &str, mut properties: Value, required: &[&str]) -> Value {
+pub(super) fn operation(name: &str, mut properties: Value, required: &[&str]) -> Value {
     properties["op"] = json!({"type":"string", "const":name});
     let mut fields = vec!["op"];
     fields.extend_from_slice(required);
@@ -117,7 +117,7 @@ pub fn parameters(name: &str) -> Value {
                     ),
                 ]
             };
-            object(
+            let mut result = object(
                 json!({"operation_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable ID for exact input retry, never reuse for changed operations."},
                 "expected_seq":{"type":"integer","minimum":0},"expected_epoch":{"type":"integer","minimum":1},
                 "operations":{"type":"array","minItems":1,"maxItems":64,"items":{"oneOf":operations}}}),
@@ -127,7 +127,18 @@ pub fn parameters(name: &str) -> Value {
                     "expected_epoch",
                     "operations",
                 ],
-            )
+            );
+            if name == "work_update" {
+                result["properties"]["message_id"] =
+                    json!({"type":"string","minLength":1,"maxLength":128});
+                result["properties"]["proposal"] = super::semantic_schema::proposal();
+                result["required"] = json!([]);
+                result["oneOf"] = json!([
+                    {"required":["message_id","proposal"]},
+                    {"required":["operation_id","expected_seq","expected_epoch","operations"]}
+                ]);
+            }
+            result
         }
     }
 }

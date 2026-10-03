@@ -38,6 +38,41 @@ fn fixture() -> (tempfile::TempDir, TicketService) {
     let service = TicketService::open(dir.path(), binding()).unwrap();
     (dir, service)
 }
+
+#[test]
+fn derived_message_operation_cannot_overwrite_an_existing_receipt() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    register(&service, "collision", 1, "取消 A");
+    let saved = save(
+        &service,
+        "collision",
+        vec![group(
+            "cancel",
+            "取消 A",
+            vec![SemanticOperation::Cancel {
+                target: target(&service, &a),
+            }],
+        )],
+    );
+    let operation_id = &saved.groups[0].operation_id;
+    let original = execute(
+        &service,
+        operation_id,
+        vec![Operation::Create {
+            temp_id: "another".into(),
+            kind: TicketKind::Work,
+            parent: None,
+            contract: contract("another"),
+            depends_on: BTreeSet::new(),
+        }],
+    );
+    let result = service.settle_message(&human(), "collision").unwrap();
+    assert_eq!(result.groups[0].status, ResolutionStatus::Rejected);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.receipts[operation_id], original);
+    assert_eq!(snapshot.tickets[&a].state, WorkState::Ready);
+}
 fn execute(service: &TicketService, id: &str, operations: Vec<Operation>) -> OperationReceipt {
     let command = service
         .prepare_command(&supervisor(), id, operations)

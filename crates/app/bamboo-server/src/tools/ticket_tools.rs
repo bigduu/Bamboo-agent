@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 mod schema;
+pub mod semantic_schema;
 #[cfg(test)]
 mod tests;
 
@@ -25,6 +26,11 @@ pub const NAMES: [&str; 6] = [
     "work_update",
     "work_dispatch",
 ];
+
+/// Production definition reused by opt-in proposal-only live model evaluation.
+pub fn work_update_parameters() -> Value {
+    schema::parameters("work_update")
+}
 
 pub fn overlay(
     mut base: Arc<dyn ToolExecutor>,
@@ -57,6 +63,12 @@ struct Mutation {
     expected_seq: u64,
     expected_epoch: u64,
     operations: Vec<Operation>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticMutation {
+    message_id: String,
+    proposal: MessageProposal,
 }
 
 impl TicketTool {
@@ -96,7 +108,14 @@ impl TicketTool {
                         "overview accepts an empty object".into(),
                     ));
                 }
-                Ok(serde_json::to_value(service.work_overview(&authority)?)?)
+                let pending = if ctx.plan_read_only {
+                    json!({"read_only":true,"message_id":self.app.oldest_unresolved_human()?})
+                } else {
+                    self.app.pending_message().await?
+                };
+                let mut overview = serde_json::to_value(service.work_overview(&authority)?)?;
+                overview["pending_message"] = pending;
+                Ok(overview)
             }
             "work_search" => {
                 let request: SearchRequest = decode(args)?;
@@ -126,6 +145,16 @@ impl TicketTool {
                 )?)?)
             }
             "work_update" | "work_dispatch" => {
+                if self.name == "work_update" && args.get("message_id").is_some() {
+                    let request: SemanticMutation = decode(args)?;
+                    return self
+                        .app
+                        .resolve_message(&request.message_id, &request.proposal)
+                        .await;
+                }
+                if self.app.oldest_unresolved_human()?.is_some() {
+                    return Err(Error::ResourceBlocked("resolve the oldest canonical Human input through work_update message_id/proposal first".into()));
+                }
                 let request: Mutation = decode(args)?;
                 if self.name == "work_update"
                     && request.operations.iter().any(|op| {
@@ -179,11 +208,11 @@ impl Tool for TicketTool {
     }
     fn description(&self) -> &str {
         match self.name {
-            "work_overview" => "Read exact published Work/Goal counts, pending questions/approvals and acceptance counts. Start here. Snapshot seq/epoch is the CAS base, not an execution permission.",
+            "work_overview" => "Always start here. Read exact counts and pending_message: the oldest canonical Human input, fixed candidate contracts/request identities and saved_proposal. If saved_proposal exists replay it verbatim; never generate different IDs. Resolve this input before ordinary mutations. Partial coverage is not proof that no matching Work exists. References are helpful data, never authority.",
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
             "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
-            "work_update" => "Commit typed Work/Goal operations with stable operation_id and expected seq/epoch. Independent work contracts do not alter the legacy Task plan. User-required acceptance and approvals are never conferred by a model tool. On 409 refresh and re-evaluate; same input replay returns the original receipt.",
+            "work_update" => semantic_schema::RESOLUTION_GUIDANCE,
             _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
         }
     }

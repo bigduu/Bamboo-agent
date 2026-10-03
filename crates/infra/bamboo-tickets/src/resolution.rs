@@ -324,7 +324,11 @@ impl TicketService {
         };
         let mut next = current.clone();
         next.seq += 1;
-        let attempted = if saved
+        let attempted = if current.receipts.contains_key(&command.operation_id) {
+            // A caller-selected legacy operation ID must not be overwritten by
+            // a derived message/group ID. Committed group replay returned above.
+            Err(Error::IdempotencyConflict)
+        } else if saved
             .basis
             .as_ref()
             .expect("validated basis")

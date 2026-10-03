@@ -56,7 +56,7 @@ async fn actual_supervisor_work_tools_return_before_held_native_worker_finishes(
             std::fs::read_to_string(f.data.join("host.log")).unwrap()
         )
     });
-    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 3);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 2);
     assert!(
         root.task_list.is_none(),
@@ -109,7 +109,7 @@ async fn actual_supervisor_work_tools_return_before_held_native_worker_finishes(
     })
     .await
     .expect("next Supervisor round completes while Worker remains active");
-    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 6);
     assert_eq!(f.probe.held.load(Ordering::SeqCst), 1);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 2);
     f.probe.release.notify_waiters();

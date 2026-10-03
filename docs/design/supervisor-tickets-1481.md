@@ -574,3 +574,56 @@ were removed. Authenticated live model catalog readiness passes for configured
 `/tmp/1481-model-readiness.log`; no extra credential/permission is required.
 The opt-in `ticket_model_semantics` target is excluded from ordinary tests.
 Readiness is not semantic evaluation; P7 model routing and Lotus remain open.
+
+## Slice 18 — bounded Supervisor Human resolution (local P7)
+
+Worktree `bamboo-1481-supervisor-resolution`, branch
+`bamboo/feat/1481-supervisor-resolution`, base `758f505c`.
+The six existing tools keep their original Supervisor incarnation/Plan gate.
+`work_overview` reads the oldest unresolved canonical Human input and its fixed
+contracts/requests; `work_update` saves the entire bounded proposal and settles
+independent groups. The model supplies no User/source/scope or operation ID.
+Zero groups durably resolve chatter. A saved proposal is replayed verbatim;
+input order blocks bypass through ordinary model mutations. Plan reads and a
+disabled mutation flag do not pin/publish resolution metadata.
+
+The Host reuses its existing post-receipt dispatch and cancellation path. It
+replays only still-current pending/admitted attempts; stopped, superseded and
+unknown runs cannot be revived. Precise User decisions notify the existing
+Inbox/activation machinery after commit, without conveying an approval grant.
+Derived message/group IDs cannot overwrite pre-existing legacy receipts.
+
+PASS: semantic domain 16/16 (11.23s), `/tmp/1481-resolution-service4.log`;
+Host model tools 5/5 including whole proposal, per-group results, chatter replay,
+Plan read-only and JSON authority rejection;
+actual short Supervisor plus held Worker 1/1 (29.80s),
+`/tmp/1481-supervisor-resolution-actual.log`; actual one-message A answer/B steer/
+C atomic create-ready-start/D cancel plus Host restart 1/1 (17.00s),
+`/tmp/1481-supervisor-resolution-multi.log`. These actual Host/Runtime tests use
+a controlled provider and do not establish natural-language model quality.
+All-target server/Ticket Clippy completes with the existing server 6 library/
+10 test warnings (engine 19/storage 1); the added needless borrow was removed.
+
+Real model evaluation: existing configured `gpt-6-sol`, encrypted credential
+read/decrypted only in the test process, 2026-10-03. Twelve Chinese fixtures
+PASS in 122.85s: chatter, vague yes, E answer, same-name ambiguity, cross-topic,
+A/B/C/D multi-intent, explicit A approval, B denial, changed amount, conditional
+approval, quoted malicious tool text and optional reference without a grant.
+Wrong approvals: zero. Production proposal schema/guidance and local service
+validation are shared. This is real-model **proposal-only synthetic** evidence;
+no payment/email/shell or other external action runs. One pass is a bounded
+acceptance sample, not a statistical correctness or exactly-once guarantee.
+
+Reproduce with `BAMBOO_TICKET_MODEL_CONFIG_ROOT=<existing read-only config root>`
+and `cargo test -p bamboo-agent --test ticket_model_semantics
+live_chinese_ticket_semantics -- --ignored --nocapture`.
+Raw synthetic report: `/Users/bigduu/Documents/Codex/2026-10-02/task/1481-evidence/p7-live-semantics.json`,
+SHA-256 `bc6620736eec3cddfbd27114c80e585d462537a77652bacc07a9402726e0bdfa`;
+log `/tmp/1481-live-semantics.log`. Missing configuration fails rather than using
+a fake provider. Initial live-test compilation failed from a shadowed Result
+alias and was corrected before this run. No production config/data is modified.
+
+P7 is locally covered by the above bounded proposal/Host tests. P8 real browser
+and P9 migration/full acceptance remain separate gates; flags remain default off.
+The parent thread outgoing relay tool is unavailable in this environment;
+progress continues in the current thread and this ledger, not remote comments.
