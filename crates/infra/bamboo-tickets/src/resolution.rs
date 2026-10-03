@@ -158,10 +158,26 @@ impl TicketService {
             .values()
             .filter(|t| t.kind != TicketKind::Step && !t.archived)
             .collect();
-        let candidates = works
-            .iter()
-            .take(limit)
-            .map(|t| ResolutionCandidate {
+        let mut input = ResolutionInput {
+            message_id: saved.message_id,
+            ingress_seq: saved.ingress_seq,
+            human,
+            basis,
+            candidates: Vec::new(),
+            truncated: !works.is_empty(),
+            omitted_count: works.len(),
+            coverage: if works.is_empty() {
+                "complete"
+            } else {
+                "partial"
+            }
+            .into(),
+        };
+        if canonical_bytes(&input)?.len() > budget {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        for t in works.iter().take(limit) {
+            input.candidates.push(ResolutionCandidate {
                 target: TicketReference::from_ticket(t),
                 kind: t.kind,
                 state: t.state,
@@ -173,25 +189,26 @@ impl TicketService {
                     .filter(|q| q.work_id == t.id && q.status == RequestStatus::Open)
                     .cloned()
                     .collect(),
-            })
-            .collect();
-        let input = ResolutionInput {
-            message_id: saved.message_id,
-            ingress_seq: saved.ingress_seq,
-            human,
-            basis,
-            candidates,
-            truncated: works.len() > limit,
-            omitted_count: works.len().saturating_sub(limit),
-            coverage: if works.len() > limit {
+            });
+            input.omitted_count = works.len() - input.candidates.len();
+            input.truncated = input.omitted_count != 0;
+            input.coverage = if input.truncated {
                 "partial"
             } else {
                 "complete"
             }
-            .into(),
-        };
-        if canonical_bytes(&input)?.len() > budget {
-            return Err(Error::ContextBudgetExceeded);
+            .into();
+            if canonical_bytes(&input)?.len() > budget {
+                input.candidates.pop();
+                if input.candidates.is_empty() {
+                    // A contract and all of its pending requests are indivisible.
+                    return Err(Error::ContextBudgetExceeded);
+                }
+                input.omitted_count = works.len() - input.candidates.len();
+                input.truncated = true;
+                input.coverage = "partial".into();
+                break;
+            }
         }
         Ok(input)
     }

@@ -72,6 +72,107 @@ struct Fixture {
 }
 
 #[tokio::test]
+async fn ticket_unsuccessful_terminal_checkpoints_recover_stop_without_submission() {
+    for status in ["error", "cancelled", "timeout", "skipped"] {
+        let mut f = Fixture::new().await;
+        let _registration = f
+            .runtime
+            .router
+            .register_run(&f.child.id, "host-run")
+            .await
+            .unwrap();
+        admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+            .await
+            .unwrap();
+        let receipt = read_dispatch(&f.child).unwrap().unwrap().receipt.unwrap();
+        f.child.metadata.insert(
+            TICKET_OWNED_STOP_KEY.into(),
+            serde_json::json!({
+                "receipt":receipt, "child_birth":f.child.created_at, "pid":1234, "completed":false
+            })
+            .to_string(),
+        );
+        f.child.metadata_version += 1;
+        f.child.set_last_run_status(status);
+        f.storage.save_session(&f.child).await.unwrap();
+        let Fixture {
+            dir,
+            service,
+            storage,
+            child,
+            spec,
+            ..
+        } = f;
+        let binding = service.published().unwrap().1.binding;
+        drop(service);
+        let service = TicketService::open(dir.path().join("tickets"), binding).unwrap();
+        assert!(!service.published().unwrap().1.assignments[&spec.assignment_id].process_stopped);
+        assert!(
+            checkpoint_ticket_result(&service, storage.as_ref(), &child, "host-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = service.published().unwrap().1;
+        assert!(
+            snapshot.assignments[&spec.assignment_id].process_stopped,
+            "{status}"
+        );
+        assert!(snapshot.submissions.is_empty());
+        checkpoint_ticket_result(&service, storage.as_ref(), &child, "host-run")
+            .await
+            .unwrap();
+        assert_eq!(service.published().unwrap().1.seq, snapshot.seq);
+    }
+}
+
+#[tokio::test]
+async fn ticket_unsuccessful_terminal_without_exact_stop_proof_keeps_quarantine() {
+    for corrupt in ["absent", "run", "birth", "pid"] {
+        let mut f = Fixture::new().await;
+        let _registration = f
+            .runtime
+            .router
+            .register_run(&f.child.id, "host-run")
+            .await
+            .unwrap();
+        admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+            .await
+            .unwrap();
+        let receipt = read_dispatch(&f.child).unwrap().unwrap().receipt.unwrap();
+        let mut proof = serde_json::json!({"receipt":receipt,"child_birth":f.child.created_at,"pid":1234,"completed":false});
+        match corrupt {
+            "run" => proof["receipt"]["run_id"] = serde_json::json!("another-run"),
+            "birth" => {
+                proof["child_birth"] =
+                    serde_json::json!(f.child.created_at - chrono::Duration::seconds(1))
+            }
+            "pid" => proof["pid"] = serde_json::json!(0),
+            _ => {}
+        }
+        if corrupt != "absent" {
+            f.child
+                .metadata
+                .insert(TICKET_OWNED_STOP_KEY.into(), proof.to_string());
+        }
+        f.child.set_last_run_status("error");
+        f.storage.save_session(&f.child).await.unwrap();
+        let before = f.service.published().unwrap().1;
+        let result =
+            checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run").await;
+        if corrupt == "absent" {
+            assert!(result.unwrap().is_none());
+        } else {
+            assert!(matches!(result, Err(Error::ScopeDenied(_))));
+        }
+        let after = f.service.published().unwrap().1;
+        assert!(!after.assignments[&f.spec.assignment_id].process_stopped);
+        assert!(after.submissions.is_empty());
+        assert_eq!(after.seq, before.seq);
+    }
+}
+
+#[tokio::test]
 async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait() {
     let f = Fixture::new().await;
     assert!(is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);

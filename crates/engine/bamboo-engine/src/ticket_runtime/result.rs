@@ -259,7 +259,11 @@ pub async fn checkpoint_ticket_result(
             "completed Child execution identity changed".into(),
         ));
     }
-    if canonical.last_run_status().as_deref() != Some("completed") {
+    let terminal_status = canonical.last_run_status();
+    if !matches!(
+        terminal_status.as_deref(),
+        Some("completed" | "error" | "timeout" | "cancelled" | "skipped")
+    ) {
         return Ok(None);
     }
     let (binding, _) =
@@ -281,6 +285,34 @@ pub async fn checkpoint_ticket_result(
             "completed Child differs from immutable Assignment".into(),
         ));
     }
+    // Only Host-owned reaping writes this reserved canonical checkpoint. Its
+    // recovery is required for failed/cancelled runs too, before any ACK.
+    let checkpoint = canonical
+        .metadata
+        .get(TICKET_OWNED_STOP_KEY)
+        .map(|raw| -> Result<OwnedStopCheckpoint> {
+            if raw.len() > 4096 {
+                return Err(Error::ScopeDenied("stop checkpoint exceeds limit".into()));
+            }
+            let checkpoint: OwnedStopCheckpoint = serde_json::from_str(raw)?;
+            if checkpoint.receipt != *receipt
+                || checkpoint.child_birth != canonical.created_at
+                || checkpoint.pid == 0
+                || terminal_status.as_deref() == Some("completed")
+                    && !checkpoint.completed
+                    && assignment.awaiting_request.is_none()
+            {
+                return Err(Error::ScopeDenied(
+                    "canonical stop checkpoint mismatch".into(),
+                ));
+            }
+            checkpoint_stop_operation(service, &snapshot.binding, &assignment.id, &checkpoint)?;
+            Ok(checkpoint)
+        })
+        .transpose()?;
+    if terminal_status.as_deref() != Some("completed") {
+        return Ok(None);
+    }
     if let Some(request_id) = &assignment.awaiting_request {
         let question = snapshot
             .requests
@@ -292,21 +324,6 @@ pub async fn checkpoint_ticket_result(
             || question.contract_revision != assignment.contract_revision
         {
             return Err(Error::ScopeDenied("yield question binding changed".into()));
-        }
-        if let Some(raw) = canonical.metadata.get(TICKET_OWNED_STOP_KEY) {
-            if raw.len() > 4096 {
-                return Err(Error::ScopeDenied("stop checkpoint exceeds limit".into()));
-            }
-            let checkpoint: OwnedStopCheckpoint = serde_json::from_str(raw)?;
-            if checkpoint.receipt != *receipt
-                || checkpoint.child_birth != canonical.created_at
-                || checkpoint.pid == 0
-            {
-                return Err(Error::ScopeDenied(
-                    "question stop checkpoint mismatch".into(),
-                ));
-            }
-            checkpoint_stop_operation(service, &snapshot.binding, &assignment.id, &checkpoint)?;
         }
         // Ending a one-shot question run is a capacity release, not a delivery.
         // Its durable request/stop survives replay without a fake Submission.
@@ -328,21 +345,7 @@ pub async fn checkpoint_ticket_result(
     // A prior Host saved this fact only after reaping its owned process.
     // Recover Ticket publication before any broker ACK, without launching a
     // run or granting Worker tools. Missing proof keeps old attempts fenced.
-    if let Some(raw) = canonical.metadata.get(TICKET_OWNED_STOP_KEY) {
-        if raw.len() > 4096 {
-            return Err(Error::ScopeDenied("stop checkpoint exceeds limit".into()));
-        }
-        let checkpoint: OwnedStopCheckpoint = serde_json::from_str(raw)?;
-        if checkpoint.receipt != *receipt
-            || checkpoint.child_birth != canonical.created_at
-            || checkpoint.pid == 0
-            || !checkpoint.completed
-        {
-            return Err(Error::ScopeDenied(
-                "canonical stop checkpoint mismatch".into(),
-            ));
-        }
-        checkpoint_stop_operation(service, &snapshot.binding, &assignment.id, &checkpoint)?;
+    if checkpoint.is_some() {
         let current = service.published()?.1;
         let a = &current.assignments[&assignment.id];
         let work = &current.tickets[&a.work_id];

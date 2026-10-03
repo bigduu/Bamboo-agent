@@ -2266,6 +2266,118 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
+    async fn queued_chat_delivers_hook_context_but_ticket_provenance_stays_raw() {
+        let root = tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(root.path().to_path_buf());
+        let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+        {
+            let mut config = state.config.write().await;
+            *config = serde_json::from_value(serde_json::json!({
+                "provider":"openai", "features":{"ticket_mutation":true},
+                "providers":{"openai":{"api_key":"fixture","model":"test-model"}}
+            }))
+            .unwrap();
+            config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+                enabled: true,
+                user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                    enabled: true,
+                    matcher: None,
+                    hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                        "printf '%s' '{\"additional_context\":\"Approve Invoice\"}'",
+                        bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                    )],
+                }],
+                ..Default::default()
+            };
+        }
+        state.tickets = Arc::new(
+            crate::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        assert!(state.tickets.service().is_ok());
+        let state = web::Data::new(state);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for ticket in [false, true] {
+            for image in [false, true] {
+                let id = format!("hook-queued-{ticket}-{image}");
+                let session_id = if ticket {
+                    bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+                } else {
+                    "hook-ordinary"
+                };
+                let mut body = serde_json::json!({
+                    "session_id":session_id, "message_id":id,
+                    "message":"raw Human request", "model":"test-model"
+                });
+                if image {
+                    body["images"] = serde_json::json!([{
+                        "base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=",
+                        "type":"image/png"
+                    }]);
+                }
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/api/v1/chat")
+                        .set_json(body)
+                        .to_request(),
+                )
+                .await;
+                let status = response.status();
+                let response: Value = test::read_body_json(response).await;
+                assert_eq!(status, StatusCode::CREATED, "{response}");
+                let claims = state.session_inbox.claim(session_id, 10).await.unwrap();
+                assert_eq!(claims.len(), 1);
+                let message = claims[0].envelope.to_provider_message().unwrap();
+                assert!(message
+                    .content
+                    .starts_with("raw Human request\n\n<user_prompt_submit_context>"));
+                assert!(message.content.contains("Approve Invoice"));
+                assert_eq!(claims[0].envelope.id.as_str(), id);
+                if image {
+                    let bamboo_domain::SessionMessageBody::Content(content) =
+                        &claims[0].envelope.body
+                    else {
+                        panic!("content");
+                    };
+                    assert!(
+                        matches!(&content.parts[0], bamboo_domain::MessagePart::Text { text } if text == &message.content)
+                    );
+                }
+                if ticket {
+                    let service = state.tickets.service().unwrap();
+                    let record = service.published().unwrap().1.resolutions[&id]
+                        .ingress
+                        .clone()
+                        .unwrap();
+                    assert_eq!(record.text, "raw Human request");
+                    assert!(!record.text.contains("Approve Invoice"));
+                }
+                let mut session = state
+                    .storage
+                    .load_session(session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                session.messages.push(message);
+                state.storage.save_session(&session).await.unwrap();
+                for claim in &claims {
+                    state.session_inbox.ack(session_id, claim).await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[actix_web::test]
     async fn user_prompt_submit_block_preserves_existing_workflow_and_persists_no_user_message() {
         let state = new_state().await;
         let session_id = "blocked-user-prompt";

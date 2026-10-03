@@ -15,6 +15,7 @@ pub(super) async fn queue(
     state: &AppState,
     session: &Session,
     request: &ChatRequest,
+    effective_message: &str,
     http: &HttpRequest,
 ) -> Result<Option<SessionInboxReceipt>, HttpResponse> {
     let ticket = state.config.read().await.features.ticket_mutation
@@ -61,7 +62,7 @@ pub(super) async fn queue(
             "Ticket Human input requires 1..32768 UTF-8 bytes",
         ));
     }
-    let mut envelope = SessionMessageEnvelope::user_input(&session.id, &request.message);
+    let mut envelope = SessionMessageEnvelope::user_input(&session.id, effective_message);
     if let Some(id) = &request.message_id {
         envelope.id =
             SessionMessageId::parse(id.clone()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
@@ -82,7 +83,7 @@ pub(super) async fn queue(
             ));
         }
         let mut parts = vec![bamboo_domain::MessagePart::Text {
-            text: request.message.clone(),
+            text: effective_message.into(),
         }];
         for image in images {
             let (_, url) = state
@@ -100,7 +101,7 @@ pub(super) async fn queue(
         }
         envelope.body =
             bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
-                text: request.message.clone(),
+                text: effective_message.into(),
                 parts,
             });
     }

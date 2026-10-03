@@ -66,3 +66,32 @@ full-access defaults and was stopped; subsequent commands explicitly set
 configuration or credential changes. Current review/full-workspace/browser
 conclusions remain pending. Feature defaults stay off; production historical
 Root/Inbox handoff remains with the existing #791 owners.
+
+## Independent review corrections
+
+The explicit read-only Codex review of `cb10f27b` against stable `685328ec`
+completed with six findings. The local follow-up rejects case aliases of `.git`
+and `.bamboo`; fails closed on conditional English approval clauses; replays
+exact owned-stop checkpoints for every existing terminal status before result
+ACK; delivers hook-augmented queued text/images while preserving raw Human
+provenance; fits complete candidate contracts/questions within the byte budget
+with explicit omissions; and retains existing ordinary file mode bits during
+atomic content replacement. New files remain private, and special mode bits are
+not copied. These changes add no keyword-based semantic dispatcher or new
+Inbox/Root ownership protocol.
+
+Current Ticket all-target regression passes 76/76 and strict all-target Clippy
+passes. This includes 18 semantic and 13 file/reconciliation tests, plus existing
+file-authority, offline-transfer and lifecycle checks. Logs and exit markers:
+`../1481-evidence/1481-reviewfix-domain.log` and
+`../1481-evidence/1481-reviewfix-clippy.log`. Engine terminal-stop recovery and
+HTTP hook/provenance checks are running separately. Their controlled fixtures
+do not establish actual OS process reap.
+
+The third actual-native attempt exited 101 before any tests ran because an
+unchanged `src/codex_cli_executor.rs` read timed out with OS error 60. The second
+attempt was interrupted without an exit marker. A verified Git-blob-identical
+source rematerialization is recorded in
+`../1481-evidence/1481-committed-source-materialization.json`; it changed no
+implementation bytes. Current native, full-workspace, built browser and fresh
+review results remain pending, rather than inheriting earlier-head results.

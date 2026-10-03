@@ -1208,7 +1208,6 @@ impl BrokerTerminalReceiptReconciler {
             if current
                 .metadata
                 .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
-                && current.last_run_status().as_deref() == Some("completed")
             {
                 let service = self
                     .ticket_service

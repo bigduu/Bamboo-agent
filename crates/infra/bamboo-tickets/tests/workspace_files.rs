@@ -124,6 +124,45 @@ fn write(path: &Path, text: &str, hash: Option<String>) -> FileOperation {
 }
 
 #[test]
+fn content_edits_preserve_existing_ordinary_modes_and_new_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    for mode in [0o755, 0o644] {
+        let path = Path::new(&f.workspace.worktree).join(format!("script-{mode}.sh"));
+        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let op = write(
+            &path,
+            "#!/bin/sh\nexit 0\n",
+            Some(content_hash(&fs::read(&path).unwrap())),
+        );
+        f.service
+            .workspace_file(&f.worker, &format!("mode-{mode}"), &op)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 0\n");
+        f.service
+            .workspace_file(&f.worker, &format!("mode-{mode}"), &op)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+    }
+    let path = Path::new(&f.workspace.worktree).join("new.sh");
+    f.service
+        .workspace_file(&f.worker, "new-private", &write(&path, "private", None))
+        .unwrap();
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+}
+
+#[test]
 fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
     let f = fixture();
     let path = Path::new(&f.workspace.worktree).join("code.rs");
@@ -315,20 +354,25 @@ fn runtime_control_cache_cannot_be_read_or_overwritten() {
     fs::create_dir(&cache).unwrap();
     let path = cache.join("private-state.json");
     fs::write(&path, "private runtime state").unwrap();
-    for op in [
-        FileOperation::Read {
-            file_path: path.to_string_lossy().into_owned(),
-        },
-        write(
-            &path,
-            "corrupt",
-            Some(content_hash(b"private runtime state")),
-        ),
-    ] {
-        assert!(matches!(
-            f.service.workspace_file(&f.worker, "control-cache", &op),
-            Err(Error::ScopeDenied(_))
-        ));
+    for component in [".bamboo", ".BAMBOO", ".Bamboo", ".git", ".GIT", ".Git"] {
+        let alias = Path::new(&f.workspace.worktree)
+            .join(component)
+            .join("private-state.json");
+        for op in [
+            FileOperation::Read {
+                file_path: alias.to_string_lossy().into_owned(),
+            },
+            write(
+                &alias,
+                "corrupt",
+                Some(content_hash(b"private runtime state")),
+            ),
+        ] {
+            assert!(matches!(
+                f.service.workspace_file(&f.worker, "control-cache", &op),
+                Err(Error::ScopeDenied(_))
+            ));
+        }
     }
     assert_eq!(fs::read_to_string(path).unwrap(), "private runtime state");
     assert!(f.service.published().unwrap().1.assignments[&f.assignment]

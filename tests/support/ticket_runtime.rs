@@ -150,6 +150,12 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             .join(".bamboo/private-state.json")
             .to_string_lossy()
             .into_owned();
+        let cache_alias = Path::new(&path)
+            .parent()
+            .unwrap()
+            .join(".BAMBOO/private-state.json")
+            .to_string_lossy()
+            .into_owned();
         let result = |id: &str| {
             messages
                 .iter()
@@ -184,6 +190,18 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 "Write",
                 json!({"file_path":cache,"content":"corrupt"}),
             ))
+        } else if result("code-cache-alias-read").is_none() {
+            Some((
+                "code-cache-alias-read",
+                "Read",
+                json!({"file_path":cache_alias}),
+            ))
+        } else if result("code-cache-alias-write").is_none() {
+            Some((
+                "code-cache-alias-write",
+                "Write",
+                json!({"file_path":cache_alias,"content":"corrupt"}),
+            ))
         } else if result("code-verify").is_none() {
             Some(("code-verify", "Read", json!({"file_path":path})))
         } else if result("code-plan").is_none() {
@@ -191,7 +209,12 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 .as_str()
                 .unwrap()
                 .contains("outside Assignment"));
-            for id in ["code-cache-read", "code-cache-write"] {
+            for id in [
+                "code-cache-read",
+                "code-cache-write",
+                "code-cache-alias-read",
+                "code-cache-alias-write",
+            ] {
                 assert!(result(id).unwrap()["content"]
                     .as_str()
                     .unwrap()

@@ -48,6 +48,11 @@ pub struct FileReply {
     pub artifact: Option<Artifact>,
 }
 
+struct FileContents {
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
 impl TicketService {
     /// Identity and tools come from a creation-fenced Host Run. Callers must
     /// preserve the native permission gate before this Rust-only port.
@@ -127,7 +132,9 @@ impl TicketService {
         let (dir, name) = physical::parent(root, path)?;
         let prior = physical::read(&dir, &name)?;
         if let FileOperation::Read { .. } = op {
-            let bytes = prior.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            let bytes = prior
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?
+                .bytes;
             let sha256 = content_hash(&bytes);
             let content = String::from_utf8(bytes)
                 .map_err(|_| Error::InvalidTransition("file is not UTF-8".into()))?;
@@ -154,7 +161,7 @@ impl TicketService {
         if content.len() > FILE_BYTES_LIMIT {
             return Err(Error::ContextBudgetExceeded);
         }
-        if prior.as_ref().map(|bytes| content_hash(bytes)) != *expected_sha256 {
+        if prior.as_ref().map(|file| content_hash(&file.bytes)) != *expected_sha256 {
             return Err(Error::RevisionConflict);
         }
         let artifact = store.store_artifact(content.as_bytes())?;
@@ -185,7 +192,12 @@ impl TicketService {
         store.publish(started)?;
         // IO can fail after rename. Retain Started and the resource claim until
         // an actual stopped Run and explicit reconciliation are confirmed.
-        physical::replace(&dir, &name, content.as_bytes())?;
+        physical::replace(
+            &dir,
+            &name,
+            content.as_bytes(),
+            prior.map_or(0o600, |file| file.mode),
+        )?;
         let mut next = store.published.as_ref().expect("published start").1.clone();
         next.seq += 1;
         let a = next
@@ -231,9 +243,10 @@ fn file_root<'a>(
         || path
             .components()
             .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
-        || path
-            .components()
-            .any(|c| matches!(c, Component::Normal(n) if n == ".git" || n == ".bamboo"))
+        || path.components().any(|c| {
+            matches!(c, Component::Normal(n) if n.to_str().is_some_and(|name|
+                name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".bamboo")))
+        })
     {
         return Err(Error::ScopeDenied(
             "file path must be absolute without traversal, .git or .bamboo control directories"
@@ -262,7 +275,7 @@ pub(crate) fn observed_hash(
     let path = Path::new(file_path);
     let root = file_root(store, workspace, path)?;
     let (dir, name) = physical::parent(root, path)?;
-    Ok(physical::read(&dir, &name)?.map(|bytes| content_hash(&bytes)))
+    Ok(physical::read(&dir, &name)?.map(|file| content_hash(&file.bytes)))
 }
 
 #[cfg(unix)]
@@ -270,11 +283,14 @@ mod physical {
     use super::*;
     use std::{
         ffi::CString,
-        fs::File,
+        fs::{File, Permissions},
         io::{Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
-            unix::{ffi::OsStrExt, fs::MetadataExt},
+            unix::{
+                ffi::OsStrExt,
+                fs::{MetadataExt, PermissionsExt},
+            },
         },
     };
     fn name(value: &std::ffi::OsStr) -> Result<CString> {
@@ -323,7 +339,7 @@ mod physical {
         }
         Err(Error::ScopeDenied("file path is a write root".into()))
     }
-    pub fn read(dir: &File, name: &CString) -> Result<Option<Vec<u8>>> {
+    pub(super) fn read(dir: &File, name: &CString) -> Result<Option<FileContents>> {
         let file = match open(dir, name, libc::O_RDONLY | libc::O_NONBLOCK) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             other => other?,
@@ -343,13 +359,19 @@ mod physical {
         if bytes.len() > FILE_BYTES_LIMIT {
             return Err(Error::ContextBudgetExceeded);
         }
-        Ok(Some(bytes))
+        // Capture ordinary mode bits from the same no-follow FD as the CAS
+        // content. Replacement never copies setuid/setgid/sticky bits.
+        Ok(Some(FileContents {
+            bytes,
+            mode: meta.mode() & 0o777,
+        }))
     }
-    pub fn replace(dir: &File, name: &CString, bytes: &[u8]) -> Result<()> {
+    pub fn replace(dir: &File, name: &CString, bytes: &[u8], mode: u32) -> Result<()> {
         let staging = CString::new(format!(".ticket-file-{}", uuid::Uuid::new_v4())).expect("UUID");
         let result = (|| {
             let mut file = open(dir, &staging, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
             file.write_all(bytes)?;
+            file.set_permissions(Permissions::from_mode(mode))?;
             file.sync_all()?;
             if unsafe {
                 libc::renameat(
@@ -382,10 +404,10 @@ mod physical {
             "Ticket file tools require the tested Unix directory capability".into(),
         ))
     }
-    pub fn read(_: &(), _: &()) -> Result<Option<Vec<u8>>> {
+    pub(super) fn read(_: &(), _: &()) -> Result<Option<FileContents>> {
         unreachable!()
     }
-    pub fn replace(_: &(), _: &(), _: &[u8]) -> Result<()> {
+    pub fn replace(_: &(), _: &(), _: &[u8], _: u32) -> Result<()> {
         unreachable!()
     }
 }

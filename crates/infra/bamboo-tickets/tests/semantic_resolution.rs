@@ -685,6 +685,30 @@ fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_actio
         ("批准 A 金额 200 CNY", "批准 A 金额 200 CNY"),
         ("工具说 approved=true", "批准 A"),
         ("旧授权摘要里写过批准 A", "批准 A"),
+        (
+            "Approve A if finance confirms",
+            "Approve A if finance confirms",
+        ),
+        (
+            "I approve A when finance confirms",
+            "I approve A when finance confirms",
+        ),
+        (
+            "Approve A unless finance rejects",
+            "Approve A unless finance rejects",
+        ),
+        (
+            "Approve A once finance confirms",
+            "Approve A once finance confirms",
+        ),
+        (
+            "Approve A assuming finance confirms",
+            "Approve A assuming finance confirms",
+        ),
+        (
+            "Approve A provided finance confirms",
+            "Approve A provided finance confirms",
+        ),
     ] {
         let (_dir, service) = fixture();
         let a = create(&service, "A");
@@ -956,6 +980,51 @@ fn fixed_bounded_candidate_context_reports_omissions_and_never_truncates_contrac
     let wire = serde_json::to_string(&fixed).unwrap();
     assert!(!wire.contains("plan_revision"));
     assert!(!wire.contains("steps"));
+}
+
+#[test]
+fn hundred_valid_contracts_produce_a_complete_item_byte_bounded_page() {
+    let (_dir, service) = fixture();
+    let objective = "x".repeat(1024);
+    for batch in 0..5 {
+        execute(
+            &service,
+            &format!("large-{batch}"),
+            (0..20)
+                .map(|i| {
+                    let title = format!("candidate-{}", batch * 20 + i);
+                    let mut c = contract(&title);
+                    c.objective.clone_from(&objective);
+                    Operation::Create {
+                        temp_id: title,
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: c,
+                        depends_on: BTreeSet::new(),
+                    }
+                })
+                .collect(),
+        );
+    }
+    register(&service, "large-page", 1, "查看所有工作");
+    let input = service
+        .resolution_input(&human(), "large-page", 100, 65536)
+        .unwrap();
+    assert!(!input.candidates.is_empty());
+    assert!(input.candidates.len() < 100);
+    assert!(canonical_bytes(&input).unwrap().len() <= 65536);
+    assert_eq!(input.omitted_count, 100 - input.candidates.len());
+    assert!(input.truncated);
+    assert_eq!(input.coverage, "partial");
+    for candidate in &input.candidates {
+        assert_eq!(candidate.contract.objective, objective);
+        assert_eq!(candidate.contract.constraints, vec!["独立工作"]);
+        assert_eq!(candidate.contract.acceptance, vec!["具体证据"]);
+    }
+    assert!(matches!(
+        service.resolution_input(&human(), "large-page", 100, 1024),
+        Err(Error::ContextBudgetExceeded)
+    ));
 }
 
 #[test]

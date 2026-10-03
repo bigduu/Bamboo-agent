@@ -1358,15 +1358,16 @@ async fn handle_chat(
     };
 
     // Image handling stays in the handler layer (depends on AppState attachment reader).
-    let ingress_receipt = match ingress::queue(&state, &session, &req, http_request).await {
-        Ok(receipt) => receipt,
-        Err(response) => {
-            if let Some(staging) = staged_workflow_activation.as_mut() {
-                staging.release().await;
+    let ingress_receipt =
+        match ingress::queue(&state, &session, &req, &effective_message, http_request).await {
+            Ok(receipt) => receipt,
+            Err(response) => {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return response;
             }
-            return response;
-        }
-    };
+        };
     let queued = ingress_receipt.is_some();
     if queued {
         let receipt = ingress_receipt.as_ref().expect("queued receipt");

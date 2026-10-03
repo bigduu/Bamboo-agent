@@ -163,6 +163,21 @@ fn approval_text(
     .any(|p| lower.starts_with(p));
     if approve {
         if !positive
+            || lower.split(|c: char| !c.is_alphabetic()).any(|word| {
+                matches!(
+                    word,
+                    "if" | "when"
+                        | "unless"
+                        | "once"
+                        | "until"
+                        | "assuming"
+                        | "provided"
+                        | "before"
+                        | "after"
+                        | "conditional"
+                        | "contingent"
+                )
+            })
             || [
                 "?",
                 "？",
