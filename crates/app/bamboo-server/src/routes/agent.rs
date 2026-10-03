@@ -93,6 +93,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route("/inspect", web::post().to(agent::tickets::inspect))
                 .route("/changes", web::post().to(agent::tickets::changes))
                 .route("/update", web::post().to(agent::tickets::update))
+                .route("/requests/respond", web::post().to(agent::tickets::respond))
                 .route("/dispatch", web::post().to(agent::tickets::dispatch))
                 .route(
                     "/dispatch/{key:.*}",

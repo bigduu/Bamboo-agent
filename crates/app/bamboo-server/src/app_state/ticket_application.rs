@@ -188,6 +188,7 @@ impl TicketApplication {
                     json!({"available": true, "binding": service.published().map(|(_,s)| s.binding).ok(),
                     "health": match service.health() { Health::Writable => "writable", _ => "read_only" },
                     "mutation_enabled": flags.ticket_mutation, "dispatch_enabled": flags.ticket_dispatch,
+                    "capabilities":{"ticket_scope_v1":true,"multi_pending_v1":true,"precise_request_response_v1":true,"message_references_v1":true},
                     "overview": overview})
                 }
                 Err(error) => json!({"available":false,"reason":error.to_string()}),

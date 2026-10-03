@@ -10,6 +10,8 @@ use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
 use bamboo_engine::session_app::metadata::SessionMetadataService;
 
 mod images;
+mod ingress;
+pub(crate) use ingress::admit_for_execute;
 mod request;
 
 /// Publish the validated workspace after its session checkpoint is durable.
@@ -75,13 +77,7 @@ fn publish_committed_chat(state: &web::Data<AppState>, session: &bamboo_agent_co
     if let Some(message) = session.messages.last() {
         state.account_sink.record(
             Some(&session.id),
-            &bamboo_agent_core::AgentEvent::MessageAppended {
-                session_id: session.id.clone(),
-                message_id: message.id.clone(),
-                role: message.role.clone(),
-                content: message.content.clone(),
-                created_at: message.created_at,
-            },
+            &bamboo_agent_core::AgentEvent::message_appended(&session.id, message),
         );
     }
 
@@ -674,13 +670,19 @@ pub async fn handler(
         Err(response) => return response,
     };
     let Some(prepared) = prepared else {
-        return handle_chat(state, req).await;
+        return handle_chat(state, req, &http_request).await;
     };
     let store = state.mutation_idempotency.clone();
-    store.execute(prepared, || handle_chat(state, req)).await
+    store
+        .execute(prepared, || handle_chat(state, req, &http_request))
+        .await
 }
 
-async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> HttpResponse {
+async fn handle_chat(
+    state: web::Data<AppState>,
+    req: web::Json<ChatRequest>,
+    http_request: &HttpRequest,
+) -> HttpResponse {
     let root_mode_selection = match bamboo_domain::RootThinkingMode::resolve_selection(
         req.thinking_mode,
         req.root_orchestration_only,
@@ -1356,7 +1358,38 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     };
 
     // Image handling stays in the handler layer (depends on AppState attachment reader).
-    if let Err(response) = images::append_user_message(
+    let ingress_receipt = match ingress::queue(&state, &session, &req, http_request).await {
+        Ok(receipt) => receipt,
+        Err(response) => {
+            if let Some(staging) = staged_workflow_activation.as_mut() {
+                staging.release().await;
+            }
+            return response;
+        }
+    };
+    let queued = ingress_receipt.is_some();
+    if queued {
+        let receipt = ingress_receipt.as_ref().expect("queued receipt");
+        match state
+            .session_inbox
+            .was_admitted(&session.id, &receipt.id)
+            .await
+        {
+            Ok(false) => {
+                session
+                    .metadata
+                    .insert("chat.queued_ingress.v1".into(), receipt.id.to_string());
+                crate::handlers::agent::events::mark_pending_turn(&mut session);
+            }
+            Ok(true) => {}
+            Err(error) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    error.to_string(),
+                )
+            }
+        }
+    } else if let Err(response) = images::append_user_message(
         &state,
         &mut session,
         &effective_message,
@@ -1426,7 +1459,9 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             if let Some(staging) = staging.as_mut() {
                 staging.release().await;
             }
-            publish_committed_chat(&commit_state, &session);
+            if !queued {
+                publish_committed_chat(&commit_state, &session);
+            }
             Ok::<(), String>(())
         });
         match commit.await {
@@ -1452,11 +1487,15 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             return response;
         }
         drop(workflow_commit_guard);
-        publish_committed_chat(&state, &session);
+        if !queued {
+            publish_committed_chat(&state, &session);
+        }
         drop(persistence_guard);
     }
 
     HttpResponse::Created().json(ChatResponse {
+        message_id: ingress_receipt.as_ref().map(|r| r.id.to_string()),
+        ingress_seq: ingress_receipt.as_ref().map(|r| r.generation),
         session_id: session_id.clone(),
         stream_url: format!("/api/v1/events/{}", session_id),
         status: "streaming".to_string(),
@@ -1503,6 +1542,8 @@ async fn handle_goal_command(
         GoalCommand::Status => {
             let response_config = current_effective.clone();
             return HttpResponse::Ok().json(ChatResponse {
+                message_id: None,
+                ingress_seq: None,
                 session_id: session_id.to_string(),
                 stream_url: format!("/api/v1/events/{}", session_id),
                 status: "accepted".to_string(),
@@ -1534,6 +1575,8 @@ async fn handle_goal_command(
             let has_prompt = cfg.effective_goal().is_some();
             if !has_prompt {
                 return HttpResponse::Ok().json(ChatResponse {
+                    message_id: None,
+                    ingress_seq: None,
                     session_id: session_id.to_string(),
                     stream_url: format!("/api/v1/events/{}", session_id),
                     status: "accepted".to_string(),
@@ -1629,6 +1672,8 @@ async fn handle_goal_command(
     let response_config = parse_session_gold_config(new_json.as_deref());
 
     HttpResponse::Ok().json(ChatResponse {
+        message_id: None,
+        ingress_seq: None,
         session_id: session_id.to_string(),
         stream_url: format!("/api/v1/events/{}", session_id),
         status: "accepted".to_string(),

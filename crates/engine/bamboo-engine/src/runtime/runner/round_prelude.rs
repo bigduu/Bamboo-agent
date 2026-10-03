@@ -139,13 +139,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     if let Some(event_tx) = event_tx {
         for message in &turn_refresh.committed_messages {
             let _ = event_tx
-                .send(AgentEvent::MessageAppended {
-                    session_id: session.id.clone(),
-                    message_id: message.id.clone(),
-                    role: message.role.clone(),
-                    content: message.content.clone(),
-                    created_at: message.created_at,
-                })
+                .send(AgentEvent::message_appended(&session.id, message))
                 .await;
         }
     }

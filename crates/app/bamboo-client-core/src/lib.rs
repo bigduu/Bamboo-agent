@@ -56,6 +56,14 @@ impl ReasoningEffort {
 pub struct ChatRequest {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Stable Project membership for a new root session. Existing sessions may
     /// repeat the same id but cannot use chat to reassign membership.
@@ -77,6 +85,10 @@ pub struct ChatRequest {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChatResponse {
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub ingress_seq: Option<u64>,
     pub session_id: String,
     pub stream_url: String,
     pub status: String,
@@ -89,6 +101,10 @@ mod chat_request_tests {
     #[test]
     fn chat_request_serializes_project_identity_for_new_root_session() {
         let value = serde_json::to_value(ChatRequest {
+            message_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
             message: "hello".to_string(),
             session_id: None,
             project_id: Some("project-client".to_string()),

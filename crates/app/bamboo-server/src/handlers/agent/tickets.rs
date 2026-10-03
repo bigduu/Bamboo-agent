@@ -22,7 +22,7 @@ impl ResponseError for TicketHttpError {
     }
 }
 
-async fn user(state: &AppState, req: &HttpRequest) -> Result<Principal> {
+pub(crate) async fn user(state: &AppState, req: &HttpRequest) -> Result<Principal> {
     let config = state.config.read().await;
     // A run-scoped Worker credential cannot be promoted to a User by reaching
     // this endpoint. Remote open-instance traffic also needs verified access.
@@ -194,6 +194,87 @@ pub async fn dispatch_query(
 ) -> std::result::Result<HttpResponse, TicketHttpError> {
     user(&state, &req).await?;
     Ok(HttpResponse::Ok().json(state.tickets.query_dispatch(&key).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestResponse {
+    pub operation_id: String,
+    pub binding: ScopeBinding,
+    pub expected_seq: u64,
+    pub expected_epoch: u64,
+    pub target: RequestReference,
+    pub decision: RequestDecision,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequestDecision {
+    Question { answer: String },
+    Approval { fingerprint: String, approve: bool },
+}
+
+/// Negotiated buttons carry the entire immutable request binding. The same
+/// User service checks current Work versions, status and fingerprint under
+/// CAS; exact successful retries retain their original receipt.
+pub async fn respond(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<RequestResponse>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let principal = user(&state, &req).await?;
+    let (service, _) = state.tickets.authority(principal.clone()).await?;
+    let snapshot = service.published()?.1;
+    let q = snapshot
+        .requests
+        .get(&body.target.request_id)
+        .ok_or_else(|| Error::ScopeDenied("request not in this scope".into()))?;
+    let t = &body.target;
+    if q.work_id != t.work_id
+        || q.assignment_id != t.assignment_id
+        || q.generation != t.generation
+        || q.contract_revision != t.contract_revision
+        || q.prompt_revision != t.prompt_revision
+    {
+        return Err(Error::RevisionConflict.into());
+    }
+    let operation = match (&body.decision, &q.kind) {
+        (RequestDecision::Question { answer }, RequestKind::Question) => Operation::Answer {
+            request_id: q.id.clone(),
+            prompt_revision: t.prompt_revision,
+            answer: answer.clone(),
+        },
+        (
+            RequestDecision::Approval {
+                fingerprint,
+                approve,
+            },
+            RequestKind::Approval {
+                fingerprint: expected,
+                ..
+            },
+        ) if fingerprint == expected => Operation::DecideApproval {
+            request_id: q.id.clone(),
+            prompt_revision: t.prompt_revision,
+            fingerprint: fingerprint.clone(),
+            approve: *approve,
+        },
+        _ => {
+            return Err(Error::ScopeDenied(
+                "decision kind or exact action fingerprint changed".into(),
+            )
+            .into())
+        }
+    };
+    let command = Command {
+        operation_id: body.operation_id.clone(),
+        binding: body.binding.clone(),
+        expected_seq: body.expected_seq,
+        expected_epoch: body.expected_epoch,
+        operations: vec![operation],
+        source: None,
+    };
+    Ok(HttpResponse::Ok().json(state.tickets.update(principal, &command).await?))
 }
 
 pub async fn artifact(

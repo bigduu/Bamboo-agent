@@ -4083,13 +4083,7 @@ impl ExternalChildRunner for ActorChildRunner {
                                 *session = committed;
                                 for message in messages {
                                     let _ = event_tx
-                                        .send(AgentEvent::MessageAppended {
-                                            session_id: session.id.clone(),
-                                            message_id: message.id,
-                                            role: message.role,
-                                            content: message.content,
-                                            created_at: message.created_at,
-                                        })
+                                        .send(AgentEvent::message_appended(&session.id, &message))
                                         .await;
                                 }
                                 activation.finish(ActorActivationFinish::Succeeded).await
@@ -4756,13 +4750,7 @@ impl PlainActorActivation {
                 .await
                 .map_err(|error| AgentError::LLM(format!("actor reply commit failed: {error}")))?;
             let _ = event_tx
-                .send(AgentEvent::MessageAppended {
-                    session_id: session.id.clone(),
-                    message_id: message.id,
-                    role: message.role,
-                    content: message.content,
-                    created_at: message.created_at,
-                })
+                .send(AgentEvent::message_appended(&session.id, &message))
                 .await;
             Ok(())
         })

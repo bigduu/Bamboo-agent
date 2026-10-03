@@ -536,3 +536,41 @@ all-target Ticket Clippy with `-D warnings`. Logs:
 An initial queued-input test needed `ResolutionBasis` equality derived;
 the final run passes. This is domain evidence only. Host semantic tools,
 real-model Chinese evaluation, multi-pending Lotus and P9 remain pending.
+
+### Local slice 17: authenticated Human delivery and precise response wire
+
+Isolated `bamboo-1481-user-ingress` / `bamboo/feat/1481-user-ingress` starts at
+88995e8d. Chat/client DTOs add optional message ID, thread, citation and trace
+fields; old clients keep their prior path. Ticket Supervisor inputs require
+verified owner access, reject Worker run credentials and reserved activation
+trace values, and persist original Human text before delivery. Ticket ingress
+order and Inbox delivery generation are independent axes. Hooks/documents do
+not replace this approval source. Native SDK envelopes already carry these
+fields; committed events and the sanitized history projection now retain them.
+
+The existing Messenger/SDK checkpoint, receipt and ACK protocol admits each
+User turn once. An initial actual test exposed HTTP execute preparation's
+last-User gate: a queued first turn had not yet reached the transcript. A
+narrow adapter invokes the same SDK boundary before preparation, skips live
+runners, and refreshes the existing startup handoff. Typed activation intent
+supports an active runner's successor. Exact cold replay does not reset a
+completed turn to pending. Failed fixture/log retained at
+`/private/tmp/bamboo-1481-ticket-lifecycle-V1VoJU/host` and
+`/tmp/1481-ingress-actual.log`; it is not counted as a pass.
+
+Capability-negotiated request responses bind scope, request, Work, Assignment,
+generation, contract and prompt revisions, decision kind and action fingerprint.
+The User service validates current versions/status under CAS. Exact successful
+retries return the original receipt. No pending singleton or client role is
+used to select approval authority.
+
+PASS: actual Host reference/Inbox/SDK/history/cold replay and precise A-only
+approval tests 2/2 (8.17s); actual short Supervisor/held Native Worker regression
+1/1 (16.38s), `/tmp/1481-ingress-actual3.log`; existing chat tests 67/67 (37.71s).
+Server/client/TUI all-target Clippy completes with only the existing engine 19,
+storage 1, server library 6/test 10 warnings after two new needless borrows
+were removed. Authenticated live model catalog readiness passes for configured
+`gpt-6-sol` using existing encrypted credentials read-only (0.11s),
+`/tmp/1481-model-readiness.log`; no extra credential/permission is required.
+The opt-in `ticket_model_semantics` target is excluded from ordinary tests.
+Readiness is not semantic evaluation; P7 model routing and Lotus remain open.
