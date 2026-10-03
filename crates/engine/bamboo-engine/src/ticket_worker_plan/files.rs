@@ -279,11 +279,11 @@ impl ToolExecutor for RemoteFileExecutor {
         for schema in &mut schemas {
             match schema.function.name.as_str() {
                 "Read" => {
-                    schema.function.description="Read one complete UTF-8 file, at most 16 KiB, inside this Assignment's write roots. No symlinks, hardlinks, .git, traversal or directory listing.".into();
+                    schema.function.description="Read one complete UTF-8 file inside this Assignment's write roots. Both raw content and the encoded result must fit 16 KiB. No symlinks, hardlinks, .git, .bamboo control directories, traversal or directory listing.".into();
                     schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path"],"properties":{"file_path":{"type":"string"}}});
                 }
                 "Write" => {
-                    schema.function.description="Atomically replace one UTF-8 file, 1–16384 bytes, inside this Assignment's write roots. Read an existing file first; a changed file conflicts. New files may be created in existing directories. Unknown effects cannot be automatically retried.".into();
+                    schema.function.description="Atomically replace one UTF-8 file, 1–16384 bytes, inside this Assignment's write roots, excluding .git and .bamboo control directories. Read an existing file first; a changed file conflicts. New files may be created in existing directories. Unknown effects cannot be automatically retried.".into();
                     schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path","content"],"properties":{"file_path":{"type":"string"},"content":{"type":"string","minLength":1,"maxLength":16384}}});
                 }
                 _ => {}

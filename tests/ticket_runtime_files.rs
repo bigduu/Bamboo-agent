@@ -276,6 +276,9 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
     let workspace = workspace.canonicalize().unwrap();
     let file = workspace.join("answer.rs");
     let outside = repo.join("answer.rs");
+    let cache = workspace.join(".bamboo/private-state.json");
+    std::fs::create_dir(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, "private runtime state").unwrap();
     *f.probe.coding_path.lock().unwrap() = Some((
         file.to_string_lossy().into_owned(),
         outside.to_string_lossy().into_owned(),
@@ -319,6 +322,10 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
         std::fs::read_to_string(outside).unwrap(),
         "pub fn answer() -> u8 { 0 }\n"
     );
+    assert_eq!(
+        std::fs::read_to_string(cache).unwrap(),
+        "private runtime state"
+    );
     assert_eq!(view["data"][0]["assignments"][0]["process_stopped"], true);
     assert_eq!(
         view["data"][0]["assignments"][0]["plan"]["steps"][0]["id"],
@@ -345,7 +352,7 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
     }
     assert!(contents.contains(&"pub fn answer() -> u8 { 42 }\n".into()));
     assert!(contents.contains(&"TICKET_CODE_DONE".into()));
-    assert_eq!(f.probe.calls.load(Ordering::SeqCst), 6);
+    let completed_calls = f.probe.calls.load(Ordering::SeqCst);
     let accept=command(&f.client,&f.base,"code-accept",json!([{"op":"accept","work_id":work,"submission_id":submission["id"],"evidence":["Read exact managed code; own worktree changed and sibling unchanged"]}])).await;
     post(&f.client, &f.base, "/tickets/update", &accept).await;
     f.restart().await;
@@ -353,6 +360,6 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
         post(&f.client, &f.base, "/tickets/inspect", &inspect).await["data"][0]["ticket"]["state"],
         "accepted"
     );
-    assert_eq!(f.probe.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(f.probe.calls.load(Ordering::SeqCst), completed_calls);
     f.finish().await;
 }

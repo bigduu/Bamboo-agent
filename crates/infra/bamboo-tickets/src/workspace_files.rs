@@ -11,6 +11,9 @@ use std::{
 };
 
 pub const FILE_BYTES_LIMIT: usize = 16384;
+// Includes the HostBridge's result envelope and JSON escaping. A raw file
+// within FILE_BYTES_LIMIT can still exceed the existing SubAgent reply budget.
+const FILE_REPLY_BYTES_LIMIT: usize = 16384;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "tool", deny_unknown_fields)]
@@ -114,10 +117,11 @@ impl TicketService {
                 .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
             || path
                 .components()
-                .any(|c| matches!(c, Component::Normal(n) if n == ".git"))
+                .any(|c| matches!(c, Component::Normal(n) if n == ".git" || n == ".bamboo"))
         {
             return Err(Error::ScopeDenied(
-                "file path must be absolute without traversal or .git".into(),
+                "file path must be absolute without traversal, .git or .bamboo control directories"
+                    .into(),
             ));
         }
         let root = workspace
@@ -138,11 +142,17 @@ impl TicketService {
             let sha256 = content_hash(&bytes);
             let content = String::from_utf8(bytes)
                 .map_err(|_| Error::InvalidTransition("file is not UTF-8".into()))?;
-            return Ok(FileReply {
+            let reply = FileReply {
                 content: Some(content),
                 sha256,
                 artifact: None,
-            });
+            };
+            if canonical_bytes(&serde_json::json!({"result": &reply}))?.len()
+                > FILE_REPLY_BYTES_LIMIT
+            {
+                return Err(Error::ContextBudgetExceeded);
+            }
+            return Ok(reply);
         }
         let FileOperation::Write {
             content,

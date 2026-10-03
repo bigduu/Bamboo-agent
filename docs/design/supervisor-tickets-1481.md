@@ -792,8 +792,10 @@ already-authorized setup before enabling new execution.
 The complete encoded Supervisor tree is capped at 1 MiB, 512 regular UTF-8
 files and depth 8; symlinks/unsafe paths are rejected. Larger histories are
 refused, never truncated. Mutation/dispatch remain independently default off.
-The real native ceiling is Task-only. Arbitrary same-UID shell/coding filesystem
-isolation, remote lease expiry with a physically surviving coding process,
+At the initial P9 checkpoint the native ceiling was Task-only. Slice 22 adds
+bounded, Host-mediated Read/Write for explicitly supplied Git worktrees, with
+actual native coding and controlled-clock capacity expiry acceptance below.
+Arbitrary same-UID shell isolation, production ActorActivation replacement,
 other filesystem platforms, sudden power loss and real irreversible provider
 effects are **UNRUN**, not inferred from these tests. #1334/#1341 retain the
 existing #791 owner; this stack does not activate owned Inbox lease expiry or
@@ -807,20 +809,22 @@ claim completion of the general Root/runtime writer/ACK/release protocol.
 | A2 | PASS | Five native questions E/B/D/A/C, restart and exact own-answer context; real-model E/no-reference proposals evaluated separately. |
 | A3 | PASS | Actual same Human A-answer/B-steer/C-create-ready-start/D-cancel and restart receipt; atomic fake/domain negative cases. |
 | A4 | PASS | Exact A-only buttons, stale revisions/generations/fingerprints and malformed references; 12-case live proposal evaluation has zero wrong approvals. Synthetic actions never execute. |
-| A5 | PASS, bounded | Ordinary/native private Task plans and sibling/root denials; native tool ceiling is Task-only, no arbitrary shell claim. |
+| A5 | PASS, bounded | Ordinary/native private plans and sibling/root denials; native Task plus explicit contract/worktree-bound Read/Write, without arbitrary shell or runtime cache access. |
 | A6 | PASS | Concurrent CAS/receipt and ingress/proposal replay; all publication/process-exit windows and frozen migration receipt. |
 | A7 | PASS | Six actual Host exit windows plus reused #1479 coordinator 49/49 and four-Worker barriers; no duplicate owner fixes. |
 | A8 | PASS | Late generation domain archive; actual pause/steer/cancel/owned stop and Host-loss quarantine without automatic redispatch. |
 | A9 | PASS | Explicit exact submission acceptance, accepted input bytes, downstream invalidation and independent Goal evidence. |
 | A10 | PASS | Fixed pagination, coverage/omissions, cursor resync and stale event/request state; actual current Lotus browser evidence. |
-| A11 | PARTIAL | Canonical worktree claims and unconfirmed/unknown-effect ownership are tested; actual local cancellation/unknown runs are tested. Physical arbitrary coding writes and remote lease-expiry survivor case are UNRUN. |
-| A12 | PASS, bounded | Full reachable hashes/readonly backup, fixed stopped-authority transfer, original retirement/new epoch, Inbox receipt preservation and import replay; active/unknown legacy import stays read-only. |
+| A11 | PASS, bounded local | Eight file-port tests plus two actual Host/native Git tests: real writes, sibling/cache denial, same-worktree 423 while native PID remains alive after controlled-clock FileHostRegistry slot expiry/reuse, and admission only after actual reap. Started/unknown writes remain quarantined without automatic retry; production Root activation fencing is not claimed. |
+| A12 | PARTIAL | Full reachable hashes/readonly backup, stopped-authority transfer, original retirement/new epoch, schema-3 code evidence, Inbox receipt preservation and inert import replay pass. Historical executed-session write handoff remains blocked on stable #1488/#1489; active/unknown imports stay read-only. |
 
-P0–P8 have the local evidence recorded above. The Task-only P9 local rollout is
-validated by the recorded bounded tests; the full A11 coding/remote lease gate
-and independent current-head review remain open. The tracker is not marked
-fully complete or default-enabled. No push, PR, merge or deployment is authorized.
-# Slice 21: bounded Assignment file authority (local-only)
+P0–P8 have the local evidence recorded above. Task-only and bounded native
+coding P9 paths have actual Runtime evidence. Historical executed-session write
+handoff, production Root activation integration and independent current-head
+review remain open, so the tracker is not fully complete or default-enabled.
+No push, PR, merge or deployment is authorized.
+
+## Slice 21: bounded Assignment file authority (local-only)
 
 This follow-up starts from `db9dc56f` in the isolated
 `bamboo/feat/1481-workspace-fencing` worktree. It adds a Host-only bounded Read/Write
@@ -891,3 +895,31 @@ Production Root/historical writer handoff still depends on the existing owners:
 account-journal final permission boundary is not stable. Neither is integrated.
 Full workspace and rebuilt Lotus/native browser checks remain pending at this
 checkpoint. Features stay off by default; no remote mutation is authorized.
+
+
+### Slice 22 boundary follow-up
+
+Read/Write reject every `.bamboo` path component as well as `.git`, protecting
+native runtime caches under an assigned worktree. Read also checks the complete
+JSON HostBridge envelope against its existing 16 KiB reply limit; escaped text
+or a raw 16 KiB file may be rejected rather than truncated. Eight file-port
+checks passed in 3.07s, including unchanged protected cache contents and complete
+bounded reads; strict Ticket Clippy passed. Updated actual native tests passed
+2/2 in 84.84s, exercising both cache attacks, managed code submission/acceptance,
+restart without extra provider calls and lease-alive exclusion.
+
+One earlier run had 1 pass/1 fail because the fixture added two provider requests
+but retained a fixed six-call assertion. The test now compares calls before and
+after restart. A separate offline attempt failed dependency resolution before
+tests; a `--locked` registry-enabled rerun passed without changing Cargo.lock.
+Logs: `/tmp/1481-file-port-control-budget.log`,
+`/tmp/1481-file-port-control-clippy.log`,
+`/tmp/1481-native-control-cache-final.log`,
+`/tmp/1481-native-control-cache-final2.log`,
+`/tmp/1481-native-control-cache-final3.log`.
+
+Unknown file writes deliberately retain Started intent and claims after process
+stop. A safe operator interface to reconcile/release these file effects is not
+implemented; no Worker JSON or automatic retry may clear them. This is a recovery
+limitation, not an external exactly-once guarantee. Full workspace completion and
+current Lotus bundle/browser acceptance still await their final logs.

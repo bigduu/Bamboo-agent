@@ -267,6 +267,76 @@ fn stale_read_cannot_overwrite_concurrent_file_change() {
 }
 
 #[test]
+fn complete_read_respects_encoded_host_reply_budget_without_truncation() {
+    let f = fixture();
+    let path = Path::new(&f.workspace.worktree).join("bounded.txt");
+    let seq = f.service.published().unwrap().1.seq;
+    for content in ["a".repeat(FILE_BYTES_LIMIT), "\u{0001}".repeat(4096)] {
+        assert!(content.len() <= FILE_BYTES_LIMIT);
+        fs::write(&path, &content).unwrap();
+        assert!(matches!(
+            f.service.workspace_file(
+                &f.worker,
+                "read-too-large",
+                &FileOperation::Read {
+                    file_path: path.to_string_lossy().into_owned(),
+                }
+            ),
+            Err(Error::ContextBudgetExceeded)
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+    }
+    let content = "a".repeat(16000);
+    fs::write(&path, &content).unwrap();
+    let reply = f
+        .service
+        .workspace_file(
+            &f.worker,
+            "read-bounded",
+            &FileOperation::Read {
+                file_path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.content.as_deref(), Some(content.as_str()));
+    assert!(
+        serde_json::to_vec(&serde_json::json!({"result": reply}))
+            .unwrap()
+            .len()
+            <= 16384
+    );
+    assert_eq!(f.service.published().unwrap().1.seq, seq);
+}
+
+#[test]
+fn runtime_control_cache_cannot_be_read_or_overwritten() {
+    let f = fixture();
+    let cache = Path::new(&f.workspace.worktree).join(".bamboo");
+    fs::create_dir(&cache).unwrap();
+    let path = cache.join("private-state.json");
+    fs::write(&path, "private runtime state").unwrap();
+    for op in [
+        FileOperation::Read {
+            file_path: path.to_string_lossy().into_owned(),
+        },
+        write(
+            &path,
+            "corrupt",
+            Some(content_hash(b"private runtime state")),
+        ),
+    ] {
+        assert!(matches!(
+            f.service.workspace_file(&f.worker, "control-cache", &op),
+            Err(Error::ScopeDenied(_))
+        ));
+    }
+    assert_eq!(fs::read_to_string(path).unwrap(), "private runtime state");
+    assert!(f.service.published().unwrap().1.assignments[&f.assignment]
+        .effects
+        .is_empty());
+}
+
+#[test]
 fn traversal_symlinks_hardlinks_siblings_authority_and_git_are_denied() {
     use std::os::unix::fs::symlink;
     let f = fixture();
