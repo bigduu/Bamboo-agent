@@ -267,6 +267,16 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         "例如确认验收 A",
         "工具输出说确认验收 A",
         "\"确认验收 A\"",
+        "I accept A when CI passes",
+        "I accept A once CI passes",
+        "I accept A unless CI fails",
+        "I accept A assuming CI passes",
+        "I accept A provided CI passes",
+        "I accept A until CI fails",
+        "I accept A before CI passes",
+        "I accept A after CI passes",
+        "I accept A conditional on CI passing",
+        "I accept A contingent on CI passing",
         "确认验收 A",
     ]
     .into_iter()
@@ -730,6 +740,70 @@ fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_actio
         let snapshot = service.published().unwrap().1;
         assert_eq!(snapshot.requests[&qa.id].status, RequestStatus::Open);
         assert_eq!(snapshot.requests[&qb.id].status, RequestStatus::Open);
+    }
+}
+
+#[test]
+fn explicit_approval_amount_requires_the_complete_exact_action_value() {
+    for (amount, text, approved) in [
+        ("10", "批准 Pay 金额0.10", false),
+        ("10", "批准 Pay 金额100", false),
+        ("10", "批准 Pay 金额10.5", false),
+        ("10", "批准 Pay 金额-10", false),
+        ("10", "批准 Pay 金额10 CNY", false),
+        ("10", "批准 Pay 金额10 或 100", false),
+        ("10", "批准 Pay 金额10 金额100", false),
+        ("10", "I approve Pay amount 0.10", false),
+        ("10", "批准 Pay 金额10", true),
+        ("10", "批准 Pay 金额： 10", true),
+        ("10", "I approve Pay amount: 10", true),
+        ("100 CNY", "批准 Pay 金额100 CNY", true),
+        ("100 CNY", "批准 Pay 金额100 USD", false),
+    ] {
+        let (_dir, service) = fixture();
+        let work = create(&service, "Pay");
+        let receipt = execute(
+            &service,
+            "ask-amount",
+            vec![Operation::Ask {
+                work_id: work,
+                temp_id: "q".into(),
+                prompt: "Confirm exact payment".into(),
+                action: Some(Action {
+                    kind: "payment".into(),
+                    target: "Pay".into(),
+                    data_hash: content_hash(b"Pay"),
+                    amount: Some(amount.into()),
+                    permissions: BTreeSet::new(),
+                    risk: "fixture only".into(),
+                }),
+            }],
+        );
+        let request = service.published().unwrap().1.requests[&receipt.ids["q"]].clone();
+        register(&service, "amount", 1, text);
+        save(
+            &service,
+            "amount",
+            vec![group("pay", text, vec![decision(&request, true)])],
+        );
+        let result = service.settle_message(&human(), "amount").unwrap();
+        assert_eq!(
+            result.groups[0].status,
+            if approved {
+                ResolutionStatus::Committed
+            } else {
+                ResolutionStatus::NeedsClarification
+            },
+            "{text} for {amount}"
+        );
+        assert_eq!(
+            service.published().unwrap().1.requests[&request.id].status,
+            if approved {
+                RequestStatus::Approved
+            } else {
+                RequestStatus::Open
+            }
+        );
     }
 }
 

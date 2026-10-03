@@ -116,6 +116,52 @@ fn request<'a>(snapshot: &'a Snapshot, target: &RequestReference) -> Result<&'a 
     Ok(q)
 }
 
+fn conditional_text(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphabetic()).any(|word| {
+        matches!(
+            word,
+            "if" | "when"
+                | "unless"
+                | "once"
+                | "until"
+                | "assuming"
+                | "provided"
+                | "before"
+                | "after"
+                | "conditional"
+                | "contingent"
+        )
+    })
+}
+
+fn explicit_amount_matches(text: &str, amount: Option<&str>) -> bool {
+    let markers: Vec<_> = text
+        .match_indices("金额")
+        .map(|(offset, marker)| offset + marker.len())
+        .chain(text.match_indices("amount").filter_map(|(offset, marker)| {
+            let before = text[..offset].chars().next_back();
+            let after = text[offset + marker.len()..].chars().next();
+            (before.is_none_or(|c| !c.is_alphabetic()) && after.is_none_or(|c| !c.is_alphabetic()))
+                .then_some(offset + marker.len())
+        }))
+        .collect();
+    if markers.is_empty() {
+        return true;
+    }
+    let Some(amount) = amount else {
+        return false;
+    };
+    // Amount is an opaque action field, including its currency/unit. Accept
+    // only one complete, exact stated value; uncertain formatting or multiple
+    // values require clarification rather than substring/numeric guessing.
+    markers.len() == 1
+        && text[markers[0]..]
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '：' | '='))
+            .trim_end_matches(['!', '！'])
+            .trim()
+            == amount.trim().to_lowercase()
+}
+
 fn approval_text(
     snapshot: &Snapshot,
     record: &HumanIngressRecord,
@@ -163,21 +209,7 @@ fn approval_text(
     .any(|p| lower.starts_with(p));
     if approve {
         if !positive
-            || lower.split(|c: char| !c.is_alphabetic()).any(|word| {
-                matches!(
-                    word,
-                    "if" | "when"
-                        | "unless"
-                        | "once"
-                        | "until"
-                        | "assuming"
-                        | "provided"
-                        | "before"
-                        | "after"
-                        | "conditional"
-                        | "contingent"
-                )
-            })
+            || conditional_text(&lower)
             || [
                 "?",
                 "？",
@@ -218,13 +250,10 @@ fn approval_text(
             ));
         }
         if let RequestKind::Approval { action, .. } = &q.kind {
-            if quote.contains("金额")
-                && action
-                    .amount
-                    .as_ref()
-                    .is_some_and(|amount| !quote.contains(amount))
-            {
-                return Err(clarify("Human amount differs from the approved action"));
+            if !explicit_amount_matches(&lower, action.amount.as_deref()) {
+                return Err(clarify(
+                    "explicit Human amount must exactly match the approved action",
+                ));
             }
         }
     } else if !negative {
@@ -288,7 +317,7 @@ fn acceptance_text(
     ]
     .iter()
     .any(|s| lower.contains(s));
-    if !named || !complete || !explicit || refused {
+    if !named || !complete || !explicit || refused || conditional_text(&lower) {
         return Err(clarify("user-required acceptance needs an explicit complete current Human clause identifying the Work/submission"));
     }
     Ok(())

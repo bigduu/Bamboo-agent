@@ -103,6 +103,75 @@ fn every_failed_publication_boundary_keeps_whole_snapshots_and_uncertain_head_re
 }
 
 #[test]
+fn retry_flushes_reused_object_directories_before_acknowledging_head() {
+    for failed_object in 1..=3 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileStore::open(dir.path(), binding()).unwrap();
+        let original = store.published.clone().unwrap();
+        let mut next = original.1.clone();
+        next.seq = 1;
+        let renamed = Arc::new(AtomicUsize::new(0));
+        let count = renamed.clone();
+        store.set_fault(Some(Arc::new(move |point| {
+            if point == FaultPoint::AfterObjectRename {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            if point == FaultPoint::BeforeDirectorySync
+                && count.load(Ordering::SeqCst) == failed_object
+            {
+                return Err(std::io::Error::other("object directory not durable"));
+            }
+            Ok(())
+        })));
+        assert!(store.publish(next.clone()).is_err());
+        assert_eq!(store.published.as_ref().unwrap().0, original.0);
+        assert_eq!(
+            canonical_bytes(&store.published.as_ref().unwrap().1).unwrap(),
+            canonical_bytes(&original.1).unwrap()
+        );
+        assert_eq!(store.health, Health::Writable);
+
+        let synced = Arc::new(AtomicUsize::new(0));
+        let count = synced.clone();
+        store.set_fault(Some(Arc::new(move |point| {
+            // All objects up to the failed directory already exist. A retry
+            // must flush each reused directory before writing anything new.
+            assert_ne!(point, FaultPoint::BeforeHeadRename);
+            if point == FaultPoint::BeforeDirectorySync
+                && count.fetch_add(1, Ordering::SeqCst) + 1 == failed_object
+            {
+                return Err(std::io::Error::other("retry directory still not durable"));
+            }
+            if count.load(Ordering::SeqCst) < failed_object {
+                assert_ne!(point, FaultPoint::BeforeObjectRename);
+            }
+            Ok(())
+        })));
+        assert!(store.publish(next.clone()).is_err());
+        assert_eq!(store.published.as_ref().unwrap().0, original.0);
+        assert_eq!(
+            canonical_bytes(&store.published.as_ref().unwrap().1).unwrap(),
+            canonical_bytes(&original.1).unwrap()
+        );
+        assert_eq!(store.health, Health::Writable);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("HEAD")).unwrap(),
+            original.0
+        );
+
+        store.set_fault(None);
+        let published = store.publish(next.clone()).unwrap();
+        drop(store);
+        let reopened = FileStore::open(dir.path(), binding()).unwrap();
+        assert_eq!(reopened.published.as_ref().unwrap().0, published);
+        assert_eq!(
+            canonical_bytes(&reopened.published.as_ref().unwrap().1).unwrap(),
+            canonical_bytes(&next).unwrap()
+        );
+    }
+}
+
+#[test]
 fn missing_head_and_symlink_never_create_replacement_authority() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("scope");

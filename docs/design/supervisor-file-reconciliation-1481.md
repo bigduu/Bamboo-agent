@@ -153,3 +153,9 @@ native-source tripwire remains unchanged. Lotus already parses nested canonical
 messages, including exact revision conflicts. This is a bounded integration fix,
 not a new error protocol. Validation is queued after the original three runners;
 their earlier source/binary tags and failures remain preserved.
+
+## MacBook bounded review corrections
+
+The independent review of 32d6e4a identified three required fixes. Reused immutable objects now flush their parent directory before any HEAD acknowledgement, including retries after object/manifest/commit rename followed by failed directory durability. Explicit stated approval amounts must equal the complete action value; substring values and ambiguous multi-value clauses remain pending clarification. User-required acceptance shares the conditional-language safeguard used for approvals.
+
+PASS: all 78 Ticket tests with all targets and test-utils, format check, and strict Clippy (no warnings), at 32d6e4a plus the four-file verified overlay. The new failure/retry fixture retains the old published snapshot until each reused directory flush succeeds and then verifies the reopened new snapshot. Decimal/extended/negative amounts and conditional acceptance do not authorize a mutation. The initial new-test compilation failure (Snapshot has no PartialEq) is retained; canonical snapshot-byte assertions passed the complete rerun. Actual power-loss and external-action exactly-once behavior remain outside these observations.

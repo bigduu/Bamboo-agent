@@ -289,8 +289,11 @@ impl FileStore {
             self.hit(FaultPoint::BeforeObjectRename)?;
             fs::rename(&staging, &final_path)?;
             self.hit(FaultPoint::AfterObjectRename)?;
-            self.sync_dir(&dir)?;
         }
+        // An earlier attempt may have renamed this object and failed before
+        // flushing its directory. Identical bytes alone do not prove that the
+        // content-addressed name survives a crash before HEAD is acknowledged.
+        self.sync_dir(&dir)?;
         Ok(hash)
     }
 
