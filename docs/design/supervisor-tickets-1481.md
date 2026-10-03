@@ -507,3 +507,32 @@ The unchanged existing child-completion coordinator passes 49/49 (3.31s).
 Actual pause/steer/accepted-input regressions pass 3/3 (19.70s). Server
 all-target Clippy completes in 3m06s with the existing engine 19, storage 1
 and server 6 library warnings; this slice introduces no new warnings there.
+
+### Local slice 16: durable semantic proposal and atomic groups
+
+Isolated `bamboo-1481-semantic-resolution` / `bamboo/feat/1481-semantic-resolution`
+starts at a526a0ab. Human ingress, processing-time fixed basis, complete
+zero-to-many proposal and per-item group outcomes use the existing full
+manifest. Admission can queue ahead; pinning happens when processing starts.
+Each indivisible group publishes typed domain changes, temporary-ID mappings
+and its original User receipt together. Independent failures are retained.
+File locking covers short transactions only; model evaluation is external.
+Restart replays saved receipts/proposals, with old-epoch pending proposals
+stale rather than regenerated. Optional fields preserve old snapshot bytes.
+
+Host-only ingress capabilities cannot be deserialized. Model operations are
+an explicit semantic allowlist; no Runtime result, role, effect, patch or
+provenance operation is admitted. Exact target revisions, request identity,
+generation, contract and action fingerprint are checked against authoritative
+records. The approval guard conservatively requires an explicit current Human
+clause identifying the action; questions, vague consent, negation, conditional
+consent, modified amounts and external/tool authority text cannot approve.
+This guard does not replace semantic target selection by the Supervisor.
+
+PASS: Ticket service 54 tests (previous 39 plus 15 deterministic proposal,
+order, replay, concurrency, ambiguity, exact binding and publication tests),
+all-target Ticket Clippy with `-D warnings`. Logs:
+`/tmp/1481-resolution-service3.log`, `/tmp/1481-resolution-clippy3.log`.
+An initial queued-input test needed `ResolutionBasis` equality derived;
+the final run passes. This is domain evidence only. Host semantic tools,
+real-model Chinese evaluation, multi-pending Lotus and P9 remain pending.

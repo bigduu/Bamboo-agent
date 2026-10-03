@@ -2,11 +2,13 @@
 //! This store owns contracts, not Session transcripts or Jiandu memory.
 mod model;
 mod query;
+mod resolution;
 mod service;
 pub mod store;
 
 pub use model::*;
 pub use query::*;
+pub use resolution::*;
 pub use service::{Authority, Principal, TicketService};
 pub use store::{FaultPoint, Health, PublicationFault};
 

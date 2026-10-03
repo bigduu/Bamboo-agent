@@ -287,6 +287,16 @@ pub struct MessageResolution {
     pub ingress_seq: u64,
     pub message_hash: String,
     pub groups: Vec<ResolutionGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<crate::HumanIngressRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<crate::ResolutionBasis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<crate::MessageProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,11 +304,16 @@ pub struct ResolutionGroup {
     pub operation_id: String,
     pub status: ResolutionStatus,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub item_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<OperationReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionStatus {
+    Proposed,
     Committed,
     NeedsClarification,
     Rejected,

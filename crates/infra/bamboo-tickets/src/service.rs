@@ -42,7 +42,7 @@ impl Authority {
     pub fn from_verified_host(binding: ScopeBinding, principal: Principal) -> Self {
         Self { binding, principal }
     }
-    fn identity(&self) -> String {
+    pub(crate) fn identity(&self) -> String {
         match &self.principal {
             Principal::Supervisor { session_id } => format!("supervisor:{session_id}"),
             Principal::User { user_id } => format!("user:{user_id}"),
@@ -77,7 +77,7 @@ impl Authority {
             ))
         }
     }
-    fn user(&self) -> Result<()> {
+    pub(crate) fn user(&self) -> Result<()> {
         if matches!(self.principal, Principal::User { .. }) {
             Ok(())
         } else {
@@ -110,7 +110,7 @@ impl Authority {
 
 #[derive(Clone)]
 pub struct TicketService {
-    inner: Arc<Mutex<FileStore>>,
+    pub(crate) inner: Arc<Mutex<FileStore>>,
 }
 
 impl TicketService {
@@ -327,24 +327,7 @@ impl TicketService {
         }
         let mut next = snapshot.clone();
         next.seq += 1;
-        let mut ids = BTreeMap::new();
-        for operation in &command.operations {
-            if let Operation::Start {
-                workspace: Some(workspace),
-                ..
-            } = operation
-            {
-                for write_root in &workspace.write_roots {
-                    let path = Path::new(write_root).canonicalize()?;
-                    if store.root().starts_with(&path) || path.starts_with(store.root()) {
-                        return Err(Error::ScopeDenied(
-                            "Ticket authority cannot be in a Worker write root".into(),
-                        ));
-                    }
-                }
-            }
-            apply(&mut next, authority, operation, &mut ids)?;
-        }
+        let ids = apply_operations(&mut next, authority, &command.operations, store.root())?;
         validate_snapshot(&next)?;
         let receipt = OperationReceipt {
             operation_id: command.operation_id.clone(),
@@ -1662,6 +1645,15 @@ fn apply(
         }
         ResolveMessage { resolution } => {
             authority.supervisor()?;
+            if resolution.ingress.is_some()
+                || resolution.basis.is_some()
+                || resolution.proposal.is_some()
+                || resolution.proposal_hash.is_some()
+            {
+                return Err(Error::ScopeDenied(
+                    "canonical Human ingress needs its Host port".into(),
+                ));
+            }
             if let Some(previous) = snapshot.resolutions.get(&resolution.message_id) {
                 if canonical_bytes(previous)? != canonical_bytes(resolution)? {
                     return Err(Error::IdempotencyConflict);
@@ -1854,6 +1846,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    crate::resolution::validate_history(snapshot)?;
     for (id, work) in &snapshot.tickets {
         if id != &work.id {
             return Err(invalid("Ticket manifest identity mismatch"));
@@ -1934,4 +1927,31 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn apply_operations(
+    snapshot: &mut Snapshot,
+    authority: &Authority,
+    operations: &[Operation],
+    root: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut ids = BTreeMap::new();
+    for operation in operations {
+        if let Operation::Start {
+            workspace: Some(workspace),
+            ..
+        } = operation
+        {
+            for write_root in &workspace.write_roots {
+                let path = Path::new(write_root).canonicalize()?;
+                if root.starts_with(&path) || path.starts_with(root) {
+                    return Err(Error::ScopeDenied(
+                        "Ticket authority cannot be in a Worker write root".into(),
+                    ));
+                }
+            }
+        }
+        apply(snapshot, authority, operation, &mut ids)?;
+    }
+    Ok(ids)
 }

@@ -1,0 +1,872 @@
+//! Deterministic proposal/transaction tests, separate from real-model semantic
+//! evaluation. They cannot prove a model chooses the correct Chinese intent.
+use bamboo_tickets::*;
+use std::{collections::BTreeSet, sync::Arc};
+
+fn binding() -> ScopeBinding {
+    ScopeBinding {
+        scope_id: "semantic-scope".into(),
+        supervisor_session_id: "supervisor".into(),
+        binding_revision: 1,
+    }
+}
+fn auth(principal: Principal) -> Authority {
+    Authority::from_verified_host(binding(), principal)
+}
+fn human() -> Authority {
+    auth(Principal::User {
+        user_id: "human".into(),
+    })
+}
+fn supervisor() -> Authority {
+    auth(Principal::Supervisor {
+        session_id: "supervisor".into(),
+    })
+}
+fn contract(title: &str) -> Contract {
+    Contract {
+        title: title.into(),
+        objective: format!("交付 {title}"),
+        constraints: vec!["独立工作".into()],
+        acceptance: vec!["具体证据".into()],
+        user_acceptance_required: true,
+        allowed_tools: BTreeSet::from(["Task".into()]),
+    }
+}
+fn fixture() -> (tempfile::TempDir, TicketService) {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TicketService::open(dir.path(), binding()).unwrap();
+    (dir, service)
+}
+fn execute(service: &TicketService, id: &str, operations: Vec<Operation>) -> OperationReceipt {
+    let command = service
+        .prepare_command(&supervisor(), id, operations)
+        .unwrap();
+    service.execute(&supervisor(), &command).unwrap()
+}
+fn create(service: &TicketService, title: &str) -> String {
+    execute(
+        service,
+        &format!("create-{title}"),
+        vec![
+            Operation::Create {
+                temp_id: "work".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract(title),
+                depends_on: BTreeSet::new(),
+            },
+            Operation::Ready {
+                work_id: "work".into(),
+            },
+        ],
+    )
+    .ids["work"]
+        .clone()
+}
+fn target(service: &TicketService, id: &str) -> TicketReference {
+    TicketReference::from_ticket(&service.published().unwrap().1.tickets[id])
+}
+fn ask(service: &TicketService, work: &str, title: &str, approval: bool) -> PendingRequest {
+    let action = approval.then(|| Action {
+        kind: "payment".into(),
+        target: title.into(),
+        data_hash: content_hash(title.as_bytes()),
+        amount: Some("100 CNY".into()),
+        permissions: BTreeSet::new(),
+        risk: "fixture only".into(),
+    });
+    let receipt = execute(
+        service,
+        &format!("ask-{title}"),
+        vec![Operation::Ask {
+            work_id: work.into(),
+            temp_id: "request".into(),
+            prompt: format!("{title} 的独立请求"),
+            action,
+        }],
+    );
+    service.published().unwrap().1.requests[&receipt.ids["request"]].clone()
+}
+fn register(service: &TicketService, id: &str, seq: u64, text: &str) -> MessageResolution {
+    let ingress = VerifiedUserIngress::from_verified_host(
+        id.into(),
+        HumanIngressRecord {
+            user_id: "human".into(),
+            source_ingress_seq: seq,
+            text: text.into(),
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: Some(format!("trace-{id}")),
+        },
+    )
+    .unwrap();
+    service.register_user_ingress(&human(), &ingress).unwrap()
+}
+fn group(id: &str, quote: &str, operations: Vec<SemanticOperation>) -> SemanticGroup {
+    SemanticGroup {
+        group_id: id.into(),
+        item_ids: vec![format!("intent-{id}")],
+        source_quote: quote.into(),
+        operations,
+        clarification: None,
+    }
+}
+fn save(service: &TicketService, id: &str, groups: Vec<SemanticGroup>) -> MessageResolution {
+    service
+        .save_message_proposal(&human(), id, &MessageProposal { groups })
+        .unwrap()
+}
+fn decision(q: &PendingRequest, approve: bool) -> SemanticOperation {
+    let RequestKind::Approval { fingerprint, .. } = &q.kind else {
+        panic!("approval fixture")
+    };
+    SemanticOperation::DecideApproval {
+        target: RequestReference::from_request(q),
+        fingerprint: fingerprint.clone(),
+        approve,
+    }
+}
+
+#[test]
+fn zero_operation_chitchat_and_exact_source_survive_cold_replay_without_regeneration() {
+    let (dir, service) = fixture();
+    register(&service, "hello", 1, "你好，今天辛苦了");
+    save(&service, "hello", vec![]);
+    let resolved = service.settle_message(&human(), "hello").unwrap();
+    assert!(resolved.groups.is_empty());
+    let seq = service.published().unwrap().1.seq;
+    register(&service, "hello", 1, "你好，今天辛苦了");
+    assert_eq!(service.published().unwrap().1.seq, seq);
+    drop(service);
+    let reopened = TicketService::open(dir.path(), binding()).unwrap();
+    let replay = register(&reopened, "hello", 1, "你好，今天辛苦了");
+    assert_eq!(replay.proposal_hash, resolved.proposal_hash);
+    let changed = VerifiedUserIngress::from_verified_host(
+        "hello".into(),
+        HumanIngressRecord {
+            text: "改为另一项动作".into(),
+            ..replay.ingress.unwrap()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.register_user_ingress(&human(), &changed),
+        Err(Error::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        reopened.message_resolution(
+            &auth(Principal::User {
+                user_id: "other".into()
+            }),
+            "hello"
+        ),
+        Err(Error::ScopeDenied(_))
+    ));
+}
+
+#[test]
+fn one_message_answers_a_steers_b_creates_and_starts_c_and_cancels_d_with_item_receipts() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let b = create(&service, "B");
+    let d = create(&service, "D");
+    let q = ask(&service, &a, "A", false);
+    register(
+        &service,
+        "multi",
+        1,
+        "A 的答案是绿色；B 改成交付蓝色；新建并启动 C；取消 D",
+    );
+    let mut blue = contract("B");
+    blue.objective = "交付蓝色".into();
+    let proposed = save(
+        &service,
+        "multi",
+        vec![
+            group(
+                "answer-a",
+                "A 的答案是绿色",
+                vec![SemanticOperation::Answer {
+                    target: RequestReference::from_request(&q),
+                    answer: "绿色".into(),
+                }],
+            ),
+            group(
+                "steer-b",
+                "B 改成交付蓝色",
+                vec![SemanticOperation::Steer {
+                    target: target(&service, &b),
+                    contract: blue,
+                }],
+            ),
+            group(
+                "create-c",
+                "新建并启动 C",
+                vec![
+                    SemanticOperation::Create {
+                        temp_id: "C".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract("C"),
+                        depends_on: vec![],
+                    },
+                    SemanticOperation::Ready {
+                        target: TicketReference::Temporary { id: "C".into() },
+                    },
+                    SemanticOperation::Start {
+                        target: TicketReference::Temporary { id: "C".into() },
+                        temp_id: "assignment-C".into(),
+                        workspace: None,
+                    },
+                ],
+            ),
+            group(
+                "cancel-d",
+                "取消 D",
+                vec![SemanticOperation::Cancel {
+                    target: target(&service, &d),
+                }],
+            ),
+        ],
+    );
+    assert!(proposed
+        .groups
+        .iter()
+        .all(|g| g.status == ResolutionStatus::Proposed));
+    assert_eq!(
+        service.published().unwrap().1.tickets.len(),
+        3,
+        "a saved model proposal has no dispatch effect"
+    );
+    let resolved = service.settle_message(&human(), "multi").unwrap();
+    assert!(resolved
+        .groups
+        .iter()
+        .all(|g| g.status == ResolutionStatus::Committed));
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.requests[&q.id].answer.as_deref(), Some("绿色"));
+    assert_eq!(snapshot.tickets[&b].contract_revision, 2);
+    assert_eq!(snapshot.tickets[&d].state, WorkState::Cancelled);
+    let receipt = resolved.groups[2].receipt.as_ref().unwrap();
+    let assignment = &snapshot.assignments[&receipt.ids["assignment-C"]];
+    assert_eq!(assignment.work_id, receipt.ids["C"]);
+    assert!(assignment.plan.steps.is_empty());
+    assert!(snapshot.intents.contains_key(&assignment.dispatch_key));
+    let before = snapshot.seq;
+    assert_eq!(
+        service.settle_message(&human(), "multi").unwrap().groups[2].receipt,
+        resolved.groups[2].receipt
+    );
+    assert_eq!(service.published().unwrap().1.seq, before);
+}
+
+#[test]
+fn indivisible_create_ready_start_group_rolls_back_while_independent_cancel_commits() {
+    let (_dir, service) = fixture();
+    let prerequisite = create(&service, "尚未验收");
+    let d = create(&service, "D");
+    register(&service, "atomic", 1, "创建并执行 C；取消 D");
+    save(
+        &service,
+        "atomic",
+        vec![
+            group(
+                "cannot-start",
+                "创建并执行 C",
+                vec![
+                    SemanticOperation::Create {
+                        temp_id: "C".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract("C"),
+                        depends_on: vec![target(&service, &prerequisite)],
+                    },
+                    SemanticOperation::Ready {
+                        target: TicketReference::Temporary { id: "C".into() },
+                    },
+                    SemanticOperation::Start {
+                        target: TicketReference::Temporary { id: "C".into() },
+                        temp_id: "attempt".into(),
+                        workspace: None,
+                    },
+                ],
+            ),
+            group(
+                "independent",
+                "取消 D",
+                vec![SemanticOperation::Cancel {
+                    target: target(&service, &d),
+                }],
+            ),
+        ],
+    );
+    let result = service.settle_message(&human(), "atomic").unwrap();
+    assert_eq!(result.groups[0].status, ResolutionStatus::Rejected);
+    assert!(result.groups[0].receipt.is_none());
+    assert_eq!(result.groups[1].status, ResolutionStatus::Committed);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets.len(), 2);
+    assert!(snapshot.assignments.is_empty());
+    assert!(snapshot.intents.is_empty());
+    assert!(!snapshot
+        .receipts
+        .contains_key(&result.groups[0].operation_id));
+    assert_eq!(snapshot.tickets[&d].state, WorkState::Cancelled);
+}
+
+#[test]
+fn exact_targets_allow_unrelated_changes_but_reject_stale_record_and_generation() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let b = create(&service, "B");
+    register(&service, "cas", 1, "取消 A");
+    save(
+        &service,
+        "cas",
+        vec![group(
+            "a",
+            "取消 A",
+            vec![SemanticOperation::Cancel {
+                target: target(&service, &a),
+            }],
+        )],
+    );
+    execute(
+        &service,
+        "unrelated",
+        vec![Operation::Cancel { work_id: b }],
+    );
+    assert_eq!(
+        service.settle_message(&human(), "cas").unwrap().groups[0].status,
+        ResolutionStatus::Committed
+    );
+    let c = create(&service, "C");
+    register(&service, "stale", 2, "取消 C");
+    save(
+        &service,
+        "stale",
+        vec![group(
+            "c",
+            "取消 C",
+            vec![SemanticOperation::Cancel {
+                target: target(&service, &c),
+            }],
+        )],
+    );
+    execute(
+        &service,
+        "steer-current",
+        vec![Operation::UpdateContract {
+            work_id: c.clone(),
+            contract: Contract {
+                objective: "新契约".into(),
+                ..contract("C")
+            },
+        }],
+    );
+    assert_eq!(
+        service.settle_message(&human(), "stale").unwrap().groups[0].status,
+        ResolutionStatus::Stale
+    );
+    assert_eq!(
+        service.published().unwrap().1.tickets[&c].state,
+        WorkState::Ready
+    );
+}
+
+#[test]
+fn later_ingress_cannot_overtake_and_two_proposals_cannot_both_mutate_same_revision() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let version = target(&service, &a);
+    for (seq, id) in [(1, "first"), (2, "second")] {
+        register(&service, id, seq, "取消 A");
+        save(
+            &service,
+            id,
+            vec![group(
+                "cancel",
+                "取消 A",
+                vec![SemanticOperation::Cancel {
+                    target: version.clone(),
+                }],
+            )],
+        );
+    }
+    assert!(matches!(
+        service.settle_message(&human(), "second"),
+        Err(Error::ResourceBlocked(_))
+    ));
+    assert_eq!(
+        service.settle_message(&human(), "first").unwrap().groups[0].status,
+        ResolutionStatus::Committed
+    );
+    assert_eq!(
+        service.settle_message(&human(), "second").unwrap().groups[0].status,
+        ResolutionStatus::Stale
+    );
+}
+
+#[test]
+fn queued_ingress_pins_context_after_the_preceding_turn_commits() {
+    let (_dir, service) = fixture();
+    register(&service, "first", 1, "新建 Alpha");
+    let queued = register(&service, "queued", 2, "取消 Alpha");
+    assert!(queued.basis.is_none());
+    save(
+        &service,
+        "first",
+        vec![group(
+            "create",
+            "新建 Alpha",
+            vec![SemanticOperation::Create {
+                temp_id: "a".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract("Alpha"),
+                depends_on: vec![],
+            }],
+        )],
+    );
+    service.settle_message(&human(), "first").unwrap();
+    let input = service
+        .resolution_input(&human(), "queued", 100, 65536)
+        .unwrap();
+    assert_eq!(input.candidates.len(), 1);
+    assert_eq!(input.candidates[0].contract.title, "Alpha");
+    let fixed = input.basis;
+    create(&service, "later-unrelated");
+    assert_eq!(
+        service
+            .resolution_input(&human(), "queued", 100, 65536)
+            .unwrap()
+            .basis,
+        fixed
+    );
+}
+
+#[test]
+fn concurrent_same_message_returns_one_original_receipt_and_one_publication() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    register(&service, "same", 1, "取消 A");
+    save(
+        &service,
+        "same",
+        vec![group(
+            "cancel",
+            "取消 A",
+            vec![SemanticOperation::Cancel {
+                target: target(&service, &a),
+            }],
+        )],
+    );
+    let seq = service.published().unwrap().1.seq;
+    let service = Arc::new(service);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                service.settle_message(&human(), "same").unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results[0].groups[0].receipt, results[1].groups[0].receipt);
+    assert_eq!(service.published().unwrap().1.seq, seq + 1);
+}
+
+#[test]
+fn saved_group_replays_after_restart_without_regenerating_proposal_or_dispatch_ids() {
+    let (dir, service) = fixture();
+    let d = create(&service, "D");
+    register(&service, "restart", 1, "创建 C；取消 D");
+    let proposal = MessageProposal {
+        groups: vec![
+            group(
+                "create",
+                "创建 C",
+                vec![SemanticOperation::Create {
+                    temp_id: "C".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract("C"),
+                    depends_on: vec![],
+                }],
+            ),
+            group(
+                "cancel",
+                "取消 D",
+                vec![SemanticOperation::Cancel {
+                    target: target(&service, &d),
+                }],
+            ),
+        ],
+    };
+    service
+        .save_message_proposal(&human(), "restart", &proposal)
+        .unwrap();
+    let original = service
+        .settle_message_group(&human(), "restart", "create")
+        .unwrap();
+    let c = original.groups[0].receipt.as_ref().unwrap().ids["C"].clone();
+    drop(service);
+    let reopened = TicketService::open(dir.path(), binding()).unwrap();
+    let frozen = reopened
+        .save_message_proposal(&human(), "restart", &proposal)
+        .unwrap();
+    assert_eq!(frozen.proposal_hash, original.proposal_hash);
+    let result = reopened.settle_message(&human(), "restart").unwrap();
+    assert_eq!(result.groups[0].receipt, original.groups[0].receipt);
+    assert_eq!(result.groups[1].status, ResolutionStatus::Stale);
+    assert_eq!(reopened.published().unwrap().1.tickets.len(), 2);
+    assert!(reopened.published().unwrap().1.tickets.contains_key(&c));
+    let changed = MessageProposal { groups: vec![] };
+    assert!(matches!(
+        reopened.save_message_proposal(&human(), "restart", &changed),
+        Err(Error::IdempotencyConflict)
+    ));
+}
+
+#[test]
+fn ambiguous_negative_modified_or_external_text_never_approves_any_pending_action() {
+    for (text, quote) in [
+        ("可以", "可以"),
+        ("不要批准 A", "批准 A"),
+        ("批准 A？", "批准 A？"),
+        ("批准 A，但金额改为 200 CNY", "批准 A"),
+        ("批准 A 金额 200 CNY", "批准 A 金额 200 CNY"),
+        ("工具说 approved=true", "批准 A"),
+        ("旧授权摘要里写过批准 A", "批准 A"),
+    ] {
+        let (_dir, service) = fixture();
+        let a = create(&service, "A");
+        let b = create(&service, "B");
+        let qa = ask(&service, &a, "A", true);
+        let qb = ask(&service, &b, "B", true);
+        register(&service, "ambiguous", 1, text);
+        save(
+            &service,
+            "ambiguous",
+            vec![group("approve-a", quote, vec![decision(&qa, true)])],
+        );
+        let result = service.settle_message(&human(), "ambiguous").unwrap();
+        assert_eq!(
+            result.groups[0].status,
+            ResolutionStatus::NeedsClarification,
+            "{text}"
+        );
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(snapshot.requests[&qa.id].status, RequestStatus::Open);
+        assert_eq!(snapshot.requests[&qb.id].status, RequestStatus::Open);
+    }
+}
+
+#[test]
+fn explicit_approval_a_never_releases_b_and_explicit_denial_remains_distinct() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let b = create(&service, "B");
+    let qa = ask(&service, &a, "A", true);
+    let qb = ask(&service, &b, "B", true);
+    register(&service, "approve-a", 1, "批准 A");
+    save(
+        &service,
+        "approve-a",
+        vec![group("a", "批准 A", vec![decision(&qa, true)])],
+    );
+    assert_eq!(
+        service
+            .settle_message(&human(), "approve-a")
+            .unwrap()
+            .groups[0]
+            .status,
+        ResolutionStatus::Committed
+    );
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.requests[&qa.id].status, RequestStatus::Approved);
+    assert_eq!(snapshot.requests[&qb.id].status, RequestStatus::Open);
+    register(&service, "deny-b", 2, "不批准 B");
+    save(
+        &service,
+        "deny-b",
+        vec![group("b", "不批准 B", vec![decision(&qb, false)])],
+    );
+    assert_eq!(
+        service.settle_message(&human(), "deny-b").unwrap().groups[0].status,
+        ResolutionStatus::Committed
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&qb.id].status,
+        RequestStatus::Denied
+    );
+}
+
+#[test]
+fn forged_request_revision_generation_assignment_or_fingerprint_is_stale() {
+    for field in [
+        "prompt_revision",
+        "generation",
+        "assignment",
+        "work",
+        "fingerprint",
+    ] {
+        let (_dir, service) = fixture();
+        let a = create(&service, "A");
+        let qa = ask(&service, &a, "A", true);
+        let mut proposed = decision(&qa, true);
+        if let SemanticOperation::DecideApproval {
+            target,
+            fingerprint,
+            ..
+        } = &mut proposed
+        {
+            match field {
+                "prompt_revision" => target.prompt_revision += 1,
+                "generation" => target.generation += 1,
+                "assignment" => target.assignment_id = Some("forged".into()),
+                "work" => target.work_id = "forged-sibling".into(),
+                _ => *fingerprint = content_hash(b"changed amount"),
+            }
+        }
+        register(&service, "forged", 1, "批准 A");
+        save(
+            &service,
+            "forged",
+            vec![group("a", "批准 A", vec![proposed])],
+        );
+        assert_eq!(
+            service.settle_message(&human(), "forged").unwrap().groups[0].status,
+            ResolutionStatus::Stale,
+            "{field}"
+        );
+        assert_eq!(
+            service.published().unwrap().1.requests[&qa.id].status,
+            RequestStatus::Open
+        );
+    }
+}
+
+#[test]
+fn same_name_approval_needs_exact_id_and_optional_reply_reference_does_not_authorize() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let other = execute(
+        &service,
+        "second-a",
+        vec![
+            Operation::Create {
+                temp_id: "work".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract("A"),
+                depends_on: BTreeSet::new(),
+            },
+            Operation::Ready {
+                work_id: "work".into(),
+            },
+        ],
+    )
+    .ids["work"]
+        .clone();
+    let qa = ask(&service, &a, "A", true);
+    let qb = ask(&service, &other, "other-A", true);
+    let ingress = VerifiedUserIngress::from_verified_host(
+        "same-name".into(),
+        HumanIngressRecord {
+            user_id: "human".into(),
+            source_ingress_seq: 1,
+            text: "批准 A".into(),
+            thread_id: Some(a.clone()),
+            in_reply_to: Some(qa.id.clone()),
+            correlation_id: None,
+        },
+    )
+    .unwrap();
+    service.register_user_ingress(&human(), &ingress).unwrap();
+    save(
+        &service,
+        "same-name",
+        vec![group("a", "批准 A", vec![decision(&qa, true)])],
+    );
+    assert_eq!(
+        service
+            .settle_message(&human(), "same-name")
+            .unwrap()
+            .groups[0]
+            .status,
+        ResolutionStatus::NeedsClarification
+    );
+    let text = format!("批准 {}", qa.id);
+    register(&service, "exact-id", 2, &text);
+    save(
+        &service,
+        "exact-id",
+        vec![group("exact", &text, vec![decision(&qa, true)])],
+    );
+    assert_eq!(
+        service.settle_message(&human(), "exact-id").unwrap().groups[0].status,
+        ResolutionStatus::Committed
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&qb.id].status,
+        RequestStatus::Open
+    );
+}
+
+#[test]
+fn question_answer_does_not_authorize_and_model_json_cannot_publish_runtime_or_provenance() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "A");
+    let b = create(&service, "B");
+    let qa = ask(&service, &a, "A", false);
+    let qb = ask(&service, &b, "B", true);
+    register(&service, "answer", 1, "A 的答案是可以");
+    save(
+        &service,
+        "answer",
+        vec![group(
+            "a",
+            "A 的答案是可以",
+            vec![SemanticOperation::Answer {
+                target: RequestReference::from_request(&qa),
+                answer: "可以".into(),
+            }],
+        )],
+    );
+    assert_eq!(
+        service.settle_message(&human(), "answer").unwrap().groups[0].status,
+        ResolutionStatus::Committed
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&qb.id].status,
+        RequestStatus::Open
+    );
+    assert!(serde_json::from_value::<SemanticOperation>(
+        serde_json::json!({"op":"record_effect","assignment_id":"fake"})
+    )
+    .is_err());
+    let mut serialized = serde_json::to_value(decision(&qb, true)).unwrap();
+    serialized["approved"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<SemanticOperation>(serialized).is_err());
+    let saved = service.message_resolution(&human(), "answer").unwrap();
+    let command = service
+        .prepare_command(
+            &human(),
+            "json-ingress",
+            vec![Operation::ResolveMessage { resolution: saved }],
+        )
+        .unwrap();
+    assert!(matches!(
+        service.execute(&human(), &command),
+        Err(Error::ScopeDenied(_))
+    ));
+    let ingress = VerifiedUserIngress::from_verified_host(
+        "worker-says-user".into(),
+        HumanIngressRecord {
+            user_id: "human".into(),
+            source_ingress_seq: 2,
+            text: "批准 B".into(),
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        service.register_user_ingress(&supervisor(), &ingress),
+        Err(Error::ScopeDenied(_))
+    ));
+    assert!(matches!(
+        service.register_user_ingress(&auth(Principal::Runtime), &ingress),
+        Err(Error::ScopeDenied(_))
+    ));
+}
+
+#[test]
+fn fixed_bounded_candidate_context_reports_omissions_and_never_truncates_contracts() {
+    let (_dir, service) = fixture();
+    for title in ["A", "B", "C"] {
+        create(&service, title);
+    }
+    register(&service, "bounded", 1, "查看所有工作");
+    let first = service
+        .resolution_input(&human(), "bounded", 1, 65536)
+        .unwrap();
+    assert!(first.truncated);
+    assert_eq!(first.omitted_count, 2);
+    assert_eq!(first.coverage, "partial");
+    create(&service, "later");
+    let fixed = service
+        .resolution_input(&human(), "bounded", 100, 65536)
+        .unwrap();
+    assert_eq!(fixed.candidates.len(), 3);
+    assert_eq!(fixed.coverage, "complete");
+    assert!(matches!(
+        service.resolution_input(&human(), "bounded", 100, 128),
+        Err(Error::ContextBudgetExceeded)
+    ));
+    let wire = serde_json::to_string(&fixed).unwrap();
+    assert!(!wire.contains("plan_revision"));
+    assert!(!wire.contains("steps"));
+}
+
+#[test]
+fn publication_fault_recovers_old_or_new_complete_group_with_original_proposal() {
+    for point in [FaultPoint::BeforeHeadRename, FaultPoint::AfterHeadRename] {
+        let (dir, service) = fixture();
+        register(&service, "fault", 1, "创建 C");
+        let proposal = MessageProposal {
+            groups: vec![group(
+                "c",
+                "创建 C",
+                vec![SemanticOperation::Create {
+                    temp_id: "C".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract("C"),
+                    depends_on: vec![],
+                }],
+            )],
+        };
+        service
+            .save_message_proposal(&human(), "fault", &proposal)
+            .unwrap();
+        let old = service.published().unwrap();
+        service.set_publication_fault(Some(Arc::new(move |seen| {
+            if seen == point {
+                Err(std::io::Error::other("fixture resolution publication"))
+            } else {
+                Ok(())
+            }
+        })));
+        assert!(service.settle_message(&human(), "fault").is_err());
+        assert_eq!(service.published().unwrap().0, old.0);
+        drop(service);
+        let reopened = TicketService::open(dir.path(), binding()).unwrap();
+        let saved = reopened.message_resolution(&human(), "fault").unwrap();
+        assert_eq!(
+            saved.proposal_hash,
+            old.1.resolutions["fault"].proposal_hash
+        );
+        if point == FaultPoint::AfterHeadRename {
+            assert_eq!(saved.groups[0].status, ResolutionStatus::Committed);
+            assert_eq!(reopened.published().unwrap().1.tickets.len(), 1);
+            let seq = reopened.published().unwrap().1.seq;
+            reopened.settle_message(&human(), "fault").unwrap();
+            assert_eq!(reopened.published().unwrap().1.seq, seq);
+        } else {
+            assert_eq!(saved.groups[0].status, ResolutionStatus::Proposed);
+            assert!(reopened.published().unwrap().1.tickets.is_empty());
+            assert_eq!(
+                reopened.settle_message(&human(), "fault").unwrap().groups[0].status,
+                ResolutionStatus::Stale
+            );
+        }
+    }
+}
