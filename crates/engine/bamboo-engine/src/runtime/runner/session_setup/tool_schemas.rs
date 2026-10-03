@@ -147,6 +147,9 @@ fn resolve_catalog_with_activation(
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
     if config.ticket_worker_plan.is_some() {
+        // Ticket native execution has a Host file capability rather than the
+        // ambient Builtin Read/Write schema. Keep catalog and executor identical.
+        tool_schemas = tools.list_tools();
         for schema in tool_schemas
             .iter_mut()
             .filter(|s| s.function.name == "Task")

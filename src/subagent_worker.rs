@@ -2197,6 +2197,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
             event_tx,
             cancel.clone(),
         );
+        let mut ticket_file_tools = None;
         match bamboo_engine::ticket_worker_plan::remote::RemoteWorkerPlan::from_run(
             &run,
             tree_host.clone(),
@@ -2204,16 +2205,25 @@ impl ChildExecutor for BambooRuntimeExecutor {
         .await
         {
             Ok(Some(plan)) => {
-                // This first Ticket route exposes no arbitrary filesystem or
-                // shell tool. Worker cache storage cannot grant TicketStore access.
-                if self
-                    .native_tool_ceiling
-                    .as_ref()
-                    .is_none_or(|c| c.tools != ["Task"])
-                {
+                if self.native_tool_ceiling.as_ref().is_none_or(|c| {
+                    !c.tools.iter().any(|t| t == "Task")
+                        || c.tools
+                            .iter()
+                            .any(|t| !matches!(t.as_str(), "Task" | "Read" | "Write"))
+                }) {
                     return ChildOutcome::error(
-                        "Ticket native route requires Task-only tool ceiling",
+                        "Ticket native route requires bounded Task/Read/Write ceiling",
                     );
+                }
+                let ceiling = self.native_tool_ceiling.as_ref().expect("verified ceiling");
+                match bamboo_engine::ticket_worker_plan::files::RemoteFileExecutor::new(
+                    self.agent.default_tools().clone(),
+                    tree_host.clone().expect("verified bridge"),
+                    session.id.clone(),
+                    &ceiling.tools,
+                ) {
+                    Ok(tools) => ticket_file_tools = Some(Arc::new(tools)),
+                    Err(error) => return ChildOutcome::error(error.to_string()),
                 }
                 builder = builder.ticket_worker_plan(Arc::new(plan));
             }
@@ -2260,6 +2270,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
             session
                 .metadata
                 .insert("runtime.canonical_subagent_host".into(), "true".into());
+        }
+        if let Some(tools) = ticket_file_tools {
+            builder = builder.tools(tools);
         }
 
         // Scope the approval proxy to exactly this run (task-local), so gated

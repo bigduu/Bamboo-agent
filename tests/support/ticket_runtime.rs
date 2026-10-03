@@ -109,6 +109,8 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
 
 #[derive(Default)]
 pub struct Probe {
+    pub coding_path: std::sync::Mutex<Option<(String, String)>>,
+    pub hold_code: std::sync::atomic::AtomicBool,
     pub ui_fixture: std::sync::atomic::AtomicBool,
     pub calls: AtomicUsize,
     pub root_calls: AtomicUsize,
@@ -122,7 +124,77 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     let task_only = body["tools"]
         .as_array()
         .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Task");
-    let (delta, finish) = if task_only {
+    let coding = body["tools"].as_array().is_some_and(|tools| {
+        tools.len() == 3
+            && tools.iter().all(|tool| {
+                matches!(
+                    tool["function"]["name"].as_str(),
+                    Some("Task" | "Read" | "Write")
+                )
+            })
+    });
+    let (delta, finish) = if coding {
+        probe.calls.fetch_add(1, Ordering::SeqCst);
+        let (path, outside) = probe
+            .coding_path
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("explicit coding fixture");
+        let messages = body["messages"].as_array().unwrap();
+        let result = |id: &str| {
+            messages
+                .iter()
+                .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+        };
+        if result("code-read").is_some()
+            && result("code-write").is_none()
+            && probe.hold_code.swap(false, Ordering::SeqCst)
+        {
+            probe.held.fetch_add(1, Ordering::SeqCst);
+            probe.release.notified().await;
+        }
+        let next = if result("code-read").is_none() {
+            Some(("code-read", "Read", json!({"file_path":path})))
+        } else if result("code-write").is_none() {
+            Some((
+                "code-write",
+                "Write",
+                json!({"file_path":path,"content":"pub fn answer() -> u8 { 42 }\n"}),
+            ))
+        } else if result("code-escape").is_none() {
+            Some((
+                "code-escape",
+                "Write",
+                json!({"file_path":outside,"content":"corrupt"}),
+            ))
+        } else if result("code-verify").is_none() {
+            Some(("code-verify", "Read", json!({"file_path":path})))
+        } else if result("code-plan").is_none() {
+            assert!(result("code-escape").unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("outside Assignment"));
+            assert!(result("code-verify").unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("42"));
+            Some((
+                "code-plan",
+                "Task",
+                json!({"tasks":[{"id":"code-step","content":"Verified isolated code artifact","status":"completed"}]}),
+            ))
+        } else {
+            None
+        };
+        match next {
+            Some((id, name, args)) => (
+                json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}),
+                "tool_calls",
+            ),
+            None => (json!({"content":"TICKET_CODE_DONE"}), "stop"),
+        }
+    } else if task_only {
         let messages = body["messages"].to_string();
         if messages.contains("TICKET_ACCEPTED_INPUT_E2E") {
             assert!(messages.contains("input_artifacts"));

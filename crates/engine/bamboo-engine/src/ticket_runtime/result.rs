@@ -382,6 +382,19 @@ pub async fn checkpoint_ticket_result(
         }
     }
     let artifact = service.store_artifact(&runtime, output.content.as_bytes())?;
+    let mut artifacts = vec![artifact.clone()];
+    for effect in service.published()?.1.assignments[&assignment.id]
+        .effects
+        .values()
+    {
+        if effect.state == bamboo_tickets::EffectState::Succeeded {
+            if let Some(file) = &effect.artifact {
+                if !artifacts.contains(file) {
+                    artifacts.push(file.clone());
+                }
+            }
+        }
+    }
     let worker = Authority::from_verified_host(
         binding,
         Principal::Worker {
@@ -403,7 +416,7 @@ pub async fn checkpoint_ticket_result(
                 "canonical Child {}; run {}; message {}; sha256 {}",
                 canonical.id, run_id, output.id, artifact.sha256
             )],
-            artifacts: vec![artifact],
+            artifacts,
         }],
     )?;
     // Submit's generation/contract/input fence preserves a late result as

@@ -5059,7 +5059,9 @@ impl LocalToolCollector {
         match serde_json::from_value::<AgentEvent>(value.clone())
             .map_err(|_| local_tool_history_unsupported())?
         {
-            AgentEvent::ToolStart { tool_name, .. } if tool_name != "Task" => {
+            AgentEvent::ToolStart { tool_name, .. }
+                if !matches!(tool_name.as_str(), "Task" | "Read" | "Write") =>
+            {
                 Err(local_tool_history_unsupported())
             }
             AgentEvent::ToolComplete {
@@ -5069,7 +5071,16 @@ impl LocalToolCollector {
                 let Some((name, args)) = self.starts.get(&tool_call_id) else {
                     return Err(local_tool_history_unsupported());
                 };
-                if name != "Task" || committed.get(&tool_call_id) != Some(args) {
+                let valid = if name == "Task" {
+                    committed.get(&tool_call_id) == Some(args)
+                } else {
+                    committed.get(&tool_call_id).is_some_and(|proof| {
+                        proof["file_tool"] == *name
+                            && proof["arguments"] == *args
+                            && proof["result"] == result.result
+                    })
+                };
+                if !valid {
                     return Err(AgentError::LLM(
                         "LocalPlan success has no exact Host receipt".into(),
                     ));
@@ -7764,7 +7775,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             serde_json::json!({"error":crate::ticket_worker_plan::remote::TICKET_BOOTSTRAP_POSTURE_PENDING})
                         } else if valid_shape
                             && (!logical_session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
-                                || args.get(crate::ticket_worker_plan::TICKET_PLAN_ACTION).is_some())
+                                || args.get(crate::ticket_worker_plan::TICKET_PLAN_ACTION).is_some()
+                                || args.get(crate::ticket_worker_plan::files::TICKET_FILE_ACTION).is_some())
                             && !cancel_token.is_cancelled()
                             && !permission_handshake.is_awaiting()
                         {
@@ -7803,6 +7815,23 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         } else { serde_json::json!({"error":"LocalPlan Child Run is no longer current"}) }
                                     }
                                     _ => serde_json::json!({"error":"LocalPlan Host authority unavailable"}),
+                                }
+                            } else if args.get(crate::ticket_worker_plan::files::TICKET_FILE_ACTION).is_some() {
+                                match (ticket_service.as_deref(), actor_directory_store, session_inbox_runtime,
+                                    activation_run_id, expected_creation, local_history_tools) {
+                                    (Some(service),Some(store),Some(binding),Some(run_id),Some(creation),Some(ceiling)) => {
+                                        if let Some(caller)=load_active_subagent_caller(store,binding,run_id,child_session_id,parent_session_id,logical_session,creation,plain_input).await {
+                                            match crate::ticket_worker_plan::files::apply_host_file_request(service,&caller,run_id,&args,&tool_call_id,ceiling) {
+                                                Ok(reply)=>{
+                                                    let body=&args[crate::ticket_worker_plan::files::TICKET_FILE_ACTION];
+                                                    committed_plan_calls.insert(tool_call_id.clone(),serde_json::json!({"file_tool":body["tool"],"arguments":body["arguments"],"result":serde_json::to_string(&reply).map_err(|_|local_tool_history_unsupported())?}));
+                                                    serde_json::json!({"result":reply})
+                                                },
+                                                Err(error)=>serde_json::json!({"error":error.to_string()}),
+                                            }
+                                        } else { serde_json::json!({"error":"Ticket file Child Run is no longer current"}) }
+                                    },
+                                    _=>serde_json::json!({"error":"Ticket file Host authority unavailable"}),
                                 }
                             } else if let Some(payload) = checkpoint_payload {
                                 let parsed = (args.as_object().is_some_and(|object| object.len() == 1))

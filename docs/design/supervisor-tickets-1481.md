@@ -852,3 +852,42 @@ fencing and historical executed-session write handoff remain owned by #1488
 (`bamboo/feat/1488-root-actor-writer`, base `6fcee4bc`); #1341 has not delivered
 that production activation binding. No replacement Root actor or Inbox writer
 protocol is introduced here. Features remain disabled by default.
+
+## Slice 22: actual bounded native coding and lease-alive acceptance
+
+Branch `bamboo/feat/1481-native-coding`, worktree `bamboo-1481-native-coding`,
+parent `919f568e`. Native Workers expose only Task plus contract-bound Read/Write
+for explicit isolated Git worktrees. Read-only Git preflight verifies the exact
+repo/common directory, base HEAD, branch and worktree marker before admission.
+All file operations use the existing permission gate and HostBridge; the Host
+revalidates the current creation-fenced Child/Run and original native ceiling.
+Successful file events must match the actual Host callback result. Submission
+contains actual immutable code artifacts from the effect ledger. Raw call replay
+retains its original expected file hash after success, rather than rebasing it.
+No ambient filesystem executor, arbitrary shell, MCP or nested worker is exposed.
+
+Actual Host/native coding passed (18.80s, again 17.46s in the mixed first run):
+own Git worktree modified, sibling repository write denied, private plan updated,
+two exact managed artifacts submitted, explicit acceptance retained on restart.
+Lease-alive acceptance passed (21.16s): OS PID existence was checked while the
+provider held a native Worker; FileHostRegistry reused an expired capacity slot
+under a controlled clock, but a second same-worktree Assignment received 423.
+Only cancellation and actual owned-process reap released the resource, after
+which the successor completed its write. This tests capacity versus ownership;
+it does not claim production ActorActivation/final-write fencing from #1488.
+The first lease fixture failed because it read the initial observation instead
+of querying the fixed dispatch key; that test-only extraction was corrected.
+Worker adapter regressions: 7/7, including permission denial, unsupported Bash,
+frozen call identity, private-plan isolation and stale Run rejection.
+
+Logs: `/tmp/1481-native-files-e2e1.log`, `/tmp/1481-native-files-e2e2.log`,
+`/tmp/1481-native-lease-alive3.log`, `/tmp/1481-native-file-adapter-unit.log`.
+Independent review of the current Bamboo diff and updated Lotus `54b22c7` is
+blocked by automatic approval review: private diff egress to the default OpenAI
+service needs explicit user authorization. The prior Lotus review found seven
+introduced regressions, all fixed in `54b22c7`; current-head review is not PASS.
+Production Root/historical writer handoff still depends on the existing owners:
+#1488 core `38a68eef` and fixture `43cfd39e` were reported locally, but #1489's
+account-journal final permission boundary is not stable. Neither is integrated.
+Full workspace and rebuilt Lotus/native browser checks remain pending at this
+checkpoint. Features stay off by default; no remote mutation is authorized.

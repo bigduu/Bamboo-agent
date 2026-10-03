@@ -302,10 +302,27 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
         let ticket_child = session
             .metadata
             .contains_key(bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+        let ticket_packet = session
+            .metadata
+            .get("ticket.work_contract_ref.v1")
+            .and_then(|raw| {
+                serde_json::from_str::<
+                        bamboo_engine::ticket_worker_plan::tickets::WorkContextPacket,
+                    >(raw)
+                    .ok()
+            });
         Ok(bamboo_subagent::proto::NativeToolCeiling::NAMES
             .iter()
             .filter(|name| {
-                if (**name == "Task") != ticket_child || (ticket_child && **name != "Task") {
+                if (!ticket_child && **name == "Task")
+                    || (ticket_child
+                        && **name != "Task"
+                        && (!matches!(**name, "Read" | "Write")
+                            || ticket_packet.as_ref().is_none_or(|packet| {
+                                packet.workspace.is_none()
+                                    || !packet.contract.allowed_tools.contains(**name)
+                            })))
+                {
                     return false;
                 }
                 self.native_owner(name)

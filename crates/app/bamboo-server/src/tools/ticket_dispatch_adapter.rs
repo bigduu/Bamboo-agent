@@ -65,6 +65,19 @@ impl ChildSessionAdapter {
         match self.query_ticket_dispatch(&service, key, spec).await? {
             DispatchObservation::Missing => {
                 ticket_runtime::require_dispatch_permission(&service, &dispatch)?;
+                if let Some(workspace) = &spec.workspace {
+                    bamboo_engine::ticket_worker_plan::files::verify_workspace(workspace.clone())
+                        .await?;
+                } else if spec
+                    .contract
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| matches!(tool.as_str(), "Read" | "Write"))
+                {
+                    return Err(Error::ScopeDenied(
+                        "Ticket file tools require an explicit isolated Git worktree".into(),
+                    ));
+                }
                 let mut metadata = self.resolve_runtime_metadata(&policy.worker_role).await;
                 metadata.insert(
                     TICKET_DISPATCH_KEY.into(),

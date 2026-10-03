@@ -13,6 +13,7 @@ pub use bamboo_tickets as tickets;
 pub const TICKET_PLAN_PACKET_KEY: &str = "ticket.local_plan.packet.v1";
 pub const TICKET_QUESTION_YIELD_KEY: &str = "ticket.worker.question_yield.v1";
 pub const TICKET_PLAN_ACTION: &str = "_ticket_local_plan_v1";
+pub mod files;
 pub mod remote;
 
 /// This host-installed port is never constructed from model tool arguments.

@@ -40,7 +40,7 @@ pub fn parameters(name: &str) -> Value {
             let contract = object(
                 json!({"title":id,"objective":id,
                 "constraints":{"type":"array","items":{"type":"string"}}, "acceptance":{"type":"array","items":id,"minItems":1},
-                "user_acceptance_required":{"type":"boolean"},"allowed_tools":{"type":"array","items":{"type":"string","enum":["Task"]},"minItems":1,"maxItems":1}}),
+                "user_acceptance_required":{"type":"boolean"},"allowed_tools":{"type":"array","uniqueItems":true,"items":{"type":"string","enum":["Task","Read","Write"]},"minItems":1,"maxItems":3}}),
                 &[
                     "title",
                     "objective",
@@ -61,7 +61,7 @@ pub fn parameters(name: &str) -> Value {
                 vec![
                     operation(
                         "start",
-                        json!({"work_id":id,"temp_id":id,"workspace":{"type":"null","description":"MVP native Task-only route uses its Host workspace; coding/shell permissions are not provided."}}),
+                        json!({"work_id":id,"temp_id":id,"workspace":{"anyOf":[{"type":"null"},object(json!({"repo":id,"base_commit":id,"branch":id,"worktree":id,"write_roots":{"type":"array","items":id,"minItems":1,"maxItems":8},"claims":{"type":"array","items":id,"minItems":1,"maxItems":16}}), &["repo","base_commit","branch","worktree","write_roots","claims"])],"description":"Task-only may use null. Coding requires an explicitly prepared isolated Git worktree matching repo/base/branch and a canonical worktree:<path> claim. Only bounded Read/Write file tools are supported."}}),
                         &["work_id", "temp_id", "workspace"],
                     ),
                     update,
