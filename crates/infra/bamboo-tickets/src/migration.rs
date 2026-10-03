@@ -76,6 +76,15 @@ fn valid_hash(hash: &str) -> bool {
 }
 
 pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
+    let files = snapshot
+        .assignments
+        .values()
+        .any(|a| a.effects.values().any(|e| e.artifact.is_some()));
+    if files && snapshot.schema != 3 {
+        return Err(Error::AuthorityUnavailable(
+            "file effect ledger requires schema 3".into(),
+        ));
+    }
     match (&snapshot.migration, snapshot.schema) {
         (None, 1)
             if snapshot.legacy_attachment.is_none()
@@ -91,7 +100,8 @@ pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
                         .as_ref()
                         .is_some_and(|s| s.artifact.is_some())
                 }) => {}
-        (Some(r), 2) => {
+        (None, 3) if files => {}
+        (Some(r), 2 | 3) => {
             let activation_seq = r
                 .retired_seq
                 .checked_add(1)
@@ -371,7 +381,7 @@ impl TicketService {
         }
         let mut next = snapshot.clone();
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
-        next.schema = 2; // Older binaries cannot ignore retirement and write schema 1.
+        next.schema = next.schema.max(2); // Never downgrade a file effect ledger.
         let supervisor_snapshot = if let Some(bytes) = &proof.supervisor_snapshot {
             store.health = Health::Writable;
             let result = store.store_artifact(bytes);

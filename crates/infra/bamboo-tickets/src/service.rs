@@ -84,7 +84,7 @@ impl Authority {
             Err(Error::ScopeDenied("explicit User decision required".into()))
         }
     }
-    fn worker(&self, assignment: &Assignment) -> Result<()> {
+    pub(crate) fn worker(&self, assignment: &Assignment) -> Result<()> {
         match (&self.principal, &assignment.runtime) {
             (
                 Principal::Worker {
@@ -260,6 +260,16 @@ impl TicketService {
                         .and_then(|s| s.artifact.as_ref())
                         == Some(artifact)
                 })))
+            || snapshot.assignments.values().any(|assignment| {
+                assignment
+                    .effects
+                    .values()
+                    .any(|effect| effect.artifact.as_ref() == Some(artifact))
+                    && match &authority.principal {
+                        Principal::Worker { assignment_id, .. } => assignment.id == *assignment_id,
+                        _ => true,
+                    }
+            })
             || snapshot.submissions.values().any(|submission| {
                 submission.artifacts.contains(artifact)
                     && match &authority.principal {
@@ -559,7 +569,7 @@ fn touch(ticket: &mut Ticket, seq: u64) {
     ticket.record_revision += 1;
     ticket.updated_seq = seq;
 }
-fn active_permit(snapshot: &Snapshot, assignment: &Assignment) -> Result<()> {
+pub(crate) fn active_permit(snapshot: &Snapshot, assignment: &Assignment) -> Result<()> {
     current_attempt(snapshot, assignment)?;
     if assignment.process_stopped {
         return Err(Error::ScopeDenied("Worker process has stopped".into()));
@@ -850,9 +860,15 @@ fn apply(
                     .values()
                     .filter(|a| holds_resources(a))
                     .any(|a| {
-                        a.workspace
-                            .as_ref()
-                            .is_some_and(|w| !candidate.claims.is_disjoint(&w.claims))
+                        a.workspace.as_ref().is_some_and(|w| {
+                            !candidate.claims.is_disjoint(&w.claims)
+                                || candidate.write_roots.iter().any(|c| {
+                                    w.write_roots.iter().any(|old| {
+                                        Path::new(c).starts_with(old)
+                                            || Path::new(old).starts_with(c)
+                                    })
+                                })
+                        })
                     })
                 {
                     return Err(Error::ResourceBlocked(
@@ -1225,6 +1241,7 @@ fn apply(
                         action_fingerprint: fingerprint.clone(),
                         state: EffectState::Planned,
                         provider_receipt: None,
+                        artifact: None,
                     },
                 );
         }
@@ -1240,6 +1257,11 @@ fn apply(
                 .effects
                 .get(attempt_id)
                 .ok_or_else(|| invalid("action attempt was not atomically authorized"))?;
+            if attempt_id.starts_with("worker-file/") || old.artifact != effect.artifact {
+                return Err(Error::ScopeDenied(
+                    "Host file receipts cannot be supplied by Worker".into(),
+                ));
+            }
             if old.action_fingerprint != effect.action_fingerprint
                 || !valid_effect_transition(old.state, effect.state)
                 || (old.state == effect.state && old != effect)
@@ -1717,7 +1739,7 @@ fn apply(
                 }
             } else {
                 snapshot.legacy_attachment = Some(source.clone());
-                snapshot.schema = 2;
+                snapshot.schema = snapshot.schema.max(2);
             }
         }
         Import {
@@ -1728,7 +1750,7 @@ fn apply(
             authority.supervisor()?;
             validate_contract(contract)?;
             if source.artifact.is_some() {
-                snapshot.schema = 2;
+                snapshot.schema = snapshot.schema.max(2);
             }
             if source.session_id.is_empty()
                 || source.task_id.is_empty()

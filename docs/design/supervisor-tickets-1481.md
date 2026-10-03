@@ -820,3 +820,35 @@ P0–P8 have the local evidence recorded above. The Task-only P9 local rollout i
 validated by the recorded bounded tests; the full A11 coding/remote lease gate
 and independent current-head review remain open. The tracker is not marked
 fully complete or default-enabled. No push, PR, merge or deployment is authorized.
+# Slice 21: bounded Assignment file authority (local-only)
+
+This follow-up starts from `db9dc56f` in the isolated
+`bamboo/feat/1481-workspace-fencing` worktree. It adds a Host-only bounded Read/Write
+port for explicit Assignment write roots. Every entry checks the immutable
+execution identity, current generation/contract/epoch, live permit and tool
+capability. Unix directory descriptors and no-follow opens protect every path
+component; traversal, symlinks, hardlinks, sibling roots, TicketStore and `.git`
+are rejected. Writes atomically replace an inode and require the hash of an
+existing file, preventing a stale read from overwriting newer content.
+
+Before touching a workspace file, the existing full-manifest publication stores
+the complete immutable content and a Started effect. A second publication records
+the success receipt. An uncertain write or publication retains the Started effect
+and resource claim; it cannot be automatically retried or reconciled by Worker
+JSON. Exact successful operations return the same receipt; changed payloads
+conflict. File artifacts are scope references and part of backup/transfer
+reachability. Schema 3 prevents an older binary from ignoring this ledger; offline
+migration preserves the schema instead of downgrading it.
+
+Validation: 6/6 file-port tests passed in 3.08s, including actual file bytes,
+escape rejection, stale-read CAS, cancellation/resource claims, ENOSPC at final
+receipt publication with restart, and stopped schema-3 transfer. Strict Ticket
+Clippy passed. Logs: `/tmp/1481-file-port-focused5.log` and
+`/tmp/1481-file-port-clippy2.log`. Earlier failing runs are retained.
+
+Native tool integration and actual coding/lease-alive acceptance are the next
+separate slice. This port alone does not complete A11. Production Root final-write
+fencing and historical executed-session write handoff remain owned by #1488
+(`bamboo/feat/1488-root-actor-writer`, base `6fcee4bc`); #1341 has not delivered
+that production activation binding. No replacement Root actor or Inbox writer
+protocol is introduced here. Features remain disabled by default.

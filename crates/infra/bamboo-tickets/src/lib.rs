@@ -6,6 +6,7 @@ mod query;
 mod resolution;
 mod service;
 pub mod store;
+mod workspace_files;
 
 pub use migration::*;
 pub use model::*;
@@ -13,6 +14,7 @@ pub use query::*;
 pub use resolution::*;
 pub use service::{Authority, Principal, TicketService};
 pub use store::{FaultPoint, Health, PublicationFault};
+pub use workspace_files::{FileOperation, FileReply, FILE_BYTES_LIMIT};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -137,6 +137,8 @@ pub struct WorkContextPacket {
     pub assignment_id: String,
     pub binding: ScopeBinding,
     pub contract: Contract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ExecutionWorkspace>,
     pub inputs: Vec<DependencyInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<ContextArtifact>,
@@ -591,7 +593,7 @@ impl TicketService {
         }
         let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
             assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
-            input_artifacts,
+            input_artifacts, workspace:assignment.workspace.clone(),
             answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision
                 && r.generation < assignment.generation && r.kind == RequestKind::Question && r.status == RequestStatus::Answered)
                 .map(|r|AnsweredInput { request_id:r.id.clone(),work_id:r.work_id.clone(),assignment_id:r.assignment_id.clone(),generation:r.generation,

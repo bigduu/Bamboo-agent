@@ -428,7 +428,7 @@ impl FileStore {
         let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
         let manifest: Manifest =
             serde_json::from_slice(&self.read_object("manifests", &commit.manifest)?)?;
-        if !matches!(commit.schema, 1 | 2) || manifest.schema != commit.schema {
+        if !matches!(commit.schema, 1..=3) || manifest.schema != commit.schema {
             return Err(Error::AuthorityUnavailable("unsupported schema".into()));
         }
         let header = manifest
@@ -677,6 +677,18 @@ fn snapshot_artifacts(snapshot: &Snapshot) -> impl Iterator<Item = &Artifact> {
         .submissions
         .values()
         .flat_map(|s| s.artifacts.iter())
+        .chain(
+            snapshot
+                .assignments
+                .values()
+                .flat_map(|a| a.effects.values().filter_map(|e| e.artifact.as_ref())),
+        )
+        .chain(
+            snapshot
+                .submissions
+                .values()
+                .flat_map(|s| s.effects.values().filter_map(|e| e.artifact.as_ref())),
+        )
         .chain(
             snapshot
                 .tickets

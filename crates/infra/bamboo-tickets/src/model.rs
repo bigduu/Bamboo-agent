@@ -175,6 +175,8 @@ pub struct Effect {
     pub action_fingerprint: String,
     pub state: EffectState,
     pub provider_receipt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

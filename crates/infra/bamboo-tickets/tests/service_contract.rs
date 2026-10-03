@@ -574,6 +574,7 @@ fn approval_is_exact_question_answer_cannot_authorize_and_consumption_is_bound()
                 action_fingerprint: fingerprint,
                 state: EffectState::Started,
                 provider_receipt: None,
+                artifact: None,
             },
         }],
     );
@@ -1251,6 +1252,7 @@ fn stopped_process_does_not_release_an_unknown_external_effect() {
                 action_fingerprint: fingerprint,
                 state: EffectState::Started,
                 provider_receipt: None,
+                artifact: None,
             },
         }],
     );

@@ -334,6 +334,7 @@ fn unconfirmed_execution_and_unknown_effects_reject_transfer_before_retirement()
             action_fingerprint: "f".into(),
             state: EffectState::OutcomeUnknown,
             provider_receipt: None,
+            artifact: None,
         },
     );
     store.publish(s).unwrap();
