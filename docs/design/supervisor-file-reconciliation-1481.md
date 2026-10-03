@@ -134,3 +134,13 @@ The existing worker-loop/private-plan regression directly covers this fix.
 Evidence: `../1481-evidence/1481-workspace-f00bd52e.log` and
 `../1481-evidence/1481-adapter-failure-backtrace.log`; post-fix worker verification
 remains pending. No repeated full-workspace or review run was started.
+
+The continuing workspace run found one further fixture mismatch: the strict
+Root catalog test expected the six new `work_*` entries from the shared
+orchestration allowlist, but its static executor never registered those schemas.
+The baseline test itself is unchanged; the allowlist additions belong to #1481.
+This is tracked as our integration failure, not pre-existing #1120 debt.
+The fixture now supplies all six schemas while retaining the exact allowlist
+assertion and forbidden-tool checks. Production catalog filtering is unchanged.
+Focused verification of this fixture is queued after the running worker/browser
+acceptance, avoiding any source/binary replacement during actual Host tests.
