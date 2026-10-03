@@ -1,5 +1,6 @@
 //! Deterministic canonical-store/admission tests. These do not launch a Worker
 //! or replace the separate fresh-process P5 end-to-end acceptance.
+use super::result::TICKET_OWNED_STOP_KEY;
 use super::*;
 use bamboo_domain::{SessionInboxLimits, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_storage::{FileSessionInbox, LockedSessionStore, SessionStoreV2};

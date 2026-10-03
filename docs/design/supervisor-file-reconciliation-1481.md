@@ -95,3 +95,10 @@ source rematerialization is recorded in
 `../1481-evidence/1481-committed-source-materialization.json`; it changed no
 implementation bytes. Current native, full-workspace, built browser and fresh
 review results remain pending, rather than inheriting earlier-head results.
+
+The first review-follow-up Engine compile failed before tests with a missing
+constant import in the new test module (`E0425`). The import is corrected in a
+separate local follow-up. The original runner terminated; a detached `/tmp`
+worktree at the same current commit is prepared for subsequent acceptance,
+without changing the implementation branch or other sessions. HTTP ingress,
+actual native, full-workspace and browser tests have not run at this checkpoint.
