@@ -105,7 +105,11 @@ curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
 curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available. For SDK embedding, `bamboo_sdk::agent::Agent` provides `run`, `run_stream`, and `execute` over the same engine. Defaults require a configured provider; they do not supply credentials. See [first-run CLI / HTTP / SDK examples](./docs/guides/GETTING_STARTED.md), [API reference](./docs/guides/API.md), and the [published crate's rustdoc](https://docs.rs/bamboo-agent).
+The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
+
+### Use it as a Rust SDK (in-process)
+
+For SDK embedding, `bamboo_sdk::agent::Agent` provides `run`, `run_stream`, and `execute` over the same engine. Defaults require a configured provider; they do not supply credentials. See [first-run CLI / HTTP / SDK examples](./docs/guides/GETTING_STARTED.md), [API reference](./docs/guides/API.md), and the [published crate's rustdoc](https://docs.rs/bamboo-agent).
 
 ## Your data and operating boundaries
 

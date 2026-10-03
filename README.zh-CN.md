@@ -105,7 +105,11 @@ curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
 curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-浏览器使用共享的 `/v2/stream` WebSocket，legacy SSE 路由仍可用。嵌入 SDK 时，`bamboo_sdk::agent::Agent` 通过 `run`、`run_stream`、`execute` 使用同一引擎；默认装配需要已配置的 provider，不会提供凭据。参见 [CLI / HTTP / SDK 入门示例](./docs/guides/GETTING_STARTED.md)、[API 参考](./docs/guides/API.md)及[发布包 rustdoc](https://docs.rs/bamboo-agent)。
+浏览器使用共享的 `/v2/stream` WebSocket，legacy SSE 路由仍可用。
+
+### 作为进程内 Rust SDK 使用
+
+嵌入 SDK 时，`bamboo_sdk::agent::Agent` 通过 `run`、`run_stream`、`execute` 使用同一引擎；默认装配需要已配置的 provider，不会提供凭据。参见 [CLI / HTTP / SDK 入门示例](./docs/guides/GETTING_STARTED.md)、[API 参考](./docs/guides/API.md)及[发布包 rustdoc](https://docs.rs/bamboo-agent)。
 
 ## 数据与运行边界
 
