@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "DuckDB-backed offline analytics over Bamboo session token-usage logs"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 serde = { workspace = true }
