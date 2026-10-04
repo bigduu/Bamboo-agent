@@ -44,14 +44,14 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         ],
     );
     let tree = tree.canonicalize().unwrap();
-    let file = tree.join("answer.rs");
+    let file = tree.join("answer-created.rs");
     *f.probe.coding_path.lock().unwrap() = Some((
         file.to_string_lossy().into_owned(),
         repo.join("answer.rs").to_string_lossy().into_owned(),
     ));
     f.probe.hold_code.store(true, Ordering::SeqCst);
     let create = command(&f.client, &f.base, "unknown-create", json!([
-        {"op":"create","temp_id":"w","kind":"work","parent":null,"depends_on":[],"contract":{"title":"Unknown file fixture","objective":"Patch own answer.rs","constraints":["Own worktree only"],"acceptance":["answer returns 42"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]}},
+        {"op":"create","temp_id":"w","kind":"work","parent":null,"depends_on":[],"contract":{"title":"Unknown file fixture","objective":"Create own answer-created.rs; preserve existing answer.rs","constraints":["Own worktree only"],"acceptance":["answer returns 42"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]}},
         {"op":"ready","work_id":"w"}
     ])).await;
     let created = post(&f.client, &f.base, "/tickets/update", &create).await;
@@ -135,6 +135,11 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "pub fn answer() -> u8 { 42 }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("answer.rs")).unwrap(),
+        "pub fn answer() -> u8 { 0 }\n",
+        "existing Assignment file remains unchanged"
     );
     let inode = std::fs::metadata(&file).unwrap().ino();
     let cli = |args: &[&str]| {
@@ -362,11 +367,13 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
     );
     let tree = tree.canonicalize().unwrap();
     *f.probe.coding_path.lock().unwrap() = Some((
-        tree.join("answer.rs").to_string_lossy().into_owned(),
+        tree.join("answer-created.rs")
+            .to_string_lossy()
+            .into_owned(),
         repo.join("answer.rs").to_string_lossy().into_owned(),
     ));
     f.probe.hold_code.store(true, Ordering::SeqCst);
-    let contract = json!({"title":"Lease alive fixture","objective":"Patch own answer.rs","constraints":["Own worktree only"],"acceptance":["exact code"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]});
+    let contract = json!({"title":"Lease alive fixture","objective":"Create own answer-created.rs; preserve existing answer.rs","constraints":["Own worktree only"],"acceptance":["exact code"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]});
     let create=command(&f.client,&f.base,"two-code",json!([
         {"op":"create","temp_id":"a","kind":"work","parent":null,"depends_on":[],"contract":contract},{"op":"ready","work_id":"a"},
         {"op":"create","temp_id":"b","kind":"work","parent":null,"depends_on":[],"contract":contract},{"op":"ready","work_id":"b"}])).await;
@@ -535,8 +542,13 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read_to_string(tree.join("answer.rs")).unwrap(),
+        std::fs::read_to_string(tree.join("answer-created.rs")).unwrap(),
         "pub fn answer() -> u8 { 42 }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("answer.rs")).unwrap(),
+        "pub fn answer() -> u8 { 0 }\n",
+        "existing Assignment file remains unchanged"
     );
     f.finish().await;
 }
@@ -574,7 +586,7 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
         ],
     );
     let workspace = workspace.canonicalize().unwrap();
-    let file = workspace.join("answer.rs");
+    let file = workspace.join("answer-created.rs");
     let outside = repo.join("answer.rs");
     let cache = workspace.join(".bamboo/private-state.json");
     std::fs::create_dir(cache.parent().unwrap()).unwrap();
@@ -584,7 +596,7 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
         outside.to_string_lossy().into_owned(),
     ));
     let create=command(&f.client,&f.base,"code-create",json!([
-        {"op":"create","temp_id":"w","kind":"work","parent":null,"depends_on":[],"contract":{"title":"Code fixture","objective":"Patch and verify own answer.rs, then submit exact code evidence.","constraints":["Never write the sibling repo or TicketStore"],"acceptance":["answer returns 42"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]}},
+        {"op":"create","temp_id":"w","kind":"work","parent":null,"depends_on":[],"contract":{"title":"Code fixture","objective":"Create and verify own answer-created.rs, preserve answer.rs, then submit exact code evidence.","constraints":["Never write the sibling repo or TicketStore"],"acceptance":["answer returns 42"],"user_acceptance_required":true,"allowed_tools":["Task","Read","Write"]}},
         {"op":"ready","work_id":"w"}])).await;
     let created = post(&f.client, &f.base, "/tickets/update", &create).await;
     let work = created["ids"]["w"].as_str().unwrap();
@@ -622,6 +634,12 @@ async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_c
         std::fs::read_to_string(outside).unwrap(),
         "pub fn answer() -> u8 { 0 }\n"
     );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("answer.rs")).unwrap(),
+        "pub fn answer() -> u8 { 0 }\n",
+        "existing Assignment file remains unchanged"
+    );
+
     assert_eq!(
         std::fs::read_to_string(cache).unwrap(),
         "private runtime state"
