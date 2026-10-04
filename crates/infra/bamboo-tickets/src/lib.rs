@@ -14,7 +14,7 @@ pub use migration::*;
 pub use model::*;
 pub use query::*;
 pub use resolution::*;
-pub use service::{Authority, Principal, TicketService};
+pub use service::{validate_native_tool_ceiling, Authority, Principal, TicketService};
 pub use store::{FaultPoint, Health, PublicationFault};
 pub use workspace_files::{FileOperation, FileReply, FILE_BYTES_LIMIT};
 

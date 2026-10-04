@@ -310,6 +310,11 @@ pub async fn checkpoint_ticket_result(
             Ok(checkpoint)
         })
         .transpose()?;
+    if checkpoint.is_none() {
+        return Err(Error::AuthorityUnavailable(
+            "canonical owned-stop checkpoint missing; retain broker receipt".into(),
+        ));
+    }
     if terminal_status.as_deref() != Some("completed") {
         return Ok(None);
     }

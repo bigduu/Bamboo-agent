@@ -23,7 +23,7 @@ fn contract(title: &str) -> Contract {
         constraints: vec!["Do not expand scope".into()],
         acceptance: vec!["Explicit evidence".into()],
         user_acceptance_required: true,
-        allowed_tools: BTreeSet::new(),
+        allowed_tools: BTreeSet::from(["Task".into()]),
     }
 }
 fn execute(service: &TicketService, id: &str, ops: Vec<Operation>) -> OperationReceipt {
@@ -464,6 +464,29 @@ fn accepted_dependency_context_has_complete_verified_bytes_or_refuses_dispatch_p
                 depends_on: BTreeSet::from([upstream.clone()]),
             }],
         );
+        if std::str::from_utf8(bytes).is_err() {
+            let before = service.published().unwrap();
+            let command = service
+                .prepare_command(
+                    &supervisor(),
+                    "start-downstream",
+                    vec![Operation::Start {
+                        work_id: downstream,
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(
+                service.execute(&supervisor(), &command),
+                Err(Error::AuthorityUnavailable(_))
+            ));
+            assert_eq!(
+                canonical_bytes(&service.published().unwrap()).unwrap(),
+                canonical_bytes(&before).unwrap()
+            );
+            continue;
+        }
         let (assignment, worker) = start(&service, &downstream, "start-downstream");
         match service.child_context_packet(&worker, &assignment, 65536) {
             Ok(packet) => {
@@ -555,9 +578,24 @@ fn external_artifact_without_trusted_resolver_cannot_become_worker_context() {
             depends_on: BTreeSet::from([upstream]),
         }],
     );
-    let (attempt, worker) = start(&service, &downstream, "consumer-start");
+    let before = service.published().unwrap();
+    let command = service
+        .prepare_command(
+            &supervisor(),
+            "consumer-start",
+            vec![Operation::Start {
+                work_id: downstream,
+                temp_id: "assignment".into(),
+                workspace: None,
+            }],
+        )
+        .unwrap();
     assert!(matches!(
-        service.child_context_packet(&worker, &attempt, 65536),
+        service.execute(&supervisor(), &command),
         Err(Error::AuthorityUnavailable(_))
     ));
+    assert_eq!(
+        canonical_bytes(&service.published().unwrap()).unwrap(),
+        canonical_bytes(&before).unwrap()
+    );
 }

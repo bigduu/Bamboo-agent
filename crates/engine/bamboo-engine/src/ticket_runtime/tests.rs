@@ -7,6 +7,18 @@ use bamboo_storage::{FileSessionInbox, LockedSessionStore, SessionStoreV2};
 use bamboo_tickets::{Contract, FaultPoint, TicketKind};
 use std::collections::BTreeSet;
 
+fn save_owned_stop_fixture(child: &mut Session, completed: bool) {
+    let receipt = read_dispatch(child).unwrap().unwrap().receipt.unwrap();
+    child.metadata.insert(
+        TICKET_OWNED_STOP_KEY.into(),
+        serde_json::json!({
+            "receipt":receipt,"child_birth":child.created_at,"pid":1234,"completed":completed
+        })
+        .to_string(),
+    );
+    child.metadata_version += 1;
+}
+
 #[tokio::test]
 async fn ticket_completed_checkpoint_recovers_unpublished_stop_and_submission_after_restart() {
     let mut f = Fixture::new().await;
@@ -70,6 +82,71 @@ struct Fixture {
     spec: DispatchSpec,
     key: String,
     child: Session,
+}
+
+#[tokio::test]
+async fn terminal_without_stop_checkpoint_retains_assignment_until_exact_proof_recovers() {
+    for status in ["completed", "error", "timeout", "cancelled", "skipped"] {
+        let mut f = Fixture::new().await;
+        let _registration = f
+            .runtime
+            .router
+            .register_run(&f.child.id, "host-run")
+            .await
+            .unwrap();
+        admit_ticket_run(&f.service, &f.runtime, &mut f.child, "host-run")
+            .await
+            .unwrap();
+        let receipt = read_dispatch(&f.child).unwrap().unwrap().receipt.unwrap();
+        f.child.set_last_run_status(status);
+        f.child
+            .messages
+            .push(bamboo_domain::Message::assistant("durable result", None));
+        f.storage.save_session(&f.child).await.unwrap();
+        let before = f.service.published().unwrap();
+        assert!(
+            matches!(
+                checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+                    .await,
+                Err(Error::AuthorityUnavailable(_))
+            ),
+            "{status}"
+        );
+        assert_eq!(
+            bamboo_tickets::canonical_bytes(&f.service.published().unwrap()).unwrap(),
+            bamboo_tickets::canonical_bytes(&before).unwrap()
+        );
+        assert_eq!(
+            before.1.tickets[&f.spec.work_id]
+                .active_assignment
+                .as_deref(),
+            Some(f.spec.assignment_id.as_str())
+        );
+        f.child.metadata.insert(TICKET_OWNED_STOP_KEY.into(), serde_json::json!({
+            "receipt": receipt, "child_birth": f.child.created_at, "pid":1234, "completed": status == "completed"
+        }).to_string());
+        f.child.metadata_version += 1;
+        f.storage.save_session(&f.child).await.unwrap();
+        let recovered =
+            checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+                .await
+                .unwrap();
+        assert_eq!(recovered.is_some(), status == "completed");
+        assert!(
+            f.service.published().unwrap().1.assignments[&f.spec.assignment_id].process_stopped
+        );
+        let after = f.service.published().unwrap();
+        assert_eq!(
+            checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
+                .await
+                .unwrap(),
+            recovered
+        );
+        assert_eq!(
+            bamboo_tickets::canonical_bytes(&f.service.published().unwrap()).unwrap(),
+            bamboo_tickets::canonical_bytes(&after).unwrap()
+        );
+    }
 }
 
 #[tokio::test]
@@ -162,7 +239,7 @@ async fn ticket_unsuccessful_terminal_without_exact_stop_proof_keeps_quarantine(
         let result =
             checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run").await;
         if corrupt == "absent" {
-            assert!(result.unwrap().is_none());
+            assert!(matches!(result, Err(Error::AuthorityUnavailable(_))));
         } else {
             assert!(matches!(result, Err(Error::ScopeDenied(_))));
         }
@@ -410,6 +487,8 @@ async fn canonical_completion_submits_exact_output_once_and_requires_user_accept
             .await
             .is_err()
     );
+    save_owned_stop_fixture(&mut f.child, true);
+    f.storage.save_session(&f.child).await.unwrap();
     let receipt = checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
         .await
         .unwrap()
@@ -490,6 +569,7 @@ async fn late_canonical_output_is_archived_without_reversing_cancel() {
         None,
     ));
     f.child.set_last_run_status("completed");
+    save_owned_stop_fixture(&mut f.child, true);
     f.storage.save_session(&f.child).await.unwrap();
     let receipt = checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "host-run")
         .await

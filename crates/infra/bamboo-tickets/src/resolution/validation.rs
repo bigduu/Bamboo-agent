@@ -141,8 +141,8 @@ fn conditional_text(text: &str) -> bool {
 }
 
 fn human_sentence<'a>(record: &'a HumanIngressRecord, quote: &str) -> Option<&'a str> {
-    // A comma may separate a condition from its action. The model cannot
-    // discard that condition by quoting only the affirmative fragment. A
+    // A comma may separate a condition or denial from its action. The model
+    // cannot discard either by quoting only the affirmative fragment. A
     // separate sentence/semicolon action retains its own approval evidence.
     let mut matches = record
         .text
@@ -157,8 +157,35 @@ fn human_sentence<'a>(record: &'a HumanIngressRecord, quote: &str) -> Option<&'a
 }
 
 fn unconditional_human_context(record: &HumanIngressRecord, quote: &str) -> bool {
-    human_sentence(record, quote)
-        .is_some_and(|sentence| !conditional_text(&sentence.to_lowercase()))
+    human_sentence(record, quote).is_some_and(|sentence| {
+        let lower = sentence.to_lowercase();
+        !conditional_text(&lower) && !refused_human_text(&lower)
+    })
+}
+
+fn refused_human_text(text: &str) -> bool {
+    [
+        "不", "未", "暂", "如果", "假如", "假设", "例如", "比如", "之前", "?", "？", "don't",
+        "don’t", "can't", "can’t", "hold off", "拒绝", "取消", "撤销", "别", "勿", "但", "\"", "“",
+        "「", "`", ">",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || text.split(|c: char| !c.is_alphabetic()).any(|word| {
+            matches!(
+                word,
+                "no" | "not"
+                    | "never"
+                    | "reject"
+                    | "decline"
+                    | "but"
+                    | "however"
+                    | "except"
+                    | "maybe"
+                    | "wait"
+                    | "example"
+            )
+        })
 }
 
 fn explicit_amount_matches(text: &str, amount: Option<&str>) -> bool {
@@ -380,12 +407,7 @@ fn acceptance_text(
                     .strip_prefix(&name.to_lowercase())
                     .is_some_and(|rest| affirmative(rest.trim_start_matches([' ', ':', '：'])))
             });
-    let refused = [
-        "不", "未", "暂", "如果", "假如", "假设", "例如", "比如", "之前", "?", "？", "not ",
-        "don't ", "if ", "example", "\"", "“", "「", "`", ">",
-    ]
-    .iter()
-    .any(|s| lower.contains(s));
+    let refused = refused_human_text(&lower);
     if !named
         || !complete
         || !explicit

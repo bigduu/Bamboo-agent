@@ -52,7 +52,7 @@ fn main() -> Result<()> {
                     constraints: vec!["No external side effects".into()],
                     acceptance: vec!["Result equals 5".into()],
                     user_acceptance_required: true,
-                    allowed_tools: BTreeSet::new(),
+                    allowed_tools: BTreeSet::from(["Task".into()]),
                 },
                 depends_on: BTreeSet::new(),
             },

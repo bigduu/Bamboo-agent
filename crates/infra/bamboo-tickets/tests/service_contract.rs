@@ -147,6 +147,7 @@ fn start(service: &TicketService, work: &str, op: &str) -> (String, Authority) {
     (id, worker)
 }
 fn submit(service: &TicketService, id: &str, worker: &Authority, op: &str) -> String {
+    let artifact = service.store_artifact(&runtime(), b"result").unwrap();
     execute(
         service,
         worker,
@@ -154,10 +155,7 @@ fn submit(service: &TicketService, id: &str, worker: &Authority, op: &str) -> St
         vec![Operation::Submit {
             assignment_id: id.into(),
             temp_id: "submission".into(),
-            artifacts: vec![Artifact {
-                uri: "artifact://result.txt".into(),
-                sha256: content_hash(b"result"),
-            }],
+            artifacts: vec![artifact],
             evidence: vec!["verified output".into()],
         }],
     )

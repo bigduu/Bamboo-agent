@@ -2,6 +2,8 @@ use crate::{service::validate_authority, *};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub const WORK_CONTEXT_BYTES_LIMIT: usize = 65536;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRef {
     pub commit: String,
@@ -537,72 +539,9 @@ impl TicketService {
         if !can_read_private(authority, assignment_id) {
             return Err(Error::ScopeDenied("sibling context denied".into()));
         }
-        let work = &snapshot.tickets[&assignment.work_id];
-        if work.contract_revision != assignment.contract_revision
-            || work.generation != assignment.generation
-            || work.state != WorkState::Active
-            || work.active_assignment.as_deref() != Some(assignment_id)
-            || assignment.dependency_inputs.iter().any(|i| {
-                snapshot.tickets.get(&i.work_id).is_none_or(|upstream| {
-                    upstream.state != WorkState::Accepted
-                        || upstream.accepted_submission.as_deref() != Some(i.submission_id.as_str())
-                        || upstream.contract_revision != i.contract_revision
-                })
-            })
-        {
-            return Err(Error::RevisionConflict);
-        }
-        if !(128..=65536).contains(&budget_bytes) {
-            return Err(Error::ContextBudgetExceeded);
-        }
-        let mut input_artifacts = Vec::new();
-        let mut input_bytes = 0usize;
-        for input in &assignment.dependency_inputs {
-            let submission = snapshot
-                .submissions
-                .get(&input.submission_id)
-                .ok_or(Error::RevisionConflict)?;
-            if submission.work_id != input.work_id
-                || submission.contract_revision != input.contract_revision
-                || submission
-                    .artifacts
-                    .iter()
-                    .map(|a| a.sha256.clone())
-                    .collect::<Vec<_>>()
-                    != input.artifact_hashes
-            {
-                return Err(Error::RevisionConflict);
-            }
-            for artifact in &submission.artifacts {
-                let bytes = self.read_artifact(authority, artifact, budget_bytes)?;
-                input_bytes = input_bytes.saturating_add(bytes.len());
-                if input_bytes > budget_bytes {
-                    return Err(Error::ContextBudgetExceeded);
-                }
-                let utf8 = String::from_utf8(bytes).map_err(|_| {
-                    Error::AuthorityUnavailable(
-                        "input Artifact requires a supported lossless UTF-8 resolver".into(),
-                    )
-                })?;
-                input_artifacts.push(ContextArtifact {
-                    source: input.clone(),
-                    artifact: artifact.clone(),
-                    utf8,
-                });
-            }
-        }
-        let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
-            assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
-            input_artifacts, workspace:assignment.workspace.clone(),
-            answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision
-                && r.generation < assignment.generation && r.kind == RequestKind::Question && r.status == RequestStatus::Answered)
-                .map(|r|AnsweredInput { request_id:r.id.clone(),work_id:r.work_id.clone(),assignment_id:r.assignment_id.clone(),generation:r.generation,
-                    contract_revision:r.contract_revision,prompt_revision:r.prompt_revision,prompt:r.prompt.clone(),answer:r.answer.clone().expect("answered question"),updated_seq:r.updated_seq }).collect(),
-            result_contract:"Submit exact assignment/generation/contract/input versions, artifact hashes and evidence. Completion means submitted.".into() };
-        if canonical_bytes(&packet)?.len() > budget_bytes {
-            return Err(Error::ContextBudgetExceeded);
-        }
-        Ok(packet)
+        build_context_packet(&snapshot, assignment, budget_bytes, |artifact, budget| {
+            self.read_artifact(authority, artifact, budget)
+        })
     }
 
     pub fn work_update(
@@ -666,4 +605,81 @@ fn page<T: Clone>(
         omitted,
         next,
     ))
+}
+
+/// The same complete packet is checked before Start publication and before
+/// native admission; callers supply their already-verified artifact reader.
+pub(crate) fn build_context_packet(
+    snapshot: &Snapshot,
+    assignment: &Assignment,
+    budget_bytes: usize,
+    mut read_artifact: impl FnMut(&Artifact, usize) -> Result<Vec<u8>>,
+) -> Result<WorkContextPacket> {
+    let assignment_id = assignment.id.as_str();
+    let work = &snapshot.tickets[&assignment.work_id];
+    if work.contract_revision != assignment.contract_revision
+        || work.generation != assignment.generation
+        || work.state != WorkState::Active
+        || work.active_assignment.as_deref() != Some(assignment_id)
+        || assignment.dependency_inputs.iter().any(|i| {
+            snapshot.tickets.get(&i.work_id).is_none_or(|upstream| {
+                upstream.state != WorkState::Accepted
+                    || upstream.accepted_submission.as_deref() != Some(i.submission_id.as_str())
+                    || upstream.contract_revision != i.contract_revision
+            })
+        })
+    {
+        return Err(Error::RevisionConflict);
+    }
+    if !(128..=WORK_CONTEXT_BYTES_LIMIT).contains(&budget_bytes) {
+        return Err(Error::ContextBudgetExceeded);
+    }
+    let mut input_artifacts = Vec::new();
+    let mut input_bytes = 0usize;
+    for input in &assignment.dependency_inputs {
+        let submission = snapshot
+            .submissions
+            .get(&input.submission_id)
+            .ok_or(Error::RevisionConflict)?;
+        if submission.work_id != input.work_id
+            || submission.contract_revision != input.contract_revision
+            || submission
+                .artifacts
+                .iter()
+                .map(|a| a.sha256.clone())
+                .collect::<Vec<_>>()
+                != input.artifact_hashes
+        {
+            return Err(Error::RevisionConflict);
+        }
+        for artifact in &submission.artifacts {
+            let bytes = read_artifact(artifact, budget_bytes)?;
+            input_bytes = input_bytes.saturating_add(bytes.len());
+            if input_bytes > budget_bytes {
+                return Err(Error::ContextBudgetExceeded);
+            }
+            let utf8 = String::from_utf8(bytes).map_err(|_| {
+                Error::AuthorityUnavailable(
+                    "input Artifact requires a supported lossless UTF-8 resolver".into(),
+                )
+            })?;
+            input_artifacts.push(ContextArtifact {
+                source: input.clone(),
+                artifact: artifact.clone(),
+                utf8,
+            });
+        }
+    }
+    let packet=WorkContextPacket { contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
+        assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
+        input_artifacts, workspace:assignment.workspace.clone(),
+        answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision
+            && r.generation < assignment.generation && r.kind == RequestKind::Question && r.status == RequestStatus::Answered)
+            .map(|r|AnsweredInput { request_id:r.id.clone(),work_id:r.work_id.clone(),assignment_id:r.assignment_id.clone(),generation:r.generation,
+                contract_revision:r.contract_revision,prompt_revision:r.prompt_revision,prompt:r.prompt.clone(),answer:r.answer.clone().expect("answered question"),updated_seq:r.updated_seq }).collect(),
+        result_contract:"Submit exact assignment/generation/contract/input versions, artifact hashes and evidence. Completion means submitted.".into() };
+    if canonical_bytes(&packet)?.len() > budget_bytes {
+        return Err(Error::ContextBudgetExceeded);
+    }
+    Ok(packet)
 }

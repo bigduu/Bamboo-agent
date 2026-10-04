@@ -295,7 +295,17 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         ("确认验收 A，前提是 CI 通过", "确认验收 A"),
         ("只有 CI 通过，确认验收 A", "确认验收 A"),
         ("确认验收 A，除非 CI 失败", "确认验收 A"),
-        ("确认验收A", "确认验收A"),
+        ("I accept A, but don't accept it", "I accept A"),
+        ("I accept A, but don’t accept it", "I accept A"),
+        ("I accept A, do not accept it", "I accept A"),
+        ("No, I accept A", "I accept A"),
+        ("I accept A, but hold off", "I accept A"),
+        ("I accept A, however wait", "I accept A"),
+        ("确认验收 A，但不要接受交付", "确认验收 A"),
+        ("确认验收 A，但是暂不验收", "确认验收 A"),
+        ("确认验收 A，别验收它", "确认验收 A"),
+        ("确认验收 A，勿接受交付", "确认验收 A"),
+        ("不要验收 B；确认验收A", "确认验收A"),
     ])
     .enumerate()
     {
@@ -317,7 +327,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         let result = service.settle_message(&human(), &id).unwrap();
         assert_eq!(
             result.groups[0].status,
-            if text == "确认验收A" {
+            if quote == "确认验收A" {
                 ResolutionStatus::Committed
             } else {
                 ResolutionStatus::NeedsClarification
@@ -325,7 +335,7 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         );
         assert_eq!(
             service.published().unwrap().1.tickets[&work].state,
-            if text == "确认验收A" {
+            if quote == "确认验收A" {
                 WorkState::Accepted
             } else {
                 WorkState::Submitted
@@ -871,7 +881,14 @@ fn approval_quote_cannot_discard_amount_or_conditions_in_its_human_sentence() {
         ("批准 A，条件是 CI 通过", false),
         ("只有 CI 通过，批准 A", false),
         ("批准 A，除非 CI 失败", false),
+        ("批准 A，但不要批准它", false),
+        ("批准 A，别批准它", false),
+        ("批准 A, but don't approve it", false),
+        ("批准 A, but don’t approve it", false),
+        ("批准 A, do not approve it", false),
+        ("批准 A, but hold off", false),
         ("批准 A，金额 100 CNY", true),
+        ("不要批准 B；批准 A，金额 100 CNY", true),
         ("金额 200 CNY；批准 A，金额 100 CNY", true),
         ("批准 A，前提是 CI 通过；批准 A", false),
     ] {

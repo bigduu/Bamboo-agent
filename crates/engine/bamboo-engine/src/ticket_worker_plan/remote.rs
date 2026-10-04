@@ -77,14 +77,14 @@ impl RemoteWorkerPlan {
         session_id: String,
         run_id: String,
     ) -> Result<Self> {
-        if session_id.is_empty()
-            || run_id.is_empty()
-            || !packet.contract.allowed_tools.contains("Task")
-        {
+        if session_id.is_empty() || run_id.is_empty() {
             return Err(Error::ScopeDenied(
                 "invalid native LocalPlan binding".into(),
             ));
         }
+        bamboo_tickets::validate_native_tool_ceiling(
+            packet.contract.allowed_tools.iter().map(String::as_str),
+        )?;
         // Events and callback controls use distinct transport lanes. A queued
         // posture event may arrive after this read. Retry only the Host's exact
         // pending-posture response, never a mutation or general authority error.

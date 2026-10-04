@@ -158,15 +158,7 @@ impl RemoteFileExecutor {
         session_id: String,
         tools: &[String],
     ) -> Result<Self> {
-        if !tools.iter().any(|t| t == "Task")
-            || tools
-                .iter()
-                .any(|t| !matches!(t.as_str(), "Task" | "Read" | "Write"))
-        {
-            return Err(Error::ScopeDenied(
-                "unsupported Ticket native ceiling".into(),
-            ));
-        }
+        bamboo_tickets::validate_native_tool_ceiling(tools.iter().map(String::as_str))?;
         Ok(Self {
             inner,
             host,

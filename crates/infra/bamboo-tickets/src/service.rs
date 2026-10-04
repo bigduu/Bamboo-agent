@@ -363,6 +363,17 @@ impl TicketService {
         next.seq += 1;
         let ids = apply_operations(&mut next, authority, &command.operations, store.root())?;
         validate_snapshot(&next)?;
+        for assignment in next.assignments.values().filter(|a| {
+            !snapshot.assignments.contains_key(&a.id)
+                && next.tickets[&a.work_id].active_assignment.as_deref() == Some(a.id.as_str())
+        }) {
+            crate::query::build_context_packet(
+                &next,
+                assignment,
+                crate::WORK_CONTEXT_BYTES_LIMIT,
+                |artifact, budget| store.read_artifact(artifact, budget),
+            )?;
+        }
         let receipt = OperationReceipt {
             operation_id: command.operation_id.clone(),
             principal: authority.identity(),
@@ -840,6 +851,18 @@ fn apply(
             {
                 return Err(invalid(
                     "start requires ready Work without an active Assignment",
+                ));
+            }
+            validate_contract(&work.contract)?;
+            if work
+                .contract
+                .allowed_tools
+                .iter()
+                .any(|tool| matches!(tool.as_str(), "Read" | "Write"))
+                && workspace.as_ref().is_none_or(|w| w.write_roots.is_empty())
+            {
+                return Err(invalid(
+                    "file tools require nonempty canonical workspace write roots",
                 ));
             }
             if let Some(workspace) = workspace {
@@ -1813,9 +1836,36 @@ fn validate_contract(contract: &Contract) -> Result<()> {
     if contract.title.trim().is_empty()
         || contract.objective.trim().is_empty()
         || contract.acceptance.is_empty()
+        || contract
+            .acceptance
+            .iter()
+            .any(|item| item.trim().is_empty())
     {
         return Err(invalid(
             "contract must include title, objective and acceptance",
+        ));
+    }
+    validate_native_tool_ceiling(contract.allowed_tools.iter().map(String::as_str))?;
+    if canonical_bytes(contract)?.len() > crate::WORK_CONTEXT_BYTES_LIMIT {
+        return Err(Error::ContextBudgetExceeded);
+    }
+    Ok(())
+}
+
+/// Keep direct service/HTTP contracts within the native Worker tool ceiling.
+pub fn validate_native_tool_ceiling<'a>(tools: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut task = false;
+    for tool in tools {
+        if !matches!(tool, "Task" | "Read" | "Write") {
+            return Err(Error::ScopeDenied(
+                "unsupported Ticket native ceiling".into(),
+            ));
+        }
+        task |= tool == "Task";
+    }
+    if !task {
+        return Err(Error::ScopeDenied(
+            "unsupported Ticket native ceiling".into(),
         ));
     }
     Ok(())
@@ -1880,8 +1930,11 @@ fn validate_workspace(workspace: &ExecutionWorkspace) -> Result<()> {
         ));
     }
     let root = Path::new(&workspace.worktree).canonicalize()?;
-    if !Path::new(&workspace.worktree).is_absolute() {
-        return Err(invalid("worktree must be absolute"));
+    if !Path::new(&workspace.worktree).is_absolute()
+        || Path::new(&workspace.worktree) != root
+        || !root.is_dir()
+    {
+        return Err(invalid("worktree must be a canonical absolute directory"));
     }
     for path in &workspace.write_roots {
         let path = Path::new(path);
@@ -1889,7 +1942,9 @@ fn validate_workspace(workspace: &ExecutionWorkspace) -> Result<()> {
             || path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
-            || !path.canonicalize()?.starts_with(&root)
+            || !path.is_dir()
+            || path.canonicalize()? != path
+            || !path.starts_with(&root)
         {
             return Err(Error::ScopeDenied("write root escapes worktree".into()));
         }
