@@ -1075,7 +1075,6 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
             let saved = save_finalized_runtime_with_inherited_child_wait(
-                agent.storage().as_ref(),
                 agent.persistence().as_ref(),
                 &mut session,
                 inherited_child_wait.as_ref(),
@@ -1186,67 +1185,20 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
 
 // Keep the final writer and its rejection path directly regression-testable.
 async fn save_finalized_runtime_with_inherited_child_wait(
-    storage: &dyn bamboo_agent_core::storage::Storage,
     persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
     session: &mut Session,
     inherited_child_wait: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
 ) -> std::io::Result<()> {
-    if inherited_child_wait.is_some()
-        && session
+    if let Some(inherited) = inherited_child_wait.filter(|wait| {
+        session
             .agent_runtime_state
             .as_ref()
             .and_then(|runtime| runtime.waiting_for_children.as_ref())
-            == inherited_child_wait
-    {
-        // Completion holds this lock through its durable clear. Keep it
-        // through our final write as well, closing the read/save window.
-        let resume_lock =
-            crate::session_app::child_completion_coordinator::session_resume_lock(&session.id);
-        let _guard = resume_lock.lock().await;
-        match storage.load_session(&session.id).await {
-            Ok(Some(latest)) if latest.created_at == session.created_at => {
-                let durable = latest.agent_runtime_state.as_ref();
-                if let Some(runtime) = session.agent_runtime_state.as_mut() {
-                    runtime.waiting_for_children =
-                        durable.and_then(|state| state.waiting_for_children.clone());
-                    if runtime.waiting_for_children.is_none() {
-                        if let Some(durable) = durable {
-                            runtime.status = durable.status;
-                            runtime.suspension = durable.suspension.clone();
-                        }
-                        if session.metadata.contains_key("agent.runtime.state") {
-                            if let Ok(serialized) = serde_json::to_string(runtime) {
-                                session
-                                    .metadata
-                                    .insert("agent.runtime.state".into(), serialized);
-                            }
-                        }
-                        match latest.metadata.get("runtime.suspend_reason") {
-                            Some(reason) => {
-                                session
-                                    .metadata
-                                    .insert("runtime.suspend_reason".into(), reason.clone());
-                            }
-                            None => {
-                                session.metadata.remove("runtime.suspend_reason");
-                            }
-                        }
-                        if !session.metadata.contains_key("runtime.suspend_reason")
-                            && session.last_run_status().as_deref() == Some("suspended")
-                        {
-                            session.set_last_run_status("completed");
-                        }
-                    }
-                }
-                persistence.save_finalized_runtime_session(session).await
-            }
-            Ok(_) => Err(std::io::Error::other(
-                bamboo_domain::SessionAuthorityConflict(
-                    "inherited child wait session disappeared or changed birth".into(),
-                ),
-            )),
-            Err(error) => Err(error),
-        }
+            == Some(*wait)
+    }) {
+        persistence
+            .save_finalized_runtime_with_inherited_child_wait(session, inherited)
+            .await
     } else {
         persistence.save_finalized_runtime_session(session).await
     }
@@ -1441,6 +1393,129 @@ mod reservation_tests {
     use super::*;
     use crate::runtime::execution::runner_state::AgentStatus;
 
+    struct CompletionAtFinalSave {
+        directory: std::path::PathBuf,
+        persistence: bamboo_storage::LockedSessionStore,
+        cleared: std::sync::atomic::AtomicBool,
+    }
+
+    impl CompletionAtFinalSave {
+        async fn clear_wait(&self, id: &str) {
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::execution::agent_spawn::reservation_tests::inherited_child_wait_adopts_independent_completion_at_final_save", "--nocapture"])
+                .env("BAMBOO_FINAL_WAIT_COMPLETION_DIR", &self.directory)
+                .env("BAMBOO_FINAL_WAIT_COMPLETION_ID", id)
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = process.try_wait().unwrap() {
+                    assert!(status.success(), "completion process failed");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    panic!("bounded completion process deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.cleared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for CompletionAtFinalSave {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.clear_wait(&session.id).await;
+            self.persistence.merge_save_finalized_runtime(session).await
+        }
+        async fn save_finalized_runtime_with_inherited_child_wait(
+            &self,
+            session: &mut Session,
+            inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+        ) -> std::io::Result<()> {
+            self.clear_wait(&session.id).await;
+            self.persistence
+                .merge_save_inherited_child_wait_and_publish(session, inherited, |_, _| {})
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_child_wait_adopts_independent_completion_at_final_save() {
+        use bamboo_agent_core::storage::Storage;
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+        if let Some(directory) = std::env::var_os("BAMBOO_FINAL_WAIT_COMPLETION_DIR") {
+            let remote = bamboo_storage::SessionStoreV2::new(directory.into())
+                .await
+                .unwrap();
+            let id = std::env::var("BAMBOO_FINAL_WAIT_COMPLETION_ID").unwrap();
+            let mut latest = remote.load_session(&id).await.unwrap().unwrap();
+            let runtime = latest.agent_runtime_state.as_mut().unwrap();
+            runtime.waiting_for_children = None;
+            runtime.status = AgentStatusState::Idle;
+            runtime.suspension = None;
+            latest.metadata.remove("runtime.suspend_reason");
+            remote.save_runtime_state(&latest).await.unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        // Independent Host persistence does not participate in the engine's
+        // process-local resume mutex. Complete only when finalization arrives,
+        // after the old helper's reload but before its final durable write.
+        let mut runner = Session::new("cross-host-final-wait", "model");
+        let inherited = WaitingForChildrenState::for_children(
+            vec!["child".into()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        );
+        let mut runtime = AgentRuntimeState::new("run");
+        runtime.waiting_for_children = Some(inherited.clone());
+        runtime.status = AgentStatusState::Suspended;
+        runner.agent_runtime_state = Some(runtime);
+        runner.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        runner.set_last_run_status("suspended");
+        local.save_session(&runner).await.unwrap();
+        let persistence = CompletionAtFinalSave {
+            directory: temp.path().to_path_buf(),
+            persistence: bamboo_storage::LockedSessionStore::new(local.clone()),
+            cleared: std::sync::atomic::AtomicBool::new(false),
+        };
+        save_finalized_runtime_with_inherited_child_wait(
+            &persistence,
+            &mut runner,
+            Some(&inherited),
+        )
+        .await
+        .unwrap();
+        assert!(persistence
+            .cleared
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let durable = local.load_session(&runner.id).await.unwrap().unwrap();
+        for session in [&runner, &durable] {
+            let runtime = session.agent_runtime_state.as_ref().unwrap();
+            assert!(
+                runtime.waiting_for_children.is_none(),
+                "independent completion must not be resurrected"
+            );
+            assert_eq!(runtime.status, AgentStatusState::Idle);
+            assert!(runtime.suspension.is_none());
+            assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(session.last_run_status().as_deref(), Some("completed"));
+        }
+    }
+
     #[tokio::test]
     async fn inherited_child_wait_rejects_aba_and_missing_birth_without_cache_publication() {
         use bamboo_agent_core::storage::Storage;
@@ -1499,7 +1574,6 @@ mod reservation_tests {
             }
 
             let saved = save_finalized_runtime_with_inherited_child_wait(
-                storage.as_ref(),
                 &persistence,
                 &mut stale,
                 Some(&wait),

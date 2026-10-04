@@ -485,4 +485,7 @@ cargo build --release
 
 ## License
 
-MIT
+Project-owned code is licensed under the [MIT License](./LICENSE).
+Third-party materials retain their own licenses and copyright notices:
+
+- `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
