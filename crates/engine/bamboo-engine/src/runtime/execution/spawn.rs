@@ -649,7 +649,7 @@ pub(crate) fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPol
     policy
 }
 
-async fn publish_child_completion(
+pub(crate) async fn publish_child_completion(
     publisher: &super::session_events::ReplayableSessionEventPublisher,
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
@@ -707,6 +707,7 @@ pub(crate) async fn publish_child_completion_parts(
             status,
             error,
             completed_at: Utc::now(),
+            source: None,
         },
     )
     .await;
