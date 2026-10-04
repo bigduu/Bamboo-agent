@@ -2563,6 +2563,13 @@ impl ExternalChildRunner for ActorChildRunner {
         let expected_status =
             effective_broker_terminal_status(delivery.terminal_status, host_nested_wait_handoff)?;
         if session.last_run_status().as_deref() != Some(expected_status) {
+            tracing::warn!(
+                child_session_id = %session.id,
+                activation_run_id,
+                expected_status,
+                actual_status = ?session.last_run_status(),
+                "Host final status differs from accepted broker terminal"
+            );
             return Err("Host final status differs from accepted broker terminal".into());
         }
         let store = self
@@ -4613,7 +4620,13 @@ impl PlainActorActivation {
                     native_groups: Vec::new(),
                 })
                 .await
-                .map_err(|error| AgentError::LLM(format!("actor reply commit failed: {error}")))?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Actor reply checkpoint rejected or unconfirmed; durable history is preserved"
+                    );
+                    AgentError::LLM(format!("actor reply commit failed: {error}"))
+                })?;
             let _ = event_tx
                 .send(AgentEvent::MessageAppended {
                     session_id: session.id.clone(),
