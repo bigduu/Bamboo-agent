@@ -11,7 +11,9 @@ See `crates/infra/bamboo-plugin/examples/portable-hooks` for a minimal bundle.
 
 Paths must remain inside the installed bundle. Hook bundles reject symlinks
 and special files. `scripts` identifies code to inspect; the review digest
-covers the **entire bundle**, entry types and paths (including empty directories), file bytes, plugin id and version.
+covers the **entire bundle**, entry types and Unicode paths (including empty directories), file bytes, Unix
+permission bits (including directory traversal permissions; readonly state on other
+platforms), plugin id and version. Non-Unicode bundle paths are rejected.
 The bundle is capped at 64 MiB, each hook configuration at 64 KiB, each
 configuration at 64 commands and each plugin at 16 configurations.
 Persistent data is outside the reviewed bundle, at `plugins/data/<id>`.

@@ -163,7 +163,24 @@ impl PortableConfig {
 }
 /// Hash entry types, paths and file bytes with length framing, in sorted order. Symlinks and
 /// special files are rejected; plugin data lives outside the reviewed bundle.
+fn hash_permissions(metadata: &std::fs::Metadata, hash: &mut Sha256) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        hash.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    hash.update([u8::from(metadata.permissions().readonly())]);
+}
+
 fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> PluginResult<()> {
+    let directory = std::fs::symlink_metadata(dir).map_err(|e| invalid(e.to_string()))?;
+    if !directory.is_dir() {
+        return Err(invalid(
+            "hook bundle directory cannot be a symlink or special file",
+        ));
+    }
+    hash_permissions(&directory, hash);
     let mut paths = std::fs::read_dir(dir)
         .map_err(|e| invalid(e.to_string()))?
         .map(|entry| entry.map(|e| e.path()))
@@ -173,7 +190,11 @@ fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> Plu
     for path in paths {
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| invalid(e.to_string()))?;
         if metadata.is_dir() {
-            let name = path.strip_prefix(root).unwrap().to_string_lossy();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .ok_or_else(|| invalid("hook bundle paths must be Unicode"))?;
             hash.update(b"directory");
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
@@ -183,9 +204,14 @@ fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> Plu
             if *total > 64 * 1024 * 1024 {
                 return Err(invalid("reviewed hook bundle exceeds 64 MiB"));
             }
-            let name = path.strip_prefix(root).unwrap().to_string_lossy();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .ok_or_else(|| invalid("hook bundle paths must be Unicode"))?;
             let bytes = std::fs::read(&path).map_err(|e| invalid(e.to_string()))?;
             hash.update(b"file");
+            hash_permissions(&metadata, hash);
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
             hash.update((bytes.len() as u64).to_le_bytes());
@@ -272,6 +298,56 @@ fn unique_events<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn executable_and_directory_permissions_invalidate_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("policy");
+        std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let digest = || {
+            let mut hash = Sha256::new();
+            hash_tree(temp.path(), temp.path(), &mut hash, &mut 0).unwrap();
+            format!("{:x}", hash.finalize())
+        };
+        let original = digest();
+        let mut receipt = HookRegistration {
+            plugin_id: "fixture".into(),
+            version: "0.1.0".into(),
+            config: "hooks.json".into(),
+            digest: original.clone(),
+            trusted_digest: None,
+            enabled: false,
+        };
+        receipt.confirm_review(&original).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(receipt.state(&digest()), HookState::NeedsReview);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(digest(), original);
+        let mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode ^ 0o010))
+            .unwrap();
+        assert_ne!(digest(), original);
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_unicode_file_and_directory_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        for byte in [0xff, 0xfe] {
+            let path = temp.path().join(std::ffi::OsString::from_vec(vec![byte]));
+            std::fs::create_dir(&path).unwrap();
+            assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, "policy").unwrap();
+            assert!(hash_tree(temp.path(), temp.path(), &mut Sha256::new(), &mut 0).is_err());
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
     #[test]
     fn empty_directory_changes_invalidate_reviewed_tree() {
         let temp = tempfile::tempdir().unwrap();
@@ -342,6 +418,10 @@ mod tests {
         {
             std::os::unix::fs::symlink("/etc/passwd", temp.path().join("escape")).unwrap();
             assert!(bundle_path(temp.path(), "escape").is_err());
+            let outside = tempfile::tempdir().unwrap();
+            let linked_root = outside.path().join("linked-bundle");
+            std::os::unix::fs::symlink(temp.path(), &linked_root).unwrap();
+            assert!(hash_tree(&linked_root, &linked_root, &mut Sha256::new(), &mut 0).is_err());
         }
     }
 }
