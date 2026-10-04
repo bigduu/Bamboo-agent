@@ -178,6 +178,26 @@ pub async fn plugin_hooks(state: web::Data<AppState>, id: web::Path<String>) -> 
         Err(error) => plugin_error_response(&error),
     }
 }
+fn reviewable_hook_registrations(
+    manifest: &bamboo_plugin::PluginManifest,
+    entry: &bamboo_plugin::InstalledPlugin,
+) -> bamboo_plugin::PluginResult<Vec<bamboo_plugin::hooks::HookRegistration>> {
+    manifest.validate()?;
+    if manifest.id != entry.id || manifest.version != entry.version {
+        return Err(bamboo_plugin::PluginError::InvalidManifest(
+            "manifest identity changed".into(),
+        ));
+    }
+    if manifest.platforms.as_ref().is_some_and(|platforms| {
+        !bamboo_plugin::Platform::current().is_some_and(|platform| platforms.contains(&platform))
+    }) {
+        return Err(bamboo_plugin::PluginError::InvalidManifest(
+            "hook plugin does not support the current platform".into(),
+        ));
+    }
+    bamboo_plugin::hooks::registrations(manifest, &entry.plugin_dir)
+}
+
 async fn hook_review_report(
     state: &AppState,
     id: &str,
@@ -193,7 +213,7 @@ async fn hook_review_report(
             .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?,
     )
     .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?;
-    match bamboo_plugin::hooks::registrations(&manifest, &entry.plugin_dir) {
+    match reviewable_hook_registrations(&manifest, entry) {
         Ok(current) => Ok(serde_json::json!({"hooks": current.iter().map(|now| {
             let stored=entry.registered.hooks.iter().find(|r| r.config==now.config);
             serde_json::json!({"config":now.config,"digest":now.digest,"state": if entry.status==bamboo_plugin::PluginInstallStatus::Installed { stored.map(|r|r.state(&now.digest)).unwrap_or(bamboo_plugin::hooks::HookState::NeedsReview) } else { bamboo_plugin::hooks::HookState::Disabled }})
@@ -234,7 +254,7 @@ pub async fn review_plugin_hooks(
                 "manifest identity changed".into(),
             ));
         }
-        let current = bamboo_plugin::hooks::registrations(&manifest, &entry.plugin_dir)?;
+        let current = reviewable_hook_registrations(&manifest, &entry)?;
         let now = current
             .iter()
             .find(|r| r.config == body.config)

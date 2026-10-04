@@ -1338,3 +1338,81 @@ async fn portable_hook_review_requires_exact_explicit_consent_and_update_resets_
         native_hooks
     );
 }
+
+#[actix_web::test]
+async fn portable_hook_review_rejects_invalid_manifest_and_platform_without_changing_trust() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let registry = data.path().join("plugins/installed.json");
+    let store = InstalledPlugins::load(&registry).await.unwrap();
+    let entry = store.get_unique("portable-hook-example").unwrap().unwrap();
+    let original: bamboo_plugin::PluginManifest =
+        serde_json::from_slice(&std::fs::read(entry.plugin_dir.join("plugin.json")).unwrap())
+            .unwrap();
+    let receipt = entry.registered.hooks[0].clone();
+    let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":receipt.config,"digest":receipt.digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let trusted = InstalledPlugins::load(&registry)
+        .await
+        .unwrap()
+        .get_unique(&entry.id)
+        .unwrap()
+        .unwrap()
+        .registered
+        .hooks
+        .clone();
+    for platform_case in [true, false] {
+        let mut changed = original.clone();
+        if platform_case {
+            changed.platforms = Some(vec![if Platform::current() == Some(Platform::Windows) {
+                Platform::Linux
+            } else {
+                Platform::Windows
+            }]);
+        } else {
+            changed.name.clear();
+        }
+        std::fs::write(
+            entry.plugin_dir.join("plugin.json"),
+            serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        let digest = bamboo_plugin::hooks::registrations(&changed, &entry.plugin_dir).unwrap()[0]
+            .digest
+            .clone();
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":receipt.config,"digest":digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/plugins/portable-hook-example/hooks")
+                .to_request(),
+        )
+        .await;
+        let report: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(report["state"], "unsupported");
+        assert_eq!(
+            InstalledPlugins::load(&registry)
+                .await
+                .unwrap()
+                .get_unique(&entry.id)
+                .unwrap()
+                .unwrap()
+                .registered
+                .hooks,
+            trusted
+        );
+    }
+}

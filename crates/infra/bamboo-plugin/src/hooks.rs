@@ -161,7 +161,7 @@ impl PortableConfig {
         Ok(config)
     }
 }
-/// Hash names and bytes with length framing, in sorted order. Symlinks and
+/// Hash entry types, paths and file bytes with length framing, in sorted order. Symlinks and
 /// special files are rejected; plugin data lives outside the reviewed bundle.
 fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> PluginResult<()> {
     let mut paths = std::fs::read_dir(dir)
@@ -173,6 +173,10 @@ fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> Plu
     for path in paths {
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| invalid(e.to_string()))?;
         if metadata.is_dir() {
+            let name = path.strip_prefix(root).unwrap().to_string_lossy();
+            hash.update(b"directory");
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
             hash_tree(root, &path, hash, total)?;
         } else if metadata.is_file() {
             *total = total.saturating_add(metadata.len());
@@ -181,6 +185,7 @@ fn hash_tree(root: &Path, dir: &Path, hash: &mut Sha256, total: &mut u64) -> Plu
             }
             let name = path.strip_prefix(root).unwrap().to_string_lossy();
             let bytes = std::fs::read(&path).map_err(|e| invalid(e.to_string()))?;
+            hash.update(b"file");
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
             hash.update((bytes.len() as u64).to_le_bytes());
@@ -267,6 +272,35 @@ fn unique_events<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_directory_changes_invalidate_reviewed_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("script.sh"), "test -d flag").unwrap();
+        let digest = || {
+            let mut hash = Sha256::new();
+            hash_tree(temp.path(), temp.path(), &mut hash, &mut 0).unwrap();
+            format!("{:x}", hash.finalize())
+        };
+        let original = digest();
+        let mut receipt = HookRegistration {
+            plugin_id: "fixture".into(),
+            version: "0.1.0".into(),
+            config: "hooks.json".into(),
+            digest: original.clone(),
+            trusted_digest: None,
+            enabled: false,
+        };
+        receipt.confirm_review(&original).unwrap();
+        std::fs::create_dir(temp.path().join("flag")).unwrap();
+        let added = digest();
+        assert_eq!(receipt.state(&added), HookState::NeedsReview);
+        std::fs::rename(temp.path().join("flag"), temp.path().join("renamed")).unwrap();
+        assert_ne!(digest(), added);
+        std::fs::remove_dir(temp.path().join("renamed")).unwrap();
+        assert_eq!(digest(), original);
+        assert_eq!(receipt.state(&digest()), HookState::Active);
+    }
+
     #[test]
     fn rejects_unsupported_protocol_surface_and_regex() {
         for input in [
