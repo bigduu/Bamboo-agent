@@ -4019,7 +4019,8 @@ async fn require_unowned_glob(
 // Zero-tool or read-only Glob named Child of a durable Ultra Root.
 // Glob uses its typed tail; zero-tool supports new input after a plain completion
 // as well as two bounded corrections within a Running activation.
-// No lease renewal/reclaim, raw steering, remote activation or automatic restart.
+// An expired initial owner can be replaced with one new input through the same
+// checkpoint/release boundary. No lease renewal, raw steering or remote activation.
 struct PlainActorActivation {
     store: Arc<bamboo_storage::SessionStoreV2>,
     fence: ActorActivationFence,
@@ -4037,7 +4038,7 @@ struct PlainActorActivation {
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
 fn plain_actor_unsupported() -> AgentError {
-    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4232,6 +4233,18 @@ impl PlainActorActivation {
                 bamboo_domain::SessionInboxLimits::default(),
             );
             let now = chrono::Utc::now();
+            // The old initial Run may still be executing physically. Its final
+            // append remains fenced; only a new owned input can release this
+            // replacement worker. Previously admitted history is not replayed.
+            let replacement = allow_failed_retry
+                && release_worker.is_some()
+                && entry.actor.state == ActorLogicalState::Active
+                && qualified_pre_ack_owner(&entry, now)
+                && entry.activation.as_ref().is_some_and(|old| {
+                    old.status.is_live() && old.lease_expires_at <= now && old.inbox_generation == 0
+                })
+                && new_input
+                && plain_initial_history(session);
             let recovery = if allow_failed_retry
                 && release_worker.is_some()
                 && qualified_pre_ack_owner(&entry, now)
@@ -4240,7 +4253,7 @@ impl PlainActorActivation {
             } else {
                 None
             };
-            if (recovery.is_some() || continuation)
+            if (recovery.is_some() || continuation || replacement)
                 && (!entry.actor.matches_session(session)
                     || entry.actor.project_id
                         != project_id_for_actor_run(session)?.map(|id| id.to_string()))
@@ -4249,6 +4262,7 @@ impl PlainActorActivation {
             }
             if recovery.is_none()
                 && !continuation
+                && !replacement
                 && ((!fresh && !retry) || !plain_initial_history(session))
             {
                 return Err(plain_actor_unsupported());
@@ -8217,6 +8231,8 @@ mod tests {
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
 
+    include!("expired_plain_owner_tests.rs");
+
     #[tokio::test]
     async fn completed_plain_continuation_requires_one_input_and_current_identity() {
         for case in [
@@ -10974,6 +10990,40 @@ mod tests {
                 .ack_owned(&child.id, &claim, chrono::Utc::now())
                 .await
                 .is_err());
+            // The original Store/claim survives the handoff. Even with the
+            // current exact prefix and dedupe cursor, its delayed checkpoint
+            // must fail on authority before AlreadyCheckpointed can succeed.
+            let authority = second.inspect_actor(&child.id).await.unwrap();
+            let leases = inbox
+                .inspect_owned_leases(&child.id, 2, chrono::Utc::now())
+                .await
+                .unwrap();
+            let delayed = inbox
+                .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
+                    fence: old.fence(),
+                    expected_created_at: child.created_at,
+                    claim: claim.clone(),
+                    expected_messages: child.messages.clone(),
+                    expected_provider_transcript: child.provider_transcript.clone(),
+                    expected_admission: child.session_inbox_admission().cloned(),
+                })
+                .await;
+            assert!(matches!(
+                delayed,
+                Err(bamboo_storage::ActorInputCheckpointError::Actor(
+                    bamboo_domain::ActorDirectoryError::StaleFence
+                ))
+            ));
+            assert_eq!(std::fs::read(directory.join("session.json")).unwrap(), main);
+            assert_eq!(second.inspect_actor(&child.id).await.unwrap(), authority);
+            assert_eq!(
+                inbox
+                    .inspect_owned_leases(&child.id, 2, chrono::Utc::now())
+                    .await
+                    .unwrap(),
+                leases
+            );
+            assert!(!inbox.was_admitted(&child.id, &envelope.id).await.unwrap());
             assert_eq!(
                 serde_json::to_value(&child.messages).unwrap(),
                 serde_json::to_value(&canonical.messages).unwrap()
