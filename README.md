@@ -488,7 +488,4 @@ cargo build --release
 Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
-- `builtin_skills/docx`, `pdf`, `pptx`, and `xlsx` retain their respective
-  `LICENSE.txt` files with Anthropic terms and restrictions; they are not
-  relicensed under MIT.
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
