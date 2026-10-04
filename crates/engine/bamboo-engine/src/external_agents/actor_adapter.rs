@@ -1330,6 +1330,25 @@ enum PlacementKind {
     Schedulable,
 }
 
+/// Ticket execution needs the local process-owned stop checkpoint before ACK.
+fn ensure_ticket_placement_is_enforceable(
+    session: &Session,
+    spec: &ProvisionSpec,
+) -> Result<(), AgentError> {
+    let ticket = session
+        .metadata
+        .contains_key(crate::ticket_runtime::TICKET_DISPATCH_KEY)
+        || session
+            .metadata
+            .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY);
+    if ticket && !matches!(spec.placement, Placement::Local) {
+        return Err(AgentError::LLM(
+            "Ticket execution requires local placement and owned stop proof".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// A read-only activation needs an executor and worker whose tool surface and
 /// no-shell checker enforce the typed capability. Codex's read-only sandbox
 /// prevents writes but still permits command execution, so neither Codex mode
@@ -2796,6 +2815,9 @@ impl ExternalChildRunner for ActorChildRunner {
             .map(|binding| binding.payload.required_assignment.clone())
             .unwrap_or_else(|| extract_assignment(session));
         let mut spec = self.build_live_spec(session, job).await;
+        // Reject before remote routing, Actor claims, provisioning or Ticket
+        // Run admission: resident workers cannot produce local owned stop proof.
+        ensure_ticket_placement_is_enforceable(session, &spec)?;
         let scoped_route = self.scoped_placement_route(&spec)?;
         let strict_remote = scoped_route.as_ref();
         if strict_remote.is_some() && !matches!(spec.executor, ExecutorSpec::BambooRuntime) {
@@ -16045,6 +16067,88 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Codex executor"), "{message}");
         assert!(message.contains("command execution"), "{message}");
+    }
+
+    #[test]
+    fn ticket_placement_keeps_local_and_ordinary_remote_execution_available() {
+        let runner = bogus_runner(HashMap::new());
+        let ordinary = session_of_role("worker", "ordinary work");
+        for placement in [
+            Placement::Local,
+            Placement::Remote {
+                endpoint: "wss://fixture.invalid/actor".into(),
+            },
+            Placement::Schedulable {
+                pool: "fixture-pool".into(),
+            },
+        ] {
+            let mut spec = runner.build_spec(&ordinary, &job_for("placement"));
+            spec.placement = placement;
+            ensure_ticket_placement_is_enforceable(&ordinary, &spec).unwrap();
+            for marker in [
+                crate::ticket_runtime::TICKET_DISPATCH_KEY,
+                crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY,
+            ] {
+                let mut ticket = ordinary.clone();
+                ticket.metadata.insert(marker.into(), "fixture".into());
+                assert_eq!(
+                    ensure_ticket_placement_is_enforceable(&ticket, &spec).is_ok(),
+                    matches!(spec.placement, Placement::Local)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_placement_rejected_before_remote_route_claim_or_worker_spawn() {
+        for marker in [
+            crate::ticket_runtime::TICKET_DISPATCH_KEY,
+            crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY,
+        ] {
+            for schedulable in [false, true] {
+                let mut session = session_of_role("worker", "Ticket work");
+                session.metadata.insert(marker.into(), "fixture".into());
+                let before = serde_json::to_value(&session).unwrap();
+                let remote = if schedulable {
+                    HashMap::new()
+                } else {
+                    HashMap::from([(
+                        "worker".into(),
+                        ResolvedRemotePlacement {
+                            endpoint: "wss://fixture.invalid/actor".into(),
+                            ..Default::default()
+                        },
+                    )])
+                };
+                let sched = if schedulable {
+                    HashMap::from([(
+                        "worker".into(),
+                        sched_placement("fixture-pool", "wss://fixture.invalid"),
+                    )])
+                } else {
+                    HashMap::new()
+                };
+                let runner = bogus_sched_runner(remote, sched);
+                let (events, mut observations) = mpsc::channel::<AgentEvent>(4);
+                let error = runner
+                    .execute_external_child(
+                        &mut session,
+                        &job_for("ticket-no-remote"),
+                        events,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Ticket execution requires local placement"),
+                    "{error}"
+                );
+                assert_eq!(serde_json::to_value(&session).unwrap(), before);
+                assert!(observations.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

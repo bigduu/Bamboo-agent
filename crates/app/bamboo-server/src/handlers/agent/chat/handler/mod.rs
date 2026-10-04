@@ -1,4 +1,4 @@
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
@@ -660,6 +660,16 @@ pub async fn handler(
     http_request: HttpRequest,
     req: web::Json<ChatRequest>,
 ) -> HttpResponse {
+    let session_id = request::resolve_session_id(req.session_id.as_deref());
+    if let Err(error) = crate::handlers::agent::tickets::require_supervisor_owner(
+        &state,
+        &http_request,
+        &session_id,
+    )
+    .await
+    {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
     let prepared = match crate::app_state::mutation_idempotency::prepare(
         &http_request,
         "chat",

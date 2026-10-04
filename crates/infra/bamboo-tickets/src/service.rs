@@ -364,6 +364,7 @@ impl TicketService {
         let ids = apply_operations(&mut next, authority, &command.operations, store.root())?;
         validate_snapshot(&next)?;
         validate_new_assignment_contexts(snapshot, &next, &store)?;
+        validate_answer_contexts(snapshot, &next, &store)?;
         let receipt = OperationReceipt {
             operation_id: command.operation_id.clone(),
             principal: authority.identity(),
@@ -660,6 +661,19 @@ fn invalidate_dependents(snapshot: &mut Snapshot, work_id: &str) {
                 work.state = WorkState::Blocked;
                 work.accepted_submission = None;
                 touch(work, snapshot.seq);
+            }
+            if let Some(assignment_id) = &work.active_assignment {
+                let assignment = snapshot
+                    .assignments
+                    .get_mut(assignment_id)
+                    .expect("active assignment");
+                if !assignment.process_stopped {
+                    if assignment.state != AssignmentState::OutcomeUnknown {
+                        assignment.state = AssignmentState::Cancelling;
+                    }
+                    assignment.record_revision += 1;
+                    assignment.updated_seq = snapshot.seq;
+                }
             }
         }
         invalidate_requests(snapshot, &id);
@@ -1836,6 +1850,87 @@ pub(crate) fn validate_new_assignment_contexts(
         crate::query::build_context_packet(
             next,
             assignment,
+            crate::WORK_CONTEXT_BYTES_LIMIT,
+            |artifact, budget| store.read_artifact(artifact, budget),
+        )?;
+    }
+    Ok(())
+}
+
+/// An Answer must fit the next generation's complete packet before the request
+/// is permanently closed. Reuse the existing packet builder and artifact budget.
+pub(crate) fn validate_answer_contexts(
+    before: &Snapshot,
+    next: &Snapshot,
+    store: &FileStore,
+) -> Result<()> {
+    let works = next
+        .requests
+        .values()
+        .filter(|request| {
+            request.kind == RequestKind::Question
+                && request.status == RequestStatus::Answered
+                && before
+                    .requests
+                    .get(&request.id)
+                    .is_none_or(|old| old.answer != request.answer)
+        })
+        .map(|request| request.work_id.clone())
+        .collect::<BTreeSet<_>>();
+    for work_id in works {
+        let work = &next.tickets[&work_id];
+        let previous = next
+            .assignments
+            .values()
+            .filter(|assignment| {
+                assignment.work_id == work_id
+                    && assignment.contract_revision == work.contract_revision
+            })
+            .max_by_key(|assignment| assignment.generation);
+        let assignment_id = "00000000-0000-0000-0000-000000000000".to_string();
+        // Answer capacity is not Start admission. Pending prerequisites have
+        // no known artifact packet yet; Start validates their complete inputs.
+        let mut available = work.clone();
+        available.depends_on.retain(|id| {
+            next.tickets
+                .get(id)
+                .is_some_and(|upstream| upstream.state == WorkState::Accepted)
+        });
+        let assignment = Assignment {
+            id: assignment_id.clone(),
+            work_id: work_id.clone(),
+            generation: work.generation + 1,
+            contract_revision: work.contract_revision,
+            authority_epoch: next.authority_epoch,
+            record_revision: 1,
+            state: AssignmentState::DispatchPending,
+            dispatch_key: format!(
+                "{}/{}/{}",
+                next.binding.scope_id,
+                assignment_id,
+                work.generation + 1
+            ),
+            runtime: None,
+            process_stopped: false,
+            awaiting_request: None,
+            dependency_inputs: dependencies(next, &available)?,
+            plan: LocalPlan {
+                plan_revision: 0,
+                steps: vec![],
+            },
+            workspace: previous.and_then(|a| a.workspace.clone()),
+            allowed_tools: work.contract.allowed_tools.clone(),
+            effects: BTreeMap::new(),
+            updated_seq: next.seq,
+        };
+        let mut projected = next.clone();
+        let projected_work = projected.tickets.get_mut(&work_id).expect("answer Work");
+        projected_work.generation = assignment.generation;
+        projected_work.state = WorkState::Active;
+        projected_work.active_assignment = Some(assignment_id);
+        crate::query::build_context_packet(
+            &projected,
+            &assignment,
             crate::WORK_CONTEXT_BYTES_LIMIT,
             |artifact, budget| store.read_artifact(artifact, budget),
         )?;

@@ -23,6 +23,415 @@ fn contract() -> Contract {
     }
 }
 
+fn fixture_git(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn prepared_git_workspace(root: &Path) -> ExecutionWorkspace {
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    fixture_git(&repo, &["init", "-b", "fixture"]);
+    std::fs::write(repo.join("result.txt"), b"fixture\n").unwrap();
+    fixture_git(&repo, &["add", "result.txt"]);
+    fixture_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Ticket Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let base_commit = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    let worktree = root.join("worktree");
+    fixture_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "ticket-fixture",
+            worktree.to_str().unwrap(),
+            &base_commit,
+        ],
+    );
+    let worktree = worktree
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    ExecutionWorkspace {
+        repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+        base_commit,
+        branch: "ticket-fixture".into(),
+        worktree: worktree.clone(),
+        write_roots: vec![worktree.clone()],
+        claims: BTreeSet::from([format!("worktree:{worktree}")]),
+    }
+}
+
+#[tokio::test]
+async fn ticket_start_preflight_rejects_git_identity_before_publication_and_preserves_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let app = TicketApplication::open(root.path(), storage, config(true)).await;
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(principal.clone()).await.unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "git-create",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "work".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let work = app.update(principal.clone(), &create).await.unwrap().ids["work"].clone();
+    let workspace = prepared_git_workspace(root.path());
+    let other = tempfile::tempdir().unwrap();
+    let other_workspace = prepared_git_workspace(other.path());
+    for mismatch in ["repo", "base", "branch", "non-git"] {
+        let mut bad = workspace.clone();
+        match mismatch {
+            "repo" => bad.repo = other_workspace.repo.clone(),
+            "base" => bad.base_commit = "a".repeat(40),
+            "branch" => bad.branch = "wrong-branch".into(),
+            _ => {
+                let path = root.path().join("non-git");
+                std::fs::create_dir(&path).unwrap();
+                bad.worktree = path.canonicalize().unwrap().to_string_lossy().into_owned();
+                bad.write_roots = vec![bad.worktree.clone()];
+                bad.claims = BTreeSet::from([format!("worktree:{}", bad.worktree)]);
+            }
+        }
+        let command = service
+            .prepare_command(
+                &authority,
+                &format!("bad-{mismatch}"),
+                vec![Operation::Start {
+                    work_id: work.clone(),
+                    temp_id: "assignment".into(),
+                    workspace: Some(bad),
+                }],
+            )
+            .unwrap();
+        let before = serde_json::to_value(service.published().unwrap()).unwrap();
+        assert!(
+            app.dispatch(principal.clone(), &command).await.is_err(),
+            "{mismatch} must fail before Start"
+        );
+        assert_eq!(
+            serde_json::to_value(service.published().unwrap()).unwrap(),
+            before,
+            "{mismatch} must not publish claims/assignment/receipt"
+        );
+    }
+    let good = service
+        .prepare_command(
+            &authority,
+            "good-start",
+            vec![Operation::Start {
+                work_id: work,
+                temp_id: "assignment".into(),
+                workspace: Some(workspace.clone()),
+            }],
+        )
+        .unwrap();
+    let response = app.dispatch(principal.clone(), &good).await.unwrap();
+    assert_eq!(response["receipt"]["operation_id"], "good-start");
+    let before = serde_json::to_value(service.published().unwrap()).unwrap();
+    fixture_git(
+        Path::new(&workspace.worktree),
+        &["checkout", "-b", "changed-after-commit"],
+    );
+    let replay = app.dispatch(principal.clone(), &good).await.unwrap();
+    assert_eq!(response["receipt"], replay["receipt"]);
+    assert_eq!(
+        serde_json::to_value(service.published().unwrap()).unwrap(),
+        before
+    );
+    let mut altered = good.clone();
+    if let Operation::Start {
+        workspace: Some(workspace),
+        ..
+    } = &mut altered.operations[0]
+    {
+        workspace.branch = "changed-after-commit".into();
+    }
+    assert!(matches!(
+        app.dispatch(principal, &altered).await,
+        Err(Error::IdempotencyConflict)
+    ));
+}
+
+#[tokio::test]
+async fn ticket_start_preflight_semantic_failure_does_not_freeze_proposal() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let app = TicketApplication::open(root.path(), storage, config(true)).await;
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(principal).await.unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "semantic-git-create",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "work".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let work = service.execute(&authority, &create).unwrap().ids["work"].clone();
+    service
+        .register_user_ingress(
+            &authority,
+            &VerifiedUserIngress::from_verified_host(
+                "git-human".into(),
+                HumanIngressRecord {
+                    user_id: "host-owner".into(),
+                    source_ingress_seq: 1,
+                    text: "开始 work".into(),
+                    thread_id: None,
+                    in_reply_to: None,
+                    correlation_id: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let workspace = prepared_git_workspace(root.path());
+    let target = TicketReference::from_ticket(&service.published().unwrap().1.tickets[&work]);
+    let mut proposal = MessageProposal {
+        groups: vec![SemanticGroup {
+            group_id: "start".into(),
+            item_ids: vec!["start-item".into()],
+            source_quote: "开始 work".into(),
+            operations: vec![SemanticOperation::Start {
+                target,
+                temp_id: "assignment".into(),
+                workspace: Some(workspace.clone()),
+            }],
+            clarification: None,
+        }],
+    };
+    if let SemanticOperation::Start {
+        workspace: Some(workspace),
+        ..
+    } = &mut proposal.groups[0].operations[0]
+    {
+        workspace.branch = "wrong".into();
+    }
+    let before = serde_json::to_value(service.published().unwrap()).unwrap();
+    assert!(app.resolve_message("git-human", &proposal).await.is_err());
+    assert_eq!(
+        serde_json::to_value(service.published().unwrap()).unwrap(),
+        before
+    );
+    if let SemanticOperation::Start {
+        workspace: Some(value),
+        ..
+    } = &mut proposal.groups[0].operations[0]
+    {
+        *value = workspace.clone();
+    }
+    let response = app.resolve_message("git-human", &proposal).await.unwrap();
+    assert_eq!(
+        response["resolution"]["groups"][0]["status"], "committed",
+        "{response}"
+    );
+    let before = serde_json::to_value(service.published().unwrap()).unwrap();
+    fixture_git(
+        Path::new(&workspace.worktree),
+        &["checkout", "-b", "changed-after-semantic-commit"],
+    );
+    let replay = app.resolve_message("git-human", &proposal).await.unwrap();
+    assert_eq!(response["resolution"], replay["resolution"]);
+    assert_eq!(
+        serde_json::to_value(service.published().unwrap()).unwrap(),
+        before
+    );
+    let mut altered = proposal;
+    altered.groups[0].source_quote = "work".into();
+    assert!(matches!(
+        app.resolve_message("git-human", &altered).await,
+        Err(Error::IdempotencyConflict)
+    ));
+}
+
+#[tokio::test]
+async fn ticket_start_preflight_rejects_nonlocal_worker_before_typed_or_semantic_publication() {
+    for placement in ["remote", "schedulable", "ordinary-other-role"] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+        let config = config(true);
+        {
+            let mut config = config.write().await;
+            if placement == "schedulable" {
+                config.subagents_mut().schedulable_placements.push(
+                    bamboo_config::config::SchedulablePlacement {
+                        role: "worker".into(),
+                        pool: "fixture-pool".into(),
+                        ..Default::default()
+                    },
+                );
+            } else {
+                config.subagents_mut().remote_placements.push(
+                    bamboo_config::config::RemoteActorPlacement {
+                        role: if placement == "remote" {
+                            "worker"
+                        } else {
+                            "ordinary-remote"
+                        }
+                        .into(),
+                        endpoint: "wss://fixture.invalid/actor".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let app = TicketApplication::open(root.path(), storage, config).await;
+        let principal = Principal::User {
+            user_id: "host-owner".into(),
+        };
+        let (service, authority) = app.authority(principal.clone()).await.unwrap();
+        let command = service
+            .prepare_command(
+                &authority,
+                "placement-create",
+                vec![
+                    Operation::Create {
+                        temp_id: "typed".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract(),
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "typed".into(),
+                    },
+                    Operation::Create {
+                        temp_id: "semantic".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract(),
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "semantic".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let ids = app.update(principal.clone(), &command).await.unwrap().ids;
+        let start = service
+            .prepare_command(
+                &authority,
+                "placement-start",
+                vec![Operation::Start {
+                    work_id: ids["typed"].clone(),
+                    temp_id: "assignment".into(),
+                    workspace: None,
+                }],
+            )
+            .unwrap();
+        let before = serde_json::to_value(service.published().unwrap()).unwrap();
+        let result = app.dispatch(principal.clone(), &start).await;
+        if placement == "ordinary-other-role" {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(result, Err(Error::ScopeDenied(_))),
+                "{placement}: {result:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(service.published().unwrap()).unwrap(),
+                before
+            );
+        }
+        service
+            .register_user_ingress(
+                &authority,
+                &VerifiedUserIngress::from_verified_host(
+                    "placement-human".into(),
+                    HumanIngressRecord {
+                        user_id: "host-owner".into(),
+                        source_ingress_seq: 1,
+                        text: "开始 work".into(),
+                        thread_id: None,
+                        in_reply_to: None,
+                        correlation_id: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let target =
+            TicketReference::from_ticket(&service.published().unwrap().1.tickets[&ids["semantic"]]);
+        let proposal = MessageProposal {
+            groups: vec![SemanticGroup {
+                group_id: "start".into(),
+                item_ids: vec!["start-item".into()],
+                source_quote: "开始 work".into(),
+                operations: vec![SemanticOperation::Start {
+                    target,
+                    temp_id: "assignment".into(),
+                    workspace: None,
+                }],
+                clarification: None,
+            }],
+        };
+        let before = serde_json::to_value(service.published().unwrap()).unwrap();
+        let result = app.resolve_message("placement-human", &proposal).await;
+        if placement == "ordinary-other-role" {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(result, Err(Error::ScopeDenied(_))),
+                "{placement}: {result:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(service.published().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn non_dispatch_update_rejects_start_without_claiming_or_publishing() {
     let root = tempfile::tempdir().unwrap();
@@ -82,6 +491,179 @@ async fn non_dispatch_update_rejects_start_without_claiming_or_publishing() {
     assert_eq!(snapshot.assignments.len(), 1);
 }
 
+#[tokio::test]
+async fn revoking_upstream_reaches_dependent_runtime_cancellation_and_stop() {
+    let (_root, app, service, authority, workspace, ids) = missing_child_fixture(false).await;
+    let snapshot = service.published().unwrap().1;
+    let runtime = Authority::from_verified_host(snapshot.binding.clone(), Principal::Runtime);
+    let upstream_assignment = &snapshot.assignments[&ids["assignment"]];
+    let receipt = RuntimeReceipt {
+        dispatch_key: upstream_assignment.dispatch_key.clone(),
+        spec_hash: snapshot.intents[&upstream_assignment.dispatch_key]
+            .spec_hash
+            .clone(),
+        run_id: "upstream-fixture-run".into(),
+        session_id: "upstream-fixture-child".into(),
+    };
+    let command = service
+        .prepare_command(
+            &runtime,
+            "upstream-fixture-finish",
+            vec![
+                Operation::Admitted {
+                    assignment_id: upstream_assignment.id.clone(),
+                    receipt: receipt.clone(),
+                },
+                Operation::Running {
+                    assignment_id: upstream_assignment.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    service.execute(&runtime, &command).unwrap();
+    let worker = Authority::from_verified_host(
+        snapshot.binding,
+        Principal::Worker {
+            assignment_id: upstream_assignment.id.clone(),
+            generation: upstream_assignment.generation,
+            run_id: receipt.run_id,
+            session_id: receipt.session_id,
+        },
+    );
+    let artifact = service
+        .store_artifact(&runtime, b"accepted upstream bytes")
+        .unwrap();
+    let submit = service
+        .prepare_command(
+            &worker,
+            "upstream-submit",
+            vec![Operation::Submit {
+                assignment_id: upstream_assignment.id.clone(),
+                temp_id: "submission".into(),
+                artifacts: vec![artifact],
+                evidence: vec!["verified fixture output".into()],
+            }],
+        )
+        .unwrap();
+    let submission = service.execute(&worker, &submit).unwrap().ids["submission"].clone();
+    let stopped = service
+        .prepare_command(
+            &runtime,
+            "upstream-confirm-stopped",
+            vec![Operation::ConfirmStopped {
+                assignment_id: upstream_assignment.id.clone(),
+                effects_reconciled: true,
+            }],
+        )
+        .unwrap();
+    service.execute(&runtime, &stopped).unwrap();
+    let accept = service
+        .prepare_command(
+            &authority,
+            "upstream-accept-and-depend",
+            vec![
+                Operation::Accept {
+                    work_id: ids["one"].clone(),
+                    submission_id: submission,
+                    evidence: vec!["reviewed".into()],
+                },
+                Operation::SetDependencies {
+                    work_id: ids["two"].clone(),
+                    depends_on: BTreeSet::from([ids["one"].clone()]),
+                },
+            ],
+        )
+        .unwrap();
+    app.update(authority.principal().clone(), &accept)
+        .await
+        .unwrap();
+    let start = service
+        .prepare_command(
+            &authority,
+            "dependent-dispatch",
+            vec![Operation::Start {
+                work_id: ids["two"].clone(),
+                temp_id: "dependent-assignment".into(),
+                workspace: Some(workspace),
+            }],
+        )
+        .unwrap();
+    let dispatched = app
+        .dispatch(authority.principal().clone(), &start)
+        .await
+        .unwrap();
+    let dependent_id = dispatched["receipt"]["ids"]["dependent-assignment"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revoke = service
+        .prepare_command(
+            &authority,
+            "reopen-upstream",
+            vec![Operation::Reopen {
+                work_id: ids["one"].clone(),
+            }],
+        )
+        .unwrap();
+    app.update(authority.principal().clone(), &revoke)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let snapshot = service.published().unwrap().1;
+            let dependent = &snapshot.assignments[&dependent_id];
+            if dependent.process_stopped {
+                assert_eq!(dependent.state, AssignmentState::Cancelled);
+                assert_eq!(snapshot.tickets[&ids["two"]].state, WorkState::Blocked);
+                assert!(snapshot.tickets[&ids["two"]].active_assignment.is_none());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dependent reaches the existing Runtime cancellation/stop port");
+}
+
+#[tokio::test]
+async fn ticket_start_preflight_replay_cannot_admit_after_nonlocal_placement_change() {
+    let (_root, app, service, authority, _workspace, ids) = missing_child_fixture(false).await;
+    let receipt = service.published().unwrap().1.receipts["start-cancel-fixture"].clone();
+    let command: Command = serde_json::from_str(&receipt.canonical_request).unwrap();
+    {
+        let mut config = app.config.write().await;
+        config.features.ticket_dispatch = true;
+        config.subagents_mut().remote_placements.push(
+            bamboo_config::config::RemoteActorPlacement {
+                role: "worker".into(),
+                endpoint: "wss://fixture.invalid/actor".into(),
+                ..Default::default()
+            },
+        );
+    }
+    let before = serde_json::to_value(service.published().unwrap()).unwrap();
+    let response = app
+        .dispatch(authority.principal().clone(), &command)
+        .await
+        .unwrap();
+    assert_eq!(response["receipt"], serde_json::to_value(receipt).unwrap());
+    assert_eq!(response["errors"][0]["status_code"], 403);
+    assert!(response["errors"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("requires local placement"));
+    assert_eq!(
+        serde_json::to_value(service.published().unwrap()).unwrap(),
+        before
+    );
+    let snapshot = service.published().unwrap().1;
+    let assignment = &snapshot.assignments[&ids["assignment"]];
+    assert!(matches!(
+        app.query_dispatch(&assignment.dispatch_key).await.unwrap(),
+        ticket_runtime::DispatchObservation::Missing
+    ));
+}
+
 async fn missing_child_fixture(
     enqueue_failure: bool,
 ) -> (
@@ -108,21 +690,7 @@ async fn missing_child_fixture(
         )
         .unwrap();
     }
-    let worktree = root.path().join("worktree");
-    std::fs::create_dir(&worktree).unwrap();
-    let canonical = worktree
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let workspace = ExecutionWorkspace {
-        repo: canonical.clone(),
-        base_commit: "a".repeat(40),
-        branch: "fixture".into(),
-        worktree: canonical.clone(),
-        write_roots: vec![canonical.clone()],
-        claims: BTreeSet::from([format!("worktree:{canonical}")]),
-    };
+    let workspace = prepared_git_workspace(root.path());
     let (service, authority) = app
         .authority(Principal::User {
             user_id: "host-owner".into(),

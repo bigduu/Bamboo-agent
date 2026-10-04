@@ -275,7 +275,7 @@ impl ToolExecutor for RemoteFileExecutor {
                     schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path"],"properties":{"file_path":{"type":"string"}}});
                 }
                 "Write" => {
-                    schema.function.description="Atomically replace one UTF-8 file, 1–16384 bytes, inside this Assignment's write roots, excluding .git and .bamboo control directories. Read an existing file first; a changed file conflicts. New files may be created in existing directories. Unknown effects cannot be automatically retried.".into();
+                    schema.function.description="Create one absent UTF-8 file, 1–16384 bytes, in an existing directory inside this Assignment's write roots, excluding .git and .bamboo control directories. Existing-file replacement is unsupported even after Read; use a new path. Installation cannot overwrite an externally created file. Unknown effects cannot be automatically retried.".into();
                     schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path","content"],"properties":{"file_path":{"type":"string"},"content":{"type":"string","minLength":1,"maxLength":16384}}});
                 }
                 _ => {}

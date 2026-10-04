@@ -124,7 +124,7 @@ fn write(path: &Path, text: &str, hash: Option<String>) -> FileOperation {
 }
 
 #[test]
-fn content_edits_preserve_existing_ordinary_modes_and_new_files_are_private() {
+fn existing_replacement_is_denied_without_effect_and_new_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
     let f = fixture();
     for mode in [0o755, 0o644] {
@@ -136,20 +136,20 @@ fn content_edits_preserve_existing_ordinary_modes_and_new_files_are_private() {
             "#!/bin/sh\nexit 0\n",
             Some(content_hash(&fs::read(&path).unwrap())),
         );
-        f.service
-            .workspace_file(&f.worker, &format!("mode-{mode}"), &op)
-            .unwrap();
+        let before = f.service.published().unwrap();
+        assert!(matches!(
+            f.service
+                .workspace_file(&f.worker, &format!("mode-{mode}"), &op),
+            Err(Error::ScopeDenied(_))
+        ));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             mode
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 0\n");
-        f.service
-            .workspace_file(&f.worker, &format!("mode-{mode}"), &op)
-            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 1\n");
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
-            mode
+            serde_json::to_value(f.service.published().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
         );
     }
     let path = Path::new(&f.workspace.worktree).join("new.sh");
@@ -376,8 +376,49 @@ fn check_external_editor_window(modes: &[&'static str]) {
             }
             Ok(())
         })));
+        let before = f.service.published().unwrap();
         let result = f.service.workspace_file(&f.worker, "window-write", &op);
         f.service.set_publication_fault(None);
+        if mode != "create" {
+            assert!(
+                matches!(result, Err(Error::ScopeDenied(_))),
+                "{mode}: {result:?}"
+            );
+            assert!(
+                !fired.load(Ordering::SeqCst),
+                "replacement must fail before Started publication"
+            );
+            assert_eq!(
+                serde_json::to_value(f.service.published().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "external_editor_fixture_process", "--nocapture"])
+                .env("BAMBOO_TICKET_EDITOR_PATH", &path)
+                .env("BAMBOO_TICKET_EDITOR_MODE", mode)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let external = fs::read(&path).unwrap();
+            assert!(matches!(
+                f.service.workspace_file(
+                    &f.worker,
+                    "external-existing",
+                    &write(&path, "Worker result", Some(content_hash(&external)))
+                ),
+                Err(Error::ScopeDenied(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), external);
+            assert!(f.service.published().unwrap().1.assignments[&f.assignment]
+                .effects
+                .is_empty());
+            continue;
+        }
         assert!(fired.load(Ordering::SeqCst));
         assert!(
             matches!(result, Err(Error::RevisionConflict)),

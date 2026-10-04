@@ -73,6 +73,32 @@ impl TicketApplication {
                 "resolve the oldest Human ingress first".into(),
             ));
         }
+        // Reject an unusable new Start before freezing its immutable proposal.
+        // Already terminal groups replay their original receipts; the service
+        // still checks the complete saved proposal identity below.
+        let workspaces = proposal
+            .groups
+            .iter()
+            .filter(|group| {
+                prior
+                    .proposal
+                    .as_ref()
+                    .and_then(|saved| {
+                        saved
+                            .groups
+                            .iter()
+                            .position(|saved| saved.group_id == group.group_id)
+                    })
+                    .and_then(|index| prior.groups.get(index))
+                    .is_none_or(|saved| saved.status == ResolutionStatus::Proposed)
+            })
+            .flat_map(|group| group.operations.iter())
+            .filter_map(|op| match op {
+                SemanticOperation::Start { workspace, .. } => Some(workspace.clone()),
+                _ => None,
+            })
+            .collect();
+        self.preflight_ticket_starts(workspaces).await?;
         service.save_message_proposal(&authority, message_id, proposal)?;
         let resolution = service.settle_message(&authority, message_id)?;
         let mut dispatch = Vec::new();

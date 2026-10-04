@@ -50,9 +50,6 @@ pub struct FileReply {
 
 struct FileContents {
     bytes: Vec<u8>,
-    mode: u32,
-    #[cfg(unix)]
-    identity: (u64, u64),
 }
 
 impl TicketService {
@@ -166,6 +163,11 @@ impl TicketService {
         if prior.as_ref().map(|file| content_hash(&file.bytes)) != *expected_sha256 {
             return Err(Error::RevisionConflict);
         }
+        if prior.is_some() {
+            return Err(Error::ScopeDenied(
+                "existing-file replacement requires atomic content CAS and is unsupported; create a new file instead".into(),
+            ));
+        }
         let artifact = store.store_artifact(content.as_bytes())?;
         let mut started = snapshot.clone();
         started.seq += 1;
@@ -192,15 +194,9 @@ impl TicketService {
         // Commit intent and complete immutable content before any physical write.
         validate_snapshot(&started)?;
         store.publish(started)?;
-        // IO can fail after rename. Retain Started and the resource claim until
+        // IO can fail after installation. Retain Started and the resource claim until
         // an actual stopped Run and explicit reconciliation are confirmed.
-        physical::replace(
-            &dir,
-            &name,
-            content.as_bytes(),
-            prior.as_ref(),
-            expected_sha256.as_deref(),
-        )?;
+        physical::create_absent(&dir, &name, content.as_bytes())?;
         let mut next = store.published.as_ref().expect("published start").1.clone();
         next.seq += 1;
         let a = next
@@ -362,64 +358,18 @@ mod physical {
         if bytes.len() > FILE_BYTES_LIMIT {
             return Err(Error::ContextBudgetExceeded);
         }
-        // Capture ordinary mode bits from the same no-follow FD as the CAS
-        // content. Replacement never copies setuid/setgid/sticky bits.
-        Ok(Some(FileContents {
-            bytes,
-            mode: meta.mode() & 0o777,
-            identity: (meta.dev(), meta.ino()),
-        }))
+        Ok(Some(FileContents { bytes }))
     }
-    pub fn replace(
-        dir: &File,
-        name: &CString,
-        bytes: &[u8],
-        prior: Option<&FileContents>,
-        expected_sha256: Option<&str>,
-    ) -> Result<()> {
+    pub fn create_absent(dir: &File, name: &CString, bytes: &[u8]) -> Result<()> {
         let staging = CString::new(format!(".ticket-file-{}", uuid::Uuid::new_v4())).expect("UUID");
         let result = (|| {
             let mut file = open(dir, &staging, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
             file.write_all(bytes)?;
-            file.set_permissions(Permissions::from_mode(
-                prior.map_or(0o600, |file| file.mode),
-            ))?;
+            file.set_permissions(Permissions::from_mode(0o600))?;
             file.sync_all()?;
-            // Started publication and staging fsync may take long enough for
-            // an external editor to change this destination. Reopen through
-            // the same no-follow directory capability at the replacement
-            // boundary. A conflict retains Started and never gains a receipt.
-            let current = read(dir, name)?;
-            if current
-                .as_ref()
-                .map(|file| content_hash(&file.bytes))
-                .as_deref()
-                != expected_sha256
-                || current.as_ref().map(|file| (file.identity, file.mode))
-                    != prior.map(|file| (file.identity, file.mode))
-            {
-                return Err(Error::RevisionConflict);
-            }
-            if prior.is_none() {
-                // linkat has kernel no-replace semantics: a creator after the
-                // final read cannot have its new destination overwritten.
-                install_absent(dir, &staging, name)?;
-            } else {
-                // POSIX provides no content-conditional rename for an existing
-                // path. This boundary recheck closes the publication window;
-                // it is not atomic CAS against non-cooperating external writers.
-                if unsafe {
-                    libc::renameat(
-                        dir.as_raw_fd(),
-                        staging.as_ptr(),
-                        dir.as_raw_fd(),
-                        name.as_ptr(),
-                    )
-                } != 0
-                {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
+            // Atomic no-replace covers a non-cooperating creator after the
+            // initial absence check; an existing path is never overwritten.
+            install_absent(dir, &staging, name)?;
             dir.sync_all()?;
             Ok(())
         })();

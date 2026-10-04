@@ -1,6 +1,7 @@
 //! One opt-in scope over the existing canonical Supervisor and Child Runtime.
 //! Authority always comes from Host storage; client JSON never selects a role.
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, OnceLock},
 };
@@ -288,8 +289,63 @@ impl TicketApplication {
             ));
         }
         let (service, authority) = self.authority(principal).await?;
+        // A committed replay still goes through the service's exact request
+        // identity check. Only new Starts need preflight before publication.
+        if !service
+            .published()?
+            .1
+            .receipts
+            .contains_key(&command.operation_id)
+        {
+            self.preflight_ticket_starts(
+                command
+                    .operations
+                    .iter()
+                    .filter_map(|op| match op {
+                        Operation::Start { workspace, .. } => Some(workspace.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+            .await?;
+        }
         let receipt = service.work_dispatch(&authority, command)?;
         self.enqueue_receipt(&service, command, receipt).await
+    }
+
+    /// Ticket stop proof is currently local-only. Git identity is read before
+    /// publishing claims and checked again by Host admission after publication.
+    async fn preflight_ticket_starts(
+        &self,
+        workspaces: Vec<Option<ExecutionWorkspace>>,
+    ) -> Result<()> {
+        if workspaces.is_empty() {
+            return Ok(());
+        }
+        if workspaces.len() > 64 {
+            return Err(Error::ContextBudgetExceeded);
+        }
+        {
+            let config = self.config.read().await;
+            let subagents = config.subagents();
+            if subagents
+                .remote_placements
+                .iter()
+                .any(|placement| placement.role == "worker")
+                || subagents
+                    .schedulable_placements
+                    .iter()
+                    .any(|placement| placement.role == "worker")
+            {
+                return Err(Error::ScopeDenied(
+                    "Ticket execution requires local placement and owned stop proof".into(),
+                ));
+            }
+        }
+        for workspace in workspaces.into_iter().flatten() {
+            bamboo_engine::ticket_worker_plan::files::verify_workspace(workspace).await?;
+        }
+        Ok(())
     }
 
     async fn enqueue_receipt(
@@ -328,28 +384,30 @@ impl TicketApplication {
         let Ok((_, snapshot)) = service.published() else {
             return;
         };
-        for work in command.operations.iter().filter_map(|op| match op {
-            Operation::Cancel { work_id }
-            | Operation::Pause { work_id, .. }
-            | Operation::UpdateContract { work_id, .. } => Some(work_id),
-            _ => None,
+        let directly_cancelled = command
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Cancel { work_id }
+                | Operation::Pause { work_id, .. }
+                | Operation::UpdateContract { work_id, .. } => Some(work_id),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for assignment in snapshot.assignments.values().filter(|assignment| {
+            !assignment.process_stopped
+                && (assignment.state == AssignmentState::Cancelling
+                    || (assignment.state == AssignmentState::OutcomeUnknown
+                        && (directly_cancelled.contains(&assignment.work_id)
+                            || snapshot.tickets[&assignment.work_id]
+                                .blocked
+                                .as_ref()
+                                .is_some_and(|blocked| {
+                                    blocked.reason
+                                        == "accepted dependency input revoked; review required"
+                                }))))
         }) {
-            let Some(assignment_id) = snapshot
-                .tickets
-                .get(work)
-                .and_then(|w| w.active_assignment.as_ref())
-            else {
-                continue;
-            };
-            let assignment = snapshot.assignments[assignment_id].clone();
-            if assignment.process_stopped
-                || !matches!(
-                    assignment.state,
-                    AssignmentState::Cancelling | AssignmentState::OutcomeUnknown
-                )
-            {
-                continue;
-            }
+            let assignment = assignment.clone();
             let service = service.clone();
             let adapter = adapter.clone();
             tokio::spawn(async move {
@@ -446,6 +504,9 @@ impl TicketApplication {
         let service = self.service()?;
         let enabled = self.config.read().await.features.ticket_dispatch;
         if enabled {
+            // Also guard a previously published pending intent when operator
+            // placement changes before its admission/retry.
+            self.preflight_ticket_starts(vec![None]).await?;
             std::fs::create_dir_all(&self.workspace)?;
         }
         let adapter = self.adapter.get().ok_or_else(|| {

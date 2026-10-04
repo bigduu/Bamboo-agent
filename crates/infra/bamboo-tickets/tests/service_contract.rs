@@ -125,6 +125,207 @@ fn empty_update_and_dispatch_do_not_publish_or_invalidate_a_valid_command() {
 }
 
 #[test]
+fn bounded_answer_does_not_require_unstarted_dependencies_to_be_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TicketService::open(dir.path(), binding()).unwrap();
+    let upstream = create(&service, "pending upstream", BTreeSet::new());
+    let work = create(
+        &service,
+        "unstarted dependent",
+        BTreeSet::from([upstream.clone()]),
+    );
+    let question = execute(
+        &service,
+        &supervisor(),
+        "dependent-question",
+        vec![Operation::Ask {
+            work_id: work.clone(),
+            temp_id: "question".into(),
+            prompt: "Which color?".into(),
+            action: None,
+        }],
+    )
+    .ids["question"]
+        .clone();
+    let answer = execute(
+        &service,
+        &user(),
+        "early-answer",
+        vec![Operation::Answer {
+            request_id: question.clone(),
+            prompt_revision: 1,
+            answer: "green".into(),
+        }],
+    );
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.requests[&question].status, RequestStatus::Answered);
+    assert_eq!(
+        snapshot.requests[&question].answer.as_deref(),
+        Some("green")
+    );
+    assert_eq!(snapshot.tickets[&upstream].state, WorkState::Ready);
+    assert!(snapshot.assignments.is_empty());
+    assert_eq!(snapshot.receipts["early-answer"], answer);
+    let start = service
+        .prepare_command(
+            &supervisor(),
+            "premature-start",
+            vec![Operation::Start {
+                work_id: work,
+                temp_id: "assignment".into(),
+                workspace: None,
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        service.execute(&supervisor(), &start),
+        Err(Error::ResourceBlocked(_))
+    ));
+    assert!(service.published().unwrap().1.assignments.is_empty());
+}
+
+#[test]
+fn oversized_answers_leave_requests_open_and_allow_bounded_resume() {
+    for cumulative in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = TicketService::open(dir.path(), binding()).unwrap();
+        let work = create(&service, "bounded answer", BTreeSet::new());
+        let mut questions = vec![];
+        for index in 0..if cumulative { 2 } else { 1 } {
+            questions.push(
+                execute(
+                    &service,
+                    &supervisor(),
+                    &format!("question-{index}"),
+                    vec![Operation::Ask {
+                        work_id: work.clone(),
+                        temp_id: "question".into(),
+                        prompt: "bounded prompt".into(),
+                        action: None,
+                    }],
+                )
+                .ids["question"]
+                    .clone(),
+            );
+        }
+        if cumulative {
+            execute(
+                &service,
+                &user(),
+                "first-answer",
+                vec![Operation::Answer {
+                    request_id: questions[0].clone(),
+                    prompt_revision: 1,
+                    answer: "a".repeat(35000),
+                }],
+            );
+        }
+        let request = questions.last().unwrap();
+        let before = service.published().unwrap();
+        let result = service.execute(
+            &user(),
+            &command(
+                &service,
+                "oversized-answer",
+                vec![Operation::Answer {
+                    request_id: request.clone(),
+                    prompt_revision: 1,
+                    answer: if cumulative {
+                        "b".repeat(35000)
+                    } else {
+                        "\"".repeat(40000)
+                    },
+                }],
+            ),
+        );
+        assert!(
+            matches!(result, Err(Error::ContextBudgetExceeded)),
+            "{cumulative}: error={:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(
+            serde_json::to_value(service.published().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            service.published().unwrap().1.requests[request].status,
+            RequestStatus::Open
+        );
+        execute(
+            &service,
+            &user(),
+            "bounded-retry",
+            vec![Operation::Answer {
+                request_id: request.clone(),
+                prompt_revision: 1,
+                answer: "short".into(),
+            }],
+        );
+        let (assignment, _) = start(&service, &work, "bounded-resume");
+        assert!(
+            canonical_bytes(
+                &service
+                    .child_context_packet(&supervisor(), &assignment, WORK_CONTEXT_BYTES_LIMIT)
+                    .unwrap()
+            )
+            .unwrap()
+            .len()
+                <= WORK_CONTEXT_BYTES_LIMIT
+        );
+    }
+}
+
+#[test]
+fn revoking_accepted_input_cancels_active_dependents_without_releasing_stop_proof() {
+    for mode in ["reopen", "cancel", "steer"] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = TicketService::open(dir.path(), binding()).unwrap();
+        let upstream = create(&service, "upstream", BTreeSet::new());
+        let dependent = create(&service, "dependent", BTreeSet::from([upstream.clone()]));
+        let (id, worker) = start(&service, &upstream, "upstream-start");
+        let submission = submit(&service, &id, &worker, "upstream-submit");
+        execute(
+            &service,
+            &user(),
+            "upstream-accept",
+            vec![Operation::Accept {
+                work_id: upstream.clone(),
+                submission_id: submission,
+                evidence: vec!["reviewed".into()],
+            }],
+        );
+        let (id, worker) = start(&service, &dependent, "dependent-start");
+        let operation = match mode {
+            "reopen" => Operation::Reopen {
+                work_id: upstream.clone(),
+            },
+            "cancel" => Operation::Cancel {
+                work_id: upstream.clone(),
+            },
+            "steer" => Operation::UpdateContract {
+                work_id: upstream.clone(),
+                contract: contract("changed upstream"),
+            },
+            _ => unreachable!(),
+        };
+        execute(&service, &user(), "revoke", vec![operation]);
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(snapshot.tickets[&dependent].state, WorkState::Blocked);
+        assert_eq!(
+            snapshot.assignments[&id].state,
+            AssignmentState::Cancelling,
+            "{mode}"
+        );
+        assert!(!snapshot.assignments[&id].process_stopped);
+        assert_eq!(
+            snapshot.tickets[&dependent].active_assignment.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(service.authorize_tool(&worker, "Task").is_err());
+    }
+}
+
+#[test]
 fn adapter_source_does_not_grant_worker_authority() {
     let dir = tempfile::tempdir().unwrap();
     let service = TicketService::open(dir.path(), binding()).unwrap();

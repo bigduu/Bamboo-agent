@@ -1490,8 +1490,24 @@ async fn fixture_with_followups(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if completed.is_err() {
+        eprintln!(
+            "actual Child completion timeout phase={}",
+            provider_host_phase(&probe).await
+        );
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(mut log) = std::fs::File::open(data.join("host.log")) {
+            let length = log.metadata().unwrap().len();
+            log.seek(SeekFrom::Start(length.saturating_sub(16384)))
+                .unwrap();
+            let mut tail = String::new();
+            log.take(16384).read_to_string(&mut tail).unwrap();
+            eprintln!("actual fixture Host diagnostic tail={}", tail);
+        }
+    }
+    let completed =
+        completed.expect("actual Child terminal checkpoint must complete within original deadline");
     if probe.replay {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {

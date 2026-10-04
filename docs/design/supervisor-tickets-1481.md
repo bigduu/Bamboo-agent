@@ -849,22 +849,32 @@ No push, PR, merge or deployment is authorized.
 
 ## Slice 21: bounded Assignment file authority (local-only)
 
+Current admission remains single-machine only: canonical Ticket dispatch rejects
+remote/schedulable placement before claims and rechecks pending admission after
+configuration changes. New typed and semantic Start verify Git repository, base
+and branch identity before publishing claims or freezing a proposal. Answer
+publication checks the complete projected packet, including cumulative answers
+and currently accepted input artifacts; Start rechecks future inputs. Revoking an
+accepted dependency cancels active consumers without releasing claims before
+owned stop proof. Existing canonical Supervisor HTTP chat/execute remain
+owner-authenticated when the mutation flag is rolled back, including cached
+response replay. These restrictions do not enable either default-off flag.
+
+
 This follow-up starts from `db9dc56f` in the isolated
 `bamboo/feat/1481-workspace-fencing` worktree. It adds a Host-only bounded Read/Write
 port for explicit Assignment write roots. Every entry checks the immutable
 execution identity, current generation/contract/epoch, live permit and tool
 capability. Unix directory descriptors and no-follow opens protect every path
 component; traversal, symlinks, hardlinks, sibling roots, TicketStore and `.git`
-are rejected. Writes require the hash of an existing file and recheck its bytes,
-inode identity and ordinary mode through the same no-follow directory FD after
-Started publication and staging fsync, immediately before atomic replacement.
-Detected changes preserve the external file and retain Started without a success
-receipt. An absent destination uses kernel no-replace publication, so a racing
-creator is never overwritten. Existing-file hash-check followed by rename is
-not an atomic content CAS against non-cooperating external editors: a writer
-after the final check can still race the rename. Internal mutexes and advisory
-locks do not remove that POSIX limitation; the supported single-writer scope
-must exclude overlapping external edits at that boundary.
+are rejected. Existing-file replacement is unsupported: a matching hash cannot
+provide atomic content CAS against non-cooperating writers with POSIX rename.
+The Host rejects it before Started publication, preserving bytes, permissions,
+HEAD and receipts. Read remains available. Write creates only absent paths with
+expected_sha256=null, private mode0600 and kernel no-replace installation; a
+racing external creator is preserved without success, and Started retains claims
+until explicit stopped-process reconciliation. No mutex/advisory-lock claim is
+used to substitute for conditional replacement.
 
 Before touching a workspace file, the existing full-manifest publication stores
 the complete immutable content and a Started effect. A second publication records

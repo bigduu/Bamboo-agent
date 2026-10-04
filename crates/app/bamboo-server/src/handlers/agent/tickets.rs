@@ -39,6 +39,28 @@ pub(crate) async fn user(state: &AppState, req: &HttpRequest) -> Result<Principa
     })
 }
 
+/// Existing canonical Supervisor read access stays owner-only after mutation rollback.
+pub(crate) async fn require_supervisor_owner(
+    state: &AppState,
+    req: &HttpRequest,
+    session_id: &str,
+) -> Result<()> {
+    let authority = state
+        .storage
+        .load_root_authority(session_id)
+        .await
+        .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
+    if authority.is_some_and(|session| {
+        matches!(
+            session.authority_identity,
+            bamboo_domain::SessionAuthorityIdentity::Supervisor { .. }
+        )
+    }) {
+        user(state, req).await?;
+    }
+    Ok(())
+}
+
 pub async fn scope(
     state: web::Data<AppState>,
     req: HttpRequest,
@@ -294,6 +316,118 @@ pub async fn artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn rollback_keeps_supervisor_chat_and_execute_owner_only() {
+        use actix_web::{test, App};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+        *state.config.write().await = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "features":{"ticket_mutation":true},
+            "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}
+        }))
+        .unwrap();
+        state.tickets = Arc::new(
+            crate::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        let supervisor = bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID;
+        let service = state.tickets.service().unwrap();
+        let before = serde_json::to_value(service.published().unwrap()).unwrap();
+        let session_before =
+            serde_json::to_value(state.storage.load_session(supervisor).await.unwrap()).unwrap();
+        state.config.write().await.features.ticket_mutation = false;
+        let state = web::Data::new(state);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for execute in [false, true] {
+            let uri = if execute {
+                format!("/api/v1/execute/{supervisor}")
+            } else {
+                "/api/v1/chat".into()
+            };
+            let body = if execute {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({
+                    "session_id":supervisor, "message":"read private Ticket evidence", "model":"fixture-model"
+                })
+            };
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .peer_addr("203.0.113.17:5700".parse().unwrap())
+                    .insert_header(("Idempotency-Key", "rollback-unauthenticated"))
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(body["error"].is_object(), "{body}");
+        }
+        assert_eq!(
+            serde_json::to_value(service.published().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(state.storage.load_session(supervisor).await.unwrap()).unwrap(),
+            session_before
+        );
+        assert!(state
+            .session_inbox
+            .claim(supervisor, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // Rollback does not disable owner access or change ordinary open-instance chat.
+        for (session_id, peer) in [
+            (supervisor, "127.0.0.1:5700"),
+            ("ordinary-rollback", "203.0.113.17:5700"),
+        ] {
+            let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat")
+                .peer_addr(peer.parse().unwrap()).insert_header(("Idempotency-Key", format!("owner-{session_id}"))).set_json(serde_json::json!({
+                    "session_id":session_id, "message":"ordinary owner input", "model":"fixture-model"
+                })).to_request()).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let owner_session =
+            serde_json::to_value(state.storage.load_session(supervisor).await.unwrap()).unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .peer_addr("203.0.113.17:5700".parse().unwrap())
+                .insert_header(("Idempotency-Key", format!("owner-{supervisor}")))
+                .set_json(serde_json::json!({"session_id":supervisor,
+                "message":"ordinary owner input", "model":"fixture-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "cached owner response cannot bypass auth"
+        );
+        assert_eq!(
+            serde_json::to_value(state.storage.load_session(supervisor).await.unwrap()).unwrap(),
+            owner_session
+        );
+        assert_eq!(
+            serde_json::to_value(service.published().unwrap()).unwrap(),
+            before
+        );
+    }
 
     #[actix_web::test]
     async fn managed_binary_artifact_http_preserves_bytes_without_guessing_media_type() {
