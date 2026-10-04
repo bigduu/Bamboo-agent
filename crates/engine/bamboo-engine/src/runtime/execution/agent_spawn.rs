@@ -881,6 +881,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 log_base_system_prompt_snapshot(&session_id, prompt);
             }
 
+            // A carried untagged wait has already been persisted. Unlike a
+            // newly armed safety-net wait, it must not resurrect a completed
+            // child wait. Tagged tool waits are reconciled by the final writer.
+            let inherited_child_wait = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.waiting_for_children.clone())
+                .filter(|wait| wait.registered_by_tool_call_id.is_none());
             let execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
@@ -1066,17 +1074,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            let saved = agent
-                .persistence()
-                .save_finalized_runtime_session(&mut session)
-                .await;
+            let saved = save_finalized_runtime_with_inherited_child_wait(
+                agent.persistence().as_ref(),
+                &mut session,
+                inherited_child_wait.as_ref(),
+            )
+            .await;
             let history_committed = saved.is_ok();
-            let authority_conflict = saved.as_ref().err().is_some_and(|error| {
-                error
-                    .get_ref()
-                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
-            });
-            if let Err(error) = saved {
+            if let Err(error) = &saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
 
@@ -1146,14 +1151,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let child_status = session.last_run_status();
             let child_error = session.last_run_error();
 
-            // Preserve normal I/O failure behavior, but never overwrite a
-            // current Root's cache with a rejected authority/incarnation.
-            if !authority_conflict && !root_actor_bound {
-                sessions_cache.insert(
-                    session_id.clone(),
-                    Arc::new(crate::SessionSnapshot::new(session)),
-                );
-            }
+            publish_final_session_cache(&sessions_cache, session, root_actor_bound, &saved);
 
             if let (Some(handler), Some(parent_session_id), Some(status)) =
                 (child_completion, parent_session_id, child_status)
@@ -1183,6 +1181,48 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
         }
         .instrument(session_span),
     );
+}
+
+// Keep the final writer and its rejection path directly regression-testable.
+async fn save_finalized_runtime_with_inherited_child_wait(
+    persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
+    session: &mut Session,
+    inherited_child_wait: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+) -> std::io::Result<()> {
+    if let Some(inherited) = inherited_child_wait.filter(|wait| {
+        session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|runtime| runtime.waiting_for_children.as_ref())
+            == Some(*wait)
+    }) {
+        persistence
+            .save_finalized_runtime_with_inherited_child_wait(session, inherited)
+            .await
+    } else {
+        persistence.save_finalized_runtime_session(session).await
+    }
+}
+
+fn publish_final_session_cache(
+    cache: &SessionCache,
+    session: Session,
+    root_actor_bound: bool,
+    saved: &std::io::Result<()>,
+) {
+    let authority_conflict = saved.as_ref().err().is_some_and(|error| {
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+    });
+    // Preserve unrelated I/O failure behavior, but never publish a rejected
+    // incarnation. Bound Root executions publish through their owned writer.
+    if !authority_conflict && !root_actor_bound {
+        cache.insert(
+            session.id.clone(),
+            Arc::new(crate::SessionSnapshot::new(session)),
+        );
+    }
 }
 
 /// Log a snapshot of the base system prompt for debugging.
@@ -1352,6 +1392,232 @@ impl Drop for RootActorExecution {
 mod reservation_tests {
     use super::*;
     use crate::runtime::execution::runner_state::AgentStatus;
+
+    struct CompletionAtFinalSave {
+        directory: std::path::PathBuf,
+        persistence: bamboo_storage::LockedSessionStore,
+        cleared: std::sync::atomic::AtomicBool,
+    }
+
+    impl CompletionAtFinalSave {
+        async fn clear_wait(&self, id: &str) {
+            let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::execution::agent_spawn::reservation_tests::inherited_child_wait_adopts_independent_completion_at_final_save", "--nocapture"])
+                .env("BAMBOO_FINAL_WAIT_COMPLETION_DIR", &self.directory)
+                .env("BAMBOO_FINAL_WAIT_COMPLETION_ID", id)
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = process.try_wait().unwrap() {
+                    assert!(status.success(), "completion process failed");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    panic!("bounded completion process deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.cleared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for CompletionAtFinalSave {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.clear_wait(&session.id).await;
+            self.persistence.merge_save_finalized_runtime(session).await
+        }
+        async fn save_finalized_runtime_with_inherited_child_wait(
+            &self,
+            session: &mut Session,
+            inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+        ) -> std::io::Result<()> {
+            self.clear_wait(&session.id).await;
+            self.persistence
+                .merge_save_inherited_child_wait_and_publish(session, inherited, |_, _| {})
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_child_wait_adopts_independent_completion_at_final_save() {
+        use bamboo_agent_core::storage::Storage;
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+        if let Some(directory) = std::env::var_os("BAMBOO_FINAL_WAIT_COMPLETION_DIR") {
+            let remote = bamboo_storage::SessionStoreV2::new(directory.into())
+                .await
+                .unwrap();
+            let id = std::env::var("BAMBOO_FINAL_WAIT_COMPLETION_ID").unwrap();
+            let mut latest = remote.load_session(&id).await.unwrap().unwrap();
+            let runtime = latest.agent_runtime_state.as_mut().unwrap();
+            runtime.waiting_for_children = None;
+            runtime.status = AgentStatusState::Idle;
+            runtime.suspension = None;
+            latest.metadata.remove("runtime.suspend_reason");
+            remote.save_runtime_state(&latest).await.unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        // Independent Host persistence does not participate in the engine's
+        // process-local resume mutex. Complete only when finalization arrives,
+        // after the old helper's reload but before its final durable write.
+        let mut runner = Session::new("cross-host-final-wait", "model");
+        let inherited = WaitingForChildrenState::for_children(
+            vec!["child".into()],
+            ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        );
+        let mut runtime = AgentRuntimeState::new("run");
+        runtime.waiting_for_children = Some(inherited.clone());
+        runtime.status = AgentStatusState::Suspended;
+        runner.agent_runtime_state = Some(runtime);
+        runner.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        runner.set_last_run_status("suspended");
+        local.save_session(&runner).await.unwrap();
+        let persistence = CompletionAtFinalSave {
+            directory: temp.path().to_path_buf(),
+            persistence: bamboo_storage::LockedSessionStore::new(local.clone()),
+            cleared: std::sync::atomic::AtomicBool::new(false),
+        };
+        save_finalized_runtime_with_inherited_child_wait(
+            &persistence,
+            &mut runner,
+            Some(&inherited),
+        )
+        .await
+        .unwrap();
+        assert!(persistence
+            .cleared
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let durable = local.load_session(&runner.id).await.unwrap().unwrap();
+        for session in [&runner, &durable] {
+            let runtime = session.agent_runtime_state.as_ref().unwrap();
+            assert!(
+                runtime.waiting_for_children.is_none(),
+                "independent completion must not be resurrected"
+            );
+            assert_eq!(runtime.status, AgentStatusState::Idle);
+            assert!(runtime.suspension.is_none());
+            assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+            assert_eq!(session.last_run_status().as_deref(), Some("completed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_child_wait_rejects_aba_and_missing_birth_without_cache_publication() {
+        use bamboo_agent_core::storage::Storage;
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, ChildWaitPolicy, WaitingForChildrenState,
+        };
+        use bamboo_storage::{LockedSessionStore, SessionStoreV2};
+
+        for missing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(
+                SessionStoreV2::new(temp.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let persistence = LockedSessionStore::new(storage.clone());
+            let cache: SessionCache = Arc::default();
+            storage
+                .save_session(&Session::new("root", "model"))
+                .await
+                .unwrap();
+            let mut stale = Session::new("nested-child-parent", "model");
+            stale.kind = bamboo_domain::SessionKind::Child;
+            stale.parent_session_id = Some("root".into());
+            stale.root_session_id = "root".into();
+            stale.spawn_depth = 1;
+            let wait = WaitingForChildrenState::for_children(
+                vec!["grandchild".into()],
+                ChildWaitPolicy::All,
+                chrono::Utc::now(),
+            );
+            let mut runtime = AgentRuntimeState::new("old-run");
+            runtime.waiting_for_children = Some(wait.clone());
+            stale.agent_runtime_state = Some(runtime);
+            stale.add_message(bamboo_agent_core::Message::assistant("STALE", None));
+            storage.save_session(&stale).await.unwrap();
+
+            let mut replacement = stale.clone();
+            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.messages.clear();
+            replacement.add_message(bamboo_agent_core::Message::assistant("REPLACEMENT", None));
+            replacement
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .waiting_for_children = None;
+            storage.delete_session(&stale.id).await.unwrap();
+            if !missing {
+                storage.save_session(&replacement).await.unwrap();
+            }
+            if !missing {
+                cache.insert(
+                    replacement.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(replacement.clone())),
+                );
+            }
+
+            let saved = save_finalized_runtime_with_inherited_child_wait(
+                &persistence,
+                &mut stale,
+                Some(&wait),
+            )
+            .await;
+            assert!(saved.is_err(), "stale incarnation must not be saved");
+            // A nested Child uses the unbound publication path. A plain I/O
+            // error used to pass its cache guard despite the durable rejection.
+            publish_final_session_cache(&cache, stale, false, &saved);
+            if missing {
+                assert!(
+                    read_cached_session(&cache, &replacement.id).is_none(),
+                    "deleted incarnation must not be resurrected in cache"
+                );
+            } else {
+                let cached = read_cached_session(&cache, &replacement.id).unwrap();
+                assert_eq!(
+                    cached.created_at, replacement.created_at,
+                    "ABA rejection must retain replacement cache birth"
+                );
+                assert_eq!(
+                    serde_json::to_value(&cached.messages).unwrap(),
+                    serde_json::to_value(&replacement.messages).unwrap(),
+                    "ABA rejection must retain replacement cache transcript"
+                );
+            }
+            assert!(saved
+                .as_ref()
+                .unwrap_err()
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+            let durable = storage.load_session(&replacement.id).await.unwrap();
+            if missing {
+                assert!(durable.is_none());
+            } else {
+                let durable = durable.unwrap();
+                assert_eq!(durable.created_at, replacement.created_at);
+                assert_eq!(
+                    serde_json::to_value(&durable.messages).unwrap(),
+                    serde_json::to_value(&replacement.messages).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn debug_prompt_snapshot_migrates_legacy_host_paths_before_logging() {
