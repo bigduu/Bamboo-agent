@@ -299,18 +299,20 @@ async fn provider_host_phase(probe: &Probe) -> Value {
     let actor = store.inspect_actor(&id).await.ok().map(|entry| {
         json!({"attempt":entry.actor.current_attempt,"state":entry.actor.state,
             "activation":entry.activation.map(|a| json!({"status":a.status,
-                "run_id":a.run_id,"inbox_generation":a.inbox_generation}))})
+                "run_id":a.run_id,"inbox_generation":a.inbox_generation,"lease_expires_at":a.lease_expires_at}))})
     });
     let child = store.load_session(&id).await.ok().flatten();
     let inbox =
         bamboo_storage::FileSessionInbox::new(store, bamboo_domain::SessionInboxLimits::default());
-    let generation = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
+    let backlog = bamboo_domain::SessionInboxPort::inspect(&inbox, &id)
         .await
         .ok()
-        .map(|state| state.generation);
+        .map(|state| json!({"pending":state.pending,"claimed":state.claimed,"generation":state.generation}));
+    let leases = bamboo_domain::SessionInboxPort::inspect_owned_leases(&inbox, &id, 2, chrono::Utc::now()).await
+        .map(|leases| leases.into_iter().map(|lease| json!({"epoch":lease.epoch,"generation":lease.generation,"expired":lease.expired,"expires_at":lease.expires_at})).collect::<Vec<_>>()).ok();
     json!({"actor":actor,"last_run_status":child.as_ref().and_then(|c| c.last_run_status()),
         "last_run_error":child.as_ref().and_then(|c| c.last_run_error()).map(|e| bounded_diagnostic(&e, 512).to_owned()),
-        "inbox_generation":generation})
+        "inbox":backlog,"leases":leases})
 }
 fn print_bounded_retry_log(data: &Path) {
     use std::io::{Read, Seek, SeekFrom};
@@ -399,6 +401,9 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 break;
             }
             wake.await;
+        }
+        if probe.recovery {
+            eprintln!("recovery provider index={child_call} passed release barrier");
         }
         if probe.two.is_some() {
             observe_two_provider(&body, &probe, child_call).await;
@@ -508,6 +513,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .unwrap(),
                 "real permanent Host ACK precedes provider"
             );
+            eprintln!("recovery provider index={child_call} passed permanent ACK check");
         }
         if (probe.correction || probe.retry) && child_call == 1 {
             assert_eq!(
@@ -949,7 +955,18 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
 }
 
 fn start(data: &Path, port: u16) -> Host {
-    let log = std::fs::File::create(data.join("host.log")).unwrap();
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data.join("host.log"))
+        .unwrap();
+    use std::io::Write;
+    writeln!(
+        log,
+        "fixture Host start port={port} at {}",
+        chrono::Utc::now()
+    )
+    .unwrap();
     Host(
         Command::new(env!("CARGO_BIN_EXE_bamboo"))
             .args([
@@ -1490,8 +1507,39 @@ async fn fixture_with_followups(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    let completed = match completed {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("terminal wait timeout: data={} host_pid={} host_exit={:?} release={} ready={} root_calls={} child_calls={}",
+                data.display(), host.0.id(), host.0.try_wait(), probe.release.load(Ordering::SeqCst),
+                probe.ready.load(Ordering::SeqCst), probe.root_calls.load(Ordering::SeqCst), probe.child_calls.load(Ordering::SeqCst));
+            match tokio::time::timeout(Duration::from_secs(3), provider_host_phase(&probe)).await {
+                Ok(phase) => eprintln!(
+                    "terminal wait Host phase={}",
+                    bounded_diagnostic(&phase.to_string(), 4096)
+                ),
+                Err(_) => eprintln!("terminal wait diagnostic store read timed out"),
+            }
+            use std::io::{Read, Seek, SeekFrom};
+            if let Ok(mut log) = std::fs::File::open(data.join("host.log")) {
+                let length = log.metadata().map(|meta| meta.len()).unwrap_or(0);
+                if log
+                    .seek(SeekFrom::Start(length.saturating_sub(8192)))
+                    .is_ok()
+                {
+                    let mut tail = Vec::new();
+                    if log.take(8192).read_to_end(&mut tail).is_ok() {
+                        eprintln!(
+                            "terminal wait Host log tail: {}",
+                            String::from_utf8_lossy(&tail)
+                        );
+                    }
+                }
+            }
+            panic!("actual Child terminal status timed out: {error}");
+        }
+    };
     if probe.replay {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
