@@ -1,6 +1,6 @@
 use super::*;
 use bamboo_storage::SessionStoreV2;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn config(enabled: bool) -> Arc<RwLock<Config>> {
     Arc::new(RwLock::new(
@@ -21,6 +21,229 @@ fn contract() -> Contract {
         user_acceptance_required: true,
         allowed_tools: BTreeSet::from(["Task".into()]),
     }
+}
+
+async fn missing_child_fixture(
+    enqueue_failure: bool,
+) -> (
+    tempfile::TempDir,
+    TicketApplication,
+    Arc<TicketService>,
+    Authority,
+    ExecutionWorkspace,
+    BTreeMap<String, String>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let state = crate::AppState::new(root.path().to_path_buf())
+        .await
+        .unwrap();
+    *state.config.write().await = config(true).read().await.clone();
+    state.config.write().await.features.ticket_dispatch = enqueue_failure;
+    let app =
+        TicketApplication::open(root.path(), state.storage.clone(), state.config.clone()).await;
+    app.bind_adapter(state.tickets.adapter.get().unwrap().clone());
+    if enqueue_failure {
+        std::fs::write(
+            root.path().join("workspaces"),
+            b"block enqueue before Child creation",
+        )
+        .unwrap();
+    }
+    let worktree = root.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let canonical = worktree
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let workspace = ExecutionWorkspace {
+        repo: canonical.clone(),
+        base_commit: "a".repeat(40),
+        branch: "fixture".into(),
+        worktree: canonical.clone(),
+        write_roots: vec![canonical.clone()],
+        claims: BTreeSet::from([format!("worktree:{canonical}")]),
+    };
+    let (service, authority) = app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "create-cancel-fixture",
+            vec![
+                Operation::Create {
+                    temp_id: "one".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "one".into(),
+                },
+                Operation::Create {
+                    temp_id: "two".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "two".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let mut ids = app
+        .update(authority.principal().clone(), &create)
+        .await
+        .unwrap()
+        .ids;
+    let start = service
+        .prepare_command(
+            &authority,
+            "start-cancel-fixture",
+            vec![Operation::Start {
+                work_id: ids["one"].clone(),
+                temp_id: "assignment".into(),
+                workspace: Some(workspace.clone()),
+            }],
+        )
+        .unwrap();
+    let response = app
+        .dispatch(authority.principal().clone(), &start)
+        .await
+        .unwrap();
+    assert_eq!(response["errors"].as_array().unwrap().len(), 1);
+    ids.insert(
+        "assignment".into(),
+        response["receipt"]["ids"]["assignment"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let assignment = service.published().unwrap().1.assignments[&ids["assignment"]].clone();
+    assert!(assignment.runtime.is_none());
+    assert!(app
+        .storage
+        .load_runtime_control_plane(&ticket_runtime::ticket_child_id(&assignment.dispatch_key))
+        .await
+        .unwrap()
+        .is_none());
+    (root, app, service, authority, workspace, ids)
+}
+
+#[tokio::test]
+async fn ticket_review_unadmitted_cancel_and_pause_release_missing_child_claims() {
+    for enqueue_failure in [false, true] {
+        for pause in [false, true] {
+            let (_root, app, service, authority, workspace, ids) =
+                missing_child_fixture(enqueue_failure).await;
+            let operation = if pause {
+                Operation::Pause {
+                    work_id: ids["one"].clone(),
+                    reason: "explicit pause".into(),
+                }
+            } else {
+                Operation::Cancel {
+                    work_id: ids["one"].clone(),
+                }
+            };
+            let command = service
+                .prepare_command(&authority, "stop-missing-child", vec![operation])
+                .unwrap();
+            app.update(authority.principal().clone(), &command)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !service.published().unwrap().1.assignments[&ids["assignment"]]
+                    .process_stopped
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("canonical missing, unadmitted attempt must release its claim");
+            let snapshot = service.published().unwrap().1;
+            assert!(snapshot.assignments[&ids["assignment"]].runtime.is_none());
+            assert!(snapshot.tickets[&ids["one"]].active_assignment.is_none());
+            assert_eq!(snapshot.tickets[&ids["one"]].paused, pause);
+            let next = service
+                .prepare_command(
+                    &authority,
+                    "reuse-released-claim",
+                    vec![Operation::Start {
+                        work_id: ids["two"].clone(),
+                        temp_id: "next-assignment".into(),
+                        workspace: Some(workspace),
+                    }],
+                )
+                .unwrap();
+            service
+                .execute(&authority, &next)
+                .expect("the same resource claim must be reusable");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ticket_review_admitted_missing_child_preserves_quarantine() {
+    let (_root, app, service, authority, workspace, ids) = missing_child_fixture(false).await;
+    let snapshot = service.published().unwrap().1;
+    let assignment = &snapshot.assignments[&ids["assignment"]];
+    // Trusted admission fixture only; canonical absence is never physical stop proof.
+    let runtime = Authority::from_verified_host(snapshot.binding, Principal::Runtime);
+    let admitted = service
+        .prepare_command(
+            &runtime,
+            "admit-fixture",
+            vec![Operation::Admitted {
+                assignment_id: assignment.id.clone(),
+                receipt: RuntimeReceipt {
+                    dispatch_key: assignment.dispatch_key.clone(),
+                    spec_hash: service.published().unwrap().1.intents[&assignment.dispatch_key]
+                        .spec_hash
+                        .clone(),
+                    session_id: ticket_runtime::ticket_child_id(&assignment.dispatch_key),
+                    run_id: "unknown-run".into(),
+                },
+            }],
+        )
+        .unwrap();
+    service.execute(&runtime, &admitted).unwrap();
+    let cancel = service
+        .prepare_command(
+            &authority,
+            "cancel-admitted-missing",
+            vec![Operation::Cancel {
+                work_id: ids["one"].clone(),
+            }],
+        )
+        .unwrap();
+    app.update(authority.principal().clone(), &cancel)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!service.published().unwrap().1.assignments[&ids["assignment"]].process_stopped);
+    let next = service
+        .prepare_command(
+            &authority,
+            "preserve-admitted-claim",
+            vec![Operation::Start {
+                work_id: ids["two"].clone(),
+                temp_id: "blocked-assignment".into(),
+                workspace: Some(workspace),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        service.execute(&authority, &next),
+        Err(Error::ResourceBlocked(_))
+    ));
 }
 
 #[tokio::test]

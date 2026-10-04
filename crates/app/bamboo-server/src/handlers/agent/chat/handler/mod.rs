@@ -1427,7 +1427,7 @@ async fn handle_chat(
         return response;
     }
 
-    let mut queued_input = if queue_root_input {
+    let mut queued_input = if queue_root_input && !queued {
         let message = session
             .messages
             .pop()

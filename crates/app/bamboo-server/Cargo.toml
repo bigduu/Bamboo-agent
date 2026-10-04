@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "HTTP server and API layer for the Bamboo agent framework"
 license = "MIT"
+license-file = "../../../LICENSE"
 # The frontend package lives inside the owning crate so workspace builds,
 # `cargo package`, and downstream installs all compile the same bytes. The
 # build script validates these files and fails closed unless an API-only build

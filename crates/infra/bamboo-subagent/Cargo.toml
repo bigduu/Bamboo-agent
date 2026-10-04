@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Sub-agent fleet runtime: project-keyed session store, indices, and Maildir-style mailbox"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }

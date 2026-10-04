@@ -345,12 +345,29 @@ impl TicketApplication {
             let adapter = adapter.clone();
             tokio::spawn(async move {
                 let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+                // Hold the same launch fence as ensure/admission while proving
+                // canonical absence. The committed cancellation already denies
+                // future dispatch; no Run receipt plus no Child/active runner
+                // identifies an attempt that never received a RunSpec.
+                let missing_launch_guard = {
+                    let guard = adapter.scheduler.lock_child_launch(&child_id).await;
+                    match adapter.storage.load_runtime_control_plane(&child_id).await {
+                        Ok(None) => Some(guard),
+                        Ok(Some(_)) => None,
+                        Err(error) => {
+                            tracing::warn!(assignment_id = %assignment.id, %error, "Ticket cancellation control plane unavailable");
+                            return;
+                        }
+                    }
+                };
                 // Cancellation interrupts existing execution even if future
                 // dispatch is disabled. Runner/lease disappearance alone does
                 // not grant a stopped-process or released-resource fact.
-                if let Err(error) = adapter.cancel_child_run_and_wait(&child_id).await {
-                    tracing::warn!(assignment_id = %assignment.id, %error, "Ticket cancellation retained for reconciliation");
-                    return;
+                if missing_launch_guard.is_none() {
+                    if let Err(error) = adapter.cancel_child_run_and_wait(&child_id).await {
+                        tracing::warn!(assignment_id = %assignment.id, %error, "Ticket cancellation retained for reconciliation");
+                        return;
+                    }
                 }
                 let Ok(current) = service.published() else {
                     return;
@@ -361,19 +378,37 @@ impl TicketApplication {
                 }
                 // An exact cancelled launch with no prepared Run receipt cannot
                 // have received a RunSpec. Check canonical Host control plane.
-                let Ok(Some(child)) = adapter.storage.load_runtime_control_plane(&child_id).await
-                else {
-                    return;
-                };
-                let Ok(Some(dispatch)) = ticket_runtime::read_dispatch(&child) else {
-                    return;
-                };
-                if dispatch.assignment_id != a.id
-                    || dispatch.receipt.is_some()
-                    || child.last_run_status().as_deref() != Some("cancelled")
-                    || !child.is_child_launch_cancelled(child.child_launch_generation())
-                {
-                    return;
+                if missing_launch_guard.is_some() {
+                    if adapter
+                        .agent_runners
+                        .read()
+                        .await
+                        .get(&child_id)
+                        .is_some_and(|runner| {
+                            matches!(
+                                runner.status,
+                                super::AgentStatus::Pending | super::AgentStatus::Running
+                            )
+                        })
+                    {
+                        return;
+                    }
+                } else {
+                    let Ok(Some(child)) =
+                        adapter.storage.load_runtime_control_plane(&child_id).await
+                    else {
+                        return;
+                    };
+                    let Ok(Some(dispatch)) = ticket_runtime::read_dispatch(&child) else {
+                        return;
+                    };
+                    if dispatch.assignment_id != a.id
+                        || dispatch.receipt.is_some()
+                        || child.last_run_status().as_deref() != Some("cancelled")
+                        || !child.is_child_launch_cancelled(child.child_launch_generation())
+                    {
+                        return;
+                    }
                 }
                 let authority =
                     Authority::from_verified_host(current.1.binding, Principal::Runtime);
