@@ -393,11 +393,27 @@ fn answer_text(
     let explicit = std::iter::once(q.id.as_str())
         .chain(unique_question.then_some(work.id.as_str()))
         .chain(
-            (unique_question && names_work(snapshot, quote, work))
-                .then_some(work.contract.title.as_str()),
+            (unique_question
+                && work.contract.title == work.contract.title.trim()
+                && !snapshot.tickets.contains_key(&work.contract.title)
+                && !snapshot.requests.contains_key(&work.contract.title)
+                && snapshot
+                    .tickets
+                    .values()
+                    .filter(|other| other.contract.title.trim() == work.contract.title)
+                    .count()
+                    == 1
+                && !snapshot.tickets.values().any(|other| {
+                    other.id != work.id
+                        && other.contract.title.contains(&work.contract.title)
+                        && quote.contains(&other.contract.title)
+                }))
+            .then_some(work.contract.title.as_str()),
         )
         .any(|name| {
             quote.trim() == format!("{name} 的答案是{answer}")
+                || quote.trim() == format!("{name}使用{answer}")
+                || quote.trim() == format!("{name} 使用{answer}")
                 || quote.trim() == format!("Answer {name}: {answer}")
                 || quote.trim() == format!("answer {name}: {answer}")
         });
@@ -494,7 +510,17 @@ pub(super) fn validate_group(
             }
         }
         match op {
-            SemanticOperation::Create { temp_id, kind, .. } => {
+            SemanticOperation::Create {
+                temp_id,
+                kind,
+                contract,
+                ..
+            } => {
+                if !contract.user_acceptance_required {
+                    return Err(Error::ScopeDenied(
+                        "model contracts must require explicit User acceptance".into(),
+                    ));
+                }
                 if *kind == TicketKind::Step
                     || temp_id.is_empty()
                     || !temporary.insert(temp_id.clone())
@@ -503,6 +529,11 @@ pub(super) fn validate_group(
                         "duplicate temporary ID or private Step creation".into(),
                     ));
                 }
+            }
+            SemanticOperation::Steer { contract, .. } if !contract.user_acceptance_required => {
+                return Err(Error::ScopeDenied(
+                    "model contracts must require explicit User acceptance".into(),
+                ));
             }
             SemanticOperation::Answer { target, answer } => {
                 let q = request(snapshot, target)?;

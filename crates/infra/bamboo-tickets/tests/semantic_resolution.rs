@@ -1139,6 +1139,34 @@ fn same_name_approval_needs_exact_id_and_optional_reply_reference_does_not_autho
 fn question_answers_require_exact_named_human_evidence() {
     for (text, quote, answer, second_question, expected) in [
         (
+            "A 使用绿色",
+            "A 使用绿色",
+            "绿色",
+            false,
+            ResolutionStatus::Committed,
+        ),
+        (
+            "A使用绿色",
+            "A使用绿色",
+            "绿色",
+            false,
+            ResolutionStatus::Committed,
+        ),
+        (
+            "不要A使用绿色",
+            "A使用绿色",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A使用绿色，但别回答",
+            "A使用绿色",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
             "A 的答案是绿色；A 的答案是绿色",
             "A 的答案是绿色",
             "绿色",
@@ -1465,4 +1493,270 @@ fn publication_fault_recovers_old_or_new_complete_group_with_original_proposal()
             );
         }
     }
+}
+
+#[test]
+fn model_contracts_require_user_acceptance_for_create_and_steer() {
+    for steer in [false, true] {
+        for required in [false, true] {
+            let (_dir, service) = fixture();
+            let work = steer.then(|| create(&service, "A"));
+            let text = if steer {
+                "steer A but keep my acceptance"
+            } else {
+                "create A and require my acceptance"
+            };
+            register(&service, "contract-bit", 1, text);
+            let mut proposed = contract("A");
+            proposed.user_acceptance_required = required;
+            let operations = if let Some(id) = &work {
+                vec![SemanticOperation::Steer {
+                    target: target(&service, id),
+                    contract: proposed,
+                }]
+            } else {
+                vec![SemanticOperation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: proposed,
+                    depends_on: vec![],
+                }]
+            };
+            save(
+                &service,
+                "contract-bit",
+                vec![group("contract", text, operations)],
+            );
+            let before = service.published().unwrap().1;
+            let result = service.settle_message(&human(), "contract-bit").unwrap();
+            let after = service.published().unwrap().1;
+            if required {
+                assert_eq!(result.groups[0].status, ResolutionStatus::Committed);
+                let id = work
+                    .as_ref()
+                    .unwrap_or_else(|| &result.groups[0].receipt.as_ref().unwrap().ids["work"]);
+                assert!(after.tickets[id].contract.user_acceptance_required);
+            } else {
+                assert_eq!(result.groups[0].status, ResolutionStatus::Rejected);
+                assert!(result.groups[0].receipt.is_none());
+                assert_eq!(after.seq, before.seq);
+                assert_eq!(
+                    canonical_bytes(&after.tickets).unwrap(),
+                    canonical_bytes(&before.tickets).unwrap()
+                );
+                assert_eq!(
+                    canonical_bytes(&after.receipts).unwrap(),
+                    canonical_bytes(&before.receipts).unwrap()
+                );
+                assert_eq!(
+                    canonical_bytes(&after.assignments).unwrap(),
+                    canonical_bytes(&before.assignments).unwrap()
+                );
+                assert_eq!(
+                    canonical_bytes(&after.intents).unwrap(),
+                    canonical_bytes(&before.intents).unwrap()
+                );
+                assert_eq!(
+                    canonical_bytes(&service.settle_message(&human(), "contract-bit").unwrap())
+                        .unwrap(),
+                    canonical_bytes(&result).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_start_preflights_complete_context_before_publishing_claims() {
+    for contract_bytes in [60000, 65500] {
+        let (_dir, service) = fixture();
+        let mut large = contract("A");
+        // The model schema bounds objective, but permits this one long constraint.
+        large.constraints = vec![];
+        large
+            .constraints
+            .push("x".repeat(contract_bytes - canonical_bytes(&large).unwrap().len() - 2));
+        assert_eq!(canonical_bytes(&large).unwrap().len(), contract_bytes);
+        register(&service, "large-start", 1, "create A and start it");
+        save(
+            &service,
+            "large-start",
+            vec![group(
+                "start",
+                "create A and start it",
+                vec![
+                    SemanticOperation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: large,
+                        depends_on: vec![],
+                    },
+                    SemanticOperation::Ready {
+                        target: TicketReference::Temporary { id: "work".into() },
+                    },
+                    SemanticOperation::Start {
+                        target: TicketReference::Temporary { id: "work".into() },
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    },
+                ],
+            )],
+        );
+        let before = service.published().unwrap().1;
+        let result = service.settle_message(&human(), "large-start").unwrap();
+        let after = service.published().unwrap().1;
+        if contract_bytes == 65500 {
+            assert_eq!(result.groups[0].status, ResolutionStatus::Rejected);
+            assert!(result.groups[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("context_budget_exceeded"));
+            assert!(result.groups[0].receipt.is_none());
+            assert_eq!(
+                canonical_bytes(&after.tickets).unwrap(),
+                canonical_bytes(&before.tickets).unwrap()
+            );
+            assert_eq!(
+                canonical_bytes(&after.assignments).unwrap(),
+                canonical_bytes(&before.assignments).unwrap()
+            );
+            assert_eq!(
+                canonical_bytes(&after.intents).unwrap(),
+                canonical_bytes(&before.intents).unwrap()
+            );
+            assert_eq!(
+                canonical_bytes(&after.receipts).unwrap(),
+                canonical_bytes(&before.receipts).unwrap()
+            );
+            assert_eq!(
+                canonical_bytes(&service.settle_message(&human(), "large-start").unwrap()).unwrap(),
+                canonical_bytes(&result).unwrap()
+            );
+            assert_eq!(service.published().unwrap().1.seq, after.seq);
+        } else {
+            assert_eq!(result.groups[0].status, ResolutionStatus::Committed);
+            let assignment = &result.groups[0].receipt.as_ref().unwrap().ids["assignment"];
+            assert!(
+                canonical_bytes(
+                    &service
+                        .child_context_packet(&supervisor(), assignment, WORK_CONTEXT_BYTES_LIMIT)
+                        .unwrap()
+                )
+                .unwrap()
+                .len()
+                    <= WORK_CONTEXT_BYTES_LIMIT
+            );
+        }
+    }
+}
+
+#[test]
+fn answer_title_aliases_cannot_steal_another_named_question_or_identifier() {
+    let mut unexpected = vec![];
+    for case in ["trimmed-short", "trailing-space", "request-id", "ticket-id"] {
+        let (_dir, service) = fixture();
+        let other_title = match case {
+            "trimmed-short" => "A ",
+            "trailing-space" => "A",
+            _ => "B",
+        };
+        let other = create(&service, other_title);
+        let other_question = ask(&service, &other, "other", false);
+        let title = match case {
+            "trimmed-short" => "A",
+            "trailing-space" => "A ",
+            "request-id" => &other_question.id,
+            "ticket-id" => &other,
+            _ => unreachable!(),
+        };
+        let work = create(&service, title);
+        let question = ask(&service, &work, "target", false);
+        let text = match case {
+            "trimmed-short" | "trailing-space" => "A 使用绿色".into(),
+            "request-id" => format!("Answer {}: green", other_question.id),
+            "ticket-id" => format!("Answer {other}: green"),
+            _ => unreachable!(),
+        };
+        let answer = if case.starts_with("trimmed") || case == "trailing-space" {
+            "绿色"
+        } else {
+            "green"
+        };
+        register(&service, "alias", 1, &text);
+        save(
+            &service,
+            "alias",
+            vec![group(
+                "answer",
+                &text,
+                vec![SemanticOperation::Answer {
+                    target: RequestReference::from_request(&question),
+                    answer: answer.into(),
+                }],
+            )],
+        );
+        let before = service.published().unwrap().1;
+        let result = service.settle_message(&human(), "alias").unwrap();
+        if result.groups[0].status != ResolutionStatus::NeedsClarification {
+            unexpected.push(format!(
+                "{case}: {:?} for wrong/ambiguous target",
+                result.groups[0].status
+            ));
+            continue;
+        }
+        assert!(result.groups[0].receipt.is_none());
+        let after = service.published().unwrap().1;
+        assert_eq!(
+            canonical_bytes(&after.requests).unwrap(),
+            canonical_bytes(&before.requests).unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            canonical_bytes(&after.tickets).unwrap(),
+            canonical_bytes(&before.tickets).unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            canonical_bytes(&after.receipts).unwrap(),
+            canonical_bytes(&before.receipts).unwrap(),
+            "{case}"
+        );
+        let exact = format!("Answer {}: {answer}", question.id);
+        register(&service, "exact-alias-retry", 2, &exact);
+        save(
+            &service,
+            "exact-alias-retry",
+            vec![group(
+                "answer",
+                &exact,
+                vec![SemanticOperation::Answer {
+                    target: RequestReference::from_request(&question),
+                    answer: answer.into(),
+                }],
+            )],
+        );
+        let exact_result = service
+            .settle_message(&human(), "exact-alias-retry")
+            .unwrap();
+        assert_eq!(
+            exact_result.groups[0].status,
+            ResolutionStatus::Committed,
+            "{case}"
+        );
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(
+            snapshot.requests[&question.id].answer.as_deref(),
+            Some(answer),
+            "{case}"
+        );
+        assert_eq!(
+            snapshot.requests[&other_question.id].status,
+            RequestStatus::Open,
+            "{case}"
+        );
+    }
+    assert!(unexpected.is_empty(), "{unexpected:?}");
 }

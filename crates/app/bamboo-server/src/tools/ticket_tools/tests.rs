@@ -246,3 +246,136 @@ async fn semantic_proposal_preserves_independent_group_results_and_no_json_user_
         422
     );
 }
+
+#[tokio::test]
+async fn model_raw_contracts_require_user_acceptance_on_both_mutation_tools() {
+    for name in ["work_update", "work_dispatch"] {
+        let f = Fixture::new().await;
+        let tool = f.tool(name);
+        let mut contract = json!({"title":"A","objective":"result","constraints":[],"acceptance":["evidence"],"user_acceptance_required":false,"allowed_tools":["Task"]});
+        let create = json!({"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],"contract":contract});
+        let before = f.app.service().unwrap().published().unwrap();
+        assert!(matches!(
+            tool.call(f.mutation("false-create", json!([create])), &f.ctx())
+                .await,
+            Err(Error::ScopeDenied(_))
+        ));
+        assert_eq!(
+            canonical_bytes(&f.app.service().unwrap().published().unwrap()).unwrap(),
+            canonical_bytes(&before).unwrap()
+        );
+        contract["user_acceptance_required"] = json!(true);
+        let create = json!({"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],"contract":contract});
+        let result = f
+            .tool("work_update")
+            .call(f.mutation("true-create", json!([create])), &f.ctx())
+            .await
+            .unwrap();
+        let work = result["receipt"]["ids"]["work"].as_str().unwrap();
+        let before = f.app.service().unwrap().published().unwrap();
+        contract["user_acceptance_required"] = json!(false);
+        let update = json!({"op":"update_contract","work_id":work,"contract":contract});
+        assert!(matches!(
+            tool.call(f.mutation("false-steer", json!([update])), &f.ctx())
+                .await,
+            Err(Error::ScopeDenied(_))
+        ));
+        assert_eq!(
+            canonical_bytes(&f.app.service().unwrap().published().unwrap()).unwrap(),
+            canonical_bytes(&before).unwrap()
+        );
+        contract["user_acceptance_required"] = json!(true);
+        contract["objective"] = json!("updated result");
+        let update = json!({"op":"update_contract","work_id":work,"contract":contract});
+        assert!(f
+            .tool("work_update")
+            .call(f.mutation("true-steer", json!([update])), &f.ctx())
+            .await
+            .is_ok());
+    }
+}
+
+#[tokio::test]
+async fn verified_typed_user_can_explicitly_choose_supervisor_acceptance() {
+    let f = Fixture::new().await;
+    let (service, authority) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let contract = Contract {
+        title: "typed".into(),
+        objective: "result".into(),
+        constraints: vec![],
+        acceptance: vec!["evidence".into()],
+        user_acceptance_required: false,
+        allowed_tools: std::collections::BTreeSet::from(["Task".into()]),
+    };
+    let create = service
+        .prepare_command(
+            &authority,
+            "typed-false-create",
+            vec![Operation::Create {
+                temp_id: "work".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract.clone(),
+                depends_on: Default::default(),
+            }],
+        )
+        .unwrap();
+    let receipt = f
+        .app
+        .update(authority.principal().clone(), &create)
+        .await
+        .unwrap();
+    let id = &receipt.ids["work"];
+    let mut changed = contract;
+    changed.objective = "typed update".into();
+    let update = service
+        .prepare_command(
+            &authority,
+            "typed-false-update",
+            vec![Operation::UpdateContract {
+                work_id: id.clone(),
+                contract: changed,
+            }],
+        )
+        .unwrap();
+    f.app
+        .update(authority.principal().clone(), &update)
+        .await
+        .unwrap();
+    assert!(
+        !service.published().unwrap().1.tickets[id]
+            .contract
+            .user_acceptance_required
+    );
+}
+
+#[test]
+fn all_model_contract_schema_branches_require_user_acceptance() {
+    fn inspect(value: &Value, count: &mut usize) {
+        if let Some(contract) = value
+            .get("properties")
+            .and_then(|p| p.get("user_acceptance_required"))
+        {
+            assert_eq!(contract["const"], true);
+            *count += 1;
+        }
+        match value {
+            Value::Object(values) => values.values().for_each(|v| inspect(v, count)),
+            Value::Array(values) => values.iter().for_each(|v| inspect(v, count)),
+            _ => {}
+        }
+    }
+    let mut count = 0;
+    inspect(&schema::parameters("work_update"), &mut count);
+    inspect(&schema::parameters("work_dispatch"), &mut count);
+    assert!(
+        count >= 4,
+        "must cover both semantic Create/Steer and raw Create/UpdateContract"
+    );
+}

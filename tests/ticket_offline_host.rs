@@ -228,6 +228,60 @@ async fn interrupted_attach_finishes_root_binding_without_republishing_ticket_re
 }
 
 #[tokio::test]
+async fn offline_migration_accepts_actual_terminal_run_statuses_and_rejects_live_or_unknown() {
+    for status in [
+        "completed",
+        "error",
+        "timeout",
+        "cancelled",
+        "skipped",
+        "running",
+        "waiting",
+        "failed",
+        "unknown",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let storage = legacy(&source).await;
+        let preview = ticket_cli::preview(&source, DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap();
+        ticket_cli::legacy_commit(
+            &source,
+            DEFAULT_SUPERVISOR_SESSION_ID,
+            preview["source_snapshot_hash"].as_str().unwrap(),
+            "terminal-attach",
+            &["old-a".into()],
+            true,
+        )
+        .await
+        .unwrap();
+        let mut session = storage
+            .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        session.set_last_run_status(status);
+        storage.save_session(&session).await.unwrap();
+        let terminal = matches!(
+            status,
+            "completed" | "error" | "timeout" | "cancelled" | "skipped"
+        );
+        let result = ticket_cli::migration_plan(&source, &destination, "terminal-migrate").await;
+        assert_eq!(result.is_ok(), terminal, "{status}: {result:?}");
+        if terminal {
+            let request: MigrationRequest =
+                serde_json::from_value(result.unwrap()["request"].clone()).unwrap();
+            let receipt = ticket_cli::migrate(&source, &request).await.unwrap();
+            assert_eq!(receipt["status"], "migrated", "{status}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn offline_host_migration_preserves_canonical_supervisor_inbox_and_exact_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");

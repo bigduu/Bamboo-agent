@@ -731,7 +731,10 @@ fn require_scope_stopped(source: &SourceSnapshot, snapshot: &Snapshot) -> anyhow
             .session
             .last_run_status()
             .as_deref()
-            .is_none_or(|s| matches!(s, "completed" | "cancelled" | "failed")),
+            .is_none_or(|s| matches!(
+                s,
+                "completed" | "error" | "timeout" | "cancelled" | "skipped"
+            )),
         "Supervisor has active/unknown run"
     );
     let known = snapshot

@@ -84,6 +84,47 @@ fn create(service: &TicketService, title: &str, dependencies: BTreeSet<String>) 
 }
 
 #[test]
+fn empty_update_and_dispatch_do_not_publish_or_invalidate_a_valid_command() {
+    for dispatch in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = TicketService::open(dir.path(), binding()).unwrap();
+        let before = service.published().unwrap();
+        let valid = command(
+            &service,
+            "valid-after-empty",
+            vec![Operation::Create {
+                temp_id: "work".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract("unchanged CAS"),
+                depends_on: BTreeSet::new(),
+            }],
+        );
+        let empty = command(&service, "empty", vec![]);
+        let result = if dispatch {
+            service.work_dispatch(&user(), &empty)
+        } else {
+            service.work_update(&user(), &empty)
+        };
+        assert!(
+            matches!(result, Err(Error::InvalidTransition(_))),
+            "{dispatch}: {result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(service.published().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(!service
+            .published()
+            .unwrap()
+            .1
+            .receipts
+            .contains_key("empty"));
+        service.execute(&user(), &valid).unwrap();
+    }
+}
+
+#[test]
 fn adapter_source_does_not_grant_worker_authority() {
     let dir = tempfile::tempdir().unwrap();
     let service = TicketService::open(dir.path(), binding()).unwrap();

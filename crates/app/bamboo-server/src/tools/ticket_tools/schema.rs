@@ -40,7 +40,7 @@ pub fn parameters(name: &str) -> Value {
             let contract = object(
                 json!({"title":id,"objective":id,
                 "constraints":{"type":"array","items":{"type":"string"}}, "acceptance":{"type":"array","items":id,"minItems":1},
-                "user_acceptance_required":{"type":"boolean"},"allowed_tools":{"type":"array","uniqueItems":true,"items":{"type":"string","enum":["Task","Read","Write"]},"minItems":1,"maxItems":3}}),
+                "user_acceptance_required":{"type":"boolean","const":true},"allowed_tools":{"type":"array","uniqueItems":true,"items":{"type":"string","enum":["Task","Read","Write"]},"minItems":1,"maxItems":3}}),
                 &[
                     "title",
                     "objective",

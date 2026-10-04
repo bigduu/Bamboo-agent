@@ -238,6 +238,15 @@ impl TicketApplication {
         principal: Principal,
         command: &Command,
     ) -> Result<OperationReceipt> {
+        if command
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::Start { .. }))
+        {
+            return Err(Error::ScopeDenied(
+                "Start requires the dispatch endpoint".into(),
+            ));
+        }
         if command.operations.iter().any(|op| {
             matches!(
                 op,
@@ -264,7 +273,7 @@ impl TicketApplication {
                 )
             })
         {
-            self.wake_after_receipt(&receipt).await;
+            self.wake_after_receipt(&receipt).await?;
         }
         Ok(receipt)
     }

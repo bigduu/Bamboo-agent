@@ -24,7 +24,7 @@ pub fn proposal() -> Value {
         json!({"title":id,"objective":{"type":"string","minLength":1,"maxLength":32768},
         "constraints":{"type":"array","items":{"type":"string"},"maxItems":64},
         "acceptance":{"type":"array","items":{"type":"string","minLength":1},"minItems":1,"maxItems":64},
-        "user_acceptance_required":{"type":"boolean"},
+        "user_acceptance_required":{"type":"boolean","const":true},
         "allowed_tools":{"type":"array","items":{"enum":["Task"]},"minItems":1,"maxItems":1}}),
         &[
             "title",

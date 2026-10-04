@@ -354,26 +354,16 @@ impl TicketService {
         {
             return Err(Error::RevisionConflict);
         }
-        if command.operations.len() > 64 {
+        if command.operations.is_empty() || command.operations.len() > 64 {
             return Err(Error::InvalidTransition(
-                "operation batch exceeds 64".into(),
+                "operation batch must contain 1..=64 operations".into(),
             ));
         }
         let mut next = snapshot.clone();
         next.seq += 1;
         let ids = apply_operations(&mut next, authority, &command.operations, store.root())?;
         validate_snapshot(&next)?;
-        for assignment in next.assignments.values().filter(|a| {
-            !snapshot.assignments.contains_key(&a.id)
-                && next.tickets[&a.work_id].active_assignment.as_deref() == Some(a.id.as_str())
-        }) {
-            crate::query::build_context_packet(
-                &next,
-                assignment,
-                crate::WORK_CONTEXT_BYTES_LIMIT,
-                |artifact, budget| store.read_artifact(artifact, budget),
-            )?;
-        }
+        validate_new_assignment_contexts(snapshot, &next, &store)?;
         let receipt = OperationReceipt {
             operation_id: command.operation_id.clone(),
             principal: authority.identity(),
@@ -1830,6 +1820,27 @@ pub(crate) fn holds_resources(a: &Assignment) -> bool {
                 | AssignmentState::OutcomeUnknown
                 | AssignmentState::Submitted
         )
+}
+
+/// Both typed commands and semantic groups must validate the complete native
+/// context before publishing a new assignment or retaining its resource claims.
+pub(crate) fn validate_new_assignment_contexts(
+    before: &Snapshot,
+    next: &Snapshot,
+    store: &FileStore,
+) -> Result<()> {
+    for assignment in next.assignments.values().filter(|a| {
+        !before.assignments.contains_key(&a.id)
+            && next.tickets[&a.work_id].active_assignment.as_deref() == Some(a.id.as_str())
+    }) {
+        crate::query::build_context_packet(
+            next,
+            assignment,
+            crate::WORK_CONTEXT_BYTES_LIMIT,
+            |artifact, budget| store.read_artifact(artifact, budget),
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_contract(contract: &Contract) -> Result<()> {

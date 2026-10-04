@@ -156,6 +156,15 @@ impl TicketTool {
                     return Err(Error::ResourceBlocked("resolve the oldest canonical Human input through work_update message_id/proposal first".into()));
                 }
                 let request: Mutation = decode(args)?;
+                if request.operations.iter().any(|op| {
+                    matches!(op, Operation::Create { contract, .. }
+                        | Operation::UpdateContract { contract, .. }
+                        if !contract.user_acceptance_required)
+                }) {
+                    return Err(Error::ScopeDenied(
+                        "model contracts must require explicit User acceptance".into(),
+                    ));
+                }
                 if self.name == "work_update"
                     && request.operations.iter().any(|op| {
                         !matches!(

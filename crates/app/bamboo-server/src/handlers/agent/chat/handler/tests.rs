@@ -8,6 +8,123 @@ use bamboo_engine::session_app::chat::{
 };
 
 #[actix_web::test]
+async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
+    use actix_web::{test, web};
+    use bamboo_agent_core::AgentEvent;
+    use std::collections::BTreeSet;
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::AppState::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let request = |message_id: Option<String>| {
+        serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "session_id":"partial-batch-root", "message":"bounded inbox input", "message_id":message_id,
+        "model":"test-model"
+    })).unwrap()
+    };
+    let initial = super::handler(
+        state.clone(),
+        test::TestRequest::post().to_http_request(),
+        web::Json(request(None)),
+    )
+    .await;
+    assert_eq!(initial.status(), actix_web::http::StatusCode::CREATED);
+    for index in 0..129 {
+        let response = super::handler(
+            state.clone(),
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .to_http_request(),
+            web::Json(request(Some(format!("partial-input-{index}")))),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    }
+    let mut feed = state.account_sink.subscribe();
+    let response = super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        response.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let history = state
+        .storage
+        .load_session("partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .filter(|m| m.id.starts_with("partial-input-"))
+            .count(),
+        128
+    );
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect("partial-batch-root")
+            .await
+            .unwrap()
+            .pending,
+        1
+    );
+    let mut seen = BTreeSet::new();
+    for _ in 0..128 {
+        let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("committed first-batch event")
+            .unwrap();
+        if let AgentEvent::MessageAppended { message_id, .. } = &change.event {
+            assert!(seen.insert(message_id.clone()), "duplicate event");
+        } else {
+            panic!("expected committed MessageAppended event");
+        }
+    }
+    super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap();
+    let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentEvent::MessageAppended { message_id, .. } = &change.event else {
+        panic!("tail event");
+    };
+    assert!(seen.insert(message_id.clone()));
+    assert_eq!(
+        seen,
+        (0..129).map(|i| format!("partial-input-{i}")).collect()
+    );
+    assert!(matches!(
+        feed.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let history = state
+        .storage
+        .load_session("partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .filter(|m| m.id.starts_with("partial-input-"))
+            .count(),
+        129
+    );
+    assert!(!history.metadata.contains_key("chat.queued_ingress.v1"));
+    let replay =
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+    assert_eq!(replay.iter().filter(|change| matches!(&change.event, AgentEvent::MessageAppended { message_id, .. } if message_id.starts_with("partial-input-"))).count(), 129);
+}
+
+#[actix_web::test]
 async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() {
     use actix_web::{test, web};
     use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};

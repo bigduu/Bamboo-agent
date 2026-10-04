@@ -713,12 +713,22 @@ the existing Session index rebuild recovers only derived indexes and grants no
 new activation permission. Provider configuration/credentials do not migrate.
 
 Internal decision wake envelopes use the existing `hidden_from_ui` metadata.
+Delivery or activation failure after a typed User decision is committed returns
+503. Retrying the exact command reuses its original receipt and stable wake ID;
+the existing Inbox deduplicates delivery. This is a client retry path, not a
+new background reconciler.
+Both semantic Create/Steer proposals and raw model Create/UpdateContract tools
+must keep `user_acceptance_required=true`; the server rejects false rather than
+rewriting it. Explicit verified User typed commands retain their separate
+contract choice. Typed commands and semantic groups share the complete native
+context preflight before publishing any new active assignment and its claims.
 Semantic user-required accept additionally needs an explicit complete current
 Human clause naming the Work/submission, so a model proposal cannot promote
 chatter, negation, conditions or quoted tool text into user confirmation.
 Question answers likewise require one complete current Human sentence naming
 the exact request or the Work's unique current question, using
-`Answer {name}: {answer}` or `{name} 的答案是{answer}` with the answer preserved verbatim. A
+`Answer {name}: {answer}`, `{name} 的答案是{answer}`, or `{name}使用{answer}`
+(optionally with a space after the name), with the answer preserved verbatim. A
 proposal cannot attach an arbitrary answer to unrelated chat. Ambiguous or
 truncated language remains pending clarification; a negative answer is still
 valid when it is the explicit named Human answer.

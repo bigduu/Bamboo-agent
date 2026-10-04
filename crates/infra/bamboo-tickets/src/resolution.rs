@@ -3,7 +3,7 @@
 //! indivisible semantic group are short file-authority transactions.
 mod model;
 mod validation;
-use crate::service::{apply_operations, validate_snapshot};
+use crate::service::{apply_operations, validate_new_assignment_contexts, validate_snapshot};
 use crate::*;
 pub use model::*;
 use std::collections::BTreeSet;
@@ -360,6 +360,7 @@ impl TicketService {
         };
         match attempted.and_then(|ids| {
             validate_snapshot(&next)?;
+            validate_new_assignment_contexts(current, &next, &store)?;
             Ok(ids)
         }) {
             Ok(ids) => {

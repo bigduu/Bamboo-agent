@@ -23,6 +23,65 @@ fn contract() -> Contract {
     }
 }
 
+#[tokio::test]
+async fn non_dispatch_update_rejects_start_without_claiming_or_publishing() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        SessionStoreV2::new(root.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let app = TicketApplication::open(root.path(), storage, config(true)).await;
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(principal.clone()).await.unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "update-create",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "work".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let work = app.update(principal.clone(), &create).await.unwrap().ids["work"].clone();
+    let start = service
+        .prepare_command(
+            &authority,
+            "wrong-endpoint-start",
+            vec![Operation::Start {
+                work_id: work.clone(),
+                temp_id: "assignment".into(),
+                workspace: None,
+            }],
+        )
+        .unwrap();
+    let before = service.published().unwrap();
+    assert!(matches!(
+        app.update(principal.clone(), &start).await,
+        Err(Error::ScopeDenied(_))
+    ));
+    assert_eq!(
+        serde_json::to_value(service.published().unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+    let result = app.dispatch(principal, &start).await.unwrap();
+    assert_eq!(result["receipt"]["operation_id"], "wrong-endpoint-start");
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets[&work].state, WorkState::Active);
+    assert_eq!(snapshot.assignments.len(), 1);
+}
+
 async fn missing_child_fixture(
     enqueue_failure: bool,
 ) -> (
@@ -416,4 +475,190 @@ async fn ticket_application_rejects_unverified_json_legacy_sources() {
         ));
     }
     assert_eq!(service.published().unwrap().0, before.0);
+}
+
+#[derive(Default)]
+struct DecisionWakeActivation {
+    fail: std::sync::atomic::AtomicBool,
+    calls: tokio::sync::Mutex<Vec<(String, u64)>>,
+}
+
+#[async_trait::async_trait]
+impl bamboo_domain::SessionActivationPort for DecisionWakeActivation {
+    async fn request_activation(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> std::result::Result<
+        bamboo_domain::SessionActivationDisposition,
+        bamboo_domain::SessionActivationError,
+    > {
+        self.calls.lock().await.push((target.into(), generation));
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(bamboo_domain::SessionActivationError::Internal(
+                "fixture activation unavailable".into(),
+            ))
+        } else {
+            Ok(bamboo_domain::SessionActivationDisposition::ActiveNotified)
+        }
+    }
+}
+
+#[tokio::test]
+async fn committed_decision_wake_failure_retries_exact_receipt_and_one_inbox_message() {
+    use bamboo_domain::SessionInboxPort;
+    for failure in ["missing-messenger", "inbox-storage", "activation"] {
+        for approval in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+            let app = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
+            let principal = Principal::User {
+                user_id: "host-owner".into(),
+            };
+            let (service, user) = app.authority(principal.clone()).await.unwrap();
+            let supervisor = Authority::from_verified_host(
+                service.published().unwrap().1.binding,
+                Principal::Supervisor {
+                    session_id: DEFAULT_SUPERVISOR_SESSION_ID.into(),
+                },
+            );
+            let create = service
+                .prepare_command(
+                    &supervisor,
+                    "wake-work",
+                    vec![Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract(),
+                        depends_on: Default::default(),
+                    }],
+                )
+                .unwrap();
+            let work = service.execute(&supervisor, &create).unwrap().ids["work"].clone();
+            let action = approval.then(|| Action {
+                kind: "fixture".into(),
+                target: "exact target".into(),
+                data_hash: content_hash(b"fixture data"),
+                amount: None,
+                permissions: Default::default(),
+                risk: "fixture".into(),
+            });
+            let ask = service
+                .prepare_command(
+                    &supervisor,
+                    "wake-question",
+                    vec![Operation::Ask {
+                        work_id: work,
+                        temp_id: "request".into(),
+                        prompt: "Exact question".into(),
+                        action,
+                    }],
+                )
+                .unwrap();
+            let request_id = service.execute(&supervisor, &ask).unwrap().ids["request"].clone();
+            let request = service.published().unwrap().1.requests[&request_id].clone();
+            let decision = match &request.kind {
+                RequestKind::Question => Operation::Answer {
+                    request_id: request_id.clone(),
+                    prompt_revision: request.prompt_revision,
+                    answer: "verbatim answer".into(),
+                },
+                RequestKind::Approval { fingerprint, .. } => Operation::DecideApproval {
+                    request_id: request_id.clone(),
+                    prompt_revision: request.prompt_revision,
+                    fingerprint: fingerprint.clone(),
+                    approve: true,
+                },
+            };
+            let command = service
+                .prepare_command(&user, "wake-decision", vec![decision])
+                .unwrap();
+            let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+                storage.clone(),
+                Default::default(),
+            ));
+            let activation = Arc::new(DecisionWakeActivation::default());
+            let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+                storage.clone(),
+                inbox.clone(),
+                activation.clone(),
+            ));
+            if failure != "missing-messenger" {
+                app.bind_messenger(messenger.clone());
+            }
+            let inbox_dir = storage
+                .bamboo_home_dir()
+                .join(
+                    storage
+                        .resolve_rel_path(DEFAULT_SUPERVISOR_SESSION_ID)
+                        .await
+                        .unwrap(),
+                )
+                .join("inbox");
+            if failure == "inbox-storage" {
+                std::fs::write(&inbox_dir, b"obstruct actual inbox directory").unwrap();
+            }
+            if failure == "activation" {
+                activation
+                    .fail
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let error = app
+                .update(principal.clone(), &command)
+                .await
+                .expect_err("post-commit wake failure must be visible");
+            assert_eq!(error.status_code(), 503, "{failure} / approval={approval}");
+            assert!(error
+                .to_string()
+                .contains("committed; retry the exact command"));
+            let committed = service.published().unwrap();
+            let receipt = committed.1.receipts["wake-decision"].clone();
+            assert_ne!(
+                committed.1.requests[&request_id].status,
+                RequestStatus::Open
+            );
+            if failure == "missing-messenger" {
+                app.bind_messenger(messenger);
+            }
+            if failure == "inbox-storage" {
+                std::fs::remove_file(&inbox_dir).unwrap();
+            }
+            activation
+                .fail
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                app.update(principal.clone(), &command).await.unwrap(),
+                receipt
+            );
+            assert_eq!(
+                canonical_bytes(&service.published().unwrap()).unwrap(),
+                canonical_bytes(&committed).unwrap()
+            );
+            assert_eq!(app.update(principal, &command).await.unwrap(), receipt);
+            assert_eq!(
+                canonical_bytes(&service.published().unwrap()).unwrap(),
+                canonical_bytes(&committed).unwrap()
+            );
+            let backlog = inbox.inspect(DEFAULT_SUPERVISOR_SESSION_ID).await.unwrap();
+            assert_eq!(backlog.pending, 1);
+            assert_eq!(backlog.generation, 1);
+            let claims = inbox
+                .claim(DEFAULT_SUPERVISOR_SESSION_ID, 10)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            let expected = bamboo_domain::SessionMessageId::stable(
+                "ticket-decision-wake-v1",
+                &json!({"operation_id":receipt.operation_id,"request_hash":receipt.request_hash}),
+            );
+            assert_eq!(claims[0].envelope.id, expected);
+            assert!(activation
+                .calls
+                .lock()
+                .await
+                .iter()
+                .all(|(id, generation)| id == DEFAULT_SUPERVISOR_SESSION_ID && *generation == 1));
+        }
+    }
 }

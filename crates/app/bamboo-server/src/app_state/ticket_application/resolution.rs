@@ -111,10 +111,13 @@ impl TicketApplication {
 
     // Precise UI decisions wake the existing Inbox/activation machinery after
     // the durable decision. The notification carries no User approval grant.
-    pub(super) async fn wake_after_receipt(&self, receipt: &OperationReceipt) {
-        let Some(messenger) = self.messenger.get() else {
-            return;
-        };
+    pub(super) async fn wake_after_receipt(&self, receipt: &OperationReceipt) -> Result<()> {
+        let messenger = self.messenger.get().ok_or_else(|| {
+            Error::AuthorityUnavailable(format!(
+                "Ticket decision {} committed; retry the exact command to deliver its wake: messenger unavailable",
+                receipt.operation_id
+            ))
+        })?;
         let display = format!("Ticket decision committed at seq {}. Read work_overview and exact requests before scheduling any ready work.", receipt.committed_seq);
         let content = SessionMessageContent::text(display);
         let envelope = SessionMessageEnvelope {
@@ -148,11 +151,13 @@ impl TicketApplication {
             attempt: None,
             correlation_id: None,
         };
-        if let Err(error) = messenger
+        messenger
             .send_with_policy(envelope, SessionActivationPolicy::InterruptSpecificWait)
             .await
-        {
-            tracing::warn!(operation_id = %receipt.operation_id, %error, "committed Ticket decision notification needs reconciliation");
-        }
+            .map_err(|error| Error::AuthorityUnavailable(format!(
+                "Ticket decision {} committed; retry the exact command to deliver its wake: {error}",
+                receipt.operation_id
+            )))?;
+        Ok(())
     }
 }

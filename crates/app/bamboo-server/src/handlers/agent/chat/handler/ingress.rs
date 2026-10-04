@@ -222,6 +222,15 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> Result<(), 
         Some(&state.session_inbox),
     )
     .await;
+    // SDK admission may durably commit and ACK one bounded batch while the
+    // newest queued input is still pending. Emit every committed message even
+    // when this call must return a retryable admission error or tail response.
+    for message in refreshed.committed_messages {
+        state.account_sink.record(
+            Some(id),
+            &bamboo_agent_core::AgentEvent::message_appended(id, &message),
+        );
+    }
     if let Some(reason) = refreshed.admission_error {
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, reason));
     }
@@ -245,12 +254,6 @@ pub(crate) async fn admit_for_execute(state: &AppState, id: &str) -> Result<(), 
         super::persist_and_cache_session_locked(state, &latest)
             .await
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    }
-    for message in refreshed.committed_messages {
-        state.account_sink.record(
-            Some(id),
-            &bamboo_agent_core::AgentEvent::message_appended(id, &message),
-        );
     }
     Ok(())
 }
