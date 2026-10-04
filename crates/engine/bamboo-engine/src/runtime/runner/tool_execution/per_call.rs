@@ -307,7 +307,7 @@ async fn execute_tool_call_only_with_execution_name(
             tool_call_id: ctx.tool_call.id.clone(),
             parsed_args: args.clone(),
         };
-        let hook_outcome = ctx
+        let mut hook_outcome = ctx
             .config
             .hook_runner
             .run_hooks(
@@ -319,6 +319,10 @@ async fn execute_tool_call_only_with_execution_name(
             )
             .await;
 
+        crate::runtime::hooks::inject_plugin_contexts(
+            session,
+            std::mem::take(&mut hook_outcome.plugin_contexts),
+        );
         match hook_outcome.decision.clone() {
             HookResult::Deny { reason } => {
                 crate::runtime::hooks::inject_contexts(
@@ -708,17 +712,23 @@ pub(super) async fn apply_tool_execution_outcome(
                 },
             },
         };
+        let original_tool_input = serde_json::from_str(&ctx.tool_call.function.arguments).ok();
         let mut hook_outcome = ctx
             .config
             .hook_runner
-            .run_hooks(
+            .run_hooks_with_tool_input(
                 AgentHookPoint::AfterToolExecution,
                 &hook_payload,
                 ctx.session,
                 ctx.runtime_state,
                 Some(ctx.event_tx),
+                original_tool_input.as_ref(),
             )
             .await;
+        crate::runtime::hooks::inject_plugin_contexts(
+            ctx.session,
+            std::mem::take(&mut hook_outcome.plugin_contexts),
+        );
         post_tool_feedback = std::mem::take(&mut hook_outcome.injected_contexts);
         if let HookResult::Deny { reason } = hook_outcome.decision.clone() {
             post_tool_feedback.push(format!("Blocked by PostToolUse hook: {reason}"));

@@ -11,6 +11,7 @@ use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
 pub struct HookRunOutcome {
     pub decision: HookResult,
     pub injected_contexts: Vec<String>,
+    pub plugin_contexts: Vec<crate::portable::PluginContext>,
 }
 
 impl Default for HookRunOutcome {
@@ -18,6 +19,7 @@ impl Default for HookRunOutcome {
         Self {
             decision: HookResult::Continue,
             injected_contexts: Vec::new(),
+            plugin_contexts: Vec::new(),
         }
     }
 }

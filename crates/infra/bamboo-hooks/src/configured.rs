@@ -1503,6 +1503,48 @@ pub(super) fn register_configured_hooks(
     }
 }
 
+/// Portable hooks share native capture, output bounds and process-tree cleanup,
+/// but have a separate wire protocol and never use native response interpretation.
+pub(crate) async fn execute_portable_command(
+    command_text: &str,
+    input: Vec<u8>,
+    timeout_seconds: u64,
+    cwd: &Path,
+    plugin_root: &Path,
+    plugin_data: &Path,
+) -> Result<LifecycleHookTestOutput, String> {
+    let shell = preferred_bash_shell();
+    let mut command = Command::new(&shell.program);
+    command
+        .arg(shell.arg)
+        .arg(command_text)
+        .current_dir(cwd)
+        .env("PLUGIN_ROOT", plugin_root)
+        .env("CLAUDE_PLUGIN_ROOT", plugin_root)
+        .env("PLUGIN_DATA", plugin_data)
+        .env("CLAUDE_PLUGIN_DATA", plugin_data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_hook_process(&mut command);
+    let child = HookChild::new(command.spawn().map_err(|e| e.to_string())?)?;
+    let output = capture_hook_child(
+        child,
+        input,
+        Duration::from_secs(timeout_seconds),
+        "plugin-command",
+    )
+    .await?;
+    Ok(LifecycleHookTestOutput {
+        exit_code: output.exit_code,
+        stdout: String::from_utf8(output.stdout.bytes).map_err(|e| e.to_string())?,
+        stderr: String::from_utf8(output.stderr.bytes).map_err(|e| e.to_string())?,
+        timed_out: output.timed_out,
+        stdout_truncated: output.stdout.truncated,
+        stderr_truncated: output.stderr.truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

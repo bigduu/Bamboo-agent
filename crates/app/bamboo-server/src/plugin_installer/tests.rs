@@ -2384,3 +2384,82 @@ async fn boot_rejects_corrupt_nonempty_grants_before_starting_plugin_service() {
     assert_eq!(status[0].state, ToolEventSinkState::Unavailable);
     assert!(status[0].granted_permissions.is_empty());
 }
+
+#[actix_web::test]
+async fn portable_hook_receipt_rollback_requires_matching_restored_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(temp.path()).await;
+    let root = temp.path().join("plugins/rollback-hooks");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let old:PluginManifest=serde_json::from_value(serde_json::json!({"id":"rollback-hooks","name":"Rollback hooks","version":"0.1.0","provides":{"hooks":[{"config":"hooks.json","scripts":["script.sh"]}]}})).unwrap();
+    let old_bytes = serde_json::to_vec(&old).unwrap();
+    tokio::fs::write(root.join("plugin.json"), &old_bytes)
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("script.sh"), "# fixture")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        root.join("hooks.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true","timeout":1}]}]}}"#,
+    )
+    .await
+    .unwrap();
+    let mut previous = installer
+        .install(
+            &old,
+            &root,
+            PluginSource::LocalDir { path: root.clone() },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let receipt = &mut previous.registered.hooks[0];
+    receipt.confirm_review(&receipt.digest.clone()).unwrap();
+    let path = temp.path().join("plugins/installed.json");
+    let mut store = InstalledPlugins::load(&path).await.unwrap();
+    store.add(previous.clone());
+    store.save(&path).await.unwrap();
+    let mut new = old.clone();
+    new.version = "0.2.0".into();
+    tokio::fs::write(root.join("plugin.json"), serde_json::to_vec(&new).unwrap())
+        .await
+        .unwrap();
+    let guard = installer.begin_operation().await;
+    installer
+        .install_with_operation_failing_final_commit(
+            &new,
+            &root,
+            PluginSource::LocalDir { path: root.clone() },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+            None,
+            &guard,
+        )
+        .await
+        .expect_err("injected rollback");
+    drop(guard);
+    let store = InstalledPlugins::load(&path).await.unwrap();
+    let restored = store.get_unique("rollback-hooks").unwrap().unwrap();
+    assert_eq!(restored, &previous);
+    let digest = bamboo_plugin::hooks::registrations(&new, &root).unwrap()[0]
+        .digest
+        .clone();
+    assert_eq!(
+        restored.registered.hooks[0].state(&digest),
+        bamboo_plugin::hooks::HookState::NeedsReview
+    );
+    // The outer existing source transaction restores the prior bundle. Trust
+    // only becomes usable again when that receipt's exact bytes are present.
+    tokio::fs::write(root.join("plugin.json"), old_bytes)
+        .await
+        .unwrap();
+    let digest = bamboo_plugin::hooks::registrations(&old, &root).unwrap()[0]
+        .digest
+        .clone();
+    assert_eq!(
+        restored.registered.hooks[0].state(&digest),
+        bamboo_plugin::hooks::HookState::Active
+    );
+}

@@ -42,6 +42,11 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/{id}/hooks", web::get().to(agent::plugin::plugin_hooks))
+        .route(
+            "/{id}/hooks/review",
+            web::post().to(agent::plugin::review_plugin_hooks),
+        )
         .route("/{id}/update", web::post().to(agent::plugin::update_plugin))
         .route("/{id}", web::delete().to(agent::plugin::remove_plugin))
 }

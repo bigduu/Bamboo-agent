@@ -1272,3 +1272,69 @@ async fn install_and_list_surface_service_status() {
         serde_json::json!("svc")
     );
 }
+
+#[actix_web::test]
+async fn portable_hook_review_requires_exact_explicit_consent_and_update_resets_it() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let native_hooks = tokio::fs::read(data.path().join("hooks.json")).await.ok();
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success(), "{:?}", response.status());
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "needs-review");
+    let digest = report["hooks"][0]["digest"].as_str().unwrap();
+    for (digest, confirm) in [("stale", true), (digest, false)] {
+        let response=test::call_service(&app,test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":"hooks/hooks.json","digest":digest,"enabled":true,"confirm_execution":confirm})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response=test::call_service(&app,test::TestRequest::post().uri("/api/v1/plugins/portable-hook-example/hooks/review").set_json(serde_json::json!({"config":"hooks/hooks.json","digest":digest,"enabled":true,"confirm_execution":true})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "active");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/portable-hook-example/update")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/portable-hook-example/hooks")
+            .to_request(),
+    )
+    .await;
+    let report: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(report["hooks"][0]["state"], "needs-review");
+    assert_eq!(
+        tokio::fs::read(data.path().join("hooks.json")).await.ok(),
+        native_hooks
+    );
+}

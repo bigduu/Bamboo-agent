@@ -7,6 +7,7 @@ description = "Lifecycle hook dispatch and external script orchestration for Bam
 license = "MIT"
 
 [dependencies]
+bamboo-plugin = { path = "../bamboo-plugin" }
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-config = { path = "../bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }

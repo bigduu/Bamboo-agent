@@ -158,3 +158,119 @@ pub async fn remove_plugin(state: web::Data<AppState>, path: web::Path<String>) 
         Err(error) => plugin_error_response(&error),
     }
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookReviewRequest {
+    pub config: String,
+    pub digest: String,
+    pub enabled: bool,
+    /// Required explicit acknowledgment before granting execution trust.
+    pub confirm_execution: bool,
+}
+
+/// Read-only review report: receipt, current bytes, strict compatibility result.
+pub async fn plugin_hooks(state: web::Data<AppState>, id: web::Path<String>) -> impl Responder {
+    let installer = ServerPluginInstaller::new(state.clone());
+    let _guard = installer.begin_operation().await;
+    match hook_review_report(&state, &id).await {
+        Ok(report) => HttpResponse::Ok().json(report),
+        Err(error) => plugin_error_response(&error),
+    }
+}
+async fn hook_review_report(
+    state: &AppState,
+    id: &str,
+) -> bamboo_plugin::PluginResult<serde_json::Value> {
+    let store =
+        bamboo_plugin::InstalledPlugins::load(&plugins_root(state).join("installed.json")).await?;
+    let entry = store.get_unique(id)?.ok_or_else(|| {
+        bamboo_plugin::PluginError::InvalidManifest("plugin not installed".into())
+    })?;
+    let manifest: bamboo_plugin::PluginManifest = serde_json::from_slice(
+        &tokio::fs::read(entry.plugin_dir.join("plugin.json"))
+            .await
+            .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?,
+    )
+    .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?;
+    match bamboo_plugin::hooks::registrations(&manifest, &entry.plugin_dir) {
+        Ok(current) => Ok(serde_json::json!({"hooks": current.iter().map(|now| {
+            let stored=entry.registered.hooks.iter().find(|r| r.config==now.config);
+            serde_json::json!({"config":now.config,"digest":now.digest,"state": if entry.status==bamboo_plugin::PluginInstallStatus::Installed { stored.map(|r|r.state(&now.digest)).unwrap_or(bamboo_plugin::hooks::HookState::NeedsReview) } else { bamboo_plugin::hooks::HookState::Disabled }})
+        }).collect::<Vec<_>>() })),
+        Err(error) => {
+            Ok(serde_json::json!({"state":"unsupported","compatibility_error":error.to_string()}))
+        }
+    }
+}
+
+/// An authenticated explicit review of exact bytes; install/update never calls it.
+pub async fn review_plugin_hooks(
+    state: web::Data<AppState>,
+    id: web::Path<String>,
+    body: web::Json<HookReviewRequest>,
+) -> impl Responder {
+    let installer = ServerPluginInstaller::new(state.clone());
+    let _guard = installer.begin_operation().await;
+    let result: bamboo_plugin::PluginResult<()> = async {
+        let path = plugins_root(&state).join("installed.json");
+        let mut store = bamboo_plugin::InstalledPlugins::load(&path).await?;
+        let mut entry = store.get_unique(&id)?.cloned().ok_or_else(|| {
+            bamboo_plugin::PluginError::InvalidManifest("plugin not installed".into())
+        })?;
+        if entry.status != bamboo_plugin::PluginInstallStatus::Installed {
+            return Err(bamboo_plugin::PluginError::InvalidManifest(
+                "install incomplete".into(),
+            ));
+        }
+        let manifest: bamboo_plugin::PluginManifest = serde_json::from_slice(
+            &tokio::fs::read(entry.plugin_dir.join("plugin.json"))
+                .await
+                .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?,
+        )
+        .map_err(|e| bamboo_plugin::PluginError::InvalidManifest(e.to_string()))?;
+        if manifest.id != entry.id || manifest.version != entry.version {
+            return Err(bamboo_plugin::PluginError::InvalidManifest(
+                "manifest identity changed".into(),
+            ));
+        }
+        let current = bamboo_plugin::hooks::registrations(&manifest, &entry.plugin_dir)?;
+        let now = current
+            .iter()
+            .find(|r| r.config == body.config)
+            .ok_or_else(|| {
+                bamboo_plugin::PluginError::InvalidManifest("unknown hook config".into())
+            })?;
+        let registered = entry
+            .registered
+            .hooks
+            .iter_mut()
+            .find(|r| r.config == body.config)
+            .ok_or_else(|| {
+                bamboo_plugin::PluginError::InvalidManifest("hook is not registered".into())
+            })?;
+        if now.digest != body.digest {
+            return Err(bamboo_plugin::PluginError::InvalidManifest(
+                "review digest changed".into(),
+            ));
+        }
+        registered.digest = now.digest.clone();
+        if body.enabled {
+            if !body.confirm_execution {
+                return Err(bamboo_plugin::PluginError::InvalidManifest(
+                    "explicit execution confirmation required".into(),
+                ));
+            }
+            registered.confirm_review(&body.digest)?;
+        } else {
+            registered.enabled = false;
+        }
+        store.add(entry);
+        store.save(&path).await
+    }
+    .await;
+    match result {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"ok":true})),
+        Err(error) => plugin_error_response(&error),
+    }
+}

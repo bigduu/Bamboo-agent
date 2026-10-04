@@ -308,7 +308,17 @@ pub(crate) fn build_goal_context_block(goal: Option<&str>) -> Option<ContextBloc
 /// source strings live in the current run's structured runtime state, so they
 /// never mutate or invalidate the cached base system prompt.
 pub(crate) fn build_agent_hook_context_block(session: &Session) -> Option<ContextBlock> {
-    let contexts = &session.agent_runtime_state.as_ref()?.hook_contexts;
+    let mut contexts = session
+        .agent_runtime_state
+        .as_ref()
+        .map(|state| state.hook_contexts.clone())
+        .unwrap_or_default();
+    let plugin_contexts: Vec<String> = session
+        .metadata
+        .get("runtime.plugin_hook_contexts")
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    contexts.extend(plugin_contexts);
     let content = contexts
         .iter()
         .map(|text| text.trim())

@@ -6,6 +6,7 @@
 
 mod configured;
 mod dispatcher;
+pub mod portable;
 
 pub use bamboo_config::LifecycleScriptRunner;
 pub use configured::{
