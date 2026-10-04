@@ -287,13 +287,147 @@ pub async fn artifact(
         sha256: hash.into_inner(),
     };
     Ok(HttpResponse::Ok()
-        .content_type("text/plain; charset=utf-8")
+        .content_type("application/octet-stream")
         .body(service.read_artifact(&authority, &artifact, store::MAX_ARTIFACT_BYTES)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn managed_binary_artifact_http_preserves_bytes_without_guessing_media_type() {
+        use actix_web::{test, App};
+        use std::{collections::BTreeSet, sync::Arc};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+        {
+            let mut config = state.config.write().await;
+            *config = serde_json::from_value(serde_json::json!({
+                "provider": "openai", "features": {"ticket_mutation": true},
+                "providers": {"openai": {"api_key": "fixture", "model": "fixture-model"}}
+            }))
+            .unwrap();
+        }
+        state.tickets = Arc::new(
+            crate::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        assert!(!state.config.read().await.features.ticket_dispatch);
+        let (service, runtime) = state.tickets.authority(Principal::Runtime).await.unwrap();
+        let user = Authority::from_verified_host(
+            service.published().unwrap().1.binding,
+            Principal::User {
+                user_id: "host-owner".into(),
+            },
+        );
+        let create = service
+            .prepare_command(
+                &user,
+                "binary-create",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: Contract {
+                            title: "binary result".into(),
+                            objective: "preserve bytes".into(),
+                            constraints: vec![],
+                            acceptance: vec!["exact bytes".into()],
+                            user_acceptance_required: true,
+                            allowed_tools: BTreeSet::from(["Task".into()]),
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::Ready {
+                        work_id: "work".into(),
+                    },
+                    Operation::Start {
+                        work_id: "work".into(),
+                        temp_id: "assignment".into(),
+                        workspace: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let ids = service.execute(&user, &create).unwrap().ids;
+        let snapshot = service.published().unwrap().1;
+        let assignment = &snapshot.assignments[&ids["assignment"]];
+        let receipt = RuntimeReceipt {
+            dispatch_key: assignment.dispatch_key.clone(),
+            spec_hash: snapshot.intents[&assignment.dispatch_key].spec_hash.clone(),
+            run_id: "fixture-run".into(),
+            session_id: "fixture-child".into(),
+        };
+        let admit = service
+            .prepare_command(
+                &runtime,
+                "binary-admit",
+                vec![
+                    Operation::Admitted {
+                        assignment_id: assignment.id.clone(),
+                        receipt: receipt.clone(),
+                    },
+                    Operation::Running {
+                        assignment_id: assignment.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        service.execute(&runtime, &admit).unwrap();
+        let bytes = b"%PDF-1.7\n\0\xff\x80binary output";
+        let artifact = service.store_artifact(&runtime, bytes).unwrap();
+        let worker = Authority::from_verified_host(
+            snapshot.binding,
+            Principal::Worker {
+                assignment_id: assignment.id.clone(),
+                generation: assignment.generation,
+                run_id: receipt.run_id,
+                session_id: receipt.session_id,
+            },
+        );
+        let submit = service
+            .prepare_command(
+                &worker,
+                "binary-submit",
+                vec![Operation::Submit {
+                    assignment_id: assignment.id.clone(),
+                    temp_id: "submission".into(),
+                    artifacts: vec![artifact.clone()],
+                    evidence: vec!["verified output".into()],
+                }],
+            )
+            .unwrap();
+        service.execute(&worker, &submit).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/artifact/{hash}", web::get().to(super::artifact)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/artifact/{}", artifact.sha256))
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .insert_header(("Host", "localhost"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("Content-Type").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(test::read_body(response).await.as_ref(), bytes);
+    }
 
     #[actix_web::test]
     async fn ticket_error_envelope_preserves_exact_conflict_and_authority_semantics() {
