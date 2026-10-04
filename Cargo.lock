@@ -3954,8 +3954,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jiandu-memory"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8f3126b0c0c4fe32e5b1d74cfdd10fce37f8f070f6ace922ee46a554e154be1"
+source = "git+https://github.com/bigduu/Jiandu.git?rev=13ba902b956a2afd5a4ef03b195e22fbb5faecef#13ba902b956a2afd5a4ef03b195e22fbb5faecef"
 dependencies = [
  "chrono",
  "dashmap",

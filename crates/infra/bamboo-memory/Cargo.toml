@@ -11,7 +11,7 @@ bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
-jiandu-memory = "=0.2.0"
+jiandu-memory = { git = "https://github.com/bigduu/Jiandu.git", rev = "13ba902b956a2afd5a4ef03b195e22fbb5faecef" }
 serde = { workspace = true }
 serde_json = "1"
 serde_yaml = "0.9"

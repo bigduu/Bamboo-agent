@@ -91,6 +91,20 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and the pers
 - **Durable memory** — atomic Global or first-class Project facts with type, status, source, relations, and lexical retrieval metadata. Jiandu is the source of truth; there is no embedding pipeline.
 - **Dream** — a Jiandu-owned derived Global or Project orientation snapshot, never a canonical memory record. Bamboo extracts facts and Ledger candidates first, captures the Jiandu generation, reads canonical `MEMORY.md`, synthesizes once, then asks Jiandu to publish with compare-and-swap so a stale run cannot overwrite newer facts.
 
+AutoDream durable candidates remain unconfirmed (`confidence` omitted), regardless
+of a model's self-rating. For retrieval-window extraction, the host records the
+ordered message IDs supplied in that batch, including continuation overlap; this
+is input coverage, not exact citations or proof of truth. Summaries, Session
+notes, and legacy retry checkpoints without an exact mapping retain an empty
+range. The host checks Session membership before persisting and retains Project
+identity resolution; a model cannot broaden Project evidence into Global or
+supply confirmation/source metadata.
+
+The Jiandu dependency is pinned to the exact paired source commit available in
+its upstream Git repository. Builds fetch that revision directly; no local
+source replacement or new published crate version is required.
+
+
 Jiandu defaults to the independent `~/.jiandu` data root. Bamboo configuration, sessions, and the prospective-record Ledger remain under `~/.bamboo`; the two stores are not mixed. For an isolated managed-host or acceptance run, `BAMBOO_JIANDU_DATA_DIR` may select a non-empty absolute Jiandu root for the server process and every local Bamboo-runtime worker it spawns. Invalid values stop the server or worker before memory initialization. This is an isolation boundary, not a second persistence mode or a migration mechanism, and `--data-dir` continues to control Bamboo data only.
 
 **Prompt-memory observations.** The canonical native agent loop can record which
