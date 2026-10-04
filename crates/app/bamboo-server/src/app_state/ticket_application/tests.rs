@@ -103,6 +103,41 @@ async fn ticket_application_default_off_does_not_bootstrap_or_attach_existing_su
 }
 
 #[tokio::test]
+async fn ticket_application_store_init_failure_preserves_ordinary_supervisor_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    // A file where the Ticket directory must be makes actual FileStore
+    // initialization fail without depending on platform-specific permissions.
+    std::fs::write(root.path().join("tickets"), b"not a directory").unwrap();
+    let app = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
+    assert!(app.service().is_err());
+    assert_eq!(app.status().await["available"], false);
+    let canonical = storage
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!canonical.root_orchestration_only_enabled());
+    assert!(canonical.allows_model_tool_execution("Write"));
+
+    // A later open still requires explicit attach, but must not leave the
+    // ordinary Supervisor restricted by the failed optional initialization.
+    std::fs::remove_file(root.path().join("tickets")).unwrap();
+    let reopened = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
+    assert!(reopened.service().is_err());
+    let recovered = storage
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!recovered.root_orchestration_only_enabled());
+    assert_eq!(
+        recovered.root_tool_authority_revision,
+        canonical.root_tool_authority_revision
+    );
+}
+
+#[tokio::test]
 async fn ticket_application_changed_root_authority_fences_every_call() {
     let root = tempfile::tempdir().unwrap();
     let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());

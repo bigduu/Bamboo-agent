@@ -80,7 +80,6 @@ impl TicketApplication {
                 supervisor
                     .set_root_orchestration_only(true)
                     .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-                storage.save_session(&supervisor).await?;
                 (supervisor, true)
             }
             None => {
@@ -104,10 +103,31 @@ impl TicketApplication {
             ));
         }
         drop(config);
-        let (binding, _) = ticket_runtime::verified_scope_binding(storage, &supervisor.id).await?;
+        let binding = if freshly_created {
+            // The strict Host reader verified this new Supervisor's identity.
+            // Prepare its future binding without restricting durable authority
+            // until the optional Ticket store has successfully initialized.
+            ScopeBinding {
+                scope_id: format!("supervisor/{incarnation_id}"),
+                supervisor_session_id: supervisor.id.clone(),
+                binding_revision: supervisor.root_tool_authority_revision,
+            }
+        } else {
+            ticket_runtime::verified_scope_binding(storage, &supervisor.id)
+                .await?
+                .0
+        };
         let service = TicketService::open(scope_root, binding)?;
         #[cfg(feature = "ticket-runtime-fixtures")]
         Self::install_fixture_fault(&service)?;
+        if freshly_created {
+            if service.health() != Health::Writable {
+                return Err(Error::AuthorityUnavailable(
+                    "new Ticket scope is not writable".into(),
+                ));
+            }
+            storage.save_session(&supervisor).await?;
+        }
         Ok(service)
     }
 
