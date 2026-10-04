@@ -282,7 +282,8 @@ fn is_zero(value: &u64) -> bool {
 /// Delivery semantics for one actor event batch.
 ///
 /// `Durable` batches must use the broker's acknowledged mailbox lane.
-/// `Snapshot` and `Ephemeral` batches may use the bounded live lane: sequence
+/// An executor requiring complete history evidence may upgrade a batch to
+/// `Durable`. `Snapshot` and `Ephemeral` batches may use the bounded live lane: sequence
 /// gaps tell a consumer to reload the authoritative session snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,10 +367,11 @@ impl ActorEventBatch {
         if self.first_seq == 0 || self.last_seq != expected_last {
             return Err("actor event batch has an invalid sequence range".to_string());
         }
-        if self
-            .events
-            .iter()
-            .any(|event| ActorEventQos::classify(event) != self.qos)
+        if self.qos != ActorEventQos::Durable
+            && self
+                .events
+                .iter()
+                .any(|event| ActorEventQos::classify(event) != self.qos)
         {
             return Err("actor event batch QoS does not match its events".to_string());
         }
@@ -396,6 +398,7 @@ pub struct ActorEventBatcher {
     source_actor_id: Option<String>,
     next_seq: u64,
     pending: Option<PendingActorEventBatch>,
+    durable_events: bool,
 }
 
 impl ActorEventBatcher {
@@ -412,7 +415,15 @@ impl ActorEventBatcher {
             source_actor_id,
             next_seq: 1,
             pending: None,
+            durable_events: false,
         }
+    }
+
+    /// Preserve the bounded coalescing/flush policy while delivering every
+    /// batch through the existing reliable lane for strict history consumers.
+    pub fn with_durable_events(mut self, required: bool) -> Self {
+        self.durable_events = required;
+        self
     }
 
     /// Add one event and return every batch that became ready. At most two are
@@ -477,7 +488,11 @@ impl ActorEventBatcher {
             source_actor_id: self.source_actor_id.clone(),
             first_seq,
             last_seq,
-            qos,
+            qos: if self.durable_events {
+                ActorEventQos::Durable
+            } else {
+                qos
+            },
             events,
         }
     }
@@ -1409,6 +1424,32 @@ mod tests {
         batch.qos = ActorEventQos::Durable;
         batch.last_seq = 2;
         assert!(batch.validate().unwrap_err().contains("sequence"));
+    }
+
+    #[test]
+    fn strict_history_upgrade_preserves_bounded_token_coalescing() {
+        let spec: RunSpec = serde_json::from_value(serde_json::json!({
+            "assignment":"read", "execution_epoch":1
+        }))
+        .unwrap();
+        let mut batcher = ActorEventBatcher::for_run(&spec, None, None).with_durable_events(true);
+        for _ in 1..MAX_ACTOR_EVENT_BATCH_EVENTS {
+            assert!(batcher
+                .push(serde_json::json!({"type":"token","content":"x"}))
+                .is_empty());
+        }
+        let batch = batcher
+            .push(serde_json::json!({"type":"token","content":"x"}))
+            .pop()
+            .unwrap();
+        assert_eq!(batch.qos, ActorEventQos::Durable);
+        assert_eq!(batch.events.len(), MAX_ACTOR_EVENT_BATCH_EVENTS);
+        assert_eq!(
+            (batch.first_seq, batch.last_seq),
+            (1, MAX_ACTOR_EVENT_BATCH_EVENTS as u64)
+        );
+        assert!(batch.validate().is_ok());
+        assert!(!batcher.has_pending());
     }
 
     #[test]
