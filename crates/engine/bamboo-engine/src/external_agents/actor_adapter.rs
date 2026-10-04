@@ -4824,17 +4824,39 @@ impl PlainActorActivation {
             } else {
                 // Full current-prefix AlreadyCheckpointed readback still checks
                 // the actual physical owner. A local worker receipt is insufficient.
-                self.input_inbox
-                    .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
-                        fence: self.fence.clone(),
-                        expected_created_at: self.created_at,
-                        claim: claim.clone(),
-                        expected_messages: actual.messages.clone(),
-                        expected_provider_transcript: actual.provider_transcript.clone(),
-                        expected_admission: actual.session_inbox_admission().cloned(),
-                    })
-                    .await
-                    .map_err(|_| plain_actor_unsupported())?;
+                let checkpoint = bamboo_storage::ActorInputCheckpoint {
+                    fence: self.fence.clone(),
+                    expected_created_at: self.created_at,
+                    claim: claim.clone(),
+                    expected_messages: actual.messages.clone(),
+                    expected_provider_transcript: actual.provider_transcript.clone(),
+                    expected_admission: actual.session_inbox_admission().cloned(),
+                };
+                let mut retries = 0;
+                loop {
+                    let result = self
+                        .input_inbox
+                        .checkpoint_actor_input(checkpoint.clone())
+                        .await;
+                    if matches!(
+                        &result,
+                        Err(bamboo_storage::ActorInputCheckpointError::PrefixConflict)
+                    ) && retries < 3
+                    {
+                        // As at initial checkpoint, this error guarantees no
+                        // publication. Repeat the identical prefix, claim and
+                        // fence; a Parent's ordinary save grants no authority.
+                        tracing::warn!(retries, "Actor initial release prefix changed before publication; retrying same claim");
+                        tokio::time::sleep(Duration::from_millis(10 << retries)).await;
+                        retries += 1;
+                        continue;
+                    }
+                    result.map_err(|error| {
+                        tracing::warn!(%error, "Actor initial release checkpoint rejected or unconfirmed");
+                        plain_actor_unsupported()
+                    })?;
+                    break;
+                }
                 self.confirm_input(
                     binding,
                     &actual,
