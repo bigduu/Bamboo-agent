@@ -94,18 +94,25 @@ No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it use
 
 ### Call it from your application
 
-With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → execute → events**. `chat` persists the message; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports.
+With a configured provider and running server, the legacy HTTP/SSE sequence is **chat → subscribe → execute**. `chat` persists the message; `execute` starts the agent loop. The example requires `curl` and `jq`; replace the model with one your account supports. In terminal A, create the session and open its live event stream:
 
 ```bash
 SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"Say hello.","model":"YOUR_MODEL_ID"}' | jq -r .session_id)
-curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
-  -H 'Content-Type: application/json' -d '{}'
-curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
+printf 'Session: %s\n' "$SID"
+curl -iNfsS "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
+Keep terminal A open. Once its HTTP 200 response headers appear, copy the printed session ID into terminal B and start the run:
+
+```bash
+SID="<session-id printed in terminal A>"
+curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+Watch terminal A for live events; subscribing after execution can miss response tokens. The browser uses the shared `/v2/stream` WebSocket; legacy SSE routes remain available.
 
 ### Use it as a Rust SDK (in-process)
 

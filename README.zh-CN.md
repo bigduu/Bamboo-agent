@@ -94,18 +94,25 @@ Headless 运行使用完整 agent 运行时和已配置的 provider。交互式 
 
 ### 接入自己的应用
 
-配置 provider 并启动服务后，legacy HTTP/SSE 调用顺序为 **chat → execute → events**。`chat` 保存消息，`execute` 才启动 agent loop。示例需要 `curl` 和 `jq`，请把模型名替换为账号支持的模型。
+配置 provider 并启动服务后，legacy HTTP/SSE 调用顺序为 **chat → 订阅事件 → execute**。`chat` 保存消息，`execute` 才启动 agent loop。示例需要 `curl` 和 `jq`，请把模型名替换为账号支持的模型。在终端 A 创建会话并打开实时事件连接：
 
 ```bash
 SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"你好。","model":"YOUR_MODEL_ID"}' | jq -r .session_id)
-curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
-  -H 'Content-Type: application/json' -d '{}'
-curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
+printf 'Session: %s\n' "$SID"
+curl -iNfsS "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
-浏览器使用共享的 `/v2/stream` WebSocket，legacy SSE 路由仍可用。
+保持终端 A 打开。看到 HTTP 200 响应头后，将打印的会话 ID 复制到终端 B，再启动运行：
+
+```bash
+SID="<终端 A 打印的会话 ID>"
+curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+在终端 A 查看实时事件；执行后才订阅可能丢失响应 token。浏览器使用共享的 `/v2/stream` WebSocket，legacy SSE 路由仍可用。
 
 ### 作为进程内 Rust SDK 使用
 
