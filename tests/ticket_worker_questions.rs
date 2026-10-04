@@ -15,32 +15,39 @@ async fn views(f: &Fixture, ids: &[String]) -> Value {
     )
     .await
 }
-fn completed_question(f: &Fixture, row: &Value) -> bool {
+async fn completed_question(store: &bamboo_storage::SessionStoreV2, row: &Value) -> bool {
+    use bamboo_agent_core::storage::Storage;
     let Some(id) = row["assignments"][0]["runtime"]["session_id"].as_str() else {
         return false;
     };
-    let path = f
-        .data
-        .join("sessions/bamboo-default-supervisor/children")
-        .join(id)
-        .join("session.json");
-    let child: Option<Value> = std::fs::read(path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok());
-    child.is_some_and(|child| {
-        child["metadata"]["last_run_status"] == "completed"
-            && child["metadata"]["ticket.worker.question_yield.v1"].is_string()
-            && child["messages"]
-                .as_array()
-                .and_then(|rows| rows.last())
-                .is_some_and(|last| last["role"] == "tool")
-    })
+    let Ok(Some(child)) = store.load_session(id).await else {
+        return false;
+    };
+    child.last_run_status().as_deref() == Some("completed")
+        && child
+            .metadata
+            .contains_key("ticket.worker.question_yield.v1")
+        && child.messages.last().is_some_and(|last| {
+            serde_json::to_value(&last.role).ok().as_ref() == Some(&json!("tool"))
+        })
 }
-async fn await_views(f: &Fixture, ids: &[String], ready: impl Fn(&Value) -> bool) -> Value {
+
+async fn await_views(
+    f: &Fixture,
+    ids: &[String],
+    ready: impl Fn(&Value, &[bool]) -> bool,
+) -> Value {
+    let store = bamboo_storage::SessionStoreV2::new(f.data.clone())
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(40), async {
         loop {
             let value = views(f, ids).await;
-            if ready(&value) {
+            let mut completed = Vec::new();
+            for row in value["data"].as_array().unwrap() {
+                completed.push(completed_question(&store, row).await);
+            }
+            if ready(&value, &completed) {
                 break value;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -87,12 +94,17 @@ async fn five_native_questions_release_workers_survive_restart_and_answer_e_b_d_
     )
     .await;
     assert_eq!(dispatched["errors"], json!([]), "{dispatched}");
-    let pending = await_views(&f, &ids, |v| {
-        v["data"].as_array().unwrap().iter().all(|row| {
-            row["requests"].as_array().unwrap().len() == 1
-                && row["assignments"][0]["process_stopped"] == true
-                && completed_question(&f, row)
-        })
+    let pending = await_views(&f, &ids, |v, completed| {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(completed)
+            .all(|(row, completed)| {
+                row["requests"].as_array().unwrap().len() == 1
+                    && row["assignments"][0]["process_stopped"] == true
+                    && *completed
+            })
     })
     .await;
     assert_eq!(f.probe.questions.load(Ordering::SeqCst), 5);
@@ -149,7 +161,7 @@ async fn five_native_questions_release_workers_survive_restart_and_answer_e_b_d_
         .await;
         let resumed = post(&f.client, &f.base, "/tickets/dispatch", &fresh).await;
         assert_eq!(resumed["errors"], json!([]), "{resumed}");
-        let result = await_views(&f, &[works[letter].clone()], |v| {
+        let result = await_views(&f, &[works[letter].clone()], |v, _| {
             v["data"][0]["ticket"]["state"] == "submitted"
         })
         .await;
@@ -166,4 +178,48 @@ async fn five_native_questions_release_workers_survive_restart_and_answer_e_b_d_
         5
     );
     f.finish().await;
+}
+
+#[actix_web::test]
+async fn question_waiter_reads_completed_runtime_sidecar_over_stale_main() {
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::{Message, Session};
+    let temp = tempfile::tempdir().unwrap();
+    let store = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+        .await
+        .unwrap();
+    let root = Session::new("bamboo-default-supervisor", "fixture-model");
+    store.save_session(&root).await.unwrap();
+    let mut child = Session::new_child(
+        "runtime-only-question",
+        &root.id,
+        "fixture-model",
+        "Question",
+    );
+    child.metadata.insert(
+        "ticket.worker.question_yield.v1".into(),
+        "request-id".into(),
+    );
+    child.add_message(Message::tool_result("question-tool", "request created"));
+    child.set_last_run_status("running");
+    store.save_session(&child).await.unwrap();
+    let main_path = temp
+        .path()
+        .join(store.resolve_rel_path(&child.id).await.unwrap())
+        .join("session.json");
+    let before = std::fs::read(&main_path).unwrap();
+    child.set_last_run_status("completed");
+    store.save_runtime_state(&child).await.unwrap();
+    assert_eq!(
+        std::fs::read(&main_path).unwrap(),
+        before,
+        "runtime-only write preserves Main bytes"
+    );
+    let canonical = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(canonical.last_run_status().as_deref(), Some("completed"));
+    let row = json!({"assignments":[{"runtime":{"session_id":child.id}}]});
+    assert!(
+        completed_question(&store, &row).await,
+        "completed canonical Child must not be rejected by stale Main metadata"
+    );
 }
