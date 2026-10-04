@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use actix_web::{web, App, HttpResponse, HttpServer};
-use bamboo_agent_core::storage::Storage;
+use bamboo_agent_core::{storage::Storage, AgentEvent};
 use bamboo_domain::{ActorActivationStatus, ActorDirectoryEntry, Role, Session};
 use bamboo_storage::SessionStoreV2;
 use chrono::Utc;
@@ -441,6 +441,24 @@ impl Fixture {
         self.store.load_session(ROOT).await.unwrap().unwrap()
     }
 
+    fn account_terminal_history(&self) -> Vec<Value> {
+        bamboo_engine::events::journal::read_since(&self.data.join("events"), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|frame| {
+                frame.session_id.as_deref() == Some(ROOT)
+                    && matches!(
+                        frame.event,
+                        AgentEvent::Complete { .. }
+                            | AgentEvent::Cancelled { .. }
+                            | AgentEvent::Error { .. }
+                            | AgentEvent::SessionHistoryCommitted { .. }
+                    )
+            })
+            .map(|frame| serde_json::to_value(frame).unwrap())
+            .collect()
+    }
+
     async fn history(&self, host: &Host) -> Option<Value> {
         let response = self
             .client
@@ -620,6 +638,18 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
         committed.model_context_state.is_some(),
         "B must establish an actual durable model context before testing stale replacement"
     );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let activation = fixture.authority().activation.unwrap();
+            assert_eq!(activation.run_id, response["run_id"].as_str().unwrap());
+            if activation.status == ActorActivationStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("B confirms its durable history publication before A resumes");
     let b = fixture.authority().activation.unwrap();
     let old = a.activation.as_ref().unwrap();
     assert!(b.attempt > old.attempt && b.lease_epoch > old.lease_epoch);
@@ -629,6 +659,21 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
     assert!(!fixture.probe.a_response_sent.load(Ordering::SeqCst));
     events.events.lock().unwrap().clear();
     account.events.lock().unwrap().clear();
+    // B's Succeeded activation follows its confirmed account publication. A
+    // is still stopped and has received no answer, so these exact durable
+    // frames belong to B. A's account sink may forward the shared journal's
+    // remote delta after resume; clearing the tap does not drain that delta.
+    let b_account_frames = fixture.account_terminal_history();
+    assert_eq!(
+        b_account_frames.len(),
+        2,
+        "only B completed and committed history while A was stopped: {b_account_frames:?}"
+    );
+    assert_eq!(b_account_frames[0]["event"]["type"], "complete");
+    assert_eq!(
+        b_account_frames[1]["event"]["type"],
+        "session_history_committed"
+    );
     fixture.a.signal("-CONT");
     fixture.probe.release_a.send_replace(true);
     tokio::time::timeout(WAIT,async {
@@ -709,10 +754,18 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
         observed
     );
     let account_events = account.events.lock().unwrap().clone();
+    assert_eq!(
+        fixture.account_terminal_history(),
+        b_account_frames,
+        "stale A cannot append any durable terminal/history result"
+    );
     assert!(
-        !account_events
-            .iter()
-            .any(|event| event.to_string().contains("session_history_committed")),
+        !account_events.iter().any(|frame| {
+            matches!(
+                frame["event"]["type"].as_str(),
+                Some("complete" | "cancelled" | "error" | "session_history_committed")
+            ) && !b_account_frames.contains(frame)
+        }),
         "stale A cannot publish the durable account-feed barrier: {account_events:?}"
     );
     if let Some(history) = fixture.history(&fixture.a).await {
