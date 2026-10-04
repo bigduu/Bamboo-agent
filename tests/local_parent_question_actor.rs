@@ -62,8 +62,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             0 => {
                 probe.first_child_ready.store(true, Ordering::SeqCst);
                 tokio::time::timeout(Duration::from_secs(60), async {
-                    while !probe.release_first_child.load(Ordering::SeqCst) {
-                        probe.wake.notified().await;
+                    loop {
+                        // notify_waiters retains notifications only for futures
+                        // created before the release flag can change.
+                        let notified = probe.wake.notified();
+                        if probe.release_first_child.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
                     }
                 })
                 .await
@@ -87,8 +93,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 assert_eq!(answers.len(), 1, "Child sees one canonical answer");
                 probe.second_child_ready.store(true, Ordering::SeqCst);
                 tokio::time::timeout(Duration::from_secs(60), async {
-                    while !probe.release_second_child.load(Ordering::SeqCst) {
-                        probe.wake.notified().await;
+                    loop {
+                        // notify_waiters retains notifications only for futures
+                        // created before the release flag can change.
+                        let notified = probe.wake.notified();
+                        if probe.release_second_child.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
                     }
                 })
                 .await
