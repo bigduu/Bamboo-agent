@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Tool execution and integrations for the Bamboo agent framework"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }

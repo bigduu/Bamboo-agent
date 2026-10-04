@@ -867,6 +867,93 @@ impl Drop for Host {
         let _ = self.0.wait();
     }
 }
+fn fixture_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        // Provider/fault cuts can outlive the Host's idle keep-alive window.
+        // Poll the live service on a fresh connection, without transport retry.
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_survives_idle_peer_close() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    fn accept_bounded(listener: &TcpListener) -> std::io::Result<TcpStream> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((peer, _)) => return Ok(peer),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn sessions_reply(peer: &mut TcpStream) -> std::io::Result<()> {
+        peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            peer.read_exact(&mut byte)?;
+            request.push(byte[0]);
+            assert!(request.len() < 8192, "bounded request head");
+        }
+        assert!(request.starts_with(b"GET /api/v1/sessions HTTP/1.1"));
+        let body = r#"{"sessions":[{"id":"plain-root","is_running":false}]}"#;
+        write!(
+            peer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )?;
+        peer.flush()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/api/v1/sessions", listener.local_addr().unwrap());
+    let (close_tx, close_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut first = accept_bounded(&listener)?;
+        sessions_reply(&mut first)?;
+        close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let _ = first.shutdown(Shutdown::Both);
+        closed_tx.send(()).unwrap();
+        // The service remains alive and accepts the next connection. Only
+        // the idle peer closes, as when the Host's keep-alive timer expires.
+        let mut second = accept_bounded(&listener)?;
+        sessions_reply(&mut second)
+    });
+    let client = fixture_http_client();
+    let first: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    close_tx.send(()).unwrap();
+    // Keep this current-thread client reactor from consuming the idle EOF
+    // until the peer confirms closure. No wall-clock expiry or retry is used.
+    closed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let second = client.get(&url).send().await;
+    let second = match second {
+        Ok(response) => response.json::<Value>().await,
+        Err(error) => Err(error),
+    };
+    let served = server.join().unwrap();
+    assert!(
+        second.is_ok(),
+        "sessions poll after idle peer close: {second:?}"
+    );
+    assert_eq!(second.unwrap(), first);
+    served.expect("live service accepted the second poll");
+}
+
 fn start(data: &Path, port: u16) -> Host {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -995,11 +1082,7 @@ async fn fixture_with_followups(
         .port();
     let mut host = start(&data, port);
     let base = format!("http://127.0.0.1:{port}/api/v1");
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
+    let client = fixture_http_client();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             assert!(

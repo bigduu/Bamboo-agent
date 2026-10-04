@@ -105,6 +105,23 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Re-read and reconcile an execution's inherited child wait under the
+    /// physical session lock, retain birth/fence checks, then save and publish.
+    async fn save_inherited_child_wait_finalized(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+        root_writer: Option<(RootActorRuntimeWrite, RootActorRuntimePublisher)>,
+    ) -> std::io::Result<()> {
+        let _ = (session, inherited, root_writer);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait finalization is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
     /// A backend without this authority protocol fails closed.
     async fn root_mode_operation(

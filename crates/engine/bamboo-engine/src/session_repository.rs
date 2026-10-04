@@ -609,6 +609,21 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_inherited_child_wait_and_publish(session, inherited, |saved, _| {
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
         self.persistence
             .seed_runtime_activation_and_publish(session, |saved, committed| {

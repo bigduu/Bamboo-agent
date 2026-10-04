@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Compression utilities for Bamboo sessions and memory workflows"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }
