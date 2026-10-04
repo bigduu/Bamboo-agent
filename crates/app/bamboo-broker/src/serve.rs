@@ -1544,7 +1544,8 @@ where
     let parent_actor = msg.from.clone();
     let parent = msg.from.session_id.clone();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()));
+    let mut event_batcher = ActorEventBatcher::for_run(&spec, None, Some(me.session_id.clone()))
+        .with_durable_events(executor.requires_contiguous_events());
 
     let (sink, mut events, mut controls) = EventSink::channel_with_control();
     // Steer: register this run's steer inbox so out-of-band Steer messages route in.
@@ -2070,6 +2071,9 @@ fn decode_steer_body(
         }
     }
 }
+
+#[cfg(test)]
+mod history_delivery_tests;
 
 #[cfg(test)]
 mod tests {

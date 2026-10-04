@@ -896,6 +896,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml",
  "tracing",
