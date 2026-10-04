@@ -43,6 +43,9 @@ const DIRECT_CONTROL_QUEUE_CAPACITY: usize = 32;
 const ACTOR_EVENT_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(20);
 const DIRECT_RUN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+#[cfg(test)]
+mod history_delivery_tests;
+
 /// Every connection/run owns its spawned helpers. A cancelled owner must not
 /// detach children merely because Tokio's plain JoinHandle was dropped.
 struct OwnedTask<T>(Option<tokio::task::JoinHandle<T>>);
@@ -713,10 +716,12 @@ fn start_run<E: ChildExecutor + ?Sized>(
 ) -> ActiveRun {
     let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut batcher = ActorEventBatcher::for_run(&spec, None, None);
+    let mut batcher = ActorEventBatcher::for_run(&spec, None, None)
+        .with_durable_events(executor.requires_contiguous_events());
     let event_fwd = event_tx.clone();
     // All event batches share one ordered data lane. Durable batches wait for
-    // capacity; lossy data uses `try_send`, making overload observable as a
+    // capacity, including the complete trace of a strict history executor.
+    // Ordinary lossy data uses `try_send`, making overload observable as a
     // sequence gap. Approval/admission controls remain independent.
     let mut fwd = OwnedTask::new(tokio::spawn(async move {
         let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);

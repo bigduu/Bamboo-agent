@@ -1282,6 +1282,10 @@ impl bamboo_engine::external_agents::ChildApprovalReviewer for ModelApprovalRevi
 
 #[async_trait]
 impl ChildExecutor for BambooRuntimeExecutor {
+    fn requires_contiguous_events(&self) -> bool {
+        self.local_tool_history
+    }
+
     fn supports_environment_lease_v1(&self) -> bool {
         true
     }
@@ -3662,8 +3666,8 @@ mod tests {
         (temp, executor, store, provider, run)
     }
 
-    async fn assert_strict_local_history_read(with_reasoning: bool) {
-        use bamboo_subagent::proto::{ActorEventBatcher, ChildFrame, LocalToolMessages};
+    async fn assert_strict_local_history_read(with_reasoning: bool, over_broker: bool) {
+        use bamboo_subagent::proto::{ChildFrame, LocalToolMessages, ParentFrame};
         let (temp, executor, _store, provider, run) =
             strict_local_history_read_fixture(with_reasoning).await;
         let id = run.logical_session.as_ref().unwrap().session_id.clone();
@@ -3673,26 +3677,99 @@ mod tests {
             .cloned()
             .map(|message| serde_json::from_value(message).unwrap())
             .collect();
-        let (sink, mut receiver) = EventSink::channel();
-        let capture = tokio::spawn(async move {
-            let mut events = Vec::new();
-            while let Some(event) = receiver.recv().await {
-                events.push(event);
-            }
-            events
-        });
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            executor.run(
-                run.clone(),
-                sink,
-                SteerInbox::disconnected(),
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("strict local Read round trip must finish");
-        let events = capture.await.unwrap();
+        assert!(executor.requires_contiguous_events());
+        let shutdown = CancellationToken::new();
+        let mut broker_task = None;
+        let (mut client, worker): (Box<dyn bamboo_subagent::ChildLink>, _) = if over_broker {
+            let broker = Arc::new(bamboo_broker::BrokerServer::new(
+                Arc::new(bamboo_broker::BrokerCore::new(temp.path().join("broker"))),
+                "history-fixture",
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            broker_task = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    broker.serve(listener).await.unwrap();
+                },
+            )));
+            let worker_endpoint = endpoint.clone();
+            let stop = shutdown.clone();
+            let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                bamboo_broker::serve::serve_executor_with_shutdown(
+                    &worker_endpoint,
+                    bamboo_subagent::AgentRef {
+                        session_id: "history-worker".into(),
+                        role: None,
+                    },
+                    "history-fixture",
+                    Arc::new(executor),
+                    stop,
+                )
+                .await
+                .unwrap();
+            }));
+            let link = bamboo_broker::BrokerChildLink::connect(
+                &endpoint,
+                bamboo_subagent::AgentRef {
+                    session_id: "history-host".into(),
+                    role: None,
+                },
+                "history-fixture",
+                "history-worker",
+            )
+            .await
+            .unwrap();
+            (Box::new(link), worker)
+        } else {
+            let server = bamboo_subagent::transport::WsServer::bind_loopback()
+                .await
+                .unwrap();
+            let endpoint = server.ws_endpoint();
+            let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                // The trait-object client is dropped after the validated
+                // terminal, so its socket may close without a WS handshake.
+                let _ = server.serve_one(Arc::new(executor)).await;
+            }));
+            let link = bamboo_subagent::transport::ChildClient::connect(&endpoint)
+                .await
+                .unwrap();
+            (Box::new(link), worker)
+        };
+        client.send(ParentFrame::Run(run.clone())).await.unwrap();
+        let (events, status, error, report) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut events = Vec::new();
+                let mut next = 1;
+                loop {
+                    match client.next_frame().await.unwrap().expect("worker terminal") {
+                        ChildFrame::EventBatch { batch } => {
+                            batch.validate().unwrap();
+                            assert_eq!(batch.qos, bamboo_subagent::ActorEventQos::Durable);
+                            assert_eq!(batch.first_seq, next);
+                            next = batch.last_seq + 1;
+                            events.extend(batch.events);
+                        }
+                        ChildFrame::Terminal {
+                            status,
+                            error,
+                            result,
+                            ..
+                        } => {
+                            break (events, status, error, result);
+                        }
+                        other => panic!("unexpected strict history frame: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("strict local Read transport round trip must finish");
+        drop(client);
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("finished history worker drains")
+            .unwrap();
+        drop(broker_task);
         let cold_store = SessionStoreV2::new(temp.path().join("worker"))
             .await
             .unwrap();
@@ -3796,35 +3873,13 @@ mod tests {
         assert_eq!(observed.result, result.content);
         assert!(observed.success);
 
-        let mut batcher = ActorEventBatcher::for_run(&run, None, Some("fixture-worker".into()));
-        let mut batches = Vec::new();
-        for event in &events {
-            batches.extend(batcher.push(event.clone()));
-        }
-        batches.extend(batcher.flush());
-        let mut next = 1;
-        let mut decoded = Vec::new();
-        for batch in batches {
-            batch.validate().unwrap();
-            assert_eq!(batch.first_seq, next);
-            next = batch.last_seq + 1;
-            let wire = ChildFrame::EventBatch { batch }.to_text();
-            let ChildFrame::EventBatch { batch } = ChildFrame::from_text(&wire).unwrap() else {
-                unreachable!()
-            };
-            decoded.extend(batch.events);
-        }
-        assert_eq!(
-            decoded, events,
-            "the real wire encoder must retain every event"
-        );
         let completions: Vec<_> = events
             .iter()
             .filter(|event| event["type"] == LocalToolMessages::TYPE)
             .collect();
-        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
-        assert!(outcome.error.is_none());
-        assert_eq!(outcome.result.as_deref(), Some(LOCAL_HISTORY_REPORT));
+        assert_eq!(status, bamboo_subagent::TerminalStatus::Completed);
+        assert!(error.is_none());
+        assert_eq!(report.as_deref(), Some(LOCAL_HISTORY_REPORT));
         assert_eq!(completions.len(), 1);
         let completion: LocalToolMessages = serde_json::from_value(completions[0].clone()).unwrap();
         let messages = completion.validate().unwrap();
@@ -3837,12 +3892,16 @@ mod tests {
 
     #[tokio::test]
     async fn strict_local_history_plain_read_preserves_complete_worker_messages_and_events() {
-        assert_strict_local_history_read(false).await;
+        for over_broker in [false, true] {
+            assert_strict_local_history_read(false, over_broker).await;
+        }
     }
 
     #[tokio::test]
     async fn strict_local_history_reasoning_read_preserves_complete_worker_history_on_completion() {
-        assert_strict_local_history_read(true).await;
+        for over_broker in [false, true] {
+            assert_strict_local_history_read(true, over_broker).await;
+        }
     }
 
     #[tokio::test]
