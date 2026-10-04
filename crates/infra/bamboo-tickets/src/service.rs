@@ -1212,6 +1212,7 @@ fn apply(
             authority.worker(&a)?;
             active_permit(snapshot, &a)?;
             if attempt_id.is_empty()
+                || attempt_id.starts_with("worker-file/")
                 || !matches!(&request.kind, RequestKind::Approval { fingerprint: actual, .. } if actual == fingerprint)
                 || request.generation != a.generation
                 || request.contract_revision != a.contract_revision
@@ -1225,6 +1226,11 @@ fn apply(
             }
             if request.status != RequestStatus::Approved {
                 return Err(invalid("action is not approved or already consumed"));
+            }
+            if a.effects.contains_key(attempt_id) {
+                return Err(invalid(
+                    "action attempt already belongs to another approval",
+                ));
             }
             let request = snapshot.requests.get_mut(request_id).expect("request");
             request.status = RequestStatus::Consumed;

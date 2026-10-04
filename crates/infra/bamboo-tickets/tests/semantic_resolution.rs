@@ -292,6 +292,9 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         ("If CI passes, I accept A", "I accept A"),
         ("I accept A, when CI passes", "I accept A"),
         ("例如，确认验收 A", "确认验收 A"),
+        ("确认验收 A，前提是 CI 通过", "确认验收 A"),
+        ("只有 CI 通过，确认验收 A", "确认验收 A"),
+        ("确认验收 A，除非 CI 失败", "确认验收 A"),
         ("确认验收A", "确认验收A"),
     ])
     .enumerate()
@@ -856,6 +859,111 @@ fn explicit_approval_amount_requires_the_complete_exact_action_value() {
             }
         );
     }
+}
+
+#[test]
+fn approval_quote_cannot_discard_amount_or_conditions_in_its_human_sentence() {
+    for (text, approved) in [
+        ("批准 A，金额 200 CNY", false),
+        ("金额 200 CNY，批准 A", false),
+        ("批准 A, amount 200 CNY", false),
+        ("批准 A，前提是 CI 通过", false),
+        ("批准 A，条件是 CI 通过", false),
+        ("只有 CI 通过，批准 A", false),
+        ("批准 A，除非 CI 失败", false),
+        ("批准 A，金额 100 CNY", true),
+        ("金额 200 CNY；批准 A，金额 100 CNY", true),
+        ("批准 A，前提是 CI 通过；批准 A", false),
+    ] {
+        let (_dir, service) = fixture();
+        let work = create(&service, "A");
+        let request = ask(&service, &work, "A", true);
+        register(&service, "sentence", 1, text);
+        save(
+            &service,
+            "sentence",
+            vec![group("approve", "批准 A", vec![decision(&request, true)])],
+        );
+        let result = service.settle_message(&human(), "sentence").unwrap();
+        assert_eq!(
+            result.groups[0].status,
+            if approved {
+                ResolutionStatus::Committed
+            } else {
+                ResolutionStatus::NeedsClarification
+            },
+            "{text}"
+        );
+        assert_eq!(
+            service.published().unwrap().1.requests[&request.id].status,
+            if approved {
+                RequestStatus::Approved
+            } else {
+                RequestStatus::Open
+            }
+        );
+    }
+}
+
+#[test]
+fn multiple_current_approvals_require_a_request_id_before_one_can_be_selected() {
+    let (_dir, service) = fixture();
+    let work = create(&service, "A");
+    let first = ask(&service, &work, "vendor-one", true);
+    let second = ask(&service, &work, "vendor-two", true);
+    for (seq, text, approve) in [
+        (1, "批准 A".to_owned(), true),
+        (2, format!("批准 {work}"), true),
+        (3, "拒绝 A".to_owned(), false),
+    ] {
+        let id = format!("ambiguous-request-{seq}");
+        register(&service, &id, seq, &text);
+        save(
+            &service,
+            &id,
+            vec![group("decide", &text, vec![decision(&first, approve)])],
+        );
+        assert_eq!(
+            service.settle_message(&human(), &id).unwrap().groups[0].status,
+            ResolutionStatus::NeedsClarification
+        );
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(snapshot.requests[&first.id].status, RequestStatus::Open);
+        assert_eq!(snapshot.requests[&second.id].status, RequestStatus::Open);
+    }
+    let text = format!("批准 {}", first.id);
+    register(&service, "exact-request", 4, &text);
+    save(
+        &service,
+        "exact-request",
+        vec![group("first", &text, vec![decision(&first, true)])],
+    );
+    assert_eq!(
+        service
+            .settle_message(&human(), "exact-request")
+            .unwrap()
+            .groups[0]
+            .status,
+        ResolutionStatus::Committed
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&second.id].status,
+        RequestStatus::Open
+    );
+    register(&service, "only-current-request", 5, "批准 A");
+    save(
+        &service,
+        "only-current-request",
+        vec![group("second", "批准 A", vec![decision(&second, true)])],
+    );
+    assert_eq!(
+        service
+            .settle_message(&human(), "only-current-request")
+            .unwrap()
+            .groups[0]
+            .status,
+        ResolutionStatus::Committed
+    );
 }
 
 #[test]

@@ -117,37 +117,48 @@ fn request<'a>(snapshot: &'a Snapshot, target: &RequestReference) -> Result<&'a 
 }
 
 fn conditional_text(text: &str) -> bool {
-    text.split(|c: char| !c.is_alphabetic()).any(|word| {
-        matches!(
-            word,
-            "if" | "when"
-                | "unless"
-                | "once"
-                | "until"
-                | "assuming"
-                | "provided"
-                | "before"
-                | "after"
-                | "conditional"
-                | "contingent"
-        )
-    })
+    [
+        "如果", "假如", "假设", "例如", "比如", "前提", "条件", "除非", "只有", "只要", "一旦",
+        "等到", "仅当", "之后", "以后",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || text.split(|c: char| !c.is_alphabetic()).any(|word| {
+            matches!(
+                word,
+                "if" | "when"
+                    | "unless"
+                    | "once"
+                    | "until"
+                    | "assuming"
+                    | "provided"
+                    | "before"
+                    | "after"
+                    | "conditional"
+                    | "contingent"
+            )
+        })
 }
 
-fn unconditional_human_context(record: &HumanIngressRecord, quote: &str) -> bool {
+fn human_sentence<'a>(record: &'a HumanIngressRecord, quote: &str) -> Option<&'a str> {
     // A comma may separate a condition from its action. The model cannot
     // discard that condition by quoting only the affirmative fragment. A
     // separate sentence/semicolon action retains its own approval evidence.
-    record.text.split(['；', ';', '。', '\n']).any(|sentence| {
-        let lower = sentence.to_lowercase();
-        sentence
-            .split(['，', ','])
-            .any(|part| part.trim() == quote.trim())
-            && !conditional_text(&lower)
-            && !["如果", "假如", "假设", "例如", "比如"]
-                .iter()
-                .any(|marker| lower.contains(marker))
-    })
+    let mut matches = record
+        .text
+        .split(['；', ';', '。', '\n'])
+        .filter(|sentence| {
+            sentence
+                .split(['，', ','])
+                .any(|part| part.trim() == quote.trim())
+        });
+    let sentence = matches.next()?;
+    matches.next().is_none().then_some(sentence)
+}
+
+fn unconditional_human_context(record: &HumanIngressRecord, quote: &str) -> bool {
+    human_sentence(record, quote)
+        .is_some_and(|sentence| !conditional_text(&sentence.to_lowercase()))
 }
 
 fn explicit_amount_matches(text: &str, amount: Option<&str>) -> bool {
@@ -227,7 +238,19 @@ fn approval_text(
     approve: bool,
 ) -> Result<()> {
     let work = &snapshot.tickets[&q.work_id];
-    if !(exact_name(quote, &q.id) || names_work(snapshot, quote, work)) {
+    let unique_approval = snapshot
+        .requests
+        .values()
+        .filter(|other| {
+            other.work_id == q.work_id
+                && other.generation == q.generation
+                && other.contract_revision == q.contract_revision
+                && other.status == RequestStatus::Open
+                && matches!(other.kind, RequestKind::Approval { .. })
+        })
+        .count()
+        == 1;
+    if !(exact_name(quote, &q.id) || (unique_approval && names_work(snapshot, quote, work))) {
         return Err(clarify(
             "approval must identify one exact current Work/request",
         ));
@@ -302,7 +325,9 @@ fn approval_text(
             ));
         }
         if let RequestKind::Approval { action, .. } = &q.kind {
-            if !explicit_amount_matches(&lower, action.amount.as_deref()) {
+            if human_sentence(record, quote).is_none_or(|sentence| {
+                !explicit_amount_matches(&sentence.to_lowercase(), action.amount.as_deref())
+            }) {
                 return Err(clarify(
                     "explicit Human amount must exactly match the approved action",
                 ));

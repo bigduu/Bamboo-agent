@@ -605,6 +605,106 @@ fn approval_is_exact_question_answer_cannot_authorize_and_consumption_is_bound()
 }
 
 #[test]
+fn a_second_approval_cannot_overwrite_an_existing_action_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TicketService::open(dir.path(), binding()).unwrap();
+    let work = create(&service, "A", BTreeSet::new());
+    let (assignment, worker) = start(&service, &work, "start");
+    let action = Action {
+        kind: "payment".into(),
+        target: "A".into(),
+        data_hash: content_hash(b"data"),
+        amount: Some("10 CNY".into()),
+        permissions: BTreeSet::new(),
+        risk: "fixture only".into(),
+    };
+    let fingerprint = content_hash(&canonical_bytes(&action).unwrap());
+    let mut requests = Vec::new();
+    for i in 0..2 {
+        let request = execute(
+            &service,
+            &worker,
+            &format!("ask-{i}"),
+            vec![Operation::Ask {
+                work_id: work.clone(),
+                temp_id: "q".into(),
+                prompt: "Approve the exact action".into(),
+                action: Some(action.clone()),
+            }],
+        )
+        .ids["q"]
+            .clone();
+        execute(
+            &service,
+            &user(),
+            &format!("approve-{i}"),
+            vec![Operation::DecideApproval {
+                request_id: request.clone(),
+                prompt_revision: 1,
+                fingerprint: fingerprint.clone(),
+                approve: true,
+            }],
+        );
+        requests.push(request);
+    }
+    let consume = |request_id: &str, attempt_id: &str| Operation::ConsumeApproval {
+        request_id: request_id.into(),
+        fingerprint: fingerprint.clone(),
+        attempt_id: attempt_id.into(),
+    };
+    execute(
+        &service,
+        &worker,
+        "consume-first",
+        vec![consume(&requests[0], "same-id")],
+    );
+    execute(
+        &service,
+        &worker,
+        "started",
+        vec![Operation::RecordEffect {
+            assignment_id: assignment.clone(),
+            attempt_id: "same-id".into(),
+            effect: Effect {
+                action_fingerprint: fingerprint.clone(),
+                state: EffectState::Started,
+                provider_receipt: None,
+                artifact: None,
+                file_intent: None,
+            },
+        }],
+    );
+    let before = service.published().unwrap();
+    for (id, attempt) in [("collision", "same-id"), ("reserved", "worker-file/new")] {
+        assert!(service
+            .execute(
+                &worker,
+                &command(&service, id, vec![consume(&requests[1], attempt)])
+            )
+            .is_err());
+        assert_eq!(service.published().unwrap().0, before.0);
+        assert_eq!(
+            service.published().unwrap().1.requests[&requests[1]].status,
+            RequestStatus::Approved
+        );
+    }
+    execute(
+        &service,
+        &worker,
+        "replay-first",
+        vec![consume(&requests[0], "same-id")],
+    );
+    assert_eq!(
+        service.published().unwrap().1.assignments[&assignment].effects,
+        before.1.assignments[&assignment].effects
+    );
+    assert_eq!(
+        service.published().unwrap().1.requests[&requests[1]].status,
+        RequestStatus::Approved
+    );
+}
+
+#[test]
 fn late_generation_is_archived_and_never_reverses_cancel_or_current_submission() {
     let dir = tempfile::tempdir().unwrap();
     let service = TicketService::open(dir.path(), binding()).unwrap();
