@@ -34,7 +34,7 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 | 🧠 **Memory system** | Session notes, Jiandu-owned derived Dream snapshots, and cross-session durable memory, with auto-dream and background gardener |
 | 🗜️ **Context compression** | Hybrid compression with rolling summary + recent-window retention, automatic trimming of oversized tool output, executed against the model's context-window budget |
 | 🛠️ **Built-in tools** | 19 built-in tools: files, images, search, Shell, Web fetch, tasks, permission requests, and more |
-| 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in docx / pdf / pptx / xlsx / skill-creator |
+| 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in workflow skills and skill-creator |
 | 🔌 **MCP** | Model Context Protocol client that hooks into external tool servers |
 | ⏰ **Workflows & schedules** | Declarative workflow loading + a cron-style schedule trigger engine |
 | 🌐 **HTTP / WebSocket / SSE** | Actix server, REST API, shared `/v2/stream` WebSocket, legacy SSE feeds, and OpenAI / Anthropic / Gemini-compatible endpoints |
@@ -138,7 +138,7 @@ Long conversations don't grow without bound. Bamboo uses a **hybrid strategy**: 
 
 Skills are enableable capability bundles. At runtime it resolves the "selected skills" from session metadata (supporting JSON arrays or the legacy comma-separated format), and performs lightweight, request-hint-based relevance selection for **unselected skills** to inject into context (capped at `MAX_UNSELECTED_SKILLS_IN_CONTEXT = 24`), avoiding stuffing every skill into the prompt. It also includes access control and runtime metadata.
 
-Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill-creator`.
+Built-in skills live in `builtin_skills/`: `debug`, `personal-assistant`, `plan`, `research`, `review`, `simplify`, and `skill-creator`.
 
 ### Tools, Workflows, Schedules, MCP
 
@@ -485,4 +485,7 @@ cargo build --release
 
 ## License
 
-MIT
+Project-owned code is licensed under the [MIT License](./LICENSE).
+Third-party materials retain their own licenses and copyright notices:
+
+- `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).

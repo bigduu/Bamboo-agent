@@ -4170,6 +4170,12 @@ Use this skill for testing.
 
         let skills = store.list_skills(None, false).await;
         assert!(skills.iter().any(|skill| skill.id == "skill-creator"));
+        for removed in ["docx", "pdf", "pptx", "xlsx"] {
+            assert!(skills.iter().all(|skill| skill.id != removed));
+            assert!(!SkillStore::builtin_skills_dir(&store.config.skills_dir)
+                .join(removed)
+                .exists());
+        }
     }
 
     #[tokio::test]

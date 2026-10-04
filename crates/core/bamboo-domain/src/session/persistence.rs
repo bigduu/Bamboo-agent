@@ -176,6 +176,23 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Finalize a wait inherited by this execution. Backends must reconcile
+    /// against durable state inside their cross-process write transaction.
+    /// Unsupported adapters fail closed rather than reopen a read/save race.
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+    ) -> io::Result<()> {
+        let _ = (session, inherited);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "atomic inherited child wait finalization is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Authoritatively seed one validated actor activation.
     ///
     /// Unlike an ordinary runtime save, the incoming RunSpec posture and its
@@ -543,6 +560,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_finalized_runtime_session(session).await
+    }
+
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &crate::session::runtime_state::WaitingForChildrenState,
+    ) -> io::Result<()> {
+        (**self)
+            .save_finalized_runtime_with_inherited_child_wait(session, inherited)
+            .await
     }
 
     async fn seed_runtime_activation(&self, session: &mut Session) -> io::Result<()> {
