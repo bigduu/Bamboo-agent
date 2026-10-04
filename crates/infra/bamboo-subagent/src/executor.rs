@@ -409,6 +409,13 @@ impl SteerInbox {
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
+    /// The Host validates this executor's complete event trace before admitting
+    /// its history. Transport may coalesce events but must not drop batches.
+    /// Ordinary observation-only executors retain their existing lossy lanes.
+    fn requires_contiguous_events(&self) -> bool {
+        false
+    }
+
     /// Advertise only when `run` validates EnvironmentLease before executing
     /// provider or tools. The broker binds this claim to the authenticated
     /// subscriber connection; an older worker defaults to unsupported.
