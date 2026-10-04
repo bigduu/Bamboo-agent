@@ -301,6 +301,18 @@ impl Host {
         self.stopped = signal == "-STOP";
     }
 
+    fn plain_rejections(&self) -> String {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("plain Actor continuation unsupported"))
+            .rev()
+            .take(8)
+            .map(|line| line.chars().take(2048).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn tail(&self) -> String {
         let text = std::fs::read_to_string(&self.log).unwrap_or_default();
         text.lines()
@@ -774,7 +786,26 @@ async fn replacement_fixture(delayed_release: bool) {
     .await;
     let child = store.load_session(&id).await.unwrap().unwrap();
     let authority = store.inspect_actor(&id).await.unwrap();
-    assert!(admitted.is_ok(),"independent Host must admit the queued input before provider; result={replacement_result}; Child status={:?}; error={:?}; authority={authority:?}; B={}",child.last_run_status(),child.last_run_error(),b.tail());
+    assert!(
+        admitted.is_ok(),
+        "independent Host must admit the queued input before provider; result={replacement_result}; Child status={:?}; error={:?}; authority={authority:?}; A_rejections={}; B_rejections={}; release_controls={:?}; B={}",
+        child.last_run_status(),
+        child.last_run_error(),
+        a.plain_rejections(),
+        b.plain_rejections(),
+        proxies.as_ref().map(|(a, b)| {
+            let requests = |proxy: &ReleaseProxy| proxy.requests().into_iter().map(|request| json!({
+                "child_id":request.child_id, "activation_run_id":request.activation_run_id,
+                "envelope_id":request.envelope_id, "generation":request.generation,
+                "execution_epoch":request.execution_epoch,
+            })).collect::<Vec<_>>();
+            json!({
+                "a_requests":requests(a), "a_release_count":a.releases().len(),
+                "b_requests":requests(b), "b_release_count":b.releases().len(),
+            })
+        }),
+        b.tail()
+    );
     tokio::time::timeout(WAIT, async {
         loop {
             let child = store.load_session(&id).await.unwrap().unwrap();

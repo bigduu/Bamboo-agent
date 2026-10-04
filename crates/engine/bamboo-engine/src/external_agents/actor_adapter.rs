@@ -2661,6 +2661,12 @@ impl ExternalChildRunner for ActorChildRunner {
             })
     }
 
+    #[tracing::instrument(
+        name = "actor_child_run",
+        level = "warn",
+        skip_all,
+        fields(child_session_id = %job.child_session_id, activation_run_id = tracing::field::Empty)
+    )]
     async fn execute_external_child(
         &self,
         session: &mut Session,
@@ -2792,7 +2798,7 @@ impl ExternalChildRunner for ActorChildRunner {
             )
             .await
             .map_err(|_| plain_actor_unsupported())?
-            .ok_or_else(plain_actor_unsupported)?;
+            .ok_or_else(|| plain_actor_unsupported())?;
             if root.id != session.root_session_id || root.kind != bamboo_domain::SessionKind::Root {
                 return Err(plain_actor_unsupported());
             }
@@ -3263,6 +3269,10 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
                 None => None,
             };
+            tracing::Span::current().record(
+                "activation_run_id",
+                bound_activation_run_id.as_deref().unwrap_or("unbound"),
+            );
             drop(delivery_tx);
             let initial_pairs = match (
                 session_inbox_runtime.as_ref(),
@@ -3373,11 +3383,11 @@ impl ExternalChildRunner for ActorChildRunner {
                     // a worker event or display placement cannot supply either.
                     let policy = permission_policy
                         .as_ref()
-                        .ok_or_else(plain_actor_unsupported)?;
+                        .ok_or_else(|| plain_actor_unsupported())?;
                     let config = self
                         .permission_config
                         .as_ref()
-                        .ok_or_else(plain_actor_unsupported)?;
+                        .ok_or_else(|| plain_actor_unsupported())?;
                     if config.policy_revision() != policy.revision
                         || !matches!(spec.placement, Placement::Local)
                     {
@@ -3979,7 +3989,7 @@ async fn require_unowned_glob(
     let rel = store
         .resolve_rel_path(&session.id)
         .await
-        .ok_or_else(plain_actor_unsupported)?;
+        .ok_or_else(|| plain_actor_unsupported())?;
     if !store.bamboo_home_dir().is_absolute()
         || rel
             != format!(
@@ -4037,7 +4047,16 @@ struct PlainActorActivation {
     recovering_pre_ack: bool,
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
+#[track_caller]
 fn plain_actor_unsupported() -> AgentError {
+    let source = std::panic::Location::caller();
+    tracing::warn!(
+        process_id = std::process::id(),
+        source_file = source.file(),
+        source_line = source.line(),
+        source_column = source.column(),
+        "plain Actor continuation unsupported"
+    );
     AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
@@ -4086,7 +4105,7 @@ fn pre_ack_input(
         .get("generation")
         .and_then(serde_json::Value::as_u64)
         .filter(|g| *g > 0)
-        .ok_or_else(plain_actor_unsupported)?;
+        .ok_or_else(|| plain_actor_unsupported())?;
     if message.role != Role::User
         || session
             .messages
@@ -4182,7 +4201,7 @@ impl PlainActorActivation {
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Self, AgentError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let run_id = run_id.ok_or_else(plain_actor_unsupported)?;
+            let run_id = run_id.ok_or_else(|| plain_actor_unsupported())?;
             let backlog = binding
                 .inbox
                 .inspect(&session.id)
@@ -4194,7 +4213,7 @@ impl PlainActorActivation {
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
             let config = permission_config
                 .as_ref()
-                .ok_or_else(plain_actor_unsupported)?;
+                .ok_or_else(|| plain_actor_unsupported())?;
             if entry.actor.policy_revision != Some(config.policy_revision())
                 || entry.actor.placement_intent != Some(bamboo_domain::ActorPlacementIntent::Local)
             {
@@ -4271,10 +4290,10 @@ impl PlainActorActivation {
                 .max_total_secs
                 .checked_add(60)
                 .and_then(chrono::Duration::try_seconds)
-                .ok_or_else(plain_actor_unsupported)?;
+                .ok_or_else(|| plain_actor_unsupported())?;
             let expires = now
                 .checked_add_signed(duration)
-                .ok_or_else(plain_actor_unsupported)?;
+                .ok_or_else(|| plain_actor_unsupported())?;
             let input_consumer = SessionInboxConsumerId::new();
             let input_deadline = expires.min(now + chrono::Duration::hours(1));
             let recovered = if let Some((id, generation)) = &recovery {
@@ -4290,7 +4309,7 @@ impl PlainActorActivation {
                     .claim_owned(&session.id, 1, Some(run_id), &lease)
                     .await
                     .map_err(|_| plain_actor_unsupported())?;
-                let claim = claims.pop().ok_or_else(plain_actor_unsupported)?;
+                let claim = claims.pop().ok_or_else(|| plain_actor_unsupported())?;
                 if claim.claim.envelope.id != *id
                     || claim.claim.generation != *generation
                     || !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
@@ -4379,7 +4398,7 @@ impl PlainActorActivation {
                 return Ok((activation, None));
             }
             let prepared = async {
-                let run_id = run_id.ok_or_else(plain_actor_unsupported)?;
+                let run_id = run_id.ok_or_else(|| plain_actor_unsupported())?;
                 let backlog = activation
                     .input_inbox
                     .inspect(&session.id)
@@ -4400,7 +4419,7 @@ impl PlainActorActivation {
                     None => activation
                         .claim_input(binding, session, run_id)
                         .await?
-                        .ok_or_else(plain_actor_unsupported)?,
+                        .ok_or_else(|| plain_actor_unsupported())?,
                 };
                 if claim.claim.generation != activation.inbox_generation {
                     return Err(plain_actor_unsupported());
@@ -4551,7 +4570,7 @@ impl PlainActorActivation {
                             .metadata
                             .as_mut()
                             .and_then(serde_json::Value::as_object_mut)
-                            .ok_or_else(plain_actor_unsupported)?
+                            .ok_or_else(|| plain_actor_unsupported())?
                             .remove("_bamboo_owned_input_checkpoint");
                         if !bamboo_domain::is_matching_session_message(&worker, &committed.envelope)
                         {
@@ -4632,7 +4651,7 @@ impl PlainActorActivation {
             let Some(claim) = self.claim_input(binding, session, run_id).await? else {
                 return Ok(None);
             };
-            let (run, epochs) = run.ok_or_else(plain_actor_unsupported)?;
+            let (run, epochs) = run.ok_or_else(|| plain_actor_unsupported())?;
             self.append_reply(session, text, event_tx).await?;
             let (messages, delivery) = self.checkpoint_input(session, run_id, &claim).await?;
             // Fresh actual Host audit, unchanged permission/ceiling checks.
@@ -4640,7 +4659,7 @@ impl PlainActorActivation {
             let epoch = epochs
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
-                .ok_or_else(plain_actor_unsupported)?;
+                .ok_or_else(|| plain_actor_unsupported())?;
             let mut next = run.clone();
             next.messages = messages;
             next.initial_session_messages = vec![delivery];
@@ -4663,7 +4682,7 @@ impl PlainActorActivation {
             return Err(plain_actor_unsupported());
         };
         let audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
-            .ok_or_else(plain_actor_unsupported)?;
+            .ok_or_else(|| plain_actor_unsupported())?;
         if audit.policy_revision != expected.policy_revision
             || audit.resolution != expected.resolution
             || audit.executor_mapping != expected.executor_mapping
@@ -4757,7 +4776,7 @@ impl PlainActorActivation {
                 bamboo_agent_core::storage::Storage::load_session(self.store.as_ref(), &session.id)
                     .await
                     .map_err(|_| plain_actor_unsupported())?
-                    .ok_or_else(plain_actor_unsupported)?;
+                    .ok_or_else(|| plain_actor_unsupported())?;
             if actual.created_at != session.created_at
                 || actual.root_session_id != session.root_session_id
                 || actual.parent_session_id != session.parent_session_id
@@ -4835,7 +4854,7 @@ impl PlainActorActivation {
                 bamboo_agent_core::storage::Storage::load_session(self.store.as_ref(), &session.id)
                     .await
                     .map_err(|_| plain_actor_unsupported())?
-                    .ok_or_else(plain_actor_unsupported)?;
+                    .ok_or_else(|| plain_actor_unsupported())?;
             self.store
                 .validate_fence(&self.fence, chrono::Utc::now())
                 .await
@@ -5285,7 +5304,10 @@ impl ReadOnlyActorCollector {
                     Ok(message)
                 })
                 .collect::<Result<_, _>>()?;
-            let (id, args) = self.start.as_ref().ok_or_else(plain_actor_unsupported)?;
+            let (id, args) = self
+                .start
+                .as_ref()
+                .ok_or_else(|| plain_actor_unsupported())?;
             let call = typed[0]
                 .tool_calls
                 .as_ref()
@@ -5296,7 +5318,7 @@ impl ReadOnlyActorCollector {
                         None
                     }
                 })
-                .ok_or_else(plain_actor_unsupported)?;
+                .ok_or_else(|| plain_actor_unsupported())?;
             if call.id != *id
                 || call.function.name != "Glob"
                 || serde_json::from_str::<serde_json::Value>(&call.function.arguments)
@@ -5372,7 +5394,7 @@ impl ReadOnlyActorCollector {
         }
     }
     fn finish(self, terminal: Option<&str>) -> Result<Vec<bamboo_agent_core::Message>, AgentError> {
-        let messages = self.messages.ok_or_else(plain_actor_unsupported)?;
+        let messages = self.messages.ok_or_else(|| plain_actor_unsupported())?;
         if terminal != Some(messages[2].content.as_str()) || messages[2].content.trim().is_empty() {
             return Err(plain_actor_unsupported());
         }
@@ -7309,11 +7331,11 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 bamboo_subagent::proto::InitialInputControl::decode(event).map_err(|_| plain_actor_unsupported())?
                             else { return Err(plain_actor_unsupported()); };
                             if !permission_handshake.posture_was_confirmed() || cancel_token.is_cancelled() { return Err(plain_actor_unsupported()); }
-                            let activation = plain_input.ok_or_else(plain_actor_unsupported)?;
-                            let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
-                            let (run, _) = plain_run.ok_or_else(plain_actor_unsupported)?;
+                            let activation = plain_input.ok_or_else(|| plain_actor_unsupported())?;
+                            let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
+                            let (run, _) = plain_run.ok_or_else(|| plain_actor_unsupported())?;
                             let claim = owned_input.as_ref().or_else(|| released_input.as_ref().map(|(claim, _)| claim))
-                                .ok_or_else(plain_actor_unsupported)?;
+                                .ok_or_else(|| plain_actor_unsupported())?;
                             let release = activation.release_initial_input(binding, logical_session, run, current_epoch, claim,
                                 &request, &mut expected_permission_posture, released_input.as_ref().map(|(_, release)| release)).await?;
                             if cancel_token.is_cancelled() { return Err(AgentError::Cancelled); }
@@ -7761,9 +7783,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                     Ok(Some(ChildFrame::SessionMessageAdmitted { confirmation })) => {
                         if let Some(activation) = plain_input {
                             if activation.initial_release_required { return Err(plain_actor_unsupported()); }
-                            let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
-                            let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
-                            let claim = owned_input.as_ref().ok_or_else(plain_actor_unsupported)?;
+                            let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
+                            let run_id = activation_run_id.ok_or_else(|| plain_actor_unsupported())?;
+                            let claim = owned_input.as_ref().ok_or_else(|| plain_actor_unsupported())?;
                             activation.confirm_input(binding, logical_session, run_id, claim, &confirmation).await?;
                             owned_input = None;
                             continue;
@@ -7898,23 +7920,23 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         }
                         if let Some(collector) = readonly.take() {
                             if status == TerminalStatus::Completed {
-                                let activation = plain_input.ok_or_else(plain_actor_unsupported)?;
+                                let activation = plain_input.ok_or_else(|| plain_actor_unsupported())?;
                                 let backlog = activation.input_inbox.inspect(&logical_session.id).await
                                     .map_err(|_| plain_actor_unsupported())?;
                                 if backlog.pending != 0 || backlog.claimed != 0 || backlog.activation_pending() {
                                     return Err(AgentError::LLM("Glob Actor continuation is unsupported; pending Inbox input is preserved".into()));
                                 }
-                                *readonly_output.as_deref_mut().ok_or_else(plain_actor_unsupported)? =
+                                *readonly_output.as_deref_mut().ok_or_else(|| plain_actor_unsupported())? =
                                     collector.finish(result.as_deref())?;
                             }
                         } else if let Some(activation) = plain_input {
                             if status == TerminalStatus::Completed {
-                                let binding = session_inbox_runtime.ok_or_else(plain_actor_unsupported)?;
-                                let run_id = activation_run_id.ok_or_else(plain_actor_unsupported)?;
+                                let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
+                                let run_id = activation_run_id.ok_or_else(|| plain_actor_unsupported())?;
                                 if continuations < continuation_limit {
                                     if let Some((claim, epoch)) = activation.continue_input(
                                         client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
-                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?, event_tx,
+                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(|| plain_actor_unsupported())?, event_tx,
                                     ).await? {
                                         owned_input = Some(claim);
                                         released_input = None;
@@ -7939,7 +7961,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     // without claiming/acking the excess input or saving
                                     // through the ordinary writer on this owned Actor.
                                     activation.append_reply(logical_session,
-                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(plain_actor_unsupported)?,
+                                        result.clone().filter(|text| !text.is_empty()).ok_or_else(|| plain_actor_unsupported())?,
                                         event_tx).await?;
                                     return Err(AgentError::LLM("Actor correction continuation limit reached; completed reply committed and remaining Inbox input preserved".into()));
                                 }
@@ -8232,6 +8254,53 @@ mod tests {
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
 
     include!("expired_plain_owner_tests.rs");
+
+    #[test]
+    fn plain_rejection_logs_branch_and_run_without_changing_error() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(output.reopen().unwrap())
+            .finish();
+        let branch_line = std::cell::Cell::new(0);
+        let error = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::warn_span!(
+                "actor_child_run",
+                child_session_id = %"diagnostic-child",
+                activation_run_id = tracing::field::Empty
+            );
+            let _entered = span.enter();
+            span.record("activation_run_id", "diagnostic-run");
+            None::<()>
+                .ok_or_else(|| {
+                    let caller_line = line!() + 1;
+                    let error = plain_actor_unsupported();
+                    branch_line.set(caller_line);
+                    error
+                })
+                .unwrap_err()
+        });
+        assert!(matches!(&error, AgentError::LLM(message)
+            if message.starts_with("This Actor Child supports a fresh plain activation,")
+                && message.ends_with("Other continuation is unsupported; durable history is preserved.")));
+        let log = std::fs::read_to_string(output.path()).unwrap();
+        assert!(log.contains("child_session_id=diagnostic-child"), "{log}");
+        assert!(
+            log.contains("activation_run_id=\"diagnostic-run\""),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("process_id={}", std::process::id())),
+            "{log}"
+        );
+        assert!(log.contains(&format!("source_file={:?}", file!())), "{log}");
+        assert!(
+            log.contains(&format!("source_line={}", branch_line.get())),
+            "{log}"
+        );
+        assert!(!error.to_string().contains("diagnostic-run"));
+    }
 
     #[tokio::test]
     async fn completed_plain_continuation_requires_one_input_and_current_identity() {
