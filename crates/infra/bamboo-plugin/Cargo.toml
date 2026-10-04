@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Local plugin bundles (manifest, install provenance, installer skeleton) for the Bamboo agent framework"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }
