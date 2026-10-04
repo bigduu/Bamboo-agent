@@ -881,6 +881,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 log_base_system_prompt_snapshot(&session_id, prompt);
             }
 
+            // A carried untagged wait has already been persisted. Unlike a
+            // newly armed safety-net wait, it must not resurrect a completed
+            // child wait. Tagged tool waits are reconciled by the final writer.
+            let inherited_child_wait = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.waiting_for_children.clone())
+                .filter(|wait| wait.registered_by_tool_call_id.is_none());
             let execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
@@ -1066,10 +1074,72 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            let saved = agent
-                .persistence()
-                .save_finalized_runtime_session(&mut session)
-                .await;
+            let saved = if inherited_child_wait.is_some()
+                && session
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|runtime| runtime.waiting_for_children.as_ref())
+                    == inherited_child_wait.as_ref()
+            {
+                // Completion holds this lock through its durable clear. Keep it
+                // through our final write as well, closing the read/save window.
+                let resume_lock =
+                    crate::session_app::child_completion_coordinator::session_resume_lock(
+                        &session_id,
+                    );
+                let _guard = resume_lock.lock().await;
+                match agent.storage().load_session(&session_id).await {
+                    Ok(Some(latest)) if latest.created_at == session.created_at => {
+                        let durable = latest.agent_runtime_state.as_ref();
+                        if let Some(runtime) = session.agent_runtime_state.as_mut() {
+                            runtime.waiting_for_children =
+                                durable.and_then(|state| state.waiting_for_children.clone());
+                            if runtime.waiting_for_children.is_none() {
+                                if let Some(durable) = durable {
+                                    runtime.status = durable.status;
+                                    runtime.suspension = durable.suspension.clone();
+                                }
+                                if session.metadata.contains_key("agent.runtime.state") {
+                                    if let Ok(serialized) = serde_json::to_string(runtime) {
+                                        session
+                                            .metadata
+                                            .insert("agent.runtime.state".into(), serialized);
+                                    }
+                                }
+                                match latest.metadata.get("runtime.suspend_reason") {
+                                    Some(reason) => {
+                                        session.metadata.insert(
+                                            "runtime.suspend_reason".into(),
+                                            reason.clone(),
+                                        );
+                                    }
+                                    None => {
+                                        session.metadata.remove("runtime.suspend_reason");
+                                    }
+                                }
+                                if !session.metadata.contains_key("runtime.suspend_reason")
+                                    && session.last_run_status().as_deref() == Some("suspended")
+                                {
+                                    session.set_last_run_status("completed");
+                                }
+                            }
+                        }
+                        agent
+                            .persistence()
+                            .save_finalized_runtime_session(&mut session)
+                            .await
+                    }
+                    Ok(_) => Err(std::io::Error::other(
+                        "inherited child wait session disappeared or changed birth",
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                agent
+                    .persistence()
+                    .save_finalized_runtime_session(&mut session)
+                    .await
+            };
             let history_committed = saved.is_ok();
             let authority_conflict = saved.as_ref().err().is_some_and(|error| {
                 error

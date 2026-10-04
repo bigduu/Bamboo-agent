@@ -19,6 +19,8 @@ const ANSWER: &str = "Blue";
 
 struct Probe {
     data: PathBuf,
+    complete_child_before_parent_reply: bool,
+    early_completion_observed: AtomicBool,
     root_calls: AtomicUsize,
     child_calls: AtomicUsize,
     first_child_ready: AtomicBool,
@@ -122,6 +124,32 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             }
             3 => {
                 assert!(body.to_string().contains("root-answer-child"));
+                if probe.complete_child_before_parent_reply {
+                    // Force the legal completion/final-save ordering which used
+                    // to resurrect the Root's inherited, untagged child wait.
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
+                        let child_id = store
+                            .list_index_entries()
+                            .await
+                            .into_iter()
+                            .find(|child| child.parent_session_id.as_deref() == Some(ROOT_ID))
+                            .unwrap()
+                            .id;
+                        loop {
+                            let child = store.load_session(&child_id).await.unwrap().unwrap();
+                            if child.last_run_status().as_deref() == Some("completed") {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("Child must complete before Parent reply finishes");
+                    probe
+                        .early_completion_observed
+                        .store(true, Ordering::SeqCst);
+                }
                 (json!({"content":"ROOT_REPLY_SENT"}), "stop")
             }
             4 => {
@@ -175,6 +203,15 @@ fn start_host(data: &Path, port: u16) -> Host {
 
 #[actix_web::test]
 async fn direct_parent_question_rearms_original_wait_and_resumes_same_child() {
+    parent_question_round_trip(false).await;
+}
+
+#[actix_web::test]
+async fn direct_parent_question_child_completes_before_parent_reply_finishes() {
+    parent_question_round_trip(true).await;
+}
+
+async fn parent_question_round_trip(complete_child_before_parent_reply: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let data = root.join("host");
@@ -187,6 +224,8 @@ async fn direct_parent_question_rearms_original_wait_and_resumes_same_child() {
         .unwrap();
     let probe = web::Data::new(Probe {
         data: data.clone(),
+        complete_child_before_parent_reply,
+        early_completion_observed: AtomicBool::new(false),
         root_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
         first_child_ready: AtomicBool::new(false),
@@ -336,7 +375,9 @@ async fn direct_parent_question_rearms_original_wait_and_resumes_same_child() {
             let parent = store.load_session(ROOT_ID).await.unwrap().unwrap();
             let requests = question_in_parent(&parent);
             assert!(requests.len() <= 1, "stable question delivery id");
-            if probe.second_child_ready.load(Ordering::SeqCst)
+            if (complete_child_before_parent_reply
+                || parent.messages.iter().any(|message| message.content == "ROOT_REPLY_SENT"))
+                && probe.second_child_ready.load(Ordering::SeqCst)
                 && parent.last_run_status().as_deref() == Some("suspended")
                 && parent
                     .agent_runtime_state
@@ -430,6 +471,12 @@ async fn direct_parent_question_rearms_original_wait_and_resumes_same_child() {
                     .agent_runtime_state
                     .as_ref()
                     .is_none_or(|state| state.waiting_for_children.is_none()));
+                if complete_child_before_parent_reply {
+                    assert!(
+                        probe.early_completion_observed.load(Ordering::SeqCst),
+                        "provider must observe early Child completion without panic/retry"
+                    );
+                }
                 assert_eq!(probe.child_calls.load(Ordering::SeqCst), 2);
                 assert_eq!(probe.root_calls.load(Ordering::SeqCst), 5);
                 let answers: Vec<_> = parent
