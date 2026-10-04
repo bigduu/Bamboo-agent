@@ -34,7 +34,7 @@ Bamboo 是一个能在你自己电脑上运行的 AI 助理"大脑"。它不只�
 | 🧠 **记忆系统** | 会话便签、由 Jiandu 持有的派生 Dream 快照和跨会话持久记忆，支持自动生成 Dream 与后台整理（gardener） |
 | 🗜️ **上下文压缩** | 滚动摘要 + 近窗保留的混合压缩，超大工具输出自动裁剪，按模型上下文窗口预算执行 |
 | 🛠️ **内置工具** | 19 个内置工具：文件、图片、搜索、Shell、网页抓取、任务、权限请求等 |
-| 🎯 **技能系统** | 可选/可发现的技能，按请求提示做轻量选择，含内置 docx / pdf / pptx / xlsx / skill-creator |
+| 🎯 **技能系统** | 可选/可发现的技能，按请求提示做轻量选择，含内置工作流技能和 skill-creator |
 | 🔌 **MCP 扩展** | Model Context Protocol 客户端，挂接外部工具服务器 |
 | ⏰ **工作流与调度** | 声明式工作流装载 + cron 风格的调度触发引擎 |
 | 🌐 **HTTP / WebSocket / SSE** | Actix 服务、REST API、共享 `/v2/stream` WebSocket、legacy SSE 事件流，以及兼容 OpenAI / Anthropic / Gemini 的端点 |
@@ -111,7 +111,7 @@ Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会�
 
 技能（skills）是可启用的能力包。运行时按会话元数据解析"已选技能"（支持 JSON 数组或逗号分隔的旧格式），并对**未选技能**做轻量、基于请求提示（request hint）的相关性挑选注入上下文（上限 `MAX_UNSELECTED_SKILLS_IN_CONTEXT = 24`），避免把所有技能都塞进提示词。还包含访问控制与运行时元数据。
 
-内置技能在 `builtin_skills/`：`docx`、`pdf`、`pptx`、`xlsx`、`skill-creator`。
+内置技能在 `builtin_skills/`：`debug`、`personal-assistant`、`plan`、`research`、`review`、`simplify` 和 `skill-creator`。
 
 ### 工具、工作流、调度、MCP
 
