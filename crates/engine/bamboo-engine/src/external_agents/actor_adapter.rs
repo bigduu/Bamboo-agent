@@ -4798,24 +4798,39 @@ impl PlainActorActivation {
     {
         Box::pin(async move {
             let message = bamboo_agent_core::Message::assistant(text, None);
-            *session = self
-                .store
-                .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
-                    fence: self.fence.clone(),
-                    expected_created_at: self.created_at,
-                    expected_messages: session.messages.clone(),
-                    expected_provider_transcript: self.provider_transcript.clone(),
-                    messages: vec![message.clone()],
-                    native_groups: Vec::new(),
-                })
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        %error,
-                        "Actor reply checkpoint rejected or unconfirmed; durable history is preserved"
-                    );
-                    AgentError::LLM(format!("actor reply commit failed: {error}"))
-                })?;
+            let request = bamboo_storage::ActorTranscriptAppend {
+                fence: self.fence.clone(),
+                expected_created_at: self.created_at,
+                expected_messages: session.messages.clone(),
+                expected_provider_transcript: self.provider_transcript.clone(),
+                messages: vec![message.clone()],
+                native_groups: Vec::new(),
+            };
+            let mut retries = 0;
+            *session = loop {
+                let result = self.store.append_actor_transcript(request.clone()).await;
+                if matches!(
+                    &result,
+                    Err(bamboo_storage::ActorTranscriptAppendError::PrefixConflict)
+                ) && retries < 3
+                {
+                    // Parent writes may change the ancestor witness before
+                    // publication. Retry this exact reply and Child prefix;
+                    // never reload/adopt a different transcript or replay an
+                    // unconfirmed write. Storage rechecks the same live fence.
+                    tokio::time::sleep(Duration::from_millis(10 << retries)).await;
+                    retries += 1;
+                    continue;
+                }
+                break result;
+            }
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "Actor reply checkpoint rejected or unconfirmed; durable history is preserved"
+                );
+                AgentError::LLM(format!("actor reply commit failed: {error}"))
+            })?;
             let _ = event_tx
                 .send(AgentEvent::message_appended(&session.id, &message))
                 .await;
