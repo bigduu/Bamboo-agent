@@ -65,6 +65,7 @@ const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     "retry_resume_pending",
     "retry_resume_reason",
     "provider_name",
+    "runtime.child_completion_source_v1",
 ];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
@@ -4742,10 +4743,20 @@ mod tests {
             PARENT_QUESTION_RESOLUTION_KEY.into(),
             serde_json::to_string(&resolution).unwrap(),
         );
+        let source_key = "runtime.child_completion_source_v1";
+        // Storage preserves opaque source bytes; only the engine validates them.
+        answered
+            .metadata
+            .insert(source_key.into(), "new-run-terminal-source".into());
         storage.save_session(&answered).await.unwrap();
 
         store.merge_save_runtime(&mut old_run).await.unwrap();
         let saved = storage.load_session(&answered.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.metadata.get(source_key),
+            answered.metadata.get(source_key),
+            "an old question handoff must preserve the source of the adopted canonical transcript"
+        );
         assert!(saved.pending_question.is_none());
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
         assert_eq!(

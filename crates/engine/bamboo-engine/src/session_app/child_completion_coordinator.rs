@@ -3029,12 +3029,35 @@ impl ChildCompletionCoordinator {
                     "child-wait watchdog: wait already satisfied but parent still suspended \
                      (lost wake); replaying the completion"
                 );
-                let error = self
-                    .load_control_plane(child_id)
-                    .await
-                    .and_then(|child| child.last_run_error());
-                self.publish_synthetic_completion(parent_session_id, child_id, status, error)
-                    .await;
+                let control_plane = self.load_control_plane(child_id).await;
+                let mut completion = ChildCompletion {
+                    parent_session_id: parent_session_id.into(),
+                    child_session_id: child_id.clone(),
+                    status: status.clone(),
+                    error: control_plane.as_ref().and_then(Session::last_run_error),
+                    completed_at: Utc::now(),
+                    source: None,
+                };
+                // Lost callbacks replay the committed source, not a synthetic
+                // latest answer. Check ownership before loading any transcript.
+                if control_plane.as_ref().is_some_and(|child| {
+                    child.parent_session_id.as_deref() == Some(parent_session_id)
+                }) {
+                    let Ok(Some(child)) = self.storage.load_session(child_id).await else {
+                        return;
+                    };
+                    completion.source = ChildCompletionSource::from_committed_session(&child)
+                        .filter(|source| source.matches_completion(&completion));
+                    if ChildCompletionSource::has_source_record(&child)
+                        && completion.source.is_none()
+                    {
+                        tracing::warn!(%child_id,
+                            "unavailable committed replay source; leaving wait armed");
+                        return;
+                    }
+                    completion.completed_at = child.updated_at;
+                }
+                self.publish_completion(completion).await;
             }
         }
     }
@@ -3121,6 +3144,18 @@ impl ChildCompletionCoordinator {
         status: &str,
         error: Option<String>,
     ) {
+        self.publish_completion(ChildCompletion {
+            parent_session_id: parent_session_id.into(),
+            child_session_id: child_session_id.into(),
+            status: status.into(),
+            error,
+            completed_at: Utc::now(),
+            source: None,
+        })
+        .await;
+    }
+
+    async fn publish_completion(&self, completion: ChildCompletion) {
         let publisher =
             crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
                 self.agent_runners.clone(),
@@ -3128,13 +3163,10 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
             );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
-        crate::runtime::execution::spawn::publish_child_completion_parts(
+        crate::runtime::execution::spawn::publish_child_completion(
             &publisher,
             Some(handler),
-            parent_session_id.to_string(),
-            child_session_id.to_string(),
-            status.to_string(),
-            error,
+            completion,
         )
         .await;
     }
@@ -3760,6 +3792,44 @@ mod tests {
             panic!("expected ChildOutcome");
         };
         assert!(outcome.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn lost_callback_replay_uses_the_committed_seal() {
+        for valid in [true, false] {
+            let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "replay-parent",
+                vec!["replay-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut child = Session::new_child("replay-child", "replay-parent", "model", "Child");
+            child.add_message(Message::assistant("sealed replay result", None));
+            child.set_last_run_status("completed");
+            save_sourced_test_child(&store, &child).await;
+            if !valid {
+                let mut child = store.load_session("replay-child").await.unwrap().unwrap();
+                child.messages[0].content = "unsealed successor result".into();
+                store.save_session(&child).await.unwrap();
+            }
+            let parent = store.load_session("replay-parent").await.unwrap().unwrap();
+            let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+            wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
+            coordinator.sweep_child_wait("replay-parent", wait).await;
+            let claims = inbox.claim("replay-parent", 1).await.unwrap();
+            if !valid {
+                assert!(claims.is_empty());
+                let parent = store.load_session("replay-parent").await.unwrap().unwrap();
+                assert!(read_runtime_state(&parent).waiting_for_children.is_some());
+                continue;
+            }
+            let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+                panic!("expected ChildOutcome");
+            };
+            assert_eq!(outcome.result.as_deref(), Some("sealed replay result"));
+        }
     }
 
     #[tokio::test]
