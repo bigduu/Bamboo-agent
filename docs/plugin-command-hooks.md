@@ -16,7 +16,7 @@ permission bits (including directory traversal permissions; readonly state on ot
 platforms), plugin id and version. Non-Unicode bundle paths are rejected.
 The bundle is capped at 64 MiB, each hook configuration at 64 KiB, each
 configuration at 64 commands and each plugin at 16 configurations.
-Persistent data is outside the reviewed bundle, at `plugins/data/<id>`.
+Persistent data is outside the reviewed bundle, at `plugins/.hook-data/<id>`.
 Reviewing scripts does not sandbox their commands or pin external interpreters,
 PATH binaries, downloaded code or dependencies outside the bundle.
 
@@ -93,7 +93,7 @@ Bamboo tool name, without Claude tool aliases. JSON stdin includes
 `session_id`, nullable `transcript_path`, `cwd`, `hook_event_name` and
 `permission_mode: "default"` (conservative portable policy; no permission
 delegation). Event fields include `prompt`, or `tool_name`, `tool_use_id`,
-original `tool_input` and post-execution `tool_response`, or
+original executor `tool_input` and post-execution `tool_response`, or
 `stop_hook_active` and `last_assistant_message`. Tool response is Bamboo's
 model-facing result text. No synthetic Claude `Edit` input is produced for
 `apply_patch` or other tools.
@@ -126,3 +126,16 @@ rewrites, persistent permission updates, env-file, executable handler objects,
 `suppressOutput`, and full upstream manifest import/export. Unsupported fields
 are rejected instead of silently discarded. Raw stderr and context may contain
 plugin-provided text; treat them as untrusted data.
+
+Portable tool matchers and stdin `tool_name` use the exact executor identity selected
+by Bamboo's callable-set resolver. Provider aliases and namespace prefixes cannot
+bypass a canonical matcher. This is the actual registered host identity, not a
+compatibility rename: an exact registered `apply_patch` stays `apply_patch`.
+Arguments remain the values supplied to that executor; Bamboo does not reshape
+patch input into Claude Edit input. Native hooks/events/transcripts retain their
+original provider spelling. PostToolUse carries the selected identity and parsed
+input from execution rather than re-resolving against a later catalog.
+
+Persistent hook data uses the reserved `.hook-data` namespace, which cannot be
+accepted as a plugin id. A valid plugin named `data` remains independent of that
+storage; uninstalling it cannot remove another plugin's hook state.

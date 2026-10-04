@@ -178,6 +178,7 @@ async fn execute_and_apply_single_tool_call(
             let outcome = per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
@@ -265,6 +266,7 @@ async fn execute_and_apply_single_tool_call(
             per_call::ToolExecutionOutcome {
                 permission_replay_origin: None,
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
@@ -677,6 +679,10 @@ pub(crate) async fn execute_round_tool_calls(
                             Ok(per_call::ToolExecutionOutcome {
                                 permission_replay_origin: None,
                                 needs_human: None,
+                                portable_tool: per_call::portable_tool_for_admitted_call(
+                                    effective_callable_set,
+                                    tool_call,
+                                ),
                                 post_tool_hook_eligible: true,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
@@ -698,10 +704,14 @@ pub(crate) async fn execute_round_tool_calls(
                 );
                 batch
                     .iter()
-                    .map(|_batch_call| {
+                    .map(|batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
                             permission_replay_origin: None,
                             needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                effective_callable_set,
+                                batch_call,
+                            ),
                             post_tool_hook_eligible: true,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",

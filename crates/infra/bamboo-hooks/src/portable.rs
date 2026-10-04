@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub const PORTABLE_CONTEXT_BYTES: usize = 8192;
 #[derive(Clone, Copy, Default)]
 pub struct PortableInputs<'a> {
+    pub resolved_tool_name: Option<&'a str>,
     pub original_tool_input: Option<&'a Value>,
     pub final_assistant_content: Option<&'a str>,
 }
@@ -393,7 +394,7 @@ pub async fn run_with_inputs(
                 registry_path: root.join("installed.json"),
                 receipt: registered,
                 root: &plugin.plugin_dir,
-                data: root.join("data").join(&plugin.id),
+                data: root.join(".hook-data").join(&plugin.id),
                 config: &registered.config,
                 source: format!(
                     "{}@{}:{}:{event:?}",
@@ -874,6 +875,55 @@ mod tests {
         };
         (temp, session, payload)
     }
+    #[tokio::test]
+    async fn persistent_data_does_not_overlap_a_plugin_named_data() {
+        let (temp, session, payload) = fixture(vec![
+            json!({"type":"command","command":"touch \"$PLUGIN_DATA/state\"","timeout":1}),
+        ])
+        .await;
+        let root = temp.path();
+        let other = root.join("data");
+        std::fs::create_dir(&other).unwrap();
+        for name in ["plugin.json", "script.sh", "hooks.json"] {
+            std::fs::copy(root.join("plugin with spaces").join(name), other.join(name)).unwrap();
+        }
+        let mut manifest: PluginManifest =
+            serde_json::from_slice(&std::fs::read(other.join("plugin.json")).unwrap()).unwrap();
+        manifest.id = "data".into();
+        std::fs::write(
+            other.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let before = registrations(&manifest, &other).unwrap();
+        let mut store = InstalledPlugins::load(&root.join("installed.json"))
+            .await
+            .unwrap();
+        let mut data_entry = store.plugins[0].clone();
+        data_entry.id = "data".into();
+        data_entry.plugin_dir = other.clone();
+        data_entry.registered.hooks = before.clone();
+        store.plugins.push(data_entry);
+        store.save(&root.join("installed.json")).await.unwrap();
+        // Only approve the original fixture, never the data plugin.
+        let digest = store.plugins[0].registered.hooks[0].digest.clone();
+        store.plugins[0].registered.hooks[0]
+            .confirm_review(&digest)
+            .unwrap();
+        store.save(&root.join("installed.json")).await.unwrap();
+        run(
+            root,
+            AgentHookPoint::BeforeToolExecution,
+            &payload,
+            &session,
+        )
+        .await;
+        assert!(root.join(".hook-data/fixture/state").exists());
+        assert_eq!(registrations(&manifest, &other).unwrap(), before);
+        manifest.id = ".hook-data".into();
+        assert!(manifest.validate().is_err());
+    }
+
     async fn trust(root: &Path) {
         let path = root.join("installed.json");
         let mut store = InstalledPlugins::load(&path).await.unwrap();
@@ -889,7 +939,7 @@ mod tests {
         ])
         .await;
         let root = temp.path();
-        let marker = root.join("data/fixture/executed");
+        let marker = root.join(".hook-data/fixture/executed");
         run(
             root,
             AgentHookPoint::BeforeToolExecution,
@@ -963,7 +1013,7 @@ mod tests {
             .await;
             assert!(report.errors.is_empty(), "{:?}", report.errors);
             assert!(matches!(report.decision, HookResult::Deny { .. }));
-            assert!(temp.path().join("data/fixture/observer").exists());
+            assert!(temp.path().join(".hook-data/fixture/observer").exists());
         }
     }
     #[tokio::test]
@@ -985,14 +1035,20 @@ mod tests {
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!temp.path().join("data/fixture/should-not-run").exists());
+        assert!(!temp
+            .path()
+            .join(".hook-data/fixture/should-not-run")
+            .exists());
         let path = temp.path().join("installed.json");
         let mut store = InstalledPlugins::load(&path).await.unwrap();
         store.plugins[0].registered.hooks[0].enabled = false;
         store.save(&path).await.unwrap();
         drop(guard);
         let report = task.await.unwrap();
-        assert!(!temp.path().join("data/fixture/should-not-run").exists());
+        assert!(!temp
+            .path()
+            .join(".hook-data/fixture/should-not-run")
+            .exists());
         assert!(matches!(report.decision, HookResult::Continue));
     }
     #[tokio::test]
@@ -1011,7 +1067,10 @@ mod tests {
         .await;
         assert!(matches!(report.decision, HookResult::Deny { .. }));
         assert!(!report.errors.is_empty());
-        assert!(!temp.path().join("data/fixture/should-not-run").exists());
+        assert!(!temp
+            .path()
+            .join(".hook-data/fixture/should-not-run")
+            .exists());
     }
     #[tokio::test]
     async fn contexts_share_one_budget_across_matching_commands() {

@@ -1061,6 +1061,7 @@ dependencies = [
  "bamboo-mcp",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-plugin",
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",

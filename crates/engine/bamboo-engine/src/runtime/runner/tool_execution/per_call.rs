@@ -120,7 +120,29 @@ pub(super) struct ToolExecutionApplyContext<'a> {
     pub state: &'a mut RoundExecutionState,
 }
 
+pub(super) struct PortableToolExecution {
+    name: String,
+    input: serde_json::Value,
+}
+
+pub(super) fn portable_tool_for_admitted_call(
+    callable: &EffectiveCallableSet,
+    call: &ToolCall,
+) -> Option<PortableToolExecution> {
+    // Timeout synthesis uses the same immutable admission snapshot as dispatch,
+    // never a later catalog or a generic name normalizer.
+    callable
+        .resolve_callable_reference(&call.function.name)
+        .map(|name| PortableToolExecution {
+            name,
+            input: parse_tool_args_best_effort(&call.function.arguments).0,
+        })
+}
+
 pub(super) struct ToolExecutionOutcome {
+    /// The exact selected executor and arguments supplied to it, carried through
+    /// result application without resolving model-controlled aliases a second time.
+    pub portable_tool: Option<PortableToolExecution>,
     pub permission_replay_origin: Option<PermissionReplayOrigin>,
     pub result: Result<ToolResult, String>,
     /// Set when the tool returned [`ToolOutcome::NeedsHuman`] — the structured
@@ -166,6 +188,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
             permission_replay_origin: None,
             result: Err(message),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::ZERO,
         });
@@ -203,6 +226,7 @@ async fn execute_tool_call_only_with_execution_name(
         return Ok(ToolExecutionOutcome {
             permission_replay_origin: None,
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: false,
             result: Err(format!(
                 "Tool '{}' is outside orchestration-only Root authority",
@@ -224,6 +248,7 @@ async fn execute_tool_call_only_with_execution_name(
         return Ok(ToolExecutionOutcome {
             permission_replay_origin: None,
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: false,
             result: Err(policy_error),
             tool_duration: std::time::Duration::ZERO,
@@ -310,12 +335,17 @@ async fn execute_tool_call_only_with_execution_name(
         let mut hook_outcome = ctx
             .config
             .hook_runner
-            .run_hooks(
+            .run_hooks_with_inputs(
                 AgentHookPoint::BeforeToolExecution,
                 &payload,
                 session,
                 runtime_state,
                 Some(ctx.event_tx),
+                bamboo_hooks::portable::PortableInputs {
+                    resolved_tool_name: Some(execution_name),
+                    original_tool_input: Some(&args),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -337,6 +367,7 @@ async fn execute_tool_call_only_with_execution_name(
                     permission_replay_origin: None,
                     result: Err(format!("Tool execution denied by hook: {reason}")),
                     needs_human: None,
+                    portable_tool: None,
                     post_tool_hook_eligible: false,
                     tool_duration: elapsed,
                 });
@@ -429,7 +460,8 @@ async fn execute_tool_call_only_with_execution_name(
     // compressor / policy / transcript path is unchanged. Completed -> its result,
     // Running -> its synthetic ack, NeedsHuman -> its rich display result.
     // Dispatch through the exact identity already selected by the effective
-    // callable-set resolver. Events, hooks, and permission handling above keep
+    // callable-set resolver. Portable policies receive this identity; native
+    // hooks, events, and permission handling above keep
     // the model's original call spelling, while the executor cannot re-resolve
     // that spelling to a different (possibly excluded) exact owner.
     let dispatch =
@@ -489,6 +521,10 @@ async fn execute_tool_call_only_with_execution_name(
         result: result.map_err(|error| error.to_string()),
         needs_human,
         post_tool_hook_eligible,
+        portable_tool: Some(PortableToolExecution {
+            name: execution_name.to_owned(),
+            input: args,
+        }),
         tool_duration,
     })
 }
@@ -545,6 +581,7 @@ async fn hook_ask_outcome(
                 permission_replay_origin: None,
                 result: Err(private_check_error.to_string()),
                 needs_human: None,
+                portable_tool: None,
                 post_tool_hook_eligible: false,
                 tool_duration: std::time::Duration::ZERO,
             });
@@ -556,6 +593,7 @@ async fn hook_ask_outcome(
             permission_replay_origin: None,
             result: Err(private_check_error.to_string()),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::ZERO,
         });
@@ -641,6 +679,7 @@ async fn hook_ask_outcome(
             permission_replay_origin: None,
             result: Err("Tool execution denied by parent agent review".to_string()),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::ZERO,
         });
@@ -653,6 +692,7 @@ async fn hook_ask_outcome(
                 .to_string(),
         ),
         needs_human: None,
+        portable_tool: None,
         post_tool_hook_eligible: false,
         tool_duration: std::time::Duration::ZERO,
     })
@@ -716,13 +756,24 @@ pub(super) async fn apply_tool_execution_outcome(
         let mut hook_outcome = ctx
             .config
             .hook_runner
-            .run_hooks_with_tool_input(
+            .run_hooks_with_inputs(
                 AgentHookPoint::AfterToolExecution,
                 &hook_payload,
                 ctx.session,
                 ctx.runtime_state,
                 Some(ctx.event_tx),
-                original_tool_input.as_ref(),
+                bamboo_hooks::portable::PortableInputs {
+                    resolved_tool_name: outcome
+                        .portable_tool
+                        .as_ref()
+                        .map(|tool| tool.name.as_str()),
+                    original_tool_input: outcome
+                        .portable_tool
+                        .as_ref()
+                        .map(|tool| &tool.input)
+                        .or(original_tool_input.as_ref()),
+                    ..Default::default()
+                },
             )
             .await;
         crate::runtime::hooks::inject_plugin_contexts(
@@ -1296,6 +1347,229 @@ mod hook_tests {
         EffectiveCallableSet::from_catalog(&catalog, mode, loaded_names.iter().copied())
     }
 
+    struct OriginalToolNameRecorder(Mutex<Vec<String>>);
+    #[async_trait]
+    impl AgentHook for OriginalToolNameRecorder {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeToolExecution
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ToolExecution { tool_name, .. } = payload {
+                self.0.lock().unwrap().push(tool_name.clone());
+            }
+            HookResult::Continue
+        }
+    }
+
+    async fn portable_alias_policy(
+        pre_command: &str,
+        canonical: &str,
+    ) -> (tempfile::TempDir, AgentLoopConfig) {
+        use bamboo_plugin::{
+            InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginManifest, PluginSource,
+            RegisteredCapabilities,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let bundle = root.join("alias-policy");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id":"alias-policy", "name":"Alias policy", "version":"0.1.0",
+            "provides":{"hooks":[{"config":"hooks.json","scripts":["policy.sh"]}]}
+        }))
+        .unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("policy.sh"), "# reviewed fixture").unwrap();
+        let post_command = r#"payload=$(cat); case "$payload" in *'"tool_name":"Bash"'*'"tool_response":"exact dispatch"'*) printf '%s' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"resolved Bash result"}}' ;; *) exit 1 ;; esac"#.replace("Bash", canonical);
+        std::fs::write(bundle.join("hooks.json"), serde_json::to_vec(&serde_json::json!({"hooks":{
+            "PreToolUse":[{"matcher":format!("^{canonical}$"),"hooks":[{"type":"command","command":pre_command,"timeout":1}]}],
+            "PostToolUse":[{"matcher":format!("^{canonical}$"),"hooks":[{"type":"command","command":post_command,"timeout":1}]}]
+        }})).unwrap()).unwrap();
+        let mut hooks = bamboo_plugin::hooks::registrations(&manifest, &bundle).unwrap();
+        let digest = hooks[0].digest.clone();
+        hooks[0].confirm_review(&digest).unwrap();
+        InstalledPlugins {
+            plugins: vec![InstalledPlugin {
+                id: manifest.id,
+                version: manifest.version,
+                source: PluginSource::LocalDir {
+                    path: bundle.clone(),
+                },
+                plugin_dir: bundle,
+                installed_at: chrono::Utc::now(),
+                status: PluginInstallStatus::Installed,
+                registered: RegisteredCapabilities {
+                    hooks,
+                    ..Default::default()
+                },
+            }],
+        }
+        .save(&root.join("installed.json"))
+        .await
+        .unwrap();
+        let runner = crate::runtime::hooks::HookRunner::new().with_lifecycle_config(
+            &LifecycleHooksConfig::default(),
+            Some(temp.path().to_owned()),
+        );
+        (
+            temp,
+            AgentLoopConfig {
+                hook_runner: Arc::new(runner),
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn execute_portable_alias_call(
+        config: &AgentLoopConfig,
+        tools: &Arc<dyn ToolExecutor>,
+        callable: &EffectiveCallableSet,
+        call: &ToolCall,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> (ToolExecutionOutcome, Session) {
+        let mut session = Session::new("portable-alias", "model");
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        let mut runtime = AgentRuntimeState::new(&session.id);
+        let outcome = execute_model_requested_tool_call_only(
+            callable,
+            ToolExecutionOnlyContext {
+                executing_supervisor: None,
+                tool_call: call,
+                event_tx,
+                metrics_collector: None,
+                session_id: "portable-alias",
+                root_session_id: "portable-alias",
+                root_orchestration_only: false,
+                round_id: "round-1",
+                round: 0,
+                tools,
+                config,
+                hook_session: Some(&mut session),
+                hook_runtime_state: Some(&mut runtime),
+                session_flags: flags,
+                available_tool_schemas: &[],
+            },
+        )
+        .await
+        .unwrap();
+        (outcome, session)
+    }
+
+    #[tokio::test]
+    async fn portable_hook_denies_resolved_aliases_but_preserves_exact_shadow_and_native_spelling()
+    {
+        let (_temp, mut config) = portable_alias_policy(r#"printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Bash blocked"}}'"#, "Bash").await;
+        let recorder = Arc::new(OriginalToolNameRecorder(Mutex::new(vec![])));
+        Arc::make_mut(&mut config.hook_runner).register(recorder.clone());
+        let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let callable =
+            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for name in ["Bash", "execute_command", "default::Bash"] {
+            let mut call = probe_call(name);
+            call.function.arguments = serde_json::json!({"command":"printf fixture"}).to_string();
+            assert_eq!(
+                callable.resolve_callable_reference(name).as_deref(),
+                Some("Bash")
+            );
+            let (outcome, _) =
+                execute_portable_alias_call(&config, &tools, &callable, &call, &event_tx).await;
+            assert!(
+                matches!(outcome.result, Err(ref error) if error.contains("Bash blocked")),
+                "{name}"
+            );
+            assert!(!outcome.post_tool_hook_eligible);
+        }
+        assert!(concrete.exact_dispatches.lock().unwrap().is_empty());
+        let shadow = effective_callable_set(
+            &["Bash", "execute_command"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let call = probe_call("execute_command");
+        assert_eq!(
+            shadow
+                .resolve_callable_reference(&call.function.name)
+                .as_deref(),
+            Some("execute_command")
+        );
+        let (outcome, _) =
+            execute_portable_alias_call(&config, &tools, &shadow, &call, &event_tx).await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            *concrete.exact_dispatches.lock().unwrap(),
+            vec![("execute_command".into(), "execute_command".into())]
+        );
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![
+                "Bash",
+                "execute_command",
+                "default::Bash",
+                "execute_command"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_hook_post_uses_selected_identity_and_original_executor_input() {
+        let (_temp, config) = portable_alias_policy("true", "Bash").await;
+        let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = concrete;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let callable =
+            effective_callable_set(&["Bash"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let mut call = probe_call("default::Bash");
+        let input = serde_json::json!({"command":"printf fixture"});
+        call.function.arguments = input.to_string();
+        let (outcome, mut session) =
+            execute_portable_alias_call(&config, &tools, &callable, &call, &event_tx).await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.portable_tool.as_ref().unwrap().name, "Bash");
+        assert_eq!(outcome.portable_tool.as_ref().unwrap().input, input);
+        apply_test_outcome(&config, &tools, &call, &mut session, &event_tx, outcome)
+            .await
+            .unwrap();
+        assert!(session
+            .metadata
+            .get("runtime.plugin_hook_contexts")
+            .unwrap()
+            .contains("resolved Bash result"));
+    }
+
+    #[tokio::test]
+    async fn portable_hook_post_observes_repaired_non_strict_arguments() {
+        let (_temp, config) = portable_alias_policy("true", "Read").await;
+        let concrete = Arc::new(ExactOwnerRecordingExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = concrete;
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let callable =
+            effective_callable_set(&["Read"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let mut call = probe_call("Read");
+        call.function.arguments = "{\"file_path\":\"/fixture\"".into();
+        assert!(serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_err());
+        let (outcome, mut session) =
+            execute_portable_alias_call(&config, &tools, &callable, &call, &event_tx).await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            outcome.portable_tool.as_ref().unwrap().input,
+            serde_json::json!({"file_path":"/fixture"})
+        );
+        apply_test_outcome(&config, &tools, &call, &mut session, &event_tx, outcome)
+            .await
+            .unwrap();
+        assert!(session
+            .metadata
+            .get("runtime.plugin_hook_contexts")
+            .unwrap()
+            .contains("resolved Read result"));
+    }
+
     async fn execute_without_hooks(
         effective_callable_set: &EffectiveCallableSet,
         tools: &Arc<dyn ToolExecutor>,
@@ -1667,6 +1941,7 @@ mod hook_tests {
                 allow_custom: false,
                 source: bamboo_agent_core::PendingQuestionSource::PauseTool,
             }),
+            portable_tool: None,
             post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::from_millis(1),
         };
@@ -2517,6 +2792,7 @@ mod hook_tests {
             permission_replay_origin: None,
             result: Ok(ToolResult::text(true, "raw output")),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: true,
             tool_duration: std::time::Duration::from_millis(7),
         };
@@ -2561,6 +2837,7 @@ mod hook_tests {
             permission_replay_origin: None,
             result: Err("executor exploded".to_string()),
             needs_human: None,
+            portable_tool: None,
             post_tool_hook_eligible: true,
             tool_duration: std::time::Duration::from_millis(3),
         };

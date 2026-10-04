@@ -1416,3 +1416,64 @@ async fn portable_hook_review_rejects_invalid_manifest_and_platform_without_chan
         );
     }
 }
+
+#[actix_web::test]
+async fn portable_hook_data_survives_install_and_uninstall_of_plugin_named_data() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/bamboo-plugin/examples/portable-hooks");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let persistent = data.path().join("plugins/.hook-data/portable-hook-example");
+    std::fs::create_dir_all(&persistent).unwrap();
+    std::fs::write(persistent.join("state"), "other plugin state").unwrap();
+    let source_copy = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source_copy.path().join("hooks")).unwrap();
+    for file in ["plugin.json", "hooks/hooks.json", "hooks/policy.py"] {
+        std::fs::copy(source.join(file), source_copy.path().join(file)).unwrap();
+    }
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(source_copy.path().join("plugin.json")).unwrap())
+            .unwrap();
+    manifest["id"] = serde_json::json!("data");
+    std::fs::write(
+        source_copy.path().join("plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(source_copy.path()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/api/v1/plugins/data")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(persistent.join("state")).unwrap(),
+        "other plugin state"
+    );
+    assert!(data
+        .path()
+        .join("plugins/portable-hook-example/plugin.json")
+        .exists());
+    assert!(!data.path().join("plugins/data").exists());
+}

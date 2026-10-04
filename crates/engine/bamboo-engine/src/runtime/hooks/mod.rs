@@ -106,10 +106,18 @@ impl HookRunner {
                 outcome.decision,
                 HookResult::Continue | HookResult::Allow | HookResult::Mutated
             ) {
+                let mut portable_payload = payload.clone();
+                if let Some(name) = inputs.resolved_tool_name {
+                    match &mut portable_payload {
+                        HookPayload::ToolExecution { tool_name, .. }
+                        | HookPayload::ToolResult { tool_name, .. } => *tool_name = name.to_owned(),
+                        _ => {}
+                    }
+                }
                 let plugin = bamboo_hooks::portable::run_with_inputs(
                     root,
                     point,
-                    payload,
+                    &portable_payload,
                     session,
                     inputs.original_tool_input,
                     inputs.final_assistant_content,
