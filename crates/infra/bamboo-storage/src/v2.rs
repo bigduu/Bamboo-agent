@@ -6342,6 +6342,57 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn save_inherited_child_wait_finalized(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+        root_writer: Option<(
+            bamboo_domain::RootActorRuntimeWrite,
+            bamboo_domain::RootActorRuntimePublisher,
+        )>,
+    ) -> io::Result<()> {
+        let started = Instant::now();
+        validate_session_id(&session.id)?;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = root_writer.as_ref().map(|(owner, _)| {
+            root_actor_runtime::RootActorWriteProof::new(
+                self.sessions_dir.join(&session.id),
+                owner.clone(),
+            )
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        let latest = self
+            .load_session_unlocked(&session.id)
+            .await?
+            .filter(|latest| latest.created_at == session.created_at)
+            .ok_or_else(|| {
+                io::Error::other(bamboo_domain::SessionAuthorityConflict(
+                    "inherited child wait session disappeared or changed birth".into(),
+                ))
+            })?;
+        let mut reconciled = session.clone();
+        if reconciled
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.waiting_for_children.as_ref())
+            == Some(inherited)
+        {
+            crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, true);
+        }
+        self.save_session_after_lock(&reconciled, started, &guards, None)
+            .await?;
+        if let Some((_, publish)) = root_writer {
+            self.publish_root_actor_runtime(&guards, publish).await?;
+        }
+        *session = reconciled;
+        Ok(())
+    }
+
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await

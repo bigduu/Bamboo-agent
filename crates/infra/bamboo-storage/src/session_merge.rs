@@ -240,36 +240,43 @@ fn adopt_durable_tagged_child_wait(
 /// same lock as the final save so completion cannot clear the wait between a
 /// read and a stale write. Untagged runner-created waits stay caller-owned:
 /// their first persistence attempt may have failed and this may be the retry.
-fn adopt_finalized_tool_child_wait(
+pub(crate) fn adopt_finalized_child_wait(
     session: &mut Session,
     latest: &Session,
+    inherited: bool,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let incoming = session.agent_runtime_state.as_mut()?;
-    if session
-        .metadata
-        .get("runtime.suspend_reason")
-        .map(String::as_str)
-        != Some("waiting_for_children")
-        || !incoming
-            .waiting_for_children
-            .as_ref()
-            .is_some_and(|wait| wait.registered_by_tool_call_id.is_some())
+    if !inherited
+        && (session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            != Some("waiting_for_children")
+            || incoming
+                .waiting_for_children
+                .as_ref()
+                .is_none_or(|wait| wait.registered_by_tool_call_id.is_none()))
     {
         return None;
     }
-    let durable = latest.agent_runtime_state.as_ref()?;
+    let durable = latest.agent_runtime_state.as_ref();
+    if !inherited && durable.is_none() {
+        return None;
+    }
 
     let registered_at = incoming
         .waiting_for_children
         .as_ref()
         .map(|wait| wait.registered_at);
-    incoming.waiting_for_children = durable.waiting_for_children.clone();
+    incoming.waiting_for_children = durable.and_then(|state| state.waiting_for_children.clone());
     let cleared = incoming.waiting_for_children.is_none();
     let cleared_without_other_suspension =
         cleared && !latest.metadata.contains_key("runtime.suspend_reason");
     if cleared {
-        incoming.status = durable.status;
-        incoming.suspension = durable.suspension.clone();
+        if let Some(durable) = durable {
+            incoming.status = durable.status;
+            incoming.suspension = durable.suspension.clone();
+        }
         match latest.metadata.get("runtime.suspend_reason") {
             Some(reason) => {
                 session
@@ -637,7 +644,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.save_session_rebasing_task_conflicts_with_input(session, None)
+        self.save_session_rebasing_task_conflicts_with_input(session, None, None)
             .await
     }
 
@@ -648,6 +655,7 @@ impl LockedSessionStore {
             Arc<dyn bamboo_domain::SessionInboxPort>,
             bamboo_domain::SessionInboxOwnedClaim,
         )>,
+        inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             let result = if let Some((inbox, claim)) = input {
@@ -656,6 +664,14 @@ impl LockedSessionStore {
                 })?;
                 self.storage
                     .save_root_actor_input(owner, session, inbox.clone(), claim, publish.clone())
+                    .await
+            } else if let Some(inherited) = inherited {
+                self.storage
+                    .save_inherited_child_wait_finalized(
+                        session,
+                        inherited,
+                        self.root_actor_writer.clone(),
+                    )
                     .await
             } else {
                 self.save_runtime_snapshot(session, false).await
@@ -1093,7 +1109,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, false, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, false, None, publish)
             .await
     }
 
@@ -1114,7 +1130,20 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, true, None, publish)
+            .await
+    }
+
+    pub async fn merge_save_inherited_child_wait_and_publish<F>(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, true, Some(inherited), publish)
             .await
     }
 
@@ -1226,7 +1255,7 @@ impl LockedSessionStore {
                 .insert(0, bamboo_domain::Message::system(prompt));
         }
         let mut result = self
-            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
             .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
@@ -1259,7 +1288,7 @@ impl LockedSessionStore {
                     .insert(0, bamboo_domain::Message::system(prompt));
             }
             result = self
-                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref())
+                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
                 .await;
         }
         if may_publish_runtime_result(&result) {
@@ -1425,7 +1454,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner_and_publish(session, false, false, |_, _| {})
+        self.merge_save_runtime_inner_and_publish(session, false, false, None, |_, _| {})
             .await
     }
 
@@ -1434,6 +1463,7 @@ impl LockedSessionStore {
         session: &mut Session,
         adopt_bypass: bool,
         finalize_child_wait: bool,
+        inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
         publish: F,
     ) -> std::io::Result<()>
     where
@@ -1478,7 +1508,7 @@ impl LockedSessionStore {
         if let Some(latest) = latest.as_ref() {
             adopt_durable_actor_parent_question_handoff(session, latest)?;
             if finalize_child_wait {
-                if let Some(registered_at) = adopt_finalized_tool_child_wait(session, latest) {
+                if let Some(registered_at) = adopt_finalized_child_wait(session, latest, false) {
                     preserve_finalized_hidden_child_resumes(session, latest, registered_at);
                 }
             }
@@ -1505,7 +1535,9 @@ impl LockedSessionStore {
             }
             adopt_fresher_durable_model_context_state(session, latest);
         }
-        let result = self.save_session_rebasing_task_conflicts(session).await;
+        let result = self
+            .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
+            .await;
         if may_publish_runtime_result(&result) {
             publish(session, result.is_ok());
         }
@@ -1886,6 +1918,15 @@ impl RuntimeSessionPersistence for LockedSessionStore {
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_finalized_runtime(session).await
+    }
+
+    async fn save_finalized_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::session::runtime_state::WaitingForChildrenState,
+    ) -> std::io::Result<()> {
+        self.merge_save_inherited_child_wait_and_publish(session, inherited, |_, _| {})
+            .await
     }
 
     async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
