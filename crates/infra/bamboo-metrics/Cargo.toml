@@ -5,6 +5,7 @@ edition = "2021"
 rust-version.workspace = true
 description = "Live metrics pipeline (bus, collector, worker, aggregation) for the Bamboo agent framework"
 license = "MIT"
+license-file = "../../../LICENSE"
 
 [dependencies]
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
