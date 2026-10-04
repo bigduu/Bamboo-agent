@@ -68,7 +68,7 @@ pub fn supports(point: AgentHookPoint) -> bool {
     event(point).is_some()
 }
 /// Scheduling hint only: execution still rechecks current trust under the
-/// operation lock. Empty, unreviewed, changed and event-unrelated registrations
+/// operation lock. Empty, unreviewed and event-unrelated registrations
 /// must not disable the host's normal parallel tool scheduling.
 pub fn has_active_hooks_for(root: &Path, point: AgentHookPoint) -> bool {
     let Some(event) = event(point) else {
@@ -106,18 +106,22 @@ pub fn has_active_hooks_for(root: &Path, point: AgentHookPoint) -> bool {
         {
             return false;
         }
-        let Ok(current) = registrations(&manifest, &plugin.plugin_dir) else {
-            return false;
-        };
         plugin.registered.hooks.iter().any(|h| {
             h.plugin_id == plugin.id
                 && h.version == plugin.version
-                && current
-                    .iter()
-                    .any(|now| now.config == h.config && h.state(&now.digest) == HookState::Active)
+                && h.state(&h.digest) == HookState::Active
                 && bundle_path(&plugin.plugin_dir, &h.config)
                     .ok()
-                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|path| {
+                        use std::io::Read;
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(path)
+                            .ok()?
+                            .take(65537)
+                            .read_to_end(&mut bytes)
+                            .ok()?;
+                        Some(bytes)
+                    })
                     .and_then(|bytes| PortableConfig::parse(&bytes).ok())
                     .is_some_and(|c| c.hooks.get(&event).is_some_and(|groups| !groups.is_empty()))
         })
@@ -371,23 +375,11 @@ pub async fn run_with_inputs(
         }) {
             continue;
         }
-        let current = match registrations(&manifest, &plugin.plugin_dir) {
-            Ok(r) => r,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("{}: unsupported: {e}", plugin.id));
-                continue;
-            }
-        };
         for registered in &plugin.registered.hooks {
             if registered.plugin_id != plugin.id || registered.version != plugin.version {
                 continue;
             }
-            let Some(now) = current.iter().find(|r| r.config == registered.config) else {
-                continue;
-            };
-            if registered.state(&now.digest) != HookState::Active {
+            if registered.state(&registered.digest) != HookState::Active {
                 continue;
             }
             let reviewed = ReviewedHookConfig {
@@ -519,8 +511,14 @@ async fn run_config(
                             .map_err(|e| e.to_string())?,
                     )
                     .map_err(|e| e.to_string())?;
-                    let current =
-                        registrations(&current_manifest, root).map_err(|e| e.to_string())?;
+                    let bundle = root.to_owned();
+                    let current = tokio::task::spawn_blocking(move || {
+                        current_manifest.validate()?;
+                        registrations(&current_manifest, &bundle)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
                     if !current.iter().any(|r| r.digest == reviewed_digest) {
                         return Err("reviewed plugin bytes changed before command execution".into());
                     }
@@ -765,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduling_hint_requires_current_active_event() {
-        let (temp, _, _) =
+        let (temp, session, payload) =
             fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
         let root = temp.path();
         assert!(!has_active_hooks_for(
@@ -790,10 +788,21 @@ mod tests {
         tokio::fs::write(root.join("plugin with spaces/script.sh"), "changed")
             .await
             .unwrap();
-        assert!(!has_active_hooks_for(
+        // A scheduling hint may conservatively remain true after bytes change;
+        // only the blocking-safe locked spawn check decides execution trust.
+        assert!(has_active_hooks_for(
             root,
             AgentHookPoint::BeforeToolExecution
         ));
+        let report = run(
+            root,
+            AgentHookPoint::BeforeToolExecution,
+            &payload,
+            &session,
+        )
+        .await;
+        assert!(!report.errors.is_empty());
+        assert!(matches!(report.decision, HookResult::Continue));
         let mut manifest: PluginManifest = serde_json::from_slice(
             &tokio::fs::read(root.join("plugin with spaces/plugin.json"))
                 .await

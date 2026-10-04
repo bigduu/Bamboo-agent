@@ -1477,3 +1477,23 @@ async fn portable_hook_data_survives_install_and_uninstall_of_plugin_named_data(
         .exists());
     assert!(!data.path().join("plugins/data").exists());
 }
+
+#[actix_web::test]
+async fn portable_hook_endpoints_report_absent_plugins_as_not_found() {
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(data.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/missing/hooks")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = test::call_service(&app, test::TestRequest::post()
+        .uri("/api/v1/plugins/missing/hooks/review")
+        .set_json(serde_json::json!({"config":"hooks.json","digest":"missing","enabled":true,"confirm_execution":true}))
+        .to_request()).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

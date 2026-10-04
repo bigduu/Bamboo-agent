@@ -51,6 +51,65 @@ impl HookRunner {
         }
     }
 
+    /// Record the exact accepted prompt from the server submission seam. The
+    /// shared loop consumes this once, so server and embedded runs cannot fire
+    /// portable UserPromptSubmit twice for the same admitted prompt.
+    pub fn mark_user_prompt_prechecked(session: &mut Session, prompt: &str) {
+        session.metadata.insert(
+            "runtime.plugin_prompt_prechecked".into(),
+            prompt_fingerprint(prompt),
+        );
+    }
+
+    /// Shared CLI/SDK fallback, before session preparation or provider calls.
+    /// Native submission hooks keep their existing server-only invocation.
+    pub(crate) async fn apply_portable_user_prompt(
+        &self,
+        session: &mut Session,
+        prompt: &str,
+    ) -> Result<String, AgentError> {
+        let prechecked = session.metadata.remove("runtime.plugin_prompt_prechecked");
+        if prechecked.as_deref() == Some(prompt_fingerprint(prompt).as_str()) {
+            return Ok(prompt.to_owned());
+        }
+        let Some(root) = &self.plugin_root else {
+            return Ok(prompt.to_owned());
+        };
+        let report = bamboo_hooks::portable::run(
+            root,
+            AgentHookPoint::BeforeSessionSetup,
+            &HookPayload::Prompt {
+                prompt: prompt.to_owned(),
+            },
+            session,
+        )
+        .await;
+        for error in &report.errors {
+            tracing::warn!(%error, "plugin prompt hook compatibility failure");
+        }
+        match report.decision {
+            HookResult::Deny { reason } | HookResult::Abort { reason } => {
+                return Err(AgentError::Tool(format!(
+                    "UserPromptSubmit hook rejected prompt: {reason}"
+                )));
+            }
+            _ => {}
+        }
+        let contexts = report
+            .contexts
+            .into_iter()
+            .map(|context| context.rendered_text())
+            .collect::<Vec<_>>();
+        if contexts.is_empty() {
+            Ok(prompt.to_owned())
+        } else {
+            Ok(format!(
+                "{prompt}\n\n<user_prompt_submit_context>\n{}\n</user_prompt_submit_context>",
+                contexts.join("\n\n---\n\n")
+            ))
+        }
+    }
+
     /// Run all hooks matching the given point.
     ///
     /// Records checkpoints in `runtime_state`. Returns the first
@@ -186,6 +245,11 @@ impl HookRunner {
                 .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))
             })
     }
+}
+
+fn prompt_fingerprint(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(prompt.as_bytes()))
 }
 
 async fn record_dispatch_report(

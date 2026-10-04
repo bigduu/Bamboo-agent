@@ -31,6 +31,7 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
     runtime_state.stop_hook_forced_continuations = 0;
     if !runner.has_hooks_for(AgentHookPoint::BeforeSessionSetup) {
         session.agent_runtime_state = Some(runtime_state);
+        HookRunner::mark_user_prompt_prechecked(session, raw_prompt);
         return Ok(raw_prompt.to_string());
     }
     let outcome = runner
@@ -76,12 +77,15 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
             .map(|context| context.rendered_text()),
     );
     if contexts.is_empty() {
+        HookRunner::mark_user_prompt_prechecked(session, raw_prompt);
         return Ok(raw_prompt.to_string());
     }
-    Ok(format!(
+    let effective_prompt = format!(
         "{raw_prompt}\n\n{USER_PROMPT_CONTEXT_START}\n{}\n{USER_PROMPT_CONTEXT_END}",
         contexts.join("\n\n---\n\n")
-    ))
+    );
+    HookRunner::mark_user_prompt_prechecked(session, &effective_prompt);
+    Ok(effective_prompt)
 }
 
 #[cfg(test)]

@@ -72,6 +72,19 @@ pub(crate) async fn run_agent_loop_with_config(
                     SessionStartSource::Startup
                 }
             });
+        let submitted_message = initial_message;
+        let initial_message = config
+            .hook_runner
+            .apply_portable_user_prompt(session, &submitted_message)
+            .await?;
+        if config.skip_initial_user_message && initial_message != submitted_message {
+            if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+                message.role == bamboo_agent_core::Role::User
+                    && message.content == submitted_message
+            }) {
+                message.content = initial_message.clone();
+            }
+        }
         super::state_bridge::ensure_initial_root_tool_authority(session, config.storage.as_ref())
             .await?;
         let mut state: LoopRunState = initialize_loop_state(
@@ -88,7 +101,7 @@ pub(crate) async fn run_agent_loop_with_config(
             .has_hooks_for(AgentHookPoint::AfterSessionSetup)
         {
             let payload = HookPayload::SessionSetup {
-                initial_message: initial_message.clone(),
+                initial_message: submitted_message.clone(),
                 source: session_start_source,
             };
             let outcome = config
@@ -313,6 +326,173 @@ mod hook_tests {
             hook_runner: Arc::new(runner),
             ..Default::default()
         }
+    }
+
+    async fn portable_prompt_config(command: &str) -> (tempfile::TempDir, AgentLoopConfig) {
+        use bamboo_plugin::{
+            InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginManifest, PluginSource,
+            RegisteredCapabilities,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        let bundle = root.join("prompt-policy");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id":"prompt-policy", "name":"Prompt policy", "version":"0.1.0",
+            "provides":{"hooks":[{"config":"hooks.json","scripts":["policy.sh"]}]}
+        }))
+        .unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("policy.sh"), "# reviewed fixture").unwrap();
+        std::fs::write(
+            bundle.join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({"hooks":{
+                "UserPromptSubmit":[{"hooks":[{"type":"command","command":command,"timeout":1}]}]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut hooks = bamboo_plugin::hooks::registrations(&manifest, &bundle).unwrap();
+        let digest = hooks[0].digest.clone();
+        hooks[0].confirm_review(&digest).unwrap();
+        InstalledPlugins {
+            plugins: vec![InstalledPlugin {
+                id: manifest.id,
+                version: manifest.version,
+                source: PluginSource::LocalDir {
+                    path: bundle.clone(),
+                },
+                plugin_dir: bundle,
+                installed_at: chrono::Utc::now(),
+                status: PluginInstallStatus::Installed,
+                registered: RegisteredCapabilities {
+                    hooks,
+                    ..Default::default()
+                },
+            }],
+        }
+        .save(&root.join("installed.json"))
+        .await
+        .unwrap();
+        let mut runner = crate::runtime::hooks::HookRunner::new().with_lifecycle_config(
+            &bamboo_config::LifecycleHooksConfig::default(),
+            Some(temp.path().to_owned()),
+        );
+        runner.register(Arc::new(AbortRoundHook));
+        (
+            temp,
+            AgentLoopConfig {
+                model_name: Some("model".into()),
+                hook_runner: Arc::new(runner),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_blocks_shared_loop_before_provider_or_session_setup() {
+        let (_temp, config) = portable_prompt_config("printf 'prompt blocked' >&2; exit 2").await;
+        let mut session = Session::new("portable-block", "model");
+        let (tx, _rx) = mpsc::channel(32);
+        let error = run_agent_loop_with_config(
+            &mut session,
+            "raw prompt".into(),
+            tx,
+            Arc::new(PanicProvider),
+            Arc::new(EmptyTools),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("prompt blocked"));
+        assert!(session.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_context_reaches_shared_loop_and_preappended_sdk_input() {
+        for preappended in [false, true] {
+            let (_temp, mut config) =
+                portable_prompt_config("printf 'portable prompt context'").await;
+            config.skip_initial_user_message = preappended;
+            let mut session = Session::new("portable-context", "model");
+            if preappended {
+                session.add_message(Message::user("raw prompt"));
+            }
+            let (tx, _rx) = mpsc::channel(32);
+            let error = run_agent_loop_with_config(
+                &mut session,
+                "raw prompt".into(),
+                tx,
+                Arc::new(PanicProvider),
+                Arc::new(EmptyTools),
+                CancellationToken::new(),
+                config,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("round rejected"));
+            let prompts = session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(prompts.len(), 1);
+            assert!(prompts[0]
+                .content
+                .contains("untrusted; source prompt-policy@0.1.0"));
+            assert!(prompts[0].content.contains("portable prompt context"));
+            assert!(!session
+                .messages
+                .iter()
+                .any(|message| message.role == Role::System
+                    && message.content.contains("portable prompt context")));
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_server_receipt_is_exact_and_consumed_once() {
+        let (_temp, config) = portable_prompt_config("printf 'must run once' >&2; exit 2").await;
+        let runner = config.hook_runner.clone();
+        let mut session = Session::new("portable-prechecked", "model");
+        crate::runtime::hooks::HookRunner::mark_user_prompt_prechecked(
+            &mut session,
+            "accepted prompt",
+        );
+        let (tx, _rx) = mpsc::channel(32);
+        let error = run_agent_loop_with_config(
+            &mut session,
+            "accepted prompt".into(),
+            tx,
+            Arc::new(PanicProvider),
+            Arc::new(EmptyTools),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("round rejected"));
+        assert!(!session
+            .metadata
+            .contains_key("runtime.plugin_prompt_prechecked"));
+        assert!(runner
+            .apply_portable_user_prompt(&mut session, "accepted prompt")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must run once"));
+        crate::runtime::hooks::HookRunner::mark_user_prompt_prechecked(
+            &mut session,
+            "different prompt",
+        );
+        assert!(runner
+            .apply_portable_user_prompt(&mut session, "accepted prompt")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

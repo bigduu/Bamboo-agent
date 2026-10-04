@@ -31,7 +31,10 @@ each command spawn. Configuration,
 script, other bundle bytes, identity or version changes invalidate trust.
 Command launch and process cleanup share the existing plugin-operation lock
 with installation, review and removal; receipt state is rechecked at each
-spawn. Removal persists disabling before cleanup. A command already executing
+spawn. Full bundle integrity scans run on blocking workers rather than Tokio
+workers. Scheduling hints inspect reviewed registrations and bounded configs,
+without hashing the bundle; a changed bundle can conservatively retain the hint
+until the spawn check rejects it. Removal persists disabling before cleanup. A command already executing
 is bounded by its timeout rather than retroactively cancelled. Commands that
 call the same host installation/review API cannot complete that reentrant
 operation while they hold the execution boundary; their timeout releases it.
@@ -101,7 +104,8 @@ model-facing result text. No synthetic Claude `Edit` input is produced for
 Commands receive `PLUGIN_ROOT`, `PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT` and
 `CLAUDE_PLUGIN_DATA` as environment variables. Quote variable expansions to
 handle spaces. Commands run in the session workspace using Bamboo's existing
-preferred shell. The first version does not support per-platform commands.
+preferred shell and the same prepared login-shell/config environment as native
+commands, with plugin root/data variables applied afterward. The first version does not support per-platform commands.
 
 JSON output accepts only top-level `decision`/`reason` and
 `hookSpecificOutput`. The latter accepts `hookEventName`, `additionalContext`,
@@ -139,3 +143,9 @@ input from execution rather than re-resolving against a later catalog.
 Persistent hook data uses the reserved `.hook-data` namespace, which cannot be
 accepted as a plugin id. A valid plugin named `data` remains independent of that
 storage; uninstalling it cannot remove another plugin's hook state.
+
+The shared engine entry runs portable UserPromptSubmit before session setup and
+provider calls, including headless/embedded runs. The server submission seam
+still checks before persisting the user message and records an exact-prompt,
+once-consumed fingerprint to prevent a second execution in the engine. Native
+UserPromptSubmit invocation remains at the existing server seam.

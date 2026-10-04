@@ -204,9 +204,9 @@ async fn hook_review_report(
 ) -> bamboo_plugin::PluginResult<serde_json::Value> {
     let store =
         bamboo_plugin::InstalledPlugins::load(&plugins_root(state).join("installed.json")).await?;
-    let entry = store.get_unique(id)?.ok_or_else(|| {
-        bamboo_plugin::PluginError::InvalidManifest("plugin not installed".into())
-    })?;
+    let entry = store
+        .get_unique(id)?
+        .ok_or_else(|| bamboo_plugin::PluginError::NotFound(id.to_string()))?;
     let manifest: bamboo_plugin::PluginManifest = serde_json::from_slice(
         &tokio::fs::read(entry.plugin_dir.join("plugin.json"))
             .await
@@ -235,9 +235,10 @@ pub async fn review_plugin_hooks(
     let result: bamboo_plugin::PluginResult<()> = async {
         let path = plugins_root(&state).join("installed.json");
         let mut store = bamboo_plugin::InstalledPlugins::load(&path).await?;
-        let mut entry = store.get_unique(&id)?.cloned().ok_or_else(|| {
-            bamboo_plugin::PluginError::InvalidManifest("plugin not installed".into())
-        })?;
+        let mut entry = store
+            .get_unique(&id)?
+            .cloned()
+            .ok_or_else(|| bamboo_plugin::PluginError::NotFound(id.to_string()))?;
         if entry.status != bamboo_plugin::PluginInstallStatus::Installed {
             return Err(bamboo_plugin::PluginError::InvalidManifest(
                 "install incomplete".into(),

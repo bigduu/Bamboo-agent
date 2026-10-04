@@ -33,4 +33,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+bamboo-infrastructure = { path = "../bamboo-infrastructure", features = ["test-utils"] }
 tempfile = "3"
