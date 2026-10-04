@@ -327,6 +327,40 @@ impl MemoryStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_memory_with_retrieval_and_source_range(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: DurableMemoryType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
+        message_range: &[String],
+    ) -> io::Result<DurableMemoryDocument> {
+        self.store
+            .write_memory_with_retrieval_and_source_range(
+                scope,
+                project_key,
+                r#type,
+                title,
+                content,
+                tags,
+                retrieval,
+                session_id,
+                actor,
+                allow_merge_if_similar,
+                granularity,
+                message_range,
+            )
+            .await
+    }
+
     pub async fn archive_memory(
         &self,
         id: &str,
