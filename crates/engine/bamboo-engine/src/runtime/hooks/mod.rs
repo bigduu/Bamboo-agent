@@ -76,6 +76,29 @@ impl HookRunner {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         original_tool_input: Option<&serde_json::Value>,
     ) -> HookRunOutcome {
+        self.run_hooks_with_inputs(
+            point,
+            payload,
+            session,
+            runtime_state,
+            event_tx,
+            bamboo_hooks::portable::PortableInputs {
+                original_tool_input,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn run_hooks_with_inputs(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        runtime_state: &mut AgentRuntimeState,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        inputs: bamboo_hooks::portable::PortableInputs<'_>,
+    ) -> HookRunOutcome {
         let report = self.dispatcher.run_hooks(point, payload, session).await;
         let mut outcome = record_dispatch_report(report, runtime_state, event_tx).await;
         if let Some(root) = &self.plugin_root {
@@ -83,12 +106,13 @@ impl HookRunner {
                 outcome.decision,
                 HookResult::Continue | HookResult::Allow | HookResult::Mutated
             ) {
-                let plugin = bamboo_hooks::portable::run_with_tool_input(
+                let plugin = bamboo_hooks::portable::run_with_inputs(
                     root,
                     point,
                     payload,
                     session,
-                    original_tool_input,
+                    inputs.original_tool_input,
+                    inputs.final_assistant_content,
                 )
                 .await;
                 for error in plugin.errors {
@@ -134,8 +158,7 @@ impl HookRunner {
             || (self
                 .plugin_root
                 .as_ref()
-                .is_some_and(|root| root.join("installed.json").exists())
-                && bamboo_hooks::portable::supports(point))
+                .is_some_and(|root| bamboo_hooks::portable::has_active_hooks_for(root, point)))
     }
 
     pub fn len(&self) -> usize {
@@ -144,10 +167,16 @@ impl HookRunner {
 
     pub fn is_empty(&self) -> bool {
         self.dispatcher.is_empty()
-            && !self
-                .plugin_root
-                .as_ref()
-                .is_some_and(|root| root.join("installed.json").exists())
+            && !self.plugin_root.as_ref().is_some_and(|root| {
+                [
+                    AgentHookPoint::BeforeSessionSetup,
+                    AgentHookPoint::BeforeToolExecution,
+                    AgentHookPoint::AfterToolExecution,
+                    AgentHookPoint::BeforeFinalize,
+                ]
+                .into_iter()
+                .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))
+            })
     }
 }
 

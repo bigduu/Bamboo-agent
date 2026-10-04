@@ -2298,7 +2298,7 @@ async fn handle_no_tool_calls_with_native(
     {
         let outcome = config
             .hook_runner
-            .run_hooks(
+            .run_hooks_with_inputs(
                 AgentHookPoint::BeforeFinalize,
                 &HookPayload::Finalize {
                     stop_hook_active: runtime_state.stop_hook_forced_continuations > 0,
@@ -2306,6 +2306,10 @@ async fn handle_no_tool_calls_with_native(
                 session,
                 runtime_state,
                 Some(event_tx),
+                bamboo_hooks::portable::PortableInputs {
+                    final_assistant_content: final_assistant_content_for_guardian,
+                    ..Default::default()
+                },
             )
             .await;
         if let HookResult::Deny { reason } = &outcome.decision {

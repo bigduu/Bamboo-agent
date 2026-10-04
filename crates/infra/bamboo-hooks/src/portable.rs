@@ -9,6 +9,12 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub const PORTABLE_CONTEXT_BYTES: usize = 8192;
+#[derive(Clone, Copy, Default)]
+pub struct PortableInputs<'a> {
+    pub original_tool_input: Option<&'a Value>,
+    pub final_assistant_content: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginContext {
     pub source: String,
@@ -60,13 +66,70 @@ fn event(point: AgentHookPoint) -> Option<PortableEvent> {
 pub fn supports(point: AgentHookPoint) -> bool {
     event(point).is_some()
 }
+/// Scheduling hint only: execution still rechecks current trust under the
+/// operation lock. Empty, unreviewed, changed and event-unrelated registrations
+/// must not disable the host's normal parallel tool scheduling.
+pub fn has_active_hooks_for(root: &Path, point: AgentHookPoint) -> bool {
+    let Some(event) = event(point) else {
+        return false;
+    };
+    let Some(store) = std::fs::read(root.join("installed.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InstalledPlugins>(&bytes).ok())
+    else {
+        return false;
+    };
+    store.plugins.iter().any(|plugin| {
+        if plugin.status != PluginInstallStatus::Installed
+            || store.plugins.iter().filter(|p| p.id == plugin.id).count() != 1
+            || !plugin
+                .registered
+                .hooks
+                .iter()
+                .any(|h| h.enabled && h.trusted_digest.as_deref() == Some(&h.digest))
+        {
+            return false;
+        }
+        let Some(manifest) = std::fs::read(plugin.plugin_dir.join("plugin.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PluginManifest>(&bytes).ok())
+        else {
+            return false;
+        };
+        if manifest.id != plugin.id
+            || manifest.version != plugin.version
+            || manifest.validate().is_err()
+            || manifest.platforms.as_ref().is_some_and(|ps| {
+                !bamboo_plugin::Platform::current().is_some_and(|p| ps.contains(&p))
+            })
+        {
+            return false;
+        }
+        let Ok(current) = registrations(&manifest, &plugin.plugin_dir) else {
+            return false;
+        };
+        plugin.registered.hooks.iter().any(|h| {
+            h.plugin_id == plugin.id
+                && h.version == plugin.version
+                && current
+                    .iter()
+                    .any(|now| now.config == h.config && h.state(&now.digest) == HookState::Active)
+                && bundle_path(&plugin.plugin_dir, &h.config)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|bytes| PortableConfig::parse(&bytes).ok())
+                    .is_some_and(|c| c.hooks.get(&event).is_some_and(|groups| !groups.is_empty()))
+        })
+    })
+}
+
 pub fn envelope(
     event: PortableEvent,
     payload: &HookPayload,
     session: &Session,
     cwd: &Path,
 ) -> Result<Value, String> {
-    envelope_with_tool_input(event, payload, session, cwd, None)
+    envelope_with_tool_input(event, payload, session, cwd, None, None)
 }
 
 fn envelope_with_tool_input(
@@ -75,6 +138,7 @@ fn envelope_with_tool_input(
     session: &Session,
     cwd: &Path,
     original_tool_input: Option<&Value>,
+    final_assistant_content: Option<&str>,
 ) -> Result<Value, String> {
     let mut value = json!({"session_id":session.id,"transcript_path":null,"cwd":cwd,"hook_event_name":event,"permission_mode":"default"});
     match (event, payload) {
@@ -123,18 +187,20 @@ fn envelope_with_tool_input(
                 serde_json::from_str(&call.function.arguments)
                     .map_err(|e| format!("invalid original tool arguments: {e}"))?
             };
-            value["tool_response"] = json!(outcome.result);
+            value["tool_response"] = json!(outcome.result.as_ref().or(outcome.error.as_ref()));
         }
         (PortableEvent::Stop, HookPayload::Finalize { stop_hook_active }) => {
             value["stop_hook_active"] = json!(stop_hook_active);
-            value["last_assistant_message"] = json!(session
-                .messages
-                .iter()
-                .rev()
-                .find(|m| matches!(m.role, bamboo_agent_core::Role::Assistant))
-                .map(|m| &m.content)
-                .cloned()
-                .unwrap_or_default());
+            value["last_assistant_message"] = json!(final_assistant_content
+                .map(str::to_owned)
+                .unwrap_or_else(|| session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.role, bamboo_agent_core::Role::Assistant))
+                    .map(|m| &m.content)
+                    .cloned()
+                    .unwrap_or_default()));
         }
         _ => return Err("portable event/payload mismatch".into()),
     }
@@ -250,6 +316,17 @@ pub async fn run_with_tool_input(
     session: &Session,
     original_tool_input: Option<&Value>,
 ) -> PortableReport {
+    run_with_inputs(root, point, payload, session, original_tool_input, None).await
+}
+
+pub async fn run_with_inputs(
+    root: &Path,
+    point: AgentHookPoint,
+    payload: &HookPayload,
+    session: &Session,
+    original_tool_input: Option<&Value>,
+    final_assistant_content: Option<&str>,
+) -> PortableReport {
     let mut report = PortableReport::default();
     let Some(event) = event(point) else {
         return report;
@@ -331,6 +408,7 @@ pub async fn run_with_tool_input(
                 &reviewed,
                 &mut remaining,
                 original_tool_input,
+                final_assistant_content,
             )
             .await;
             match result {
@@ -372,6 +450,7 @@ async fn run_config(
     reviewed: &ReviewedHookConfig<'_>,
     remaining: &mut usize,
     original_tool_input: Option<&Value>,
+    final_assistant_content: Option<&str>,
 ) -> Result<PortableReport, String> {
     let root = reviewed.root;
     let data = &reviewed.data;
@@ -385,7 +464,14 @@ async fn run_config(
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
-    let input = envelope_with_tool_input(event, payload, session, &cwd, original_tool_input)?;
+    let input = envelope_with_tool_input(
+        event,
+        payload,
+        session,
+        &cwd,
+        original_tool_input,
+        final_assistant_content,
+    )?;
     let stop_active = input["stop_hook_active"].as_bool().unwrap_or(false);
     let bytes = serde_json::to_vec(&input).map_err(|e| e.to_string())?;
     let mut report = PortableReport::default();
@@ -614,6 +700,7 @@ mod tests {
             &session,
             Path::new("/work"),
             Some(&original),
+            None,
         )
         .unwrap();
         assert_eq!(post["tool_input"], original);
@@ -632,6 +719,111 @@ mod tests {
         assert_eq!(stop["stop_hook_active"], true);
         assert_eq!(stop["last_assistant_message"], "");
     }
+    #[test]
+    fn failed_tool_response_and_pending_stop_content_are_current() {
+        let mut session = Session::new("fixture", "model");
+        session.messages.push(bamboo_agent_core::Message::assistant(
+            "previous reply",
+            None,
+        ));
+        let payload = HookPayload::ToolResult {
+            tool_name: "apply_patch".into(),
+            tool_call_id: "call".into(),
+            outcome: bamboo_domain::HookToolOutcome {
+                success: false,
+                result: None,
+                error: Some("patch failed".into()),
+                needs_human: false,
+                duration_ms: 1,
+            },
+        };
+        let post = envelope_with_tool_input(
+            PortableEvent::PostToolUse,
+            &payload,
+            &session,
+            Path::new("/work"),
+            Some(&json!({"patch":"original"})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(post["tool_response"], "patch failed");
+        let stop = envelope_with_tool_input(
+            PortableEvent::Stop,
+            &HookPayload::Finalize {
+                stop_hook_active: false,
+            },
+            &session,
+            Path::new("/work"),
+            None,
+            Some("pending final reply"),
+        )
+        .unwrap();
+        assert_eq!(stop["last_assistant_message"], "pending final reply");
+        assert_eq!(session.messages.last().unwrap().content, "previous reply");
+    }
+
+    #[tokio::test]
+    async fn scheduling_hint_requires_current_active_event() {
+        let (temp, _, _) =
+            fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
+        let root = temp.path();
+        assert!(!has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+        trust(root).await;
+        assert!(has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+        assert!(!has_active_hooks_for(root, AgentHookPoint::BeforeFinalize));
+        let path = root.join("installed.json");
+        let mut store = InstalledPlugins::load(&path).await.unwrap();
+        store.plugins[0].registered.hooks[0].enabled = false;
+        store.save(&path).await.unwrap();
+        assert!(!has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+        trust(root).await;
+        tokio::fs::write(root.join("plugin with spaces/script.sh"), "changed")
+            .await
+            .unwrap();
+        assert!(!has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+        let mut manifest: PluginManifest = serde_json::from_slice(
+            &tokio::fs::read(root.join("plugin with spaces/plugin.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        tokio::fs::write(root.join("plugin with spaces/hooks.json"), serde_json::to_vec(&json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true","timeout":1}]}]}})).unwrap()).await.unwrap();
+        store.plugins[0].registered.hooks =
+            registrations(&manifest, &store.plugins[0].plugin_dir).unwrap();
+        store.save(&path).await.unwrap();
+        trust(root).await;
+        assert!(has_active_hooks_for(root, AgentHookPoint::BeforeFinalize));
+        assert!(!has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+        manifest.provides.hooks.clear();
+        tokio::fs::write(
+            root.join("plugin with spaces/plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+        store.plugins[0].registered.hooks.clear();
+        store.save(&path).await.unwrap();
+        assert!(!has_active_hooks_for(
+            root,
+            AgentHookPoint::BeforeToolExecution
+        ));
+    }
+
     async fn fixture(commands: Vec<Value>) -> (tempfile::TempDir, Session, HookPayload) {
         let temp = tempfile::tempdir().unwrap();
         let bundle = temp.path().join("plugin with spaces");
