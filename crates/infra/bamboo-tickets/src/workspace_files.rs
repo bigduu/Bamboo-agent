@@ -51,6 +51,8 @@ pub struct FileReply {
 struct FileContents {
     bytes: Vec<u8>,
     mode: u32,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
 impl TicketService {
@@ -196,7 +198,8 @@ impl TicketService {
             &dir,
             &name,
             content.as_bytes(),
-            prior.map_or(0o600, |file| file.mode),
+            prior.as_ref(),
+            expected_sha256.as_deref(),
         )?;
         let mut next = store.published.as_ref().expect("published start").1.clone();
         next.seq += 1;
@@ -364,25 +367,58 @@ mod physical {
         Ok(Some(FileContents {
             bytes,
             mode: meta.mode() & 0o777,
+            identity: (meta.dev(), meta.ino()),
         }))
     }
-    pub fn replace(dir: &File, name: &CString, bytes: &[u8], mode: u32) -> Result<()> {
+    pub fn replace(
+        dir: &File,
+        name: &CString,
+        bytes: &[u8],
+        prior: Option<&FileContents>,
+        expected_sha256: Option<&str>,
+    ) -> Result<()> {
         let staging = CString::new(format!(".ticket-file-{}", uuid::Uuid::new_v4())).expect("UUID");
         let result = (|| {
             let mut file = open(dir, &staging, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
             file.write_all(bytes)?;
-            file.set_permissions(Permissions::from_mode(mode))?;
+            file.set_permissions(Permissions::from_mode(
+                prior.map_or(0o600, |file| file.mode),
+            ))?;
             file.sync_all()?;
-            if unsafe {
-                libc::renameat(
-                    dir.as_raw_fd(),
-                    staging.as_ptr(),
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                )
-            } != 0
+            // Started publication and staging fsync may take long enough for
+            // an external editor to change this destination. Reopen through
+            // the same no-follow directory capability at the replacement
+            // boundary. A conflict retains Started and never gains a receipt.
+            let current = read(dir, name)?;
+            if current
+                .as_ref()
+                .map(|file| content_hash(&file.bytes))
+                .as_deref()
+                != expected_sha256
+                || current.as_ref().map(|file| (file.identity, file.mode))
+                    != prior.map(|file| (file.identity, file.mode))
             {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(Error::RevisionConflict);
+            }
+            if prior.is_none() {
+                // linkat has kernel no-replace semantics: a creator after the
+                // final read cannot have its new destination overwritten.
+                install_absent(dir, &staging, name)?;
+            } else {
+                // POSIX provides no content-conditional rename for an existing
+                // path. This boundary recheck closes the publication window;
+                // it is not atomic CAS against non-cooperating external writers.
+                if unsafe {
+                    libc::renameat(
+                        dir.as_raw_fd(),
+                        staging.as_ptr(),
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
             dir.sync_all()?;
             Ok(())
@@ -393,6 +429,62 @@ mod physical {
             }
         }
         result
+    }
+    fn install_absent(dir: &File, staging: &CString, name: &CString) -> Result<()> {
+        if unsafe {
+            libc::linkat(
+                dir.as_raw_fd(),
+                staging.as_ptr(),
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(Error::RevisionConflict)
+            } else {
+                Err(error.into())
+            };
+        }
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), staging.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn no_replace_preserves_external_creator_after_final_absence_check() {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = File::open(temp.path()).unwrap();
+            let destination = CString::new("target").unwrap();
+            let staging = CString::new("staging").unwrap();
+            std::fs::write(temp.path().join("staging"), "Worker result").unwrap();
+            assert!(read(&dir, &destination).unwrap().is_none());
+            let status = std::process::Command::new("sh")
+                .args(["-c", r#"printf '%s' 'external creator' > "$1""#, "editor"])
+                .arg(temp.path().join("target"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(matches!(
+                install_absent(&dir, &staging, &destination),
+                Err(Error::RevisionConflict)
+            ));
+            assert_eq!(
+                std::fs::read(temp.path().join("target")).unwrap(),
+                b"external creator"
+            );
+            assert_eq!(
+                std::fs::read(temp.path().join("staging")).unwrap(),
+                b"Worker result"
+            );
+        }
     }
 }
 
@@ -407,7 +499,13 @@ mod physical {
     pub(super) fn read(_: &(), _: &()) -> Result<Option<FileContents>> {
         unreachable!()
     }
-    pub fn replace(_: &(), _: &(), _: &[u8], _: u32) -> Result<()> {
+    pub fn replace(
+        _: &(),
+        _: &(),
+        _: &[u8],
+        _: Option<&FileContents>,
+        _: Option<&str>,
+    ) -> Result<()> {
         unreachable!()
     }
 }

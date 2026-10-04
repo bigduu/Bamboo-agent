@@ -1136,6 +1136,141 @@ fn same_name_approval_needs_exact_id_and_optional_reply_reference_does_not_autho
 }
 
 #[test]
+fn question_answers_require_exact_named_human_evidence() {
+    for (text, quote, answer, second_question, expected) in [
+        (
+            "A 的答案是绿色；A 的答案是绿色",
+            "A 的答案是绿色",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是",
+            "A 的答案是",
+            "",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是不",
+            "A 的答案是不",
+            "不",
+            false,
+            ResolutionStatus::Committed,
+        ),
+        (
+            "hello",
+            "hello",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是绿色",
+            "A 的答案是绿色",
+            "红色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "如果需要，A 的答案是绿色",
+            "A 的答案是绿色",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是绿色，但别回答",
+            "A 的答案是绿色",
+            "绿色",
+            false,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是绿色",
+            "A 的答案是绿色",
+            "绿色",
+            true,
+            ResolutionStatus::NeedsClarification,
+        ),
+        (
+            "A 的答案是绿色",
+            "A 的答案是绿色",
+            "绿色",
+            false,
+            ResolutionStatus::Committed,
+        ),
+        (
+            "Answer A: green",
+            "Answer A: green",
+            "green",
+            false,
+            ResolutionStatus::Committed,
+        ),
+    ] {
+        let (_dir, service) = fixture();
+        let a = create(&service, "A");
+        let q = ask(&service, &a, "first", false);
+        if second_question {
+            ask(&service, &a, "second", false);
+        }
+        register(&service, "answer-evidence", 1, text);
+        save(
+            &service,
+            "answer-evidence",
+            vec![group(
+                "answer",
+                quote,
+                vec![SemanticOperation::Answer {
+                    target: RequestReference::from_request(&q),
+                    answer: answer.into(),
+                }],
+            )],
+        );
+        let result = service.settle_message(&human(), "answer-evidence").unwrap();
+        assert_eq!(result.groups[0].status, expected, "{text}");
+        let snapshot = service.published().unwrap().1;
+        assert_eq!(
+            snapshot.requests[&q.id].answer.as_deref(),
+            (expected == ResolutionStatus::Committed).then_some(answer),
+            "{text}"
+        );
+        if expected != ResolutionStatus::Committed {
+            assert_eq!(snapshot.requests[&q.id].status, RequestStatus::Open);
+            let exact = format!("{} 的答案是精确回答", q.id);
+            register(&service, "exact-request", 2, &exact);
+            save(
+                &service,
+                "exact-request",
+                vec![group(
+                    "answer-exact",
+                    &exact,
+                    vec![SemanticOperation::Answer {
+                        target: RequestReference::from_request(&q),
+                        answer: "精确回答".into(),
+                    }],
+                )],
+            );
+            assert_eq!(
+                service
+                    .settle_message(&human(), "exact-request")
+                    .unwrap()
+                    .groups[0]
+                    .status,
+                ResolutionStatus::Committed
+            );
+            assert_eq!(
+                service.published().unwrap().1.requests[&q.id]
+                    .answer
+                    .as_deref(),
+                Some("精确回答")
+            );
+        }
+    }
+}
+
+#[test]
 fn question_answer_does_not_authorize_and_model_json_cannot_publish_runtime_or_provenance() {
     let (_dir, service) = fixture();
     let a = create(&service, "A");

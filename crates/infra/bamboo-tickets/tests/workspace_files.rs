@@ -306,6 +306,126 @@ fn stale_read_cannot_overwrite_concurrent_file_change() {
 }
 
 #[test]
+fn external_editor_fixture_process() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = std::env::var_os("BAMBOO_TICKET_EDITOR_PATH") else {
+        return;
+    };
+    let path = Path::new(&path);
+    match std::env::var("BAMBOO_TICKET_EDITOR_MODE").unwrap().as_str() {
+        "replace" => {
+            let staging = path.with_extension("editor-temp");
+            fs::write(&staging, "external editor result").unwrap();
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::rename(staging, path).unwrap();
+        }
+        "in-place" => fs::write(path, "external editor result").unwrap(),
+        "create" => {
+            fs::write(path, "external editor result").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        "same-bytes-replacement" => {
+            let staging = path.with_extension("editor-temp");
+            fs::write(&staging, "old").unwrap();
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::rename(staging, path).unwrap();
+        }
+        "mode-only" => fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap(),
+        other => panic!("unsupported fixture mode {other}"),
+    }
+}
+
+#[test]
+fn external_edit_during_started_publication_is_not_overwritten_and_stays_fenced() {
+    check_external_editor_window(&["replace", "in-place", "create"]);
+}
+
+#[test]
+fn external_inode_or_mode_change_with_same_bytes_during_publication_stays_fenced() {
+    check_external_editor_window(&["same-bytes-replacement", "mode-only"]);
+}
+
+fn check_external_editor_window(modes: &[&'static str]) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    for &mode in modes {
+        let f = fixture();
+        let path = Path::new(&f.workspace.worktree).join("code.rs");
+        let expected = if mode == "create" {
+            None
+        } else {
+            fs::write(&path, "old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            Some(content_hash(b"old"))
+        };
+        let op = write(&path, "Worker result", expected);
+        let editor_path = path.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        f.service.set_publication_fault(Some(Arc::new(move |point| {
+            if point == FaultPoint::AfterHeadRename && !observed.swap(true, Ordering::SeqCst) {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "external_editor_fixture_process", "--nocapture"])
+                    .env("BAMBOO_TICKET_EDITOR_PATH", &editor_path)
+                    .env("BAMBOO_TICKET_EDITOR_MODE", mode)
+                    .status()?;
+                assert!(status.success());
+            }
+            Ok(())
+        })));
+        let result = f.service.workspace_file(&f.worker, "window-write", &op);
+        f.service.set_publication_fault(None);
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(
+            matches!(result, Err(Error::RevisionConflict)),
+            "{mode}: {result:?}"
+        );
+        let external_content = if matches!(mode, "same-bytes-replacement" | "mode-only") {
+            "old"
+        } else {
+            "external editor result"
+        };
+        assert_eq!(fs::read_to_string(&path).unwrap(), external_content);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            if mode == "mode-only" { 0o755 } else { 0o644 }
+        );
+        let snapshot = f.service.published().unwrap().1;
+        let effects = &snapshot.assignments[&f.assignment].effects;
+        assert_eq!(effects.len(), 1);
+        let (id, effect) = effects.iter().next().unwrap();
+        assert_eq!(effect.state, EffectState::Started);
+        assert!(!snapshot.receipts.contains_key(id));
+        assert!(matches!(
+            f.service.workspace_file(&f.worker, "window-write", &op),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assert!(matches!(
+            f.service.workspace_file(
+                &f.worker,
+                "new-write",
+                &write(
+                    &path,
+                    "later",
+                    Some(content_hash(external_content.as_bytes()))
+                )
+            ),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assert!(fs::read_dir(&f.workspace.worktree)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ticket-file-")));
+    }
+}
+
+#[test]
 fn complete_read_respects_encoded_host_reply_budget_without_truncation() {
     let f = fixture();
     let path = Path::new(&f.workspace.worktree).join("bounded.txt");

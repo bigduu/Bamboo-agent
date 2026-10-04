@@ -716,6 +716,12 @@ Internal decision wake envelopes use the existing `hidden_from_ui` metadata.
 Semantic user-required accept additionally needs an explicit complete current
 Human clause naming the Work/submission, so a model proposal cannot promote
 chatter, negation, conditions or quoted tool text into user confirmation.
+Question answers likewise require one complete current Human sentence naming
+the exact request or the Work's unique current question, using
+`Answer {name}: {answer}` or `{name} 的答案是{answer}` with the answer preserved verbatim. A
+proposal cannot attach an arbitrary answer to unrelated chat. Ambiguous or
+truncated language remains pending clarification; a negative answer is still
+valid when it is the explicit named Human answer.
 
 PASS: Ticket domain 61 unique tests; `/tmp/1481-p9-domain-final1.log` and final
 acceptance-source regression `/tmp/1481-p9-semantic-final2.log` (17/17, 10.34s).
@@ -839,8 +845,16 @@ port for explicit Assignment write roots. Every entry checks the immutable
 execution identity, current generation/contract/epoch, live permit and tool
 capability. Unix directory descriptors and no-follow opens protect every path
 component; traversal, symlinks, hardlinks, sibling roots, TicketStore and `.git`
-are rejected. Writes atomically replace an inode and require the hash of an
-existing file, preventing a stale read from overwriting newer content.
+are rejected. Writes require the hash of an existing file and recheck its bytes,
+inode identity and ordinary mode through the same no-follow directory FD after
+Started publication and staging fsync, immediately before atomic replacement.
+Detected changes preserve the external file and retain Started without a success
+receipt. An absent destination uses kernel no-replace publication, so a racing
+creator is never overwritten. Existing-file hash-check followed by rename is
+not an atomic content CAS against non-cooperating external editors: a writer
+after the final check can still race the rename. Internal mutexes and advisory
+locks do not remove that POSIX limitation; the supported single-writer scope
+must exclude overlapping external edits at that boundary.
 
 Before touching a workspace file, the existing full-manifest publication stores
 the complete immutable content and a Started effect. A second publication records

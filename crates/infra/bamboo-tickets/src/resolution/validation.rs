@@ -366,6 +366,53 @@ fn approval_text(
     Ok(())
 }
 
+fn answer_text(
+    snapshot: &Snapshot,
+    record: &HumanIngressRecord,
+    quote: &str,
+    q: &PendingRequest,
+    answer: &str,
+) -> Result<()> {
+    let work = &snapshot.tickets[&q.work_id];
+    let unique_question = snapshot
+        .requests
+        .values()
+        .filter(|other| {
+            other.work_id == q.work_id
+                && other.generation == q.generation
+                && other.contract_revision == q.contract_revision
+                && other.status == RequestStatus::Open
+                && other.kind == RequestKind::Question
+        })
+        .count()
+        == 1;
+    // User authority requires a verbatim answer in a complete, explicitly
+    // addressed Human sentence. Pending Worker prompts are not answer evidence.
+    // Work names are usable only for one current question; otherwise the Human
+    // must identify the exact request. Ambiguous natural language clarifies.
+    let explicit = std::iter::once(q.id.as_str())
+        .chain(unique_question.then_some(work.id.as_str()))
+        .chain(
+            (unique_question && names_work(snapshot, quote, work))
+                .then_some(work.contract.title.as_str()),
+        )
+        .any(|name| {
+            quote.trim() == format!("{name} 的答案是{answer}")
+                || quote.trim() == format!("Answer {name}: {answer}")
+                || quote.trim() == format!("answer {name}: {answer}")
+        });
+    if answer.trim().is_empty()
+        || answer != answer.trim()
+        || !explicit
+        || human_sentence(record, quote).is_none_or(|sentence| sentence.trim() != quote.trim())
+    {
+        return Err(clarify(
+            "question answers need an exact, unambiguous named Human sentence and verbatim answer",
+        ));
+    }
+    Ok(())
+}
+
 fn acceptance_text(
     snapshot: &Snapshot,
     record: &HumanIngressRecord,
@@ -457,12 +504,14 @@ pub(super) fn validate_group(
                     ));
                 }
             }
-            SemanticOperation::Answer { target, .. } => {
-                if request(snapshot, target)?.kind != RequestKind::Question {
+            SemanticOperation::Answer { target, answer } => {
+                let q = request(snapshot, target)?;
+                if q.kind != RequestKind::Question {
                     return Err(Error::ScopeDenied(
                         "a question answer cannot approve an action".into(),
                     ));
                 }
+                answer_text(snapshot, record, &group.source_quote, q, answer)?;
             }
             SemanticOperation::DecideApproval {
                 target,
