@@ -548,6 +548,23 @@ fn root_authority_storage_preference(
 /// refresh) instead of a bespoke adapter.
 #[async_trait::async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
+    fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
+        bamboo_domain::RuntimeSessionPersistence::inherited_child_wait(self.persistence.as_ref())
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: bamboo_domain::InheritedChildWait,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        let mut bound = self.clone();
+        bound.persistence = Arc::new(
+            self.persistence
+                .as_ref()
+                .bind_inherited_child_wait(inherited),
+        );
+        Ok(Arc::new(bound))
+    }
+
     fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
         self.root_actor_owner
             .as_ref()
