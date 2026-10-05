@@ -21,5 +21,6 @@ pub use manager::{
 };
 pub use protocol::*;
 pub use tool_index::{ToolIndex, MAX_MCP_OWNERSHIP_LEDGER_RELATIONSHIPS};
-pub use transports::*;
+// Re-export the SDK for embedded consumers constructing custom transports.
+pub use rmcp;
 pub use types::*;
