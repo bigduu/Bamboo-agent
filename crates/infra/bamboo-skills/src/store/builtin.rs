@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{
-    entry_from_skill, parse_bundle_metadata_bytes, workflow_catalog_content_digest, BundleMetadata,
+    bundle_metadata_from_bytes, entry_from_skill, workflow_catalog_content_digest, BundleMetadata,
     WorkflowCatalogEntry,
 };
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
@@ -76,14 +76,7 @@ pub fn builtin_workflow_catalog_entry(
     bundle: &BuiltinSkillBundle,
     revision: u64,
 ) -> SkillResult<WorkflowCatalogEntry> {
-    let metadata = if let Some(bytes) = bundle.files.get("workflow.yaml") {
-        parse_bundle_metadata_bytes("workflow.yaml", bytes, true)
-    } else if let Some(bytes) = bundle.files.get("agents/bamboo.yaml") {
-        parse_bundle_metadata_bytes("agents/bamboo.yaml", bytes, false)
-    } else {
-        Ok(BundleMetadata::default())
-    }
-    .map_err(SkillError::Validation)?;
+    let metadata = builtin_bundle_metadata(&bundle.files)?;
     let mut entry = entry_from_skill(
         &bundle.skill,
         SkillDirectorySource::Builtin,
@@ -99,6 +92,18 @@ pub fn builtin_workflow_catalog_entry(
             .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
     );
     Ok(entry)
+}
+
+fn builtin_bundle_metadata(files: &HashMap<String, Vec<u8>>) -> SkillResult<BundleMetadata> {
+    let mut metadata = bundle_metadata_from_bytes(
+        files.get("workflow.yaml").map(Vec::as_slice),
+        files.get("agents/bamboo.yaml").map(Vec::as_slice),
+    )
+    .map_err(SkillError::Validation)?;
+    if let Some(raw) = files.get("agents/openai.yaml") {
+        metadata.apply_openai_metadata(raw);
+    }
+    Ok(metadata)
 }
 
 /// Archive the pre-catalog global materialization only when every file proves
@@ -229,8 +234,9 @@ pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
             SkillError::Validation(format!("Builtin skill {} is missing SKILL.md", skill_root))
         })?;
 
-        let skill =
+        let mut skill =
             parse_markdown_skill(Path::new(&format!("{}/SKILL.md", skill_root)), &markdown)?;
+        builtin_bundle_metadata(&assets)?.apply_to_skill(&mut skill);
         bundles.push(BuiltinSkillBundle {
             skill,
             files: assets,

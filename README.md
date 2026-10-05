@@ -152,7 +152,7 @@ cargo clippy
 
 Bare Cargo commands use the manifest's `default-members`; `cargo test` is not every workspace member. The dev-only analytics crate is excluded by default. Inspect [Cargo.toml](./Cargo.toml) before using `--workspace`.
 
-- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md)
+- [Architecture](./docs/design/architecture-overview.md) · [Configuration](./docs/config-reference.md) · [Skill bundle input](./docs/design/codex-skill-input.md)
 - [Plugins](./docs/guides/PLUGINS.md) · [Migration](./docs/guides/MIGRATION_GUIDE.md) · [Documentation index](./docs/README.md)
 - [Contributing](./CONTRIBUTING.md) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
 
@@ -162,4 +162,4 @@ Project-owned code is licensed under the [MIT License](./LICENSE).
 Third-party materials retain their own licenses and copyright notices:
 
 - `builtin_skills/skill-creator` retains its [Apache-2.0 license](./builtin_skills/skill-creator/LICENSE.txt).
-- Codex-derived tool-search code retains its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
+- Codex-derived tool-search and Skill-input code retain its [Apache-2.0 license and source notices](./THIRD_PARTY_NOTICES.md).
