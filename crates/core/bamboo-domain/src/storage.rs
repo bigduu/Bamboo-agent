@@ -145,6 +145,70 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Whether this backend owns atomic child-wait mutations. Legacy backends
+    /// retain LockedSessionStore's process-local serialized compatibility path.
+    fn supports_atomic_child_wait_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Read one waited-for Child through its parent's canonical tree. Durable
+    /// linkage must be checked before loading transcript content.
+    async fn load_child_wait_session(
+        &self,
+        parent: &Session,
+        child_id: &str,
+        full: bool,
+    ) -> std::io::Result<Option<Session>> {
+        let control = self.load_runtime_control_plane(child_id).await?;
+        let owned = control.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        });
+        if !full || owned.is_none() {
+            return Ok(owned);
+        }
+        Ok(self.load_session(child_id).await?.filter(|child| {
+            child.kind == crate::SessionKind::Child
+                && child.parent_session_id.as_deref() == Some(&parent.id)
+        }))
+    }
+
+    /// Merge a child wait into the latest control plane under the physical
+    /// session writer lock. Terminal filtering uses fresh durable child state,
+    /// not a per-instance index. Explicit waits check terminality; pre-launch
+    /// arms retain prior terminal generations until the new launch is queued.
+    /// Zero means the requested explicit policy is satisfied.
+    async fn register_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: crate::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<(Session, usize)> {
+        let _ = (expected, batch, policy, check_terminal, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait registration is unsupported",
+        ))
+    }
+
+    /// Commit a child completion only if the full observed wait and Session
+    /// incarnation still match. A conflict performs no write or publication.
+    async fn compare_exchange_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _ = (expected, updated, runtime_only, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic child wait completion is unsupported",
+        ))
+    }
+
     /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
     /// A backend without this authority protocol fails closed.
     async fn root_mode_operation(
