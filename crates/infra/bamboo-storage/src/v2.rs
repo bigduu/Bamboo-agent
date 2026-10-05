@@ -52,6 +52,7 @@ mod actor_checkpoint_lineage;
 mod actor_checkpoint_lineage_tests;
 mod actor_directory;
 mod actor_input;
+pub(crate) mod child_wait_control_plane;
 // A private observation port, deliberately without an acting caller.
 #[allow(dead_code)]
 mod canonical_birth_census;
@@ -1371,6 +1372,9 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     transcript_write_hook:
         std::sync::Mutex<Option<Arc<actor_transcript_tests::TranscriptWriteHook>>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    child_wait_registration_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     #[cfg(test)]
     default_write_hook:
         std::sync::Mutex<Option<Arc<default_actor_context_tests::DefaultWriteHook>>>,
@@ -1692,6 +1696,8 @@ impl SessionStoreV2 {
             actor_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             transcript_write_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            child_wait_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             default_write_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -5828,6 +5834,28 @@ impl SessionStoreV2 {
                 )
             }),
         );
+        self.save_runtime_state_after_lock(
+            session,
+            &rel,
+            total_started,
+            &guards,
+            publish,
+            inherited,
+        )
+        .await
+    }
+
+    /// Reuse the runtime publication protocol after the caller owns the same
+    /// lifecycle, Task and physical Session guards as the ordinary writer.
+    async fn save_runtime_state_after_lock(
+        &self,
+        session: &Session,
+        rel: &str,
+        total_started: Instant,
+        guards: &Arc<DefaultWriterGuards>,
+        publish: Option<bamboo_domain::RootActorRuntimePublisher>,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+    ) -> io::Result<Option<Session>> {
         let reconciled = match inherited {
             Some(inherited) => Some(
                 self.reconcile_inherited_runtime_snapshot(session, inherited, true)
@@ -5838,14 +5866,14 @@ impl SessionStoreV2 {
         let session = reconciled.as_ref().unwrap_or(session);
         self.check_default_or_root_actor_context(
             session,
-            &self.abs_path_from_rel(&rel),
+            &self.abs_path_from_rel(rel),
             false,
-            &guards,
+            guards,
         )
         .await?;
         self.validate_authority_for_save(session).await?;
         self.validate_root_context_for_save(session).await?;
-        self.validate_child_project_for_write(session, false, Some(&rel))
+        self.validate_child_project_for_write(session, false, Some(rel))
             .await?;
         self.reject_regressing_runtime_task(session).await?;
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
@@ -5881,7 +5909,7 @@ impl SessionStoreV2 {
                     })?;
             }
         }
-        let abs_dir = self.abs_path_from_rel(&rel);
+        let abs_dir = self.abs_path_from_rel(rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
         let runtime_snapshot = runtime_sidecar_snapshot(session);
@@ -5911,7 +5939,7 @@ impl SessionStoreV2 {
             }
         }
         let filesystem_started = Instant::now();
-        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, &guards)
+        self.write_default_bytes(&abs_dir.join(RUNTIME_SIDECAR_FILE), runtime_bytes, guards)
             .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
@@ -5958,7 +5986,7 @@ impl SessionStoreV2 {
                     .ok_or_else(|| {
                         other_io_error("runtime Root disappeared during index repair")
                     })?;
-                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
+                self.repair_index_from_authoritative_session(&authoritative, rel.to_string())
                     .await?;
             }
             stages.index_publication = index_started.elapsed();
@@ -5985,7 +6013,7 @@ impl SessionStoreV2 {
             "session runtime-state commit completed"
         );
         if let Some(publish) = publish {
-            self.publish_root_actor_runtime(&guards, publish).await?;
+            self.publish_root_actor_runtime(guards, publish).await?;
         }
         Ok(reconciled)
     }
@@ -6579,6 +6607,43 @@ impl Storage for SessionStoreV2 {
             &_guard,
         )
         .await
+    }
+
+    async fn load_child_wait_session(
+        &self,
+        parent: &Session,
+        child_id: &str,
+        full: bool,
+    ) -> io::Result<Option<Session>> {
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        SessionStoreV2::load_child_wait_session(self, parent, child_id, full).await
+    }
+
+    fn supports_atomic_child_wait_control_plane(&self) -> bool {
+        true
+    }
+
+    async fn register_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: bamboo_domain::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<(Session, usize)> {
+        self.register_child_wait(expected, batch, policy, check_terminal, publish)
+            .await
+    }
+
+    async fn compare_exchange_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        self.compare_exchange_child_wait(expected, updated, runtime_only, publish)
+            .await
     }
 
     async fn list_child_run_statuses(

@@ -198,6 +198,8 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 # tests that must opt in to the scoped env-cache fixture.
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 bamboo-storage = { path = "../../infra/bamboo-storage", features = ["test-utils"] }
+# Cross-crate race tests reuse the engine's canonical terminal seal.
+bamboo-engine = { path = "../../engine/bamboo-engine", features = ["test-utils"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

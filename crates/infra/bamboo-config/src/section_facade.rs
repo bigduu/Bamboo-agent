@@ -1917,13 +1917,6 @@ fn validate_mcp(value: &McpSection) -> Result<(), String> {
                         .map_err(|_| "MCP credential reference is invalid".to_string())?;
                 }
             }
-            TransportConfig::Sse(transport) => {
-                validate_secret_free_http_url("MCP SSE", &transport.url, false)?;
-                if transport.connect_timeout_ms == 0 {
-                    return Err("MCP connection timeout must be greater than zero".to_string());
-                }
-                validate_mcp_headers(&transport.headers)?;
-            }
             TransportConfig::StreamableHttp(transport) => {
                 validate_secret_free_http_url("MCP streamable HTTP", &transport.url, false)?;
                 if transport.connect_timeout_ms == 0 {
@@ -9988,12 +9981,12 @@ mod tests {
                 "env_encrypted": {"API_TOKEN": crate::encryption::encrypt("different").unwrap()}
             }),
             json!({
-                "transport": {"type": "sse", "url": "https://mcp.test/sse"},
+                "transport": {"type": "streamable_http", "url": "https://mcp.test/http"},
                 "headers": {"Authorization": "plaintext"},
                 "headers_encrypted": {"Authorization": crate::encryption::encrypt("different").unwrap()}
             }),
             json!({
-                "transport": {"type": "sse", "url": "https://mcp.test/sse"},
+                "transport": {"type": "streamable_http", "url": "https://mcp.test/http"},
                 "headers": [{
                     "name": "Authorization",
                     "value": "plaintext",
@@ -10705,7 +10698,7 @@ mod tests {
                     "version": 1,
                     "servers": [{
                         "id": "empty-url",
-                        "transport": {"type": "sse", "url": ""}
+                        "transport": {"type": "streamable_http", "url": ""}
                     }]
                 }),
             ),
@@ -10757,7 +10750,7 @@ mod tests {
                     "version": 1,
                     "servers": [{
                         "id": "zero-connect",
-                        "transport": {"type": "sse", "url": "https://mcp.test/sse", "connect_timeout_ms": 0}
+                        "transport": {"type": "streamable_http", "url": "https://mcp.test/http", "connect_timeout_ms": 0}
                     }]
                 }),
             ),

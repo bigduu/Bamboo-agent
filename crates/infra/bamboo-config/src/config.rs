@@ -9380,12 +9380,12 @@ mod tests {
                 denied_tools: vec![],
             },
             bamboo_domain::mcp_config::McpServerConfig {
-                id: "sse-secret".to_string(),
+                id: "http-secret".to_string(),
                 name: None,
                 enabled: true,
-                transport: bamboo_domain::mcp_config::TransportConfig::Sse(
-                    bamboo_domain::mcp_config::SseConfig {
-                        url: "http://localhost:8080/sse".to_string(),
+                transport: bamboo_domain::mcp_config::TransportConfig::StreamableHttp(
+                    bamboo_domain::mcp_config::StreamableHttpConfig {
+                        url: "http://localhost:8080/http".to_string(),
                         headers: vec![bamboo_domain::mcp_config::HeaderConfig {
                             name: "Authorization".to_string(),
                             value: "Bearer token123".to_string(),
@@ -9419,7 +9419,7 @@ mod tests {
         );
         assert!(
             content.contains("Bearer token123"),
-            "config.json should persist MCP SSE headers in mainstream format"
+            "config.json should persist MCP Streamable HTTP headers in mainstream format"
         );
         assert!(
             !content.contains("\"env_encrypted\""),
@@ -9447,17 +9447,17 @@ mod tests {
             _ => panic!("Expected stdio transport"),
         }
 
-        let sse = loaded
+        let http = loaded
             .mcp
             .servers
             .iter()
-            .find(|s| s.id == "sse-secret")
-            .expect("sse server should exist");
-        match &sse.transport {
-            bamboo_domain::mcp_config::TransportConfig::Sse(sse) => {
-                assert_eq!(sse.headers[0].value, "Bearer token123");
+            .find(|s| s.id == "http-secret")
+            .expect("http server should exist");
+        match &http.transport {
+            bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
+                assert_eq!(http.headers[0].value, "Bearer token123");
             }
-            _ => panic!("Expected SSE transport"),
+            _ => panic!("Expected Streamable HTTP transport"),
         }
     }
 

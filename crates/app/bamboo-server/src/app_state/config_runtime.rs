@@ -2379,7 +2379,6 @@ fn mcp_durable_comparison_document(config: &McpConfig) -> McpConfig {
                         && !config.env_credential_refs.contains_key(name)
                 });
             }
-            TransportConfig::Sse(config) => clear_paired_header_plaintext(&mut config.headers),
             TransportConfig::StreamableHttp(config) => {
                 clear_paired_header_plaintext(&mut config.headers)
             }
@@ -2418,12 +2417,6 @@ fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
                     server.id
                 ));
             }
-            TransportConfig::Sse(sse) if sse.url.trim().is_empty() => {
-                return Err(format!(
-                    "MCP SSE server '{}' URL cannot be empty",
-                    server.id
-                ));
-            }
             TransportConfig::StreamableHttp(http) if http.url.trim().is_empty() => {
                 return Err(format!(
                     "MCP HTTP server '{}' URL cannot be empty",
@@ -2449,7 +2442,6 @@ fn validate_mcp_config(config: &McpConfig) -> Result<(), String> {
                         .map_err(|_| "MCP credential reference is invalid".to_string())?;
                 }
             }
-            TransportConfig::Sse(config) => validate_header_refs(&server.id, &config.headers)?,
             TransportConfig::StreamableHttp(config) => {
                 validate_header_refs(&server.id, &config.headers)?
             }
@@ -4021,9 +4013,6 @@ fn retain_mcp_credentials(
             }
         }
         match (&current_server.transport, &mut candidate_server.transport) {
-            (TransportConfig::Sse(current), TransportConfig::Sse(candidate)) => {
-                retain_mcp_header_credentials(&current.headers, &mut candidate.headers)
-            }
             (
                 TransportConfig::StreamableHttp(current),
                 TransportConfig::StreamableHttp(candidate),
@@ -4053,9 +4042,6 @@ fn materialize_mcp_touched_replacements(
                     }
                 }
             }
-            TransportConfig::Sse(http) => {
-                collect_mcp_header_replacements(&http.headers, touched, &mut replacements)?
-            }
             TransportConfig::StreamableHttp(http) => {
                 collect_mcp_header_replacements(&http.headers, touched, &mut replacements)?
             }
@@ -4074,9 +4060,6 @@ fn materialize_mcp_touched_replacements(
                         stdio.env.insert(name.clone(), value.clone());
                     }
                 }
-            }
-            TransportConfig::Sse(http) => {
-                apply_mcp_header_replacements(&mut http.headers, &replacements)?
             }
             TransportConfig::StreamableHttp(http) => {
                 apply_mcp_header_replacements(&mut http.headers, &replacements)?
@@ -4184,7 +4167,6 @@ fn credential_ref_mcp_document(
                     ));
                 }
             }
-            TransportConfig::Sse(config) => reference_headers(&mut config.headers)?,
             TransportConfig::StreamableHttp(config) => reference_headers(&mut config.headers)?,
         }
     }
@@ -4204,9 +4186,6 @@ fn retain_mcp_credential_refs(document: &McpConfig, runtime: &mut McpConfig) {
             (TransportConfig::Stdio(document), TransportConfig::Stdio(runtime)) => {
                 runtime.env_encrypted.clear();
                 runtime.env_credential_refs = document.env_credential_refs.clone();
-            }
-            (TransportConfig::Sse(document), TransportConfig::Sse(runtime)) => {
-                copy_header_ciphertext(&document.headers, &mut runtime.headers);
             }
             (
                 TransportConfig::StreamableHttp(document),
@@ -4271,7 +4250,6 @@ fn mcp_credential_refs(
                     )?);
                 }
             }
-            TransportConfig::Sse(http) => collect_mcp_header_refs(&http.headers, &mut references)?,
             TransportConfig::StreamableHttp(http) => {
                 collect_mcp_header_refs(&http.headers, &mut references)?
             }
@@ -4389,15 +4367,6 @@ fn normalize_legacy_mcp_credentials(
                         .insert(name, reference.as_str().to_string());
                 }
             }
-            TransportConfig::Sse(candidate_http) => normalize_legacy_mcp_headers(
-                &candidate_server.id,
-                current_server.and_then(|server| match &server.transport {
-                    TransportConfig::Sse(http) => Some(http.headers.as_slice()),
-                    _ => None,
-                }),
-                &mut candidate_http.headers,
-                &mut intents,
-            )?,
             TransportConfig::StreamableHttp(candidate_http) => normalize_legacy_mcp_headers(
                 &candidate_server.id,
                 current_server.and_then(|server| match &server.transport {
@@ -6923,8 +6892,8 @@ for line in sys.stdin:
                 id: "http-server".to_string(),
                 name: None,
                 enabled: false,
-                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
-                    url: "https://example.test/sse".to_string(),
+                transport: TransportConfig::StreamableHttp(bamboo_mcp::StreamableHttpConfig {
+                    url: "https://example.test/mcp".to_string(),
                     headers: vec![bamboo_mcp::HeaderConfig {
                         name: "Authorization".to_string(),
                         value: "existing-secret".to_string(),
@@ -6941,7 +6910,7 @@ for line in sys.stdin:
             }],
         };
         let mut http_candidate = http_current.clone();
-        let TransportConfig::Sse(http) = &mut http_candidate.servers[0].transport else {
+        let TransportConfig::StreamableHttp(http) = &mut http_candidate.servers[0].transport else {
             unreachable!()
         };
         http.headers[0].credential_ref = Some("mcp.foreign.header_authorization".to_string());
@@ -7030,8 +6999,8 @@ for line in sys.stdin:
                 id: "http".to_string(),
                 name: None,
                 enabled: false,
-                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
-                    url: "https://example.test/sse".to_string(),
+                transport: TransportConfig::StreamableHttp(bamboo_mcp::StreamableHttpConfig {
+                    url: "https://example.test/mcp".to_string(),
                     headers: vec![bamboo_mcp::HeaderConfig {
                         name: "Authorization".to_string(),
                         value: "old-header-secret".to_string(),
@@ -7048,14 +7017,17 @@ for line in sys.stdin:
             }],
         };
         let mut delete_all_headers = current_http.clone();
-        let TransportConfig::Sse(candidate) = &mut delete_all_headers.servers[0].transport else {
+        let TransportConfig::StreamableHttp(candidate) =
+            &mut delete_all_headers.servers[0].transport
+        else {
             unreachable!()
         };
         candidate.headers.clear();
         let touched = BTreeSet::from([header_ref]);
         materialize_mcp_touched_replacements(&mut delete_all_headers, &touched).unwrap();
         retain_mcp_credentials(&current_http, &mut delete_all_headers, &touched);
-        let TransportConfig::Sse(candidate) = &delete_all_headers.servers[0].transport else {
+        let TransportConfig::StreamableHttp(candidate) = &delete_all_headers.servers[0].transport
+        else {
             unreachable!()
         };
         assert!(candidate.headers.is_empty());
@@ -8986,8 +8958,8 @@ for line in sys.stdin:
                 id: "unsafe-url".to_string(),
                 name: None,
                 enabled: true,
-                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
-                    url: format!("https://example.test/sse?token={secret}"),
+                transport: TransportConfig::StreamableHttp(bamboo_mcp::StreamableHttpConfig {
+                    url: format!("https://example.test/mcp?token={secret}"),
                     headers: vec![],
                     connect_timeout_ms: 100,
                 }),
@@ -11224,16 +11196,18 @@ for line in sys.stdin:
                         id: "switch-header".to_string(),
                         name: None,
                         enabled: false,
-                        transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
-                            url: "https://example.test/sse".to_string(),
-                            headers: vec![bamboo_mcp::HeaderConfig {
-                                name: "Authorization".to_string(),
-                                value: String::new(),
-                                value_encrypted: None,
-                                credential_ref: Some(header_ref.as_str().to_string()),
-                            }],
-                            connect_timeout_ms: 100,
-                        }),
+                        transport: TransportConfig::StreamableHttp(
+                            bamboo_mcp::StreamableHttpConfig {
+                                url: "https://example.test/mcp".to_string(),
+                                headers: vec![bamboo_mcp::HeaderConfig {
+                                    name: "Authorization".to_string(),
+                                    value: String::new(),
+                                    value_encrypted: None,
+                                    credential_ref: Some(header_ref.as_str().to_string()),
+                                }],
+                                connect_timeout_ms: 100,
+                            },
+                        ),
                         request_timeout_ms: 100,
                         healthcheck_interval_ms: 100,
                         reconnect: ReconnectConfig::default(),
@@ -11247,8 +11221,8 @@ for line in sys.stdin:
         if let TransportConfig::Stdio(stdio) = &mut current.servers[0].transport {
             stdio.env.insert("TOKEN".to_string(), "env-a".to_string());
         }
-        if let TransportConfig::Sse(sse) = &mut current.servers[1].transport {
-            sse.headers[0].value = "header-a".to_string();
+        if let TransportConfig::StreamableHttp(http) = &mut current.servers[1].transport {
+            http.headers[0].value = "header-a".to_string();
         }
         state.config.write().await.mcp = current;
 
@@ -11271,17 +11245,17 @@ for line in sys.stdin:
             panic!("stdio transport")
         };
         assert_eq!(stdio.env["TOKEN"], "env-b");
-        let TransportConfig::Sse(sse) = &runtime
+        let TransportConfig::StreamableHttp(http) = &runtime
             .mcp
             .servers
             .iter()
             .find(|server| server.id == "switch-header")
-            .expect("SSE server")
+            .expect("Streamable HTTP server")
             .transport
         else {
-            panic!("sse transport")
+            panic!("Streamable HTTP transport")
         };
-        assert_eq!(sse.headers[0].value, "header-b");
+        assert_eq!(http.headers[0].value, "header-b");
         drop(runtime);
         let disk_before = std::fs::read(dir.path().join("mcp.json")).unwrap();
         let missing_env = bamboo_config::credential_ref("mcp", "missing", "env_TOKEN").unwrap();
@@ -11380,9 +11354,9 @@ for line in sys.stdin:
                     }),
                 ),
                 make_server(
-                    "a-sse",
-                    TransportConfig::Sse(bamboo_mcp::SseConfig {
-                        url: "https://example.test/sse".to_string(),
+                    "a-http",
+                    TransportConfig::StreamableHttp(bamboo_mcp::StreamableHttpConfig {
+                        url: "https://example.test/mcp".to_string(),
                         headers: vec![],
                         connect_timeout_ms: 100,
                     }),
@@ -11404,7 +11378,7 @@ for line in sys.stdin:
                 .iter()
                 .map(|server| server.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["z-stdio", "a-sse"],
+            vec!["z-stdio", "a-http"],
             "the superseded startup generation must not reapply"
         );
         drop(runtime);
