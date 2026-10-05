@@ -622,13 +622,34 @@ async fn real_model_single_work_code_delivery_acceptance_and_restart() {
         &f.client,
         &f.base,
         "live-code-user-grant",
-        json!([
-            {"op":"update_contract","work_id":work,"contract":contract},
-            {"op":"ready","work_id":work}
-        ]),
+        json!([{"op":"update_contract","work_id":work,"contract":contract}]),
     )
     .await;
+    f.save("explicit-user-coding-grant-request", &grant);
     let granted = post(&f.client, &f.base, "/tickets/update", &grant).await;
+    // The existing update_contract transition already makes a stopped draft
+    // ready. A second Ready operation in this transaction would be invalid.
+    let granted_view = f.inspect(&work).await;
+    f.save(
+        "explicit-user-coding-grant-result",
+        &json!({"receipt":granted,"view":granted_view}),
+    );
+    assert_eq!(granted_view["data"][0]["ticket"]["state"], "ready");
+    let granted_tools: std::collections::BTreeSet<String> = serde_json::from_value(
+        granted_view["data"][0]["ticket"]["contract"]["allowed_tools"].clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        granted_tools,
+        ["Task", "Read", "Write"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert!(granted_view["data"][0]["assignments"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let workspace = json!({"repo":repo.canonicalize().unwrap(),"base_commit":base,"branch":"ticket-live-code",
         "worktree":tree,"write_roots":[tree],"claims":[format!("worktree:{}",tree.display())]});
     let dispatch = command(
