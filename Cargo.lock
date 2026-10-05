@@ -1007,7 +1007,6 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dirs",
- "fs2",
  "futures",
  "hex",
  "libc",
