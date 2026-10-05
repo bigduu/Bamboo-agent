@@ -54,7 +54,7 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 9] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
     "SubAgent",
     "Plan",
     "Task",
@@ -64,6 +64,12 @@ pub const ROOT_ORCHESTRATION_TOOLS: [&str; 9] = [
     "Glob",
     "GetFileInfo",
     "ViewImage",
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
 ];
 
 pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {

@@ -1065,6 +1065,7 @@ dependencies = [
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
+ "bamboo-tickets",
  "bamboo-tools",
  "base64 0.23.1",
  "bytes",
@@ -1402,6 +1403,7 @@ dependencies = [
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
+ "bamboo-tickets",
  "bamboo-tools",
  "base64 0.23.1",
  "bytes",
@@ -1564,6 +1566,21 @@ dependencies = [
  "tokio-util",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bamboo-tickets"
+version = "0.0.0"
+dependencies = [
+ "fs2",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

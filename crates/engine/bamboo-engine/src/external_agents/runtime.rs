@@ -97,6 +97,12 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
+        for runner in &self.runners {
+            runner.set_ticket_service(service.clone());
+        }
+    }
+
     async fn validate_required_child_context_route(
         &self,
         session: &bamboo_agent_core::Session,

@@ -30,6 +30,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 # Workspace crates
 bamboo-engine = { path = "../../engine/bamboo-engine" }
+bamboo-tickets = { path = "../../infra/bamboo-tickets" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
@@ -177,6 +178,7 @@ prost = "0.14"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 
 [features]
+ticket-runtime-fixtures = ["bamboo-tickets/test-utils"]
 # Test-only scoped access to bamboo-config's process-global env-cache fixtures.
 # Kept out of defaults so production builds retain the ordinary global path.
 test-utils = ["bamboo-config/test-utils"]

@@ -350,7 +350,9 @@ impl BuiltinToolExecutor {
         }
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
-        let _ = registry.register(TaskTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, TaskTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(ViewImageTool::new());
         let _ = registry.register(WebFetchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
@@ -381,7 +383,7 @@ impl BuiltinToolExecutor {
 
     /// Observe the registered Arc, not a same-name custom replacement.
     pub fn eligible_native_tool(&self, name: &str) -> bool {
-        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Write")
+        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Task" | "Write")
             && self.registry.get(name).is_some_and(|tool| {
                 self.is_framework_builtin_instance(name, &tool)
                     && self
@@ -395,7 +397,7 @@ impl BuiltinToolExecutor {
     pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
         let set: BTreeSet<_> = names.iter().cloned().collect();
         if set.len() != names.len()
-            || names.len() > 5
+            || names.len() > 6
             || names.iter().any(|name| !self.eligible_native_tool(name))
         {
             return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
@@ -5016,6 +5018,34 @@ mod tests {
             .build()
             .with_native_tool_ceiling(vec!["Grep".into()])
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_only_native_ceiling_has_no_filesystem_or_shell_surface() {
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(vec!["Task".into()])
+            .unwrap();
+        assert_eq!(
+            executor
+                .list_tools()
+                .iter()
+                .map(|s| s.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Task"]
+        );
+        let call = make_tool_call(
+            "Task",
+            json!({"tasks":[{"content":"Own step","status":"pending"}]}),
+        );
+        assert!(executor.execute(&call).await.unwrap().success);
+        for name in ["Bash", "Read", "Write", "Edit", "SubAgent"] {
+            assert!(executor
+                .execute(&make_tool_call(name, json!({})))
+                .await
+                .is_err());
+            assert!(!executor.owns_exact_tool(name));
+        }
+        assert!(executor.eligible_native_tool("Task"));
     }
 
     struct CeilingReplacement(Arc<AtomicUsize>);

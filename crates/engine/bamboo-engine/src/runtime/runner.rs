@@ -24,6 +24,7 @@ mod workspace_context;
 
 pub use bamboo_agent_core::PromptSnapshot;
 pub(crate) use loop_execution::run_agent_loop_with_config;
+pub use state_bridge::{refresh_turn_boundary_with_inbox, TurnBoundaryRefresh};
 
 pub fn read_prompt_snapshot(session: &Session) -> Option<PromptSnapshot> {
     session_setup::read_prompt_snapshot(session)

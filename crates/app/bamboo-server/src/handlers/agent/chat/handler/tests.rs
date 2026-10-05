@@ -8,6 +8,255 @@ use bamboo_engine::session_app::chat::{
 };
 
 #[actix_web::test]
+async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
+    use actix_web::{test, web};
+    use bamboo_agent_core::AgentEvent;
+    use std::collections::BTreeSet;
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::AppState::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let request = |message_id: Option<String>| {
+        serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+        "session_id":"partial-batch-root", "message":"bounded inbox input", "message_id":message_id,
+        "model":"test-model"
+    })).unwrap()
+    };
+    let initial = super::handler(
+        state.clone(),
+        test::TestRequest::post().to_http_request(),
+        web::Json(request(None)),
+    )
+    .await;
+    assert_eq!(initial.status(), actix_web::http::StatusCode::CREATED);
+    for index in 0..129 {
+        let response = super::handler(
+            state.clone(),
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .to_http_request(),
+            web::Json(request(Some(format!("partial-input-{index}")))),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    }
+    let mut feed = state.account_sink.subscribe();
+    let response = super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        response.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let history = state
+        .storage
+        .load_session("partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .filter(|m| m.id.starts_with("partial-input-"))
+            .count(),
+        128
+    );
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect("partial-batch-root")
+            .await
+            .unwrap()
+            .pending,
+        1
+    );
+    let mut seen = BTreeSet::new();
+    for _ in 0..128 {
+        let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("committed first-batch event")
+            .unwrap();
+        if let AgentEvent::MessageAppended { message_id, .. } = &change.event {
+            assert!(seen.insert(message_id.clone()), "duplicate event");
+        } else {
+            panic!("expected committed MessageAppended event");
+        }
+    }
+    super::ingress::admit_for_execute(&state, "partial-batch-root")
+        .await
+        .unwrap();
+    let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentEvent::MessageAppended { message_id, .. } = &change.event else {
+        panic!("tail event");
+    };
+    assert!(seen.insert(message_id.clone()));
+    assert_eq!(
+        seen,
+        (0..129).map(|i| format!("partial-input-{i}")).collect()
+    );
+    assert!(matches!(
+        feed.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let history = state
+        .storage
+        .load_session("partial-batch-root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .filter(|m| m.id.starts_with("partial-input-"))
+            .count(),
+        129
+    );
+    assert!(!history.metadata.contains_key("chat.queued_ingress.v1"));
+    let replay =
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+    assert_eq!(replay.iter().filter(|change| matches!(&change.event, AgentEvent::MessageAppended { message_id, .. } if message_id.starts_with("partial-input-"))).count(), 129);
+}
+
+#[actix_web::test]
+async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() {
+    use actix_web::{test, web};
+    use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::AppState::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let request = |message: &str, message_id: Option<&str>| {
+        serde_json::from_value::<super::ChatRequest>(serde_json::json!({
+            "session_id":"queued-owned-root", "message":message, "message_id":message_id,
+            "model":"test-model"
+        }))
+        .unwrap()
+    };
+    let first = super::handler(
+        state.clone(),
+        test::TestRequest::post().to_http_request(),
+        web::Json(request("old canonical Human turn", None)),
+    )
+    .await;
+    assert_eq!(first.status(), actix_web::http::StatusCode::CREATED);
+    let session = state
+        .storage
+        .load_session("queued-owned-root")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_messages = serde_json::to_value(&session.messages).unwrap();
+    let sender = state.get_session_event_sender(&session.id).await;
+    let mut reservation = match reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        &session.id,
+        &sender,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        _ => panic!("fixture Root must be idle"),
+    };
+    reservation
+        .bind_root_actor(&state.agent, &session)
+        .await
+        .unwrap();
+    assert!(state
+        .session_store
+        .root_actor_input_required(&session)
+        .await
+        .unwrap());
+    for _ in 0..2 {
+        let response = super::handler(
+            state.clone(),
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .to_http_request(),
+            web::Json(request("new exact Human turn", Some("new-owned-input"))),
+        )
+        .await;
+        let status = response.status();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["message_id"],
+            "new-owned-input"
+        );
+    }
+    let mut queued = state
+        .storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&queued.messages).unwrap(),
+        before_messages
+    );
+    assert_eq!(
+        queued
+            .metadata
+            .get("chat.queued_ingress.v1")
+            .map(String::as_str),
+        Some("new-owned-input")
+    );
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&session.id)
+            .await
+            .unwrap()
+            .pending,
+        1
+    );
+    let admission = reservation
+        .execution_persistence()
+        .unwrap()
+        .admit_root_inbox(
+            &mut queued,
+            state.session_inbox.clone(),
+            Some(reservation.run_id()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admission.admission_error.is_none());
+    assert_eq!(admission.merged, 1);
+    assert_eq!(admission.committed_messages[0].id, "new-owned-input");
+    assert_eq!(
+        admission.committed_messages[0].content,
+        "new exact Human turn"
+    );
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&session.id)
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
+}
+
+#[actix_web::test]
 async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
     use actix_web::{test, web};
     use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
@@ -2453,6 +2702,119 @@ mod optional_model_e2e {
             bamboo_agent_core::workspace_state::peek_workspace("chat-project-path-missing")
                 .is_none()
         );
+    }
+
+    #[actix_web::test]
+    async fn queued_chat_delivers_hook_context_but_ticket_provenance_stays_raw() {
+        let root = tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(root.path().to_path_buf());
+        let mut state = AppState::new(root.path().to_path_buf()).await.unwrap();
+        {
+            let mut config = state.config.write().await;
+            *config = serde_json::from_value(serde_json::json!({
+                "provider":"openai", "features":{"ticket_mutation":true},
+                "providers":{"openai":{"api_key":"fixture","model":"test-model"}}
+            }))
+            .unwrap();
+            config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+                enabled: true,
+                user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                    enabled: true,
+                    matcher: None,
+                    hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                        "printf '%s' '{\"additional_context\":\"Approve Invoice\"}'",
+                        bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                    )],
+                }],
+                ..Default::default()
+            };
+        }
+        state.tickets = Arc::new(
+            crate::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        assert!(state.tickets.service().is_ok());
+        let state = web::Data::new(state);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for ticket in [false, true] {
+            for image in [false, true] {
+                let id = format!("hook-queued-{ticket}-{image}");
+                let session_id = if ticket {
+                    bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+                } else {
+                    "hook-ordinary"
+                };
+                let mut body = serde_json::json!({
+                    "session_id":session_id, "message_id":id,
+                    "message":"raw Human request", "model":"test-model"
+                });
+                if image {
+                    body["images"] = serde_json::json!([{
+                        "base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=",
+                        "type":"image/png"
+                    }]);
+                }
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/api/v1/chat")
+                        .set_json(body)
+                        .peer_addr("127.0.0.1:5700".parse().unwrap())
+                        .to_request(),
+                )
+                .await;
+                let status = response.status();
+                let response: Value = test::read_body_json(response).await;
+                assert_eq!(status, StatusCode::CREATED, "{response}");
+                let claims = state.session_inbox.claim(session_id, 10).await.unwrap();
+                assert_eq!(claims.len(), 1);
+                let message = claims[0].envelope.to_provider_message().unwrap();
+                assert!(message
+                    .content
+                    .starts_with("raw Human request\n\n<user_prompt_submit_context>"));
+                assert!(message.content.contains("Approve Invoice"));
+                assert_eq!(claims[0].envelope.id.as_str(), id);
+                if image {
+                    let bamboo_domain::SessionMessageBody::Content(content) =
+                        &claims[0].envelope.body
+                    else {
+                        panic!("content");
+                    };
+                    assert!(
+                        matches!(&content.parts[0], bamboo_domain::MessagePart::Text { text } if text == &message.content)
+                    );
+                }
+                if ticket {
+                    let service = state.tickets.service().unwrap();
+                    let record = service.published().unwrap().1.resolutions[&id]
+                        .ingress
+                        .clone()
+                        .unwrap();
+                    assert_eq!(record.text, "raw Human request");
+                    assert!(!record.text.contains("Approve Invoice"));
+                }
+                let mut session = state
+                    .storage
+                    .load_session(session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                session.messages.push(message);
+                state.storage.save_session(&session).await.unwrap();
+                for claim in &claims {
+                    state.session_inbox.ack(session_id, claim).await.unwrap();
+                }
+            }
+        }
     }
 
     #[actix_web::test]

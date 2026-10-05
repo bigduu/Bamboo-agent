@@ -612,6 +612,12 @@ pub enum AgentEvent {
         role: bamboo_domain::Role,
         content: String,
         created_at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 
     /// The runtime session snapshot for a run has been saved successfully.
@@ -844,6 +850,29 @@ pub struct LegacyChildLifecycleObservation<'a> {
 }
 
 impl AgentEvent {
+    /// Project grouping/citation/tracing from a committed transcript message.
+    /// These fields are display data, never an authorization capability.
+    pub fn message_appended(session_id: &str, message: &bamboo_domain::Message) -> Self {
+        let reference = |field: &str| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("session_message"))
+                .and_then(|m| m.get(field))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Self::MessageAppended {
+            session_id: session_id.into(),
+            message_id: message.id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            created_at: message.created_at,
+            thread_id: reference("thread_id"),
+            in_reply_to: reference("in_reply_to"),
+            correlation_id: reference("correlation_id"),
+        }
+    }
     /// Interpret direct and one-level parent-wrapped child lifecycle events
     /// identically for the bounded legacy replay cache. A wrapped event is
     /// admitted only when its inner parent equals the wrapper's child. This

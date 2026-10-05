@@ -116,6 +116,11 @@ impl LocalToolMessages {
     pub const MAX_PAIRS: usize = 32;
 
     pub fn supports_tools(tools: &[String], read_only: bool) -> bool {
+        if tools.iter().any(|name| name == "Task") {
+            return tools
+                .iter()
+                .all(|name| matches!(name.as_str(), "Task" | "Read" | "Write"));
+        }
         !tools.is_empty()
             && !(read_only && tools.len() == 1 && tools[0] == "Glob")
             && tools
@@ -234,7 +239,7 @@ fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NativeToolCeiling {
-    pub const NAMES: [&'static str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+    pub const NAMES: [&'static str; 6] = ["Bash", "Edit", "Glob", "Read", "Task", "Write"];
     pub const MAX_BYTES: usize = 16 * 1024;
 
     pub fn validate(&self) -> Result<(), &'static str> {

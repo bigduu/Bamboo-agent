@@ -19,6 +19,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatRequest {
     pub message: String,
+    /// Optional stable delivery ID. Omission preserves legacy chat behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Grouping, citation and tracing are data, never approval authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
     pub session_id: Option<String>,
     /// Stable first-class Project membership for a newly-created session.
     /// Existing sessions cannot be reassigned through chat.
@@ -94,6 +104,10 @@ pub struct ChatImage {
 /// * `goal_command` - Present when the message was a `/goal` control command
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_seq: Option<u64>,
     /// Unique session identifier for this conversation
     pub session_id: String,
     /// SSE endpoint URL to receive real-time agent events
@@ -200,6 +214,10 @@ mod tests {
     #[test]
     fn test_chat_request_debug() {
         let req = ChatRequest {
+            message_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
             message: "Test".to_string(),
             session_id: None,
             project_id: None,
@@ -240,6 +258,8 @@ mod tests {
     #[test]
     fn test_chat_response_serialization() {
         let resp = ChatResponse {
+            message_id: None,
+            ingress_seq: None,
             session_id: "sess-456".to_string(),
             stream_url: "/stream/sess-456".to_string(),
             status: "streaming".to_string(),
@@ -255,6 +275,8 @@ mod tests {
     #[test]
     fn test_chat_response_debug() {
         let resp = ChatResponse {
+            message_id: None,
+            ingress_seq: None,
             session_id: "test".to_string(),
             stream_url: "/stream".to_string(),
             status: "active".to_string(),

@@ -299,6 +299,9 @@ pub struct AppState {
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
 
+    /// One Host-owned Ticket authority; records survive disabling dispatch.
+    pub tickets: Arc<ticket_application::TicketApplication>,
+
     /// Coordinates child completion notifications into parent resume.
     pub child_completion_coordinator: Arc<bamboo_engine::ChildCompletionCoordinator>,
 
@@ -550,6 +553,7 @@ pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+pub mod ticket_application;
 mod tools;
 pub mod watchers;
 
