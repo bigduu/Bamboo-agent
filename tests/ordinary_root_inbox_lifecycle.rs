@@ -119,7 +119,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         assert!(has_user(&body, CHILD_RESULT));
         probe.child_ready.store(true, Ordering::SeqCst);
         released(&probe.release_child).await;
-        (json!({"content":CHILD_RESULT}), "stop")
+        (json!({"content":child_report().to_string()}), "stop")
     } else if body["model"] == "inbox-root" {
         // Foreground identity is the configured model. The runtime may project
         // the tool catalog after cancellation; that does not turn a Root
@@ -136,16 +136,20 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             tool_call(
                 "root-original-child",
                 "SubAgent",
-                json!({"role":"worker","message":format!("Return only {CHILD_RESULT}; use no tools.")}),
+                json!({"role":"worker","message":format!("Return this exact v1 child report; use no tools: {}", child_report())}),
             )
         } else if has_user(&body, SUCCESSOR) {
             (json!({"content":SUCCESSOR_REPLY}), "stop")
         } else if body["messages"].as_array().unwrap().iter().any(|message| {
-            message["content"]
-                .as_str()
-                .is_some_and(|text| text.contains(CHILD_RESULT))
-                && message["role"] == "user"
-                && text_is_child_outcome(message)
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .and_then(child_projection)
+                    .is_some_and(|projection| {
+                        projection["view"] == "typed_result"
+                            && projection["available"] == true
+                            && projection["child_report"] == child_report()
+                    })
         }) {
             (json!({"content":COLLECTED}), "stop")
         } else if has_user(&body, INPUT) {
@@ -181,14 +185,15 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .body(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
-fn text_is_child_outcome(message: &Value) -> bool {
-    // Provider metadata may be stripped; the coordinator's rendered result
-    // carries the Child's terminal marker and is distinct from its assignment.
-    message["content"].as_str().is_some_and(|text| {
-        text.contains(CHILD_RESULT)
-            && !text.contains("Return only")
-            && !text.contains("use no tools")
-    })
+fn child_report() -> Value {
+    json!({"version":1,"outcome":"completed","summary":CHILD_RESULT,
+        "reported_evidence":[],"reported_verification":[],"proposals":[],"blockers":[],"open_decisions":[]})
+}
+
+fn child_projection(content: &str) -> Option<Value> {
+    // Only the Host's projection marker distinguishes delivery from assignment.
+    let (_, projection) = content.split_once("Child typed result:\n")?;
+    serde_json::from_str(projection.lines().next()?).ok()
 }
 
 struct Host(Child);
@@ -261,7 +266,7 @@ impl Fixture {
             .unwrap();
         let agents = projects.paths().project_home(&project.id).join("agents");
         std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One held plain result\nmodel_hint: openai:inbox-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nReturn the exact assignment marker; use no tools.\n").unwrap();
+        std::fs::write(agents.join("worker.md"), "---\nschema_version: 1\nname: worker\ndescription: One held typed report\nmodel_hint: openai:inbox-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nReturn the assigned v1 child report exactly; use no tools.\n").unwrap();
         let (release_child, _) = tokio::sync::watch::channel(false);
         let (release_root, _) = tokio::sync::watch::channel(false);
         let probe = web::Data::new(Probe {
@@ -623,10 +628,18 @@ async fn waiting_ordinary_root_handles_durable_input_retains_child_result_and_re
     let result = &outcomes(&completed)[0];
     assert_eq!(result.child_session_id, child_id);
     assert_eq!(result.status, "completed");
-    assert!(result
-        .result
-        .as_deref()
-        .is_some_and(|text| text.contains(CHILD_RESULT)));
+    assert!(result.result.is_none());
+    assert!(result.error.is_none());
+    assert!(serde_json::to_vec(result).unwrap().len() <= 8192);
+    let projection = child_projection(&result.provider_message.as_ref().unwrap().content.text)
+        .expect("durable Child outcome carries the Host typed result projection");
+    assert_eq!(projection["view"], "typed_result");
+    assert_eq!(projection["available"], true);
+    assert_eq!(projection["child_report"], child_report());
+    assert_eq!(
+        projection["host_observation"]["terminal_source"]["child_session_id"],
+        child_id
+    );
     fixture.admitted_once(INPUT_ID, INPUT).await;
     let calls = fixture.probe.input_calls.load(Ordering::SeqCst);
 
@@ -638,6 +651,7 @@ async fn waiting_ordinary_root_handles_durable_input_retains_child_result_and_re
     let replayed = fixture.canonical().await;
     fixture.admitted_once(INPUT_ID, INPUT).await;
     assert_eq!(outcomes(&replayed).len(), 1);
+    assert_eq!(&outcomes(&replayed)[0], result);
     assert_eq!(fixture.probe.child_calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.probe.input_calls.load(Ordering::SeqCst), calls);
     fixture.finish().await;
