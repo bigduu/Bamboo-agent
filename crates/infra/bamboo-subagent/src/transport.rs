@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -45,6 +47,9 @@ const DIRECT_RUN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 #[cfg(test)]
 mod history_delivery_tests;
+
+#[cfg(test)]
+mod tls_tests;
 
 /// Every connection/run owns its spawned helpers. A cancelled owner must not
 /// detach children merely because Tokio's plain JoinHandle was dropped.
@@ -469,16 +474,14 @@ pub fn build_server_config(
     key_file: &Path,
 ) -> Result<rustls::ServerConfig, String> {
     use std::fs::File;
-    use std::io::BufReader;
 
     let cert_path = cert_file.display();
     let key_path = key_file.display();
 
     let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cf))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cf)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
     if certs.is_empty() {
         return Err(format!(
             "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
@@ -486,9 +489,9 @@ pub fn build_server_config(
     }
 
     let kf = File::open(key_file).map_err(|e| format!("open key_file '{key_path}': {e}"))?;
-    let key = match rustls_pemfile::private_key(&mut BufReader::new(kf)) {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    let key = match PrivateKeyDer::from_pem_reader(kf) {
+        Ok(k) => k,
+        Err(PemError::NoItemsFound) => {
             return Err(format!(
                 "no private key in key_file '{key_path}' (expected PKCS#8/RSA/SEC1)"
             ))
@@ -516,14 +519,12 @@ pub fn build_server_config(
 /// [`ChildClient::connect_with_auth`] (default webpki roots) instead.
 pub fn client_config_trusting_cert(cert_file: &Path) -> Result<rustls::ClientConfig, String> {
     use std::fs::File;
-    use std::io::BufReader;
 
     let cert_path = cert_file.display();
     let cf = File::open(cert_file).map_err(|e| format!("open cert_file '{cert_path}': {e}"))?;
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cf))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cf)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse cert_file '{cert_path}': {e}"))?;
     if certs.is_empty() {
         return Err(format!(
             "no certificates in cert_file '{cert_path}' (expected PEM CERTIFICATE blocks)"
