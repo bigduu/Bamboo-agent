@@ -23,18 +23,6 @@ pub(super) fn to_api_config(server: &bamboo_mcp::McpServerConfig) -> McpServerCo
                 startup_timeout_ms: stdio.startup_timeout_ms,
             }
         }
-        bamboo_mcp::TransportConfig::Sse(sse) => TransportConfigApi::Sse {
-            url: sse.url.clone(),
-            headers: sse
-                .headers
-                .iter()
-                .map(|header| HeaderConfigApi {
-                    name: header.name.clone(),
-                    value: mask(),
-                })
-                .collect(),
-            connect_timeout_ms: sse.connect_timeout_ms,
-        },
         bamboo_mcp::TransportConfig::StreamableHttp(sh) => TransportConfigApi::StreamableHttp {
             url: sh.url.clone(),
             headers: sh
