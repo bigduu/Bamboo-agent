@@ -52,6 +52,8 @@ pub mod parser;
 pub mod storage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+mod codex_frontmatter;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,9 +85,9 @@ const MAX_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKFLOW_SKILL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WORKFLOW_PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
 const MAX_RETAINED_WORKFLOW_BYTES: usize = 256 * 1024 * 1024;
-const MAX_WORKFLOW_RESOURCES_PER_SKILL: usize = 1024;
+pub(crate) const MAX_WORKFLOW_RESOURCES_PER_SKILL: usize = 1024;
 const MAX_WORKFLOW_RESOURCES_PER_PUBLICATION: usize = 4096;
-const MAX_WORKFLOW_RESOURCE_PATH_BYTES: usize = 1024;
+pub(crate) const MAX_WORKFLOW_RESOURCE_PATH_BYTES: usize = 1024;
 const MAX_WORKFLOWS_PER_PUBLICATION: usize = 1024;
 const MAX_CACHED_WORKSPACE_STORES: usize = 64;
 const MAX_CACHED_WORKSPACE_ALIASES: usize = 256;
@@ -1718,9 +1720,12 @@ impl SkillStore {
             let mut entry = match winner {
                 Candidate::Valid(record) => match load_bundle_metadata(&record.skill_root).await {
                     Ok(metadata) => {
-                        skills.insert(id.clone(), record.skill.clone());
+                        let mut skill = record.skill.clone();
+                        metadata.apply_to_skill(&mut skill);
+                        let entry = entry_from_skill(&skill, record.source, revision, metadata);
+                        skills.insert(id.clone(), skill);
                         roots.insert(id.clone(), record.skill_root.clone());
-                        entry_from_skill(&record.skill, record.source, revision, metadata)
+                        entry
                     }
                     Err(error) => {
                         if previous_roots.get(&id) == Some(&record.skill_root) {
@@ -4877,7 +4882,7 @@ Use this skill for testing.
         fs::write(
             root.join("SKILL.md"),
             format!(
-                "---\nname: steady\ndescription: changed too early\n{PRIVATE_FIELD}: secret\n---\n{PRIVATE_INSTRUCTIONS}\n"
+                "---\nname: steady\ndescription: changed too early\n{PRIVATE_FIELD}: secret\nallowed-tools: [\n---\n{PRIVATE_INSTRUCTIONS}\n"
             ),
         )
             .await
@@ -5208,7 +5213,7 @@ Use this skill for testing.
         fs::write(
             shadowed_root.join("SKILL.md"),
             format!(
-                "---\nname: shared-skill\ndescription: shadowed\n{PRIVATE_FIELD}: secret\n---\n{PRIVATE_INSTRUCTIONS}\n"
+                "---\nname: shared-skill\ndescription: shadowed\n{PRIVATE_FIELD}: secret\nallowed-tools: [\n---\n{PRIVATE_INSTRUCTIONS}\n"
             ),
         )
         .await
@@ -6838,3 +6843,6 @@ Use this skill for testing.
         assert!(error.to_string().contains("workspace alias capacity"));
     }
 }
+
+#[cfg(test)]
+mod input_tests;

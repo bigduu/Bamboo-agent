@@ -4,8 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 description = "Agent skill management (definitions, store, selection, access control) for the Bamboo agent framework"
-license = "MIT"
-license-file = "../../../LICENSE"
+license = "MIT AND Apache-2.0"
 
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }

@@ -348,3 +348,7 @@ impl NamedAgentCatalog {
 
 #[cfg(test)]
 mod tests;
+
+// Reuse descriptor-confined agents/ reads for optional Skill sidecar input.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use reader::AgentDirectory as SkillAgentDirectory;
