@@ -517,4 +517,44 @@ Use this skill when users want to create skills.
             );
         }
     }
+
+    #[test]
+    fn codex_adapter_quoted_host_controls_cannot_be_repaired_into_prose() {
+        for key in [
+            "'metadata'",
+            "\"metadata\"",
+            "\"\\u006detadata\"",
+            "!!str metadata",
+            "&host_key metadata",
+        ] {
+            let malformed =
+                format!("---\ndescription: Demo\n{key}: {{legacy_manual_only: true,\n---\nBody");
+            assert!(
+                parse_markdown_skill(Path::new("safe-id/SKILL.md"), &malformed).is_err(),
+                "malformed host container was accepted for {key}"
+            );
+            let valid = format!(
+                "---\ndescription: Deploy to AWS: ECS\n{key}:\n  legacy_manual_only: true\n---\nBody"
+            );
+            let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), &valid).unwrap();
+            assert_eq!(skill.description, "Deploy to AWS: ECS");
+            assert_eq!(skill.metadata.unwrap()["legacy_manual_only"], true);
+        }
+        for key in [
+            "'allowed-tools'",
+            "\"allowed_tools\"",
+            "\"allowed\\u002dtools\"",
+        ] {
+            let malformed = format!("---\ndescription: Demo\n{key}: [\n---\nBody");
+            assert!(
+                parse_markdown_skill(Path::new("safe-id/SKILL.md"), &malformed).is_err(),
+                "malformed tool restriction was accepted for {key}"
+            );
+        }
+        let valid_alias = "---\ndescription: Demo\nkey_name: &host_key metadata\n*host_key:\n  legacy_manual_only: true\n---\nBody";
+        let skill = parse_markdown_skill(Path::new("safe-id/SKILL.md"), valid_alias).unwrap();
+        assert_eq!(skill.metadata.unwrap()["legacy_manual_only"], true);
+        let malformed_alias = "---\ndescription: Demo\nkey_name: &host_key metadata\n*host_key: {legacy_manual_only: true,\n---\nBody";
+        assert!(parse_markdown_skill(Path::new("safe-id/SKILL.md"), malformed_alias).is_err());
+    }
 }

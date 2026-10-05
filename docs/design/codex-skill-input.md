@@ -38,7 +38,8 @@ Bamboo additionally validates its safe managed IDs, `allowed-tools` (or
 metadata. Scalar tool lists split at whitespace or commas and use existing host
 normalization; unknown references are preserved and do not grant tools.
 YAML repair does not quote malformed tool restrictions or a malformed metadata
-container into harmless prose. This is a deliberate host boundary: acceptance
+container into harmless prose, including quoted, escaped, tagged or aliased
+host keys. This is a deliberate host boundary: acceptance
 by the Codex metadata parser alone does not make an unsafe Bamboo bundle valid.
 
 Optional OpenAI sidecar reads use the existing descriptor-confined `agents/`

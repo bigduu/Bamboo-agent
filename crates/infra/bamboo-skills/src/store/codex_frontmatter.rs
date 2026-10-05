@@ -140,8 +140,15 @@ fn repair_frontmatter_scalar_fields(frontmatter: &str, protected_keys: &[&str]) 
             repaired_lines.push(line.to_string());
             continue;
         };
+        // Quoting, escaping and YAML tags do not change a host key's identity.
+        // An alias cannot be resolved in isolation; leave its value untouched
+        // when host controls are protected instead of treating it as prose.
+        let protected_key = !protected_keys.is_empty()
+            && serde_yaml::from_str::<String>(key.trim())
+                .map(|key| protected_keys.contains(&key.as_str()))
+                .unwrap_or(true);
         if key.trim().is_empty()
-            || protected_keys.contains(&key.trim())
+            || protected_key
             || !value.chars().next().is_none_or(char::is_whitespace)
         {
             repaired_lines.push(line.to_string());

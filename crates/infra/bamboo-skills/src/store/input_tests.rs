@@ -353,3 +353,46 @@ async fn codex_input_ignores_linked_optional_sidecar_files_and_directories() {
     .is_none());
     assert_eq!(input(&store, "portable", None).await, (definition, entry));
 }
+
+#[tokio::test]
+async fn codex_input_quoted_malformed_host_controls_preserve_restrictive_lkg() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = skill(
+        temp.path(),
+        "restricted",
+        "Original",
+        "metadata:\n  legacy_manual_only: true\n",
+    )
+    .await;
+    fs::write(
+        root.join("agents/bamboo.yaml"),
+        "invocation_policy:\n  explicit: false\n  automatic: true\n",
+    )
+    .await
+    .unwrap();
+    let store = SkillStore::new(SkillStoreConfig {
+        skills_dir: temp.path().to_path_buf(),
+        ..Default::default()
+    });
+    store.initialize().await.unwrap();
+    let (original, original_entry) = input(&store, "restricted", None).await;
+    assert_eq!(
+        original_entry.invocation_policy,
+        serde_json::json!({"explicit": false, "automatic": false})
+    );
+    for key in ["'metadata'", "\"metadata\"", "\"\\u006detadata\""] {
+        fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\ndescription: Changed\n{key}: {{legacy_manual_only: true,\n---\nChanged body"
+            ),
+        )
+        .await
+        .unwrap();
+        let (definition, entry) = input(&store, "restricted", None).await;
+        assert_eq!(definition, original, "{key}");
+        assert_eq!(entry.status, WorkflowStatus::Invalid, "{key}");
+        assert_eq!(entry.invocation_policy, original_entry.invocation_policy);
+        assert_eq!(entry.content_digest, original_entry.content_digest);
+    }
+}
