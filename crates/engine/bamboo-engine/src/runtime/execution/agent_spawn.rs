@@ -840,6 +840,8 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let agent = root_actor.as_ref().map_or(agent.clone(), |owner| {
                 Arc::new(agent.with_execution_persistence(owner.persistence()))
             });
+            let activation_run_id = execution_reservation.run_id().to_string();
+            let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
 
@@ -1074,6 +1076,11 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
+            super::child_completion::ChildCompletionSource::prepare(
+                &mut session,
+                &activation_run_id,
+                &prior_message_ids,
+            );
             let saved = save_finalized_runtime_with_inherited_child_wait(
                 agent.persistence().as_ref(),
                 &mut session,
@@ -1081,6 +1088,12 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             )
             .await;
             let history_committed = saved.is_ok();
+            let completion_source =
+                super::child_completion::ChildCompletionSource::after_final_save(
+                    &session,
+                    history_committed,
+                );
+            let completed_at = chrono::Utc::now();
             if let Err(error) = &saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
@@ -1162,7 +1175,8 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                     child_session_id: session_id.clone(),
                     status,
                     error: child_error,
-                    completed_at: chrono::Utc::now(),
+                    completed_at,
+                    source: completion_source,
                 };
                 if std::panic::AssertUnwindSafe(handler.on_child_completed(completion))
                     .catch_unwind()

@@ -384,6 +384,39 @@ impl ActorEventBatch {
     }
 }
 
+/// A current-Run completeness claim for the existing contiguous history lane.
+/// This is not a durable applied cursor or a replay/recovery acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorEventWatermark {
+    pub version: u32,
+    pub logical_session: Option<LogicalSessionIdentity>,
+    pub activation_id: Option<String>,
+    pub execution_epoch: u64,
+    /// Last sequenced event after the transport drained and flushed; zero means
+    /// that this Run emitted no events.
+    pub final_seq: u64,
+}
+
+impl ActorEventWatermark {
+    pub const VERSION: u32 = 1;
+
+    pub fn matches_consumed_run(
+        &self,
+        logical_session: &LogicalSessionIdentity,
+        activation_id: &str,
+        execution_epoch: u64,
+        consumed_seq: u64,
+    ) -> bool {
+        self.version == Self::VERSION
+            && !activation_id.is_empty()
+            && execution_epoch != 0
+            && self.logical_session.as_ref() == Some(logical_session)
+            && self.activation_id.as_deref() == Some(activation_id)
+            && self.execution_epoch == execution_epoch
+            && self.final_seq == consumed_seq
+    }
+}
+
 #[derive(Debug)]
 struct PendingActorEventBatch {
     first_seq: u64,
@@ -476,6 +509,24 @@ impl ActorEventBatcher {
 
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Call only after every returned batch was successfully forwarded and the
+    /// final flush succeeded. Ordinary lossy and legacy runs make no complete
+    /// trace claim. The caller, not this builder, owns delivery confirmation.
+    pub fn final_watermark(&self) -> Option<ActorEventWatermark> {
+        (self.durable_events
+            && self.execution_epoch != 0
+            && !self.has_pending()
+            // Saturated native coordinates cannot prove a complete prefix.
+            && self.next_seq < u64::MAX)
+            .then(|| ActorEventWatermark {
+                version: ActorEventWatermark::VERSION,
+                logical_session: self.logical_session.clone(),
+                activation_id: self.activation_id.clone(),
+                execution_epoch: self.execution_epoch,
+                final_seq: self.next_seq - 1,
+            })
     }
 
     fn build(
@@ -877,6 +928,10 @@ pub enum ChildFrame {
     },
     Terminal {
         status: TerminalStatus,
+        /// Transport-owned current-Run completeness claim; absent on legacy or
+        /// ordinary lossy observation routes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_event_watermark: Option<ActorEventWatermark>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1160,6 +1215,7 @@ mod tests {
             status: TerminalStatus::Completed,
             result: Some("done".into()),
             error: None,
+            final_event_watermark: None,
             transcript: Vec::new(),
         };
         assert_eq!(ChildFrame::from_text(&t.to_text()).unwrap(), t);
@@ -1169,6 +1225,7 @@ mod tests {
             status: TerminalStatus::Suspended,
             result: None,
             error: None,
+            final_event_watermark: None,
             transcript: vec![serde_json::json!({"role":"assistant","content":"x"})],
         };
         assert_eq!(ChildFrame::from_text(&s.to_text()).unwrap(), s);
@@ -1470,3 +1527,6 @@ mod tests {
         assert_eq!(ActorEventQos::classify(&event), ActorEventQos::Durable);
     }
 }
+
+#[cfg(test)]
+mod watermark_tests;

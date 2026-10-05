@@ -6347,6 +6347,48 @@ fn permission_posture_seed_from_event(
     )))
 }
 
+fn actor_event_logical_identity(
+    session: &Session,
+    parent_session_id: &str,
+    creation: Option<&bamboo_subagent::proto::ChildCreationIdentity>,
+) -> LogicalSessionIdentity {
+    LogicalSessionIdentity {
+        creation: creation.cloned(),
+        session_id: session.id.clone(),
+        parent_session_id: session
+            .parent_session_id
+            .clone()
+            .or_else(|| Some(parent_session_id.to_string())),
+        root_session_id: if session.root_session_id.trim().is_empty() {
+            parent_session_id.to_string()
+        } else {
+            session.root_session_id.clone()
+        },
+    }
+}
+
+fn validate_strict_history_terminal(
+    watermark: Option<&bamboo_subagent::ActorEventWatermark>,
+    session: &Session,
+    parent_session_id: &str,
+    activation_run_id: Option<&str>,
+    execution_epoch: u64,
+    creation: Option<&bamboo_subagent::proto::ChildCreationIdentity>,
+    consumed_seq: u64,
+) -> Result<(), AgentError> {
+    let identity = actor_event_logical_identity(session, parent_session_id, creation);
+    if watermark
+        .zip(activation_run_id)
+        .is_some_and(|(watermark, run_id)| {
+            watermark.matches_consumed_run(&identity, run_id, execution_epoch, consumed_seq)
+        })
+    {
+        Ok(())
+    } else {
+        Err(AgentError::LLM("actor_history_tail_incomplete".into()))
+    }
+}
+
 fn validate_actor_event_batch(
     batch: &ActorEventBatch,
     logical_session: &Session,
@@ -6366,19 +6408,8 @@ fn validate_actor_event_batch(
     // migrated/test sessions have not yet materialized parent ancestry on the
     // in-memory Session, so comparing the batch directly with those raw fields
     // can reject the identity the host itself just dispatched.
-    let expected_identity = LogicalSessionIdentity {
-        creation: expected_creation.cloned(),
-        session_id: logical_session.id.clone(),
-        parent_session_id: logical_session
-            .parent_session_id
-            .clone()
-            .or_else(|| Some(parent_session_id.to_string())),
-        root_session_id: if logical_session.root_session_id.trim().is_empty() {
-            parent_session_id.to_string()
-        } else {
-            logical_session.root_session_id.clone()
-        },
-    };
+    let expected_identity =
+        actor_event_logical_identity(logical_session, parent_session_id, expected_creation);
     if identity != &expected_identity {
         return Err(AgentError::LLM(
             "actor event batch targets a different logical session".to_string(),
@@ -7710,7 +7741,10 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 );
                             }
                         }
-                        if local_history.is_some() && batch.first_seq != next_actor_event_seq {
+                        if local_history_tools.is_some()
+                            && (batch.first_seq != next_actor_event_seq
+                                || batch.qos != bamboo_subagent::ActorEventQos::Durable
+                                || batch.last_seq == u64::MAX) {
                             return Err(local_tool_history_unsupported());
                         }
                         if batch.last_seq < next_actor_event_seq {
@@ -8235,7 +8269,16 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             .await?;
                         }
                     }
-                    Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
+                    Ok(Some(ChildFrame::Terminal { status, result, error, final_event_watermark, .. })) => {
+                        if local_history_tools.is_some() {
+                            // Check before history commit or terminal receipt acceptance.
+                            // Normal lossy observations do not promise a complete trace.
+                            validate_strict_history_terminal(
+                                final_event_watermark.as_ref(), logical_session, parent_session_id,
+                                activation_run_id, current_epoch, expected_creation,
+                                next_actor_event_seq - 1,
+                            )?;
+                        }
                         if remote_cancel_deadline.is_some() && status == TerminalStatus::Cancelled {
                             // A selected Worker terminal proves that its Run
                             // ended even if permission posture or an Inbox
@@ -10212,6 +10255,7 @@ mod tests {
                 status: TerminalStatus::Completed,
                 result: Some("complete".into()),
                 error: None,
+                final_event_watermark: None,
                 transcript: vec![],
             };
             let frames = match case {
@@ -10291,6 +10335,314 @@ mod tests {
             assert_eq!(serde_json::to_value(&session).unwrap(), before, "{case}");
             assert!(link.sent.is_empty());
             assert!(rx.try_recv().is_err(), "DATA must never enter public feed");
+        }
+    }
+
+    struct HistoryTerminalProbe {
+        frames: VecDeque<ChildFrame>,
+        accepted: Option<TerminalStatus>,
+        acks: usize,
+    }
+
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for HistoryTerminalProbe {
+        async fn send(&mut self, _frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            Ok(())
+        }
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            Ok(self.frames.pop_front())
+        }
+        fn accept_durable_terminal(&mut self, status: TerminalStatus) {
+            self.accepted = Some(status);
+        }
+        fn durable_delivery_receipt(&self) -> Option<bamboo_subagent::DurableChildDeliveryReceipt> {
+            Some(bamboo_subagent::DurableChildDeliveryReceipt {
+                broker_identity: "fixture".into(),
+                parent_mailbox: "parent".into(),
+                correlation_id: "current".into(),
+                message_ids: vec!["tail".into(), "terminal".into()],
+                terminal_status: self.accepted?,
+            })
+        }
+        async fn acknowledge_durable_frames(&mut self) -> bamboo_subagent::TransportResult<()> {
+            self.acks += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_terminal_watermark_gates_history_commit_and_durable_acceptance() {
+        use bamboo_subagent::ChildLink;
+        for case in [
+            "success",
+            "tail",
+            "short",
+            "missing",
+            "version",
+            "activation",
+            "epoch",
+            "birth",
+            "duplicate",
+            "overlap",
+            "reorder",
+            "midgap",
+            "qos",
+            "zero_missing",
+            "zero_valid",
+            "error_tail",
+            "cancelled_tail",
+            "error_valid",
+            "error_zero_valid",
+            "ordinary_lossy",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("watermark-root", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child("watermark-child", &root.id, "model", "child");
+            child
+                .messages
+                .push(bamboo_agent_core::Message::user("assignment"));
+            store.save_session(&child).await.unwrap();
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+            let binding = actor_binding(store.clone(), inbox, locked);
+            let _owner = binding
+                .router
+                .register_run(&child.id, "current")
+                .await
+                .unwrap();
+            let before = serde_json::to_value(&child).unwrap();
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: child.created_at,
+                spawn_depth: child.spawn_depth,
+            };
+            let identity = actor_event_logical_identity(&child, &root.id, Some(&creation));
+            let mut rows = child.messages.clone();
+            rows.push(bamboo_agent_core::Message::assistant("complete", None));
+            let data = serde_json::to_value(bamboo_subagent::proto::LocalToolMessages::Complete {
+                version: 1,
+                messages: rows
+                    .iter()
+                    .map(|row| serde_json::to_value(row).unwrap())
+                    .collect(),
+            })
+            .unwrap();
+            let batch = |seq, event, qos| ActorEventBatch {
+                logical_session: Some(identity.clone()),
+                activation_id: Some("current".into()),
+                execution_epoch: 7,
+                source_node_id: None,
+                source_actor_id: Some("selected".into()),
+                first_seq: seq,
+                last_seq: seq,
+                qos,
+                events: vec![event],
+            };
+            let durable = bamboo_subagent::ActorEventQos::Durable;
+            let token = serde_json::json!({"type":"token", "content":"observation"});
+            let mut frames = vec![ChildFrame::EventBatch {
+                batch: batch(1, data.clone(), durable),
+            }];
+            let mut marker = bamboo_subagent::ActorEventWatermark {
+                version: 1,
+                logical_session: Some(identity.clone()),
+                activation_id: Some("current".into()),
+                execution_epoch: 7,
+                final_seq: 1,
+            };
+            match case {
+                "tail" | "error_tail" | "cancelled_tail" => marker.final_seq = 2,
+                "short" => marker.final_seq = 0,
+                "version" => marker.version = 99,
+                "activation" => marker.activation_id = Some("old".into()),
+                "epoch" => marker.execution_epoch = 6,
+                "birth" => {
+                    marker
+                        .logical_session
+                        .as_mut()
+                        .unwrap()
+                        .creation
+                        .as_mut()
+                        .unwrap()
+                        .created_at += chrono::Duration::nanoseconds(1)
+                }
+                "duplicate" => frames.push(frames[0].clone()),
+                "overlap" | "midgap" | "qos" => {
+                    frames = vec![
+                        ChildFrame::EventBatch {
+                            batch: batch(
+                                1,
+                                token.clone(),
+                                if case == "qos" {
+                                    bamboo_subagent::ActorEventQos::Ephemeral
+                                } else {
+                                    durable
+                                },
+                            ),
+                        },
+                        ChildFrame::EventBatch {
+                            batch: batch(
+                                if case == "overlap" {
+                                    1
+                                } else if case == "midgap" {
+                                    3
+                                } else {
+                                    2
+                                },
+                                data,
+                                durable,
+                            ),
+                        },
+                    ];
+                    marker.final_seq = 2;
+                }
+                "reorder" => {
+                    frames = vec![
+                        ChildFrame::EventBatch {
+                            batch: batch(2, data, durable),
+                        },
+                        ChildFrame::EventBatch {
+                            batch: batch(1, token, durable),
+                        },
+                    ]
+                }
+                "zero_missing" | "zero_valid" | "error_zero_valid" => {
+                    frames.clear();
+                    marker.final_seq = 0;
+                }
+                "ordinary_lossy" => {
+                    frames = vec![ChildFrame::EventBatch {
+                        batch: batch(3, token, bamboo_subagent::ActorEventQos::Ephemeral),
+                    }]
+                }
+                _ => {}
+            }
+            let status = match case {
+                "error_tail" | "error_valid" | "error_zero_valid" => TerminalStatus::Error,
+                "cancelled_tail" => TerminalStatus::Cancelled,
+                _ => TerminalStatus::Completed,
+            };
+            frames.push(ChildFrame::Terminal {
+                status,
+                result: Some("complete".into()),
+                error: Some("worker failed".into()),
+                transcript: vec![],
+                final_event_watermark: (!matches!(
+                    case,
+                    "missing" | "zero_missing" | "ordinary_lossy"
+                ))
+                .then_some(marker),
+            });
+            let mut link = HistoryTerminalProbe {
+                frames: frames.into(),
+                accepted: None,
+                acks: 0,
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let (_live, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let tools = vec!["Read".into()];
+            let outcome = drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: &root.id,
+                child_session_id: "watermark-child",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut child,
+                expected_permission_posture: None,
+                expected_creation: Some(&creation),
+                session_inbox_runtime: Some(&binding),
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
+                activation_run_id: Some("current"),
+                execution_epoch: 7,
+                expected_source_actor_id: "selected",
+                initial_inflight_claims: vec![].into(),
+                plain_actor: false,
+                remote_environment_lease: false,
+                readonly_output: None,
+                local_history_tools: (case != "ordinary_lossy").then_some(&tools),
+                local_history_read_only: true,
+                plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
+                actor_event_observer: None,
+                plain_run: None,
+                first_frame_timeout: Some(Duration::from_secs(1)),
+            })
+            .await;
+            let cold = store.load_session(&child.id).await.unwrap().unwrap();
+            if matches!(case, "success" | "ordinary_lossy") {
+                assert_eq!(outcome.unwrap().as_deref(), Some("complete"), "{case}");
+            } else {
+                let error = outcome.unwrap_err().to_string();
+                if !matches!(
+                    case,
+                    "duplicate"
+                        | "overlap"
+                        | "reorder"
+                        | "midgap"
+                        | "qos"
+                        | "zero_valid"
+                        | "error_valid"
+                        | "error_zero_valid"
+                ) {
+                    assert!(
+                        error.contains("actor_history_tail_incomplete"),
+                        "{case}: {error}"
+                    );
+                }
+            }
+            if case == "success" {
+                assert_eq!(
+                    serde_json::to_value(&cold.messages).unwrap(),
+                    serde_json::to_value(rows).unwrap()
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&cold).unwrap(),
+                    before,
+                    "{case}: no cold history commit"
+                );
+                assert_eq!(
+                    serde_json::to_value(&child).unwrap(),
+                    before,
+                    "{case}: no mutable history commit"
+                );
+            }
+            let accepted = matches!(
+                case,
+                "success" | "ordinary_lossy" | "error_valid" | "error_zero_valid"
+            );
+            assert_eq!(link.accepted.is_some(), accepted, "{case}");
+            assert_eq!(
+                link.durable_delivery_receipt().is_some(),
+                accepted,
+                "{case}"
+            );
+            assert_eq!(link.acks, 0, "frame pump never ACKs uncheckpointed history");
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    matches!(event, AgentEvent::Token { .. }),
+                    "typed DATA cannot leak"
+                );
+            }
         }
     }
 
@@ -12960,6 +13312,7 @@ mod tests {
             status: TerminalStatus::Completed,
             result: Some("done".to_string()),
             error: None,
+            final_event_watermark: None,
             transcript: Vec::new(),
         }
     }
@@ -13086,6 +13439,7 @@ mod tests {
                     status,
                     result: None,
                     error: error.map(str::to_owned),
+                    final_event_watermark: None,
                     transcript: Vec::new(),
                 }),
                 accepted: false,
@@ -13165,6 +13519,7 @@ mod tests {
                         status: TerminalStatus::Cancelled,
                         result: None,
                         error: None,
+                        final_event_watermark: None,
                         transcript: Vec::new(),
                     }))
                 }
@@ -14398,6 +14753,7 @@ mod tests {
                     status: TerminalStatus::Completed,
                     result: Some("done".to_string()),
                     error: None,
+                    final_event_watermark: None,
                     transcript: Vec::new(),
                 },
             ]),
@@ -15401,6 +15757,7 @@ mod tests {
                         status: TerminalStatus::Completed,
                         result: Some("done".into()),
                         error: None,
+                        final_event_watermark: None,
                         transcript: vec![],
                     }))
                 }
@@ -15567,6 +15924,7 @@ mod tests {
                     status: TerminalStatus::Completed,
                     result: Some("done".into()),
                     error: None,
+                    final_event_watermark: None,
                     transcript: vec![],
                 }))
             }

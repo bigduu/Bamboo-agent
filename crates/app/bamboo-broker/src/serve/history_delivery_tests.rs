@@ -187,6 +187,51 @@ impl bamboo_subagent::ChildExecutor for HistoryExecutor {
 
 #[tokio::test]
 async fn executor_opt_in_reaches_broker_run_and_outcome_follows_receipts() {
+    assert_run_watermark(&HistoryExecutor, 5, 1, false).await;
+    assert_run_watermark(&EmptyHistoryExecutor { emit_tail: false }, 0, 7, false).await;
+    assert_run_watermark(&EmptyHistoryExecutor { emit_tail: false }, 0, 8, false).await;
+    assert_run_watermark(&EmptyHistoryExecutor { emit_tail: false }, 0, 0, false).await;
+    assert_run_watermark(&EmptyHistoryExecutor { emit_tail: true }, 1, 7, true).await;
+}
+
+struct EmptyHistoryExecutor {
+    emit_tail: bool,
+}
+#[async_trait::async_trait]
+impl bamboo_subagent::ChildExecutor for EmptyHistoryExecutor {
+    fn requires_contiguous_events(&self) -> bool {
+        true
+    }
+    async fn run(
+        &self,
+        spec: RunSpec,
+        events: bamboo_subagent::EventSink,
+        _steer: bamboo_subagent::SteerInbox,
+        _cancel: CancellationToken,
+    ) -> bamboo_subagent::ChildOutcome {
+        if self.emit_tail {
+            events
+                .emit(json!({"type":"token", "content":"final flush"}))
+                .await;
+        }
+        let mut outcome = bamboo_subagent::ChildOutcome::completed("file evidence");
+        outcome.final_event_watermark = Some(bamboo_subagent::ActorEventWatermark {
+            version: 99,
+            logical_session: spec.logical_session,
+            activation_id: spec.activation_run_id,
+            execution_epoch: spec.execution_epoch,
+            final_seq: 999,
+        });
+        outcome
+    }
+}
+
+async fn assert_run_watermark(
+    executor: &dyn bamboo_subagent::ChildExecutor,
+    event_count: u64,
+    epoch: u64,
+    fail_final_receipt: bool,
+) {
     let (control, _control_rx) = tokio::sync::mpsc::channel(1);
     let (events, mut rx) = tokio::sync::mpsc::channel(1);
     let me = AgentRef {
@@ -206,16 +251,18 @@ async fn executor_opt_in_reaches_broker_run_and_outcome_follows_receipts() {
             role: None,
         },
         kind: InboxKind::Run,
-        body: json!({"assignment":"read", "execution_epoch":1}),
+        body: json!({"assignment":"read", "execution_epoch":epoch, "activation_run_id":"current",
+            "logical_session":{"session_id":"logical-child", "parent_session_id":"logical-parent", "root_session_id":"root", "creation":{"created_at":Utc::now(), "spawn_depth":1}}}),
         created_at: Utc::now(),
         correlation_id: None,
     };
+    let expected_run: RunSpec = serde_json::from_value(message.body.clone()).unwrap();
     let coords = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let tree_waiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     tokio::time::timeout(Duration::from_secs(2), async {
         let run = handle_run(
-            &HistoryExecutor,
+            executor,
             &me,
             message,
             CancellationToken::new(),
@@ -248,9 +295,26 @@ async fn executor_opt_in_reaches_broker_run_and_outcome_follows_receipts() {
                         assert_eq!(batch.qos, ActorEventQos::Durable);
                         assert_eq!(batch.first_seq, next_seq);
                         next_seq = batch.last_seq + 1;
+                        if fail_final_receipt && batch.last_seq == event_count {
+                            drop(result);
+                            break;
+                        }
                     }
                     InboxKind::Outcome => {
-                        assert_eq!(next_seq, 6);
+                        assert_eq!(next_seq, event_count + 1);
+                        let outcome: bamboo_subagent::ChildOutcome =
+                            serde_json::from_value(message.body.clone()).unwrap();
+                        if epoch == 0 {
+                            assert!(outcome.final_event_watermark.is_none());
+                        } else {
+                            let marker = outcome.final_event_watermark.unwrap();
+                            assert!(marker.matches_consumed_run(
+                                expected_run.logical_session.as_ref().unwrap(),
+                                "current",
+                                epoch,
+                                event_count
+                            ));
+                        }
                         assert_eq!(message.body["result"], "file evidence");
                         result.send(Ok(MsgId::new())).unwrap();
                         break;
@@ -261,7 +325,15 @@ async fn executor_opt_in_reaches_broker_run_and_outcome_follows_receipts() {
             }
         };
         let (handled, ()) = tokio::join!(run, receive);
-        assert!(matches!(handled, Handled::Ack));
+        if fail_final_receipt {
+            assert!(matches!(handled, Handled::LeaveAndDisconnect));
+            assert!(
+                rx.try_recv().is_err(),
+                "failed tail receipt must not publish Outcome"
+            );
+        } else {
+            assert!(matches!(handled, Handled::Ack));
+        }
     })
     .await
     .expect("run should complete after every history and outcome receipt");

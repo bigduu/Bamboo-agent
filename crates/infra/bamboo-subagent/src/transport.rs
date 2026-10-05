@@ -95,6 +95,7 @@ impl ActiveRun {
                         status: crate::proto::TerminalStatus::Cancelled,
                         result: None,
                         error: None,
+                        final_event_watermark: None,
                         transcript: Vec::new(),
                     }),
                 )
@@ -705,6 +706,53 @@ async fn writer_task<S>(
     let _ = ws_tx.close().await;
 }
 
+async fn forward_direct_events(
+    mut ev_rx: mpsc::Receiver<serde_json::Value>,
+    mut batcher: ActorEventBatcher,
+    legacy_event_wire: bool,
+    event_fwd: mpsc::Sender<ChildFrame>,
+) -> Result<Option<crate::ActorEventWatermark>, ()> {
+    let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    flush.tick().await;
+    let mut open = true;
+    while open {
+        tokio::select! {
+            event = ev_rx.recv() => match event {
+                Some(event) => {
+                    if legacy_event_wire {
+                        if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                    for batch in batcher.push(event) {
+                        if !send_direct_event_batch(&event_fwd, batch).await {
+                            return Err(());
+                        }
+                    }
+                }
+                None => open = false,
+            },
+            _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
+                if let Some(batch) = batcher.flush() {
+                    if !send_direct_event_batch(&event_fwd, batch).await {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+    if !legacy_event_wire {
+        if let Some(batch) = batcher.flush() {
+            if !send_direct_event_batch(&event_fwd, batch).await {
+                return Err(());
+            }
+        }
+    }
+    Ok(batcher.final_watermark())
+}
+
 fn start_run<E: ChildExecutor + ?Sized>(
     executor: Arc<E>,
     spec: RunSpec,
@@ -714,53 +762,21 @@ fn start_run<E: ChildExecutor + ?Sized>(
     event_tx: mpsc::Sender<ChildFrame>,
     pending: PendingReplies,
 ) -> ActiveRun {
-    let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
+    let (sink, ev_rx, mut control_rx) = EventSink::channel_with_control();
     let legacy_event_wire = spec.execution_epoch == 0;
-    let mut batcher = ActorEventBatcher::for_run(&spec, None, None)
+    let batcher = ActorEventBatcher::for_run(&spec, None, None)
         .with_durable_events(executor.requires_contiguous_events());
     let event_fwd = event_tx.clone();
     // All event batches share one ordered data lane. Durable batches wait for
     // capacity, including the complete trace of a strict history executor.
     // Ordinary lossy data uses `try_send`, making overload observable as a
     // sequence gap. Approval/admission controls remain independent.
-    let mut fwd = OwnedTask::new(tokio::spawn(async move {
-        let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        flush.tick().await;
-        let mut open = true;
-        while open {
-            tokio::select! {
-                event = ev_rx.recv() => match event {
-                    Some(event) => {
-                        if legacy_event_wire {
-                            if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        for batch in batcher.push(event) {
-                            if !send_direct_event_batch(&event_fwd, batch).await {
-                                return;
-                            }
-                        }
-                    }
-                    None => open = false,
-                },
-                _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
-                    if let Some(batch) = batcher.flush() {
-                        if !send_direct_event_batch(&event_fwd, batch).await {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        if !legacy_event_wire {
-            if let Some(batch) = batcher.flush() {
-                let _ = send_direct_event_batch(&event_fwd, batch).await;
-            }
-        }
-    }));
+    let mut fwd = OwnedTask::new(tokio::spawn(forward_direct_events(
+        ev_rx,
+        batcher,
+        legacy_event_wire,
+        event_fwd,
+    )));
     let out_control = control_tx.clone();
     let mut control = OwnedTask::new(tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
@@ -839,7 +855,12 @@ fn start_run<E: ChildExecutor + ?Sized>(
             .catch_unwind()
             .await
             .unwrap_or_else(|_| crate::executor::ChildOutcome::error("actor executor panicked"));
-        let _ = fwd.join().await; // flush all events before the terminal frame
+        // A failed/panicked forwarder cannot certify complete history or send
+        // successful Terminal. The connection close remains retryable.
+        let Ok(Ok(final_event_watermark)) = fwd.join().await else {
+            pump.abort();
+            return;
+        };
         let _ = control.join().await; // flush durable-admission confirmations first
         pump.abort(); // no more host callbacks after the run ends
                       // Terminal follows every accepted event batch on the bounded event
@@ -847,6 +868,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
         let _ = event_tx
             .send(ChildFrame::Terminal {
                 status: outcome.status,
+                final_event_watermark,
                 result: outcome.result,
                 error: outcome.error,
                 transcript: outcome.transcript,

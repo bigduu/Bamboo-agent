@@ -1231,6 +1231,11 @@ async fn fast_child_completion_automatically_starts_parent_successor() {
         .unwrap();
     child.add_message(Message::assistant("fast child reply", None));
     child.set_last_run_status("completed");
+    crate::execution::ChildCompletionSource::prepare(
+        &mut child,
+        "fast-child-run",
+        &Default::default(),
+    );
     harness.storage.save_session(&child).await.unwrap();
 
     let completion = ChildCompletion {
@@ -1239,6 +1244,7 @@ async fn fast_child_completion_automatically_starts_parent_successor() {
         status: "completed".to_string(),
         error: None,
         completed_at: now,
+        source: crate::execution::ChildCompletionSource::from_committed_session(&child),
     };
     let coordinator = harness.coordinator.clone();
     let completion_task = tokio::spawn(async move {
@@ -2330,6 +2336,14 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
     .await
     .expect("first production run must reach terminal barrier");
 
+    let activation_a = harness
+        .agent_runners
+        .read()
+        .await
+        .get(&harness.child_session_id)
+        .unwrap()
+        .run_id
+        .clone();
     let mut envelope =
         SessionMessageEnvelope::user_input(&harness.child_session_id, "after final provider round");
     envelope.id = SessionMessageId::parse(message_id.clone()).unwrap();
@@ -2372,6 +2386,24 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
         .await
         .unwrap()
         .unwrap();
+    let source_a =
+        crate::execution::ChildCompletionSource::from_committed_session(&first_terminal_snapshot)
+            .expect(
+            "actual SDK finalizer must seal the canonical terminal source before successor release",
+        );
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_a.activation_run_id, activation_a);
+    assert_eq!(
+        source_a
+            .result(&first_terminal_snapshot, &parent)
+            .as_deref(),
+        Some("done")
+    );
     assert!(!first_terminal_snapshot
         .messages
         .iter()
@@ -2422,6 +2454,22 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
             .count(),
         1
     );
+    let source_b = crate::execution::ChildCompletionSource::from_committed_session(&settled)
+        .expect("actual resumed-child finalizer must seal its own terminal source");
+    assert_eq!(
+        source_b.activation_run_id,
+        harness
+            .agent_runners
+            .read()
+            .await
+            .get(&harness.child_session_id)
+            .unwrap()
+            .run_id
+    );
+    assert_ne!(source_a.activation_run_id, source_b.activation_run_id);
+    assert_ne!(source_a.result_message_id, source_b.result_message_id);
+    assert!(source_a.result(&settled, &parent).is_none());
+    assert!(source_b.result(&settled, &parent).is_some());
     let backlog = harness
         .inbox
         .inspect(&harness.child_session_id)

@@ -24,8 +24,8 @@ use crate::runtime::execution::event_forwarder::create_event_forwarder_with_hist
 use crate::runtime::execution::runner_lifecycle::{finalize_runner, try_reserve_runner};
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
-    publish_child_completion_parts, watch_child_liveness, watchdog_policy_for_session,
-    ChildLaunchGuard, SpawnContext, SpawnJob,
+    publish_child_completion, publish_child_completion_parts, watch_child_liveness,
+    watchdog_policy_for_session, ChildLaunchGuard, SpawnContext, SpawnJob,
 };
 use crate::runtime::execution::SessionExecutionReservation;
 
@@ -480,6 +480,7 @@ async fn run_child_spawn_inner(
     let activation_run_id = run_id;
 
     tokio::spawn(async move {
+        let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
         // Set the child model via the single authoritative pre-execution
         // mutation point. The child session's system prompt is already in place
         // (loaded from storage), so pass `None` for `system_prompt`.
@@ -719,6 +720,11 @@ async fn run_child_spawn_inner(
         } else {
             session.clear_last_run_error();
         }
+        crate::execution::ChildCompletionSource::prepare(
+            &mut session,
+            &activation_run_id,
+            &prior_message_ids,
+        );
         let broker_receipt_prepared = match tokio::time::timeout(
             Duration::from_secs(5),
             external_runner.prepare_durable_child_delivery(&session, &activation_run_id),
@@ -753,6 +759,15 @@ async fn run_child_spawn_inner(
             }
         };
         let history_committed = saved.is_ok();
+        let completion_source =
+            crate::execution::ChildCompletionSource::after_final_save(&session, history_committed);
+        let completed_at = Utc::now();
+        let status = session.last_run_status().unwrap_or(status);
+        let error = if history_committed {
+            session.last_run_error()
+        } else {
+            error
+        };
         if let Err(error) = saved {
             tracing::warn!(
                 session_id = %session_id_clone,
@@ -837,13 +852,17 @@ async fn run_child_spawn_inner(
         // Stop forwarding/heartbeats and emit terminal child status through the
         // same durable completion path used by success/error/cancel/timeout.
         done.cancel();
-        publish_child_completion_parts(
+        publish_child_completion(
             &parent_event_publisher_for_done,
             completion_handler,
-            parent_id_for_done,
-            child_id_for_done,
-            status,
-            error,
+            crate::execution::ChildCompletion {
+                parent_session_id: parent_id_for_done,
+                child_session_id: child_id_for_done,
+                status,
+                error,
+                completed_at,
+                source: completion_source,
+            },
         )
         .await;
 
