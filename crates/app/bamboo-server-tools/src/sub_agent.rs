@@ -1793,6 +1793,15 @@ impl SubAgentTool {
                     .await
                     .map_err(tool_error_from_child_session)?;
 
+                if count == 0 {
+                    return tool_result(json!({
+                        "status": "already_satisfied",
+                        "parent_session_id": parent_session_id,
+                        "wait_for": policy.as_str(),
+                        "note": "The requested wait is already satisfied by finished child sessions. Use SubAgent.get with view=result to read their answers.",
+                    })).map(ToolOutcome::Completed);
+                }
+
                 waiting_for_children_tool_result(json!({
                     "status": "waiting",
                     "parent_session_id": parent_session_id,

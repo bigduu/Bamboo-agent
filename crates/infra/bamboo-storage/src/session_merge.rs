@@ -980,6 +980,120 @@ impl LockedSessionStore {
         result
     }
 
+    /// Forward child-wait mutations to the final physical writer. The local
+    /// lock orders this instance's callers; V2 owns cross-instance atomicity.
+    pub async fn register_child_wait_and_publish(
+        &self,
+        expected: &Session,
+        batch: &[(String, Option<String>)],
+        policy: bamboo_domain::ChildWaitPolicy,
+        check_terminal: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<(Session, usize)> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        if self.storage.supports_atomic_child_wait_control_plane() {
+            return self
+                .storage
+                .register_child_wait_control_plane(expected, batch, policy, check_terminal, publish)
+                .await;
+        }
+        // Preserve legacy/custom backend support under this instance's existing
+        // serialization lock. Only capable backends claim physical atomicity.
+        use crate::v2::child_wait_control_plane::{
+            register_pending, terminal, validate_incarnation,
+        };
+        let mut latest = self
+            .storage
+            .load_session(&expected.id)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "child wait parent disappeared",
+                )
+            })?;
+        validate_incarnation(expected, &latest)?;
+        let mut pending = Vec::new();
+        let mut satisfied = false;
+        for entry in batch {
+            if !check_terminal {
+                pending.push(entry.clone());
+                continue;
+            }
+            let child = self.storage.load_runtime_control_plane(&entry.0).await?;
+            let status = child
+                .filter(|child| child.parent_session_id.as_deref() == Some(&expected.id))
+                .and_then(|child| child.last_run_status())
+                .filter(|status| terminal(status));
+            if let Some(status) = status {
+                satisfied |= policy == bamboo_domain::ChildWaitPolicy::Any
+                    || (policy == bamboo_domain::ChildWaitPolicy::FirstError
+                        && matches!(status.as_str(), "error" | "timeout" | "cancelled"));
+            } else {
+                pending.push(entry.clone());
+            }
+        }
+        if satisfied || pending.is_empty() {
+            publish(&latest);
+            return Ok((latest, 0));
+        }
+        let count = pending.len();
+        register_pending(&mut latest, pending, policy)?;
+        self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+            .await?;
+        publish(&latest);
+        Ok((latest, count))
+    }
+
+    pub async fn compare_exchange_child_wait_and_publish(
+        &self,
+        expected: &Session,
+        updated: &mut Session,
+        runtime_only: bool,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _guard = self.acquire_lock(&expected.id).await;
+        if self.storage.supports_atomic_child_wait_control_plane() {
+            return self
+                .storage
+                .compare_exchange_child_wait_control_plane(expected, updated, runtime_only, publish)
+                .await;
+        }
+        use crate::v2::child_wait_control_plane::{
+            apply_transition, is_observation, runtime, validate_incarnation,
+        };
+        let mut latest = self
+            .storage
+            .load_session(&expected.id)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "child wait parent disappeared",
+                )
+            })?;
+        validate_incarnation(expected, &latest)?;
+        validate_incarnation(expected, updated)?;
+        if runtime(&latest).waiting_for_children != runtime(expected).waiting_for_children {
+            return Ok(false);
+        }
+        if is_observation(expected, updated) {
+            *updated = latest;
+            return Ok(true);
+        }
+        apply_transition(&mut latest, expected, updated, runtime_only)?;
+        if runtime_only {
+            self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+                .await?;
+        } else {
+            self.save_session_rebasing_task_conflicts(&mut latest)
+                .await?;
+        }
+        publish(&latest);
+        *updated = latest;
+        Ok(true)
+    }
+
     /// Atomically patch Task-owned control-plane fields and publish the saved
     /// value before releasing this session's serialization lock.
     ///

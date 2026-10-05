@@ -924,141 +924,186 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         let per_parent = session_resume_lock(&completion.parent_session_id);
         let _per_parent_guard = per_parent.lock().await;
 
-        let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                "child completion received for missing parent"
-            );
-            return;
-        };
+        let (parent, should_resume, messenger, child_admission) = loop {
+            let Some(mut parent) = self.load_session(&completion.parent_session_id).await else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "child completion received for missing parent"
+                );
+                return;
+            };
 
-        // A parent may itself be a child (nested sub-agents): the rest of this
-        // handler is kind-agnostic — it operates on `completion.parent_session_id`,
-        // inspects that session's own `waiting_for_children` runtime state, and
-        // resumes it. (Previously this bailed unless the parent was Root, which
-        // silently dropped grandchild completions.)
-        let mut runtime_state = read_runtime_state(&parent);
+            let expected_parent = parent.clone();
 
-        // Single source of truth: reconstruct the completed-child set from the
-        // session index rather than from a denormalized copy on the parent file.
-        let completed_child_ids = derive_completed_child_ids(
-            &self.storage,
-            &completion.parent_session_id,
-            &completion.child_session_id,
-        )
-        .await;
+            // A parent may itself be a child (nested sub-agents): the rest of this
+            // handler is kind-agnostic — it operates on `completion.parent_session_id`,
+            // inspects that session's own `waiting_for_children` runtime state, and
+            // resumes it. (Previously this bailed unless the parent was Root, which
+            // silently dropped grandchild completions.)
+            let mut runtime_state = read_runtime_state(&parent);
 
-        let mut should_resume = false;
-        let mut remaining_children = 0usize;
-        let active_wait = runtime_state.waiting_for_children.clone();
-        if active_wait.is_none() {
-            // A fast Child can finish while its parent is still completing a
-            // normal reasoning round, before that parent registers a wait.
-            // There is no parent control-plane transition to save here. In
-            // particular, a stale parent snapshot must not attempt a full
-            // transcript checkpoint against an advancing model-context ledger.
-            // Orphan-wait registration uses this same lock and will observe the
-            // terminal Child index after this completion returns.
-            return;
-        }
-        if let Some(wait) = active_wait.as_ref() {
-            remaining_children = wait
-                .child_session_ids
-                .iter()
-                .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
-                .count();
-            should_resume = wait_policy_satisfied(
-                wait.wait_for,
-                &wait.child_session_ids,
-                &completed_child_ids,
-                &completion.child_session_id,
-                &completion.status,
-            );
-        }
-
-        // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
-        // model-provided and unvalidated, and the watchdog unstrands a wait
-        // over a FOREIGN/unknown id by publishing a synthetic completion
-        // here. We must resume the parent (so it is not stranded) but MUST
-        // NOT fold that foreign session's transcript into the parent — that
-        // would be a cross-session disclosure primitive. Decide ownership
-        // from the child's OWN parent linkage (control-plane only, no
-        // messages loaded), and only load its full content when it is truly
-        // this parent's child. An unowned id resumes with the neutral/error
-        // message (`runtime_resume_message` falls back to `completion.error`
-        // when no child content is supplied).
-        let reported_child_owned = match self
-            .storage
-            .load_runtime_control_plane(&completion.child_session_id)
-            .await
-        {
-            Ok(Some(control_plane)) => completion_child_is_owned(
+            // Single source of truth: reconstruct the completed-child set from the
+            // session index rather than from a denormalized copy on the parent file.
+            let mut completed_child_ids = derive_completed_child_ids(
+                &self.storage,
                 &completion.parent_session_id,
-                control_plane.parent_session_id.as_deref(),
-            ),
-            _ => false,
-        };
+                &completion.child_session_id,
+            )
+            .await;
 
-        // Load the completed child once, ONLY when owned. The guardian
-        // branch inspects its subagent_type + final verdict; the generic
-        // path folds its final assistant content into the hidden resume
-        // message (avoiding an extra `SubAgent.get` round trip after resume).
-        let loaded_child = if reported_child_owned {
-            match self
-                .storage
-                .load_session(&completion.child_session_id)
-                .await
-            {
-                Ok(child) => child,
-                Err(error) => {
-                    tracing::warn!(
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "failed to load child session for runtime resume message"
-                    );
-                    None
+            let mut should_resume = false;
+            let mut remaining_children = 0usize;
+            let active_wait = runtime_state.waiting_for_children.clone();
+            if active_wait.as_ref().is_none_or(|wait| {
+                !wait
+                    .child_session_ids
+                    .contains(&completion.child_session_id)
+            }) {
+                // Registration owns the physical writer while it fresh-checks
+                // Child terminality. Our no-wait decision must use that same
+                // boundary, so a callback cannot disappear before its arm lands.
+                let mut unchanged = parent.clone();
+                match self
+                    .persistence
+                    .compare_exchange_child_wait_and_publish(
+                        &parent,
+                        &mut unchanged,
+                        true,
+                        Arc::new(|_| {}),
+                    )
+                    .await
+                {
+                    Ok(false) => continue,
+                    Ok(true) => return,
+                    Err(error) => {
+                        tracing::warn!(parent_session_id = %parent.id, %error,
+                            "child completion could not settle no-wait observation");
+                        return;
+                    }
                 }
             }
-        } else {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                "completion child is not a child of this parent; resuming with a neutral \
-                 message and NOT folding its content"
-            );
-            None
-        };
-
-        // An old committed callback cannot count a successor, stage another
-        // outcome, or clear a newer wait. Source-less synthetic completions may
-        // unblock recovery, but never borrow the latest transcript answer.
-        if let Some(source) = completion.source.as_ref() {
-            if loaded_child
-                .as_ref()
-                .and_then(ChildCompletionSource::from_committed_session)
-                .as_ref()
-                != Some(source)
-                || !source.matches_completion(&completion)
-                || loaded_child
-                    .as_ref()
-                    .is_none_or(|child| !source.matches_parent(child, &parent))
-            {
-                tracing::warn!(child_session_id = %completion.child_session_id,
-                    "stale/unavailable committed child completion source; leaving wait armed");
-                return;
+            // Independent Stores can have stale child-status indexes. Refresh
+            // this arm's known children from their durable control planes.
+            if let Some(wait) = active_wait.as_ref() {
+                for id in &wait.child_session_ids {
+                    if id == &completion.child_session_id {
+                        continue;
+                    }
+                    if let Ok(Some(child)) = self
+                        .storage
+                        .load_child_wait_session(&parent, id, false)
+                        .await
+                    {
+                        completed_child_ids.retain(|completed| completed != id);
+                        if completion_child_is_owned(&parent.id, child.parent_session_id.as_deref())
+                            && child
+                                .last_run_status()
+                                .as_deref()
+                                .is_some_and(is_terminal_child_status)
+                        {
+                            completed_child_ids.push(id.clone());
+                        }
+                    }
+                }
             }
-        }
-        let child_final_response = loaded_child
-            .as_ref()
-            .and_then(|child| completion.source.as_ref()?.result(child, &parent));
-        // Select the exact provider-facing resume message before durable
-        // admission. The typed body carries its content/parts and safe runtime
-        // metadata, so the canonical path is semantically identical to the
-        // rolling-upgrade transcript fallback.
-        let guardian_resume = if should_resume {
-            let reviewed_round = runtime_state.round.current_round;
-            loaded_child.as_ref().and_then(|child| {
+            if let Some(wait) = active_wait.as_ref() {
+                remaining_children = wait
+                    .child_session_ids
+                    .iter()
+                    .filter(|id| !completed_child_ids.iter().any(|completed| completed == *id))
+                    .count();
+                should_resume = wait_policy_satisfied(
+                    wait.wait_for,
+                    &wait.child_session_ids,
+                    &completed_child_ids,
+                    &completion.child_session_id,
+                    &completion.status,
+                );
+            }
+
+            // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
+            // model-provided and unvalidated, and the watchdog unstrands a wait
+            // over a FOREIGN/unknown id by publishing a synthetic completion
+            // here. We must resume the parent (so it is not stranded) but MUST
+            // NOT fold that foreign session's transcript into the parent — that
+            // would be a cross-session disclosure primitive. Decide ownership
+            // from the child's OWN parent linkage (control-plane only, no
+            // messages loaded), and only load its full content when it is truly
+            // this parent's child. An unowned id resumes with the neutral/error
+            // message (`runtime_resume_message` falls back to `completion.error`
+            // when no child content is supplied).
+            let reported_child_owned = match self
+                .storage
+                .load_child_wait_session(&parent, &completion.child_session_id, false)
+                .await
+            {
+                Ok(Some(control_plane)) => completion_child_is_owned(
+                    &completion.parent_session_id,
+                    control_plane.parent_session_id.as_deref(),
+                ),
+                _ => false,
+            };
+
+            // Load the completed child once, ONLY when owned. The guardian
+            // branch inspects its subagent_type + final verdict; the generic
+            // path folds its final assistant content into the hidden resume
+            // message (avoiding an extra `SubAgent.get` round trip after resume).
+            let loaded_child = if reported_child_owned {
+                match self
+                    .storage
+                    .load_child_wait_session(&parent, &completion.child_session_id, true)
+                    .await
+                {
+                    Ok(child) => child,
+                    Err(error) => {
+                        tracing::warn!(
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "failed to load child session for runtime resume message"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id,
+                    "completion child is not a child of this parent; resuming with a neutral \
+                     message and NOT folding its content"
+                );
+                None
+            };
+
+            // An old committed callback cannot count a successor, stage another
+            // outcome, or clear a newer wait. Source-less synthetic completions may
+            // unblock recovery, but never borrow the latest transcript answer.
+            if let Some(source) = completion.source.as_ref() {
+                if loaded_child
+                    .as_ref()
+                    .and_then(ChildCompletionSource::from_committed_session)
+                    .as_ref()
+                    != Some(source)
+                    || !source.matches_completion(&completion)
+                    || loaded_child
+                        .as_ref()
+                        .is_none_or(|child| !source.matches_parent(child, &parent))
+                {
+                    tracing::warn!(child_session_id = %completion.child_session_id,
+                    "stale/unavailable committed child completion source; leaving wait armed");
+                    return;
+                }
+            }
+            let child_final_response = loaded_child
+                .as_ref()
+                .and_then(|child| completion.source.as_ref()?.result(child, &parent));
+            // Select the exact provider-facing resume message before durable
+            // admission. The typed body carries its content/parts and safe runtime
+            // metadata, so the canonical path is semantically identical to the
+            // rolling-upgrade transcript fallback.
+            let guardian_resume = if should_resume {
+                let reviewed_round = runtime_state.round.current_round;
+                loaded_child.as_ref().and_then(|child| {
                 if child.subagent_type().as_deref() != Some("guardian") {
                     return None;
                 }
@@ -1115,315 +1160,357 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 );
                 Some(message)
             })
-        } else {
-            None
-        };
-        let mut typed_result = loaded_child
-            .as_ref()
-            .and_then(|child| sealed_child_report(&completion, child, &parent));
-        let mut resume_message = if let Some(projection) = typed_result.as_mut() {
-            let message = typed_child_resume_message(&completion, remaining_children, projection);
-            if fits_child_result_budget(&message) {
-                message
             } else {
-                *projection = unavailable_child_result("typed_result", "result_budget_exceeded");
-                typed_child_resume_message(&completion, remaining_children, projection)
-            }
-        } else {
-            guardian_resume.unwrap_or_else(|| {
-                runtime_resume_message(
-                    &completion,
-                    remaining_children,
-                    child_final_response.as_deref(),
-                )
-            })
-        };
-        if typed_result.is_some() && !fits_child_result_budget(&resume_message) {
-            tracing::warn!(child_session_id = %completion.child_session_id,
-                "typed child resume identity exceeds budget; leaving wait armed");
-            return;
-        }
-
-        // Stage the typed child outcome before clearing any durable wait. A
-        // crash after this admission leaves the parent suspended with an
-        // inspectable envelope; only a durably committed policy transition
-        // below is allowed to activate it.
-        let messenger = self.agent.session_messenger().cloned();
-        let mut child_admission = if let (Some(wait), Some(messenger)) =
-            (active_wait.as_ref(), messenger.as_ref())
-        {
-            let mut envelope = child_completion_envelope(
-                &completion,
-                wait.registered_at,
-                child_final_response,
-                &resume_message,
-            );
-            if let Some(run_id) = self
-                .agent
-                .activation_router()
-                .map(|router| router.current_run_id(&completion.parent_session_id))
-            {
-                if let Some(run_id) = run_id.await {
-                    envelope.correlation_id = Some(format!("child_completion_after_run:{run_id}"));
-                }
-            }
-            if let Some(projection) = typed_result.as_mut() {
-                if !bound_typed_child_delivery(
-                    &mut envelope,
-                    &mut resume_message,
-                    projection,
-                    &completion,
-                    remaining_children,
-                ) {
-                    tracing::warn!(child_session_id = %completion.child_session_id,
-                        "typed child outcome wrapper exceeds budget; leaving wait armed");
-                    return;
-                }
-            }
-            match messenger.admit(envelope).await {
-                Ok(admission) => Some(admission),
-                Err(error) => {
-                    tracing::warn!(
-                        parent_session_id = %completion.parent_session_id,
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "child outcome SessionInbox admission failed; leaving parent wait armed"
-                    );
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        // The durable Child index can reach terminal state before its
-        // completion callback acquires this parent lock. Clearing an already
-        // satisfied wait after staging only the current callback would drop
-        // every later callback at the no-wait guard above. Stage those exact
-        // waited-for terminal siblings first, using the same wait identity and
-        // Inbox protocol. Any/FirstError still do not wait for running siblings.
-        if should_resume {
-            if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
-                let parent_run_id = if let Some(router) = self.agent.activation_router() {
-                    router.current_run_id(&completion.parent_session_id).await
+                None
+            };
+            let mut typed_result = loaded_child
+                .as_ref()
+                .and_then(|child| sealed_child_report(&completion, child, &parent));
+            let mut resume_message = if let Some(projection) = typed_result.as_mut() {
+                let message =
+                    typed_child_resume_message(&completion, remaining_children, projection);
+                if fits_child_result_budget(&message) {
+                    message
                 } else {
-                    None
-                };
-                for child_id in &wait.child_session_ids {
-                    if child_id == &completion.child_session_id
-                        || !completed_child_ids.contains(child_id)
-                    {
-                        continue;
-                    }
-                    // Check lineage before reading transcript content. The
-                    // index is parent-scoped, but ownership must still come
-                    // from this child's own durable control plane.
-                    let owned = match self.storage.load_runtime_control_plane(child_id).await {
-                        Ok(Some(child)) => completion_child_is_owned(
-                            &completion.parent_session_id,
-                            child.parent_session_id.as_deref(),
-                        ),
-                        _ => false,
-                    };
-                    let sibling = if owned {
-                        self.storage.load_session(child_id).await
-                    } else {
-                        tracing::warn!(%child_id, "terminal sibling ownership unavailable; leaving parent wait armed");
-                        return;
-                    };
-                    let sibling = match sibling {
-                        Ok(Some(child))
-                            if completion_child_is_owned(
-                                &completion.parent_session_id,
-                                child.parent_session_id.as_deref(),
-                            ) && child
-                                .last_run_status()
-                                .as_deref()
-                                .is_some_and(is_terminal_child_status) =>
-                        {
-                            child
-                        }
-                        _ => {
-                            tracing::warn!(%child_id, "terminal sibling snapshot unavailable; leaving parent wait armed");
-                            return;
-                        }
-                    };
-                    if ChildCompletionSource::has_source_record(&sibling)
-                        && ChildCompletionSource::from_committed_session(&sibling).is_none()
-                    {
-                        tracing::warn!(%child_id, "terminal sibling source is invalid; leaving wait armed");
-                        return;
-                    }
-                    let sibling_completion = ChildCompletion {
-                        parent_session_id: completion.parent_session_id.clone(),
-                        child_session_id: child_id.clone(),
-                        status: sibling.last_run_status().expect("terminal status checked"),
-                        error: sibling.last_run_error(),
-                        completed_at: sibling.updated_at,
-                        source: ChildCompletionSource::from_committed_session(&sibling),
-                    };
-                    if sibling_completion
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| !source.matches_parent(&sibling, &parent))
-                    {
-                        tracing::warn!(%child_id, "terminal sibling parent context is stale; leaving wait armed");
-                        return;
-                    }
-                    let result = sibling_completion
-                        .source
-                        .as_ref()
-                        .and_then(|source| source.result(&sibling, &parent));
-                    let mut typed_result =
-                        sealed_child_report(&sibling_completion, &sibling, &parent);
-                    let mut presentation = if let Some(projection) = typed_result.as_ref() {
-                        typed_child_resume_message(
-                            &sibling_completion,
-                            remaining_children,
-                            projection,
-                        )
-                    } else {
-                        runtime_resume_message(
-                            &sibling_completion,
-                            remaining_children,
-                            result.as_deref(),
-                        )
-                    };
-                    let mut envelope = child_completion_envelope(
-                        &sibling_completion,
-                        wait.registered_at,
-                        result,
-                        &presentation,
-                    );
-                    if let Some(run_id) = parent_run_id.as_ref() {
+                    *projection =
+                        unavailable_child_result("typed_result", "result_budget_exceeded");
+                    typed_child_resume_message(&completion, remaining_children, projection)
+                }
+            } else {
+                guardian_resume.unwrap_or_else(|| {
+                    runtime_resume_message(
+                        &completion,
+                        remaining_children,
+                        child_final_response.as_deref(),
+                    )
+                })
+            };
+            if typed_result.is_some() && !fits_child_result_budget(&resume_message) {
+                tracing::warn!(child_session_id = %completion.child_session_id,
+                "typed child resume identity exceeds budget; leaving wait armed");
+                return;
+            }
+
+            // Stage the typed child outcome before clearing any durable wait. A
+            // crash after this admission leaves the parent suspended with an
+            // inspectable envelope; only a durably committed policy transition
+            // below is allowed to activate it.
+            let messenger = self.agent.session_messenger().cloned();
+            let mut child_admission = if let (Some(wait), Some(messenger)) =
+                (active_wait.as_ref(), messenger.as_ref())
+            {
+                let mut envelope = child_completion_envelope(
+                    &completion,
+                    wait.registered_at,
+                    child_final_response,
+                    &resume_message,
+                );
+                if let Some(run_id) = self
+                    .agent
+                    .activation_router()
+                    .map(|router| router.current_run_id(&completion.parent_session_id))
+                {
+                    if let Some(run_id) = run_id.await {
                         envelope.correlation_id =
                             Some(format!("child_completion_after_run:{run_id}"));
                     }
-                    if let Some(projection) = typed_result.as_mut() {
-                        if !bound_typed_child_delivery(
-                            &mut envelope,
-                            &mut presentation,
-                            projection,
-                            &sibling_completion,
-                            remaining_children,
-                        ) {
-                            tracing::warn!(%child_id, "typed terminal sibling wrapper exceeds budget; leaving wait armed");
+                }
+                if let Some(projection) = typed_result.as_mut() {
+                    if !bound_typed_child_delivery(
+                        &mut envelope,
+                        &mut resume_message,
+                        projection,
+                        &completion,
+                        remaining_children,
+                    ) {
+                        tracing::warn!(child_session_id = %completion.child_session_id,
+                        "typed child outcome wrapper exceeds budget; leaving wait armed");
+                        return;
+                    }
+                }
+                match messenger.admit(envelope).await {
+                    Ok(admission) => Some(admission),
+                    Err(error) => {
+                        tracing::warn!(
+                            parent_session_id = %completion.parent_session_id,
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "child outcome SessionInbox admission failed; leaving parent wait armed"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // The durable Child index can reach terminal state before its
+            // completion callback acquires this parent lock. Clearing an already
+            // satisfied wait after staging only the current callback would drop
+            // every later callback at the no-wait guard above. Stage those exact
+            // waited-for terminal siblings first, using the same wait identity and
+            // Inbox protocol. Any/FirstError still do not wait for running siblings.
+            if should_resume {
+                if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
+                    let parent_run_id = if let Some(router) = self.agent.activation_router() {
+                        router.current_run_id(&completion.parent_session_id).await
+                    } else {
+                        None
+                    };
+                    for child_id in &wait.child_session_ids {
+                        if child_id == &completion.child_session_id
+                            || !completed_child_ids.contains(child_id)
+                        {
+                            continue;
+                        }
+                        // Check lineage before reading transcript content. The
+                        // index is parent-scoped, but ownership must still come
+                        // from this child's own durable control plane.
+                        let owned = match self
+                            .storage
+                            .load_child_wait_session(&parent, child_id, false)
+                            .await
+                        {
+                            Ok(Some(child)) => completion_child_is_owned(
+                                &completion.parent_session_id,
+                                child.parent_session_id.as_deref(),
+                            ),
+                            _ => false,
+                        };
+                        let sibling = if owned {
+                            self.storage
+                                .load_child_wait_session(&parent, child_id, true)
+                                .await
+                        } else {
+                            tracing::warn!(%child_id, "terminal sibling ownership unavailable; leaving parent wait armed");
+                            return;
+                        };
+                        let sibling = match sibling {
+                            Ok(Some(child))
+                                if completion_child_is_owned(
+                                    &completion.parent_session_id,
+                                    child.parent_session_id.as_deref(),
+                                ) && child
+                                    .last_run_status()
+                                    .as_deref()
+                                    .is_some_and(is_terminal_child_status) =>
+                            {
+                                child
+                            }
+                            _ => {
+                                tracing::warn!(%child_id, "terminal sibling snapshot unavailable; leaving parent wait armed");
+                                return;
+                            }
+                        };
+                        if ChildCompletionSource::has_source_record(&sibling)
+                            && ChildCompletionSource::from_committed_session(&sibling).is_none()
+                        {
+                            tracing::warn!(%child_id, "terminal sibling source is invalid; leaving wait armed");
                             return;
                         }
-                    }
-                    match messenger.admit(envelope).await {
-                        Ok(admission) => {
-                            // Preparing the highest generation authorizes the
-                            // whole staged prefix while RespectSpecificWait
-                            // keeps it inert until the wait save succeeds.
-                            if child_admission.as_ref().is_none_or(|current| {
-                                admission.delivery.generation > current.delivery.generation
-                            }) {
-                                child_admission = Some(admission);
+                        let sibling_completion = ChildCompletion {
+                            parent_session_id: completion.parent_session_id.clone(),
+                            child_session_id: child_id.clone(),
+                            status: sibling.last_run_status().expect("terminal status checked"),
+                            error: sibling.last_run_error(),
+                            completed_at: sibling.updated_at,
+                            source: ChildCompletionSource::from_committed_session(&sibling),
+                        };
+                        if sibling_completion
+                            .source
+                            .as_ref()
+                            .is_some_and(|source| !source.matches_parent(&sibling, &parent))
+                        {
+                            tracing::warn!(%child_id, "terminal sibling parent context is stale; leaving wait armed");
+                            return;
+                        }
+                        let result = sibling_completion
+                            .source
+                            .as_ref()
+                            .and_then(|source| source.result(&sibling, &parent));
+                        let mut typed_result =
+                            sealed_child_report(&sibling_completion, &sibling, &parent);
+                        let mut presentation = if let Some(projection) = typed_result.as_ref() {
+                            typed_child_resume_message(
+                                &sibling_completion,
+                                remaining_children,
+                                projection,
+                            )
+                        } else {
+                            runtime_resume_message(
+                                &sibling_completion,
+                                remaining_children,
+                                result.as_deref(),
+                            )
+                        };
+                        let mut envelope = child_completion_envelope(
+                            &sibling_completion,
+                            wait.registered_at,
+                            result,
+                            &presentation,
+                        );
+                        if let Some(run_id) = parent_run_id.as_ref() {
+                            envelope.correlation_id =
+                                Some(format!("child_completion_after_run:{run_id}"));
+                        }
+                        if let Some(projection) = typed_result.as_mut() {
+                            if !bound_typed_child_delivery(
+                                &mut envelope,
+                                &mut presentation,
+                                projection,
+                                &sibling_completion,
+                                remaining_children,
+                            ) {
+                                tracing::warn!(%child_id, "typed terminal sibling wrapper exceeds budget; leaving wait armed");
+                                return;
                             }
                         }
-                        Err(error) => {
-                            tracing::warn!(%child_id, %error, "terminal sibling admission failed; leaving parent wait armed");
-                            return;
+                        match messenger.admit(envelope).await {
+                            Ok(admission) => {
+                                // Preparing the highest generation authorizes the
+                                // whole staged prefix while RespectSpecificWait
+                                // keeps it inert until the wait save succeeds.
+                                if child_admission.as_ref().is_none_or(|current| {
+                                    admission.delivery.generation > current.delivery.generation
+                                }) {
+                                    child_admission = Some(admission);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%child_id, %error, "terminal sibling admission failed; leaving parent wait armed");
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if should_resume {
-            if let (Some(messenger), Some(admission)) =
-                (messenger.as_ref(), child_admission.as_ref())
-            {
-                if let Err(error) = messenger.prepare_activation(admission).await {
-                    tracing::warn!(
-                        parent_session_id = %completion.parent_session_id,
-                        child_session_id = %completion.child_session_id,
-                        %error,
-                        "child outcome activation watermark failed; leaving parent wait armed"
-                    );
+            if should_resume {
+                if let (Some(messenger), Some(admission)) =
+                    (messenger.as_ref(), child_admission.as_ref())
+                {
+                    if let Err(error) = messenger.prepare_activation(admission).await {
+                        tracing::warn!(
+                            parent_session_id = %completion.parent_session_id,
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "child outcome activation watermark failed; leaving parent wait armed"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            if should_resume {
+                runtime_state.waiting_for_children = None;
+                runtime_state.status = AgentStatusState::Idle;
+                runtime_state.suspension = None;
+                parent.metadata.remove("runtime.suspend_reason");
+
+                if child_admission.is_none() {
+                    // Rolling-upgrade fallback only. The canonical path keeps the
+                    // child outcome solely in SessionInbox until the next safe
+                    // reasoning boundary.
+                    parent.add_message(resume_message);
+                }
+            } else if runtime_state.waiting_for_children.is_some() {
+                runtime_state.status = AgentStatusState::Suspended;
+                runtime_state.suspension = Some(SuspensionState {
+                    reason: "waiting_for_children".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: Some("ChildCompletion".to_string()),
+                });
+            }
+
+            parent.updated_at = Utc::now();
+            write_runtime_state(&mut parent, &runtime_state);
+            // Canonical ChildOutcome admission owns the provider-visible message;
+            // this transaction only changes the parent's wait/control state. A
+            // concurrent Root turn may already have advanced its model-context
+            // ledger, so use the control-plane writer, which adopts that durable
+            // ledger under the session lock. The rolling-upgrade fallback above
+            // appends a message and still requires an append-safe checkpoint.
+            let runtime_only = child_admission.is_some();
+            let sessions = self.sessions.clone();
+            let history = expected_parent.clone();
+            let save = self
+                .persistence
+                .compare_exchange_child_wait_and_publish(
+                    &expected_parent,
+                    &mut parent,
+                    runtime_only,
+                    Arc::new(move |saved| {
+                        if runtime_only {
+                            if let Some(cached) = sessions.get(&saved.id) {
+                                cached.update(|current| {
+                                    if current.created_at != saved.created_at {
+                                        *current = saved.clone();
+                                        current.messages = history.messages.clone();
+                                        current.provider_transcript =
+                                            history.provider_transcript.clone();
+                                        current
+                                            .runtime_metadata
+                                            .get_or_insert_with(Default::default)
+                                            .session_inbox_admission =
+                                            history.session_inbox_admission().cloned();
+                                        return;
+                                    }
+
+                                    let messages = current.messages.clone();
+                                    let provider_transcript = current.provider_transcript.clone();
+                                    let admission =
+                                        current.runtime_metadata.as_ref().and_then(|metadata| {
+                                            metadata.session_inbox_admission.clone()
+                                        });
+                                    *current = saved.clone();
+                                    current.messages = messages;
+                                    current.provider_transcript = provider_transcript;
+                                    current
+                                        .runtime_metadata
+                                        .get_or_insert_with(Default::default)
+                                        .session_inbox_admission = admission;
+                                });
+                            } else {
+                                let mut snapshot = saved.clone();
+                                snapshot.messages = history.messages.clone();
+                                snapshot.provider_transcript = history.provider_transcript.clone();
+                                snapshot
+                                    .runtime_metadata
+                                    .get_or_insert_with(Default::default)
+                                    .session_inbox_admission = history
+                                    .runtime_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.session_inbox_admission.clone());
+                                sessions.insert(
+                                    snapshot.id.clone(),
+                                    Arc::new(crate::SessionSnapshot::new(snapshot)),
+                                );
+                            }
+                        } else {
+                            sessions.insert(
+                                saved.id.clone(),
+                                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                            );
+                        }
+                    }),
+                )
+                .await;
+            match save {
+                Ok(false) => {
+                    // Membership or policy changed, even if first-arm tag/time
+                    // stayed the same. Reload and recompute; never replay a clear.
+                    continue;
+                }
+                Ok(true) => break (parent, should_resume, messenger, child_admission),
+                Err(error) => {
+                    tracing::warn!(parent_session_id = %completion.parent_session_id,
+                    child_session_id = %completion.child_session_id, %error,
+                    "child outcome is durable but parent wait transition failed; leaving activation deferred");
                     return;
                 }
             }
-        }
-
-        if should_resume {
-            runtime_state.waiting_for_children = None;
-            runtime_state.status = AgentStatusState::Idle;
-            runtime_state.suspension = None;
-            parent.metadata.remove("runtime.suspend_reason");
-
-            if child_admission.is_none() {
-                // Rolling-upgrade fallback only. The canonical path keeps the
-                // child outcome solely in SessionInbox until the next safe
-                // reasoning boundary.
-                parent.add_message(resume_message);
-            }
-        } else if runtime_state.waiting_for_children.is_some() {
-            runtime_state.status = AgentStatusState::Suspended;
-            runtime_state.suspension = Some(SuspensionState {
-                reason: "waiting_for_children".to_string(),
-                suspended_at: Utc::now(),
-                resumable: true,
-                hook_point: Some("ChildCompletion".to_string()),
-            });
-        }
-
-        parent.updated_at = Utc::now();
-        write_runtime_state(&mut parent, &runtime_state);
-        // Canonical ChildOutcome admission owns the provider-visible message;
-        // this transaction only changes the parent's wait/control state. A
-        // concurrent Root turn may already have advanced its model-context
-        // ledger, so use the control-plane writer, which adopts that durable
-        // ledger under the session lock. The rolling-upgrade fallback above
-        // appends a message and still requires an append-safe checkpoint.
-        let save = if child_admission.is_some() {
-            self.persistence
-                .save_runtime_only_and_publish_on_success(&mut parent, |saved| {
-                    if let Some(cached) = self.sessions.get(&saved.id) {
-                        cached.update(|current| {
-                            let messages = current.messages.clone();
-                            let provider_transcript = current.provider_transcript.clone();
-                            let admission = current
-                                .runtime_metadata
-                                .as_ref()
-                                .and_then(|metadata| metadata.session_inbox_admission.clone());
-                            let mut refreshed = saved.clone();
-                            refreshed.messages = messages;
-                            refreshed.provider_transcript = provider_transcript;
-                            if let Some(admission) = admission {
-                                refreshed
-                                    .runtime_metadata
-                                    .get_or_insert_with(Default::default)
-                                    .session_inbox_admission = Some(admission);
-                            } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
-                                metadata.session_inbox_admission = None;
-                            }
-                            *current = refreshed;
-                        });
-                    }
-                })
-                .await
-        } else {
-            self.persistence
-                .checkpoint_runtime_session(&mut parent)
-                .await
         };
-        if let Err(error) = save {
-            tracing::warn!(
-                parent_session_id = %completion.parent_session_id,
-                child_session_id = %completion.child_session_id,
-                %error,
-                "child outcome is durable but parent wait transition failed; leaving activation deferred"
-            );
-            return;
-        }
-        if child_admission.is_none() {
-            self.sessions.insert(
-                parent.id.clone(),
-                Arc::new(crate::SessionSnapshot::new(parent.clone())),
-            );
-        }
 
         // Capture before releasing the per-parent lock so the borrow checker
         // is satisfied; `resume_parent` has its own retry loop and should not
