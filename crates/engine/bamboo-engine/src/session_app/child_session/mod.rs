@@ -15,7 +15,7 @@ mod helpers;
 mod inspection;
 pub mod named_profile;
 pub mod owned_tree;
-mod result_projection;
+pub(crate) mod result_projection;
 
 #[cfg(test)]
 mod tests;

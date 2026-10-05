@@ -341,6 +341,8 @@ async fn fixture(case: Case) {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("REAL_ROOT_PACKET_FINISHED"))
+                && (case != Case::TypedReport
+                    || parent.last_run_status().as_deref() == Some("completed"))
             {
                 break parent;
             }
@@ -488,6 +490,7 @@ async fn fixture(case: Case) {
                 serde_json::from_str::<Value>(&stored.content).unwrap(),
                 typed_report()
             );
+            assert_typed_parent_resume(&requests, &completed, &child, &binding);
             // Stop the real host before observing through a cold adapter/tool.
             drop(host);
             cold_typed_inspection(&data, &child, &binding, &stored.content).await;
@@ -535,6 +538,101 @@ fn typed_report() -> Value {
         "reported_verification":[{"check":"fixture","reported_status":"not_run","details":""}],
         "proposals":[],"blockers":["Root must decide"],"open_decisions":[]})
 }
+
+fn resume_typed_projection(content: &str) -> Option<Value> {
+    // This is the host's explicit projection marker. Do not infer a report
+    // shape from arbitrary child-authored text in the Parent request.
+    let (_, projection) = content.split_once("Child typed result:\n")?;
+    serde_json::from_str(projection.lines().next()?).ok()
+}
+
+fn assert_typed_parent_resume(
+    requests: &[Value],
+    parent: &bamboo_domain::Session,
+    child: &bamboo_domain::Session,
+    binding: &ChildContextBinding,
+) {
+    let terminal_source: Value = serde_json::from_str(
+        child
+            .metadata
+            .get("runtime.child_completion_source_v1")
+            .expect("the real terminal writer persisted its source seal"),
+    )
+    .unwrap();
+    let provider_messages: Vec<_> = requests
+        .iter()
+        .filter(|request| request["model"] == "root-packet-test")
+        .flat_map(|request| request["messages"].as_array().unwrap())
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| {
+            let projection = resume_typed_projection(message["content"].as_str()?)?;
+            Some((message, projection))
+        })
+        .collect();
+    assert_eq!(
+        provider_messages.len(),
+        1,
+        "the actual resumed Parent provider request must receive the typed result"
+    );
+    let (provider_message, projection) = &provider_messages[0];
+    assert!(serde_json::to_vec(provider_message).unwrap().len() <= 8192);
+    assert_eq!(projection["view"], "typed_result");
+    assert_eq!(projection["available"], true);
+    assert_eq!(projection["child_report"], typed_report());
+    assert_eq!(
+        projection["host_observation"]["kind"],
+        "committed_terminal_source"
+    );
+    assert_eq!(
+        projection["host_observation"]["terminal_source"],
+        terminal_source
+    );
+    assert_eq!(
+        projection["host_observation"]["assignment_sha256"],
+        binding.assignment_sha256
+    );
+    assert_eq!(
+        projection["host_observation"]["child_created_at"],
+        json!(child.created_at)
+    );
+    assert_eq!(
+        projection["host_observation"]["last_run_status"],
+        "completed"
+    );
+    assert_eq!(terminal_source["status"], "completed");
+    // Runtime completion is independently observed. The model's blocked
+    // outcome and not_run verification remain its own unverified claims.
+    assert_eq!(projection["child_report"]["outcome"], "blocked");
+    assert_eq!(
+        projection["child_report"]["reported_verification"][0]["reported_status"],
+        "not_run"
+    );
+    let runtime_messages: Vec<_> = parent
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == Role::User
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "child_completion_resume"
+                        && metadata["child_session_id"] == child.id
+                })
+        })
+        .collect();
+    assert_eq!(runtime_messages.len(), 1, "one durable completion resume");
+    let runtime_message = runtime_messages[0];
+    assert!(serde_json::to_vec(runtime_message).unwrap().len() <= 8192);
+    assert_eq!(
+        resume_typed_projection(&runtime_message.content).as_ref(),
+        Some(projection)
+    );
+    assert_eq!(
+        runtime_message.metadata.as_ref().unwrap()["child_typed_result_included"],
+        true
+    );
+    assert!(runtime_message.content.contains("Resume the parent task"));
+    assert!(runtime_message.content.contains("SubAgent"));
+}
+
 async fn cold_typed_inspection(
     data: &Path,
     child: &bamboo_domain::Session,
@@ -546,6 +644,7 @@ async fn cold_typed_inspection(
         tools::{ChildSessionAdapter, SubAgentTool},
     };
     use bamboo_agent_core::tools::{Tool, ToolExecutionContext, ToolOutcome};
+    use bamboo_engine::execution::{ChildCompletion, ChildCompletionHandler};
     use sha2::{Digest, Sha256};
     let state = AppState::new(data.to_path_buf()).await.unwrap();
     let adapter = Arc::new(ChildSessionAdapter::new(
@@ -572,6 +671,10 @@ async fn cold_typed_inspection(
             .join("runtime.json"),
     ];
     let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let backlog = state.session_inbox.inspect("packet-root").await.unwrap();
+    assert_eq!(backlog.pending, 0);
+    assert_eq!(backlog.claimed, 0);
+    assert!(state.agent_runners.read().await.is_empty());
     for view in ["result_binding", "typed_result"] {
         let mut args = json!({"action":"get","child_session_id":child.id,"view":view});
         if view == "typed_result" {
@@ -619,6 +722,33 @@ async fn cold_typed_inspection(
             assert_eq!(value["child_created_at"], json!(child.created_at));
         }
     }
+    // A cold process can receive the original callback again, including the
+    // same persisted-source replay used at the watchdog's lost-wake boundary.
+    // The cleared durable wait must prevent another message or activation.
+    let completion = ChildCompletion {
+        parent_session_id: "packet-root".into(),
+        child_session_id: child.id.clone(),
+        status: "completed".into(),
+        error: None,
+        completed_at: child.updated_at,
+        source: Some(
+            serde_json::from_str(&child.metadata["runtime.child_completion_source_v1"]).unwrap(),
+        ),
+    };
+    tokio::join!(
+        state
+            .child_completion_coordinator
+            .on_child_completed(completion.clone()),
+        state
+            .child_completion_coordinator
+            .on_child_completed(completion),
+    );
+    assert_eq!(
+        state.session_inbox.inspect("packet-root").await.unwrap(),
+        backlog,
+        "cold duplicate/replay cannot admit or authorize another outcome"
+    );
+    assert!(state.agent_runners.read().await.is_empty());
     assert_eq!(
         files
             .iter()

@@ -49,6 +49,10 @@ use crate::model_config_helper::{
 use crate::session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
 };
+use crate::session_app::child_session::result_projection::{
+    child_result_identity, decode_report, fits_child_result_budget, plain_child_report_message,
+    project_child_report, unavailable_child_result,
+};
 use crate::session_app::execute::consume_pending_clarification_resume;
 use crate::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
 use crate::session_app::resume::{
@@ -572,6 +576,111 @@ fn runtime_resume_message(
     message
 }
 
+/// Only a strict v1 report from the sealed result message enters this route.
+/// Legacy text, Guardian verdicts and resident completions retain their paths.
+fn sealed_child_report(
+    completion: &ChildCompletion,
+    child: &Session,
+    parent: &Session,
+) -> Option<serde_json::Value> {
+    if child.subagent_type().as_deref() == Some("guardian")
+        || child
+            .metadata
+            .get("lifecycle")
+            .is_some_and(|v| v == "resident")
+    {
+        return None;
+    }
+    let source = completion.source.as_ref()?;
+    if !source.matches_completion(completion) {
+        return None;
+    }
+    let binding = bamboo_domain::ChildContextBinding::from_session(child).ok()??;
+    let content = source.result(child, parent)?;
+    let message = child
+        .messages
+        .iter()
+        .find(|m| Some(&m.id) == source.result_message_id.as_ref())?;
+    if !plain_child_report_message(message) {
+        return None;
+    }
+    let report = decode_report(&content).ok()?;
+    let mut observation =
+        child_result_identity(parent, child, &binding, source.project_id.as_deref());
+    observation.as_object_mut()?.extend(
+        serde_json::json!({"kind":"committed_terminal_source","terminal_source":source,
+            "last_run_status":source.status})
+        .as_object()?
+        .clone(),
+    );
+    Some(project_child_report(report, observation))
+}
+
+fn typed_child_resume_message(
+    completion: &ChildCompletion,
+    remaining_children: usize,
+    projection: &serde_json::Value,
+) -> Message {
+    let inspection = serde_json::json!({
+        "intent":"inspect", "target":completion.child_session_id, "message":"result",
+    });
+    let mut message = Message::user(format!(
+        "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
+         Child typed result:\n{}\n\n\
+         Resume the parent task. Child-reported evidence and verification are claims, not host-certified facts. \
+         For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.",
+        completion.child_session_id, completion.status, remaining_children, projection,
+    ));
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY:true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY:"child_completion_resume",
+        "child_session_id":completion.child_session_id,"child_status":completion.status,
+        "child_final_response_included":projection["available"] == true,
+        "child_typed_result_included":true,
+    }));
+    message.never_compress = false;
+    message
+}
+
+/// The result, metadata, provider wrapper and final correlation all count.
+/// Keep the original semantic envelope ID: a fallback is the same sealed event.
+fn bound_typed_child_delivery(
+    envelope: &mut SessionMessageEnvelope,
+    message: &mut Message,
+    projection: &mut serde_json::Value,
+    completion: &ChildCompletion,
+    remaining_children: usize,
+) -> bool {
+    fn install(envelope: &mut SessionMessageEnvelope, message: &Message) {
+        if let SessionMessageBody::ChildOutcome(outcome) = &mut envelope.body {
+            // The provider projection owns the typed result. Keep the body
+            // semantics stable when a later retry needs a smaller presentation:
+            // provider_message is deliberately excluded from Inbox idempotency.
+            // The envelope ID still binds the original sealed report and source.
+            outcome.result = None;
+            // Error identity remains sealed and hashed in the original ID/source.
+            // Do not copy a potentially unbounded raw error into this typed route.
+            outcome.error = None;
+            outcome.provider_message = Some(session_provider_message(message));
+        }
+    }
+    fn fits(envelope: &SessionMessageEnvelope, message: &Message) -> bool {
+        fits_child_result_budget(envelope)
+            && fits_child_result_budget(message)
+            && envelope
+                .to_provider_message()
+                .is_ok_and(|actual| fits_child_result_budget(&actual))
+    }
+    install(envelope, message);
+    if fits(envelope, message) {
+        return true;
+    }
+    *projection = unavailable_child_result("typed_result", "result_budget_exceeded");
+    *message = typed_child_resume_message(completion, remaining_children, projection);
+    install(envelope, message);
+    fits(envelope, message)
+}
+
 /// The hidden resume message for a completed **guardian** review: a directive,
 /// verdict-tailored note that carries the reviewer's findings straight into the
 /// parent (so it can act without a SubAgent inspection), mirroring
@@ -992,13 +1101,31 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         } else {
             None
         };
-        let resume_message = guardian_resume.unwrap_or_else(|| {
-            runtime_resume_message(
-                &completion,
-                remaining_children,
-                child_final_response.as_deref(),
-            )
-        });
+        let mut typed_result = loaded_child
+            .as_ref()
+            .and_then(|child| sealed_child_report(&completion, child, &parent));
+        let mut resume_message = if let Some(projection) = typed_result.as_mut() {
+            let message = typed_child_resume_message(&completion, remaining_children, projection);
+            if fits_child_result_budget(&message) {
+                message
+            } else {
+                *projection = unavailable_child_result("typed_result", "result_budget_exceeded");
+                typed_child_resume_message(&completion, remaining_children, projection)
+            }
+        } else {
+            guardian_resume.unwrap_or_else(|| {
+                runtime_resume_message(
+                    &completion,
+                    remaining_children,
+                    child_final_response.as_deref(),
+                )
+            })
+        };
+        if typed_result.is_some() && !fits_child_result_budget(&resume_message) {
+            tracing::warn!(child_session_id = %completion.child_session_id,
+                "typed child resume identity exceeds budget; leaving wait armed");
+            return;
+        }
 
         // Stage the typed child outcome before clearing any durable wait. A
         // crash after this admission leaves the parent suspended with an
@@ -1021,6 +1148,19 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             {
                 if let Some(run_id) = run_id.await {
                     envelope.correlation_id = Some(format!("child_completion_after_run:{run_id}"));
+                }
+            }
+            if let Some(projection) = typed_result.as_mut() {
+                if !bound_typed_child_delivery(
+                    &mut envelope,
+                    &mut resume_message,
+                    projection,
+                    &completion,
+                    remaining_children,
+                ) {
+                    tracing::warn!(child_session_id = %completion.child_session_id,
+                        "typed child outcome wrapper exceeds budget; leaving wait armed");
+                    return;
                 }
             }
             match messenger.admit(envelope).await {
@@ -1117,11 +1257,21 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                         .source
                         .as_ref()
                         .and_then(|source| source.result(&sibling, &parent));
-                    let presentation = runtime_resume_message(
-                        &sibling_completion,
-                        remaining_children,
-                        result.as_deref(),
-                    );
+                    let mut typed_result =
+                        sealed_child_report(&sibling_completion, &sibling, &parent);
+                    let mut presentation = if let Some(projection) = typed_result.as_ref() {
+                        typed_child_resume_message(
+                            &sibling_completion,
+                            remaining_children,
+                            projection,
+                        )
+                    } else {
+                        runtime_resume_message(
+                            &sibling_completion,
+                            remaining_children,
+                            result.as_deref(),
+                        )
+                    };
                     let mut envelope = child_completion_envelope(
                         &sibling_completion,
                         wait.registered_at,
@@ -1131,6 +1281,18 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     if let Some(run_id) = parent_run_id.as_ref() {
                         envelope.correlation_id =
                             Some(format!("child_completion_after_run:{run_id}"));
+                    }
+                    if let Some(projection) = typed_result.as_mut() {
+                        if !bound_typed_child_delivery(
+                            &mut envelope,
+                            &mut presentation,
+                            projection,
+                            &sibling_completion,
+                            remaining_children,
+                        ) {
+                            tracing::warn!(%child_id, "typed terminal sibling wrapper exceeds budget; leaving wait armed");
+                            return;
+                        }
                     }
                     match messenger.admit(envelope).await {
                         Ok(admission) => {
@@ -3413,6 +3575,367 @@ mod tests {
         ChildCompletionSource::from_committed_session(
             &store.load_session(id).await.unwrap().unwrap(),
         )
+    }
+
+    fn typed_test_report() -> serde_json::Value {
+        serde_json::json!({"version":1,"outcome":"blocked","summary":"Quoted \"claim\" \\ 用户🪷\n",
+            "reported_evidence":[{"description":"reported only","reference":"/never/read/reported-ref","sha256":null}],
+            "reported_verification":[{"check":"fixture","reported_status":"passed","details":"a model claim"}],
+            "proposals":["Try the next step"],"blockers":["Need approval"],"open_decisions":["Which route?"]})
+    }
+
+    fn typed_test_child(parent: &Session, id: &str, report: &str) -> Session {
+        let mut child = Session::new_child(id, &parent.id, "model", "Child");
+        let packet = bamboo_domain::ChildContextPacket {
+            version: 1,
+            objective: "bounded task".into(),
+            constraints: vec![],
+            acceptance: vec!["report only".into()],
+            non_goals: vec![],
+            necessary_user_instructions: vec![],
+            recorded_decisions: vec![],
+            source_user_message_ids: vec![parent.messages[0].id.clone()],
+            background_message_ids: vec![],
+        };
+        let resolved = packet.resolve(parent, "bounded task").unwrap();
+        let binding = bamboo_domain::ChildContextBinding::new(
+            parent,
+            id,
+            resolved.required_brief.clone(),
+            resolved,
+        )
+        .unwrap();
+        binding.install(&mut child).unwrap();
+        child.add_message(binding.assignment_message());
+        child.add_message(Message::assistant(report, None));
+        child.set_last_run_status("completed");
+        ChildCompletionSource::prepare(&mut child, "sealed-report-run", &Default::default());
+        child
+    }
+
+    fn typed_test_completion(child: &Session) -> ChildCompletion {
+        ChildCompletion {
+            parent_session_id: child.parent_session_id.clone().unwrap(),
+            child_session_id: child.id.clone(),
+            status: "completed".into(),
+            error: None,
+            completed_at: child.updated_at,
+            source: ChildCompletionSource::from_committed_session(child),
+        }
+    }
+
+    #[test]
+    fn sealed_typed_projection_keeps_host_source_distinct_from_all_reported_claims() {
+        let mut parent = Session::new("typed-parent", "model");
+        parent.add_message(Message::user("required user constraint"));
+        let report = typed_test_report();
+        let child = typed_test_child(&parent, "typed-child", &report.to_string());
+        let completion = typed_test_completion(&child);
+        let projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        assert_eq!(projection["child_report"], report);
+        assert_eq!(
+            projection["host_observation"]["terminal_source"],
+            serde_json::to_value(&completion.source).unwrap()
+        );
+        assert_eq!(
+            projection["host_observation"]["kind"],
+            "committed_terminal_source"
+        );
+        assert_eq!(
+            projection["host_observation"]["last_run_status"],
+            "completed"
+        );
+        assert_eq!(projection["child_report"]["outcome"], "blocked");
+        assert_eq!(
+            projection["child_report"]["reported_verification"][0]["reported_status"],
+            "passed"
+        );
+        assert!(projection["host_observation"].get("verified").is_none());
+        for excluded in [
+            "guardian",
+            "resident",
+            "legacy",
+            "malformed",
+            "missing_source",
+            "multipart",
+        ] {
+            let mut excluded_child = child.clone();
+            match excluded {
+                "guardian" => {
+                    excluded_child
+                        .metadata
+                        .insert("subagent_type".into(), "guardian".into());
+                }
+                "resident" => {
+                    excluded_child
+                        .metadata
+                        .insert("lifecycle".into(), "resident".into());
+                }
+                "legacy" => {
+                    excluded_child =
+                        Session::new_child("typed-child", &parent.id, "model", "Child");
+                    excluded_child.add_message(Message::assistant(report.to_string(), None));
+                    excluded_child.set_last_run_status("completed");
+                }
+                "malformed" => {
+                    excluded_child.messages.last_mut().unwrap().content = format!("prose {report}")
+                }
+                "multipart" => {
+                    excluded_child.messages.last_mut().unwrap().content_parts = Some(
+                        serde_json::from_value(
+                            serde_json::json!([{ "type":"text", "text":"not plain" }]),
+                        )
+                        .unwrap(),
+                    )
+                }
+                _ => {}
+            }
+            ChildCompletionSource::prepare(
+                &mut excluded_child,
+                "excluded-run",
+                &Default::default(),
+            );
+            let mut excluded_completion = typed_test_completion(&excluded_child);
+            if excluded == "missing_source" {
+                excluded_completion.source = None;
+            }
+            assert!(
+                sealed_child_report(&excluded_completion, &excluded_child, &parent).is_none(),
+                "{excluded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_delivery_counts_complete_escaped_envelope_and_final_correlation() {
+        let mut parent = Session::new("typed-parent", "model");
+        parent.add_message(Message::user("required source"));
+        let child = typed_test_child(&parent, "typed-child", &typed_test_report().to_string());
+        let completion = typed_test_completion(&child);
+        let original = sealed_child_report(&completion, &child, &parent).unwrap();
+        let presentation = typed_child_resume_message(&completion, 0, &original);
+        let mut base = child_completion_envelope(
+            &completion,
+            Utc::now(),
+            completion.source.as_ref().unwrap().result(&child, &parent),
+            &presentation,
+        );
+        let mut projection = original.clone();
+        let mut message = presentation.clone();
+        assert!(bound_typed_child_delivery(
+            &mut base,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        assert_eq!(projection, original);
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        store.save_session(&parent).await.unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(store, Default::default());
+        let first = inbox.deliver(&base).await.unwrap();
+        let stable_id = base.id.clone();
+        let base_bytes = serde_json::to_vec(&base.to_provider_message().unwrap())
+            .unwrap()
+            .len();
+        assert!(base_bytes < 8192);
+        let correlation = base.correlation_id.as_ref().unwrap().clone();
+        for (extra, available) in [(8192 - base_bytes, true), (8193 - base_bytes, false)] {
+            let mut envelope = base.clone();
+            envelope.correlation_id = Some(format!("{correlation}{}", "x".repeat(extra)));
+            assert_eq!(
+                serde_json::to_vec(&envelope.to_provider_message().unwrap())
+                    .unwrap()
+                    .len(),
+                base_bytes + extra
+            );
+            let mut message = presentation.clone();
+            let mut projection = original.clone();
+            assert!(bound_typed_child_delivery(
+                &mut envelope,
+                &mut message,
+                &mut projection,
+                &completion,
+                0
+            ));
+            assert_eq!(projection["available"], available);
+            assert!(fits_child_result_budget(&envelope));
+            assert!(fits_child_result_budget(&message));
+            assert!(fits_child_result_budget(
+                &envelope.to_provider_message().unwrap()
+            ));
+            assert_eq!(
+                envelope.idempotency_semantics(),
+                base.idempotency_semantics()
+            );
+            assert_eq!(envelope.id, stable_id);
+            assert_eq!(
+                inbox.deliver(&envelope).await.unwrap(),
+                first,
+                "presentation overflow cannot change delivery semantics"
+            );
+            if !available {
+                assert_eq!(projection["reason"], "result_budget_exceeded");
+                assert!(projection.get("child_report").is_none());
+                assert!(message.content.contains("SubAgent"));
+                assert!(!message.content.contains("Bounded tail"));
+            }
+        }
+        let mut large = typed_test_report();
+        large["summary"] = serde_json::json!("\"\\\n".repeat(500));
+        large["proposals"] = serde_json::json!(["\"\\\n".repeat(250)]);
+        let child = typed_test_child(&parent, "escaped-child", &large.to_string());
+        assert!(decode_report(&large.to_string()).is_ok());
+        let completion = typed_test_completion(&child);
+        let mut projection = sealed_child_report(&completion, &child, &parent).unwrap();
+        let mut message = typed_child_resume_message(&completion, 0, &projection);
+        let mut envelope =
+            child_completion_envelope(&completion, Utc::now(), Some(large.to_string()), &message);
+        assert!(serde_json::to_vec(&envelope).unwrap().len() > 8192);
+        assert!(bound_typed_child_delivery(
+            &mut envelope,
+            &mut message,
+            &mut projection,
+            &completion,
+            0
+        ));
+        assert_eq!(projection["available"], false);
+        assert!(fits_child_result_budget(&envelope));
+        assert!(fits_child_result_budget(&message));
+        assert!(fits_child_result_budget(
+            &envelope.to_provider_message().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_source_mutations_reject_before_admission_and_wait_clear() {
+        for mutation in ["birth", "assignment", "input", "result", "parent_source"] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "typed-parent",
+                vec!["typed-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
+            parent.add_message(Message::user("required source"));
+            store.save_session(&parent).await.unwrap();
+            let mut child =
+                typed_test_child(&parent, "typed-child", &typed_test_report().to_string());
+            store.save_session(&child).await.unwrap();
+            let mut completion = typed_test_completion(&child);
+            match mutation {
+                "birth" => {
+                    completion.source.as_mut().unwrap().child_created_at +=
+                        chrono::Duration::seconds(1)
+                }
+                "assignment" => {
+                    child.messages[0].content.push_str("changed assignment");
+                }
+                "input" => child.add_message(Message::user("new user input")),
+                "result" => child
+                    .messages
+                    .last_mut()
+                    .unwrap()
+                    .content
+                    .push_str("changed"),
+                _ => {
+                    parent.messages[0].content.push_str("changed");
+                    store.save_session(&parent).await.unwrap();
+                }
+            }
+            store.save_session(&child).await.unwrap();
+            coordinator.on_child_completed(completion).await;
+            assert_eq!(
+                inbox.inspect(&parent.id).await.unwrap().pending,
+                0,
+                "{mutation}"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0, "{mutation}");
+            assert!(
+                read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                    .waiting_for_children
+                    .is_some(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_cold_watchdog_and_terminal_siblings_admit_each_source_once() {
+        for cold_watchdog in [false, true] {
+            let (_temp, store, inbox, coordinator, reservations, launches) =
+                completion_inbox_fixture().await;
+            let ids = vec!["typed-a".into(), "typed-b".into()];
+            save_waiting_test_parent(&store, "typed-parent", ids.clone(), ChildWaitPolicy::All)
+                .await;
+            let mut parent = store.load_session("typed-parent").await.unwrap().unwrap();
+            parent.add_message(Message::user("required source"));
+            store.save_session(&parent).await.unwrap();
+            let mut completions = Vec::new();
+            for id in &ids {
+                let child = typed_test_child(&parent, id, &typed_test_report().to_string());
+                store.save_session(&child).await.unwrap();
+                completions.push(typed_test_completion(&child));
+            }
+            if cold_watchdog {
+                // No callbacks or cached Session snapshots precede this disk-only sweep.
+                let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
+                wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
+                coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
+                coordinator.sweep_child_wait(&parent.id, wait).await;
+            } else {
+                // The terminal index is ahead of the second sibling's callback.
+                coordinator.on_child_completed(completions[0].clone()).await;
+            }
+            for completion in completions {
+                coordinator.on_child_completed(completion).await;
+            }
+            let claims = inbox.claim(&parent.id, 8).await.unwrap();
+            assert_eq!(claims.len(), 2);
+            assert_eq!(reservations.load(Ordering::SeqCst), 1);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            for claim in claims {
+                assert!(fits_child_result_budget(&claim.envelope));
+                assert!(fits_child_result_budget(
+                    &claim.envelope.to_provider_message().unwrap()
+                ));
+                let SessionMessageBody::ChildOutcome(outcome) = claim.envelope.body else {
+                    panic!("child outcome");
+                };
+                let projection: serde_json::Value = serde_json::from_str(
+                    outcome
+                        .provider_message
+                        .as_ref()
+                        .unwrap()
+                        .content
+                        .text
+                        .split_once("Child typed result:\n")
+                        .unwrap()
+                        .1
+                        .lines()
+                        .next()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(projection["child_report"], typed_test_report());
+                assert_eq!(
+                    projection["host_observation"]["terminal_source"]["child_session_id"],
+                    outcome.child_session_id
+                );
+                assert_eq!(
+                    projection["host_observation"]["last_run_status"],
+                    "completed"
+                );
+                assert!(fits_child_result_budget(&outcome.provider_message));
+            }
+        }
     }
 
     async fn completion_inbox_fixture() -> (

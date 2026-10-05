@@ -1,4 +1,5 @@
 //! Pure strict projection of child-reported content. No reported reference is read.
+use bamboo_domain::{ChildContextBinding, Message, MessagePhase, Session};
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -10,6 +11,44 @@ pub const MAX_CHILD_RESULT_BYTES: usize = 8192;
 
 pub fn unavailable_child_result(view: &str, reason: &str) -> Value {
     json!({"view":view,"version":1,"available":false,"reason":reason})
+}
+
+/// Measure the complete serialized wrapper, including JSON escaping.
+pub(crate) fn fits_child_result_budget(value: &impl Serialize) -> bool {
+    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_CHILD_RESULT_BYTES)
+}
+
+/// Identity fields shared by inspection and sealed completion projection.
+/// Callers must validate the parent, binding and their own finality boundary.
+pub(crate) fn child_result_identity(
+    parent: &Session,
+    child: &Session,
+    binding: &ChildContextBinding,
+    project_id: Option<&str>,
+) -> Value {
+    json!({"parent_session_id":parent.id,"parent_created_at":parent.created_at,
+        "child_session_id":child.id,"child_created_at":child.created_at,
+        "root_session_id":child.root_session_id,"spawn_depth":child.spawn_depth,
+        "current_project_id":project_id,"assignment_sha256":binding.assignment_sha256,
+        "source_contents_match":true,
+        "required_source_count":binding.payload.sources.iter().filter(|s|s.required).count(),
+        "optional_source_count":binding.payload.sources.iter().filter(|s|!s.required).count()})
+}
+
+pub(crate) fn project_child_report(report: Value, host_observation: Value) -> Value {
+    json!({"view":"typed_result","version":1,"available":true,
+        "child_report":report,"host_observation":host_observation})
+}
+
+pub(crate) fn plain_child_report_message(message: &Message) -> bool {
+    message.phase != Some(MessagePhase::Commentary)
+        && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+        && message.content_parts.as_ref().is_none_or(Vec::is_empty)
+        && !message.content.trim().is_empty()
+        && !message.compressed
+        && message.compressed_by_event_id.is_none()
+        && message.compression_level == 0
+        && !message.content.starts_with("[post-compaction-recovery]")
 }
 
 pub(super) fn lowercase_sha256(value: &str) -> bool {
@@ -122,7 +161,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-pub(super) fn decode_report(content: &str) -> Result<Value, &'static str> {
+pub(crate) fn decode_report(content: &str) -> Result<Value, &'static str> {
     if content.len() > MAX_CHILD_RESULT_BYTES {
         return Err("result_budget_exceeded");
     }
