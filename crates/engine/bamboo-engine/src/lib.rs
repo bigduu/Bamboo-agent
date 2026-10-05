@@ -28,6 +28,8 @@ pub use session_cache::SessionSnapshot;
 pub mod session_messaging;
 pub mod session_repository;
 pub use session_repository::SessionRepository;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 pub mod title_gen;
 pub mod token_usage_log;
 pub mod workflow_run;
