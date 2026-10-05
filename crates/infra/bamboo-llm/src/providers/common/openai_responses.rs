@@ -459,18 +459,14 @@ fn responses_tool_search_json(execution: ResponsesToolSearchExecution) -> Value 
         ResponsesToolSearchExecution::Client => json!({
             "type": "tool_search",
             "execution": "client",
-            "description": "Search the current Bamboo tool, Skill, and Workflow catalog by capability.",
+            "description": "Search the current eligible Deferred tools by name, description, and parameter metadata.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "maxLength": bamboo_domain::MAX_DISCOVERY_QUERY_CHARS,
-                        "description": "Short capability query, such as git status, browser testing, or release workflow."
-                    },
-                    "kinds": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": ["tool", "skill", "workflow"]}
+                        "description": "Short tool capability query, such as git status or browser testing."
                     },
                     "limit": {
                         "type": "integer",
@@ -3259,6 +3255,22 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn codex_client_search_schema_is_tools_only_with_bounded_query_and_limit() {
+        let search = responses_tool_search_json(ResponsesToolSearchExecution::Client);
+        assert_eq!(search["execution"], "client");
+        assert!(search["parameters"]["properties"].get("kinds").is_none());
+        assert_eq!(
+            search["parameters"]["properties"]["query"]["maxLength"],
+            bamboo_domain::MAX_DISCOVERY_QUERY_CHARS
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["limit"]["maximum"],
+            bamboo_domain::MAX_DISCOVERY_RESULTS
+        );
+        assert_eq!(search["parameters"]["additionalProperties"], false);
     }
 
     #[test]
