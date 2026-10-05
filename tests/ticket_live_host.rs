@@ -306,14 +306,28 @@ impl LiveHost {
         })
         .await;
         match waited {
-            Ok(Ok(messages)) => (request, json!({"admitted":admitted,"messages":messages})),
+            Ok(Ok(messages)) => (
+                request,
+                json!({"admitted":admitted,"messages":messages,"status":"completed"}),
+            ),
             outcome => {
                 eprintln!(
                     "LIVE_TICKET_HOST bounded failure diagnostics: requests={}; preserved_host={}",
                     json!(self.bridge.requests()),
                     self.data.join("host.log").display()
                 );
-                panic!("real-model Host completion failed: {outcome:?}");
+                let root = store
+                    .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let diagnostic = serde_json::to_value(&root).unwrap();
+                (
+                    request,
+                    json!({"admitted":admitted,"messages":root.messages,
+                    "status":root.last_run_status(),"bounded_failure":format!("{outcome:?}"),
+                    "run_error":diagnostic["runtime_metadata"]["last_run_error"]}),
+                )
             }
         }
     }
@@ -567,6 +581,17 @@ async fn live_chinese_human_resolution_through_actual_host() {
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
+        std::fs::copy(
+            f.data.join("host.log"),
+            evidence.join(format!("{case}-host.log")),
+        )
+        .unwrap();
+        f.bridge.verify_unchanged();
+        assert_eq!(
+            run["status"], "completed",
+            "Host completion failure ({case}): {}",
+            run["run_error"]
+        );
         report["assessment"] = assess(case, &before, &after, &id);
         let prior_resolution = json!(after.resolutions[&id]);
         let prior_requests = f.bridge.requests();
