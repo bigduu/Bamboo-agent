@@ -47,6 +47,8 @@ use crate::session_messaging::SessionMessenger;
 pub struct AgentRuntime {
     pub storage: Arc<dyn Storage>,
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    /// Capturing no inherited wait is also immutable for this execution.
+    pub(crate) inherited_child_wait_captured: bool,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -220,6 +222,7 @@ impl AgentRuntimeBuilder {
             router.set_inbox(inbox.clone());
         }
         Ok(AgentRuntime {
+            inherited_child_wait_captured: false,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
@@ -718,6 +721,30 @@ impl AgentRuntime {
     /// Builds an [`AgentLoopConfig`] from the request parameters and shared
     /// runtime resources, then delegates to [`run_agent_loop_with_config`].
     pub async fn execute(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+    ) -> crate::runtime::runner::Result<()> {
+        let existing = self.persistence.inherited_child_wait();
+        if let Some(inherited) = existing.as_ref() {
+            inherited
+                .validate_session(session)
+                .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+        } else if !self.inherited_child_wait_captured {
+            let mut runtime = self.clone();
+            if let Some(inherited) = bamboo_domain::InheritedChildWait::capture(session) {
+                runtime.persistence = self
+                    .persistence
+                    .bind_inherited_child_wait(inherited)
+                    .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
+            }
+            runtime.inherited_child_wait_captured = true;
+            return runtime.execute_bound(session, req).await;
+        }
+        self.execute_bound(session, req).await
+    }
+
+    async fn execute_bound(
         &self,
         session: &mut Session,
         req: ExecuteRequest,

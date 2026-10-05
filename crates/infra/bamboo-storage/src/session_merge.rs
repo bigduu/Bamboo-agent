@@ -315,6 +315,60 @@ pub(crate) fn adopt_finalized_child_wait(
     }
 }
 
+/// Intermediate persistence of a carried untagged wait owns neither its
+/// durable completion nor replacement. Only that exact captured wait is
+/// reconciled; a new wait armed by this run remains caller-owned.
+pub(crate) fn reconcile_inherited_child_wait(
+    session: &mut Session,
+    latest: &Session,
+    inherited: &bamboo_domain::InheritedChildWait,
+) -> std::io::Result<()> {
+    inherited.validate_session(session)?;
+    inherited.validate_session(latest)?;
+    let Some(incoming) = session.agent_runtime_state.as_mut() else {
+        return Ok(());
+    };
+    if incoming.waiting_for_children.as_ref() != Some(inherited.wait()) {
+        return Ok(());
+    }
+    incoming.waiting_for_children = latest
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.waiting_for_children.clone());
+    let cleared = incoming.waiting_for_children.is_none();
+    if cleared {
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_children")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if incoming
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_children")
+        {
+            incoming.suspension = None;
+            if incoming.status == bamboo_domain::AgentStatusState::Suspended {
+                incoming.status = bamboo_domain::AgentStatusState::Idle;
+            }
+        }
+    }
+    // Preserve the legacy mirror only where an adapter already installed it.
+    if session.metadata.contains_key("agent.runtime.state") {
+        session.metadata.insert(
+            "agent.runtime.state".into(),
+            serde_json::to_string(incoming).map_err(std::io::Error::other)?,
+        );
+    }
+    if cleared {
+        preserve_finalized_hidden_child_resumes(session, latest, inherited.wait().registered_at);
+    }
+    Ok(())
+}
+
 fn preserve_finalized_hidden_child_resumes(
     session: &mut Session,
     latest: &Session,
@@ -501,6 +555,7 @@ fn unconditional_task_patch_would_regress(
 /// sessions proceed concurrently.
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
+    inherited_child_wait: Option<bamboo_domain::InheritedChildWait>,
     root_actor_writer: Option<(
         bamboo_domain::RootActorRuntimeWrite,
         bamboo_domain::RootActorRuntimePublisher,
@@ -556,6 +611,7 @@ impl LockedSessionStore {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self {
             storage,
+            inherited_child_wait: None,
             root_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
@@ -577,18 +633,50 @@ impl LockedSessionStore {
         }
         Ok(Self {
             storage: self.storage.clone(),
+            inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: Some((owner, publish)),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         })
     }
 
-    async fn save_runtime_snapshot(
+    /// Keep the exact captured birth/wait in a private execution view, sharing
+    /// process serialization and any already-bound ordinary Root capability.
+    pub fn bind_inherited_child_wait(&self, inherited: bamboo_domain::InheritedChildWait) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            inherited_child_wait: Some(inherited),
+            root_actor_writer: self.root_actor_writer.clone(),
+            locks: self.locks.clone(),
+            task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
+        }
+    }
+
+    fn inherited_for_session(
         &self,
         session: &Session,
+    ) -> Option<&bamboo_domain::InheritedChildWait> {
+        self.inherited_child_wait
+            .as_ref()
+            .filter(|wait| wait.session_id() == session.id)
+    }
+
+    async fn save_runtime_snapshot(
+        &self,
+        session: &mut Session,
         runtime_only: bool,
     ) -> std::io::Result<()> {
-        if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+        if let Some(inherited) = self.inherited_for_session(session) {
+            self.storage
+                .save_runtime_with_inherited_child_wait(
+                    session,
+                    inherited,
+                    runtime_only,
+                    self.root_actor_writer.clone(),
+                    None,
+                )
+                .await
+        } else if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
             self.storage
                 .save_root_actor_runtime(owner, session, runtime_only, publish.clone())
                 .await
@@ -659,7 +747,21 @@ impl LockedSessionStore {
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
-            let result = if let Some((inbox, claim)) = input {
+            if let Some(provenance) = self.inherited_for_session(session) {
+                provenance.validate_session(session)?;
+            }
+            let result = if inherited.is_none() && self.inherited_for_session(session).is_some() {
+                self.storage
+                    .save_runtime_with_inherited_child_wait(
+                        session,
+                        self.inherited_for_session(session)
+                            .expect("bound provenance"),
+                        false,
+                        self.root_actor_writer.clone(),
+                        input.cloned(),
+                    )
+                    .await
+            } else if let Some((inbox, claim)) = input {
                 let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
                     std::io::Error::other("Root input checkpoint requires a bound writer")
                 })?;
@@ -1913,6 +2015,17 @@ impl LockedSessionStore {
 /// not define a separate adapter layer for the same behavior.
 #[async_trait::async_trait]
 impl RuntimeSessionPersistence for LockedSessionStore {
+    fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
+        self.inherited_child_wait.clone()
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: bamboo_domain::InheritedChildWait,
+    ) -> std::io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Ok(Arc::new(self.bind_inherited_child_wait(inherited)))
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
     }

@@ -128,3 +128,6 @@ pub mod task_evaluation {
 pub mod agent {
     pub use crate::runtime::agent::*;
 }
+
+#[cfg(test)]
+mod inherited_wait_regression_tests;
