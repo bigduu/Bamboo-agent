@@ -5740,6 +5740,41 @@ impl SessionStoreV2 {
         owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
         publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> io::Result<()> {
+        self.save_runtime_state_with_owner_and_inherited(session, owner, publish, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn reconcile_inherited_runtime_snapshot(
+        &self,
+        session: &Session,
+        inherited: &bamboo_domain::InheritedChildWait,
+        runtime_only: bool,
+    ) -> io::Result<Session> {
+        inherited.validate_session(session)?;
+        let latest = if runtime_only {
+            self.load_runtime_control_plane_unchecked(&session.id)
+                .await?
+        } else {
+            self.load_session_unlocked(&session.id).await?
+        }
+        .ok_or_else(|| {
+            io::Error::other(bamboo_domain::SessionAuthorityConflict(
+                "inherited child wait session disappeared".into(),
+            ))
+        })?;
+        let mut reconciled = session.clone();
+        crate::session_merge::reconcile_inherited_child_wait(&mut reconciled, &latest, inherited)?;
+        Ok(reconciled)
+    }
+
+    async fn save_runtime_state_with_owner_and_inherited(
+        &self,
+        session: &Session,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+        publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+    ) -> io::Result<Option<Session>> {
         // Fast path: write ONLY the small runtime sidecar (no messages), leaving
         // session.json — which carries the full conversation history — untouched.
         // Legacy sessions retain O(1) I/O in conversation length. Initialized
@@ -5769,12 +5804,12 @@ impl SessionStoreV2 {
             // session.json and the index get created. Deliberately acquire no
             // shared Task guard before this call: `save_session` owns that
             // boundary, avoiding a same-instance shared-lock re-entry.
-            if owner.is_some() {
+            if owner.is_some() || inherited.is_some() {
                 return Err(root_actor_runtime::conflict(
                     "Root runtime source is missing",
                 ));
             }
-            return self.save_session(session).await;
+            return self.save_session(session).await.map(|_| None);
         };
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -5793,6 +5828,14 @@ impl SessionStoreV2 {
                 )
             }),
         );
+        let reconciled = match inherited {
+            Some(inherited) => Some(
+                self.reconcile_inherited_runtime_snapshot(session, inherited, true)
+                    .await?,
+            ),
+            None => None,
+        };
+        let session = reconciled.as_ref().unwrap_or(session);
         self.check_default_or_root_actor_context(
             session,
             &self.abs_path_from_rel(&rel),
@@ -5944,7 +5987,7 @@ impl SessionStoreV2 {
         if let Some(publish) = publish {
             self.publish_root_actor_runtime(&guards, publish).await?;
         }
-        Ok(())
+        Ok(reconciled)
     }
 
     async fn save_session_after_lock(
@@ -6147,7 +6190,7 @@ impl Storage for SessionStoreV2 {
         claim: &bamboo_domain::SessionInboxOwnedClaim,
         publish: bamboo_domain::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_input_impl(owner, session, inbox, claim, publish)
+        self.save_root_actor_input_impl(owner, &mut session.clone(), inbox, claim, publish, None)
             .await
     }
 
@@ -6384,6 +6427,81 @@ impl Storage for SessionStoreV2 {
         {
             crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, true);
         }
+        self.save_session_after_lock(&reconciled, started, &guards, None)
+            .await?;
+        if let Some((_, publish)) = root_writer {
+            self.publish_root_actor_runtime(&guards, publish).await?;
+        }
+        *session = reconciled;
+        Ok(())
+    }
+
+    async fn save_runtime_with_inherited_child_wait(
+        &self,
+        session: &mut Session,
+        inherited: &bamboo_domain::InheritedChildWait,
+        runtime_only: bool,
+        root_writer: Option<(
+            bamboo_domain::RootActorRuntimeWrite,
+            bamboo_domain::RootActorRuntimePublisher,
+        )>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::SessionInboxOwnedClaim,
+        )>,
+    ) -> io::Result<()> {
+        inherited.validate_session(session)?;
+        if let Some((inbox, claim)) = input {
+            if runtime_only {
+                return Err(io::Error::other("Root input requires a full checkpoint"));
+            }
+            let (owner, publish) = root_writer
+                .ok_or_else(|| io::Error::other("Root input checkpoint requires a bound writer"))?;
+            return self
+                .save_root_actor_input_impl(
+                    &owner,
+                    session,
+                    inbox,
+                    &claim,
+                    publish,
+                    Some(inherited),
+                )
+                .await;
+        }
+        if runtime_only {
+            let (owner, publish) = match root_writer.as_ref() {
+                Some((owner, publish)) => (Some(owner), Some(publish.clone())),
+                None => (None, None),
+            };
+            let reconciled = self
+                .save_runtime_state_with_owner_and_inherited(
+                    session,
+                    owner,
+                    publish,
+                    Some(inherited),
+                )
+                .await?;
+            *session = reconciled.expect("inherited runtime writer reconciled its snapshot");
+            return Ok(());
+        }
+        let started = Instant::now();
+        validate_session_id(&session.id)?;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = root_writer.as_ref().map(|(owner, _)| {
+            root_actor_runtime::RootActorWriteProof::new(
+                self.sessions_dir.join(&session.id),
+                owner.clone(),
+            )
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        let reconciled = self
+            .reconcile_inherited_runtime_snapshot(session, inherited, false)
+            .await?;
         self.save_session_after_lock(&reconciled, started, &guards, None)
             .await?;
         if let Some((_, publish)) = root_writer {

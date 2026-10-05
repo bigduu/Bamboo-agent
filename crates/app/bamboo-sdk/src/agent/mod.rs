@@ -384,19 +384,34 @@ impl Agent {
         // Keep the shared execution body off nested public run/resume futures.
         // The boxed future retains the existing ownership and cancellation order.
         Box::pin(async move {
+            // One execution-private view covers Project assignment, approved
+            // tool replay and all later runtime checkpoints. Freeze None too.
+            let mut execution = self.clone();
+            let persistence = if self.persistence().inherited_child_wait().is_none() {
+                match bamboo_domain::InheritedChildWait::capture(session) {
+                    Some(inherited) => self
+                        .persistence()
+                        .bind_inherited_child_wait(inherited)
+                        .map_err(|error| AgentError::LLM(error.to_string()))?,
+                    None => self.persistence().clone(),
+                }
+            } else {
+                self.persistence().clone()
+            };
+            execution.inner = self.inner.with_execution_persistence(persistence);
             // Own the logical session before any pre-execution mutation or approved
             // tool replay. Two cloned SDK Session values must collide before either
             // can duplicate a mutating side effect.
-            let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
+            let direct_lease = execution.inner.begin_direct_execution(&session.id).await?;
             if session.project_id_meta().is_none() {
-                if let Some(project_id) = self.project_id.as_ref() {
+                if let Some(project_id) = execution.project_id.as_ref() {
                     let existing = if session.kind == bamboo_domain::SessionKind::Root {
-                        match self.storage().load_root_authority(&session.id).await {
+                        match execution.storage().load_root_authority(&session.id).await {
                             // Preserve compatibility for custom Storage backends that
                             // predate the strict Root port. V2 always uses its canonical
                             // directory lookup, even when this instance's index is stale.
                             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                                self.storage().load_session(&session.id).await
+                                execution.storage().load_session(&session.id).await
                             }
                             result => result,
                         }
@@ -426,7 +441,8 @@ impl Agent {
                         candidate.set_project_id_meta(project_id.to_string());
                         candidate.metadata_version = next_version;
                         candidate.updated_at = std::time::SystemTime::now().into();
-                        self.inner
+                        execution
+                            .inner
                             .prepare_external_project_assignment_read_only(&mut candidate)
                             .await?;
                         #[cfg(test)]
@@ -436,10 +452,24 @@ impl Agent {
                         // workspace or replaying an approved tool. The final writer
                         // fences an independent store's competing assignment. The
                         // V2 runtime path leaves conversation history untouched.
-                        self.storage()
-                            .save_runtime_state(&candidate)
-                            .await
-                            .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
+                        if let Some(inherited) = execution.persistence().inherited_child_wait() {
+                            // Preserve this assignment's original authoritative
+                            // candidate and default-writer fence. Ordinary metadata
+                            // adoption would conceal a competing Project CAS.
+                            execution
+                                .storage()
+                                .save_runtime_with_inherited_child_wait(
+                                    &mut candidate,
+                                    &inherited,
+                                    true,
+                                    None,
+                                    None,
+                                )
+                                .await
+                        } else {
+                            execution.storage().save_runtime_state(&candidate).await
+                        }
+                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
                         *session = candidate;
                     } else {
                         // First creation keeps its existing revision and persistence
@@ -455,7 +485,8 @@ impl Agent {
             // would execute against stale process state. Assigned sessions fail
             // closed here when this runtime has no Project resolver; the pending
             // replay marker remains intact for a correctly configured retry.
-            self.inner
+            execution
+                .inner
                 .prepare_external_session_for_execution(session)
                 .await?;
 
@@ -467,7 +498,7 @@ impl Agent {
             // entry waiting after its replay markers have been cleared. Check every
             // ergonomic entry into the loop, not just `resume`. See
             // `reexecute_approved_tool_if_pending` for the full rationale.
-            match self
+            match execution
                 .reexecute_approved_tool_if_pending(session, &event_tx)
                 .await
             {
@@ -505,8 +536,8 @@ impl Agent {
             // provider with one clean configured System message.
             bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
                 session,
-                self.system_prompt.as_deref(),
-                self.model.as_deref(),
+                execution.system_prompt.as_deref(),
+                execution.model.as_deref(),
             );
 
             // The last user message in the session drives execution (the engine
@@ -523,11 +554,12 @@ impl Agent {
             // built from exactly the configured tool set, so no per-run
             // `disabled_tools` filter is needed here.
             let mut builder = ExecuteRequestBuilder::new(initial_message, event_tx, cancel_token);
-            if let Some(model) = self.model.clone() {
+            if let Some(model) = execution.model.clone() {
                 builder = builder.model(model);
             }
 
-            self.inner
+            execution
+                .inner
                 .execute_direct_registered(session, builder.build(), direct_lease)
                 .await
         })
@@ -1811,10 +1843,26 @@ mod reexecute_and_child_approval_tests {
 
     #[tokio::test]
     async fn root_context_fence_sdk_first_project_assignment_rejects_final_store_race() {
+        for inherited in [false, true] {
+            prove_first_project_assignment_rejects_race(inherited).await;
+        }
+    }
+
+    async fn prove_first_project_assignment_rejects_race(inherited: bool) {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
         let mut session = seed_gated_tool_session("sdk-root-context-race", "context-race-call");
+        if inherited {
+            session
+                .agent_runtime_state
+                .get_or_insert_with(|| bamboo_domain::AgentRuntimeState::new("prior-run"))
+                .waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+                vec!["prior-project-child".into()],
+                bamboo_domain::ChildWaitPolicy::All,
+                session.created_at,
+            ));
+        }
         session.metadata.insert(
             PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
             "context-race-call".to_string(),

@@ -16,6 +16,51 @@ pub enum RetrievalWindowCheckpointOutcome {
     Rebased,
 }
 
+/// Immutable execution provenance for an already-persisted untagged Child wait.
+/// This capability is captured once from the execution's initial snapshot; it
+/// is not Session metadata and must never be reconstructed at a later save.
+#[derive(Debug, Clone)]
+pub struct InheritedChildWait {
+    session_id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    wait: crate::WaitingForChildrenState,
+}
+
+impl InheritedChildWait {
+    pub fn capture(session: &Session) -> Option<Self> {
+        let wait = session
+            .agent_runtime_state
+            .as_ref()?
+            .waiting_for_children
+            .as_ref()?;
+        if wait.registered_by_tool_call_id.is_some() {
+            return None;
+        }
+        Some(Self {
+            session_id: session.id.clone(),
+            created_at: session.created_at,
+            wait: wait.clone(),
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn wait(&self) -> &crate::WaitingForChildrenState {
+        &self.wait
+    }
+
+    pub fn validate_session(&self, session: &Session) -> io::Result<()> {
+        if session.id != self.session_id || session.created_at != self.created_at {
+            return Err(io::Error::other(crate::SessionAuthorityConflict(
+                "inherited child wait session changed identity or birth".into(),
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Provider-boundary admission through the bound Root writer. None from the
 /// port below means this execution does not use ordinary Root authority.
 #[derive(Debug, Default)]
@@ -140,6 +185,25 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {
+    /// An execution-private binding, never reconstructed from mutable state.
+    fn inherited_child_wait(&self) -> Option<InheritedChildWait> {
+        None
+    }
+
+    /// Return an execution-private view retaining the captured wait provenance
+    /// through every intermediate save. Unsupported persisters fail closed.
+    fn bind_inherited_child_wait(
+        &self,
+        _inherited: InheritedChildWait,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "execution-scoped inherited child wait persistence is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Immutable capability already captured by this concrete execution.
     /// An unbound Host/default persister never supplies a current owner.
     fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
@@ -539,6 +603,17 @@ impl Drop for RootActorExecutionBinding {
 
 #[async_trait::async_trait]
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
+    fn inherited_child_wait(&self) -> Option<InheritedChildWait> {
+        (**self).inherited_child_wait()
+    }
+
+    fn bind_inherited_child_wait(
+        &self,
+        inherited: InheritedChildWait,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_inherited_child_wait(inherited)
+    }
+
     fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
         (**self).root_actor_writer()
     }
