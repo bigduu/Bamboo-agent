@@ -3182,7 +3182,6 @@ pub fn credentials_path(data_dir: impl AsRef<Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -3492,7 +3491,7 @@ mod tests {
             .write(true)
             .open(dir.path().join(".config-credential-migration.lock"))
             .unwrap();
-        migration_lock.lock_exclusive().unwrap();
+        migration_lock.lock().unwrap();
         std::fs::write(
             dir.path().join("config-credential-migration.json"),
             b"manifest-commit-window",
