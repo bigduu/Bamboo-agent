@@ -615,9 +615,9 @@ fn loaded_record_is_workflow(record: &LoadedSkillRecord, captures: &CapturedSour
     if let Some(captured) = captures.get(&CandidateKey::for_record(record)) {
         return captured.metadata.kind == WorkflowKind::Orchestration;
     }
-    // Only the loader's explicit workflow.yaml compatibility path has a valid
-    // non-legacy record without a capture. It cannot become ordinary authority
-    // by rereading a disappearing marker or policy through an ambient path.
+    // Uncaptured non-legacy records use the explicit workflow.yaml path or were
+    // confirmed as Orchestration by the legacy loader after capture failed.
+    // This compatibility partition cannot grant ordinary source authority.
     true
 }
 

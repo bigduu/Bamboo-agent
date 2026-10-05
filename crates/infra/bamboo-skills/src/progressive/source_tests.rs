@@ -731,7 +731,24 @@ async fn exhausted_root_capacity_does_not_evict_an_old_publication_consumer() {
 
 #[tokio::test]
 async fn orchestration_optional_openai_read_error_keeps_the_old_workflow_boundary() {
-    for marker in [false, true] {
+    for (marker, limits) in [
+        (false, SourceLimits::default()),
+        (true, SourceLimits::default()),
+        (
+            false,
+            SourceLimits {
+                roots: 0,
+                ..SourceLimits::default()
+            },
+        ),
+        (
+            false,
+            SourceLimits {
+                index: 0,
+                ..SourceLimits::default()
+            },
+        ),
+    ] {
         let temp = Fixture::new();
         let root = bundle(temp.path());
         std::fs::create_dir_all(root.join("agents/openai.yaml")).unwrap();
@@ -767,10 +784,19 @@ budgets:
 "#,
             )
             .unwrap();
-        } else {
-            std::fs::write(root.join("agents/bamboo.yaml"), "composition: {}").unwrap();
         }
-        let store = store(temp.path());
+        std::fs::write(
+            root.join("agents/bamboo.yaml"),
+            "composition: {}\ninvocation_policy:\n  explicit: false\n  automatic: false\n",
+        )
+        .unwrap();
+        let store = SkillStore::new_with_source_limits(
+            SkillStoreConfig {
+                skills_dir: temp.path().into(),
+                ..Default::default()
+            },
+            limits,
+        );
         store.reload().await.unwrap();
         let workflow = store
             .workflow_catalog_snapshot()
@@ -781,8 +807,87 @@ budgets:
             .unwrap();
         assert_eq!(workflow.kind, crate::WorkflowKind::Orchestration);
         assert_eq!(workflow.status, WorkflowStatus::Valid);
+        assert_eq!(workflow.invocation_policy["explicit"], false);
+        assert_eq!(workflow.invocation_policy["automatic"], false);
         assert!(!store.source_bindings().await.contains_key("source-fixture"));
         assert!(store.skill_catalog_snapshot().await.entries.is_empty());
+        assert_eq!(store.source_pool().counts().0, 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn linked_host_composition_keeps_orchestration_compatibility() {
+    for deny in [false, true] {
+        let temp = Fixture::new();
+        let root = bundle(temp.path());
+        std::fs::create_dir(root.join("agents")).unwrap();
+        let outside = temp.path().parent().unwrap().join("host-composition.yaml");
+        std::fs::write(
+            &outside,
+            if deny {
+                "composition: {}\ninvocation_policy:\n  explicit: false\n  automatic: false\n"
+            } else {
+                "composition: {}"
+            },
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agents/bamboo.yaml")).unwrap();
+        assert!(!root.join("workflow.yaml").exists());
+        assert_eq!(
+            crate::catalog::load_bundle_metadata(&root)
+                .await
+                .unwrap()
+                .kind,
+            crate::WorkflowKind::Orchestration
+        );
+
+        let store = store(temp.path());
+        store.reload().await.unwrap();
+        let workflow = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "source-fixture")
+            .expect("linked host composition must remain a Workflow");
+        assert_eq!(workflow.kind, crate::WorkflowKind::Orchestration);
+        assert_eq!(workflow.status, WorkflowStatus::Valid);
+        assert_eq!(workflow.invocation_policy["explicit"], !deny);
+        assert_eq!(workflow.invocation_policy["automatic"], false);
+        assert_eq!(
+            store.get_workflow_root("source-fixture").await.unwrap(),
+            root
+        );
+        assert!(store.skill_catalog_snapshot().await.entries.is_empty());
+        assert!(store.get_skill("source-fixture").await.is_err());
+        assert!(!store.source_bindings().await.contains_key("source-fixture"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_linked_host_metadata_cannot_grant_instruction_source() {
+    for raw in [
+        "invocation_policy:\n  explicit: true\n  automatic: true\n",
+        "composition: [\n",
+    ] {
+        let temp = Fixture::new();
+        let root = bundle(temp.path());
+        std::fs::create_dir(root.join("agents")).unwrap();
+        let outside = temp.path().parent().unwrap().join("host-policy.yaml");
+        std::fs::write(&outside, raw).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agents/bamboo.yaml")).unwrap();
+        let store = store(temp.path());
+        store.reload().await.unwrap();
+        let instruction = row(&store).await;
+        assert_eq!(instruction.kind, crate::WorkflowKind::Instruction);
+        assert_eq!(instruction.status, WorkflowStatus::Invalid);
+        assert_eq!(instruction.invocation_policy["explicit"], false);
+        assert_eq!(instruction.invocation_policy["automatic"], false);
+        assert!(store.get_skill("source-fixture").await.is_err());
+        assert!(store.workflow_catalog_snapshot().await.entries.is_empty());
+        assert!(!store.source_bindings().await.contains_key("source-fixture"));
     }
 }
 

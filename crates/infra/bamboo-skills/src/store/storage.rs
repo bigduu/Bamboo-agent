@@ -508,18 +508,30 @@ pub(crate) async fn load_captured_records(
                         tracing::debug!(%error, "Skill source capture rejected");
                         let skill_root =
                             skill_file.parent().unwrap_or(&discovery.dir).to_path_buf();
-                        report.failed.push(FailedSkillRecord {
-                            skill_id: skill_root
-                                .file_name()
-                                .and_then(|value| value.to_str())
-                                .map(str::to_string),
-                            skill_root,
-                            skill_file,
-                            source: discovery.source,
-                            mode: discovery.mode.clone(),
-                            error: "SKILL.md: failed to capture coherent source".into(),
-                        });
-                        continue;
+                        // Bamboo-sidecar-only orchestration also owns the old
+                        // Workflow input path. An ambient lookup may classify
+                        // that compatibility record, never admit an Instruction.
+                        if crate::catalog::load_bundle_metadata(&skill_root)
+                            .await
+                            .is_ok_and(|metadata| {
+                                metadata.kind == crate::WorkflowKind::Orchestration
+                            })
+                        {
+                            None
+                        } else {
+                            report.failed.push(FailedSkillRecord {
+                                skill_id: skill_root
+                                    .file_name()
+                                    .and_then(|value| value.to_str())
+                                    .map(str::to_string),
+                                skill_root,
+                                skill_file,
+                                source: discovery.source,
+                                mode: discovery.mode.clone(),
+                                error: "SKILL.md: failed to capture coherent source".into(),
+                            });
+                            continue;
+                        }
                     }
                 }
             } else {
