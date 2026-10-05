@@ -21,7 +21,7 @@ const ORIGINAL: &str = "pub fn answer() -> u8 { 0 }\n";
 fn model_catalog_read(request: &Value) -> bool {
     request["role"] == "models"
         && request["path"] == "/v1/models"
-        && request["model"].is_null()
+        && request.get("model") == Some(&Value::Null)
         && request["status"] == 200
         && request["request_bytes"] == 0
         && request["request_sha256"] == content_hash(b"")
@@ -112,6 +112,11 @@ fn replay_allows_only_valid_catalog_reads_without_another_execution() {
         invalid[field] = value;
         let mut changed = before.clone();
         changed.push(invalid);
+        assert!(!replay_keeps_model_execution(&before, &changed, "selected"));
+        let mut missing = catalog.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        let mut changed = before.clone();
+        changed.push(missing);
         assert!(!replay_keeps_model_execution(&before, &changed, "selected"));
     }
 }
