@@ -90,7 +90,6 @@ actix-ws = "0.4"
 # process-default provider (avoids the rustls 0.23 "no process-level
 # CryptoProvider" panic); `ring` is the provider already resolved in the lock.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
