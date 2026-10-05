@@ -235,6 +235,26 @@ mod tests {
     }
 
     #[test]
+    fn yaml_roundtrip_preserves_nested_expressions_and_scalar_types() {
+        let expr = ToolExpr::retry(ToolExpr::sequence(vec![
+            ToolExpr::call(
+                "inspect",
+                json!({
+                    "strings": ["yes", "on", "001", "null", "中文"],
+                    "boolean": true,
+                    "number": 1.5,
+                    "nothing": null,
+                }),
+            ),
+            ToolExpr::parallel(vec![ToolExpr::call("report", json!({}))]),
+        ]));
+
+        let yaml = expr.to_yaml().expect("nested expression should serialize");
+        let restored = ToolExpr::from_yaml(&yaml).expect("nested expression should parse");
+        assert_eq!(restored, expr);
+    }
+
+    #[test]
     fn test_json_roundtrip() {
         let expr = ToolExpr::choice_with_else(
             Condition::Success,
