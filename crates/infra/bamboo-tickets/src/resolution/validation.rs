@@ -228,6 +228,11 @@ fn exact_name(text: &str, name: &str) -> bool {
             || [
                 "批准",
                 "同意",
+                "拒绝",
+                "不批准",
+                "不要批准",
+                "不同意",
+                "禁止",
                 "确认验收",
                 "验收通过",
                 "接受交付",
@@ -497,6 +502,12 @@ pub(super) fn validate_group(
     {
         return Err(clarify("operations require exact current Human text"));
     }
+    // The saved quote must still occur verbatim in the current Human text.
+    // A final Chinese sentence delimiter belongs to that quote, while the
+    // existing clause validators compare the sentence content after splitting.
+    // Remove only one final delimiter, never another sentence or its context.
+    let quote = group.source_quote.trim();
+    let clause = quote.strip_suffix('。').unwrap_or(quote).trim_end();
     let mut temporary = BTreeSet::new();
     for op in &group.operations {
         for target in operation_references(op) {
@@ -542,7 +553,7 @@ pub(super) fn validate_group(
                         "a question answer cannot approve an action".into(),
                     ));
                 }
-                answer_text(snapshot, record, &group.source_quote, q, answer)?;
+                answer_text(snapshot, record, clause, q, answer)?;
             }
             SemanticOperation::DecideApproval {
                 target,
@@ -554,7 +565,7 @@ pub(super) fn validate_group(
                 {
                     return Err(Error::RevisionConflict);
                 }
-                approval_text(snapshot, record, &group.source_quote, q, *approve)?;
+                approval_text(snapshot, record, clause, q, *approve)?;
             }
             SemanticOperation::Accept {
                 target,
